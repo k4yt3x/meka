@@ -1643,20 +1643,15 @@ pub(super) fn profile_config_option(
     .category(SessionConfigOptionCategory::Model)
     .description("The profile this session runs on.")
 }
-/// The project picker as a `configOptions` entry: the configured projects behind a first entry
-/// with the empty id, which is no project. A session can be on a project the file has since
-/// dropped, and then no option matches, which a client renders as nothing selected: the truth, as
-/// for a profile. No category: the protocol's are the model's and the mode's, and a project is
-/// neither.
-pub(super) fn project_config_option(
-    projects: &std::collections::BTreeMap<String, crate::config::ProjectConfig>,
-    current: &str,
-) -> SessionConfigOption {
+/// The project picker as a `configOptions` entry: every project behind a first entry with the
+/// empty id, which is no project. No category: the protocol's are the model's and the mode's,
+/// and a project is neither.
+pub(super) fn project_config_option(projects: &[String], current: &str) -> SessionConfigOption {
     let mut options = vec![SessionConfigSelectOption::new(
         SessionConfigValueId::from(String::new()),
         "No project".to_string(),
     )];
-    options.extend(projects.keys().map(|name| {
+    options.extend(projects.iter().map(|name| {
         SessionConfigSelectOption::new(SessionConfigValueId::from(name.clone()), name.clone())
     }));
     SessionConfigOption::select(
@@ -1711,12 +1706,14 @@ pub(super) async fn build_config_options(
         profile_config_option(&shared.config.profiles, &current_profile),
     ];
     // Offered only where there is a project to pick, so an installation without any shows the
-    // pickers it always had.
-    if !shared.config.projects.is_empty() {
-        options.push(project_config_option(
-            &shared.config.projects,
-            &current_project,
-        ));
+    // pickers it always had. Read from the store at every build, so a project added while the
+    // server runs is offered on the next update.
+    let projects = shared.store.project_names().await.unwrap_or_else(|error| {
+        tracing::warn!("failed to list projects for the config options: {error}");
+        Vec::new()
+    });
+    if !projects.is_empty() {
+        options.push(project_config_option(&projects, &current_project));
     }
     options.push(approvals_config_option(permission));
     options

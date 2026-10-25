@@ -341,24 +341,30 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         // of the spaces after a foreground reset, and a box with no padding is no box.
         Item::Banner {
             version,
-            profile,
-            model,
-            project,
-            directory,
+            revision,
+            debug,
+            mcp_servers,
+            skills,
+            memories,
+            instructions,
         } => {
-            let profile = match model {
-                Some(model) => format!("{profile} ({model})"),
-                None => profile.clone(),
-            };
-            let profile = match project {
-                Some(project) => format!("{profile}, project '{project}'"),
-                None => profile,
-            };
             let lead = BANNER_GAP + display_width(BANNER_MARK[0]) + 2;
             let room = width.saturating_sub(lead).max(1);
             // The name bold and white, so it is what the eye lands on, the version dimmed beside
             // it; the facts a step down from the name, in the palette's plain white, which most
             // themes set to a light gray, rather than the bright one.
+            // The build beside the version, dimmed with it: a release built from its tag says
+            // nothing more, since the version is the revision.
+            let build: Vec<&str> = revision
+                .iter()
+                .map(String::as_str)
+                .chain(debug.then_some("debug"))
+                .collect();
+            let build = if build.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", build.join(", "))
+            };
             let title = vec![
                 Span::styled(
                     "meka".to_string(),
@@ -366,7 +372,7 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
                         .fg(draw::WHITE)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" v{version}"), gray()),
+                Span::styled(format!(" v{version}{build}"), gray()),
             ];
             let fact = |text: &str| {
                 vec![Span::styled(
@@ -374,10 +380,19 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
                     Style::default().fg(Color::Gray),
                 )]
             };
+            // What the agent can do on one line and what it knows on the next.
             let rows = [
                 draw::cut_spans(title, room),
-                fact(&profile),
-                fact(directory),
+                fact(&format!(
+                    "{} · {}",
+                    counted(*mcp_servers, "MCP server", "MCP servers"),
+                    counted(*skills, "skill", "skills")
+                )),
+                fact(&format!(
+                    "{} · {}",
+                    counted(*memories, "memory", "memories"),
+                    counted(*instructions, "instructions", "instructions")
+                )),
             ];
             let mut lines = vec![Line::default()];
             lines.extend(BANNER_MARK.iter().zip(rows).map(|(mark, text)| {
@@ -791,6 +806,8 @@ pub(crate) struct StatusFacts<'a> {
     pub(crate) shown: &'a [crate::config::StatusFact],
     pub(crate) permission: crate::permission::Permission,
     pub(crate) path: Option<String>,
+    /// The project the session is on, while it is on one.
+    pub(crate) project: Option<String>,
     /// The profile the session runs on, by name.
     pub(crate) profile: Option<String>,
     /// The model the profile runs, when the config names one.
@@ -813,6 +830,12 @@ pub(crate) fn color(color: crossterm::style::Color) -> Color {
 /// What the status row says, alone and in red, while the composer is in its shell mode.
 pub(crate) const SHELL_MODE_LABEL: &str = "Run command in shell";
 
+/// `count` of a noun as the banner and the status row say it: `0 skills`, `1 skill`, `2 skills`.
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+    let noun = if count == 1 { singular } else { plural };
+    format!("{count} {noun}")
+}
+
 /// The status row: the permission level, always, as a cell of its color in the gutter column and
 /// its name at the text edge in the same color, then the facts the config lists, and the hint
 /// against the right edge when it fits there.
@@ -822,8 +845,6 @@ pub(crate) fn status_line(facts: &StatusFacts<'_>, width: usize) -> Line<'static
     fn lead(spans: &mut Vec<Span<'static>>) {
         spans.push(Span::styled(" · ".to_string(), gray()));
     }
-    let counted =
-        |count: usize, noun: &str| format!("{count} {noun}{}", if count == 1 { "" } else { "s" });
     let mut spans: Vec<Span<'static>> = Vec::new();
     // The shell mode takes the whole row: one red sentence where the level and the facts were,
     // since those are about the session and the sentence is about what the next Enter does. It
@@ -845,15 +866,14 @@ pub(crate) fn status_line(facts: &StatusFacts<'_>, width: usize) -> Line<'static
     for fact in facts.shown.iter().filter(|_| !facts.shell_mode) {
         let text = match fact {
             StatusFact::Path => facts.path.clone(),
+            StatusFact::Project => facts.project.clone(),
             StatusFact::Profile => facts.profile.clone(),
             StatusFact::Model => facts.model.clone(),
             StatusFact::Context => facts.context.clone(),
-            StatusFact::Tasks => {
-                (facts.work.tasks > 0).then(|| counted(facts.work.tasks, "background task"))
-            }
-            StatusFact::Subagents => {
-                (facts.work.subagents > 0).then(|| counted(facts.work.subagents, "sub-agent"))
-            }
+            StatusFact::Tasks => (facts.work.tasks > 0)
+                .then(|| counted(facts.work.tasks, "background task", "background tasks")),
+            StatusFact::Subagents => (facts.work.subagents > 0)
+                .then(|| counted(facts.work.subagents, "sub-agent", "sub-agents")),
         };
         if let Some(text) = text {
             lead(&mut spans);
@@ -1440,10 +1460,12 @@ mod tests {
             Item::Image,
             Item::Banner {
                 version: token.clone(),
-                profile: token.clone(),
-                model: Some(address.clone()),
-                project: None,
-                directory: address.clone(),
+                revision: Some(address.clone()),
+                debug: true,
+                mcp_servers: 2,
+                skills: 12,
+                memories: 48,
+                instructions: 3,
             },
         ];
         let mut too_wide = Vec::new();
@@ -1807,24 +1829,26 @@ mod tests {
     }
 
     /// The banner is meka's mark in cyan beside three lines on no background, two columns in
-    /// from the edge under a blank row: the name bold and white with the version dimmed, the
-    /// profile with its model and the directory a step down in the palette's plain white; a
-    /// profile whose model the config leaves to the backend shows its name alone.
+    /// from the edge under a blank row: the name bold and white with the version and the build
+    /// dimmed beside it, then what the agent can do and what it knows a step down in the
+    /// palette's plain white. A release built from its tag shows the version alone.
     #[test]
     fn the_banner_is_the_mark_beside_three_lines() {
         let item = Item::Banner {
             version: "0.72.0".into(),
-            profile: "synthetic".into(),
-            model: Some("hf:zai-org/GLM-5.3".into()),
-            project: None,
-            directory: "~/projects/something".into(),
+            revision: Some("a1b2c3d-dirty".into()),
+            debug: true,
+            mcp_servers: 2,
+            skills: 1,
+            memories: 48,
+            instructions: 3,
         };
         let lines = entry_lines(&entry(item, false), 80);
         assert_eq!(plain(&lines), vec![
             "",
-            "  █▄ ▄█  meka v0.72.0",
-            "  █ ▀ █  synthetic (hf:zai-org/GLM-5.3)",
-            "  █   █  ~/projects/something",
+            "  █▄ ▄█  meka v0.72.0 (a1b2c3d-dirty, debug)",
+            "  █ ▀ █  2 MCP servers · 1 skill",
+            "  █   █  48 memories · 3 instructions",
         ]);
         assert!(
             lines
@@ -1847,31 +1871,37 @@ mod tests {
             "the name is bold: {name:?}"
         );
         let version = &lines[1].spans[4];
-        assert_eq!(version.content.as_ref(), " v0.72.0");
+        assert_eq!(version.content.as_ref(), " v0.72.0 (a1b2c3d-dirty, debug)");
         assert_eq!(
             version.style.fg,
             Some(Color::DarkGray),
-            "the version is dimmed"
+            "the version and the build are dimmed"
         );
         assert_eq!(
             lines[2].spans[3].style.fg,
             Some(Color::Gray),
             "the facts are the palette's plain white, a step down from the name"
         );
-        let bare = entry_lines(
+        let release = entry_lines(
             &entry(
                 Item::Banner {
                     version: "0.72.0".into(),
-                    profile: "work".into(),
-                    model: None,
-                    project: None,
-                    directory: "~".into(),
+                    revision: None,
+                    debug: false,
+                    mcp_servers: 0,
+                    skills: 0,
+                    memories: 1,
+                    instructions: 0,
                 },
                 false,
             ),
             60,
         );
-        assert_eq!(plain(&bare)[2], "  █ ▀ █  work");
+        assert_eq!(plain(&release)[1..], [
+            "  █▄ ▄█  meka v0.72.0",
+            "  █ ▀ █  0 MCP servers · 0 skills",
+            "  █   █  1 memory · 0 instructions",
+        ]);
     }
 
     /// A prompt keeps the zero-width joiners of what the user typed, so a family emoji stays
@@ -2157,6 +2187,7 @@ mod tests {
                 shown: &crate::config::StatusFact::ALL,
                 permission: crate::permission::Permission::Workspace,
                 path: Some("~/projects".into()),
+                project: Some("webdev".into()),
                 profile: Some("work".into()),
                 model: Some("claude-opus-4-8".into()),
                 context: Some("34%".into()),
@@ -2168,7 +2199,8 @@ mod tests {
         );
         assert_eq!(
             text(idle.clone()),
-            "  workspace · ~/projects · work · claude-opus-4-8 · 34%"
+            "  workspace · ~/projects · webdev · work · claude-opus-4-8 · 34%",
+            "the project follows the path, bare, as the profile and the model are"
         );
         let level = color(crate::permission::Permission::Workspace.indicator_color());
         let cell = &idle.spans[0];
@@ -2189,6 +2221,7 @@ mod tests {
                 shown: &crate::config::StatusFact::DEFAULT_ROW,
                 permission: crate::permission::Permission::Workspace,
                 path: None,
+                project: None,
                 profile: None,
                 model: None,
                 context: None,
@@ -2217,6 +2250,7 @@ mod tests {
                 shown: &crate::config::StatusFact::DEFAULT_ROW,
                 permission: crate::permission::Permission::Read,
                 path: None,
+                project: None,
                 profile: None,
                 model: None,
                 context: None,
@@ -2262,6 +2296,7 @@ mod tests {
             shown,
             permission: crate::permission::Permission::Read,
             path: Some("~/x".into()),
+            project: None,
             profile: Some("work".into()),
             model: Some("m".into()),
             context: Some("34%".into()),
@@ -2291,6 +2326,17 @@ mod tests {
         assert_eq!(
             text(status_line(&facts(&[StatusFact::Context], None), 60)),
             "  read · 34%"
+        );
+        assert_eq!(
+            text(status_line(
+                &facts(
+                    &[StatusFact::Path, StatusFact::Project, StatusFact::Profile],
+                    None
+                ),
+                60
+            )),
+            "  read · ~/x · work",
+            "a session on no project shows no project segment"
         );
         let bare = text(status_line(&facts(&[], Some("copied 2 rows")), 30));
         assert!(

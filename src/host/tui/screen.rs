@@ -142,8 +142,6 @@ pub(crate) struct ScreenLaunch {
     pub(crate) skill_roots: Vec<PathBuf>,
     pub(crate) current_profile: Arc<std::sync::RwLock<String>>,
     pub(crate) configured_profiles: Vec<crate::config::ProfileSummary>,
-    /// What `/project` offers; the session's own project is read off the agent.
-    pub(crate) configured_projects: Vec<crate::config::ProjectSummary>,
     pub(crate) schedule: crate::config::ResolvedScheduleConfig,
     pub(crate) store: crate::store::Store,
     pub(crate) agent: Arc<crate::agent::Agent>,
@@ -356,9 +354,6 @@ struct Screen {
     composer: Composer,
     overlay: Option<Overlay>,
     skill_watch: crate::skills::SkillNameWatch,
-    /// Every installed skill's name, as the watch last read them; the completer is handed the
-    /// ones the session's project shows.
-    installed_skill_names: Vec<String>,
     /// What was logged lately, at every level the screen's layer keeps, for `/log`.
     log_ring: std::collections::VecDeque<crate::relay::LogLine>,
     /// Whether the host is answering something the screen sent it, and since when.
@@ -423,7 +418,6 @@ impl Screen {
             composer: Composer::new(history),
             overlay: None,
             skill_watch,
-            installed_skill_names: Vec::new(),
             log_ring: std::collections::VecDeque::with_capacity(LOG_RING_LINES),
             busy,
             activity: view::Activity::Working,
@@ -632,17 +626,8 @@ impl Screen {
 
     fn refresh_skill_names(&mut self) {
         if let Some(discovered) = self.skill_watch.refresh() {
-            self.installed_skill_names = discovered;
+            *crate::sync::write(&self.launch.completer.skill_names) = discovered;
         }
-        // Narrowed by the project the session is on now, as `/skill` is, so completion never
-        // offers a name the command then refuses.
-        let access = self.launch.agent.project_access();
-        *crate::sync::write(&self.launch.completer.skill_names) = self
-            .installed_skill_names
-            .iter()
-            .filter(|name| access.sees_skill(name))
-            .cloned()
-            .collect();
     }
 
     /// The list follows the line: open as `/` is typed, narrowed with every key. Skill names are
@@ -1907,14 +1892,16 @@ impl Screen {
             SlashCommand::Project(super::commands::ProjectVerb::Picker) => {
                 let current = self.launch.agent.project();
                 // The first row leaves the project: a row rather than a name, since no project is
-                // named by nothing.
+                // named by nothing. Read from the store now, so a project added since the screen
+                // opened is offered.
                 let mut names = vec![String::new()];
-                names.extend(
-                    self.launch
-                        .configured_projects
-                        .iter()
-                        .map(|project| project.name.clone()),
-                );
+                match self.launch.store.project_names().await {
+                    Ok(projects) => names.extend(projects),
+                    Err(error) => {
+                        self.reply(error.to_string());
+                        return;
+                    }
+                }
                 let choices = names
                     .iter()
                     .map(|name| Choice {
@@ -2011,8 +1998,7 @@ impl Screen {
             // shows it, which is what a person who typed the command is there for. The columns a
             // terminal table carried (priority, age, tags, elapsed) are the show panel's.
             SlashCommand::SkillList => {
-                let index = crate::skills::discover_skills_in_roots(&self.launch.skill_roots)
-                    .seen_by(&self.launch.agent.project_access());
+                let index = crate::skills::discover_skills_in_roots(&self.launch.skill_roots);
                 if index.skills.is_empty() {
                     self.reply("No skills.");
                 } else {
@@ -2827,6 +2813,7 @@ impl Screen {
                     shown: &self.launch.status_row,
                     permission: self.launch.shared_permission.get(),
                     path: Some(shorten_path_with_tilde(&self.launch.cwd.get())),
+                    project: self.launch.agent.project(),
                     profile: self.profile_fact(),
                     model: self.model_fact(),
                     context: self.context_gauge(),

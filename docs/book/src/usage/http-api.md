@@ -236,9 +236,9 @@ Omitted, it is the server's own default profile. The session keeps
 it for the rest of its life and every session response echoes it back as `profile`, so a client can
 confirm which account a session bills.
 
-`project` names a [project](projects.md) in the server's `config.toml`, which decides the memory
-tier the session's writes land in and the tiers it sees; `GET /v1/projects` lists them, and a name
-that is not configured is a `422` whose `detail` reads `no project named 'x' (configured: a, b)`.
+`project` names a [project](projects.md), which decides the memory tier the session's writes land
+in and the tiers it sees; `GET /v1/projects` lists them, and a name no project has is a `422` whose
+`detail` reads `no project named 'x' (configured: a, b)`.
 Omitted or empty, the session is on no project, and every session response echoes `project` back,
 `""` for none. `PATCH /v1/sessions/{id}` with `{"project": "movie"}` moves a session onto a project
 and `{"project": ""}` takes it off one; the row is rewritten, and the next turn's context restates
@@ -1211,7 +1211,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 |----------|------|-------------|
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
 | `GET /v1/health/ready` | None | Readiness probe: 200 if the store is healthy, at least one profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `profile_configured`, and `mcp_servers_healthy` (boolean, no server names). **`profile_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
-| `GET /v1/projects` | Any read scope | Projects, as `{"projects": [...]}`: every `[projects.<name>]` the server's `config.toml` defines and every name a row still carries, each with `name`, `memories` (in its tier), `sessions` (root sessions on it), `configured`, `false` for a name only the store carries, and whichever of `allowed_servers`, `disabled_servers`, `allowed_skills` and `disabled_skills` its table sets. Read-only; projects come from `config.toml` |
+| `GET /v1/projects` | Any read scope | Projects, as `{"projects": [...]}`: every project, each with `name`, `created_at` (RFC 3339), `memories` (in its tier) and `sessions` (root sessions on it). Read-only; projects are created with `meka project add` |
 | `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `fallbacks`, the profiles a turn moves to when this one cannot serve it (omitted when it names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
 | `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
@@ -1492,7 +1492,7 @@ Key points:
 | POST | `/v1/mcp/{name}/reconnect` | `mcp:w` | Reconnect an MCP server |
 | GET | `/v1/instructions` | `sessions:r` | Resolved standing instructions, without the per-session files `[instructions]` names |
 | GET | `/v1/profiles` | read | Configured profiles |
-| GET | `/v1/projects` | read | Configured projects, with their memory and session counts |
+| GET | `/v1/projects` | read | Every project, with when it was added and its memory and session counts |
 | GET | `/v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI spec |
 
 `GET /v1/sessions` is paginated by `limit` and `cursor` (see [Sessions](#sessions)), and takes `include_children=true` to list sub-agent sessions alongside root ones, `working_directory=<path>` to filter by working directory, and `parent=<id>` to list one session's direct children. A sub-agent's session record carries `parent_id`, which is what reconnects it to the session that dispatched it.

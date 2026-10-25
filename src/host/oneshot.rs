@@ -229,8 +229,6 @@ pub(crate) async fn run_oneshot(
         cwd: recorded_cwd,
         announce,
     } = resolve_session_resume(&store, &config).await?;
-    // The opening skill within the session's project, which is known only now.
-    crate::host::refuse_a_hidden_opening_skill(&config, project.as_deref())?;
     // The run's output starts after the resume, so the banner is its first block and what follows
     // is set off from it like every block from the one above.
     if let Some(id) = announce {

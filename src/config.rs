@@ -19,8 +19,6 @@ mod mcp;
 /// Accounts and profiles: the `backend` vocabulary, an account and a profile as written and a
 /// profile as resolved through its account, and which profile a run selects.
 mod profile;
-/// Projects: a `[projects.<name>]` table as written, and the name rule every project passes.
-mod project;
 /// The `[serve]` section: the HTTP server's bind address, tokens, webhooks and limits.
 mod serve;
 
@@ -33,14 +31,7 @@ pub(crate) use profile::{
     sort_profile_keys, validate_max_output_tokens,
 };
 
-pub(crate) use self::{
-    mcp::*,
-    project::{
-        ProjectAccess, ProjectConfig, ProjectSummary, require_project, validate_project_names,
-        validate_project_views,
-    },
-    serve::*,
-};
+pub(crate) use self::{mcp::*, serve::*};
 
 /// In-memory shape of `config.toml`. Each top-level `[section]` deserializes into its own
 /// sub-struct; missing sections fall back to `Default`. This is the raw deserialized form;
@@ -60,10 +51,6 @@ pub(crate) struct ConfigFile {
     #[serde(default)]
     pub(crate) profiles: std::collections::BTreeMap<String, ProfileConfig>,
     pub(crate) mcp: Option<McpConfig>,
-    /// Named projects, parsed from `[projects.<name>]`. A session opens one by name; see
-    /// [`ProjectConfig`].
-    #[serde(default)]
-    pub(crate) projects: std::collections::BTreeMap<String, ProjectConfig>,
     pub(crate) permissions: Option<PermissionsConfig>,
     pub(crate) shell: Option<ShellConfig>,
     pub(crate) tools: Option<ToolsConfig>,
@@ -520,6 +507,8 @@ pub(crate) struct ThinkingConfig {
 pub(crate) enum StatusFact {
     /// The session's working directory, shortened with `~`.
     Path,
+    /// The project the session is on, by name, while it is on one.
+    Project,
     /// The profile the session runs on, by name.
     Profile,
     /// The model the profile runs, when the config names one. Its own fact rather than part of
@@ -535,8 +524,9 @@ pub(crate) enum StatusFact {
 
 impl StatusFact {
     /// Every value, in the order a refusal lists them.
-    pub(crate) const ALL: [StatusFact; 6] = [
+    pub(crate) const ALL: [StatusFact; 7] = [
         Self::Path,
+        Self::Project,
         Self::Profile,
         Self::Model,
         Self::Context,
@@ -544,11 +534,13 @@ impl StatusFact {
         Self::Subagents,
     ];
     /// What the row shows when the config does not say: every fact but the model, in the order
-    /// above. The gauge sits after the profile because the window is the model's, so the number
-    /// reads beside what runs it; the model itself is opted into, since a profile's name usually
-    /// says it already.
-    pub(crate) const DEFAULT_ROW: [StatusFact; 5] = [
+    /// above. The project follows the path because both say where the session's work is, where
+    /// the profile and the model say what runs it; the gauge sits after the profile because the
+    /// window is the model's, so the number reads beside what runs it; the model itself is opted
+    /// into, since a profile's name usually says it already.
+    pub(crate) const DEFAULT_ROW: [StatusFact; 6] = [
         Self::Path,
+        Self::Project,
         Self::Profile,
         Self::Context,
         Self::Tasks,
@@ -559,6 +551,7 @@ impl StatusFact {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Path => "path",
+            Self::Project => "project",
             Self::Profile => "profile",
             Self::Model => "model",
             Self::Context => "context",
@@ -1600,8 +1593,6 @@ impl std::str::FromStr for OutputFormat {
 pub(crate) struct CliOverrides {
     pub(crate) profile: Option<String>,
     pub(crate) project: Option<String>,
-    /// `--skill` on the run, by name, for the check against the session's project.
-    pub(crate) skill: Option<String>,
     /// `--format` on the run, read by a `--oneshot` turn.
     pub(crate) output_format: OutputFormat,
     pub(crate) eager_load_tools: Vec<String>,
@@ -1644,9 +1635,6 @@ pub(crate) struct RunRequest {
     /// session opens on, what `-c` and a bare `-r` select among, and where `-r <id>` moves the
     /// session it names.
     pub(crate) requested_project: Option<String>,
-    /// The skill `--skill` named, kept by name beside the prompt it was rendered into: whether the
-    /// session may see it depends on the project the session turns out to be on.
-    pub(crate) requested_skill: Option<String>,
     /// The workspace beyond the working directory, from `--additional-workspace-directory`:
     /// joined with the cwd (and, under ACP, the client's folders) to form the write boundary at
     /// `workspace` and the search scope at every level.
@@ -1711,9 +1699,6 @@ pub(crate) struct ResolvedConfig {
     /// picks one name at startup, but a session names its own, and resolving that one needs the
     /// profile still to be here.
     pub(crate) profiles: std::collections::BTreeMap<String, ProfileConfig>,
-    /// Every configured project, by name. A session names its own, and a name a row carries is
-    /// checked against this map when the session runs.
-    pub(crate) projects: std::collections::BTreeMap<String, ProjectConfig>,
     /// Set when profile selection failed (no profiles, ambiguous, an unknown name, or a profile
     /// whose account is missing); surfaced by [`Self::validate`] with guidance.
     pub(crate) provider_error: Option<String>,
@@ -1802,8 +1787,6 @@ pub(crate) struct ResolvedConfig {
     /// later cannot start appearing on the API by accident. Credentials were never in here to
     /// begin with; they live in the database keyed by account name.
     pub(crate) profile_summaries: Vec<ProfileSummary>,
-    /// The configured projects as a picker or `GET /v1/projects` shows them.
-    pub(crate) project_summaries: Vec<ProjectSummary>,
     /// The files `[instructions].files` names, tilde-expanded and otherwise as written: a relative
     /// entry stays relative because each session resolves it against its own working directory
     /// when it opens; see [`InstructionsConfig::files`]. Empty unless configured.
@@ -2464,11 +2447,6 @@ impl ResolvedConfig {
         let (config_file, config_error) = load_config_file();
         let accounts = config_file.accounts;
         let profiles = config_file.profiles;
-        let projects = config_file.projects;
-        let project_summaries: Vec<ProjectSummary> = projects
-            .keys()
-            .map(|name| ProjectSummary { name: name.clone() })
-            .collect();
         // `--profile`, else `default_profile`, else the sole profile. A miss is a deferred error
         // `validate()` raises, so `resolve` stays infallible.
         let (profile_request, requested_active) = match overrides.profile.clone() {
@@ -2681,7 +2659,6 @@ impl ResolvedConfig {
             configured_default_profile,
             accounts,
             profiles,
-            projects,
             provider_error,
             config_error,
             model,
@@ -2741,7 +2718,6 @@ impl ResolvedConfig {
             mcp_default_permission,
             mcp_deferral,
             profile_summaries,
-            project_summaries,
             instruction_files,
             standing_instructions,
             skills_enabled,
@@ -2767,7 +2743,6 @@ impl ResolvedConfig {
                 requested_permission,
                 requested_profile: overrides.profile,
                 requested_project: overrides.project,
-                requested_skill: overrides.skill,
                 session_resume: SessionResume::from_flags(
                     overrides.resume,
                     overrides.continue_last,
@@ -2815,12 +2790,6 @@ impl ResolvedConfig {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
         self.validate_default_profile()?;
-        validate_project_names(self.projects.keys()).map_err(crate::error::MekaError::Config)?;
-        validate_project_views(
-            &self.projects,
-            self.mcp_servers.iter().map(|server| server.name.as_str()),
-        )
-        .map_err(crate::error::MekaError::Config)?;
         validate_fallback_chains(&self.accounts, &self.profiles, self.session_context_window)
             .map_err(crate::error::MekaError::Config)?;
         warn_about_inert_profile_keys(&self.accounts, &self.profiles);
@@ -4631,6 +4600,7 @@ command = "ida-mcp"
             StatusFact::DEFAULT_ROW,
             [
                 StatusFact::Path,
+                StatusFact::Project,
                 StatusFact::Profile,
                 StatusFact::Context,
                 StatusFact::Tasks,
@@ -4859,65 +4829,6 @@ retention = "0s"
             .validate()
             .expect_err("retention = \"0s\" must not be accepted");
         assert!(error.to_string().contains("[session].retention"), "{error}");
-    }
-
-    /// The whole file is what the user edits, so the refusal has to come out of `validate` with
-    /// the section named; the name rule itself is tested in `config::project`.
-    #[test]
-    fn a_project_name_the_entry_rule_refuses_fails_validation() {
-        let provider = r#"
-default_profile = "p"
-
-[accounts.p]
-backend = "openai-chat-completions"
-
-[profiles.p]
-account = "p"
-model = "m"
-"#;
-        let resolved = resolve_with_config(&format!("{provider}\n[projects.webdev]\n"));
-        assert!(resolved.projects.contains_key("webdev"));
-        assert_eq!(resolved.project_summaries.len(), 1);
-        resolved.validate().expect("a plain project name is fine");
-
-        let resolved = resolve_with_config(&format!("{provider}\n[projects.\"web dev\"]\n"));
-        let error = resolved.validate().expect_err("a space is refused");
-        assert!(
-            error.to_string().contains("`[projects]`") && error.to_string().contains("'web dev'"),
-            "{error}"
-        );
-
-        let resolved = resolve_with_config(&format!(
-            "{provider}\n[projects.Webdev]\n[projects.webdev]\n"
-        ));
-        let error = resolved
-            .validate()
-            .expect_err("case-only duplicates are refused");
-        assert!(error.to_string().contains("differ only by case"), "{error}");
-
-        let resolved = resolve_with_config(&format!(
-            "{provider}\n[projects.webdev]\ncolour = \"blue\"\n"
-        ));
-        let error = resolved
-            .validate()
-            .expect_err("a key meka does not model is refused at parse");
-        assert!(
-            error.to_string().contains("colour") && error.to_string().contains("line"),
-            "{error}"
-        );
-
-        // The view lists are checked against the file: a server no `[[mcp.servers]]` entry
-        // defines restricts nothing, so it is refused with the project and the key named.
-        let resolved = resolve_with_config(&format!(
-            "{provider}\n[projects.webdev]\nallowed_servers = [\"ghost\"]\n"
-        ));
-        let error = resolved.validate().expect_err("an unknown server");
-        assert!(
-            error
-                .to_string()
-                .contains("`[projects.webdev].allowed_servers` names 'ghost'"),
-            "{error}"
-        );
     }
 
     #[test]

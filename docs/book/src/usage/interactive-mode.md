@@ -7,15 +7,20 @@ meka
 ```
 
 The screen takes over the terminal, the way an editor does. A new session opens on meka's mark,
-the `M` of its icon in the terminal's cyan, two columns in, beside three lines: the version, the
-profile the session runs on with its model, and the directory it opened in. It stands while
-nothing but a warning stands with it, and goes with the first prompt. The
+the `M` of its icon in the terminal's cyan, two columns in, beside three lines: the version, with
+the commit the binary was built from (`-dirty` for a tree with uncommitted changes) and `debug`
+for an unoptimized build beside it when they say more than the version does; then what the agent
+carries for the session, the MCP servers and skills on one line, the memories it sees and the
+standing instructions in effect on the next, each file counted once and a flag or variable as
+one. It stands while nothing but a warning
+stands with it, and goes with the first prompt. The
 conversation fills the screen from the top;
 the composer sits at the bottom, a gray block behind a `>`; and a status row under the composer
 opens with the permission level, a cell of the level's color and its name in the same color, then
-names the session's working directory (shortened with `~`), the profile the session runs on, the
-context gauge (`128.4k/1.0M 13%`: tokens in context, the model's window, the share used), and
-`2 background tasks` and `1 sub-agent` while any run.
+names the session's working directory (shortened with `~`), the [project](./projects.md) it is on
+while it is on one, the profile the session runs on, the context gauge (`128.4k/1.0M 13%`: tokens
+in context, the model's window, the share used), and `2 background tasks` and `1 sub-agent` while
+any run.
 [`display.status_row`](../configuration/config-file.md#displaystatus_row) picks the
 facts after the level and their order, and can add the profile's model. Type and press **Enter**. What you sent stays on the transcript behind the same `>` in the same gray
 block, in white, and the answer streams in under it as it arrives, word by word, settling into
@@ -274,8 +279,8 @@ Typing `/` opens the list of commands above the composer, each with its descript
 narrows as you type. **Up** and **Down** move the pick, **Enter** runs the picked command, **Tab**
 fills it in so you can go on to an argument, and **Esc** closes the list until you type again. An
 argument's list opens the same way: permission levels for `/permission`, `on`/`off` for
-`/approvals`, configured profile names for `/profile`, `open` and `close` then configured project
-names for `/project`, installed skill names for `/skill`, the
+`/approvals`, configured profile names for `/profile`, `open` and `close` then the project names
+for `/project`, installed skill names for `/skill`, the
 subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab after a completed
 directory drills into its subdirectories).
 

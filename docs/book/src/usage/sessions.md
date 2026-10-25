@@ -425,9 +425,9 @@ meka session list
 ```
 
 This shows a table with each session's id, last update time (local, with its UTC offset), profile,
-[project](./projects.md) (`-` for none), and its title: the one you [set](#titling-a-session), else
-the words of the first message. Pinned sessions come first, newest pin on top, marked with `*`; the
-rest follow most recently updated first:
+[project](./projects.md) (`-` for none, and the column only once a project exists), and its title:
+the one you [set](#titling-a-session), else the words of the first message. Pinned sessions come
+first, newest pin on top, marked with `*`; the rest follow most recently updated first:
 
 ```
 ID        Updated                  Profile   Project  Title

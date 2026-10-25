@@ -79,10 +79,10 @@ async fn attach_session(value: &str, context: AttachContext<'_>) -> anyhow::Resu
     let hydrated = crate::host::hydrate_conversation(store, id).await?;
     let profile = crate::provider::profile_for_config(store, config, Some(id)).await?;
     let resolved = crate::host::resolve_profile_switch(shared, &profile).await?;
-    // The row's project, refused by name when the file no longer defines it, as the profile is.
+    // The row's project, refused by name when the store no longer has it, as the profile is.
     let project = (!recorded.project.is_empty()).then(|| recorded.project.clone());
     if let Some(name) = &project {
-        crate::host::resolve_project_switch(shared, name)?;
+        crate::host::resolve_project_switch(shared, name).await?;
     }
     // The row's level, clamped to what the configuration still allows, as every resume reads it.
     let level = config
@@ -513,7 +513,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         // The row moves first, for the reason the profile's does: the row is where every other
         // process reads which tier this session's memories are in.
         SlashCommand::Project(ProjectVerb::Open(name)) => 'open: {
-            let project = match crate::host::resolve_project_switch(shared, &name) {
+            let project = match crate::host::resolve_project_switch(shared, &name).await {
                 Ok(project) => project,
                 Err(error) => {
                     ui.reply(error.to_string());
@@ -562,18 +562,12 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             }
         }
         SlashCommand::SkillInvoke { name, extra } => 'invoke: {
-            let access = agent.project_access();
-            let installed = agent.skills().current_for(&access).await;
+            let installed = agent.skills().current().await;
             let Some(skill) = installed.find(&name) else {
-                let every = agent.skills().current().await;
-                let message = match (access.project(), installed.skip_reason(&name)) {
-                    // Installed and hidden: the one remedy is the project's list.
-                    (Some(project), _) if every.find(&name).is_some() => {
-                        format!("project '{project}' hides skill '{name}'")
-                    }
+                let message = match installed.skip_reason(&name) {
                     // A file that is there and unreadable is not a missing skill.
-                    (_, Some(_)) => installed.unavailable(&name),
-                    (_, None) => crate::text::unknown_name(
+                    Some(_) => installed.unavailable(&name),
+                    None => crate::text::unknown_name(
                         "skill",
                         &name,
                         installed.skills.iter().map(|skill| skill.name.as_str()),

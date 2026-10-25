@@ -1049,7 +1049,9 @@ pub(crate) async fn import(
             selected: None,
             default: state.shared.default_profile.as_deref(),
             configured: Some(&state.shared.config.profiles),
-            projects: Some(&state.shared.config.projects),
+            projects: state.shared.store.project_names().await.map_err(|error| {
+                ProblemDetail::internal_sanitized("failed to list projects", error)
+            })?,
         },
         Some(state.shared.config.permission),
     )

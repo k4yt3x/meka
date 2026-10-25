@@ -165,7 +165,7 @@ pub(crate) async fn apply_recorded_profile(
 /// Move a session's agent onto the project its row currently names, before a turn runs on it,
 /// for the reason [`apply_recorded_profile`] gives: the row is the carrier, and a turn that ran
 /// under another project would file its memories in a tier the record does not name. A project
-/// the file no longer defines is refused by name, as a profile is.
+/// the store no longer has is refused by name, as a profile the file lacks is.
 pub(crate) async fn apply_recorded_project(
     shared: &SharedDeps,
     agent: &crate::agent::Agent,
@@ -179,7 +179,7 @@ pub(crate) async fn apply_recorded_project(
         return Ok(());
     }
     if let Some(name) = &recorded {
-        crate::config::require_project(name, &shared.config.projects)?;
+        shared.store.require_project(name).await?;
     }
     agent.set_project(recorded.clone());
     match recorded {
@@ -302,14 +302,16 @@ pub(crate) async fn build_shared_deps(
         tracing::info!("instructions loaded from {source}", source = found.source);
     }
     let user_instructions_source = instructions.as_ref().map(|found| found.source.to_string());
+    let user_instructions_count = instructions.as_ref().map_or(0, |found| found.count());
     let user_instructions = instructions.map(|found| found.text);
 
-    let agent_options = AgentOptions::from_config(
+    let mut agent_options = AgentOptions::from_config(
         &config,
         sandboxed_shell,
         gate_tools.clone(),
         user_instructions.clone(),
     );
+    agent_options.user_instructions_count = user_instructions_count;
 
     // Kick off the MCP background connector once for the whole process. The connector writes tool
     // discoveries through `update_server_tools`, which fans them out to every attached registry,
@@ -441,8 +443,8 @@ pub(crate) async fn build_session_agent(
         crate::provider::profile_for_config(&shared.store, &shared.config, session_id).await?,
     )
     .await?;
-    // The row's project where there is a row, refused by name when the file no longer defines
-    // it, as the profile is: a session cannot be opened on a tier that does not exist.
+    // The row's project where there is a row, refused by name when the store no longer has it,
+    // as the profile is: a session cannot be opened on a tier that does not exist.
     let project = match session_id {
         Some(id) => shared
             .store
@@ -452,17 +454,7 @@ pub(crate) async fn build_session_agent(
         None => project,
     };
     if let Some(name) = &project {
-        crate::config::require_project(name, &shared.config.projects)?;
-        // Said once, as the session opens, rather than at every turn: a skill the file names and
-        // the store lacks restricts nothing, and skills come and go without a config edit, so the
-        // file is not refused over it.
-        let access = crate::config::ProjectAccess::of(&shared.config.projects, Some(name));
-        let installed = shared.skills.current().await;
-        for skill in access.skill_names() {
-            if installed.find(skill).is_none() && installed.skip_reason(skill).is_none() {
-                tracing::warn!("project '{name}' names skill '{skill}', which is not installed");
-            }
-        }
+        shared.store.require_project(name).await?;
     }
     let agent_options = session_agent_options(shared, &cwd.get());
     let mut cells = SessionCells::new(
@@ -509,6 +501,7 @@ fn session_agent_options(shared: &SharedDeps, directory: &std::path::Path) -> Ag
         crate::instructions::warn_if_large(found);
         tracing::info!("instructions loaded from {source}", source = found.source);
     }
+    options.user_instructions_count += listed.as_ref().map_or(0, |found| found.count());
     options.user_instructions = crate::instructions::join(options.user_instructions.take(), listed);
     options
 }
@@ -587,12 +580,15 @@ pub(crate) async fn resolve_profile_switch(
     crate::config::require_profile(name, &shared.config.profiles)?;
     Ok(crate::provider::resolved_profile(&shared.providers, name.to_string()).await?)
 }
-/// The project a live session is asked to move onto, refused by name when the configuration has
-/// no such project. The mid-session moves ask this: `/project open`, a resident `PATCH
+/// The project a live session is asked to move onto, refused by name when the store has no such
+/// project. The mid-session moves ask this: `/project open`, a resident `PATCH
 /// /v1/sessions/{id}` and ACP's `session/set_config_option`; moving off a project needs no
 /// resolution.
-pub(crate) fn resolve_project_switch(shared: &SharedDeps, name: &str) -> anyhow::Result<String> {
-    crate::config::require_project(name, &shared.config.projects)?;
+pub(crate) async fn resolve_project_switch(
+    shared: &SharedDeps,
+    name: &str,
+) -> anyhow::Result<String> {
+    shared.store.require_project(name).await?;
     Ok(name.to_string())
 }
 /// Record a change a host has already applied to a live session on its row, and decide what a
@@ -747,14 +743,14 @@ pub(crate) async fn resolve_session_resume(
     store: &Store,
     config: &ResolvedConfig,
 ) -> anyhow::Result<ResumedSession> {
-    // Checked first, whatever the run resumes: a name the file lacks is refused before a lock is
+    // Checked first, whatever the run resumes: a name the store lacks is refused before a lock is
     // taken or a row touched.
     let requested_project = config.request.requested_project.as_deref();
     if let Some(name) = requested_project {
         if name.is_empty() {
             anyhow::bail!("`--project` needs a project name; leave it out for a session on none");
         }
-        crate::config::require_project(name, &config.projects)?;
+        store.require_project(name).await?;
     }
     let fresh = || ResumedSession {
         permission_to_record: None,

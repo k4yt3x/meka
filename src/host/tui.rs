@@ -62,8 +62,6 @@ pub(crate) async fn run_interactive(
         cwd: recorded_cwd,
         announce,
     } = resolve_session_resume(&store, &config).await?;
-    // The opening skill within the session's project, which is known only now.
-    crate::host::refuse_a_hidden_opening_skill(&config, project.as_deref())?;
     // After the resume, whose lock is what spares the session this run was asked for.
     let windows = RetentionWindows::from_config(&config);
     sweep_expired(windows, &store).await?;
@@ -103,7 +101,8 @@ pub(crate) async fn run_interactive(
     ));
 
     // What the screen opens with: the banner where the log has nothing to show, the resume row,
-    // then the conversation as far back as the log goes.
+    // then the conversation as far back as the log goes. The banner and the rows after it are
+    // pushed once the agent is built, since the banner says what the agent carries.
     let mut transcript = model::Transcript::new(model::Settings {
         show_session_id_on_create: config.show_session_id_on_create,
         turn_end_summary: config.turn_end_summary.clone(),
@@ -113,27 +112,6 @@ pub(crate) async fn run_interactive(
             Ok(turns) => transcript.set_turn_records(turns),
             Err(error) => tracing::warn!("failed to read the session's turns: {error}"),
         }
-    }
-    if log_end.is_none() {
-        let profile = crate::sync::read(&current_profile).clone();
-        let model = config
-            .profile_summaries
-            .iter()
-            .find(|summary| summary.name == profile)
-            .and_then(|summary| summary.model.clone());
-        transcript.push(model::Item::Banner {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            profile,
-            model,
-            project: project.clone(),
-            directory: input::shorten_path_with_tilde(&cwd.get()),
-        });
-    }
-    if let Some(id) = announce {
-        transcript.push(model::Item::SessionId {
-            label: "Resuming session".to_string(),
-            id: id.to_string(),
-        });
     }
 
     // The same deps the long-lived hosts build, so all four hosts assemble a session identically.
@@ -170,20 +148,14 @@ pub(crate) async fn run_interactive(
     // A prompt or skill given without `--oneshot` is the first turn's input. The screen opens
     // busy, so Enter during that turn goes where it goes during any other.
     let initial_turn_pending = initial_prompt.is_some();
-    if let Some(prompt) = initial_prompt {
-        transcript.push(model::Item::Prompt {
-            text: prompt.clone(),
-            class: None,
-            inbox_id: None,
-            delivered: true,
-        });
+    if let Some(prompt) = &initial_prompt {
         #[allow(
             clippy::expect_used,
             reason = "the receiver is `host_receiver` above, still owned here, so `send` cannot fail"
         )]
         host_sender
             .send(HostEvent::UserInput {
-                text: prompt,
+                text: prompt.clone(),
                 images: Vec::new(),
             })
             .expect("a fresh channel accepts its first send");
@@ -266,6 +238,45 @@ pub(crate) async fn run_interactive(
     };
     // After the agent, so a start the builder refused leaves the row at the level it had.
     record_resume_permission(&store, session_id, permission_to_record).await;
+    if log_end.is_none() {
+        // The build, then what the agent carries for the session: the servers the configuration
+        // enables (whether each connected is `/mcp list`'s to say), the installed skills, the
+        // memories the session's opening view holds, and the pieces of standing instructions in
+        // effect.
+        let memories = shared
+            .memories
+            .count(&crate::store::memory::MemoryView::for_session(
+                agent.project().as_deref(),
+            ))
+            .await?;
+        transcript.push(model::Item::Banner {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            revision: option_env!("MEKA_GIT_REVISION").map(str::to_string),
+            debug: cfg!(debug_assertions),
+            mcp_servers: config
+                .mcp_servers
+                .iter()
+                .filter(|server| server.disabled != Some(true))
+                .count(),
+            skills: shared.skills.current().await.skills.len(),
+            memories: usize::try_from(memories).unwrap_or(usize::MAX),
+            instructions: agent.user_instructions_count(),
+        });
+    }
+    if let Some(id) = announce {
+        transcript.push(model::Item::SessionId {
+            label: "Resuming session".to_string(),
+            id: id.to_string(),
+        });
+    }
+    if let Some(prompt) = initial_prompt {
+        transcript.push(model::Item::Prompt {
+            text: prompt,
+            class: None,
+            inbox_id: None,
+            delivered: true,
+        });
+    }
     // The resumed log is what the list is; read it before the first prompt rather than at the
     // first turn, so `/status` and a `/fork` between them see the session as it was left.
     agent.hydrate_checklist(&messages).await;
@@ -352,17 +363,12 @@ pub(crate) async fn run_interactive(
                 .iter()
                 .map(|profile| profile.name.clone())
                 .collect(),
-            project_names: config
-                .project_summaries
-                .iter()
-                .map(|project| project.name.clone())
-                .collect(),
+            project_names: store.project_names().await?,
             cwd: cwd.clone(),
         },
         skill_roots: config.skill_roots(),
         current_profile: Arc::clone(&current_profile),
         configured_profiles: config.profile_summaries.clone(),
-        configured_projects: config.project_summaries.clone(),
         schedule: config.schedule.clone(),
         store: store.clone(),
         agent: Arc::clone(&agent),

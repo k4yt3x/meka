@@ -71,9 +71,6 @@ pub(crate) struct Agent {
     /// Body-only edits take effect even sooner; `load_skill_body` re-reads from disk on every
     /// invocation regardless of cache state.
     skills: Arc<SkillCache>,
-    /// Every configured project, for the view this session's project gives it of the servers and
-    /// skills.
-    projects: Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
     /// Shared memory cache, same contract as `skills`: re-checked at the top of each turn so a
     /// memory the agent writes mid-turn appears in the very next turn's index.
     memories: Arc<MemoryStore>,
@@ -208,7 +205,6 @@ impl Agent {
             last_rendered_world: tokio::sync::RwLock::new(None),
             current_turn: std::sync::Mutex::new(None),
             skills: materials.skills.clone(),
-            projects: Arc::clone(&materials.core.projects),
             memories: materials.memories.clone(),
             compaction_generation: std::sync::atomic::AtomicU64::new(GENERATION_UNKNOWN),
             scratchpad_hints: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -329,6 +325,12 @@ impl Agent {
     /// The session's own profile, which is not the process default once a resume or a switch has
     /// happened, or the fallback serving this turn in its place; the only thing a status display
     /// may read if it is to agree with the turn.
+    /// How many pieces the standing instructions this session runs under were read as, the
+    /// files `[instructions].files` names included; zero for none.
+    pub(crate) fn user_instructions_count(&self) -> usize {
+        self.options.user_instructions_count
+    }
+
     pub(crate) fn profile(&self) -> String {
         self.cells.profile.current().profile
     }
@@ -348,11 +350,6 @@ impl Agent {
     /// section for the new view.
     pub(crate) fn set_project(&self, project: Option<String>) {
         self.cells.project.set(project);
-    }
-
-    /// What this agent's project lets it see of the servers and skills, as it stands now.
-    pub(crate) fn project_access(&self) -> crate::config::ProjectAccess {
-        self.cells.project_lens(&self.projects).access()
     }
 
     /// The slot holding the lock on a session this agent created, for a host that has to outlive
@@ -411,6 +408,7 @@ impl Agent {
             // `crate::tools::subagent::build_subagent_system_prompt` and skills are the reusable
             // worker-instruction unit.
             user_instructions: None,
+            user_instructions_count: 0,
             // Follows the parent because the flag is the one lever a user has for an endpoint that
             // lacks SSE, and a sub-agent on that endpoint would fail streaming where its parent
             // does not. Nothing of the sub-agent's output is rendered either way, so the choice is
@@ -824,6 +822,7 @@ mod tests {
             compact_checkpoint: false,
             turn_retention: None,
             user_instructions: None,
+            user_instructions_count: 0,
             mcp_grace: std::time::Duration::from_secs(0),
             system_prompt_override: Some("test".to_string()),
         };

@@ -69,7 +69,7 @@ fn visible_server_entry(
 
 pub(crate) struct ListMcpResourcesTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) scope: super::registry::LiveScope,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -107,15 +107,10 @@ impl Tool for ListMcpResourcesTool {
         let server_filter = optional_str(&input, "server", "mcp_resource_list")?.map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
-            visible_server_entry(
-                "mcp_resource_list",
-                &self.manager,
-                &self.scope.current(),
-                name,
-            )?;
+            visible_server_entry("mcp_resource_list", &self.manager, &self.tool_scope, name)?;
             vec![name.clone()]
         } else {
-            visible_servers(&self.manager, &self.scope.current())
+            visible_servers(&self.manager, &self.tool_scope)
         };
 
         if names.is_empty() {
@@ -170,7 +165,7 @@ impl Tool for ListMcpResourcesTool {
 
 pub(crate) struct ReadMcpResourceTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) scope: super::registry::LiveScope,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -216,7 +211,7 @@ impl Tool for ReadMcpResourceTool {
         let entry = visible_server_entry(
             "mcp_resource_read",
             &self.manager,
-            &self.scope.current(),
+            &self.tool_scope,
             &server,
         )?;
 
@@ -306,7 +301,7 @@ fn format_resource_contents(
 
 pub(crate) struct ListMcpPromptsTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) scope: super::registry::LiveScope,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -344,15 +339,10 @@ impl Tool for ListMcpPromptsTool {
         let server_filter = optional_str(&input, "server", "mcp_prompt_list")?.map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
-            visible_server_entry(
-                "mcp_prompt_list",
-                &self.manager,
-                &self.scope.current(),
-                name,
-            )?;
+            visible_server_entry("mcp_prompt_list", &self.manager, &self.tool_scope, name)?;
             vec![name.clone()]
         } else {
-            visible_servers(&self.manager, &self.scope.current())
+            visible_servers(&self.manager, &self.tool_scope)
         };
 
         if names.is_empty() {
@@ -418,7 +408,7 @@ impl Tool for ListMcpPromptsTool {
 
 pub(crate) struct GetMcpPromptTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) scope: super::registry::LiveScope,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -470,12 +460,8 @@ impl Tool for GetMcpPromptTool {
 
         let arguments = input.get("arguments").and_then(|v| v.as_object()).cloned();
 
-        let entry = visible_server_entry(
-            "mcp_prompt_get",
-            &self.manager,
-            &self.scope.current(),
-            &server,
-        )?;
+        let entry =
+            visible_server_entry("mcp_prompt_get", &self.manager, &self.tool_scope, &server)?;
 
         let result = crate::mcp::get_prompt(&entry, name.clone(), arguments, &cancellation).await?;
 
@@ -544,12 +530,8 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
     // nothing useful to do without at least one. A sub-agent denied every configured server is in
     // exactly that position, so it takes the same exit: seven tools that can only answer "unknown
     // server" are worse than no tools, because the model spends turns discovering that.
-    // Judged by the registration scope, not the project's view: a project that hides every
-    // server today may be left for one that does not, and a tool never registered cannot come
-    // back. What the model sees of these seven while a project leaves them no server is the
-    // registry's `is_carried` to decide.
-    let scope = registry.live_scope();
-    if visible_servers(&manager, registry.registration_scope()).is_empty() {
+    let tool_scope = Arc::new(registry.tool_scope().clone());
+    if visible_servers(&manager, &tool_scope).is_empty() {
         return;
     }
     // The seven are discovery-style helpers, so they take the install's `[mcp].deferral` the way
@@ -586,38 +568,38 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
     }
     register_meta!("mcp_resource_list", ListMcpResourcesTool {
         manager: Arc::clone(&manager),
-        scope: scope.clone(),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_resource_read", ReadMcpResourceTool {
         manager: Arc::clone(&manager),
-        scope: scope.clone(),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_prompt_list", ListMcpPromptsTool {
         manager: Arc::clone(&manager),
-        scope: scope.clone(),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_prompt_get", GetMcpPromptTool {
         manager: Arc::clone(&manager),
-        scope: scope.clone(),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_resource_subscribe", SubscribeMcpResourceTool {
         manager: Arc::clone(&manager),
-        scope: scope.clone(),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_resource_unsubscribe", UnsubscribeMcpResourceTool {
         manager: Arc::clone(&manager),
-        scope: scope.clone(),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_resource_updates_list", ListMcpResourceUpdatesTool {
         manager: Arc::clone(&manager),
-        scope
+        tool_scope
     });
     drop(manager);
 }
 
 pub(crate) struct SubscribeMcpResourceTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) scope: super::registry::LiveScope,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -656,7 +638,7 @@ impl Tool for SubscribeMcpResourceTool {
         let entry = visible_server_entry(
             "mcp_resource_subscribe",
             &self.manager,
-            &self.scope.current(),
+            &self.tool_scope,
             &server,
         )?;
         crate::mcp::subscriptions::subscribe(&entry, uri.clone(), &cancellation)
@@ -674,7 +656,7 @@ impl Tool for SubscribeMcpResourceTool {
 
 pub(crate) struct UnsubscribeMcpResourceTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) scope: super::registry::LiveScope,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -710,7 +692,7 @@ impl Tool for UnsubscribeMcpResourceTool {
         let entry = visible_server_entry(
             "mcp_resource_unsubscribe",
             &self.manager,
-            &self.scope.current(),
+            &self.tool_scope,
             &server,
         )?;
         crate::mcp::subscriptions::unsubscribe(&entry, uri.clone(), &cancellation)
@@ -728,7 +710,7 @@ impl Tool for UnsubscribeMcpResourceTool {
 
 pub(crate) struct ListMcpResourceUpdatesTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) scope: super::registry::LiveScope,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -755,14 +737,13 @@ impl Tool for ListMcpResourceUpdatesTool {
         // The update log is shared by every session on this MCP context, so a parent's
         // subscription to a denied server would show that server's resource URIs to a worker that
         // cannot otherwise see it exists.
-        let scope = self.scope.current();
         let updates: Vec<_> = self
             .manager
             .client_context
             .resource_updates
             .snapshot()
             .into_iter()
-            .filter(|(server, _uri, _stamp)| scope.admits_server(server))
+            .filter(|(server, _uri, _stamp)| self.tool_scope.admits_server(server))
             .collect();
         if updates.is_empty() {
             return Ok(ToolOutput::text(

@@ -17,7 +17,7 @@ Without it, an agent's only state is its context window. When a long session com
 
 ## Tiers
 
-A memory is in one of two tiers: **global**, which every session sees, or a **project's**, which the sessions on that [project](./projects.md) see beside the global ones. A session on no project sees the global tier alone. Which tier a session is on is its project, set with `--project`, `/project`, or the session's `project` field over HTTP and ACP; nothing in the store decides it.
+A memory is in one of two tiers: **global**, which every session sees, or a **project's**, which the sessions on that [project](./projects.md) see beside the global ones. A session on no project sees the global tier alone. Which tier a session is on is its project, set with `--project`, `/project`, or the session's `project` field over HTTP and ACP; a project is a row `meka project add` creates, and a name no project has is refused at every one of those doors.
 
 - `memory_write` files a memory in the session's project unless `tier: "global"` says otherwise. In a session on no project every write is global, and `tier: "project"` is refused. Writing to a memory that exists keeps its tier unless `tier` names the other one, which moves it: that is how the agent re-files a note it saved in the wrong tier, and the result line says `global` when a project session's write lands in the global tier.
 - A name is unique within a tier, and a global name is never also a project's, so a session never sees two memories of one name; two projects may hold the same name. A write that would make a global memory and a project memory share a name is refused with `choose another name`, at every door.
@@ -258,6 +258,7 @@ meka memory get notes --project movie                # the one in movie, when th
 meka memory edit stale-note                         # $VISUAL, then $EDITOR, on the body
 meka memory remove stale-note
 meka memory export --directory ~/backup/memory      # one Markdown file per memory
+meka memory import ~/backup/memory                  # the reverse, into this store
 ```
 
 `meka memory add` takes:
@@ -275,7 +276,7 @@ meka memory export --directory ~/backup/memory      # one Markdown file per memo
 | `--expires <WHEN>` | RFC 3339, or `YYYY-MM-DD` for the whole of that day; an empty value clears it. |
 | `--verified` | Record that the fact was just verified current. |
 | `--force` | Update an existing memory instead of refusing; whatever is not mentioned is kept. |
-| `--project <NAME>` | The [tier](#tiers) to file it in, a configured project or `""` for the global tier; omitted, an existing memory keeps its tier and a new one is global. Naming the other tier for an existing memory moves it. |
+| `--project <NAME>` | The [tier](#tiers) to file it in, an existing project or `""` for the global tier; omitted, an existing memory keeps its tier and a new one is global. Naming the other tier for an existing memory moves it. |
 
 On the screen, `/memory` is a picker of what is saved, by name and description, and Enter (or
 `/memory <name>`) shows one memory in full.
@@ -284,9 +285,9 @@ On the screen, `/memory` is a picker of what is saved, by name and description, 
 
 `meka memory edit` opens the **body** only. Metadata goes through `meka memory add <name> --force --description ...`, which keeps whatever it does not mention.
 
-## Export, backup, and git
+## Export and import
 
-`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `project` for a project memory, `priority` and `load` when they are not the defaults, `created`, `verified` when it differs from `created`, `expires`, `source`, `read_count`, `references` and `tags` when they are set, followed by the body. A project's memories go under a directory of the project's name, so two projects holding one name write two files; the global tier is at the root. `--project <name>` exports one tier. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
+`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `project` for a project memory, `priority` and `load` when they are not the defaults, `created`, `verified` when it differs from `created`, `expires`, `source`, `read_count`, `references` and `tags` when they are set, followed by the body. A project's memories go under a directory of the project's name, so two projects holding one name write two files; the global tier is at the root. Beside the files sits `export.toml`, carrying the snapshot's `format_version`. `--project <name>` exports one tier. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
 
 `read_count` is there because it is the one value a file cannot otherwise reconstruct. Descriptions, bodies and dates are all in the note; how often the agent has actually opened it is not, and a restored backup with every counter at zero would silently lose each memory's accumulated ranking weight.
 
@@ -302,7 +303,9 @@ What lands on disk is byte-exact: bodies, tags, priorities and recorded dates ar
 
 Descriptions are the one field normalized rather than preserved: every write door collapses a description to a single line before storing it, so what comes back is what was stored. A description made only of characters YAML cannot carry has no such form, and `meka memory export` refuses the whole run and names it rather than writing a file whose frontmatter would not parse.
 
-An export reads back with any tool that understands YAML frontmatter; meka itself has no import command, because a store you can rebuild from a directory is a second source of truth and this subsystem deliberately has one.
+An export reads back with any tool that understands YAML frontmatter, and `meka memory import <dir>` reads it back into a store: every file of the snapshot in one transaction, so nothing lands unless everything does. The project of each memory is read from its frontmatter and must exist, so `meka project add <name>` comes first on the other installation; `created`, `verified` and `read_count` are restored as written, which is what makes the import a restore rather than a copy. A memory the store already holds in the same tier is refused by name until `--force`, which overwrites it with the file; a name a global memory and a project memory would then share is refused outright, since no tier may hold the other's name; and the inline budget holds over the whole import as it holds over a write. The manifest is read first: a snapshot an older meka wrote at another `format_version` is brought forward in one place, the migration module, or refused by version.
+
+The store stays the one source of truth. An export is a snapshot nothing reads until you import it, and an import is a one-time act, the way a session archive's is; meka never watches the directory.
 
 ## Coming from a file-backed store
 

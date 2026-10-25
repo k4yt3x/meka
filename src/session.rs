@@ -18,9 +18,6 @@ pub(crate) struct CoreMaterials {
     pub(crate) backend_probe: crate::sandbox::BackendProbe,
     /// The `[tools]` filter; sub-agents inherit it.
     pub(crate) builtin_filter: crate::config::BuiltinToolFilter,
-    /// Every configured project, for the view a session's project gives it of the servers and
-    /// skills; see [`ProjectLens`].
-    pub(crate) projects: Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
     /// The per-path write locks every registry built from these materials takes.
     pub(crate) write_locks: crate::workspace::WriteLocks,
     /// Shared by every session this process builds, so a host can tell which sub-agents are in a
@@ -41,7 +38,6 @@ impl CoreMaterials {
             sandbox_backend: sandbox.backend,
             backend_probe: sandbox.probe.clone(),
             builtin_filter,
-            projects: Arc::new(config.projects.clone()),
             write_locks: crate::workspace::WriteLocks::default(),
             running_subagents: RunningSubagents::default(),
         }
@@ -59,7 +55,6 @@ impl CoreMaterials {
                 reason: "test fixture".to_string(),
             },
             builtin_filter: crate::config::BuiltinToolFilter::default(),
-            projects: Arc::new(std::collections::BTreeMap::new()),
             write_locks: crate::workspace::WriteLocks::default(),
             running_subagents: RunningSubagents::default(),
         }
@@ -228,29 +223,6 @@ impl SharedProject {
     }
 }
 
-/// What the project a session is on lets it see of the installed servers and skills, read live
-/// from the project cell against the configured projects, so a move mid-session changes what the
-/// next read sees. The default lens is a session on no project, which sees everything.
-#[derive(Clone, Default)]
-pub(crate) struct ProjectLens {
-    project: SharedProject,
-    projects: Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
-}
-
-impl ProjectLens {
-    pub(crate) fn new(
-        project: SharedProject,
-        projects: Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
-    ) -> Self {
-        Self { project, projects }
-    }
-
-    /// The view as it stands now.
-    pub(crate) fn access(&self) -> crate::config::ProjectAccess {
-        crate::config::ProjectAccess::of(&self.projects, self.project.get().as_deref())
-    }
-}
-
 /// The live state of one session: the cells that change as it runs, read by every tool and by the
 /// agent through the same handles, so a change made through any one of them reaches all of them.
 #[derive(Clone)]
@@ -301,14 +273,6 @@ pub(crate) struct SessionCells {
 }
 
 impl SessionCells {
-    /// The lens on this session's project over the configured projects.
-    pub(crate) fn project_lens(
-        &self,
-        projects: &Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
-    ) -> ProjectLens {
-        ProjectLens::new(self.project.clone(), Arc::clone(projects))
-    }
-
     /// The cells of a session that has not run yet: no session id, an empty checklist, fresh
     /// gauges, nothing in the background.
     pub(crate) fn new(
@@ -592,6 +556,9 @@ pub(crate) struct AgentOptions {
     /// `--instructions` overrides the config-file value; a session's copy carries the files
     /// `[instructions].files` names after it.
     pub(crate) user_instructions: Option<String>,
+    /// How many pieces [`Self::user_instructions`] was read as, by
+    /// [`crate::instructions::Instructions::count`]; what the screen's banner counts.
+    pub(crate) user_instructions_count: usize,
     /// Max time to wait for still-`Pending` MCP servers to settle before the readiness gate
     /// decides. Which servers actually gate is per-server (`[[mcp.servers]].required`), so there
     /// is no strictness flag here.
@@ -707,6 +674,7 @@ impl AgentOptions {
             compact_checkpoint: config.compact_checkpoint,
             turn_retention: config.turn_retention,
             user_instructions,
+            user_instructions_count: 0,
             mcp_grace: config.mcp_grace,
             system_prompt_override: None,
         }
@@ -725,6 +693,7 @@ impl AgentOptions {
             compact_checkpoint: false,
             turn_retention: None,
             user_instructions: None,
+            user_instructions_count: 0,
             mcp_grace: std::time::Duration::ZERO,
             system_prompt_override: None,
         }
@@ -764,7 +733,7 @@ mod tests {
             selected: None,
             default,
             configured: None,
-            projects: None,
+            projects: Vec::new(),
         }
     }
 
@@ -813,7 +782,10 @@ mod tests {
             root_new_id,
         } = plan_import(
             serde_json::from_str(&text).expect("parse"),
-            planner_profiles(Some("test-profile")),
+            ImportInstallation {
+                projects: vec!["webdev".to_string()],
+                ..planner_profiles(Some("test-profile"))
+            },
             Some(crate::permission::Permission::Read),
         )
         .expect("plan");

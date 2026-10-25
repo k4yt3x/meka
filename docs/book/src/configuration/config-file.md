@@ -33,7 +33,7 @@ Everything in that directory is content you put there, so it is safe to keep und
 
 Windows still writes both, because its file locks are mandatory rather than advisory: a lock held on `config.toml` would make the file unreadable to the command holding it, and `LockFileEx` refuses a directory handle outright. If you keep a meka config directory under version control on Windows, ignore `.config.toml.lock` and `skills/.meka-store.lock`.
 
-The sections below are in the order a file is best written in: the blocks with many entries first (`default_profile`, accounts, profiles, MCP servers, projects), then each single table from the most to the least consequential, and `[serve]` last.
+The sections below are in the order a file is best written in: the blocks with many entries first (`default_profile`, accounts, profiles, MCP servers), then each single table from the most to the least consequential, and `[serve]` last.
 
 ## Accounts and profiles
 
@@ -983,35 +983,6 @@ redirect_port = 8400
 
 If `client_id` is omitted, meka attempts [dynamic client registration](https://datatracker.ietf.org/doc/html/rfc7591) with the server.
 
-## `[projects.*]`
-
-A project is a work context a session opens by name, with a memory tier of its own beside the global one; see [Projects](../usage/projects.md). Each `[projects.<name>]` table defines one, and an empty table is a complete project:
-
-```toml
-[projects.webdev]
-
-[projects.movie]
-```
-
-A name is letters, digits, `-` and `_`, starting with a letter or digit, and never a name Windows reserves; two names that differ only by case are refused. `meka project add`, `set`, `rename` and `remove` edit these tables for you, and `project rename` moves every session and memory with the name.
-
-A project may also narrow what its sessions see of the installed MCP servers and skills. The keys come in the pair every list in meka's config uses: an `allowed_` list is the whole view, named in full; a `disabled_` list takes names out of it; neither means everything installed. Nothing on a server's table or in a skill's frontmatter names a project.
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `allowed_servers` | no | The MCP servers a session on the project sees, named in full. Each must be a configured `[[mcp.servers]]` name. |
-| `disabled_servers` | no | MCP servers a session on the project does not see; applied after `allowed_servers`. A name in both lists is refused. |
-| `allowed_skills` | no | The skills a session on the project sees, named in full. |
-| `disabled_skills` | no | Skills a session on the project does not see. A skill that is not installed is warned about when a session opens on the project, not refused, since skills come and go without a config edit. |
-
-```toml
-[projects.movie]
-allowed_servers = ["blender"]
-disabled_skills = ["release-checklist"]
-```
-
-A session on the project meets a hidden server nowhere: its tools are out of the catalog, `tool_load` and `tool_search` do not find them, the MCP meta-tools do not list the server, and a sub-agent it spawns is narrowed the same way. A hidden skill is out of the `[Skills]` index and unknown to `skill_read`, `skill_search`, `skill_edit` and `skill_delete`; `skill_write` creates skills whatever the project, since a skill file belongs to the installation, and refuses to overwrite one the project hides. Every server still connects at startup whatever the projects say; the view decides what a session sees, not what runs.
-
 ## `[permissions]`
 
 Controls which permission levels are reachable at runtime and which level the session starts at. See the [Permissions](../usage/permissions.md) page for what each level does.
@@ -1441,6 +1412,7 @@ What the status row under the composer shows after the permission level, which a
 in the order listed:
 
 - `path`: the session's working directory, shortened with `~`
+- `project`: the [project](../usage/projects.md) the session is on, by name, while it is on one
 - `profile`: the profile the session runs on, by name
 - `model`: the model the profile runs, when the config names one; off by default, since a profile
   named for its model would show it twice
@@ -1459,7 +1431,7 @@ refused by name.
 status_row = ["profile", "context"]
 ```
 
-Default: `["path", "profile", "context", "tasks", "subagents"]`
+Default: `["path", "project", "profile", "context", "tasks", "subagents"]`
 
 ### `display.turn_end_summary`
 

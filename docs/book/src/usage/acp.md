@@ -192,14 +192,14 @@ A prompt left unanswered for 30 minutes is denied, and the turn carries on; the 
 ## Session config options
 
 Every session-creation response also carries `configOptions`, a list of options a client can
-render and change with `session/set_config_option`. meka advertises three, four where
-`config.toml` defines a [project](./projects.md), in this order:
+render and change with `session/set_config_option`. meka advertises three, four where a
+[project](./projects.md) exists, in this order:
 
 | `configId` | Kind | Category | Values | Meaning |
 |------------|------|----------|--------|---------|
 | `permission` | select | `mode` | The ids in `[permissions].enabled` | The same picker as `modes`, so it sits beside the one below |
 | `profile` | select | `model` | The profile names in your `config.toml` | The profile this session runs on |
-| `project` | select | none | `""` (shown as "No project"), then the project names in your `config.toml` | The project this session is on, whose memories it sees beside the global ones; offered only when a project is defined |
+| `project` | select | none | `""` (shown as "No project"), then every project's name | The project this session is on, whose memories it sees beside the global ones; offered only when a project exists, and read from the store at every update, so one added while the editor runs is offered next |
 | `approvals` | boolean | `mode` | `true` / `false` | Whether a call above the level is put to you for approval rather than refused; see [Permissions](./permissions.md#approvals) |
 
 `approvals` takes the protocol's boolean value, `"type": "boolean", "value": true` beside `configId`
@@ -228,8 +228,8 @@ different one, so from the next turn the model no longer sees the reasoning reco
 profile.
 
 Changing `project` rewrites the row the same way, and the next turn's context restates the
-memories the session now sees; a new session is on no project, and a name `config.toml` does not
-define is refused without moving the row.
+memories the session now sees; a new session is on no project, and a name no project has is
+refused without moving the row.
 
 While a turn is in flight either switch is refused with `InvalidParams` (`cannot switch profile while a
 turn is in flight; cancel it first`, or `project`), the answer a second `session/prompt` gets, and

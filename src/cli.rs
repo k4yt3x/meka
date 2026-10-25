@@ -540,49 +540,20 @@ pub(crate) enum ProfileAction {
     },
 }
 
-/// Projects: the work contexts a session opens by name, each with a memory tier of its own beside
-/// the global one. Defined in `config.toml` as `[projects.<name>]`; a session is put on one with
-/// `--project`, `/project` or the session's `project` field.
+/// Projects: the names a session is on, each a memory tier of its own beside the global one. A
+/// project is a row in the store; a session is put on one with `--project`, `/project` or the
+/// session's `project` field.
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum ProjectAction {
     /// Add a project
-    ///
-    /// The four lists are the project's view of the installed servers and skills: an `allowed`
-    /// list names the whole view, a `disabled` list takes names out of it, and neither means
-    /// everything installed. Change them later with `meka project set`.
     Add {
         /// Project name (alphanumerics, `-`, `_` only)
         name: String,
-        /// MCP server its sessions see (repeatable)
-        #[arg(long = "allowed-server", value_name = "NAME")]
-        allowed_server: Vec<String>,
-        /// MCP server its sessions do not see (repeatable)
-        #[arg(long = "disabled-server", value_name = "NAME")]
-        disabled_server: Vec<String>,
-        /// Skill its sessions see (repeatable)
-        #[arg(long = "allowed-skill", value_name = "NAME")]
-        allowed_skill: Vec<String>,
-        /// Skill its sessions do not see (repeatable)
-        #[arg(long = "disabled-skill", value_name = "NAME")]
-        disabled_skill: Vec<String>,
     },
     /// List projects
     List {
         #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
-    },
-    /// Set one of a project's lists
-    #[command(long_about = project_set_about())]
-    Set {
-        /// Project name
-        name: String,
-        /// List to write
-        key: String,
-        /// Comma-separated names
-        value: Option<String>,
-        /// Remove the list
-        #[arg(long, conflicts_with = "value")]
-        unset: bool,
     },
     /// Remove a project
     Remove {
@@ -827,6 +798,15 @@ pub(crate) enum MemoryAction {
         /// Only this project's memories
         #[arg(long, value_name = "NAME")]
         project: Option<String>,
+    },
+    /// Import an export directory
+    Import {
+        /// Directory `meka memory export` wrote
+        #[arg(value_name = "DIR")]
+        directory: std::path::PathBuf,
+        /// Overwrite a memory that exists
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1161,14 +1141,6 @@ fn profile_set_about() -> String {
     )
 }
 
-/// The long help of `project set`: the settable keys, from the table `project set` refuses by.
-fn project_set_about() -> String {
-    format!(
-        "Set one of a project's lists\n\nKeys: {}. The value is a comma-separated list of names.",
-        project::SETTABLE_PROJECT_KEYS.join(", ")
-    )
-}
-
 #[derive(Parser, Debug)]
 #[command(name = "meka", version, about = "A general-purpose AI agent harness")]
 pub(crate) struct Cli {
@@ -1276,7 +1248,6 @@ impl Cli {
         crate::config::CliOverrides {
             profile: self.profile.clone(),
             project: self.project.clone(),
-            skill: self.skill.clone(),
             eager_load_tools: self.eager_load_tool.clone(),
             instructions: self.instructions.clone(),
             permission: self.permission,

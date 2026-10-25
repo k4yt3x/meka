@@ -149,9 +149,8 @@ pub(super) async fn emit_available_commands(
     connection: &ConnectionTo<Client>,
     session_id: &SessionId,
     skills: &Arc<SkillCache>,
-    access: &crate::config::ProjectAccess,
 ) {
-    let snapshot = skills.current_for(access).await;
+    let snapshot = skills.current().await;
     let mut commands: Vec<AvailableCommand> = crate::host::COMMANDS
         .iter()
         .filter(|command| command.for_editors)
@@ -240,7 +239,6 @@ pub(super) fn split_acp_slash(prompt_text: &str) -> Option<(String, String)> {
 pub(super) async fn slash_to_prompt_text(
     prompt_text: String,
     skills: &Arc<SkillCache>,
-    access: &crate::config::ProjectAccess,
 ) -> Result<String, SlashInvocationError> {
     let Some((name, extra)) = split_acp_slash(&prompt_text) else {
         return Ok(prompt_text);
@@ -255,10 +253,10 @@ pub(super) async fn slash_to_prompt_text(
     if !crate::skills::looks_like_skill_invocation(&name) {
         return Ok(prompt_text);
     }
-    let snapshot = skills.current_for(access).await;
+    let snapshot = skills.current().await;
     let Some(skill) = snapshot.find(&name) else {
         return Err(SlashInvocationError::SkillNotFound(
-            skills.current().await.unavailable_to(&name, access),
+            snapshot.unavailable(&name),
         ));
     };
     let body = crate::skills::load_skill_body(skill)
@@ -401,10 +399,10 @@ pub(super) async fn run_prompt_turn(
     // asked for a specific account, and answering from another one silently is the failure the
     // whole per-session binding exists to prevent.
     if let Err(error) =
-        crate::host::apply_recorded_bindings(&state.shared, &entry.agent, entry.id).await
+        crate::host::apply_recorded_profile(&state.shared, &entry.agent, entry.id).await
     {
         return responder.respond_with_error(build_failure_error(
-            "cannot run this turn on the profile or project this session is recorded against",
+            "cannot run this turn on the profile this session is recorded against",
             &error,
             state.shared.relay_provider_errors(),
         ));
@@ -443,7 +441,6 @@ pub(super) async fn run_prompt_turn(
         &frontend.connection,
         &frontend.session_id,
         &state.shared.skills,
-        &entry.agent.project_access(),
     )
     .await;
 
@@ -478,13 +475,7 @@ pub(super) async fn run_prompt_turn(
     }
 
     let original_prompt_text = prompt_text.clone();
-    let prompt_text = match slash_to_prompt_text(
-        prompt_text,
-        &state.shared.skills,
-        &entry.agent.project_access(),
-    )
-    .await
-    {
+    let prompt_text = match slash_to_prompt_text(prompt_text, &state.shared.skills).await {
         Ok(text) => text,
         Err(SlashInvocationError::SkillNotFound(name)) => {
             // `slash_to_prompt_text` only returns `SkillNotFound` for strings whose first token is

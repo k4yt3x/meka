@@ -62,7 +62,7 @@ pub(crate) fn agent_build_problem(
             refusal @ (MekaError::Config(_)
             | MekaError::SessionNotDrivable(_)
             | MekaError::ProfileNotConfigured { .. }
-            | MekaError::ProjectNotConfigured { .. }
+            | MekaError::UnknownProject { .. }
             | MekaError::SessionNotFound(_)
             | MekaError::SessionLocked(_)),
         ) => ProblemDetail::for_error(refusal, false),

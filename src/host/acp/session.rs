@@ -402,14 +402,13 @@ pub(super) async fn handle_load_session(
         title_sent,
         frontend,
     };
-    let project_access = entry.agent.project_access();
     state.sessions.write().await.insert(session_id_str, entry);
 
     // Refresh the palette + advertise the current mode set: the editor was reopened, so its UI
     // starts blank.
     let modes = build_mode_state(&permission);
     let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
-    emit_available_commands(&cx, &session_id, &state.shared.skills, &project_access).await;
+    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
     responder.respond(
         LoadSessionResponse::new()
@@ -585,12 +584,11 @@ pub(super) async fn handle_resume_session(
         title_sent,
         frontend,
     };
-    let project_access = entry.agent.project_access();
     state.sessions.write().await.insert(session_id_str, entry);
 
     let modes = build_mode_state(&permission);
     let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
-    emit_available_commands(&cx, &session_id, &state.shared.skills, &project_access).await;
+    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
     responder.respond(
         ResumeSessionResponse::new()
@@ -842,14 +840,13 @@ pub(super) async fn handle_fork_session(
         title_sent,
         frontend,
     };
-    let project_access = entry.agent.project_access();
     state.sessions.write().await.insert(session_id_str, entry);
 
     tracing::info!("session/fork: {source_uuid} forked into {session_uuid}");
 
     let modes = build_mode_state(&permission);
     let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
-    emit_available_commands(&cx, &session_id, &state.shared.skills, &project_access).await;
+    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
     responder.respond(
         ForkSessionResponse::new(session_id)
@@ -1126,7 +1123,7 @@ pub(super) async fn handle_set_session_config_option(
             let project = if value.is_empty() {
                 None
             } else {
-                match crate::host::resolve_project_switch(&state.shared, &value) {
+                match crate::host::resolve_project_switch(&state.shared, &value).await {
                     Ok(project) => Some(project),
                     Err(error) => {
                         return responder.respond_with_error(build_failure_error(
@@ -1162,15 +1159,6 @@ pub(super) async fn handle_set_session_config_option(
                 ));
             }
             entry.agent.set_project(project);
-            // The skills the new project hides are commands the client must stop offering, and
-            // the ones it shows, commands it must start to; the list goes out as a load sends it.
-            emit_available_commands(
-                &entry.frontend.connection,
-                &entry.frontend.session_id,
-                &state.shared.skills,
-                &entry.agent.project_access(),
-            )
-            .await;
         }
         unknown => {
             return responder.respond_with_error(invalid_params_error(crate::text::unknown_name(

@@ -1637,20 +1637,28 @@ fn a_host_command_typed_during_a_turn_is_refused() {
     );
 }
 
-/// A new session opens on the banner: meka's mark beside the version, the profile with its model
-/// and the directory, at the top under a blank row. The first prompt takes it down.
+/// A new session opens on the banner: meka's mark beside the version and the build, then what
+/// the agent carries, at the top under a blank row. The first prompt takes it down.
 #[test]
 fn a_new_session_opens_on_the_banner() {
     let install = screen_install("read", "", "");
     let screens = run_screen(&install, TWO_TURNS, &["hi", "/exit"]);
     let opening = &screens[0];
-    assert_eq!(
-        opening[1],
-        format!("  █▄ ▄█  meka v{}", env!("CARGO_PKG_VERSION")),
+    // The binary under test is an unoptimized build from this checkout, so the build follows the
+    // version; its commit is whatever the checkout is at.
+    let version = format!("  █▄ ▄█  meka v{} (", env!("CARGO_PKG_VERSION"));
+    assert!(
+        opening[1].starts_with(&version) && opening[1].ends_with("debug)"),
         "{opening:#?}"
     );
-    assert_eq!(opening[2], "  █ ▀ █  default (mock-model)", "{opening:#?}");
-    assert_eq!(opening[3], "  █   █  ~/work", "{opening:#?}");
+    assert_eq!(
+        opening[2], "  █ ▀ █  0 MCP servers · 0 skills",
+        "{opening:#?}"
+    );
+    assert_eq!(
+        opening[3], "  █   █  0 memories · 0 instructions",
+        "{opening:#?}"
+    );
     assert!(opening[0].is_empty(), "the blank row above: {opening:#?}");
     let rows = final_screen(&screens);
     assert!(

@@ -78,6 +78,17 @@ pub(crate) struct Instructions {
     pub(crate) source: InstructionsSource,
 }
 
+impl Instructions {
+    /// How many pieces the set was read as: each file that contributed, or one for a flag or a
+    /// variable, whose text arrives whole.
+    pub(crate) fn count(&self) -> usize {
+        match &self.source {
+            InstructionsSource::Flag | InstructionsSource::Env => 1,
+            InstructionsSource::Files(paths) => paths.len(),
+        }
+    }
+}
+
 /// Read the conventional location. `<config>/instructions/` takes precedence over
 /// `<config>/instructions.md`, so splitting a grown file is a rename rather than a migration.
 ///
@@ -519,6 +530,26 @@ mod tests {
         let project = tempfile::tempdir().expect("tempdir");
         std::fs::write(project.path().join("AGENTS.md"), [0xff, 0xfe, 0xfd]).expect("write bytes");
         assert!(read_files(&[PathBuf::from("AGENTS.md")], project.path()).is_none());
+    }
+
+    /// A set is counted by the pieces it was read as: every file a directory contributed, one
+    /// for a flag or a variable, whose text arrives whole.
+    #[test]
+    fn a_set_counts_its_files_and_a_flag_as_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for name in ["00-style.md", "10-tools.md"] {
+            std::fs::write(temp.path().join(name), "rule\n").expect("write");
+        }
+        let directory = read_explicit(temp.path()).expect("a directory of two");
+        assert_eq!(directory.count(), 2);
+        let one = read_explicit(&temp.path().join("00-style.md")).expect("one file");
+        assert_eq!(one.count(), 1);
+        let flag = resolve(&crate::config::StandingInstructions::Flag(
+            "be brief".to_string(),
+        ))
+        .expect("resolves")
+        .expect("a flag is a set");
+        assert_eq!(flag.count(), 1);
     }
 
     #[test]

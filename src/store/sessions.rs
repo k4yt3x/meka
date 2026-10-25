@@ -1249,83 +1249,6 @@ impl Store {
             })
     }
 
-    /// How many root sessions are on one project, for the refusal `meka project remove` gives
-    /// while any are; root sessions only, for the reason [`Self::count_sessions_on_profile`]
-    /// gives.
-    pub(crate) async fn count_sessions_on_project(&self, project: &str) -> Result<u64> {
-        let project = project.to_string();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM sessions
-                         WHERE project = ?1 AND NOT {}",
-                        spawned_session_sql("")
-                    ),
-                    rusqlite::params![project],
-                    |row| row.get::<_, i64>(0),
-                )
-            })
-            .await
-            .map(|count| count.max(0) as u64)
-            .map_err(|error| {
-                MekaError::Database(format!("failed to count sessions on a project: {error}"))
-            })
-    }
-
-    /// Every project some root session names, sorted, for the listing that shows a project the
-    /// file no longer defines beside the ones it does. Root sessions, as
-    /// [`Self::count_sessions_on_project`] counts them: a sub-agent's row keeps the project its
-    /// parent was on when it was spawned, and a name only such rows carry would be listed with a
-    /// count of none.
-    pub(crate) async fn session_project_names(&self) -> Result<Vec<String>> {
-        self.connection
-            .call(|connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(&format!(
-                    "SELECT DISTINCT project FROM sessions
-                     WHERE project != '' AND NOT {}
-                     ORDER BY project ASC",
-                    spawned_session_sql("")
-                ))?;
-                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to read the sessions' projects: {error}"))
-            })
-    }
-
-    /// Move every session and every memory on `project` to `new_project`, and answer how many
-    /// of each moved.
-    ///
-    /// One transaction over both tables, so a crash cannot leave the sessions on one name and
-    /// their memories on another, which no door could then bring back together.
-    pub(crate) async fn rename_project(
-        &self,
-        project: &str,
-        new_project: &str,
-    ) -> Result<(u64, u64)> {
-        let project = project.to_string();
-        let new_project = new_project.to_string();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                let transaction = connection.transaction()?;
-                let sessions = transaction.execute(
-                    "UPDATE sessions SET project = ?2 WHERE project = ?1",
-                    rusqlite::params![project, new_project],
-                )?;
-                let memories = transaction.execute(
-                    "UPDATE memories SET project = ?2 WHERE project = ?1",
-                    rusqlite::params![project, new_project],
-                )?;
-                transaction.commit()?;
-                Ok((sessions as u64, memories as u64))
-            })
-            .await
-            .map_err(|error| MekaError::Database(format!("failed to rename a project: {error}")))
-    }
-
     /// Take the lock on an id that is about to become a row.
     ///
     /// The ordering rule in one place, because four doors mint a session and each has to keep it.
@@ -9729,14 +9652,6 @@ mod tests {
         assert_eq!(listed(Some("webdev")).await, [on_web]);
         assert_eq!(listed(Some("")).await, [plain]);
         assert_eq!(listed(None).await.len(), 2);
-        assert_eq!(
-            store
-                .count_sessions_on_project("webdev")
-                .await
-                .expect("count"),
-            1,
-            "root sessions only, as the profile count is"
-        );
 
         // A fork continues the conversation in the same project.
         let forked = store
@@ -9771,61 +9686,5 @@ mod tests {
             .await
             .expect("move off");
         assert_eq!(info(plain).await, "");
-
-        // A rename moves every row on the project, sessions and memories in one transaction.
-        let memories = store.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
-        memories
-            .write(crate::store::memory::WriteRequest {
-                name: "note".to_string(),
-                description: Some("d".to_string()),
-                view: crate::store::memory::MemoryView::Session("webdev".to_string()),
-                ..Default::default()
-            })
-            .await
-            .expect("a webdev memory");
-        assert_eq!(
-            store.rename_project("webdev", "web").await.expect("rename"),
-            (3, 1),
-            "the root, its sub-agent and the fork, plus the one memory"
-        );
-        assert_eq!(info(on_web).await, "web");
-        assert_eq!(info(child).await, "web");
-        assert_eq!(memories.project_names().await.expect("names"), ["web"]);
-        assert_eq!(
-            store
-                .count_sessions_on_project("webdev")
-                .await
-                .expect("count"),
-            0
-        );
-
-        // A project only a sub-agent's row carries is neither counted nor listed: the listing's
-        // names follow its counts.
-        let (_orphan, _orphan_lock) = store
-            .create_child_session(
-                plain,
-                None,
-                Vec::new(),
-                None,
-                "read".to_string(),
-                "profile".to_string(),
-                "orphan".to_string(),
-            )
-            .await
-            .expect("a sub-agent on a project its parent is not on");
-        assert_eq!(
-            store
-                .count_sessions_on_project("orphan")
-                .await
-                .expect("count"),
-            0
-        );
-        assert_eq!(store.session_project_names().await.expect("names"), ["web"]);
-        let patch = |project: &str| SessionPatch {
-            project: Some(project.to_string()),
-            ..SessionPatch::default()
-        };
-        assert_eq!(patch("web").to_string(), "project 'web'");
-        assert_eq!(patch("").to_string(), "no project");
     }
 }

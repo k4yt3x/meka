@@ -18420,18 +18420,34 @@ fn a_canceled_detached_turn_records_the_client_as_its_reason() {
     assert_eq!(ended["reason"], "client", "{ended}");
 }
 
+/// `meka project add` against the harness's store, while the server runs: a project is a row,
+/// so the server sees it on its next read.
+fn add_project(harness: &ServeTestHarness, name: &str) {
+    let added = harness
+        .install
+        .meka(&["project", "add", name])
+        .output()
+        .expect("run meka project add");
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+}
+
 /// A session is created on a project, moved and taken off one by `PATCH`, listed by it, and
-/// refused a project the file does not define; `GET /v1/projects` lists the configured projects
-/// with their counts.
+/// refused a project the store does not have; `GET /v1/projects` lists the projects with their
+/// counts.
 #[test]
 fn sessions_carry_their_project_over_http() {
-    let harness = ServeTestHarness::spawn_with(
-        "",
-        "[projects.webdev]\n[projects.movie]\ndisabled_skills = [\"release\"]\n",
-        mock_simple_turn(),
-        "sk_test_token",
-        &["sessions:r", "sessions:w", "memory:r", "memory:w"],
-    );
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "memory:r",
+        "memory:w",
+    ]);
+    add_project(&harness, "webdev");
+    add_project(&harness, "movie");
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
     let created: serde_json::Value = harness
         .request(reqwest::Method::POST, "/v1/sessions")
@@ -18517,27 +18533,41 @@ fn sessions_carry_their_project_over_http() {
         .expect("send")
         .json()
         .expect("parse");
+    let listed: Vec<(String, u64, u64)> = projects["projects"]
+        .as_array()
+        .expect("projects")
+        .iter()
+        .map(|project| {
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(
+                    project["created_at"].as_str().unwrap_or_default()
+                )
+                .is_ok(),
+                "{project}"
+            );
+            (
+                project["name"].as_str().unwrap_or_default().to_string(),
+                project["memories"].as_u64().unwrap_or_default(),
+                project["sessions"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect();
     assert_eq!(
-        projects["projects"],
-        serde_json::json!([
-            {"name": "movie", "memories": 0, "sessions": 0, "configured": true, "disabled_skills": ["release"]},
-            {"name": "webdev", "memories": 0, "sessions": 0, "configured": true},
-        ]),
+        listed,
+        [("movie".to_string(), 0, 0), ("webdev".to_string(), 0, 0)],
         "{projects}"
     );
 }
 
 /// The memory routes file a memory under a project, list one tier, read a name that is in several
-/// projects only when one is named, and refuse a project the file does not define.
+/// projects only when one is named, and refuse a project the store does not have.
 #[test]
 fn memory_routes_file_by_project_and_refuse_a_bare_name_in_several() {
-    let harness = ServeTestHarness::spawn_with(
-        "",
-        "[projects.webdev]\n[projects.movie]\n",
-        mock_simple_turn(),
-        "sk_test_token",
-        &["memory:r", "memory:w"],
-    );
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "memory:r", "memory:w",
+    ]);
+    add_project(&harness, "webdev");
+    add_project(&harness, "movie");
     for project in ["webdev", "movie"] {
         let written: serde_json::Value = harness
             .request(reqwest::Method::PUT, "/v1/memory/notes")
@@ -18671,86 +18701,6 @@ fn memory_routes_file_by_project_and_refuse_a_bare_name_in_several() {
     assert_eq!(tier("?project=webdev"), Vec::<String>::new());
 }
 
-/// A skill the session's project hides reaches it through no door: `options.skill` refuses it on
-/// a turn, and the first turn after the move announces the skill as gone under the project line.
-#[test]
-fn a_project_move_hides_a_skill_from_the_turn_option_and_announces_it() {
-    let harness = ServeTestHarness::spawn_with(
-        "",
-        "[projects.movie]\ndisabled_skills = [\"release\"]\n",
-        mock_simple_turn(),
-        "sk_test_token",
-        &["sessions:r", "sessions:w"],
-    );
-    let release = harness.root().join("meka").join("skills").join("release");
-    std::fs::create_dir_all(&release).expect("mkdir");
-    std::fs::write(
-        release.join("SKILL.md"),
-        "---\nname: release\ndescription: how to cut a release\n---\nTag it.\n",
-    )
-    .expect("seed");
-    let id = create_session_id(&harness);
-    let turn = |body: serde_json::Value| {
-        harness
-            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
-            .json(&body)
-            .send()
-            .expect("send")
-    };
-    let shown = turn(serde_json::json!({
-        "message": "go",
-        "options": {"skill": "release"},
-        "stream": false,
-    }));
-    assert_eq!(shown.status(), 200, "{}", shown.text().unwrap_or_default());
-
-    let moved = harness
-        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
-        .json(&serde_json::json!({"project": "movie"}))
-        .send()
-        .expect("send");
-    assert_eq!(moved.status(), 200, "{}", moved.text().unwrap_or_default());
-    let hidden = turn(serde_json::json!({
-        "message": "go",
-        "options": {"skill": "release"},
-        "stream": false,
-    }));
-    assert_eq!(hidden.status(), 422);
-    let detail: serde_json::Value = hidden.json().expect("problem");
-    assert!(
-        detail["detail"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("project 'movie' hides skill 'release'"),
-        "{detail}"
-    );
-    let after = turn(serde_json::json!({"message": "and now", "stream": false}));
-    assert_eq!(after.status(), 200, "{}", after.text().unwrap_or_default());
-
-    let body: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
-        .send()
-        .expect("send")
-        .json()
-        .expect("parse");
-    let user_texts: Vec<String> = body["messages"]
-        .as_array()
-        .expect("messages")
-        .iter()
-        .filter(|message| message["role"] == "user")
-        .map(message_text)
-        .collect();
-    // The turn after the move, not the last user message: the mock's empty rounds draw nudges.
-    let moved_turn = user_texts
-        .iter()
-        .find(|text| text.contains("- Project is now 'movie'."))
-        .unwrap_or_else(|| panic!("no turn announced the move: {user_texts:?}"));
-    assert!(
-        moved_turn.contains("Skills no longer available") && moved_turn.contains("release"),
-        "{moved_turn}"
-    );
-}
-
 /// A `PATCH` naming the project while a turn runs is refused as one naming the profile is: the
 /// turn's memories file into the tier its context shows, and its catalog is read through one view.
 #[test]
@@ -18762,11 +18712,11 @@ fn a_project_patch_during_a_turn_is_refused_like_a_profile_s() {
             { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let harness =
-        ServeTestHarness::spawn_with("", "[projects.movie]\n", script, "sk_test_token", &[
-            "sessions:r",
-            "sessions:w",
-        ]);
+    let harness = ServeTestHarness::spawn_with("", "", script, "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+    ]);
+    add_project(&harness, "movie");
     let id = create_session_id(&harness);
     let base_url = harness.base_url.clone();
     let token = harness.token.clone();

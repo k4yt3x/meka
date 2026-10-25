@@ -410,12 +410,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "memories_carry_load_references_source_verification_and_expiry",
         step: Step::Rust(memories_carry_load_references_source_verification_and_expiry),
     },
-    // 0.84 lets a session open a project and files a memory into the global tier or the
-    // project's; a row written before the column has no project, as a session with no profile
-    // has none.
+    // 0.84 lets a session open a project, a row of `projects`, and files a memory into the
+    // global tier or the project's; a row written before the columns is on no project, as a
+    // session with no profile is on none.
     Migration {
-        name: "sessions_and_memories_record_their_project",
-        step: Step::Rust(sessions_and_memories_record_their_project),
+        name: "projects_are_rows_named_by_sessions_and_memories",
+        step: Step::Rust(projects_are_rows_named_by_sessions_and_memories),
     },
     // 0.84 records on every compaction boundary what set the compaction going, which strategy
     // wrote the summary, the memories the checkpoint wrote and whether the recent turns were
@@ -844,6 +844,7 @@ const HEAD_TABLES: &[&str] = &[
     "memories",
     "message_blobs",
     "messages",
+    "projects",
     "prompt_history",
     "scheduled_jobs",
     "scratchpad_entries",
@@ -853,7 +854,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 6_640_939_281_267_135_889;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 13_810_882_772_540_558_385;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2929,8 +2930,8 @@ fn memories_carry_load_references_source_verification_and_expiry(
     Ok(())
 }
 
-/// `sessions` and `memories` record a project, and a memory's name is unique within its tier
-/// rather than across the store.
+/// `projects` holds the projects, `sessions` and `memories` record the one they are on, and a
+/// memory's name is unique within its tier rather than across the store.
 ///
 /// A session with no project and a memory in the global tier record the empty string, as
 /// `sessions.profile` records no profile. The name constraint moves from `name` to `(project,
@@ -2938,11 +2939,13 @@ fn memories_carry_load_references_source_verification_and_expiry(
 /// row is copied with its `id`, so the external-content FTS table keeps addressing the right
 /// rowids, and the index is rebuilt anyway so the step leaves it whole on its own. The drop takes
 /// the index's triggers with it; they come back on the open that follows, from
-/// `crate::store::memory::reconcile_index`, which owns them and nothing else creates. Each half
-/// is guarded on `project` being absent, so a replay over a store that lost its `user_version`
-/// finds nothing to do. No frozen step reads an object the rebuild removes: each names `memories`
+/// `crate::store::memory::reconcile_index`, which owns them and nothing else creates. The column
+/// halves are guarded on `project` being absent and the table is created only where it is not,
+/// so a replay over a store that lost its `user_version` finds nothing to do; the backfill gives
+/// every name the rows carry a project row, dated by the oldest row on it, and ignores the names
+/// that have one. No frozen step reads an object the rebuild removes: each names `memories`
 /// itself, which keeps its name, so `classify_by_shape`'s floor stays where it is.
-fn sessions_and_memories_record_their_project(
+fn projects_are_rows_named_by_sessions_and_memories(
     transaction: &rusqlite::Transaction<'_>,
 ) -> rusqlite::Result<()> {
     if !table_has_column(transaction, "sessions", "project")? {
@@ -2982,6 +2985,19 @@ fn sessions_and_memories_record_their_project(
              INSERT INTO memories_fts(memories_fts) VALUES('rebuild');",
         )?;
     }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS projects (
+            name       TEXT PRIMARY KEY NOT NULL,
+            created_at TEXT NOT NULL
+         );
+         INSERT OR IGNORE INTO projects (name, created_at)
+         SELECT project, MIN(created_at) FROM (
+             SELECT project, created_at FROM sessions WHERE project != ''
+             UNION ALL
+             SELECT project, created_at FROM memories WHERE project != ''
+         )
+         GROUP BY project;",
+    )?;
     Ok(())
 }
 
@@ -3634,6 +3650,19 @@ fn background_reports_name_only_their_tasks(
         )?;
     }
     Ok(())
+}
+
+/// Bring the frontmatter of a memory export file written at format `from` to `current`, the
+/// version this build writes, reporting whether `from` is one this build reads. An export is not
+/// the store, so the ledger never reaches it; this is the export's one conversion, and the
+/// versions it converts live here and nowhere else. The format has had one version, so there is
+/// nothing to rewrite yet: `frontmatter` is what the first conversion will edit.
+pub(crate) fn bring_memory_file_forward(
+    _frontmatter: &mut yaml_serde::Value,
+    from: u32,
+    current: u32,
+) -> bool {
+    from == current
 }
 
 /// Bring a session archive written by an older meka to the current shape, reporting whether it
@@ -4900,8 +4929,8 @@ mod tests {
                 11700233977647167775_u64,
             ),
             (
-                "sessions_and_memories_record_their_project",
-                3180749961311918637_u64,
+                "projects_are_rows_named_by_sessions_and_memories",
+                4611095635135850049_u64,
             ),
             (
                 "compact_boundaries_record_their_compaction",
@@ -8985,6 +9014,7 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE sessions DROP COLUMN project;
+                 DROP TABLE projects;
                  CREATE TABLE memories_old (
                      id INTEGER PRIMARY KEY,
                      name TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -9008,7 +9038,7 @@ mod tests {
         connection
             .execute_batch(&format!(
                 "PRAGMA user_version = {};",
-                position_of("sessions_and_memories_record_their_project")
+                position_of("projects_are_rows_named_by_sessions_and_memories")
             ))
             .expect("one step short of head");
         connection
@@ -9093,7 +9123,7 @@ mod tests {
         let pending = plan(&connection).expect("plan");
         assert_eq!(
             pending.from as usize,
-            position_of("sessions_and_memories_record_their_project")
+            position_of("projects_are_rows_named_by_sessions_and_memories")
         );
         apply(&mut connection, pending, &Context::default()).expect("the step runs");
 
@@ -9140,6 +9170,10 @@ mod tests {
             })
             .expect("the session row");
         assert_eq!(session_project, "");
+        assert!(
+            project_rows(&connection).is_empty(),
+            "no row named a project, so the table starts empty"
+        );
 
         // The constraint moved: one name in two projects is fine, twice in one project is not,
         // and case still does not distinguish names within a tier.
@@ -9184,11 +9218,37 @@ mod tests {
             .expect("search");
         assert_eq!(hits, 1, "the triggers index a write after the rebuild");
 
+        // A replay leaves the rows alone and gives every name the rows carry a project row,
+        // dated by the oldest row on it; a second replay keeps the rows it finds.
         let before = memory_rows(&connection);
-        let transaction = connection.transaction().expect("transaction");
-        sessions_and_memories_record_their_project(&transaction).expect("a replay");
-        transaction.commit().expect("commit");
-        assert_eq!(memory_rows(&connection), before, "a replay is a no-op");
+        for pass in 1..=2 {
+            let transaction = connection.transaction().expect("transaction");
+            projects_are_rows_named_by_sessions_and_memories(&transaction).expect("a replay");
+            transaction.commit().expect("commit");
+            assert_eq!(memory_rows(&connection), before, "replay {pass} is a no-op");
+            assert_eq!(
+                project_rows(&connection),
+                [
+                    ("movie".to_string(), "2024-01-01T00:00:00+00:00".to_string()),
+                    (
+                        "webdev".to_string(),
+                        "2024-01-01T00:00:00+00:00".to_string()
+                    ),
+                ],
+                "replay {pass} backfills the projects the rows name"
+            );
+        }
+    }
+
+    /// Every project row, by name, with when it was added.
+    fn project_rows(connection: &rusqlite::Connection) -> Vec<(String, String)> {
+        let mut statement = connection
+            .prepare("SELECT name, created_at FROM projects ORDER BY name ASC")
+            .expect("prepare");
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query");
+        rows.collect::<rusqlite::Result<Vec<_>>>().expect("rows")
     }
 
     /// A `.dump` round trip loses `user_version`, so a store already in the project shape is

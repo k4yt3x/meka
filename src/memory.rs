@@ -749,6 +749,131 @@ pub(crate) fn export_memory(memory: &Memory) -> String {
     )
 }
 
+/// The file `meka memory export` writes beside the memory files, carrying the snapshot's
+/// `format_version`; `meka memory import` reads it before any memory file.
+pub(crate) const MEMORY_EXPORT_MANIFEST: &str = "export.toml";
+
+/// The shape of an export directory this build writes and reads as it is. Bumped when a field
+/// changes name or meaning; a snapshot at an older version is brought forward by the migration
+/// module, the one place that may know what an older meka wrote.
+pub(crate) const MEMORY_EXPORT_FORMAT_VERSION: u32 = 1;
+
+/// The manifest's text.
+pub(crate) fn render_export_manifest() -> String {
+    format!("format_version = {MEMORY_EXPORT_FORMAT_VERSION}\n")
+}
+
+/// The format version a manifest states.
+pub(crate) fn parse_export_manifest(text: &str) -> Result<u32, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Manifest {
+        format_version: u32,
+    }
+    toml::from_str::<Manifest>(text)
+        .map(|manifest| manifest.format_version)
+        .map_err(|error| format!("{MEMORY_EXPORT_MANIFEST} does not parse: {error}"))
+}
+
+/// A memory as an export file states it, checked as the write doors check a write: what
+/// `meka memory import` hands the store. The three fields a write door sets itself, `created_at`,
+/// `verified_at` and `read_count`, come from the file, which is what makes an import a restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportedMemory {
+    pub(crate) name: String,
+    /// Empty for the global tier.
+    pub(crate) project: String,
+    pub(crate) description: String,
+    pub(crate) priority: u8,
+    pub(crate) load: Load,
+    pub(crate) created_at: SystemTime,
+    pub(crate) verified_at: SystemTime,
+    pub(crate) expires_at: Option<SystemTime>,
+    pub(crate) source: String,
+    pub(crate) references: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) read_count: u32,
+    pub(crate) body: String,
+}
+
+/// Split an export file into its frontmatter text and its body, undoing the framing
+/// [`render_memory`] adds: one newline after the closing fence and one at the end, so a body
+/// comes back byte for byte, an empty one included.
+pub(crate) fn split_memory_file(text: &str) -> Result<(&str, &str), String> {
+    let (frontmatter, rest) =
+        crate::entry::split_frontmatter(text).ok_or("missing YAML frontmatter")?;
+    let body = rest
+        .strip_prefix('\n')
+        .and_then(|body| body.strip_suffix('\n'))
+        .ok_or("the body is not framed as `meka memory export` writes it")?;
+    Ok((frontmatter, body))
+}
+
+/// One export file's memory at the current format: `name` is the file's stem, `frontmatter` its
+/// header as YAML, `body` what [`split_memory_file`] returned. Every field goes through the check
+/// its write door applies, so a file edited by hand is held to what `meka memory add` is.
+pub(crate) fn memory_from_export(
+    name: &str,
+    frontmatter: yaml_serde::Value,
+    body: &str,
+) -> Result<ImportedMemory, String> {
+    /// The header as [`render_memory`] writes it. Every field it leaves out at its default is
+    /// optional here, which is the format's own definition rather than a tolerance.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Frontmatter {
+        description: String,
+        project: Option<String>,
+        priority: Option<u8>,
+        load: Option<Load>,
+        created: Option<String>,
+        verified: Option<String>,
+        expires: Option<String>,
+        source: Option<String>,
+        read_count: Option<u32>,
+        references: Option<Vec<String>>,
+        tags: Option<Vec<String>>,
+    }
+    validate_memory_name(name)?;
+    let header: Frontmatter = yaml_serde::from_value(frontmatter)
+        .map_err(|error| format!("the frontmatter does not parse: {error}"))?;
+    let description = normalize_description(&header.description);
+    if !description_says_something(&description) {
+        return Err("the description is empty".to_string());
+    }
+    let project = match header.project {
+        Some(project) => {
+            crate::entry::validate_entry_name(&project, "project")?;
+            project
+        }
+        None => String::new(),
+    };
+    let stamp = |field: &str, raw: Option<String>| -> Result<Option<SystemTime>, String> {
+        raw.map(|raw| {
+            parse_stamp(&raw).ok_or_else(|| format!("{field} '{raw}' is not an RFC 3339 timestamp"))
+        })
+        .transpose()
+    };
+    let created_at = stamp("created", header.created)?.unwrap_or_else(SystemTime::now);
+    let verified_at = stamp("verified", header.verified)?.unwrap_or(created_at);
+    let expires_at = stamp("expires", header.expires)?;
+    Ok(ImportedMemory {
+        name: name.to_string(),
+        project,
+        description,
+        priority: parse_priority(header.priority.map(i64::from), name),
+        load: header.load.unwrap_or_default(),
+        created_at,
+        verified_at,
+        expires_at,
+        source: normalize_source(header.source.as_deref().unwrap_or_default())?,
+        references: normalize_references(&header.references.unwrap_or_default())?,
+        tags: normalize_tags(&header.tags.unwrap_or_default())?,
+        read_count: header.read_count.unwrap_or_default(),
+        body: body.to_string(),
+    })
+}
+
 /// Make stored memory text safe to render into a model's context or a terminal.
 ///
 /// The store returns bytes (see `crate::store::memory::row_to_memory`), because `meka memory edit`
@@ -1167,5 +1292,90 @@ mod tests {
             render_age(now + std::time::Duration::from_secs(86_400), now),
             "at a future date"
         );
+    }
+
+    /// An export file reads back as the memory it was written from, every field included, with
+    /// the body byte for byte; a file with a description alone takes every default; and a file
+    /// the write doors would refuse is refused by the same words.
+    #[test]
+    fn an_export_file_reads_back_as_the_memory_it_was_written_from() {
+        let stamp = |raw: &str| parse_stamp(raw).expect("a stamp");
+        let memory = Memory {
+            name: "deploy-host".to_string(),
+            project: "ops".to_string(),
+            description: "Where deploys run".to_string(),
+            priority: 2,
+            load: Load::Inline,
+            references: vec!["runbook".to_string(), "https://example.com/x".to_string()],
+            source: "k4yt3x, in chat".to_string(),
+            verified_at: stamp("2026-03-04T05:06:07+00:00"),
+            expires_at: Some(stamp("2027-01-01T00:00:00+00:00")),
+            tags: vec!["infra".to_string(), "ops".to_string()],
+            created_at: stamp("2026-01-02T03:04:05.123456789+00:00"),
+            updated_at: stamp("2026-03-04T05:06:07+00:00"),
+            read_count: 4,
+            body: Some("\n\nfirst line\r\nsecond: [x]\n\n".to_string()),
+        };
+        let file = export_memory(&memory);
+        let (frontmatter, body) = split_memory_file(&file).expect("framed as written");
+        let frontmatter: yaml_serde::Value = yaml_serde::from_str(frontmatter).expect("yaml");
+        let imported = memory_from_export("deploy-host", frontmatter, body).expect("reads back");
+        assert_eq!(imported, ImportedMemory {
+            name: "deploy-host".to_string(),
+            project: "ops".to_string(),
+            description: "Where deploys run".to_string(),
+            priority: 2,
+            load: Load::Inline,
+            created_at: memory.created_at,
+            verified_at: memory.verified_at,
+            expires_at: memory.expires_at,
+            source: "k4yt3x, in chat".to_string(),
+            references: memory.references.clone(),
+            tags: memory.tags.clone(),
+            read_count: 4,
+            body: "\n\nfirst line\r\nsecond: [x]\n\n".to_string(),
+        });
+
+        let minimal = "---\ndescription: Just this\n---\n\n\n";
+        let (frontmatter, body) = split_memory_file(minimal).expect("framed");
+        let frontmatter: yaml_serde::Value = yaml_serde::from_str(frontmatter).expect("yaml");
+        let before = SystemTime::now();
+        let imported = memory_from_export("tone", frontmatter, body).expect("defaults");
+        assert_eq!(body, "");
+        assert_eq!(imported.project, "");
+        assert_eq!(imported.priority, crate::entry::DEFAULT_PRIORITY);
+        assert_eq!(imported.load, Load::default());
+        assert!(
+            imported.created_at >= before,
+            "created now when the file says nothing"
+        );
+        assert_eq!(imported.verified_at, imported.created_at);
+        assert_eq!(imported.read_count, 0);
+        assert!(imported.references.is_empty() && imported.tags.is_empty());
+
+        let refused = |text: &str, name: &str| -> String {
+            let (frontmatter, body) = split_memory_file(text).expect("framed");
+            let frontmatter: yaml_serde::Value = yaml_serde::from_str(frontmatter).expect("yaml");
+            memory_from_export(name, frontmatter, body).expect_err("refused")
+        };
+        assert!(
+            refused("---\ndescription: x\ncolour: blue\n---\n\n\n", "a").contains("colour"),
+            "a key the format does not have is refused by name"
+        );
+        assert!(refused("---\ndescription: \"\"\n---\n\n\n", "a").contains("description"));
+        assert!(
+            refused("---\ndescription: x\ncreated: yesterday\n---\n\n\n", "a").contains("RFC 3339")
+        );
+        assert!(refused("---\ndescription: x\n---\n\n\n", "bad name").contains("name"));
+        assert!(
+            refused("---\ndescription: x\nproject: web dev\n---\n\n\n", "a").contains("project")
+        );
+        assert!(
+            split_memory_file("---\ndescription: x\n---\nno blank line\n").is_err(),
+            "a body not framed as the export writes it is refused rather than guessed at"
+        );
+        assert!(split_memory_file("no frontmatter at all").is_err());
+        assert_eq!(parse_export_manifest("format_version = 1\n"), Ok(1));
+        assert!(parse_export_manifest("format_version = 1\nextra = true\n").is_err());
     }
 }

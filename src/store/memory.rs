@@ -1425,6 +1425,26 @@ impl MemoryStore {
         })
     }
 
+    /// How many memories the view holds.
+    pub(crate) async fn count(&self, view: &MemoryView) -> Result<u64> {
+        let Some(connection) = self.connection.as_deref() else {
+            return Ok(0);
+        };
+        let view = view.clone();
+        connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let (clause, parameters) = view.clause("", 1);
+                connection.query_row(
+                    &format!("SELECT count(*) FROM memories WHERE 1 = 1 {clause}"),
+                    rusqlite::params_from_iter(parameters),
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map(|count| u64::try_from(count).unwrap_or(0))
+            .map_err(|error| MekaError::Database(format!("failed to count memories: {error}")))
+    }
+
     /// Every memory within the view, ordered as the `[Memory]` index renders them: priority
     /// ascending, then most recently created, then by name so the result is total and stable.
     ///
@@ -1857,6 +1877,111 @@ impl MemoryStore {
         match written {
             Guarded::Committed(written) => Ok(written),
             Guarded::Refused(refusal) => Err(MekaError::InvalidRequest(refusal)),
+        }
+    }
+
+    /// Write every memory of an export snapshot, as `meka memory import` hands them, in one
+    /// transaction: nothing lands unless everything does.
+    ///
+    /// The rules every write door applies are applied here, over the whole import and before the
+    /// commit: a project the store does not have, a name the store holds in the same tier, which
+    /// `force` alone overwrites, a name a global memory and a project memory would then share,
+    /// and the inline budget, measured as [`Self::write`] measures it. `created_at`, `verified_at`
+    /// and `read_count` are the file's, which is what makes an import a restore; `updated_at` is
+    /// now, since the row is written now.
+    pub(crate) async fn import(
+        &self,
+        entries: Vec<crate::memory::ImportedMemory>,
+        force: bool,
+    ) -> Result<usize> {
+        let now = crate::memory::render_stamp(SystemTime::now());
+        let inline_max_bytes = self.inline_max_bytes;
+        let written = self
+            .writable()?
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let projects = super::projects::names_in(&transaction)?;
+                let inline_bytes_before = inline_bytes_in_force(&transaction, &now, "")?;
+                for entry in &entries {
+                    if !entry.project.is_empty() && !projects.contains(&entry.project) {
+                        return Ok(Guarded::Refused(format!(
+                            "{}; add it with `meka project add {}` first",
+                            crate::text::unknown_name("project", &entry.project, &projects),
+                            entry.project
+                        )));
+                    }
+                    let holders: Vec<String> = {
+                        let mut statement = transaction.prepare(
+                            "SELECT project FROM memories WHERE name = ?1 ORDER BY project ASC",
+                        )?;
+                        let rows =
+                            statement.query_map(rusqlite::params![entry.name], |row| row.get(0))?;
+                        rows.collect::<rusqlite::Result<_>>()?
+                    };
+                    if let Some(refusal) = import_refusal(entry, &holders, force) {
+                        return Ok(Guarded::Refused(refusal));
+                    }
+                    // The conflict arm is reached only under `force`: without it the check above
+                    // refused a name the tier holds.
+                    transaction.execute(
+                        "INSERT INTO memories
+                             (name, project, description, tags, body, priority, created_at,
+                              updated_at, read_count, load, reference_list, source, verified_at,
+                              expires_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                         ON CONFLICT(project, name) DO UPDATE SET
+                             description    = excluded.description,
+                             tags           = excluded.tags,
+                             body           = excluded.body,
+                             priority       = excluded.priority,
+                             created_at     = excluded.created_at,
+                             updated_at     = excluded.updated_at,
+                             read_count     = excluded.read_count,
+                             load           = excluded.load,
+                             reference_list = excluded.reference_list,
+                             source         = excluded.source,
+                             verified_at    = excluded.verified_at,
+                             expires_at     = excluded.expires_at",
+                        rusqlite::params![
+                            entry.name,
+                            entry.project,
+                            entry.description,
+                            entry.tags.join(" "),
+                            entry.body,
+                            i64::from(entry.priority),
+                            crate::memory::render_stamp(entry.created_at),
+                            now,
+                            i64::from(entry.read_count),
+                            entry.load.name(),
+                            references_column(&entry.references),
+                            entry.source,
+                            crate::memory::render_stamp(entry.verified_at),
+                            entry.expires_at.map(crate::memory::render_stamp),
+                        ],
+                    )?;
+                }
+                // The global band is the widest: it counts the global bodies and the fullest
+                // project's, so if it holds, every session's band holds.
+                let inline_bytes_after = inline_bytes_in_force(&transaction, &now, "")?;
+                if inline_bytes_after > inline_max_bytes && inline_bytes_after > inline_bytes_before
+                {
+                    return Ok(Guarded::Refused(format!(
+                        "the import would leave the inline memories at {} against the {} inline \
+                         budget (`[memory] inline_max_bytes`); raise the budget or set `load: \
+                         index` on some of the export's inline memories",
+                        crate::text::format_size(inline_bytes_after),
+                        crate::text::format_size(inline_max_bytes)
+                    )));
+                }
+                transaction.commit()?;
+                Ok(Guarded::Committed(entries.len()))
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to import memories: {error}")))?;
+        match written {
+            Guarded::Committed(count) => Ok(count),
+            Guarded::Refused(refusal) => Err(MekaError::Usage(refusal)),
         }
     }
 
@@ -2350,44 +2475,6 @@ impl MemoryStore {
             .await
             .map_err(|error| MekaError::Database(format!("failed to read memories: {error}")))
     }
-
-    /// How many memories are in `project`'s tier, for the refusal `meka project remove` gives
-    /// while any are.
-    pub(crate) async fn count_memories_on_project(&self, project: &str) -> Result<u64> {
-        let Some(connection) = self.connection.as_deref() else {
-            return Ok(0);
-        };
-        let project = project.to_string();
-        connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.query_row(
-                    "SELECT count(*) FROM memories WHERE project = ?1",
-                    rusqlite::params![project],
-                    |row| row.get::<_, i64>(0),
-                )
-            })
-            .await
-            .map(|count| u64::try_from(count).unwrap_or(0))
-            .map_err(|error| MekaError::Database(format!("failed to count memories: {error}")))
-    }
-
-    /// Every project some memory names, sorted, so a listing can show a project the file no
-    /// longer defines beside the ones it does.
-    pub(crate) async fn project_names(&self) -> Result<Vec<String>> {
-        let Some(connection) = self.connection.as_deref() else {
-            return Ok(Vec::new());
-        };
-        connection
-            .call(|connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(
-                    "SELECT DISTINCT project FROM memories WHERE project != '' ORDER BY project ASC",
-                )?;
-                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .await
-            .map_err(|error| MekaError::Database(format!("failed to read memories: {error}")))
-    }
 }
 
 /// The one memory `found` holds for `name`, or the refusal when the operator's view holds the
@@ -2501,6 +2588,51 @@ fn resolve_write_tier(
         )),
         _ => Err(format!(
             "'{name}' is a memory of other projects; choose another name"
+        )),
+    }
+}
+
+/// Why an imported memory may not land beside what the store holds under its name, if it may not:
+/// the tier already has it, which only `force` overwrites, or the other kind of tier has it, which
+/// nothing may, since a global name and a project name never coincide.
+fn import_refusal(
+    entry: &crate::memory::ImportedMemory,
+    holders: &[String],
+    force: bool,
+) -> Option<String> {
+    let name = &entry.name;
+    if holders.contains(&entry.project) {
+        if force {
+            return None;
+        }
+        let tier = if entry.project.is_empty() {
+            "the global tier".to_string()
+        } else {
+            format!("project '{}'", entry.project)
+        };
+        return Some(format!(
+            "'{name}' already exists in {tier}; pass `--force` to overwrite it"
+        ));
+    }
+    let across: Vec<&String> = holders
+        .iter()
+        .filter(|holder| entry.project.is_empty() || holder.is_empty())
+        .collect();
+    match across.as_slice() {
+        [] => None,
+        [global] if global.is_empty() => Some(format!(
+            "'{name}' is a global memory, and a project memory may not share its name; rename \
+             one first"
+        )),
+        projects => Some(format!(
+            "'{name}' is a memory of project{} {}, and a global memory may not share its name; \
+             rename one first",
+            if projects.len() == 1 { "" } else { "s" },
+            projects
+                .iter()
+                .map(|project| format!("'{project}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }
@@ -5075,10 +5207,13 @@ mod tests {
             "an export orders by project and then by name"
         );
         assert_eq!(
-            store.count_memories_on_project("p2").await.expect("count"),
+            store
+                .export_all(&MemoryView::Project("p2".to_string()))
+                .await
+                .expect("export")
+                .len(),
             2
         );
-        assert_eq!(store.project_names().await.expect("names"), ["p1", "p2"]);
 
         // A read counts only within the view: a session with no project never opened p1's note.
         store
@@ -5279,14 +5414,17 @@ mod tests {
             .await
             .expect_err("write");
         assert!(refused.to_string().ends_with(expected), "{refused}");
-        assert_eq!(
-            store.count_memories_on_project("a").await.expect("count"),
-            1
-        );
-        assert_eq!(
-            store.count_memories_on_project("b").await.expect("count"),
-            1
-        );
+        for project in ["a", "b"] {
+            assert_eq!(
+                store
+                    .export_all(&MemoryView::Project(project.to_string()))
+                    .await
+                    .expect("export")
+                    .len(),
+                1,
+                "nothing moved in project '{project}'"
+            );
+        }
         // Named, each door reaches the one row.
         let b = MemoryView::Project("b".to_string());
         assert_eq!(
@@ -5397,6 +5535,160 @@ mod tests {
         assert!(
             refused.to_string().contains("(global and project 'p2')"),
             "{refused}"
+        );
+    }
+
+    /// An import restores what the files state, the stamps and the read count included, in one
+    /// transaction: a project the store lacks, a name the tier already holds without `force`,
+    /// a name the other kind of tier holds and the inline budget each refuse the whole import, and
+    /// `force` alone overwrites a name the tier holds.
+    #[tokio::test]
+    async fn an_import_restores_the_files_and_refuses_what_a_write_would() {
+        use crate::memory::{ImportedMemory, Load};
+
+        let database = crate::store::Store::for_test().await;
+        database.add_project("p").await.expect("a project");
+        let store = database.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
+        let stamp = |raw: &str| crate::memory::parse_stamp(raw).expect("a stamp");
+        let entry = |name: &str, project: &str, description: &str| ImportedMemory {
+            name: name.to_string(),
+            project: project.to_string(),
+            description: description.to_string(),
+            priority: 3,
+            load: Load::Index,
+            created_at: stamp("2024-05-06T07:08:09+00:00"),
+            verified_at: stamp("2024-06-06T07:08:09+00:00"),
+            expires_at: None,
+            source: "a test".to_string(),
+            references: vec!["other".to_string()],
+            tags: vec!["t".to_string()],
+            read_count: 7,
+            body: "the body".to_string(),
+        };
+
+        let count = store
+            .import(
+                vec![
+                    entry("tone", "", "Be brief"),
+                    entry("stack", "p", "Uses pnpm"),
+                ],
+                false,
+            )
+            .await
+            .expect("imported");
+        assert_eq!(count, 2);
+        let tone = store
+            .get("tone", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("tone");
+        assert_eq!(tone.created_at, stamp("2024-05-06T07:08:09+00:00"));
+        assert_eq!(tone.verified_at, stamp("2024-06-06T07:08:09+00:00"));
+        assert_eq!(tone.read_count, 7);
+        assert_eq!(tone.body.as_deref(), Some("the body"));
+        assert_eq!(tone.tags, ["t"]);
+        assert_eq!(tone.references, ["other"]);
+        assert_eq!(tone.source, "a test");
+        let stack = store
+            .get("stack", &MemoryView::Project("p".to_string()))
+            .await
+            .expect("get")
+            .expect("stack");
+        assert_eq!(stack.project, "p");
+        assert_eq!(
+            names_of(&store.export_all(&MemoryView::All).await.expect("all")),
+            ["tone", "stack"]
+        );
+
+        // The same files again: refused without `force`, every row untouched; overwritten with it.
+        let refused = store
+            .import(vec![entry("tone", "", "Be briefer")], false)
+            .await
+            .expect_err("taken");
+        assert_eq!(
+            refused.to_string(),
+            "'tone' already exists in the global tier; pass `--force` to overwrite it"
+        );
+        let unchanged = store
+            .get("tone", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("tone");
+        assert_eq!(unchanged.description, "Be brief");
+        store
+            .import(vec![entry("tone", "", "Be briefer")], true)
+            .await
+            .expect("overwritten");
+        let overwritten = store
+            .get("tone", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("tone");
+        assert_eq!(overwritten.description, "Be briefer");
+
+        // All or nothing: the good file beside a bad one does not land.
+        let refused = store
+            .import(
+                vec![
+                    entry("fine", "", "Would land"),
+                    entry("stray", "ghost", "No project"),
+                ],
+                false,
+            )
+            .await
+            .expect_err("an unknown project");
+        assert!(
+            refused.to_string().contains("no project named 'ghost'")
+                && refused.to_string().contains("`meka project add ghost`"),
+            "{refused}"
+        );
+        assert!(
+            store
+                .get("fine", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_none(),
+            "nothing landed"
+        );
+        let refused = store
+            .import(vec![entry("stack", "", "A global one")], false)
+            .await
+            .expect_err("a project holds the name");
+        assert_eq!(
+            refused.to_string(),
+            "'stack' is a memory of project 'p', and a global memory may not share its name; \
+             rename one first"
+        );
+        let refused = store
+            .import(vec![entry("tone", "p", "A project one")], false)
+            .await
+            .expect_err("the global tier holds the name");
+        assert_eq!(
+            refused.to_string(),
+            "'tone' is a global memory, and a project memory may not share its name; rename one \
+             first"
+        );
+
+        // The inline budget holds over the whole import, measured as a write measures it.
+        let tight = store.with_inline_max_bytes_for_test(16);
+        let refused = tight
+            .import(
+                vec![ImportedMemory {
+                    load: Load::Inline,
+                    body: "x".repeat(40),
+                    ..entry("rule", "", "A standing rule")
+                }],
+                false,
+            )
+            .await
+            .expect_err("past the budget");
+        assert!(refused.to_string().contains("inline budget"), "{refused}");
+        assert!(
+            store
+                .get("rule", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_none()
         );
     }
 }

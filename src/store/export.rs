@@ -91,9 +91,8 @@ pub(crate) struct ExportedBlob {
 ///
 /// A session runs on the profile its row names and files its memories under the project it names,
 /// and an import is a door that writes such a row, so it answers to the same rule as every other:
-/// each name is one this installation configures, or the import is refused. `--profile` is the
-/// explicit act that moves a session onto another profile; a project the archive names is added
-/// first.
+/// each name is one this installation has, or the import is refused. `--profile` is the explicit
+/// act that moves a session onto another profile; a project the archive names is added first.
 pub(crate) struct ImportInstallation<'a> {
     /// `--profile <name>`, when it was passed: every imported session takes it, whatever the
     /// archive recorded.
@@ -107,10 +106,9 @@ pub(crate) struct ImportInstallation<'a> {
     /// and the HTTP server always holds a parsed one.
     pub(crate) configured:
         Option<&'a std::collections::BTreeMap<String, crate::config::ProfileConfig>>,
-    /// The projects this installation configures, which a project the archive records has to be
-    /// among; `None` where there is no installation to check against, as for the profiles.
-    pub(crate) projects:
-        Option<&'a std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
+    /// The projects this installation's store has, which a project the archive records has to be
+    /// among.
+    pub(crate) projects: Vec<String>,
 }
 /// What [`plan_import`] settled: the sessions to write, the image bytes they reference, and the
 /// id the archive's root was given.
@@ -514,15 +512,12 @@ pub(crate) fn plan_import(
         };
         // Refused rather than written, as a profile is: a row naming a project this installation
         // lacks is a session every resume refuses by name.
-        if !session.project.is_empty()
-            && let Some(projects) = installation.projects
-        {
-            crate::config::require_project(&session.project, projects).map_err(|refusal| {
-                crate::error::MekaError::Usage(format!(
-                    "{refusal}; the archive names it, so add it with `meka project add {}` first",
-                    session.project
-                ))
-            })?;
+        if !session.project.is_empty() && !installation.projects.contains(&session.project) {
+            return Err(crate::error::MekaError::Usage(format!(
+                "{}; the archive names it, so add it with `meka project add {}` first",
+                crate::text::unknown_name("project", &session.project, &installation.projects),
+                session.project
+            )));
         }
         records.push(crate::store::ImportSessionRecord {
             new_id,
@@ -720,7 +715,7 @@ mod tests {
                 selected: None,
                 default: Some("other"),
                 configured: Some(&profiles),
-                projects: None,
+                projects: Vec::new(),
             },
             None,
         ));
@@ -735,7 +730,6 @@ mod tests {
     #[test]
     fn an_archive_naming_a_project_this_installation_lacks_is_refused() {
         let profiles = configured(&["work"]);
-        let none = std::collections::BTreeMap::new();
         let mut archive = archive_on("work");
         archive.sessions[0].project = "movie".to_string();
         let message = refusal(plan_import(
@@ -744,7 +738,7 @@ mod tests {
                 selected: None,
                 default: Some("work"),
                 configured: Some(&profiles),
-                projects: Some(&none),
+                projects: Vec::new(),
             },
             Some(crate::permission::Permission::Read),
         ));
@@ -753,10 +747,6 @@ mod tests {
                 && message.contains("`meka project add movie`"),
             "{message}"
         );
-        let defined: std::collections::BTreeMap<String, crate::config::ProjectConfig> =
-            [("movie".to_string(), crate::config::ProjectConfig::default())]
-                .into_iter()
-                .collect();
         let mut archive = archive_on("work");
         archive.sessions[0].project = "movie".to_string();
         plan_import(
@@ -765,11 +755,11 @@ mod tests {
                 selected: None,
                 default: Some("work"),
                 configured: Some(&profiles),
-                projects: Some(&defined),
+                projects: vec!["movie".to_string()],
             },
             Some(crate::permission::Permission::Read),
         )
-        .expect("a configured project is planned");
+        .expect("a project the store has is planned");
     }
 
     /// A stamp that is not RFC 3339 is refused ahead of any row: meka's own are, every listing
@@ -785,7 +775,7 @@ mod tests {
                 selected: None,
                 default: Some("work"),
                 configured: Some(&profiles),
-                projects: None,
+                projects: Vec::new(),
             },
             Some(crate::permission::Permission::Read),
         ));
@@ -812,7 +802,7 @@ mod tests {
                     selected: None,
                     default: Some("work"),
                     configured: Some(&profiles),
-                    projects: None,
+                    projects: Vec::new(),
                 },
                 Some(crate::permission::Permission::Read),
             )
@@ -836,7 +826,7 @@ mod tests {
                 selected: Some("other"),
                 default: None,
                 configured: Some(&profiles),
-                projects: None,
+                projects: Vec::new(),
             },
             None,
         )
@@ -852,7 +842,7 @@ mod tests {
                 selected: Some("ghost"),
                 default: None,
                 configured: Some(&profiles),
-                projects: None,
+                projects: Vec::new(),
             },
             None,
         ));
@@ -870,7 +860,7 @@ mod tests {
                 selected: None,
                 default: Some("other"),
                 configured: Some(&profiles),
-                projects: None,
+                projects: Vec::new(),
             },
             None,
         )
@@ -883,7 +873,7 @@ mod tests {
                 selected: None,
                 default: None,
                 configured: Some(&profiles),
-                projects: None,
+                projects: Vec::new(),
             },
             None,
         ));

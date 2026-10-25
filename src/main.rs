@@ -235,7 +235,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                         let context = store::migrations::Context::adopting(adopted.as_deref())
                             .starting_at(&permission.to_string());
                         (
-                            Some((adopted, file.profiles, file.projects)),
+                            Some((adopted, file.profiles)),
                             Some(permission),
                             context,
                             memory_inline_max_bytes,
@@ -263,20 +263,18 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     crate::cli::profile::run(action, &store).await
                 }
                 cli::Command::Project { action } => {
-                    crate::cli::project::run(action, &store, memory_inline_max_bytes).await
+                    crate::cli::project::run(action, &store).await
                 }
                 cli::Command::Session { action } => {
-                    let (default, configured, projects) = match &installation {
-                        Some((default, configured, projects)) => {
-                            (default.as_deref(), Some(configured), Some(projects))
-                        }
-                        None => (None, None, None),
+                    let (default, configured) = match &installation {
+                        Some((default, configured)) => (default.as_deref(), Some(configured)),
+                        None => (None, None),
                     };
                     let profiles = crate::store::export::ImportInstallation {
                         selected: cli_ref.profile.as_deref(),
                         default,
                         configured,
-                        projects,
+                        projects: store.project_names().await?,
                     };
                     crate::cli::session::run_session_subcommand(
                         &store,

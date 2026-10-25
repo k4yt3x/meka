@@ -30,6 +30,7 @@ pub(crate) mod inbox;
 mod locks;
 pub(crate) mod memory;
 pub(crate) mod migrations;
+pub(crate) mod projects;
 pub(crate) mod schedule;
 mod scratchpad;
 mod search;

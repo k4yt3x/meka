@@ -51,9 +51,6 @@ pub(super) struct LoadToolTool {
     /// declares its deferred tools a load answers with references the wire expands, and carries no
     /// schema text of its own.
     pub(super) profile: Arc<std::sync::OnceLock<crate::provider::PublishedProfile>>,
-    /// What the session sees now, read at call time: a tool the project hides is not registered as
-    /// far as a load or a search can tell.
-    pub(super) scope: super::registry::LiveScope,
 }
 
 impl LoadToolTool {
@@ -71,12 +68,8 @@ impl LoadToolTool {
              discovery]` in the conversation context, or search with `{SEARCH_TOOL_NAME}`."
         );
         if hint.is_empty() {
-            let scope = self.scope.current();
-            let registered: Vec<Arc<dyn Tool>> = crate::sync::read(tools)
-                .iter()
-                .filter(|entry| scope.admits_tool(&entry.definition.name))
-                .map(|entry| Arc::clone(&entry.tool))
-                .collect();
+            let registered: Vec<Arc<dyn Tool>> =
+                crate::sync::read(tools).tools().cloned().collect();
             let deferred = deferred_names(&self.deferred);
             if let Some((matches, _)) = render_search(
                 &registered,
@@ -107,10 +100,9 @@ impl LoadToolTool {
         name: &str,
         tools: &std::sync::Arc<RwLock<super::registry::Registered>>,
     ) -> String {
-        let scope = self.scope.current();
         let registered: Vec<String> = crate::sync::read(tools)
             .names()
-            .filter(|name| is_carried_by_wire(&self.profile, name) && scope.admits_tool(name))
+            .filter(|name| is_carried_by_wire(&self.profile, name))
             .map(str::to_string)
             .collect();
         crate::tools::did_you_mean_hint(name, registered.iter().map(String::as_str))
@@ -182,11 +174,9 @@ impl Tool for LoadToolTool {
         let mut references: Vec<ToolResultContent> = Vec::new();
         let mut resolved = 0usize;
         let mut unresolved = 0usize;
-        let scope = self.scope.current();
         for name in &names {
             let tool = crate::sync::read(&tools)
                 .get(name)
-                .filter(|_| scope.admits_tool(name))
                 .map(|entry| Arc::clone(&entry.tool));
 
             let Some(tool) = tool else {
@@ -362,13 +352,9 @@ impl Tool for ToolSearchTool {
                 true,
             ));
         };
-        let scope = self.loader.scope.current();
         let registered: Vec<Arc<dyn Tool>> = crate::sync::read(&tools)
             .iter()
-            .filter(|entry| {
-                is_carried_by_wire(&self.loader.profile, &entry.definition.name)
-                    && scope.admits_tool(&entry.definition.name)
-            })
+            .filter(|entry| is_carried_by_wire(&self.loader.profile, &entry.definition.name))
             .map(|entry| Arc::clone(&entry.tool))
             .collect();
         let deferred = deferred_names(&self.loader.deferred);
@@ -804,7 +790,6 @@ mod tests {
             permission_overrides: Arc::clone(&overrides),
             permission: permission.clone(),
             profile: Arc::new(std::sync::OnceLock::new()),
-            scope: Default::default(),
         };
         let tool_search = ToolSearchTool {
             loader: tool_load.clone(),

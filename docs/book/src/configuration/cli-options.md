@@ -44,14 +44,12 @@ See the [`meka profile` CLI reference](./config-file.md#meka-profile-cli) for th
 
 ### `project`
 
-Manage projects: the work contexts a session opens, each a `[projects.<name>]` table and a memory
-tier of its own. See [Projects](../usage/projects.md).
+Manage projects: the names a session is on, each a memory tier of its own, kept as rows of the
+store. See [Projects](../usage/projects.md).
 
 ```bash
-meka project add webdev [--allowed-server <NAME>]... [--disabled-server <NAME>]... [--allowed-skill <NAME>]... [--disabled-skill <NAME>]...
-meka project list [--format <FORMAT>]   # name, memories, sessions, servers, skills, configured
-meka project set webdev allowed_servers fs,exa    # or disabled_servers, allowed_skills, disabled_skills
-meka project set webdev allowed_servers --unset   # back to every configured server
+meka project add webdev
+meka project list [--format <FORMAT>]   # name, when it was added, memories, sessions
 meka project remove webdev              # refused while anything is on it
 meka project rename webdev web          # moves its sessions and memories with it
 ```
@@ -155,6 +153,7 @@ meka memory edit <NAME> [--project <NAME>]      # the body, in $VISUAL, then $ED
 meka memory remove <NAME> [--project <NAME>]
 meka memory verify [--rebuild]
 meka memory export [--directory <DIR>] [--project <NAME>]   # default: ./meka-memory-export
+meka memory import <DIR> [--force]              # the reverse; --force overwrites a memory that exists
 ```
 
 `--project` names the [tier](../usage/memory.md#tiers) a command works in: a project's, or the
@@ -296,7 +295,7 @@ rewritten and it keeps that profile from then on. See
 
 ### `--project <NAME>`
 
-Open the session on a project, one of the `[projects.<name>]` tables in `config.toml`; see
+Open the session on a project, one `meka project add` created; see
 [Projects](../usage/projects.md). A new session records it, the way it records its profile, and
 sees the project's memories beside the global ones.
 
@@ -308,8 +307,8 @@ meka -r 550e --project webdev     # moves session 550e onto webdev
 ```
 
 Beside `-c` and a bare `-r`, the flag **filters** the session meka selects; beside `-r <SESSION>`
-it **moves** the session you named, rewriting its row. A name the file does not define is refused
-before anything is touched. There is no value for "no project": a session with nothing named is
+it **moves** the session you named, rewriting its row. A name no project has is refused before
+anything is touched. There is no value for "no project": a session with nothing named is
 on none, and `/project close` takes a session off one.
 
 ### `--permission <LEVEL>`

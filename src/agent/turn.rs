@@ -848,7 +848,7 @@ impl Agent {
     /// delivered.
     pub(super) async fn read_world_snapshot(&self, session_id: Uuid) -> prompt::WorldSnapshot {
         let catalog = self.tool_registry.tool_catalog();
-        let skills = self.skills.current_for(&self.project_access()).await;
+        let skills = self.skills.current().await;
         let (memories, memories_readable) = match prompt::memory_index_is_live(&catalog) {
             false => (Vec::new(), true),
             true => match self

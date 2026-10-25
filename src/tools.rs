@@ -1511,7 +1511,6 @@ mod tests {
                     sandbox_backend: crate::config::SandboxBackend::Landlock,
                     backend_probe,
                     builtin_filter: filter,
-                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },

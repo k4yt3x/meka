@@ -108,8 +108,8 @@ pub(crate) struct CreateSessionRequest {
     /// `GET /v1/profiles` lists them.
     pub(crate) profile: Option<String>,
     /// Project the session opens on, which decides the memory tier its writes land in and the
-    /// tiers it sees. Absent or empty, the session is on none. Must name a project in
-    /// `config.toml`; `GET /v1/projects` lists them.
+    /// tiers it sees. Absent or empty, the session is on none. Must name a project `meka project
+    /// add` created; `GET /v1/projects` lists them.
     pub(crate) project: Option<String>,
     /// Per-session capability flags. See the HTTP API docs § "Capabilities".
     #[serde(default)]
@@ -353,9 +353,14 @@ pub(crate) async fn create_session(
     // the one spelling for none, as it is on a `PATCH`.
     let project = match body.project.filter(|name| !name.is_empty()) {
         Some(name) => {
-            crate::config::require_project(&name, &state.shared.config.projects).map_err(
-                |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
-            )?;
+            state
+                .shared
+                .store
+                .require_project(&name)
+                .await
+                .map_err(|error| {
+                    ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+                })?;
             name
         }
         None => String::new(),
@@ -1247,9 +1252,10 @@ async fn patch_dormant_session(
     };
     // Both names checked before either is written, as the resident path checks every field up
     // front, so a body naming a profile and an unknown project leaves the row where it was.
-    let project = project
-        .map(|project| requested_project_move(state, project))
-        .transpose()?;
+    let project = match project {
+        Some(project) => Some(requested_project_move(state, project).await?),
+        None => None,
+    };
     if let Some(profile) = profile {
         crate::config::require_profile(profile, &state.shared.config.profiles).map_err(
             |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
@@ -1315,15 +1321,19 @@ async fn patch_dormant_session(
 }
 
 /// The project a `PATCH` body names as the row takes it: `None` for the empty value that takes the
-/// session off its project, the name otherwise, refused when `config.toml` does not define it.
-fn requested_project_move(
+/// session off its project, the name otherwise, refused when the store has no such project.
+async fn requested_project_move(
     state: &ServerState,
     project: &str,
 ) -> Result<Option<String>, ProblemDetail> {
     if project.is_empty() {
         return Ok(None);
     }
-    crate::config::require_project(project, &state.shared.config.projects)
+    state
+        .shared
+        .store
+        .require_project(project)
+        .await
         .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?;
     Ok(Some(project.to_string()))
 }
@@ -1526,10 +1536,10 @@ pub(crate) async fn patch_session(
         }
         None => None,
     };
-    // The project, checked against the file before anything moves; the empty value is the one
+    // The project, checked against the store before anything moves; the empty value is the one
     // spelling for off.
     let new_project: Option<Option<String>> = match body.project.as_deref() {
-        Some(project) => Some(requested_project_move(&state, project)?),
+        Some(project) => Some(requested_project_move(&state, project).await?),
         None => None,
     };
 

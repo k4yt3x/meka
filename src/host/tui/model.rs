@@ -122,16 +122,24 @@ pub(crate) enum Item {
     TurnEnd(String),
     /// An input image, which the terminal cannot draw.
     Image,
-    /// What a session with nothing in its log opens on: meka's version, the profile the session
-    /// runs on with its model, and the directory it opened in. Gone once the conversation starts;
-    /// see [`Self::keeps_banner`].
+    /// What a session with nothing in its log opens on: the build, and what the agent carries
+    /// for the whole session. The session's own facts are the status row's. Gone once the
+    /// conversation starts; see [`Self::keeps_banner`].
     Banner {
         version: String,
-        profile: String,
-        model: Option<String>,
-        /// The project the session opened on, when it opened on one.
-        project: Option<String>,
-        directory: String,
+        /// The commit the binary was built from, `-dirty` when the tree had uncommitted changes;
+        /// `None` for a build outside a checkout.
+        revision: Option<String>,
+        /// Whether the binary is an unoptimized build.
+        debug: bool,
+        /// The MCP servers the configuration enables.
+        mcp_servers: usize,
+        skills: usize,
+        /// The memories the session's opening view holds.
+        memories: usize,
+        /// The pieces of standing instructions in effect: each file read, or one for a flag or
+        /// a variable; zero for none.
+        instructions: usize,
     },
 }
 
@@ -2107,10 +2115,12 @@ mod tests {
     fn the_banner_goes_when_the_conversation_starts() {
         let banner = || Item::Banner {
             version: "0.1.0".into(),
-            profile: "work".into(),
-            model: None,
-            project: None,
-            directory: "~".into(),
+            revision: None,
+            debug: false,
+            mcp_servers: 0,
+            skills: 0,
+            memories: 0,
+            instructions: 0,
         };
         let mut transcript = transcript();
         transcript.push(banner());

@@ -9,12 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Projects: `[projects.<name>]` in `config.toml` names a work context a session opens by name.
+- Projects: `meka project add <name>` names a memory tier a session opens by name.
 - `--project`, `/project`, HTTP `project` and an ACP config option put a session on one.
 - Memory has a global tier and one per project; `memory_write` and `memory_search` take `tier`.
-- `meka project add|list|set|rename|remove`; `--project` on `memory` commands and `session list`.
+- `meka project add|list|rename|remove`; `--project` on `memory` commands and `session list`.
 - `GET /v1/projects`; `project` on the memory routes; `memory export` uses a directory per project.
-- A project narrows the MCP servers and skills its sessions see: four `allowed_`/`disabled_` lists.
+- `meka memory import <dir>` restores an export, stamps and read counts included, in one step.
+- `meka memory export` writes `export.toml` beside the files, carrying the snapshot's version.
 - `meka tool show <name>` prints a built-in tool's schema as the model receives it.
 - Every compaction is reported as what it was: what set it going, who wrote it, what it wrote.
 - The screen shows a row for every compaction, automatic ones included, and a word while one runs.
@@ -23,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `meka memory list` and `meka session list` show a `Project` column.
+- `meka memory list` and `meka session list` show a `Project` column once a project exists.
+- The screen's banner names the build and counts the servers, skills, memories and instructions.
+- The screen's status row shows the project the session is on; `[display] status_row` lists it.
 - `clipboard-win` moves to 5.4.3, off a yanked release.
 - Inline memory bodies share a 32 KiB budget, `[memory] inline_max_bytes`; it was 4 KiB and fixed.
 - A memory write that would take the inline bodies past the budget is refused, at every door alike.

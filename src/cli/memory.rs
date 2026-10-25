@@ -16,17 +16,27 @@ use crate::{
 /// Ceiling on the tags column, shown for information; `get` lists them all.
 const TAGS_TRUNCATE: usize = 24;
 
-/// The listing's columns: the name `get`, `show` and `remove` take, four facts, and the
-/// description spending the rest.
-const MEMORY_COLUMNS: [crate::text::Column; 7] = [
-    crate::text::Column::content("Name"),
-    crate::text::Column::capped("Project", crate::text::NAME_WIDTH),
-    crate::text::Column::content("Priority"),
-    crate::text::Column::content("Load"),
-    crate::text::Column::content("Recorded"),
-    crate::text::Column::capped("Tags", TAGS_TRUNCATE),
-    crate::text::Column::remainder("Description"),
-];
+/// The listing's columns: the name `get`, `show` and `remove` take, the project once the store
+/// has one, three facts, and the description spending the rest. The project column is withheld
+/// until a project exists, since a column of dashes says nothing on an installation that never
+/// defined one.
+fn memory_columns(with_project: bool) -> Vec<crate::text::Column> {
+    let mut columns = vec![crate::text::Column::content("Name")];
+    if with_project {
+        columns.push(crate::text::Column::capped(
+            "Project",
+            crate::text::NAME_WIDTH,
+        ));
+    }
+    columns.extend([
+        crate::text::Column::content("Priority"),
+        crate::text::Column::content("Load"),
+        crate::text::Column::content("Recorded"),
+        crate::text::Column::capped("Tags", TAGS_TRUNCATE),
+        crate::text::Column::remainder("Description"),
+    ]);
+    columns
+}
 
 /// Argument bag for [`run_add`], borrowed so callers don't clone every field out of the
 /// clap-derived `cli::MemoryAction::Add` variant.
@@ -57,6 +67,7 @@ pub(crate) async fn list(
     filter: &MemoryFilter,
     format: crate::cli::OutputFormat,
     stream: crate::render::Stream,
+    with_project: bool,
 ) -> Result<()> {
     let index = store.list(filter).await?;
     if format == crate::cli::OutputFormat::Json {
@@ -76,23 +87,29 @@ pub(crate) async fn list(
     let rows: Vec<Vec<String>> = index
         .iter()
         .map(|entry| {
-            vec![
-                entry.name.clone(),
-                if entry.project.is_empty() {
+            let mut row = vec![entry.name.clone()];
+            if with_project {
+                row.push(if entry.project.is_empty() {
                     "-".to_string()
                 } else {
                     entry.project.clone()
-                },
+                });
+            }
+            row.extend([
                 entry.priority.to_string(),
                 entry.load.to_string(),
                 memory::render_age(entry.created_at, now),
                 entry.tags.join(","),
                 crate::text::prose_cell(&memory::render_description_for_model(&entry.description)),
-            ]
+            ]);
+            row
         })
         .collect();
 
-    stream.write(crate::text::format_table(&MEMORY_COLUMNS, &rows))?;
+    stream.write(crate::text::format_table(
+        &memory_columns(with_project),
+        &rows,
+    ))?;
 
     Ok(())
 }
@@ -675,6 +692,18 @@ pub(crate) async fn run_export(
     if created_directory {
         create_private_export_dir(directory)?;
     }
+    // The manifest first, so a directory the files below are still landing in already says what
+    // it is; it is removed with them if one of them fails.
+    let manifest = directory.join(memory::MEMORY_EXPORT_MANIFEST);
+    if let Err(error) = crate::fs::write_file_atomic(&manifest, &memory::render_export_manifest()) {
+        remove_partial_export(&[], &[], directory, created_directory);
+        return Err(MekaError::io(format!(
+            "failed to write {}: {error}; nothing was exported",
+            manifest.display()
+        )));
+    }
+    let mut written: Vec<PathBuf> = vec![manifest];
+    written.reserve(memories.len());
 
     // Through `write_file_atomic`, for two properties `std::fs::write` lacks: the file is created
     // at 0600 inside a 0700 directory, as private as the database it came from, and it `fsync`s
@@ -686,7 +715,6 @@ pub(crate) async fn run_export(
     // A project's memories go under a directory of its name, so two projects holding one name
     // write two files; the frontmatter carries the project regardless, and is what a reader
     // trusts. Created as privately as the root, on the first memory that needs it.
-    let mut written: Vec<PathBuf> = Vec::with_capacity(memories.len());
     let mut project_directories: Vec<PathBuf> = Vec::new();
     for memory in &memories {
         let parent = if memory.project.is_empty() {
@@ -744,6 +772,108 @@ pub(crate) async fn run_export(
         directory = directory.display()
     );
     Ok(())
+}
+
+/// `meka memory import <DIR>`: the reverse of [`run_export`], every memory file of the snapshot
+/// into the store in one transaction, with the manifest read first so a snapshot an older meka
+/// wrote is brought forward, or refused, before a file is parsed.
+///
+/// Every file is parsed and checked before the store is asked, so a refusal names the file and
+/// nothing has moved; the store's own refusals, a project it lacks, a name taken in the same tier
+/// without `--force`, a name the other kind of tier holds and the inline budget, roll the whole
+/// import back the same way.
+pub(crate) async fn run_import(store: &MemoryStore, directory: &Path, force: bool) -> Result<()> {
+    let manifest_path = directory.join(memory::MEMORY_EXPORT_MANIFEST);
+    let manifest = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        MekaError::Usage(format!(
+            "{} is not a memory export: failed to read {}: {error}",
+            directory.display(),
+            memory::MEMORY_EXPORT_MANIFEST
+        ))
+    })?;
+    let version = memory::parse_export_manifest(&manifest).map_err(MekaError::Usage)?;
+    let files = export_files(directory)?;
+    if files.is_empty() {
+        return Err(MekaError::Usage(format!(
+            "nothing to import: {} holds no memory files",
+            directory.display()
+        )));
+    }
+    let mut entries = Vec::with_capacity(files.len());
+    for path in &files {
+        let refusal = |reason: String| MekaError::Usage(format!("{}: {reason}", path.display()));
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| refusal(format!("failed to read the file: {error}")))?;
+        let (frontmatter, body) = memory::split_memory_file(&text).map_err(refusal)?;
+        let mut frontmatter: yaml_serde::Value = yaml_serde::from_str(frontmatter)
+            .map_err(|error| refusal(format!("the frontmatter is not YAML: {error}")))?;
+        // Only the migration module knows what an older meka wrote, so a snapshot at another
+        // version is handed over file by file and read back brought forward, or refused.
+        if version != memory::MEMORY_EXPORT_FORMAT_VERSION
+            && !crate::store::migrations::bring_memory_file_forward(
+                &mut frontmatter,
+                version,
+                memory::MEMORY_EXPORT_FORMAT_VERSION,
+            )
+        {
+            return Err(MekaError::Usage(format!(
+                "unsupported memory export format_version {version} (this build supports {})",
+                memory::MEMORY_EXPORT_FORMAT_VERSION
+            )));
+        }
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| refusal("the file name is not a memory name".to_string()))?;
+        entries.push(memory::memory_from_export(name, frontmatter, body).map_err(refusal)?);
+    }
+    let count = store.import(entries, force).await?;
+    tracing::info!(
+        "imported {count} memories from {directory}",
+        directory = directory.display()
+    );
+    Ok(())
+}
+
+/// The memory files of an export directory, sorted: the `.md` files at its root, then those one
+/// directory down, where [`run_export`] puts a project's. Anything else in the tree is left
+/// alone, so the manifest, a `.git` directory and an editor's leftovers are not read as memories.
+fn export_files(directory: &Path) -> Result<Vec<PathBuf>> {
+    let (mut files, subdirectories) = split_entries(directory)?;
+    for subdirectory in subdirectories {
+        files.extend(split_entries(&subdirectory)?.0);
+    }
+    Ok(files)
+}
+
+/// One directory's entries, sorted and split into its `.md` files and its directories, a hidden
+/// directory left out.
+fn split_entries(directory: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let unreadable = |error: std::io::Error| {
+        MekaError::io(format!("failed to read {}: {error}", directory.display()))
+    };
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(directory)
+        .map_err(unreadable)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()
+        .map_err(unreadable)?;
+    paths.sort();
+    let (directories, files): (Vec<PathBuf>, Vec<PathBuf>) =
+        paths.into_iter().partition(|path| path.is_dir());
+    let files = files
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+        .collect();
+    let directories = directories
+        .into_iter()
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+        })
+        .collect();
+    Ok((files, directories))
 }
 
 /// Create the export directory born at 0700, rather than at whatever the umask allows.
@@ -883,7 +1013,7 @@ async fn require_memory(
 }
 
 pub(crate) async fn run_memory_subcommand(
-    store: &Store,
+    database: &Store,
     action: &crate::cli::MemoryAction,
     inline_max_bytes: usize,
 ) -> anyhow::Result<()> {
@@ -891,7 +1021,7 @@ pub(crate) async fn run_memory_subcommand(
     // memories; it is not a reason to refuse to show, back up or delete what is already stored.
     // The inline budget does apply: it is a bound on what the band shows whole, and an operator's
     // `add` past it would put the store in the state the agent's own writes are refused for.
-    let store = store.memory_store(true, inline_max_bytes);
+    let store = database.memory_store(true, inline_max_bytes);
     match action {
         crate::cli::MemoryAction::List {
             format,
@@ -913,8 +1043,15 @@ pub(crate) async fn run_memory_subcommand(
                 },
                 expired: *expired,
             };
-            crate::cli::memory::list(&store, &filter, *format, crate::render::Stream::Stdout)
-                .await?
+            let with_project = !database.project_names().await?.is_empty();
+            crate::cli::memory::list(
+                &store,
+                &filter,
+                *format,
+                crate::render::Stream::Stdout,
+                with_project,
+            )
+            .await?
         }
         crate::cli::MemoryAction::Get {
             name,
@@ -950,11 +1087,10 @@ pub(crate) async fn run_memory_subcommand(
             verified,
             force,
         } => {
-            // A project the file does not define is refused here, as every door that puts a
-            // row on a project refuses it: the global tier is the one spelled empty.
+            // A project the store does not have is refused here, as every door that puts a row
+            // on a project refuses it: the global tier is the one spelled empty.
             if let Some(project) = project.as_deref().filter(|project| !project.is_empty()) {
-                let config_file = crate::config::load_config_file_or_err()?;
-                crate::config::require_project(project, &config_file.projects)?;
+                database.require_project(project).await?;
             }
             crate::cli::memory::run_add(&store, crate::cli::memory::AddArgs {
                 name,
@@ -987,6 +1123,9 @@ pub(crate) async fn run_memory_subcommand(
                 .clone()
                 .unwrap_or_else(crate::cli::memory::default_export_dir);
             crate::cli::memory::run_export(&store, &directory, project.as_deref()).await?
+        }
+        crate::cli::MemoryAction::Import { directory, force } => {
+            crate::cli::memory::run_import(&store, directory, *force).await?
         }
     }
     Ok(())
@@ -1855,5 +1994,104 @@ mod tests {
             .await
             .expect_err("must refuse a non-empty directory");
         assert!(error.to_string().contains("not empty"), "{error}");
+    }
+
+    /// An export imports back into an empty store as it was: the same memories, bodies, stamps
+    /// and read counts, project memories under their project. A directory without the manifest,
+    /// and a manifest at a version this build does not read, are refused before anything moves.
+    #[tokio::test]
+    async fn an_export_imports_back_as_it_was() {
+        let source_database = crate::store::Store::for_test().await;
+        source_database.add_project("ops").await.expect("project");
+        let source =
+            source_database.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
+        for (name, project, body) in [("tone", "", "Be brief."), ("deploy", "ops", "Run it.")] {
+            source
+                .write(WriteRequest {
+                    name: name.to_string(),
+                    description: Some(format!("{name} description")),
+                    tags: Some(vec!["t".to_string()]),
+                    body: Some(body.to_string()),
+                    priority: Some(2),
+                    view: MemoryView::for_operator(Some(project)),
+                    ..WriteRequest::default()
+                })
+                .await
+                .expect("write");
+        }
+        source
+            .record_read("tone", &MemoryView::Global)
+            .await
+            .expect("a read");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("export");
+        run_export(&source, &directory, None).await.expect("export");
+        assert_eq!(
+            std::fs::read_to_string(directory.join(memory::MEMORY_EXPORT_MANIFEST))
+                .expect("manifest"),
+            "format_version = 1\n"
+        );
+        assert!(directory.join("ops").join("deploy.md").is_file());
+
+        let target_database = crate::store::Store::for_test().await;
+        target_database.add_project("ops").await.expect("project");
+        let target =
+            target_database.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
+        run_import(&target, &directory, false)
+            .await
+            .expect("import");
+        let exported = source.export_all(&MemoryView::All).await.expect("source");
+        let imported = target.export_all(&MemoryView::All).await.expect("target");
+        let shape = |memories: &[memory::Memory]| {
+            memories
+                .iter()
+                .map(|memory| {
+                    (
+                        memory.name.clone(),
+                        memory.project.clone(),
+                        memory.description.clone(),
+                        memory.body.clone(),
+                        memory.tags.clone(),
+                        memory.priority,
+                        memory.created_at,
+                        memory.verified_at,
+                        memory.read_count,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&imported), shape(&exported));
+        assert_eq!(imported[0].read_count, 1, "the read count rides along");
+
+        let bare = temp.path().join("bare");
+        std::fs::create_dir_all(&bare).expect("mkdir");
+        std::fs::write(bare.join("tone.md"), "---\ndescription: x\n---\n\n\n").expect("file");
+        let refused = run_import(&target, &bare, true)
+            .await
+            .expect_err("no manifest");
+        assert!(
+            refused.to_string().contains("is not a memory export"),
+            "{refused}"
+        );
+        std::fs::write(
+            bare.join(memory::MEMORY_EXPORT_MANIFEST),
+            "format_version = 2\n",
+        )
+        .expect("manifest");
+        let refused = run_import(&target, &bare, true)
+            .await
+            .expect_err("a version this build does not read");
+        assert_eq!(
+            refused.to_string(),
+            "unsupported memory export format_version 2 (this build supports 1)"
+        );
+        assert!(
+            target
+                .get("tone", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_some_and(|tone| tone.description == "tone description"),
+            "nothing moved"
+        );
     }
 }

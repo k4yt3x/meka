@@ -119,31 +119,29 @@ impl From<&SessionMatch> for SessionMatchView {
     }
 }
 
-/// A project as `meka project list` prints it and `GET /v1/projects` answers with: its name and
-/// how many memories and sessions are on it.
+/// A project as `meka project list` prints it and `GET /v1/projects` answers with: its name, when
+/// it was added, and how many memories and sessions are on it.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct ProjectView {
     pub(crate) name: String,
+    /// RFC 3339.
+    pub(crate) created_at: String,
     /// Memories in the project's tier.
     pub(crate) memories: u64,
     /// Root sessions on the project.
     pub(crate) sessions: u64,
-    /// Whether `config.toml` defines the project. A name only the store carries is one that was
-    /// removed from the file, or renamed by hand, while rows still named it.
-    pub(crate) configured: bool,
-    /// The MCP servers its sessions see, named in full; absent for every configured server.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) allowed_servers: Option<Vec<String>>,
-    /// The MCP servers its sessions do not see; absent for none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) disabled_servers: Option<Vec<String>>,
-    /// The skills its sessions see, named in full; absent for every installed skill.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) allowed_skills: Option<Vec<String>>,
-    /// The skills its sessions do not see; absent for none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) disabled_skills: Option<Vec<String>>,
+}
+
+impl From<crate::store::projects::ProjectRecord> for ProjectView {
+    fn from(record: crate::store::projects::ProjectRecord) -> Self {
+        Self {
+            name: record.name,
+            created_at: record.created_at,
+            memories: record.memories,
+            sessions: record.sessions,
+        }
+    }
 }
 
 /// A profile as `meka profile list` prints it and `GET /v1/profiles` answers with: its account, the

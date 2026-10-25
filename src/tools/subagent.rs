@@ -63,13 +63,6 @@ pub(crate) struct ToolBuilderParams {
     pub(crate) parent_options: AgentOptions,
 }
 
-impl ToolBuilderParams {
-    /// The spawning session's view of the servers and skills, read now.
-    pub(crate) fn project_lens(&self) -> crate::session::ProjectLens {
-        self.cells.project_lens(&self.materials.core.projects)
-    }
-}
-
 /// The terms a sub-agent was spawned under, persisted as JSON on its session row
 /// (`sessions.subagent_spec_json`).
 ///
@@ -480,12 +473,7 @@ impl Tool for AgentSpawnTool {
         // bad name fails fast without leaving an orphan child session behind.
         let skill = match &skill_name {
             Some(name) => {
-                let installed = self
-                    .tool_builder_params
-                    .materials
-                    .skills
-                    .current_for(&self.tool_builder_params.project_lens().access())
-                    .await;
+                let installed = self.tool_builder_params.materials.skills.current().await;
                 match installed.find(name) {
                     Some(skill) => Some(skill.clone()),
                     // A skill whose `SKILL.md` will not parse is in no index, so listing what *is*
@@ -653,11 +641,7 @@ impl Tool for AgentSpawnTool {
                 );
             }
         }
-        // Narrowed by the parent's project as well: a worker spawned from a project session sees
-        // what that session sees, and no wider, whatever the call asked for.
-        let effective_scope = self.inherited_scope.narrow(&call_site_scope).narrow(
-            &super::registry::project_tool_scope(&self.tool_builder_params.project_lens().access()),
-        );
+        let effective_scope = self.inherited_scope.narrow(&call_site_scope);
 
         // Context grants. Both default to nothing and are clamped against what this agent itself
         // holds, so a worker can never hand a grandchild more than it was given. Unlike the deny
@@ -2839,7 +2823,6 @@ mod tests {
                         reason: "test fixture".to_string(),
                     },
                     builtin_filter: BuiltinToolFilter::default(),
-                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -2913,7 +2896,6 @@ mod tests {
                         reason: "test fixture".to_string(),
                     },
                     builtin_filter: BuiltinToolFilter::default(),
-                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -3249,6 +3231,7 @@ mod tests {
                 compact_checkpoint: false,
                 turn_retention: None,
                 user_instructions: Some("never inherited by a worker".to_string()),
+                user_instructions_count: 1,
                 mcp_grace: std::time::Duration::ZERO,
                 system_prompt_override: None,
             },
@@ -4115,60 +4098,6 @@ mod tests {
             Some("movie".to_string()),
             "the row follows the parent, as it does for the profile"
         );
-    }
-
-    /// A worker spawned from a session on a project sees what that session sees: the project's
-    /// disabled servers are in the spec the spawn records, whatever the call asked for.
-    #[tokio::test]
-    async fn a_spawned_worker_s_scope_is_narrowed_by_its_parent_s_project() {
-        let store = store_for_test().await;
-        let parent_sid = store
-            .create_session(None, "test-profile".to_string())
-            .await
-            .expect("parent");
-        let mut params = params_for_test(
-            store.clone(),
-            crate::session::SharedSessionId::new(Some(parent_sid)),
-        );
-        params.cells.profile = binding_named(
-            Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
-                text_round("done"),
-            ])),
-            "test-profile",
-        );
-        params.cells.project = crate::session::SharedProject::new(Some("webdev".to_string()));
-        params.materials.core.projects = Arc::new(
-            toml::from_str("[webdev]\ndisabled_servers = [\"notion\"]\n").expect("projects"),
-        );
-        let spawn = AgentSpawnTool {
-            parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
-            tool_builder_params: params,
-            inherited_scope: ToolScope::default(),
-            remaining_depth: 1,
-            absolute_depth: 0,
-        };
-        let output = spawn
-            .execute(
-                serde_json::json!({"prompt": "do a thing", "permission": "read"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
-            )
-            .await
-            .expect("spawn");
-        let text = output.text_content();
-        let agent_id: Uuid = text
-            .lines()
-            .find_map(|line| line.strip_prefix("Agent: "))
-            .and_then(|id| Uuid::parse_str(id.trim()).ok())
-            .unwrap_or_else(|| panic!("no agent id in: {text}"));
-        let spec: SubagentSpec = serde_json::from_str(
-            &store
-                .load_subagent_spec(agent_id)
-                .await
-                .expect("load spec")
-                .expect("a spawned worker has a spec"),
-        )
-        .expect("spec decodes");
-        assert_eq!(spec.denied_servers, ["notion"]);
     }
 
     /// The sibling of the test above, on the follow-up door.

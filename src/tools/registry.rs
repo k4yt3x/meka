@@ -318,60 +318,6 @@ pub(super) fn is_carried_by_wire(
         .get()
         .is_some_and(|profile| profile.current().provider.refuses_tool_name(name))
 }
-/// The tool scope a project's view amounts to: its disabled servers denied and, when it names an
-/// allow-list, only those servers admitted. A project never names a tool, so that side is left
-/// unrestricted.
-pub(crate) fn project_tool_scope(access: &crate::config::ProjectAccess) -> ToolScope {
-    ToolScope::new(
-        access.disabled_servers().iter().cloned(),
-        std::iter::empty::<String>(),
-    )
-    .allowing(
-        access
-            .allowed_servers()
-            .map(|servers| servers.iter().cloned()),
-        None::<Vec<String>>,
-    )
-}
-
-/// A registry's scope as it stands now: the configured or spawned scope narrowed by the project
-/// the session is on, read per call so a project move changes what the next call sees. Handed to
-/// the meta-tools in place of a copy, which would freeze the project at registration.
-#[derive(Clone)]
-pub(crate) struct LiveScope {
-    base: Arc<ToolScope>,
-    project: Arc<std::sync::OnceLock<crate::session::ProjectLens>>,
-}
-
-impl Default for LiveScope {
-    /// A scope that admits everything and follows no project.
-    fn default() -> Self {
-        Self {
-            base: Arc::new(ToolScope::default()),
-            project: Arc::new(std::sync::OnceLock::new()),
-        }
-    }
-}
-
-impl From<ToolScope> for LiveScope {
-    /// A fixed scope with no project behind it, as a registry built with no session has.
-    fn from(scope: ToolScope) -> Self {
-        Self {
-            base: Arc::new(scope),
-            project: Arc::new(std::sync::OnceLock::new()),
-        }
-    }
-}
-
-impl LiveScope {
-    pub(crate) fn current(&self) -> ToolScope {
-        match self.project.get() {
-            Some(lens) => self.base.narrow(&project_tool_scope(&lens.access())),
-            None => (*self.base).clone(),
-        }
-    }
-}
-
 /// The one sentence a load or a call of a tool the wire does not carry is answered with.
 pub(crate) fn not_carried_refusal(name: &str) -> String {
     format!("Tool '{name}' is not available on this profile's backend.")
@@ -575,14 +521,7 @@ pub(crate) struct ToolRegistry {
     /// `builtin_filter` this covers MCP tools too, and is read back out by
     /// [`crate::tools::mcp_adapter::install_on_worker_registry`] and
     /// [`mcp_resources::register_all`] so the registry stays the single place the answer lives.
-    /// What this decides at registration; what the model sees is this narrowed by the project,
-    /// see [`Self::tool_scope`].
     pub(super) tool_scope: Arc<ToolScope>,
-    /// The lens on the session's project, published once the cells are known. Read at every
-    /// lookup rather than applied at registration, because a project move mid-session has to
-    /// change what the next call sees, and a server the new project admits may have been hidden
-    /// when its tools arrived. Unset on a registry no session published to, which sees everything.
-    pub(super) project: Arc<std::sync::OnceLock<crate::session::ProjectLens>>,
     /// Files read this session, shared with the file tools so `file_edit` can require a prior
     /// read. Cleared on conversation compaction.
     pub(super) read_tracker: ReadTracker,
@@ -678,6 +617,10 @@ impl Registered {
             .iter()
             .map(|entry| entry.definition.name.as_str())
     }
+
+    pub(super) fn tools(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        self.entries.iter().map(|entry| &entry.tool)
+    }
 }
 
 /// The tools a request carries, and what their schemas cost the window.
@@ -738,7 +681,6 @@ impl ToolRegistry {
             permission_overrides: Arc::new(overrides),
             builtin_filter: Arc::new(filter),
             tool_scope: Arc::new(tool_scope),
-            project: Arc::new(std::sync::OnceLock::new()),
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
             background_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile: Arc::new(std::sync::OnceLock::new()),
@@ -765,38 +707,11 @@ impl ToolRegistry {
             .unwrap_or_else(crate::workspace::WriteScope::deny_all)
     }
 
-    /// What this registry refuses to register: the configured or spawned scope alone. Read by the
-    /// MCP installation paths so they can skip a withheld server's discovery round trip, rather
-    /// than each caller threading its own copy of the lists. The project is not in it, since a
-    /// project move must be able to show a server whose tools were registered while it was hidden.
-    pub(crate) fn registration_scope(&self) -> &ToolScope {
+    /// What this registry refuses to register. Read by the MCP installation paths so they can skip
+    /// a withheld server's discovery round trip and its resource/prompt meta-tools, rather than
+    /// each caller threading its own copy of the lists.
+    pub(crate) fn tool_scope(&self) -> &ToolScope {
         &self.tool_scope
-    }
-
-    /// What the session sees now: the registration scope narrowed by the project it is on.
-    pub(crate) fn tool_scope(&self) -> ToolScope {
-        self.live_scope().current()
-    }
-
-    /// The same, as a handle that reads the project per call; see [`LiveScope`].
-    pub(crate) fn live_scope(&self) -> LiveScope {
-        LiveScope {
-            base: Arc::clone(&self.tool_scope),
-            project: Arc::clone(&self.project),
-        }
-    }
-
-    /// Hand the registry the session's project lens; a second call is ignored, as for the profile.
-    pub(crate) fn publish_project(&self, lens: crate::session::ProjectLens) {
-        let _already_set = self.project.set(lens);
-    }
-
-    /// The project's own narrowing, which every lookup the model can make applies.
-    fn project_scope(&self) -> ToolScope {
-        self.project
-            .get()
-            .map(|lens| project_tool_scope(&lens.access()))
-            .unwrap_or_default()
     }
 
     /// Whether this registry will accept a tool by that name: it has to pass both the `[tools]`
@@ -925,7 +840,6 @@ impl ToolRegistry {
             permission_overrides: Arc::clone(&self.permission_overrides),
             permission: crate::tools::tests::shared_permission_for_test(),
             profile: Arc::clone(&self.profile),
-            scope: self.live_scope(),
         }));
     }
 
@@ -977,36 +891,9 @@ impl ToolRegistry {
         let _already_set = self.profile.set(profile.clone());
     }
 
-    /// Whether the model can see the tool `name` now: the wire carries it ([`is_carried_by_wire`])
-    /// and the session's project admits its server. The seven MCP meta-tools ride only while the
-    /// project leaves a configured server for them to name; seven tools that can only answer
-    /// "unknown server" are worse than none, since the model spends turns discovering that.
+    /// Whether this session's wire carries the tool `name` now; see [`is_carried_by_wire`].
     pub(crate) fn is_carried(&self, name: &str) -> bool {
-        self.is_carried_within(name, &self.project_scope())
-    }
-
-    /// [`Self::is_carried`] against a project scope the caller read once, for a pass over every
-    /// registered tool.
-    fn is_carried_within(&self, name: &str, project: &ToolScope) -> bool {
-        is_carried_by_wire(&self.profile, name) && self.project_admits(name, project)
-    }
-
-    /// Whether the session's project lets the model see `name`: the one answer the catalog and
-    /// the call door share, so a tool the model cannot see is not one it can call from memory.
-    fn project_admits(&self, name: &str, project: &ToolScope) -> bool {
-        if !project.admits_tool(name) {
-            return false;
-        }
-        if !project.is_unrestricted()
-            && crate::tools::MCP_META_TOOL_NAMES.contains(&name)
-            && let Some(manager) = self.mcp_manager()
-        {
-            return manager
-                .server_names()
-                .iter()
-                .any(|server| project.admits_server(server));
-        }
-        true
+        is_carried_by_wire(&self.profile, name)
     }
 
     /// How this session's wire carries deferred tools now; see [`wire_delivery`].
@@ -1017,10 +904,9 @@ impl ToolRegistry {
     /// Every registered tool name the wire carries. Unlike [`Self::tool_catalog`] this clones no
     /// descriptions and imposes no order, which is all a "did you mean" lookup needs.
     pub(crate) fn registered_tool_names(&self) -> Vec<String> {
-        let project = self.project_scope();
         crate::sync::read(&self.tools)
             .names()
-            .filter(|name| self.is_carried_within(name, &project))
+            .filter(|name| self.is_carried(name))
             .map(str::to_string)
             .collect()
     }
@@ -1031,12 +917,7 @@ impl ToolRegistry {
         crate::sync::read(&self.deferred).contains(name)
     }
 
-    /// The tool `name`, for a call. `None` for a tool the session's project hides as for one that
-    /// is not registered: a tool the model cannot see is not one it can call by guessing the name.
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        if !self.project_admits(name, &self.project_scope()) {
-            return None;
-        }
         crate::sync::read(&self.tools)
             .get(name)
             .map(|entry| Arc::clone(&entry.tool))
@@ -1138,12 +1019,8 @@ impl ToolRegistry {
         // and later removed (an MCP `tools/list_changed` swap) and drops out; a set declared
         // outright is in the array and priced.
         let mut loaded_names: HashSet<&str> = HashSet::new();
-        let project = self.project_scope();
         for name in loaded {
-            if carried.declared_outright
-                || !deferred.contains(name)
-                || !self.is_carried_within(name, &project)
-            {
+            if carried.declared_outright || !deferred.contains(name) || !self.is_carried(name) {
                 continue;
             }
             if let Some(entry) = tools.get(name) {
@@ -1190,10 +1067,9 @@ impl ToolRegistry {
     /// and the catalog, so the catalog never calls a tool deferred that the array declares.
     fn carried<'a>(&self, tools: &'a Registered, deferred_names: &HashSet<String>) -> Carried<'a> {
         let delivery = self.deferred_tool_delivery();
-        let project = self.project_scope();
         let (deferred, active): (Vec<&RegisteredTool>, Vec<&RegisteredTool>) = tools
             .iter()
-            .filter(|entry| self.is_carried_within(&entry.definition.name, &project))
+            .filter(|entry| self.is_carried(&entry.definition.name))
             .partition(|entry| deferred_names.contains(&entry.definition.name));
         let discovery_rides = !deferred.is_empty() && delivery != DeferredToolDelivery::Searched;
         let mut carried = Carried {
@@ -1375,7 +1251,6 @@ impl ToolRegistry {
             permission_overrides: Arc::clone(&self.permission_overrides),
             permission: cells.permission.clone(),
             profile: Arc::clone(&self.profile),
-            scope: self.live_scope(),
         };
         // In the order the model meets them: a search finds, a load follows.
         self.register_builtin(Arc::new(load_tool::ToolSearchTool {
@@ -1386,14 +1261,11 @@ impl ToolRegistry {
         // the whole point of the config switch: a disabled subsystem must keep its schemas out of
         // every request, not ship tools that can only ever fail.
         if skills.enabled() {
-            let lens = cells.project_lens(&materials.core.projects);
             self.register_builtin(Arc::new(skill::SkillReadTool {
                 skills: skills.clone(),
-                lens: lens.clone(),
             }));
             self.register_builtin(Arc::new(skill::SkillSearchTool {
                 skills: skills.clone(),
-                lens: lens.clone(),
             }));
             // Authoring is opt-in per installation and never reaches a sub-agent. Same reasoning
             // as `MemoryAccess::Write` being unreachable from `agent_spawn`, and stronger here: a
@@ -1402,13 +1274,11 @@ impl ToolRegistry {
             if skills_managed {
                 self.register_builtin(Arc::new(skill::SkillWriteTool {
                     skills: skills.clone(),
-                    lens: lens.clone(),
                 }));
                 self.register_builtin(Arc::new(skill::SkillEditTool {
                     skills: skills.clone(),
-                    lens: lens.clone(),
                 }));
-                self.register_builtin(Arc::new(skill::SkillDeleteTool { skills, lens }));
+                self.register_builtin(Arc::new(skill::SkillDeleteTool { skills }));
             }
         }
         // Two independent gates: `enabled()` is whether this installation keeps memories at all,
@@ -1615,7 +1485,6 @@ impl ToolRegistry {
     ) -> Result<Self> {
         let registry = Self::new_with_filter(materials.core.builtin_filter.clone());
         registry.publish_profile(&cells.profile);
-        registry.publish_project(cells.project_lens(&materials.core.projects));
         // Before the tools are registered, because both the `task_*` registration and the schema
         // splice read this flag.
         if materials.background.enabled {
@@ -1628,14 +1497,7 @@ impl ToolRegistry {
             parent_session_id: None,
             inherited_scratchpad_names: Vec::new(),
             schedule: Some(materials.schedule.clone()),
-            // Narrowed by the session's project, read live, so a gate names only what the
-            // session could call itself.
-            gate_tools: options.gate_tools.clone().map(|inner| {
-                Arc::new(super::gate::ScopedGateTools::new(
-                    inner,
-                    registry.live_scope(),
-                )) as Arc<dyn crate::schedule::GateTools>
-            }),
+            gate_tools: options.gate_tools.clone(),
             background: true,
             context_ceiling_percent: options.context_ceiling_percent,
             auto_compact: options.auto_compact,
@@ -1732,7 +1594,6 @@ impl ToolRegistry {
             scope.tool_scope,
         );
         registry.publish_profile(&cells.profile);
-        registry.publish_project(cells.project_lens(&materials.core.projects));
         registry.register_core_tools(&materials.core, cells.site())?;
         registry.register_session_scoped_tools(materials, cells, SessionScope {
             // Never, whatever the installation's `agent_managed` says. See the registration site.
@@ -1828,7 +1689,6 @@ mod tests {
                     sandbox_backend: crate::config::SandboxBackend::Landlock,
                     backend_probe: crate::sandbox::BackendProbe::Ok(sandbox_capability),
                     builtin_filter: BuiltinToolFilter::default(),
-                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -1908,7 +1768,6 @@ mod tests {
                     sandbox_backend: crate::config::SandboxBackend::Landlock,
                     backend_probe: crate::sandbox::BackendProbe::Ok(sandbox_capability),
                     builtin_filter: BuiltinToolFilter::default(),
-                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -2328,7 +2187,6 @@ mod tests {
                     sandbox_backend: crate::config::SandboxBackend::Landlock,
                     backend_probe,
                     builtin_filter: BuiltinToolFilter::default(),
-                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -2455,7 +2313,6 @@ mod tests {
                     sandbox_backend: crate::config::SandboxBackend::Landlock,
                     backend_probe: crate::sandbox::BackendProbe::Ok(sandbox_capability),
                     builtin_filter: BuiltinToolFilter::default(),
-                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -3177,7 +3034,6 @@ mod tests {
                     sandbox_backend: crate::config::SandboxBackend::Landlock,
                     backend_probe,
                     builtin_filter: filter,
-                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -3261,7 +3117,6 @@ mod tests {
                     sandbox_backend: crate::config::SandboxBackend::Landlock,
                     backend_probe,
                     builtin_filter: BuiltinToolFilter::default(),
-                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -3691,163 +3546,5 @@ mod tests {
                 "BUILTIN_TOOL_NAMES missing '{expected}'"
             );
         }
-    }
-
-    /// A project's view narrows what the model can see of the registry, read live: the catalog,
-    /// the names a hint draws on, a lookup for a call and the scope the meta-tools consult all
-    /// follow the project the session is on now, so a move mid-session changes the next call.
-    #[tokio::test]
-    async fn a_project_s_view_hides_a_server_s_tools_until_the_session_moves() {
-        let registry = ToolRegistry::new();
-        for name in ["mcp__hidden__search", "mcp__open__search", "plain_tool"] {
-            registry
-                .register(Arc::new(StubTool {
-                    name: name.to_string(),
-                }))
-                .expect("register");
-        }
-        registry.register_load_tool_for_test();
-        let projects: std::collections::BTreeMap<String, crate::config::ProjectConfig> =
-            toml::from_str(
-                "[narrow]\ndisabled_servers = [\"hidden\"]\n[strict]\nallowed_servers = \
-                 [\"open\"]\n",
-            )
-            .expect("projects");
-        let project = crate::session::SharedProject::new(Some("narrow".to_string()));
-        registry.publish_project(crate::session::ProjectLens::new(
-            project.clone(),
-            Arc::new(projects),
-        ));
-        let catalog = |registry: &ToolRegistry| -> Vec<String> {
-            registry
-                .tool_catalog()
-                .into_iter()
-                .map(|(name, ..)| name)
-                .collect()
-        };
-
-        let seen = catalog(&registry);
-        assert!(
-            !seen.iter().any(|name| name == "mcp__hidden__search"),
-            "{seen:?}"
-        );
-        assert!(
-            seen.iter().any(|name| name == "mcp__open__search"),
-            "{seen:?}"
-        );
-        assert!(seen.iter().any(|name| name == "plain_tool"), "{seen:?}");
-        assert!(registry.get("mcp__hidden__search").is_none());
-        assert!(registry.get("mcp__open__search").is_some());
-        assert!(
-            !registry
-                .registered_tool_names()
-                .iter()
-                .any(|name| name == "mcp__hidden__search")
-        );
-        let scope = registry.tool_scope();
-        assert!(!scope.admits_server("hidden") && scope.admits_server("open"));
-        assert!(
-            registry.registration_scope().admits_server("hidden"),
-            "the project narrows what is seen, never what is registered"
-        );
-        let load = registry.get("tool_load").expect("tool_load");
-        let output = load
-            .execute(
-                serde_json::json!({"name": "mcp__hidden__search"}),
-                crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
-            )
-            .await
-            .expect("load");
-        assert!(
-            output.text_content().contains("is not registered"),
-            "{}",
-            output.text_content()
-        );
-
-        // Off the project, everything; on the strict one, only the server named in full, while
-        // a built-in rides regardless; on a project the file lacks, no server at all.
-        project.set(None);
-        assert!(
-            catalog(&registry)
-                .iter()
-                .any(|name| name == "mcp__hidden__search")
-        );
-        project.set(Some("strict".to_string()));
-        let seen = catalog(&registry);
-        assert!(
-            !seen.iter().any(|name| name == "mcp__hidden__search"),
-            "{seen:?}"
-        );
-        assert!(
-            seen.iter().any(|name| name == "mcp__open__search"),
-            "{seen:?}"
-        );
-        assert!(seen.iter().any(|name| name == "plain_tool"), "{seen:?}");
-        project.set(Some("gone".to_string()));
-        let seen = catalog(&registry);
-        assert!(
-            !seen.iter().any(|name| name.starts_with("mcp__"))
-                && seen.iter().any(|name| name == "plain_tool"),
-            "{seen:?}"
-        );
-    }
-
-    /// The MCP meta-tools are registered whatever the project says, since a session may move to a
-    /// project with servers, and ride in the catalog only while the project leaves them a server
-    /// to name.
-    #[tokio::test]
-    async fn the_mcp_meta_tools_ride_only_while_the_project_leaves_them_a_server() {
-        let manager = crate::mcp::McpClientManager::prepare(
-            &[crate::config::McpServerConfig::for_test("notes")],
-            None,
-            None,
-            crate::mcp::McpClientContext::new(),
-            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
-        )
-        .await
-        .expect("prepare");
-        let registry = ToolRegistry::new();
-        registry.set_mcp_manager(std::sync::Arc::downgrade(&manager));
-        let project = crate::session::SharedProject::new(Some("quiet".to_string()));
-        registry.publish_project(crate::session::ProjectLens::new(
-            project.clone(),
-            Arc::new(
-                toml::from_str("[quiet]\ndisabled_servers = [\"notes\"]\n").expect("projects"),
-            ),
-        ));
-        mcp_resources::register_all(&registry, std::sync::Arc::clone(&manager));
-        assert!(
-            crate::sync::read(&registry.tools)
-                .get("mcp_resource_list")
-                .is_some(),
-            "registered, so a later move can show it"
-        );
-        assert!(
-            registry.get("mcp_resource_list").is_none(),
-            "and not callable while withheld, as nothing the catalog hides is"
-        );
-        let catalog = |registry: &ToolRegistry| -> Vec<String> {
-            registry
-                .tool_catalog()
-                .into_iter()
-                .map(|(name, ..)| name)
-                .collect()
-        };
-        assert!(
-            !catalog(&registry)
-                .iter()
-                .any(|name| name == "mcp_resource_list"),
-            "withheld while the project hides every server: {:?}",
-            catalog(&registry)
-        );
-        project.set(None);
-        assert!(
-            catalog(&registry)
-                .iter()
-                .any(|name| name == "mcp_resource_list"),
-            "{:?}",
-            catalog(&registry)
-        );
-        assert!(registry.get("mcp_resource_list").is_some());
     }
 }

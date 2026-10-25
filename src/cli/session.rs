@@ -10,17 +10,27 @@
 use crate::{cli, conversation, store::Store, text::Precision, view::SessionView};
 
 /// The listing's columns: an id prefix every session command accepts, the timestamp, the profile
-/// and the project for information, and the first message's words spending the rest.
+/// and, once the store has a project, the project for information, and the first message's words
+/// spending the rest. The project column is withheld until a project exists, since a column of
+/// dashes says nothing on an installation that never defined one.
 ///
 /// A full UUID would cost 36 of the 120 to repeat what eight characters usually say, and
 /// [`show_session`] has the whole one.
-const SESSION_COLUMNS: [crate::text::Column; 5] = [
-    crate::text::Column::content("ID"),
-    crate::text::Column::content("Updated"),
-    crate::text::Column::capped("Profile", crate::text::NAME_WIDTH),
-    crate::text::Column::capped("Project", crate::text::NAME_WIDTH),
-    crate::text::Column::remainder("Title"),
-];
+fn session_columns(with_project: bool) -> Vec<crate::text::Column> {
+    let mut columns = vec![
+        crate::text::Column::content("ID"),
+        crate::text::Column::content("Updated"),
+        crate::text::Column::capped("Profile", crate::text::NAME_WIDTH),
+    ];
+    if with_project {
+        columns.push(crate::text::Column::capped(
+            "Project",
+            crate::text::NAME_WIDTH,
+        ));
+    }
+    columns.push(crate::text::Column::remainder("Title"));
+    columns
+}
 
 /// What marks a pinned session's title in the listing. On the title rather than in a column of
 /// its own, so an installation with no pins spends nothing on it.
@@ -458,9 +468,10 @@ pub(crate) async fn list_sessions(
     // The universe a printed prefix will be resolved against, which is every session rather than
     // the ones this listing chose to show.
     let resolvable = store.all_session_ids().await?;
+    let with_project = !store.project_names().await?.is_empty();
     crate::render::write_stdout(crate::text::format_table(
-        &SESSION_COLUMNS,
-        &session_rows(&sessions, &resolvable),
+        &session_columns(with_project),
+        &session_rows(&sessions, &resolvable, with_project),
     ))?;
 
     Ok(())
@@ -473,6 +484,7 @@ pub(crate) async fn list_sessions(
 fn session_rows(
     sessions: &[crate::store::SessionSummary],
     resolvable: &[String],
+    with_project: bool,
 ) -> Vec<Vec<String>> {
     let ids: Vec<String> = sessions
         .iter()
@@ -488,23 +500,26 @@ fn session_rows(
         .iter()
         .zip(&ids)
         .map(|(session, id)| {
-            vec![
+            let mut row = vec![
                 id.get(..id_width).unwrap_or(id).to_string(),
                 format_stored_timestamp(&session.updated_at, Precision::Minutes),
                 session.profile.clone(),
-                if session.project.is_empty() {
+            ];
+            if with_project {
+                row.push(if session.project.is_empty() {
                     "-".to_string()
                 } else {
                     session.project.clone()
-                },
-                // A pin is marked on the label, since the pinned rows sit at the top and the mark
-                // is what says why. The words are a title someone set, or a first message's, which
-                // a model composed or an API caller sent through `POST /v1/sessions`.
-                match session.pinned_at {
-                    Some(_) => format!("{PIN_MARK} {}", crate::text::prose_cell(&session.title)),
-                    None => crate::text::prose_cell(&session.title),
-                },
-            ]
+                });
+            }
+            // A pin is marked on the label, since the pinned rows sit at the top and the mark is
+            // what says why. The words are a title someone set, or a first message's, which a
+            // model composed or an API caller sent through `POST /v1/sessions`.
+            row.push(match session.pinned_at {
+                Some(_) => format!("{PIN_MARK} {}", crate::text::prose_cell(&session.title)),
+                None => crate::text::prose_cell(&session.title),
+            });
+            row
         })
         .collect()
 }
@@ -846,8 +861,8 @@ mod tests {
             .await
             .expect("list");
         let table = crate::text::format_table(
-            &SESSION_COLUMNS,
-            &session_rows(&sessions, &ids_of(&sessions)),
+            &session_columns(false),
+            &session_rows(&sessions, &ids_of(&sessions), false),
         );
         assert_eq!(table.lines().count(), 2, "one session, one row: {table}");
         for line in table.lines() {
@@ -904,9 +919,9 @@ mod tests {
             .list_sessions(10, None, &crate::store::SessionFilter::default())
             .await
             .expect("list");
-        let rows = session_rows(&sessions, &ids_of(&sessions));
-        assert_eq!(rows[0][4], "* kept words");
-        assert_eq!(rows[1][4], "plain words about herons");
+        let rows = session_rows(&sessions, &ids_of(&sessions), false);
+        assert_eq!(rows[0][3], "* kept words");
+        assert_eq!(rows[1][3], "plain words about herons");
 
         let found = store
             .search_sessions("herons", 10, crate::store::SessionReach::Store {
@@ -955,8 +970,8 @@ mod tests {
                 .await
                 .expect("list");
             crate::text::format_table(
-                &SESSION_COLUMNS,
-                &session_rows(&sessions, &ids_of(&sessions)),
+                &session_columns(false),
+                &session_rows(&sessions, &ids_of(&sessions), false),
             )
         }
         let preview_of = |table: &str| {
@@ -973,7 +988,7 @@ mod tests {
         let short = table(&["stub"]).await;
         let long = table(&["openrouter-anthropic-messages", "claude-max"]).await;
         assert!(
-            long.contains("openrouter-anthropic-messages  -"),
+            long.contains("openrouter-anthropic-messages  word"),
             "a real profile name is shown in full, not cut to a fixed ceiling: {long}"
         );
         assert!(
@@ -1033,7 +1048,7 @@ mod tests {
             selected: None,
             default: None,
             configured: None,
-            projects: None,
+            projects: Vec::new(),
         };
 
         // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serializes every test

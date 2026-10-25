@@ -599,16 +599,21 @@ pub(crate) async fn put_memory(
         Some(raw) if raw.trim().is_empty() => Some(None),
         Some(raw) => Some(Some(crate::memory::parse_expiry(raw).map_err(store_error)?)),
     };
-    // A project the file does not define is refused before the write, as every door that files a
+    // A project the store does not have is refused before the write, as every door that files a
     // row under a project refuses it.
     if let Some(project) = body
         .project
         .as_deref()
         .filter(|project| !project.is_empty())
     {
-        crate::config::require_project(project, &state.shared.config.projects).map_err(
-            |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
-        )?;
+        state
+            .shared
+            .store
+            .require_project(project)
+            .await
+            .map_err(|error| {
+                ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+            })?;
     }
 
     // One upsert in one immediate transaction, and no lock. No `flock` and no blocking pool: the
@@ -839,14 +844,13 @@ pub(crate) struct ProjectsResponse {
     pub(crate) projects: Vec<crate::view::ProjectView>,
 }
 
-/// `GET /v1/projects`: the projects `config.toml` defines, and any a row still names, with how
-/// many memories and sessions each holds.
+/// `GET /v1/projects`: every project, with how many memories and sessions each holds.
 #[utoipa::path(
     get,
     path = "/v1/projects",
     tag = "discovery",
     responses(
-        (status = 200, description = "Projects, configured or still named by rows", body = ProjectsResponse),
+        (status = 200, description = "Every project, with its counts", body = ProjectsResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -857,12 +861,14 @@ pub(crate) async fn projects(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::AnyRead>,
 ) -> Result<Json<ProjectsResponse>, ProblemDetail> {
-    let projects = crate::cli::project::project_views(
-        &state.shared.store,
-        &state.shared.memories,
-        &state.shared.config.projects,
-    )
-    .await
-    .map_err(|error| ProblemDetail::internal_sanitized("failed to list projects", error))?;
+    let projects = state
+        .shared
+        .store
+        .list_projects()
+        .await
+        .map_err(|error| ProblemDetail::internal_sanitized("failed to list projects", error))?
+        .into_iter()
+        .map(crate::view::ProjectView::from)
+        .collect();
     Ok(Json(ProjectsResponse { projects }))
 }

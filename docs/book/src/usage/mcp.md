@@ -144,10 +144,6 @@ In addition to tools, meka exposes MCP resources and prompts through several bui
 | `mcp_resource_unsubscribe` | Cancel a prior subscription. |
 | `mcp_resource_updates_list` | List the latest recorded update per resource in the shared, bounded MCP context log; it resets when the host restarts. |
 
-## Per-project servers
-
-A [project](./projects.md) can narrow which servers its sessions see, with `allowed_servers` and `disabled_servers` on its `[projects.<name>]` table. Every configured server still connects at startup; the view decides what a session on the project is shown. A hidden server's tools are out of that session's catalog and out of reach of `tool_load` and `tool_search`, the resource and prompt meta-tools do not list it, and a sub-agent the session spawns cannot name it either. A session on no project sees every server, as before.
-
 ## Startup concurrency
 
 MCP servers connect in parallel at startup, partitioned by transport so a fleet of stdio servers (process-spawn bound) doesn't fight a fleet of HTTP servers (network bound):
