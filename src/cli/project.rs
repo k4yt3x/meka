@@ -21,7 +21,9 @@ pub(crate) async fn run(action: &ProjectAction, store: &Store) -> anyhow::Result
         }
         ProjectAction::List { format } => run_list(store, *format).await?,
         ProjectAction::Rename { name, new_name } => {
-            let (sessions, memories) = store.rename_project(name, new_name).await?;
+            let renamed = store.rename_project(name, new_name).await?;
+            let sessions = renamed.sessions_moved;
+            let memories = renamed.memories_moved;
             tracing::info!(
                 "renamed project '{name}' to '{new_name}'; {sessions} session(s) and {memories} \
                  memor(ies) follow"

@@ -6,7 +6,7 @@ A project is an idea, not a directory. Nothing binds one to a path, nothing open
 
 ## Defining a project
 
-A project is a row in the store, created by `meka project add`. Names follow the rule memories and skills follow: letters, digits, `-` and `_`, starting with a letter or digit, and never a name Windows reserves. Names are compared exactly, and two that differ only by case are refused.
+A project is a row in the store, created by `meka project add` or `POST /v1/projects`. Names follow the rule memories and skills follow: letters, digits, `-` and `_`, starting with a letter or digit, and never a name Windows reserves. Names are compared exactly, and two that differ only by case are refused.
 
 ```bash
 meka project add webdev
@@ -32,7 +32,9 @@ meka -r 550e --project webdev               # moves session 550e onto webdev
 
 On the screen, `/project` opens a picker over the projects, with a first row that leaves the project; `/project open <name>` moves the session directly and `/project close` takes it off its project. Either way the row is rewritten, so the choice holds for a resume from any surface, and the next turn's context restates the memories the session now sees. `/status` names the project the session is on.
 
-Over HTTP, `POST /v1/sessions` takes `project`, `PATCH /v1/sessions/{id}` moves a session with `{"project": "movie"}` and takes it off one with `{"project": ""}`, every session record carries `project`, and `GET /v1/sessions?project=<name>` lists the sessions on one (`project=` those on none). `GET /v1/projects` lists the projects. See [HTTP API](./http-api.md#sessions).
+Over HTTP, `POST /v1/sessions` takes `project`, `PATCH /v1/sessions/{id}` moves a session with `{"project": "movie"}` and takes it off one with `{"project": ""}`, every session record carries `project`, and `GET /v1/sessions?project=<name>` lists the sessions on one (`project=` those on none). See [HTTP API](./http-api.md#sessions).
+
+The projects themselves are managed over HTTP as they are on the command line, under the `memory:w` scope, since a project is a memory tier: `GET /v1/projects` lists them with their counts, `POST /v1/projects` with `{"name": "webdev"}` adds one and answers `201` with the project, `PATCH /v1/projects/{name}` with `{"name": "web"}` renames one and answers it under its new name, and `DELETE /v1/projects/{name}` removes one. A name a project already has, or one the rule refuses, is a `422`; a name no project has is a `404` on the path; and the removal is a `422` whose `detail` carries the counts while anything is on the project.
 
 Under ACP, a `project` entry in `configOptions` is offered whenever a project exists, with a "No project" value first; see [ACP](./acp.md#session-config-options).
 

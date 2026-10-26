@@ -237,8 +237,8 @@ it for the rest of its life and every session response echoes it back as `profil
 confirm which account a session bills.
 
 `project` names a [project](projects.md), which decides the memory tier the session's writes land
-in and the tiers it sees; `GET /v1/projects` lists them, and a name no project has is a `422` whose
-`detail` reads `no project named 'x' (configured: a, b)`.
+in and the tiers it sees; `GET /v1/projects` lists them, `POST /v1/projects` adds one, and a name no
+project has is a `422` whose `detail` reads `no project named 'x' (configured: a, b)`.
 Omitted or empty, the session is on no project, and every session response echoes `project` back,
 `""` for none. `PATCH /v1/sessions/{id}` with `{"project": "movie"}` moves a session onto a project
 and `{"project": ""}` takes it off one; the row is rewritten, and the next turn's context restates
@@ -1008,7 +1008,7 @@ Each token carries a set of scopes that control what it can access:
 | `skills:r` | Read installed skills, including bodies |
 | `skills:w` | Create, update, delete skills |
 | `memory:r` | Read the memory store |
-| `memory:w` | Create, update, delete memories |
+| `memory:w` | Create, update, delete memories; add, rename and remove projects |
 | `schedule:r` | List scheduled jobs. `GET /v1/schedule` is server-wide and returns each job's full `prompt`, so this reads instruction text and not just schedules. A gate's `check` is withheld unless the token also holds `sessions:r` |
 | `schedule:w` | Create and cancel scheduled jobs. **A job's `prompt` runs a full turn with tools**, so this is deferred turn execution, not just bookkeeping. A job's optional `gate` runs a shell command or a read-only tool call and additionally requires `sessions:w` (see below) |
 | `mcp:r` | Read MCP server status and advertised tools |
@@ -1094,8 +1094,10 @@ Idempotency keys are **ignored for a held stream**; such a client reconnects thr
 | `POST /turn` (detached, with a key) | yes | the same `202` and turn record; the turn ran once |
 | `POST /v1/sessions/{id}/inbox` (with a key) | yes | the earlier item is answered, `replayed: true`; the key is on the row, so this holds across a restart |
 | `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/sessions/{id}/tasks/{task_id}`, `DELETE /v1/sessions/{id}/inbox/{item_id}` | yes | already-done is the same state; a withdrawn item answers **404** on the retry |
-| `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure; treat it as success if you are retrying blind |
+| `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/projects/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure; treat it as success if you are retrying blind |
 | `PUT /v1/skills/{name}`, `PUT /v1/memory/{name}` | yes | same body writes the same skill file or memory row |
+| `POST /v1/projects` | yes, but | the project exists, so the retry answers **422** naming it; nothing is added twice |
+| `PATCH /v1/projects/{name}` | yes, but | the old name is gone, so the retry answers **404**; the project is under the new name |
 | `POST /compact` | mostly | a second compaction summarizes the summary; fidelity drops, nothing is lost. It takes no `If-Match`, since it addresses no position in the history and a stale view costs a retry nothing it cannot undo |
 | `POST /rewind` | with `If-Match` | drops another turn without it. Under the `ETag` the first attempt was decided on, a retry after the first went through is refused with `412` |
 | `POST /sessions/import` | **no** | creates a second copy of the tree under new ids |
@@ -1139,7 +1141,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/auth-scope` | 403 | Token lacks the required scope |
 | `/errors/session-permission` | 403 | The token is fine; the *session* sits too low. Raise it with `PATCH /v1/sessions/{id}`; a better token will not help |
 | `/errors/session-not-found` | 404 | Unknown session id |
-| `/errors/not-found` | 404 | Unknown skill, memory, MCP server, background task, scheduled job, image blob, inbox item, or turn; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
+| `/errors/not-found` | 404 | Unknown skill, memory, project, MCP server, background task, scheduled job, image blob, inbox item, or turn; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
 | `/errors/session-not-loaded` | 409 | The session exists but is not in memory; submit a turn to load it. Do **not** retry `POST /cancel`: there is no turn to cancel |
 | `/errors/session-locked` | 409 | Another meka process holds the session's lock (e.g. two `meka serve` instances sharing one store); wait or restart the other process |
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
@@ -1211,7 +1213,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 |----------|------|-------------|
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
 | `GET /v1/health/ready` | None | Readiness probe: 200 if the store is healthy, at least one profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `profile_configured`, and `mcp_servers_healthy` (boolean, no server names). **`profile_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
-| `GET /v1/projects` | Any read scope | Projects, as `{"projects": [...]}`: every project, each with `name`, `created_at` (RFC 3339), `memories` (in its tier) and `sessions` (root sessions on it). Read-only; projects are created with `meka project add` |
+| `GET /v1/projects` | Any read scope | Projects, as `{"projects": [...]}`: every project, each with `name`, `created_at` (RFC 3339), `memories` (in its tier) and `sessions` (root sessions on it). `POST /v1/projects` adds one, `PATCH /v1/projects/{name}` renames one and `DELETE /v1/projects/{name}` removes one, under `memory:w`; see [Projects](projects.md#defining-a-project) |
 | `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `fallbacks`, the profiles a turn moves to when this one cannot serve it (omitted when it names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
 | `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
@@ -1493,6 +1495,9 @@ Key points:
 | GET | `/v1/instructions` | `sessions:r` | Resolved standing instructions, without the per-session files `[instructions]` names |
 | GET | `/v1/profiles` | read | Configured profiles |
 | GET | `/v1/projects` | read | Every project, with when it was added and its memory and session counts |
+| POST | `/v1/projects` | `memory:w` | Add a project, `{"name": "<name>"}`; answers `201` with the project |
+| PATCH | `/v1/projects/{name}` | `memory:w` | Rename a project, `{"name": "<new>"}`, moving every session and memory on it |
+| DELETE | `/v1/projects/{name}` | `memory:w` | Remove a project; `422` with the counts while a memory or session is on it |
 | GET | `/v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI spec |
 
 `GET /v1/sessions` is paginated by `limit` and `cursor` (see [Sessions](#sessions)), and takes `include_children=true` to list sub-agent sessions alongside root ones, `working_directory=<path>` to filter by working directory, and `parent=<id>` to list one session's direct children. A sub-agent's session record carries `parent_id`, which is what reconnects it to the session that dispatched it.

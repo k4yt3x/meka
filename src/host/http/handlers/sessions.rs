@@ -108,8 +108,8 @@ pub(crate) struct CreateSessionRequest {
     /// `GET /v1/profiles` lists them.
     pub(crate) profile: Option<String>,
     /// Project the session opens on, which decides the memory tier its writes land in and the
-    /// tiers it sees. Absent or empty, the session is on none. Must name a project `meka project
-    /// add` created; `GET /v1/projects` lists them.
+    /// tiers it sees. Absent or empty, the session is on none. Must name a project the store has;
+    /// `GET /v1/projects` lists them and `POST /v1/projects` adds one.
     pub(crate) project: Option<String>,
     /// Per-session capability flags. See the HTTP API docs § "Capabilities".
     #[serde(default)]
@@ -1460,7 +1460,7 @@ pub(crate) async fn patch_session(
     // `ensure_session_loaded` answers 404 for a row that is gone and re-attaches the other, and the
     // next pass finds it.
     const DOING: &str = "change the session's working directory, profile or project";
-    let (entry, _turn_exclusive) = loop {
+    let (entry, turn_exclusive) = loop {
         let entry = ensure_session_loaded(&state, id).await?;
         if body.working_directory.is_none() && body.profile.is_none() && body.project.is_none() {
             break (entry, None);
@@ -1698,7 +1698,11 @@ pub(crate) async fn patch_session(
             last_turn: info.last_turn,
         },
         capabilities: entry.capabilities,
-        turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
+        // The claim this handler holds is the counter's one increment and no turn, and nothing
+        // runs under it; a body that claimed nothing reads the counter, since a turn may be
+        // running under a change of level, approvals, title or pin.
+        turn_in_flight: turn_exclusive.is_none()
+            && entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
         inbox_pending: None,
         approvals_pending: Some(entry.frontend.approvals_pending()),
         checklist: Some(entry.agent.cells().checklist.get().items),

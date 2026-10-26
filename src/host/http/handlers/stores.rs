@@ -848,7 +848,7 @@ pub(crate) struct ProjectsResponse {
 #[utoipa::path(
     get,
     path = "/v1/projects",
-    tag = "discovery",
+    tag = "projects",
     responses(
         (status = 200, description = "Every project, with its counts", body = ProjectsResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
@@ -871,4 +871,138 @@ pub(crate) async fn projects(
         .map(crate::view::ProjectView::from)
         .collect();
     Ok(Json(ProjectsResponse { projects }))
+}
+
+/// The body of `POST /v1/projects` and of `PATCH /v1/projects/{name}`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectNameRequest {
+    /// The project's name, `[A-Za-z0-9][A-Za-z0-9_-]*`, compared exactly and refused when it
+    /// differs from an existing name only by case. On a `PATCH`, the name the project moves to.
+    pub(crate) name: String,
+}
+
+/// What a project door's refusal is on the wire. The path's name, when no project has it, is the
+/// resource that is not there, said in the words every door refuses an unknown project with;
+/// every other refusal is the store's own sentence about what was sent, and a database fault is
+/// the sanitized 500.
+fn project_refusal(error: crate::error::MekaError, relay: bool) -> ProblemDetail {
+    match error {
+        unknown @ crate::error::MekaError::UnknownProject { .. } => ProblemDetail::new(
+            ErrorKind::NotFound,
+            StatusCode::NOT_FOUND,
+            unknown.sentence(),
+        ),
+        error => ProblemDetail::for_error(&error, relay),
+    }
+}
+
+/// `POST /v1/projects`: add a project.
+///
+/// Under `memory:w`, with the rename and the removal: a project is a memory tier and nothing
+/// else, so the scope that writes the tiers is the one that opens and closes them.
+#[utoipa::path(
+    post,
+    path = "/v1/projects",
+    tag = "projects",
+    request_body = ProjectNameRequest,
+    responses(
+        (status = 201, description = "Project added", body = crate::view::ProjectView),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
+        (status = 422, description = "Invalid name, or one a project already has, exactly or under case folding", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["memory:w"]))
+)]
+pub(crate) async fn create_project(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::MemoryWrite>,
+    raw_body: Bytes,
+) -> Result<(StatusCode, Json<crate::view::ProjectView>), ProblemDetail> {
+    let body: ProjectNameRequest = serde_json::from_slice(&raw_body)
+        .map_err(|error| ProblemDetail::invalid_body("project", error))?;
+    let name = body.name.as_str();
+    let added = state
+        .shared
+        .store
+        .add_project(name)
+        .await
+        .map_err(|error| project_refusal(error, state.config.relay_provider_errors))?;
+    tracing::info!("added project '{name}' via HTTP");
+    Ok((StatusCode::CREATED, Json(added.into())))
+}
+
+/// `PATCH /v1/projects/{name}`: rename a project, moving every session and memory on it.
+#[utoipa::path(
+    patch,
+    path = "/v1/projects/{name}",
+    tag = "projects",
+    params(("name" = String, Path, description = "Project name")),
+    request_body = ProjectNameRequest,
+    responses(
+        (status = 200, description = "The project under its new name", body = crate::view::ProjectView),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "No such project", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
+        (status = 422, description = "Invalid new name, or one another project has, exactly or under case folding", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["memory:w"]))
+)]
+pub(crate) async fn rename_project(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::MemoryWrite>,
+    AxumPath(name): AxumPath<String>,
+    raw_body: Bytes,
+) -> Result<Json<crate::view::ProjectView>, ProblemDetail> {
+    let body: ProjectNameRequest = serde_json::from_slice(&raw_body)
+        .map_err(|error| ProblemDetail::invalid_body("project patch", error))?;
+    let new_name = body.name.as_str();
+    let renamed = state
+        .shared
+        .store
+        .rename_project(&name, new_name)
+        .await
+        .map_err(|error| project_refusal(error, state.config.relay_provider_errors))?;
+    let sessions = renamed.sessions_moved;
+    let memories = renamed.memories_moved;
+    tracing::info!(
+        "renamed project '{name}' to '{new_name}' via HTTP; {sessions} session(s) and {memories} \
+         memor(ies) follow"
+    );
+    Ok(Json(renamed.project.into()))
+}
+
+/// `DELETE /v1/projects/{name}`: remove a project nothing is on.
+#[utoipa::path(
+    delete,
+    path = "/v1/projects/{name}",
+    tag = "projects",
+    params(("name" = String, Path, description = "Project name")),
+    responses(
+        (status = 204, description = "Project removed"),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "No such project", body = ProblemDetail),
+        (status = 422, description = "A memory or a session is still on the project; `detail` carries the counts", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["memory:w"]))
+)]
+pub(crate) async fn delete_project(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::MemoryWrite>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<StatusCode, ProblemDetail> {
+    state
+        .shared
+        .store
+        .remove_project(&name)
+        .await
+        .map_err(|error| project_refusal(error, state.config.relay_provider_errors))?;
+    tracing::info!("removed project '{name}' via HTTP");
+    Ok(StatusCode::NO_CONTENT)
 }

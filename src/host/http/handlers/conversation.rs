@@ -644,7 +644,11 @@ async fn announce_rewound(
             return;
         }
     };
-    let record = crate::host::http::handlers::sessions::listed_session(&summary, resident, false);
+    let mut record =
+        crate::host::http::handlers::sessions::listed_session(&summary, resident, false);
+    // A resident rewind announces under the idle claim it holds, which is the counter's one
+    // increment and no turn; a dormant one has no entry to count. Neither is a turn in flight.
+    record.turn_in_flight = false;
     crate::host::http::handlers::sessions::announce_session(
         state,
         SseEventType::SessionUpdated,

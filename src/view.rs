@@ -119,8 +119,8 @@ impl From<&SessionMatch> for SessionMatchView {
     }
 }
 
-/// A project as `meka project list` prints it and `GET /v1/projects` answers with: its name, when
-/// it was added, and how many memories and sessions are on it.
+/// A project as `meka project list` prints it and the `/v1/projects` routes answer with: its name,
+/// when it was added, and how many memories and sessions are on it.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct ProjectView {

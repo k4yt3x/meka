@@ -17255,6 +17255,84 @@ fn open_server_feed(
     request.send().expect("send")
 }
 
+/// A `PATCH` naming a profile or a project claims the session while it writes, as a rewind does,
+/// and neither is a turn: the reply, the record each puts on the server feed and a `GET` after
+/// them all say `turn_in_flight: false`.
+#[test]
+fn a_claiming_patch_and_a_rewind_report_no_turn_in_flight() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    add_project(&harness, "movie");
+    let feed = open_server_feed(&harness, None);
+    let id = create_session_id(&harness);
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "hi"}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200, "{}", turn.text().unwrap_or_default());
+    for body in [
+        serde_json::json!({"profile": "mock"}),
+        serde_json::json!({"project": "movie"}),
+    ] {
+        let patched = harness
+            .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+            .json(&body)
+            .send()
+            .expect("send");
+        assert_eq!(
+            patched.status(),
+            200,
+            "{}",
+            patched.text().unwrap_or_default()
+        );
+        let record: serde_json::Value = patched.json().expect("parse");
+        assert_eq!(record["turn_in_flight"], false, "{body}: {record}");
+    }
+    let rewound = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
+        .json(&serde_json::json!({"turns": 1}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        rewound.status(),
+        200,
+        "{}",
+        rewound.text().unwrap_or_default()
+    );
+    let after: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(after["turn_in_flight"], false, "{after}");
+
+    let deleted = harness
+        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send");
+    assert_eq!(deleted.status(), 204);
+    let body = read_feed_until(feed, |text| text.contains("event: session.deleted"));
+    // The records announced after the turn ended: the project move and the rewind, and the
+    // profile's when a re-statement of the same profile counts as a change.
+    let after_the_turn = body
+        .rfind("event: turn.finished")
+        .map_or(body.as_str(), |at| &body[at..]);
+    let updates: Vec<serde_json::Value> = sse_events(after_the_turn)
+        .into_iter()
+        .filter(|(name, _)| name == "session.updated")
+        .map(|(_, data)| data)
+        .collect();
+    assert!(updates.len() >= 2, "{body}");
+    assert!(
+        updates.iter().any(|update| update["project"] == "movie"),
+        "{updates:?}"
+    );
+    for update in &updates {
+        assert_eq!(update["turn_in_flight"], false, "{update}");
+    }
+}
+
 /// The server feed is the listing's change feed: one connection learns of every session made,
 /// changed and deleted, and of every turn's start and end, each event naming its session with the
 /// whole record where a record is what changed; a session's own feed learns of its own changes.
@@ -18557,6 +18635,186 @@ fn sessions_carry_their_project_over_http() {
         [("movie".to_string(), 0, 0), ("webdev".to_string(), 0, 0)],
         "{projects}"
     );
+}
+
+/// A project is added, renamed and removed over HTTP: the add answers the row, a name a project
+/// has or the entry rule refuses is a 422, the rename answers the row under its new name with the
+/// session that followed it, a name the store lacks is a 404 on the path, and the removal is
+/// refused with the counts until nothing is on the project.
+#[test]
+fn projects_are_added_renamed_and_removed_over_http() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "memory:r",
+        "memory:w",
+    ]);
+    let added = harness
+        .request(reqwest::Method::POST, "/v1/projects")
+        .json(&serde_json::json!({"name": "webdev"}))
+        .send()
+        .expect("send");
+    assert_eq!(added.status(), 201, "{}", added.text().unwrap_or_default());
+    let added: serde_json::Value = added.json().expect("parse");
+    assert_eq!(added["name"], "webdev", "{added}");
+    assert_eq!(added["memories"], 0, "{added}");
+    assert_eq!(added["sessions"], 0, "{added}");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(added["created_at"].as_str().unwrap_or_default())
+            .is_ok(),
+        "{added}"
+    );
+    for body in [
+        serde_json::json!({"name": "webdev"}),
+        serde_json::json!({"name": "WebDev"}),
+        serde_json::json!({"name": "web dev"}),
+        serde_json::json!({}),
+    ] {
+        let refused = harness
+            .request(reqwest::Method::POST, "/v1/projects")
+            .json(&body)
+            .send()
+            .expect("send");
+        assert_eq!(refused.status(), 422, "{body}");
+        let problem: serde_json::Value = refused.json().expect("parse");
+        assert_eq!(
+            problem["type"], "https://meka.run/errors/invalid-body",
+            "{body}: {problem}"
+        );
+    }
+
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let session: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": cwd, "project": "webdev"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let id = session["id"].as_str().expect("id").to_string();
+
+    let renamed = harness
+        .request(reqwest::Method::PATCH, "/v1/projects/webdev")
+        .json(&serde_json::json!({"name": "web"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        renamed.status(),
+        200,
+        "{}",
+        renamed.text().unwrap_or_default()
+    );
+    let renamed: serde_json::Value = renamed.json().expect("parse");
+    assert_eq!(renamed["name"], "web", "{renamed}");
+    assert_eq!(renamed["sessions"], 1, "{renamed}");
+    assert_eq!(renamed["created_at"], added["created_at"], "{renamed}");
+    let moved: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(moved["project"], "web", "{moved}");
+
+    // The old name is gone from the path, for the rename and the removal alike.
+    let gone = harness
+        .request(reqwest::Method::PATCH, "/v1/projects/webdev")
+        .json(&serde_json::json!({"name": "site"}))
+        .send()
+        .expect("send");
+    assert_eq!(gone.status(), 404, "{}", gone.text().unwrap_or_default());
+    let problem: serde_json::Value = gone.json().expect("parse");
+    assert_eq!(
+        problem["type"], "https://meka.run/errors/not-found",
+        "{problem}"
+    );
+    assert_eq!(
+        problem["detail"], "no project named 'webdev' (configured: web)",
+        "{problem}"
+    );
+    let gone = harness
+        .request(reqwest::Method::DELETE, "/v1/projects/webdev")
+        .send()
+        .expect("send");
+    assert_eq!(gone.status(), 404, "{}", gone.text().unwrap_or_default());
+
+    let held = harness
+        .request(reqwest::Method::DELETE, "/v1/projects/web")
+        .send()
+        .expect("send");
+    assert_eq!(held.status(), 422, "{}", held.text().unwrap_or_default());
+    let problem: serde_json::Value = held.json().expect("parse");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("1 session")),
+        "{problem}"
+    );
+    let off: serde_json::Value = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"project": ""}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(off["project"], "", "{off}");
+    let removed = harness
+        .request(reqwest::Method::DELETE, "/v1/projects/web")
+        .send()
+        .expect("send");
+    assert_eq!(
+        removed.status(),
+        204,
+        "{}",
+        removed.text().unwrap_or_default()
+    );
+    let projects: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/projects")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        projects["projects"].as_array().map(Vec::len),
+        Some(0),
+        "{projects}"
+    );
+}
+
+/// The three project writes take `memory:w`; a token holding the other write scopes and
+/// `memory:r` is refused on each and still reads the listing.
+#[test]
+fn project_writes_need_the_memory_write_scope() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "memory:r",
+        "skills:w",
+        "schedule:w",
+        "mcp:w",
+    ]);
+    for (method, path) in [
+        (reqwest::Method::POST, "/v1/projects"),
+        (reqwest::Method::PATCH, "/v1/projects/webdev"),
+        (reqwest::Method::DELETE, "/v1/projects/webdev"),
+    ] {
+        let refused = harness
+            .request(method.clone(), path)
+            .json(&serde_json::json!({"name": "webdev"}))
+            .send()
+            .expect("send");
+        assert_eq!(refused.status(), 403, "{method} {path}");
+        let problem: serde_json::Value = refused.json().expect("parse");
+        assert_eq!(
+            problem["type"], "https://meka.run/errors/auth-scope",
+            "{method} {path}: {problem}"
+        );
+    }
+    let listed = harness
+        .request(reqwest::Method::GET, "/v1/projects")
+        .send()
+        .expect("send");
+    assert_eq!(listed.status(), 200);
 }
 
 /// The memory routes file a memory under a project, list one tier, read a name that is in several

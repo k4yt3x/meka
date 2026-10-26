@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Only a project's sessions see its memories; `memory_write` and `memory_search` take `tier`.
 - `meka memory import <dir>` restores an export; `memory export` writes one directory per project.
 - `GET /v1/projects` lists projects; `project` on the memory routes and `session list` picks one.
+- HTTP: `POST`, `PATCH` and `DELETE` on `/v1/projects` add, rename and remove a project.
 - `meka tool show <name>` prints a built-in tool's schema as the model receives it.
 - Every compaction says what set it going, which strategy wrote it and which memories it wrote.
 - The screen shows a row for every compaction, automatic ones included, and a word while one runs.
@@ -51,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A list argument takes one bare string as its entry and drops a blank entry.
 - A library's warning reaches the screen as its own line, without `log.*` location fields.
 - Copying from the transcript no longer warns when no clipboard manager takes the text.
+- A session `PATCH` or rewind no longer reports a running turn in its reply or on the feed.
 
 ### Security
 

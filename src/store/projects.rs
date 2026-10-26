@@ -1,10 +1,11 @@
 //! The `projects` table: every project a session can be on, each a memory tier beside the global
 //! one.
 //!
-//! A project is a row and nothing else, created by `meka project add`, so every door handed a
-//! name from outside asks [`Store::require_project`] before a row records it: a typo is refused
-//! with the names that exist rather than opening an empty tier. A rename moves the row and every
-//! session and memory on it in one transaction, and a removal refuses while any still names it.
+//! A project is a row and nothing else, created by `meka project add` or `POST /v1/projects`, so
+//! every door handed a name from outside asks [`Store::require_project`] before a row records it:
+//! a typo is refused with the names that exist rather than opening an empty tier. A rename moves
+//! the row and every session and memory on it in one transaction, and a removal refuses while any
+//! still names it.
 
 use super::{Store, sessions::spawned_session_sql};
 use crate::error::{MekaError, Result};
@@ -20,6 +21,15 @@ pub(crate) struct ProjectRecord {
     /// Root sessions on the project. A sub-agent's row carries the project its parent was on,
     /// and counting it would list a project as busier than the sessions a person can resume.
     pub(crate) sessions: u64,
+}
+
+/// What a rename did: the project under its new name, and how many sessions, sub-agents
+/// included, and memories followed it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenamedProject {
+    pub(crate) project: ProjectRecord,
+    pub(crate) sessions_moved: u64,
+    pub(crate) memories_moved: u64,
 }
 
 /// What a door decided inside its transaction.
@@ -45,6 +55,34 @@ impl<T> Decided<T> {
 pub(super) fn names_in(connection: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare("SELECT name FROM projects ORDER BY name ASC")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// The projects in `connection` with their counts, sorted by name: every one, or the one `name`
+/// names. A writer reads its own row through this inside its transaction, so what it answers is
+/// what it committed.
+fn records_in(
+    connection: &rusqlite::Connection,
+    name: Option<&str>,
+) -> rusqlite::Result<Vec<ProjectRecord>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT p.name, p.created_at,
+                (SELECT COUNT(*) FROM memories m WHERE m.project = p.name),
+                (SELECT COUNT(*) FROM sessions s
+                  WHERE s.project = p.name AND NOT {})
+         FROM projects p
+         WHERE ?1 IS NULL OR p.name = ?1
+         ORDER BY p.name ASC",
+        spawned_session_sql("s.")
+    ))?;
+    let rows = statement.query_map(rusqlite::params![name], |row| {
+        Ok(ProjectRecord {
+            name: row.get(0)?,
+            created_at: row.get(1)?,
+            memories: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+            sessions: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+        })
+    })?;
     rows.collect()
 }
 
@@ -90,9 +128,9 @@ fn counted(count: u64, singular: &str, plural: &str) -> String {
 }
 
 impl Store {
-    /// Add a project. Refuses a name the entry rule refuses, one that exists, and one that differs
-    /// from an existing name only by case.
-    pub(crate) async fn add_project(&self, name: &str) -> Result<()> {
+    /// Add a project and answer its row. Refuses a name the entry rule refuses, one that exists,
+    /// and one that differs from an existing name only by case.
+    pub(crate) async fn add_project(&self, name: &str) -> Result<ProjectRecord> {
         crate::entry::validate_entry_name(name, "project").map_err(MekaError::Usage)?;
         let name = name.to_string();
         self.connection
@@ -102,12 +140,18 @@ impl Store {
                 if let Some(by) = name_taken_by(&transaction, &name, None)? {
                     return Ok(Decided::Refused(taken(&name, &by)));
                 }
+                let created_at = chrono::Utc::now().to_rfc3339();
                 transaction.execute(
                     "INSERT INTO projects (name, created_at) VALUES (?1, ?2)",
-                    rusqlite::params![name, chrono::Utc::now().to_rfc3339()],
+                    rusqlite::params![name, created_at],
                 )?;
                 transaction.commit()?;
-                Ok(Decided::Done(()))
+                Ok(Decided::Done(ProjectRecord {
+                    name,
+                    created_at,
+                    memories: 0,
+                    sessions: 0,
+                }))
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to add a project: {error}")))?
@@ -117,26 +161,7 @@ impl Store {
     /// Every project, sorted by name, with how many memories and root sessions are on each.
     pub(crate) async fn list_projects(&self) -> Result<Vec<ProjectRecord>> {
         self.connection
-            .call(|connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(&format!(
-                    "SELECT p.name, p.created_at,
-                            (SELECT COUNT(*) FROM memories m WHERE m.project = p.name),
-                            (SELECT COUNT(*) FROM sessions s
-                              WHERE s.project = p.name AND NOT {})
-                     FROM projects p
-                     ORDER BY p.name ASC",
-                    spawned_session_sql("s.")
-                ))?;
-                let rows = statement.query_map([], |row| {
-                    Ok(ProjectRecord {
-                        name: row.get(0)?,
-                        created_at: row.get(1)?,
-                        memories: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
-                        sessions: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
-                    })
-                })?;
-                rows.collect()
-            })
+            .call(|connection| records_in(connection, None))
             .await
             .map_err(|error| MekaError::Database(format!("failed to list projects: {error}")))
     }
@@ -159,12 +184,16 @@ impl Store {
         Err(unknown(name, known))
     }
 
-    /// Rename a project, moving every session and memory on it, and answer how many of each
-    /// moved.
+    /// Rename a project, moving every session and memory on it, and answer the row under its new
+    /// name with how many of each moved.
     ///
     /// One transaction over the three tables, so a crash cannot leave the sessions on one name
     /// and their memories on another, which no door could then bring back together.
-    pub(crate) async fn rename_project(&self, name: &str, new_name: &str) -> Result<(u64, u64)> {
+    pub(crate) async fn rename_project(
+        &self,
+        name: &str,
+        new_name: &str,
+    ) -> Result<RenamedProject> {
         crate::entry::validate_entry_name(new_name, "project").map_err(MekaError::Usage)?;
         let name = name.to_string();
         let new_name = new_name.to_string();
@@ -191,8 +220,15 @@ impl Store {
                     "UPDATE memories SET project = ?2 WHERE project = ?1",
                     rusqlite::params![name, new_name],
                 )?;
+                let project = records_in(&transaction, Some(&new_name))?
+                    .pop()
+                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
                 transaction.commit()?;
-                Ok(Decided::Done((sessions as u64, memories as u64)))
+                Ok(Decided::Done(RenamedProject {
+                    project,
+                    sessions_moved: sessions as u64,
+                    memories_moved: memories as u64,
+                }))
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to rename a project: {error}")))?
@@ -341,10 +377,20 @@ mod tests {
             "{of_unknown}"
         );
 
+        let renamed = store.rename_project("webdev", "web").await.expect("rename");
         assert_eq!(
-            store.rename_project("webdev", "web").await.expect("rename"),
+            (renamed.sessions_moved, renamed.memories_moved),
             (2, 1),
             "the root and its sub-agent, plus the one memory"
+        );
+        assert_eq!(
+            (
+                renamed.project.name.as_str(),
+                renamed.project.memories,
+                renamed.project.sessions
+            ),
+            ("web", 1, 1),
+            "the row under its new name, counting the root alone"
         );
         assert_eq!(
             store.recorded_project(root).await.expect("row"),
