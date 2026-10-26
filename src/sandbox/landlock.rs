@@ -414,17 +414,24 @@ pub(crate) fn run_confined(
     }
     std::os::unix::process::CommandExt::exec(std::process::Command::new(program).args(arguments))
 }
-/// The network rights the ruleset handles: every TCP bind and connect from ABI v4, the first with
-/// network rights, on anything but `host`, and granted to no port, which is what refuses them all.
-/// UDP has no Landlock right on any ABI and stays open, as the docs say. Nothing on `host`. Judged
-/// against `host` rather than `none` so a setting the ruleset cannot express, `remote`, fails
-/// closed here whatever the caller passed.
+/// The network rights the ruleset handles on anything but `host`, granted to no port, which is
+/// what refuses them all: every TCP bind and connect from ABI v4, the first with network rights,
+/// and every UDP bind and send from ABI v10 (kernel 7.2), the first with a UDP right, so UDP stays
+/// open on a kernel between the two, as the docs say. Nothing on `host`. Judged against `host`
+/// rather than `none` so a setting the ruleset cannot express, `remote`, fails closed here
+/// whatever the caller passed.
 pub(super) fn handled_network_for_abi(abi_version: i32, network: crate::config::Network) -> u64 {
-    if network != crate::config::Network::Host && abi_version >= 4 {
-        LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
-    } else {
-        0
+    if network == crate::config::Network::Host {
+        return 0;
     }
+    let mut access = 0;
+    if abi_version >= 4 {
+        access |= LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    }
+    if abi_version >= 10 {
+        access |= LANDLOCK_ACCESS_NET_BIND_UDP | LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP;
+    }
+    access
 }
 
 pub(super) fn handled_access_for_abi(abi_version: i32) -> u64 {
@@ -494,6 +501,8 @@ pub(super) const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 pub(super) const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
 pub(super) const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
 pub(super) const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+pub(super) const LANDLOCK_ACCESS_NET_BIND_UDP: u64 = 1 << 2;
+pub(super) const LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP: u64 = 1 << 3;
 pub(super) const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
 pub(super) const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 1;
 #[repr(C)]
@@ -528,11 +537,21 @@ mod tests {
     /// script ending in `; true` would make a ruleset denying every write and one allowing every
     /// write produce the same success.
     fn confined_exit(abi: i32, grants: Vec<super::LandlockGrant>, script: &str) -> Option<i32> {
+        confined_exit_under(abi, grants, script, crate::config::Network::Host)
+    }
+
+    /// [`confined_exit`] under a network setting, for the tests that judge the network rights.
+    fn confined_exit_under(
+        abi: i32,
+        grants: Vec<super::LandlockGrant>,
+        script: &str,
+        network: crate::config::Network,
+    ) -> Option<i32> {
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-c").arg(script);
         unsafe {
             command.pre_exec(move || {
-                super::apply_landlock(abi, &grants, crate::config::Network::Host)
+                super::apply_landlock(abi, &grants, network)
                     .map_err(std::io::Error::from_raw_os_error)
             });
         }
@@ -932,30 +951,37 @@ mod tests {
         assert!(!base.join("fresh.txt").exists());
     }
 
-    /// The ruleset handles every TCP bind and connect on `none` from ABI v4, which granted to no
-    /// port refuses them all; nothing on `host`, and nothing on an ABI without network rights.
+    /// The ruleset handles every TCP bind and connect on `none` from ABI v4 and every UDP bind
+    /// and send from ABI v10, which granted to no port refuses them all; nothing on `host`, and
+    /// nothing on an ABI without network rights.
     #[test]
-    fn the_ruleset_handles_tcp_only_on_none_from_abi_4() {
-        let both = super::LANDLOCK_ACCESS_NET_BIND_TCP | super::LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    fn the_ruleset_handles_tcp_from_abi_4_and_udp_from_abi_10_on_none() {
+        let tcp = super::LANDLOCK_ACCESS_NET_BIND_TCP | super::LANDLOCK_ACCESS_NET_CONNECT_TCP;
+        let udp = super::LANDLOCK_ACCESS_NET_BIND_UDP | super::LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP;
         assert_eq!(
             super::handled_network_for_abi(4, crate::config::Network::None),
-            both
+            tcp
         );
         assert_eq!(
             super::handled_network_for_abi(9, crate::config::Network::None),
-            both
+            tcp,
+            "UDP has no right below ABI v10"
+        );
+        assert_eq!(
+            super::handled_network_for_abi(10, crate::config::Network::None),
+            tcp | udp
         );
         assert_eq!(
             super::handled_network_for_abi(3, crate::config::Network::None),
             0
         );
         assert_eq!(
-            super::handled_network_for_abi(9, crate::config::Network::Host),
+            super::handled_network_for_abi(10, crate::config::Network::Host),
             0
         );
         assert_eq!(
-            super::handled_network_for_abi(9, crate::config::Network::Remote),
-            both,
+            super::handled_network_for_abi(10, crate::config::Network::Remote),
+            tcp | udp,
             "`remote` is refused whole rather than let through as `host`"
         );
     }
@@ -976,18 +1002,7 @@ mod tests {
         // The system paths readable and executable, as a read-only command has them, so the
         // shell and the interpreter can start; only the network differs between the two runs.
         let grants = super::landlock_grants(abi, &[], None, &[], &[]);
-        let exit_under = |network: crate::config::Network| -> Option<i32> {
-            let grants = grants.clone();
-            let mut command = std::process::Command::new("/bin/sh");
-            command.arg("-c").arg(&script);
-            unsafe {
-                command.pre_exec(move || {
-                    super::apply_landlock(abi, &grants, network)
-                        .map_err(std::io::Error::from_raw_os_error)
-                });
-            }
-            command.status().expect("spawn").code()
-        };
+        let exit_under = |network| confined_exit_under(abi, grants.clone(), &script, network);
         assert_eq!(
             exit_under(crate::config::Network::Host),
             Some(5),
@@ -997,6 +1012,35 @@ mod tests {
             exit_under(crate::config::Network::None),
             Some(6),
             "the connect must be refused on `none`"
+        );
+    }
+
+    /// A command under the ruleset cannot send a UDP datagram on `none` from ABI v10, the first
+    /// with a UDP right, and can on `host`; below v10 the datagram goes through on `none` too,
+    /// which is what the docs say of such a kernel.
+    #[test]
+    fn a_confined_command_cannot_send_a_datagram_on_none_from_abi_10() {
+        let Some(abi) = usable_abi() else {
+            return;
+        };
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let port = socket.local_addr().expect("address").port();
+        let script = format!(
+            "python3 -c \"import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\
+             .sendto(b'x', ('127.0.0.1', {port}))\" >/dev/null 2>&1 && exit 5; exit 6"
+        );
+        let grants = super::landlock_grants(abi, &[], None, &[], &[]);
+        let exit_under = |network| confined_exit_under(abi, grants.clone(), &script, network);
+        assert_eq!(
+            exit_under(crate::config::Network::Host),
+            Some(5),
+            "the datagram must go through on `host`, or the test proves nothing"
+        );
+        let refused = abi >= 10;
+        assert_eq!(
+            exit_under(crate::config::Network::None),
+            Some(if refused { 6 } else { 5 }),
+            "ABI v{abi}: a datagram on `none` is refused from v10 and goes through below it"
         );
     }
 }

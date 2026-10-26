@@ -19,14 +19,15 @@
 //!
 //! **What every backend leaves open**: the network, unless `[permissions].network` narrows it,
 //! which each backend holds as far as it can ([`held_network`]): `none` by Bubblewrap unsharing the
-//! namespace, Landlock refusing every TCP port from ABI v4, `sandbox-exec` withholding the outbound
-//! rule and the AppContainer granting no network capability, `remote` by the AppContainer's ingress
-//! table alone, and nothing by the Windows restricted token; and reads outside the boundary only
-//! where `[permissions].confine_reads` is off and the session is a root one, since a sub-agent's
-//! reads are confined to its scope on every backend but the restricted token. The boundary these
-//! enforce is "this command cannot change the machine", not "this command cannot send anything".
-//! Landlock alone also cannot stop a command changing a file's mode, owner, timestamps or extended
-//! attributes: no ABI has a right for those, and Bubblewrap's read-only bind is what refuses them.
+//! namespace, Landlock refusing every TCP port from ABI v4 and every UDP port from ABI v10,
+//! `sandbox-exec` withholding the outbound rule and the AppContainer granting no network
+//! capability, `remote` by the AppContainer's ingress table alone, and nothing by the Windows
+//! restricted token; and reads outside the boundary only where `[permissions].confine_reads` is off
+//! and the session is a root one, since a sub-agent's reads are confined to its scope on every
+//! backend but the restricted token. The boundary these enforce is "this command cannot change the
+//! machine", not "this command cannot send anything". Landlock alone also cannot stop a command
+//! changing a file's mode, owner, timestamps or extended attributes: no ABI has a right for those,
+//! and Bubblewrap's read-only bind is what refuses them.
 
 pub(crate) mod appcontainer;
 #[cfg(target_os = "linux")]
