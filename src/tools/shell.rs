@@ -2215,9 +2215,17 @@ mod tests {
         match result {
             Err(MekaError::ToolExecution { tool_name, message }) => {
                 assert_eq!(tool_name, "shell_execute");
+                // The backend as this platform calls it: the value's name where the platform takes
+                // one, the mechanism where it takes none, so the assertion holds on macOS as on
+                // Linux.
+                let label = crate::sandbox::backend_label(
+                    crate::config::SandboxBackend::Bubblewrap,
+                    &tool.backend_probe,
+                )
+                .expect("every platform in the matrix names its backend");
                 assert!(
-                    message.contains("Bubblewrap"),
-                    "expected backend display name in error: {message}"
+                    message.contains(label),
+                    "expected the backend as this platform calls it in error: {message}"
                 );
                 assert!(
                     message.contains("bwrap not found on PATH"),

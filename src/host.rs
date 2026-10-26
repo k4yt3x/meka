@@ -584,6 +584,11 @@ mod tests {
             },
             store.clone(),
         );
+        // Polled once before the clock moves, so the task takes its immediate first tick now and
+        // the advance below is what fires the hourly one. Advanced first, the interval is created
+        // after the move and the hourly tick fires only if the clock auto-advances while a store
+        // reply is awaited, which is a race the runtime wins or loses by platform.
+        tokio::task::yield_now().await;
         tokio::time::advance(EXPIRY_SWEEP_INTERVAL).await;
         // The sweep runs on the store's own thread, so give the task a few turns to finish it.
         let mut remaining = 2;
