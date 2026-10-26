@@ -1070,7 +1070,7 @@ The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's bui
 
 | Key | Purpose |
 |---|---|
-| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register, with one exception: the seven [MCP meta-tools](../usage/mcp.md#resources-and-prompts) register regardless, because they are how the agent reaches a configured server's resources and prompts at all. Naming one here is inert and warns at startup; use `disabled_tools` to remove one. Use `meka tool list` to see the canonical names. |
+| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register, with two exceptions: the seven [MCP meta-tools](../usage/mcp.md#resources-and-prompts) register regardless, because they are how the agent reaches a configured server's resources and prompts at all, and so does `context_replace`, compaction's own plumbing, which no list reaches and which is refused outside a checkpoint. Naming a meta-tool here is inert and warns at startup; use `disabled_tools` to remove one. Use `meka tool list` to see the canonical names. |
 | `disabled_tools` | Block-list of built-in tool names. Applied **after** `allowed_tools`; a tool here is never registered even if it also appears in the allow-list. |
 | `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `workspace`, `unrestricted`; any other value is refused at startup, naming the line. |
 

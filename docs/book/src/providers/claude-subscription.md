@@ -225,4 +225,4 @@ You can see the effect directly: `/status` reports the cache hit ratio, and read
 
 ### Streaming
 
-Server-Sent Events with the same event taxonomy as [`anthropic-messages`](./anthropic-messages.md): `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`. Reasoning streams as `thinking_delta` events; redacted thinking arrives as a `redacted_thinking` block carrying an opaque `data` payload and no signature, rendered as `[redacted thinking]`.
+Server-Sent Events with the same event taxonomy as [`anthropic-messages`](./anthropic-messages.md): `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`. Every request streams, as the captured CLI wire does; `--no-stream` and the compaction's own calls fold the stream in place. Reasoning streams as `thinking_delta` events; redacted thinking arrives as a `redacted_thinking` block carrying an opaque `data` payload and no signature, rendered as `[redacted thinking]`.

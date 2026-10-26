@@ -772,4 +772,94 @@ mod tests {
             "the default is the direct API's moving breakpoint: {sent}"
         );
     }
+
+    /// A completion is the stream folded in place: the wire sees one request shape, `stream: true`,
+    /// and the caller gets the message, stop reason and usage the frames described. One shape is
+    /// what keeps a checkpoint or a summary on the turn's cache where a gateway caches the two
+    /// shapes apart.
+    #[tokio::test]
+    async fn a_completion_is_the_stream_folded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        let (saw_body, body_seen) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = match socket.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(_) => return,
+                };
+                request.extend_from_slice(&chunk[..read]);
+                let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let length: usize = String::from_utf8_lossy(&request[..head_end])
+                    .split("\r\n")
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse().ok())
+                    .unwrap_or(0);
+                if request.len() >= head_end + 4 + length {
+                    let body = String::from_utf8_lossy(&request[head_end + 4..]).into_owned();
+                    if saw_body.send(body).is_err() {
+                        return;
+                    }
+                    break;
+                }
+            }
+            let frames = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{frames}",
+                frames.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.shutdown().await.is_err() {
+                tracing::debug!("mock endpoint failed to shut its socket down cleanly");
+            }
+        });
+
+        let provider = provider_with_base(
+            "claude-sonnet-4-20250514",
+            None,
+            Some(&format!("http://127.0.0.1:{port}")),
+        );
+        let completion = provider
+            .complete(
+                CompletionRequest::new("", &[Message::user("hello")], &[]),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the folded stream is the completion");
+        let body: serde_json::Value =
+            serde_json::from_str(&body_seen.await.expect("the request reached the endpoint"))
+                .expect("a JSON body");
+        assert_eq!(body["stream"], true, "one request shape: {body}");
+        assert_eq!(completion.message.text_content(), "hi");
+        assert_eq!(
+            completion.stop_reason,
+            crate::provider::StopReason::MaxTokens
+        );
+        assert_eq!(completion.usage.input_tokens, 7);
+        assert_eq!(completion.usage.output_tokens, 1);
+    }
 }

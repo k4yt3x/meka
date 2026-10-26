@@ -7950,6 +7950,8 @@ mod tests {
     }
 
     /// The tool names a worker's first request carried, sorted: what its registry held.
+    /// The tools the worker's first request carried, sorted. `context_replace` is compaction's
+    /// plumbing and rides on every catalog, so every expectation lists it.
     fn tools_sent(provider: &crate::provider::mock::MockProvider) -> Vec<String> {
         let mut names: Vec<String> = provider.streams()[0]
             .tools
@@ -7988,7 +7990,7 @@ mod tests {
             )
             .await
             .expect("spawn succeeds");
-        assert_eq!(tools_sent(&provider), vec!["file_read"]);
+        assert_eq!(tools_sent(&provider), vec!["context_replace", "file_read"]);
         let agent_id = agent_id_in(&output.text_content());
         let spec: SubagentSpec = serde_json::from_str(
             &store
@@ -8052,7 +8054,7 @@ mod tests {
             )
             .await
             .expect("spawn succeeds");
-        assert_eq!(tools_sent(&provider), vec!["file_read"]);
+        assert_eq!(tools_sent(&provider), vec!["context_replace", "file_read"]);
         let agent_id = agent_id_in(&output.text_content());
         let spec: SubagentSpec = serde_json::from_str(
             &store
@@ -8097,7 +8099,7 @@ mod tests {
             )
             .await
             .expect("follow-up succeeds");
-        assert_eq!(tools_sent(&provider), vec!["file_read"]);
+        assert_eq!(tools_sent(&provider), vec!["context_replace", "file_read"]);
     }
 
     /// A bare spawn is the parent's whole scope: its working directory, its additional workspace

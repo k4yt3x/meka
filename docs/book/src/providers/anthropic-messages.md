@@ -110,4 +110,4 @@ thinking = "budgeted"   # only if the endpoint rejects the adaptive form
 }
 ```
 
-**Streaming:** Server-Sent Events with named event types (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`, `ping`).
+**Streaming:** Server-Sent Events with named event types (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`, `ping`). A non-streaming call (`--no-stream`, a compaction's checkpoint or summary) is the same stream folded in place, so every request has one shape and reads one cache; a gateway can keep a separate cache per shape.

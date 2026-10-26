@@ -751,7 +751,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::provider::{StopReason, openai::responses_wire::aggregate_stream};
+    use crate::provider::{StopReason, aggregate_stream};
 
     fn credential_for_test() -> AuthCredential {
         AuthCredential::OAuthToken {

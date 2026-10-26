@@ -47,6 +47,11 @@ impl AvailableTools {
         self.0.contains(name)
     }
 
+    /// Every tool, sorted, for a prompt that lists what is available.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+
     /// Recovery guidance shared by ordinary turns and compaction, which may offer different tools.
     pub(crate) fn history_guidance(&self) -> String {
         match (

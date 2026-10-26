@@ -244,11 +244,13 @@ pub(crate) fn admit_arguments(
 /// `context_compact` is one exception: it does not do work, it parks a request the tool loop
 /// drains once the batch's results are in. Detaching it would race that drain, leaving the request
 /// to fire a round later than the agent asked for, or against the next turn entirely, and would
-/// persist a `background_tasks` row for an operation that takes microseconds. The checklist tools
-/// are the other: an edit takes microseconds and the model needs the list it returns in the same
-/// round, and a detached one would land at a time the replay that recovers the list cannot know.
+/// persist a `background_tasks` row for an operation that takes microseconds. `context_replace` is
+/// another: it hands the checkpoint its summary and ends it, and nothing waits on a task for that.
+/// The checklist tools are the other: an edit takes microseconds and the model needs the list it
+/// returns in the same round, and a detached one would land at a time the replay that recovers the
+/// list cannot know.
 pub(crate) fn detachable(name: &str) -> bool {
-    name != "context_compact" && !crate::checklist::is_tool(name)
+    !matches!(name, "context_compact" | "context_replace") && !crate::checklist::is_tool(name)
 }
 
 /// A call's arguments as a built-in that does not own `background` received them: the flag meka
@@ -1059,6 +1061,7 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "agent_spawn" => "prompt",
         "checklist_add" => "items",
         "context_compact" => "instructions",
+        "context_replace" => "summary",
         "conversation_read" => "start",
         "conversation_search" => "query",
         "file_edit" | "file_read" | "file_write" => "path",
@@ -1183,21 +1186,20 @@ mod tests {
     };
     use crate::store::Store;
 
-    /// The one tool that cannot detach is refused where the flag is consumed, not only left out
-    /// of the schema: a model that generalizes `background` to it would get a detached compaction
-    /// that fires against a later turn.
+    /// The context tools that do no work are refused where the flag is consumed, not only left out
+    /// of the schema: a model that generalizes `background` to them would get a detached compaction
+    /// that fires against a later turn, or a summary nothing waits for.
     #[test]
-    fn context_compact_cannot_be_detached() {
+    fn the_context_tools_that_do_no_work_cannot_be_detached() {
         let schema = serde_json::json!({"type": "object", "properties": {"instructions": {"type": "string"}}});
-        let refused = super::admit_arguments(
-            "context_compact",
-            &serde_json::json!({"background": true}),
-            &schema,
-        );
-        assert!(
-            matches!(refused, Err(ref output) if output.is_error && output.text_content().contains("background")),
-            "{refused:?}"
-        );
+        for name in ["context_compact", "context_replace"] {
+            let refused =
+                super::admit_arguments(name, &serde_json::json!({"background": true}), &schema);
+            assert!(
+                matches!(refused, Err(ref output) if output.is_error && output.text_content().contains("background")),
+                "{name}: {refused:?}"
+            );
+        }
         let (_, detach) = super::admit_arguments(
             "file_read",
             &serde_json::json!({"background": true}),
@@ -2137,17 +2139,9 @@ mod tests {
             false,
         )
         .await;
-        let listed = registry.checkpoint_tools(
-            Permission::Read,
-            true,
-            Arc::new(std::sync::Mutex::new(None)),
-        );
+        let listed = registry.checkpoint_tools(Permission::Read, true);
         assert!(listed.iter().any(|t| t.definition().name == "file_read"));
-        let hidden = registry.checkpoint_tools(
-            Permission::Read,
-            false,
-            Arc::new(std::sync::Mutex::new(None)),
-        );
+        let hidden = registry.checkpoint_tools(Permission::Read, false);
         assert!(!hidden.iter().any(|t| t.definition().name == "file_read"));
     }
 

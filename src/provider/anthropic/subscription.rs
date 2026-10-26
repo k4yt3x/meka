@@ -986,11 +986,8 @@ impl OAuthProfileResponse {
 mod tests {
     use std::sync::Arc;
 
-    use super::{attestation::CC_VERSION, shared::parse_non_streaming_response, *};
-    use crate::{
-        conversation::{ContentBlock, Role, ToolResultContent},
-        provider::StopReason,
-    };
+    use super::{attestation::CC_VERSION, *};
+    use crate::conversation::{ContentBlock, Role, ToolResultContent};
 
     /// The body's keys in the order they will be serialized, which is the order they go on the
     /// wire: `serde_json`'s `preserve_order` feature makes `Map` insertion-ordered, and Claude
@@ -1310,67 +1307,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_parse_non_streaming_text() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "text",
-                "text": "Hello there!"
-            }],
-            "stop_reason": "end_turn",
-            "usage": { "input_tokens": 10, "output_tokens": 5 }
-        });
-
-        let (message, stop_reason, _) =
-            parse_non_streaming_response(&response).expect("should parse");
-
-        assert_eq!(message.text_content(), "Hello there!");
-        assert_eq!(stop_reason, StopReason::EndTurn);
-    }
-
-    #[test]
-    fn claude_parse_non_streaming_tool_use() {
-        let response = serde_json::json!({
-            "id": "msg_456",
-            "type": "message",
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "I'll read that file for you."
-                },
-                {
-                    "type": "tool_use",
-                    "id": "toolu_abc",
-                    "name": "file_read",
-                    "input": {"path": "/tmp/test.txt"}
-                }
-            ],
-            "stop_reason": "tool_use",
-            "usage": { "input_tokens": 20, "output_tokens": 15 }
-        });
-
-        let (message, stop_reason, _) =
-            parse_non_streaming_response(&response).expect("should parse");
-
-        assert_eq!(stop_reason, StopReason::ToolUse);
-        assert_eq!(message.text_content(), "I'll read that file for you.");
-
-        let tool_uses = message.tool_uses();
-        assert_eq!(tool_uses.len(), 1);
-
-        if let ContentBlock::ToolUse { id, name, input } = &tool_uses[0] {
-            assert_eq!(id, "toolu_abc");
-            assert_eq!(name, "file_read");
-            assert_eq!(input["path"], "/tmp/test.txt");
-        } else {
-            panic!("expected ToolUse block");
-        }
-    }
-
-    #[test]
     fn patch_request_body_replaces_placeholder() {
         let messages = vec![Message::user("hello")];
         let provider = provider_for_test();
@@ -1437,42 +1373,6 @@ mod tests {
             &crate::provider::Attribution::default(),
         );
         assert!(body.get("system").is_none());
-    }
-
-    #[test]
-    fn claude_parse_missing_tool_use_id() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "tool_use",
-                "name": "file_read",
-                "input": {"path": "/tmp/test.txt"}
-            }],
-            "stop_reason": "tool_use"
-        });
-
-        let result = parse_non_streaming_response(&response);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn claude_parse_missing_tool_use_name() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "tool_use",
-                "id": "toolu_abc",
-                "input": {"path": "/tmp/test.txt"}
-            }],
-            "stop_reason": "tool_use"
-        });
-
-        let result = parse_non_streaming_response(&response);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1795,131 +1695,6 @@ mod tests {
             &crate::provider::Attribution::default(),
         );
         assert!(body.get("tools").is_none());
-    }
-
-    #[test]
-    fn claude_parse_missing_content_array() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "stop_reason": "end_turn"
-        });
-        let result = parse_non_streaming_response(&response);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn claude_parse_missing_stop_reason_defaults_to_end_turn() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "text", "text": "hi"}]
-        });
-        let (_, stop_reason, _) = parse_non_streaming_response(&response).expect("should parse");
-        assert_eq!(stop_reason, StopReason::EndTurn);
-    }
-
-    #[test]
-    fn claude_parse_max_tokens_stop_reason() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "text", "text": "truncated"}],
-            "stop_reason": "max_tokens"
-        });
-        let (_, stop_reason, _) = parse_non_streaming_response(&response).expect("should parse");
-        assert_eq!(stop_reason, StopReason::MaxTokens);
-    }
-
-    #[test]
-    fn claude_parse_unknown_stop_reason() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "text", "text": "hi"}],
-            "stop_reason": "something_new"
-        });
-        let (_, stop_reason, _) = parse_non_streaming_response(&response).expect("should parse");
-        assert_eq!(
-            stop_reason,
-            StopReason::Unknown("something_new".to_string())
-        );
-    }
-
-    #[test]
-    fn claude_parse_empty_content_array() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "stop_reason": "end_turn"
-        });
-        let (message, ..) = parse_non_streaming_response(&response).expect("should parse");
-        assert!(message.content.is_empty());
-        assert_eq!(message.text_content(), "");
-    }
-
-    #[test]
-    fn claude_parse_thinking_block() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [
-                {"type": "thinking", "thinking": "hmm..."},
-                {"type": "text", "text": "answer"}
-            ],
-            "stop_reason": "end_turn"
-        });
-        let (message, ..) = parse_non_streaming_response(&response).expect("should parse");
-        assert_eq!(message.content.len(), 2);
-        assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "hmm...")
-        );
-        assert_eq!(message.text_content(), "answer");
-    }
-
-    #[test]
-    fn claude_parse_unknown_block_type_skipped() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [
-                {"type": "totally_unknown", "data": "xyz"},
-                {"type": "text", "text": "answer"}
-            ],
-            "stop_reason": "end_turn"
-        });
-        let (message, ..) = parse_non_streaming_response(&response).expect("should parse");
-        assert_eq!(message.content.len(), 1);
-        assert_eq!(message.text_content(), "answer");
-    }
-
-    #[test]
-    fn claude_parse_tool_use_missing_input_defaults() {
-        let response = serde_json::json!({
-            "id": "msg_123",
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "tool_use",
-                "id": "toolu_abc",
-                "name": "list_files"
-            }],
-            "stop_reason": "tool_use"
-        });
-        let (message, ..) = parse_non_streaming_response(&response).expect("should parse");
-        if let ContentBlock::ToolUse { input, .. } = &message.content[0] {
-            assert_eq!(*input, serde_json::json!({}));
-        } else {
-            panic!("expected ToolUse block");
-        }
     }
 
     fn provider_with(model: &str, thinking: bool) -> ClaudeSubscriptionProvider {
@@ -2963,12 +2738,12 @@ mod tests {
             body(&attribution)["diagnostics"],
             serde_json::json!({"previous_message_id": null})
         );
-        attribution.record_message_id("not an id");
+        crate::provider::record_message_id(&slot, "not an id");
         assert_eq!(
             body(&attribution)["diagnostics"]["previous_message_id"],
             serde_json::Value::Null
         );
-        attribution.record_message_id("msg_011Cepw4KgcVvSiBJbcdRbqv");
+        crate::provider::record_message_id(&slot, "msg_011Cepw4KgcVvSiBJbcdRbqv");
         assert_eq!(
             body(&attribution)["diagnostics"]["previous_message_id"],
             "msg_011Cepw4KgcVvSiBJbcdRbqv"
@@ -4980,15 +4755,29 @@ mod tests {
                             r#"{"type":"error","error":{"type":"authentication_error","message":"invalid token"}}"#,
                         )
                     } else {
+                        // A completion is the stream folded, so the mock answers as the wire
+                        // does: frames, not a message document.
                         (
                             200,
                             "OK",
-                            r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+                            concat!(
+                                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                                "data: {\"type\":\"message_stop\"}\n\n",
+                            ),
                         )
                     }
                 };
+                let content_type = if status == 200 {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
                 let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );

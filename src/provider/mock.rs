@@ -221,6 +221,9 @@ pub(crate) struct MockProvider {
     completion_turn_positions: Mutex<Vec<Option<crate::stats::TurnPosition>>>,
     /// How each `complete` call named its worker, in call order, for the same reason.
     completion_workers: Mutex<Vec<Option<crate::provider::WorkerIdentity>>>,
+    /// The tool names each `complete` call carried, in call order: whether a checkpoint's request
+    /// carries the turn's catalog is visible nowhere else.
+    completion_tools: Mutex<Vec<Vec<String>>>,
     /// What each [`Provider::stream`] call was handed, in order.
     ///
     /// The streaming counterpart to [`Self::completions`], and added for the same reason plus one
@@ -283,6 +286,12 @@ impl MockProvider {
     #[cfg(test)]
     pub(crate) fn completions(&self) -> Vec<Vec<Message>> {
         crate::sync::lock(&self.completions).clone()
+    }
+
+    /// The tool names behind each `complete` call so far, in order.
+    #[cfg(test)]
+    pub(crate) fn completion_tools(&self) -> Vec<Vec<String>> {
+        crate::sync::lock(&self.completion_tools).clone()
     }
 
     /// The prompt id behind each `complete` call so far, in order.
@@ -355,11 +364,13 @@ impl Provider for MockProvider {
         let CompletionRequest {
             system_prompt,
             messages,
-            tools: _,
+            tools,
             thinking,
             attribution,
             ..
         } = request;
+        crate::sync::lock(&self.completion_tools)
+            .push(tools.iter().map(|tool| tool.name.clone()).collect());
         crate::sync::lock(&self.completion_thinking).push(thinking);
         crate::sync::lock(&self.completions).push(messages.to_vec());
         crate::sync::lock(&self.completion_prompt_ids).push(attribution.prompt_id);

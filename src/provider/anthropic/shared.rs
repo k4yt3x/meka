@@ -65,10 +65,10 @@ pub(super) use crate::provider::budget::{IMAGE_REDACTION_PLACEHOLDER, redact_old
 /// by the Claude backends only; the others need not pay the resize cost.
 pub(super) const MAX_IMAGE_DIMENSION_PX: u32 = 2000;
 
-/// Extract a `TokenUsage` from an Anthropic `usage` object. Used by both the non-streaming response
-/// parser and the SSE driver. Anthropic emits the same shape (`input_tokens`, `output_tokens`,
-/// `cache_creation_input_tokens`, `cache_read_input_tokens`) in both places. Missing fields default
-/// to 0 (older API responses, or providers that don't surface cache stats).
+/// Extract a `TokenUsage` from an Anthropic `usage` object, as `message_start` and `message_delta`
+/// carry it (`input_tokens`, `output_tokens`, `cache_creation_input_tokens`,
+/// `cache_read_input_tokens`). Missing fields default to 0 (older API responses, or providers that
+/// don't surface cache stats).
 pub(super) fn parse_usage_object(usage: &serde_json::Value) -> TokenUsage {
     tracing::debug!("claude usage: {usage}");
     let field = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -648,104 +648,6 @@ pub(super) fn parse_claude_stop_reason(reason: &str) -> StopReason {
     }
 }
 
-/// The assistant message, stop reason and usage out of a non-streaming Claude response.
-pub(super) fn parse_non_streaming_response(
-    response: &serde_json::Value,
-) -> Result<(Message, StopReason, TokenUsage)> {
-    let stop_reason_str = response
-        .get("stop_reason")
-        .and_then(|reason| reason.as_str())
-        .unwrap_or("end_turn");
-
-    let stop_reason = parse_claude_stop_reason(stop_reason_str);
-
-    let token_usage = response
-        .get("usage")
-        .map(parse_usage_object)
-        .unwrap_or_default();
-
-    let content_array = response
-        .get("content")
-        .and_then(|content| content.as_array())
-        .ok_or_else(|| MekaError::Provider("no content array in response".to_string()))?;
-
-    let mut content_blocks = Vec::new();
-
-    for block in content_array {
-        let block_type = block
-            .get("type")
-            .and_then(|block_type| block_type.as_str())
-            .unwrap_or("");
-
-        match block_type {
-            "text" => {
-                if let Some(text) = block.get("text").and_then(|text| text.as_str()) {
-                    content_blocks.push(ContentBlock::Text {
-                        text: text.to_string(),
-                    });
-                }
-            }
-            "tool_use" => {
-                let id = block
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .ok_or_else(|| {
-                        MekaError::Provider("tool_use block missing 'id' field".to_string())
-                    })?
-                    .to_string();
-                let name = block
-                    .get("name")
-                    .and_then(|name| name.as_str())
-                    .ok_or_else(|| {
-                        MekaError::Provider("tool_use block missing 'name' field".to_string())
-                    })?
-                    .to_string();
-                let input = block.get("input").cloned().unwrap_or_else(|| {
-                    tracing::warn!("tool_use block missing 'input' field");
-                    serde_json::json!({})
-                });
-
-                content_blocks.push(ContentBlock::ToolUse { id, name, input });
-            }
-            "thinking" => {
-                if let Some(thinking) = block.get("thinking").and_then(|t| t.as_str()) {
-                    let signature = block
-                        .get("signature")
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.to_string());
-                    if let Some(block) = ContentBlock::replayable_thinking(
-                        thinking.to_string(),
-                        signature.map(|signature| OpaqueReasoning::Signed { signature }),
-                    ) {
-                        content_blocks.push(block);
-                    }
-                }
-            }
-            "redacted_thinking" => {
-                if let Some(data) = block.get("data").and_then(|d| d.as_str()) {
-                    content_blocks.push(ContentBlock::RedactedThinking {
-                        data: data.to_string(),
-                    });
-                } else {
-                    tracing::warn!("redacted_thinking block missing 'data' field");
-                }
-            }
-            _ => {
-                tracing::warn!("unknown Claude content block type: {block_type}");
-            }
-        }
-    }
-
-    Ok((
-        Message {
-            role: Role::Assistant,
-            content: content_blocks,
-        },
-        stop_reason,
-        token_usage,
-    ))
-}
-
 /// What the two Claude providers differ in, so one driver serves both. The API-key backend has
 /// nothing to refresh and no decoration; the subscription backend rotates a rejected credential
 /// once, patches the attestation into the serialized body, and remembers the response's request id.
@@ -812,82 +714,23 @@ fn transport_error(body_length: usize, error: &reqwest::Error) -> MekaError {
     )
 }
 
-/// One non-streaming Claude call: the body within budget, one send, one retry on a credential the
-/// backend could refresh, and the login remedy on a second rejection.
+/// A non-streaming Claude call is the streaming one folded in place, so a wire has one request
+/// shape. A gateway may keep separate caches for streamed and unstreamed requests (OpenRouter's
+/// Vertex route does, measured 2026-10-26 against captured bodies), and a turn streams, so a
+/// checkpoint or a summary sent unstreamed would read none of the turn's prefix. The captured
+/// subscription wire streams every request too.
 pub(super) async fn complete<B: ClaudeBackend>(
     backend: &B,
     request: CompletionRequest<'_>,
     cancellation: CancellationToken,
 ) -> Result<crate::provider::Completion> {
-    let CompletionRequest {
-        system_prompt,
-        messages,
-        tools,
-        deferred_tools,
-        thinking,
-        attribution,
-        ..
-    } = request;
-    let (body_json, redaction_notice) =
-        build_body_within_budget(messages, backend.max_request_bytes(), |messages| {
-            serialize_body(&backend.request_body(
-                system_prompt,
-                messages,
-                tools,
-                deferred_tools,
-                false,
-                thinking,
-                &attribution,
-            ))
-        })?;
-    let body_json = backend.finish_body(system_prompt, body_json)?;
-    let body_length = body_json.len();
-
-    let response = crate::oauth::send_with_one_refresh(
-        backend,
-        crate::error::ProviderRequest::Completion,
-        |error| transport_error(body_length, error),
-        || async {
-            Ok(backend
-                .authenticated_request(
-                    backend.client().post(backend.endpoint()),
-                    !tools.is_empty(),
-                    !deferred_tools.is_empty(),
-                    false,
-                    thinking,
-                    &attribution,
-                )
-                .await?
-                .body(body_json.clone()))
-        },
-        &cancellation,
-    )
-    .await?;
-
-    let retry_after = crate::error::parse_retry_after(response.headers());
-    backend.remember_request_id(&attribution, response.headers());
-    let response = crate::provider::succeeded(
-        response,
-        "completion",
-        crate::error::ProviderRequest::Completion,
-        &cancellation,
-    )
-    .await?;
-    let response_text =
-        crate::error::read_whole_reply(response, retry_after, &cancellation).await?;
-
-    let response_json: serde_json::Value = serde_json::from_str(&response_text)
-        .map_err(|error| MekaError::Provider(format!("invalid JSON response: {error}")))?;
-    if let Some(message_id) = response_json.get("id").and_then(|id| id.as_str()) {
-        attribution.record_message_id(message_id);
-    }
-    let (message, stop_reason, usage) = parse_non_streaming_response(&response_json)?;
-    Ok(crate::provider::Completion {
-        message,
-        stop_reason,
-        usage,
-        notices: redaction_notice.into_iter().collect(),
-    })
+    let (event_sender, event_receiver) = mpsc::channel::<StreamEvent>(1024);
+    let (streamed, folded) = tokio::join!(
+        stream(backend, request, event_sender, cancellation),
+        crate::provider::aggregate_stream(event_receiver),
+    );
+    streamed?;
+    Ok(folded)
 }
 
 /// One streaming Claude call, with the same retry-once policy as [`complete`]. A redaction notice
@@ -1984,47 +1827,6 @@ mod tests {
         assert_eq!(blocks[1]["source"]["type"], "base64");
         assert_eq!(blocks[1]["source"]["media_type"], "image/png");
         assert_eq!(blocks[1]["source"]["data"], "QUJD");
-    }
-
-    /// The whole-reply parser keeps a thinking block by the rule the streamed fold keeps one: an
-    /// empty unsigned block is nothing to replay, and a `--no-stream` transcript that carried one
-    /// would differ from the live turn's.
-    #[test]
-    fn an_empty_unsigned_thinking_block_is_dropped_by_the_whole_reply_parser_too() {
-        let response = serde_json::json!({
-            "content": [
-                { "type": "thinking", "thinking": "" },
-                { "type": "thinking", "thinking": "", "signature": "sig" },
-                { "type": "text", "text": "done" },
-            ],
-            "stop_reason": "end_turn",
-            "usage": { "input_tokens": 1, "output_tokens": 1 },
-        });
-        let (message, ..) = parse_non_streaming_response(&response).unwrap();
-        assert_eq!(message.content.len(), 2, "{:?}", message.content);
-        assert!(matches!(
-            &message.content[0],
-            ContentBlock::Thinking { thinking, opaque: Some(OpaqueReasoning::Signed { signature }) }
-                if thinking.is_empty() && signature == "sig"
-        ));
-        assert!(matches!(&message.content[1], ContentBlock::Text { text } if text == "done"));
-    }
-
-    #[test]
-    fn parse_redacted_thinking_block() {
-        let response = serde_json::json!({
-            "content": [
-                { "type": "redacted_thinking", "data": "ENCRYPTED_OPAQUE_BLOB" },
-                { "type": "text", "text": "done" },
-            ],
-            "stop_reason": "end_turn",
-            "usage": { "input_tokens": 1, "output_tokens": 1 },
-        });
-        let (message, ..) = parse_non_streaming_response(&response).unwrap();
-        assert!(matches!(
-            &message.content[0],
-            ContentBlock::RedactedThinking { data } if data == "ENCRYPTED_OPAQUE_BLOB"
-        ));
     }
 
     #[test]

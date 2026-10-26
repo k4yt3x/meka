@@ -370,16 +370,6 @@ impl Attribution {
             .and_then(|slot| crate::sync::lock(slot).clone())
     }
 
-    /// Keep the id of the message a response carried, for the next request's
-    /// `diagnostics.previous_message_id`. Recorded from the body on the non-streaming path; the
-    /// streaming parser records into the slot itself through [`record_message_id`], since only it
-    /// sees `message_start`. Either way an errored response leaves the previous id in place.
-    pub(crate) fn record_message_id(&self, message_id: &str) {
-        if let Some(slot) = &self.previous_message {
-            record_message_id(slot, message_id);
-        }
-    }
-
     /// Whether this request is a turn of the conversation rather than a side query such as a
     /// compaction: only a turn carries a message slot, and only a turn reports
     /// `diagnostics.previous_message_id`.
@@ -647,9 +637,10 @@ pub(crate) struct Completion {
 
 /// How a stream of [`StreamEvent`]s becomes the message it described.
 ///
-/// The one fold, for the agent (which also shows each event as it arrives) and for a Responses
-/// `complete` (the stream aggregated with nobody watching). Two copies can disagree on when a
-/// thinking block is kept, and a resumed transcript then differs from the live turn.
+/// The one fold, for the agent (which also shows each event as it arrives) and for a `complete` on
+/// the Responses and Claude wires (the stream aggregated with nobody watching). Two copies can
+/// disagree on when a thinking block is kept, and a resumed transcript then differs from the live
+/// turn.
 #[derive(Default)]
 pub(crate) struct MessageAccumulator {
     content: Vec<ContentBlock>,
@@ -762,6 +753,22 @@ impl MessageAccumulator {
             notices: self.notices,
         }
     }
+}
+
+/// Fold a [`StreamEvent`] stream into the [`Completion`] a [`Provider::complete`] returns, with
+/// nobody watching: how a wire with one request shape answers a non-streaming call. A
+/// `StreamEvent::Error` is logged at debug, not returned: every producer sends it right before its
+/// own typed `Err`, which surfaces from the concurrently awaited `stream` and is said once there,
+/// as a warning by the retry or by the host.
+pub(crate) async fn aggregate_stream(mut receiver: mpsc::Receiver<StreamEvent>) -> Completion {
+    let mut accumulator = MessageAccumulator::new();
+    while let Some(event) = receiver.recv().await {
+        if let StreamEvent::Error(error) = &event {
+            tracing::debug!("stream error folded into a completion: {error}");
+        }
+        accumulator.push(event);
+    }
+    accumulator.finish()
 }
 
 async fn finalize_tool_call_accumulators(

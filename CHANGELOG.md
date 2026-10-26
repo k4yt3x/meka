@@ -48,6 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The scope lines name what the shell and `web_fetch` each reach where a backend narrows one.
 - A confined command on Windows cannot read or set the clipboard, drive windows or inject input.
 - Landlock alone under `network = "none"` closes UDP too on kernel 7.2+; it closed TCP alone.
+- A compaction's checkpoint carries the turn's tool list and images, so it reads the prompt cache.
+- `context_replace` is in every catalog and refused outside a checkpoint; `[tools]` cannot drop it.
+- A Claude completion under `--no-stream`, or for a checkpoint or summary, is the stream folded.
 
 ### Fixed
 

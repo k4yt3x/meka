@@ -545,6 +545,8 @@ pub(crate) struct ToolRegistry {
     /// pass so the turn's universal `scratchpad` parameter refuses them like the tools do. Empty
     /// on the root agent's registry.
     pub(super) inherited_scratchpad_names: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Where this registry's `context_replace` lands, armed by a checkpoint turn for its duration.
+    pub(super) checkpoint: context::CheckpointSlot,
 }
 /// The registered tools in registration order, each with the definition it answered when it was
 /// registered, indexed by name.
@@ -675,7 +677,7 @@ impl ToolRegistry {
         tool_scope: ToolScope,
     ) -> Self {
         let overrides = filter.permission_overrides.clone();
-        Self {
+        let registry = Self {
             tools: Arc::new(std::sync::RwLock::new(Registered::default())),
             deferred: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_overrides: Arc::new(overrides),
@@ -687,7 +689,23 @@ impl ToolRegistry {
             read_tracker: Arc::new(RwLock::new(HashMap::new())),
             write_scope: Arc::new(std::sync::RwLock::new(None)),
             inherited_scratchpad_names: Arc::new(std::sync::RwLock::new(Vec::new())),
-        }
+            checkpoint: context::CheckpointSlot::default(),
+        };
+        // Compaction's plumbing, in every catalog from construction, so the checkpoint's request
+        // carries the turn's own tool list and shares its cached prefix. Past `register_builtin`
+        // on purpose: neither `[tools]` nor a sub-agent's scope may remove it, since either would
+        // silently downgrade every compaction to the fallback summarizer, and the slot refuses it
+        // outside a checkpoint.
+        #[allow(
+            clippy::expect_used,
+            reason = "the first registration into an empty set cannot collide"
+        )]
+        registry
+            .register(Arc::new(context::ContextReplaceTool {
+                slot: registry.checkpoint.clone(),
+            }))
+            .expect("context_replace registers into an empty registry");
+        registry
     }
 
     /// The scratchpad entries a parent lent this session read-only.
@@ -1079,8 +1097,14 @@ impl ToolRegistry {
             discovery_rides,
             declared_outright: false,
         };
+        // Compaction's plumbing is in every catalog and loads nothing, so it does not make a set
+        // of deferred tools reachable: a catalog holding nothing else is declared outright, as an
+        // empty one is.
         carried.declared_outright = !carried.deferred.is_empty()
-            && !carried.active.iter().any(|entry| carried.rides(entry));
+            && !carried
+                .active
+                .iter()
+                .any(|entry| entry.definition.name != "context_replace" && carried.rides(entry));
         carried
     }
 
@@ -1415,9 +1439,8 @@ impl ToolRegistry {
     /// read are owned by the `Agent`, which does not exist when the registry is built. The caller
     /// makes them, hands them here, and points the agent at the same handles.
     ///
-    /// `context_replace` is deliberately absent. It only exists inside a checkpoint turn, which
-    /// builds its own tool list; registering it here would offer the model a way to blank its
-    /// context during ordinary work.
+    /// `context_replace` is not here either: it is registered at construction, on every registry,
+    /// so the checkpoint's request carries the same catalog the turn does.
     ///
     /// Sub-agents get neither. A sub-agent's window is its own, but the compaction it would be
     /// asking for happens inside a turn its parent is waiting on, and the parent owns that
@@ -1441,19 +1464,20 @@ impl ToolRegistry {
         }));
     }
 
-    /// The tools a checkpoint turn may use: this registry's, filtered to [`CHECKPOINT_TOOL_NAMES`]
-    /// and the caller's permission, plus a fresh `context_replace` bound to `slot`. With
-    /// `approvals` on the level does not filter: a call above it is put to the user at dispatch,
-    /// the way it is in an ordinary turn, so the checkpoint offers what it can ask about.
+    /// The tools a checkpoint turn may call: this registry's, filtered to [`CHECKPOINT_TOOL_NAMES`]
+    /// and the caller's permission, plus `context_replace`. The request still carries the whole
+    /// catalog, so its prefix is the turn's and the prompt cache holds; a call to anything outside
+    /// this set is refused at the checkpoint's dispatch. With `approvals` on the level does not
+    /// filter: a call above it is put to the user at dispatch, the way it is in an ordinary turn,
+    /// so the checkpoint offers what it can ask about.
     ///
     /// Read *out of* the live registry rather than built fresh, so a tool the user disabled in
-    /// `[tools]` stays disabled here, and every tool keeps the session's cwd, permission and
+    /// `[tools]` stays unavailable here, and every tool keeps the session's cwd, permission and
     /// frontend already baked into it.
     pub(crate) fn checkpoint_tools(
         &self,
         permission: Permission,
         approvals: bool,
-        slot: context::SubmissionSlot,
     ) -> Vec<Arc<dyn Tool>> {
         let mut tools: Vec<Arc<dyn Tool>> = CHECKPOINT_TOOL_NAMES
             .iter()
@@ -1468,14 +1492,19 @@ impl ToolRegistry {
                 approvals || permission.allows(required)
             })
             .collect();
-        // Unconditional, deliberately outside the permission filter above. `context_replace` has
-        // no effect outside this process - it writes a summary into a slot the caller owns - and
-        // without it a checkpoint has no way to finish, so filtering it out would silently
-        // downgrade every compaction at `none` permission to the fallback summarizer. That leaves
-        // a `none`-permission checkpoint holding exactly one tool, which is the right shape: it
-        // can still write the summary, it just has nowhere to save anything.
-        tools.push(Arc::new(context::ContextReplaceTool { slot }));
+        // Outside the permission filter above. `context_replace` has no effect outside this
+        // process, it writes a summary into this registry's slot, and without it a checkpoint has
+        // no way to finish, so filtering it out would silently downgrade every compaction at
+        // `none` permission to the fallback summarizer. That leaves a `none`-permission checkpoint
+        // holding exactly one tool, which is the right shape: it can still write the summary, it
+        // just has nowhere to save anything.
+        tools.extend(self.get("context_replace"));
         tools
+    }
+
+    /// Arm the slot `context_replace` writes into, for one checkpoint turn.
+    pub(crate) fn arm_checkpoint(&self) -> context::ArmedCheckpoint {
+        self.checkpoint.arm()
     }
 
     /// The root agent's registry: the core tools and the session-scoped set, with the
@@ -2488,11 +2517,11 @@ mod tests {
         );
     }
 
-    /// With nothing active the deferred tools are declared outright on a declaring wire, since the
-    /// API refuses an array that is deferred through; the moment something active is there they go
+    /// With nothing but compaction's plumbing active the deferred tools are declared outright on a
+    /// declaring wire, since nothing could load them; the moment something active is there they go
     /// back to riding as deferred declarations.
     #[tokio::test]
-    async fn an_all_deferred_set_is_declared_outright() {
+    async fn a_set_with_nothing_but_the_plumbing_active_is_declared_outright() {
         use crate::provider::DeferredToolDelivery;
         let registry = ToolRegistry::new();
         registry.register_deferred_fixture("mcp__probe__fetch");
@@ -2514,7 +2543,7 @@ mod tests {
                 .iter()
                 .map(|d| d.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["mcp__probe__fetch"]
+            vec!["context_replace", "mcp__probe__fetch"]
         );
         assert!(alone.deferred_definitions.is_empty());
         assert!(alone.schema_tokens > 0, "declared outright, it is priced");
@@ -2526,11 +2555,11 @@ mod tests {
         // The catalog says what the array does: a tool declared with its schema is not deferred
         // to the model, so the context block lists it as available and asks for no load.
         let catalog = registry.tool_catalog();
-        assert_eq!(catalog.len(), 1);
-        assert!(
-            !catalog[0].3,
-            "declared outright, so not deferred: {catalog:?}"
-        );
+        let probe = catalog
+            .iter()
+            .find(|row| row.0 == "mcp__probe__fetch")
+            .expect("the probe is in the catalog");
+        assert!(!probe.3, "declared outright, so not deferred: {catalog:?}");
 
         // An appending wire declares such a set outright too: with no `tool_load` in the scope,
         // nothing else could ever make the tool callable.
@@ -2550,7 +2579,7 @@ mod tests {
                 .iter()
                 .map(|d| d.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["mcp__probe__fetch"]
+            vec!["context_replace", "mcp__probe__fetch"]
         );
         published.store(&crate::provider::ResolvedProfile {
             provider: std::sync::Arc::new(
@@ -2865,9 +2894,8 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_tools_are_the_allow_list_plus_context_replace() {
         let registry = tool_registry_for_test().await;
-        let slot = Arc::new(std::sync::Mutex::new(None));
         let names: HashSet<String> = registry
-            .checkpoint_tools(Permission::Unrestricted, false, slot)
+            .checkpoint_tools(Permission::Unrestricted, false)
             .iter()
             .map(|tool| tool.definition().name)
             .collect();
@@ -2890,9 +2918,8 @@ mod tests {
             std::collections::HashMap::new(),
         ))
         .await;
-        let slot = Arc::new(std::sync::Mutex::new(None));
         let names: HashSet<String> = registry
-            .checkpoint_tools(Permission::Unrestricted, false, slot)
+            .checkpoint_tools(Permission::Unrestricted, false)
             .iter()
             .map(|tool| tool.definition().name)
             .collect();
@@ -2901,14 +2928,39 @@ mod tests {
         assert!(names.contains("context_replace"));
     }
 
-    /// `context_replace` is deliberately absent from `BUILTIN_TOOL_NAMES`. Listing it would make
-    /// `disabled_tools = ["context_replace"]` a valid-looking entry that silently downgrades every
-    /// compaction to the fallback summarizer; left out, it warns as unrecognized instead.
+    /// `context_replace` is in every catalog and deliberately absent from `BUILTIN_TOOL_NAMES`.
+    /// Listing it would make `disabled_tools = ["context_replace"]` a valid-looking entry that
+    /// silently downgrades every compaction to the fallback summarizer; left out, it warns as
+    /// unrecognized instead.
     #[test]
     fn context_replace_is_not_a_configurable_builtin() {
         assert!(!BUILTIN_TOOL_NAMES.contains(&"context_replace"));
         assert!(BUILTIN_TOOL_NAMES.contains(&"context_check"));
         assert!(BUILTIN_TOOL_NAMES.contains(&"context_compact"));
+    }
+
+    /// An exhaustive `[tools].allowed_tools` and a sub-agent scope that denies it both leave
+    /// `context_replace` registered: it is compaction's plumbing, and a filter that could remove it
+    /// would silently downgrade every compaction to the fallback summarizer.
+    #[tokio::test]
+    async fn context_replace_is_registered_past_every_filter() {
+        let allow_listed = tool_registry_for_test_with_filter(BuiltinToolFilter::from_config(
+            Some(vec!["file_read".to_string()]),
+            Vec::new(),
+            HashMap::new(),
+        ))
+        .await;
+        assert!(
+            allow_listed.get("memory_write").is_none(),
+            "the allow-list must be in force for the test to prove anything"
+        );
+        assert!(allow_listed.get("context_replace").is_some());
+
+        let scoped = ToolRegistry::new_with_filter_and_scope(
+            BuiltinToolFilter::default(),
+            ToolScope::new(Vec::new(), vec!["context_replace".to_string()]),
+        );
+        assert!(scoped.get("context_replace").is_some());
     }
 
     #[test]
@@ -2996,18 +3048,10 @@ mod tests {
 
         // At Read permission, file_read should now be excluded from the checkpoint
         // tools because the override raised it to `unrestricted`.
-        let read_defs = registry.checkpoint_tools(
-            Permission::Read,
-            false,
-            Arc::new(std::sync::Mutex::new(None)),
-        );
+        let read_defs = registry.checkpoint_tools(Permission::Read, false);
         assert!(!read_defs.iter().any(|t| t.definition().name == "file_read"));
 
-        let write_defs = registry.checkpoint_tools(
-            Permission::Unrestricted,
-            false,
-            Arc::new(std::sync::Mutex::new(None)),
-        );
+        let write_defs = registry.checkpoint_tools(Permission::Unrestricted, false);
         assert!(
             write_defs
                 .iter()

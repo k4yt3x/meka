@@ -41,9 +41,71 @@ pub(crate) struct Submission {
     pub(crate) keep_recent: Option<bool>,
 }
 
-/// Slot `context_replace` writes into. Owned by the checkpoint turn that registered the tool, so a
-/// fresh one is created per compaction and never outlives it.
-pub(crate) type SubmissionSlot = Arc<std::sync::Mutex<Option<Submission>>>;
+/// Where a checkpoint turn's `context_replace` lands. Armed by the turn for its duration and idle
+/// otherwise, which is what lets the tool sit in every request's catalog: the catalog stays the
+/// turn's, so a checkpoint reads the prompt cache rather than rewriting it, and a call made outside
+/// a checkpoint is refused rather than acted on. One per registry, so a sub-agent's checkpoint
+/// cannot submit into its parent's.
+#[derive(Clone, Default)]
+pub(crate) struct CheckpointSlot(Arc<std::sync::Mutex<CheckpointState>>);
+
+#[derive(Default)]
+enum CheckpointState {
+    #[default]
+    Idle,
+    Armed(Option<Submission>),
+}
+
+impl CheckpointSlot {
+    /// Arm for one checkpoint turn. The guard disarms when dropped, so an early return leaves the
+    /// slot idle, and hands back what the turn submitted.
+    pub(crate) fn arm(&self) -> ArmedCheckpoint {
+        *crate::sync::lock(&self.0) = CheckpointState::Armed(None);
+        ArmedCheckpoint(self.clone())
+    }
+
+    fn is_armed(&self) -> bool {
+        matches!(&*crate::sync::lock(&self.0), CheckpointState::Armed(_))
+    }
+
+    /// Record a submission; `false` when no checkpoint is armed.
+    fn submit(&self, submission: Submission) -> bool {
+        match &mut *crate::sync::lock(&self.0) {
+            CheckpointState::Idle => false,
+            CheckpointState::Armed(slot) => {
+                *slot = Some(submission);
+                true
+            }
+        }
+    }
+}
+
+/// A checkpoint turn's hold on its slot.
+pub(crate) struct ArmedCheckpoint(CheckpointSlot);
+
+impl ArmedCheckpoint {
+    /// Whether `context_replace` has been called, which ends the turn.
+    pub(crate) fn is_submitted(&self) -> bool {
+        matches!(
+            &*crate::sync::lock(&self.0.0),
+            CheckpointState::Armed(Some(_))
+        )
+    }
+
+    /// Disarm and take what the turn submitted.
+    pub(crate) fn finish(self) -> Option<Submission> {
+        match std::mem::replace(&mut *crate::sync::lock(&self.0.0), CheckpointState::Idle) {
+            CheckpointState::Armed(submission) => submission,
+            CheckpointState::Idle => None,
+        }
+    }
+}
+
+impl Drop for ArmedCheckpoint {
+    fn drop(&mut self) {
+        *crate::sync::lock(&self.0.0) = CheckpointState::Idle;
+    }
+}
 
 /// Live numbers `context_check` reports, kept current by the agent.
 #[derive(Clone)]
@@ -364,11 +426,13 @@ impl Tool for ContextCompactTool {
     }
 }
 
-/// The checkpoint turn's terminal call. Registered only for that turn, so it never appears in the
-/// ordinary catalog and is deliberately absent from `BUILTIN_TOOL_NAMES`: listing it there would
-/// let a `disabled_tools` entry silently downgrade every compaction to the fallback summarizer.
+/// The checkpoint turn's terminal call. In every catalog, so the checkpoint's request carries the
+/// turn's own tool list and shares its cached prefix; the slot refuses a call made outside a
+/// checkpoint. Deliberately absent from `BUILTIN_TOOL_NAMES` and registered past the `[tools]`
+/// filter: it is compaction's plumbing rather than a capability, and a `disabled_tools` entry would
+/// silently downgrade every compaction to the fallback summarizer.
 pub(super) struct ContextReplaceTool {
-    pub(crate) slot: SubmissionSlot,
+    pub(crate) slot: CheckpointSlot,
 }
 
 #[async_trait]
@@ -379,7 +443,7 @@ impl Tool for ContextReplaceTool {
             description: "Replace your context with the summary you have written. Call this once, \
                           last, to end the checkpoint. Everything before the kept tail is \
                           discarded from your window, so the summary has to carry whatever the \
-                          work still depends on."
+                          work still depends on. Refused outside a checkpoint."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -409,6 +473,16 @@ impl Tool for ContextReplaceTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        // Ahead of reading the arguments: outside a checkpoint the call is refused whatever it
+        // carries, and the remedy is the request that brings one.
+        if !self.slot.is_armed() {
+            return Ok(ToolOutput::text(
+                "No checkpoint is running, so there is nothing to replace. `context_compact` asks \
+                 for one."
+                    .to_string(),
+                true,
+            ));
+        }
         let summary = match optional_str(&input, "summary", "context_replace") {
             Ok(Some(summary)) => summary.trim(),
             // Not given, or not a string: a tool error rather than a hard failure either way, so
@@ -424,14 +498,20 @@ impl Tool for ContextReplaceTool {
                 true,
             ));
         }
-        let mut slot = crate::sync::lock(&self.slot);
-        *slot = Some(Submission {
+        let recorded = self.slot.submit(Submission {
             summary: summary.to_string(),
             keep_recent: input
                 .get("keep_recent")
                 .and_then(serde_json::Value::as_bool),
         });
-        drop(slot);
+        // Disarmed between the check above and here: the checkpoint ended, and a summary it will
+        // never read is refused rather than reported accepted.
+        if !recorded {
+            return Ok(ToolOutput::text(
+                "The checkpoint has ended; this summary was not recorded.".to_string(),
+                true,
+            ));
+        }
         Ok(ToolOutput::text("Checkpoint accepted.".to_string(), false))
     }
 }
@@ -599,10 +679,9 @@ mod tests {
     /// model can recover from rather than accepted.
     #[tokio::test]
     async fn replace_refuses_an_empty_summary() {
-        let slot: SubmissionSlot = Arc::new(std::sync::Mutex::new(None));
-        let tool = ContextReplaceTool {
-            slot: Arc::clone(&slot),
-        };
+        let slot = CheckpointSlot::default();
+        let armed = slot.arm();
+        let tool = ContextReplaceTool { slot: slot.clone() };
         let output = tool
             .execute(
                 serde_json::json!({"summary": "   "}),
@@ -614,15 +693,14 @@ mod tests {
             output.is_error,
             "an empty summary must be refused as an error the model can act on"
         );
-        assert!(slot.lock().expect("lock").is_none());
+        assert!(armed.finish().is_none());
     }
 
     #[tokio::test]
     async fn replace_records_the_summary_and_tail_decision() {
-        let slot: SubmissionSlot = Arc::new(std::sync::Mutex::new(None));
-        let tool = ContextReplaceTool {
-            slot: Arc::clone(&slot),
-        };
+        let slot = CheckpointSlot::default();
+        let armed = slot.arm();
+        let tool = ContextReplaceTool { slot: slot.clone() };
         tool.execute(
             serde_json::json!({"summary": "what happened", "keep_recent": false}),
             crate::tools::ToolContext::detached(CancellationToken::new()),
@@ -630,8 +708,51 @@ mod tests {
         .await
         .expect("context_replace");
 
-        let submission = slot.lock().expect("lock").take().expect("recorded");
+        let submission = armed.finish().expect("recorded");
         assert_eq!(submission.summary, "what happened");
         assert_eq!(submission.keep_recent, Some(false));
+    }
+
+    /// Outside a checkpoint the call is refused whatever it carries: the tool sits in every catalog
+    /// so the checkpoint's request can share the turn's cached prefix, and does nothing until a
+    /// checkpoint arms it.
+    #[tokio::test]
+    async fn replace_is_refused_outside_a_checkpoint() {
+        let slot = CheckpointSlot::default();
+        let tool = ContextReplaceTool { slot: slot.clone() };
+        let output = tool
+            .execute(
+                serde_json::json!({"summary": "what happened"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("context_replace");
+        assert!(output.is_error);
+        assert!(
+            output.text_content().contains("`context_compact`"),
+            "{}",
+            output.text_content()
+        );
+        assert!(
+            slot.arm().finish().is_none(),
+            "the refused call recorded nothing"
+        );
+    }
+
+    /// The guard disarms when it goes out of scope, so a checkpoint that returns early leaves no
+    /// armed slot behind for a later call to land in.
+    #[tokio::test]
+    async fn an_armed_checkpoint_disarms_when_dropped() {
+        let slot = CheckpointSlot::default();
+        drop(slot.arm());
+        let tool = ContextReplaceTool { slot: slot.clone() };
+        let output = tool
+            .execute(
+                serde_json::json!({"summary": "what happened"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("context_replace");
+        assert!(output.is_error, "{}", output.text_content());
     }
 }

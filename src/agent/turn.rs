@@ -451,39 +451,6 @@ pub(super) fn should_nudge_thinking_only(
         && !already_nudged
         && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_))
 }
-/// Replace every image with a `[image]` placeholder, leaving all text intact.
-///
-/// The checkpoint turn's preprocessing, and deliberately only half of what
-/// [`strip_images_and_truncate`] does. Images are the expensive part of re-sending a conversation
-/// and almost never what a summary needs to carry; text is exactly what the agent has to read to
-/// judge what matters, so truncating it would hand the agent the same degraded view that made the
-/// standalone summarizer worth replacing.
-pub(super) fn strip_images(content: &mut [ContentBlock]) {
-    use crate::conversation::ToolResultContent;
-
-    for block in content.iter_mut() {
-        match block {
-            ContentBlock::ToolResult {
-                content: tool_content,
-                ..
-            } => {
-                for item in tool_content.iter_mut() {
-                    if matches!(item, ToolResultContent::Image { .. }) {
-                        *item = ToolResultContent::Text {
-                            text: "[image]".to_string(),
-                        };
-                    }
-                }
-            }
-            ContentBlock::Image { .. } => {
-                *block = ContentBlock::Text {
-                    text: "[image]".to_string(),
-                };
-            }
-            _ => {}
-        }
-    }
-}
 /// Preprocess message content blocks for the compaction summarizer: replace images with "[image]"
 /// markers and truncate large text blocks.
 pub(super) fn strip_images_and_truncate(content: &mut [ContentBlock]) {
@@ -6953,9 +6920,14 @@ mod tests {
             !attempt.system_prompt.is_empty(),
             "a turn always carries a system prompt"
         );
-        assert!(
-            attempt.tools.is_empty(),
-            "this harness registers no tools, so none should be advertised"
+        assert_eq!(
+            attempt
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["context_replace"],
+            "this harness registers no tools of its own, so only compaction's plumbing is advertised"
         );
     }
 

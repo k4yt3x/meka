@@ -2231,10 +2231,18 @@ mod tests {
                     message.contains("bwrap not found on PATH"),
                     "expected probe reason in error: {message}"
                 );
-                assert!(
-                    message.contains("`[shell].sandbox_backend`"),
-                    "expected the key to fix in error: {message}"
-                );
+                // The remedy where a setting can fix it and none where none can: macOS has one
+                // backend and no value for it, so an unusable probe there names nothing to set.
+                match crate::sandbox::backend_remedy(&tool.backend_probe) {
+                    Some(remedy) => assert!(
+                        message.contains(remedy),
+                        "expected the remedy in error: {message}"
+                    ),
+                    None => assert!(
+                        !message.contains("`[shell].sandbox_backend`"),
+                        "no setting fixes this platform's backend, so none is named: {message}"
+                    ),
+                }
             }
             Err(other) => panic!("expected ToolExecution, got {other:?}"),
             Ok(output) => panic!("expected hard error, got Ok({:?})", output.text_content()),

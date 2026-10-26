@@ -107,26 +107,6 @@ pub(super) fn build_request_body_for(
     serde_json::Value::Object(body)
 }
 
-/// Fold a [`StreamEvent`] stream into the tuple [`crate::provider::Provider::complete`] returns.
-/// Mirrors the accumulation in `Agent::run_streaming_attempt` but without any frontend emission, so
-/// a streaming-only provider can satisfy the non-streaming completion contract by silently
-/// consuming its own SSE. Text deltas concatenate into a trailing `Text` block; tool-call and
-/// thinking events fold into their blocks; usage tiers merge; notices collect; `MessageEnd` sets
-/// the stop reason. `StreamEvent::Error` is logged, not returned: the typed error surfaces from the
-/// concurrently-awaited `stream` future in each backend's `complete`.
-pub(super) async fn aggregate_stream(
-    mut receiver: mpsc::Receiver<StreamEvent>,
-) -> crate::provider::Completion {
-    let mut accumulator = crate::provider::MessageAccumulator::new();
-    while let Some(event) = receiver.recv().await {
-        if let StreamEvent::Error(error) = &event {
-            tracing::error!("responses: stream error: {error}");
-        }
-        accumulator.push(event);
-    }
-    accumulator.finish()
-}
-
 /// Ask the server to round-trip its reasoning as `reasoning.encrypted_content`.
 ///
 /// A no-op unless the request already asks for reasoning, since there would be nothing to encrypt.
@@ -903,7 +883,7 @@ pub(super) async fn complete<B: ResponsesBackend>(
     let (event_sender, event_receiver) = mpsc::channel::<StreamEvent>(1024);
     let (stream_result, aggregated) = tokio::join!(
         stream(backend, request, event_sender, cancellation),
-        aggregate_stream(event_receiver),
+        crate::provider::aggregate_stream(event_receiver),
     );
     stream_result?;
     Ok(aggregated)
@@ -2775,7 +2755,7 @@ mod tests {
             sender.send(event).await.expect("buffered");
         }
         drop(sender);
-        let message = aggregate_stream(receiver).await.message;
+        let message = crate::provider::aggregate_stream(receiver).await.message;
 
         let input = input_of(&[Message::user("hi"), message]);
         let reasoning = input

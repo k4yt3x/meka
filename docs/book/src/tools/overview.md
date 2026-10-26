@@ -43,6 +43,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`image_render`](./overview.md#image_render) | Read | View an image from in-memory base64 or scratchpad |
 | [`context_check`](./overview.md#context_check--context_compact) | Read | Measure the context window live: occupancy, headroom, compaction count |
 | [`context_compact`](./overview.md#context_check--context_compact) | Read | Ask for a compaction before the next step of this turn |
+| [`context_replace`](./overview.md#context_check--context_compact) | Read | Submit a checkpoint's summary; refused outside a checkpoint |
 | [`conversation_search`](./overview.md#conversation_search--conversation_read) | Read | Search the full conversation history, including compacted turns |
 | [`conversation_read`](./overview.md#conversation_search--conversation_read) | Read | Read conversation turns by index |
 | [`session_list`](./overview.md#session_list--session_search) | Read | List the sessions the agent may read |
@@ -67,7 +68,7 @@ Tools are grouped by the minimum permission level required:
 - `checklist_add`, `checklist_edit`, `checklist_read`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_steer`, `agent_delete`, `image_render`
 - All skill tools, including `skill_write`, `skill_edit` and `skill_delete` when they are enabled: like memory,
   skills live in meka's own config directory, not your working tree
-- `conversation_search`, `conversation_read`, `session_list`, `session_search`, `context_check`, `context_compact`
+- `conversation_search`, `conversation_read`, `session_list`, `session_search`, `context_check`, `context_compact`, `context_replace`
 - Every scratchpad tool except `scratchpad_save_file`, which writes to a path you name and so sits at `workspace` with `file_write`
 - All memory tools. Writing a memory needs only read permission: memories live in the store,
   which is meka's own, not your working tree.
@@ -140,7 +141,7 @@ A server that changes its tool list mid-session (`tools/list_changed`) rewrites 
 
 ## Background calls
 
-With [`[background] enabled`](../configuration/config-file.md#background), every tool except `context_compact` gains an optional `background` parameter, MCP tools included. `context_compact` does no work of its own: it parks a request the loop drains once the batch's results are in, and detaching it would race that drain. A call that sets it returns a task id immediately and delivers its result later as its own turn, which is what makes a twenty-minute build affordable. See [Background tasks](../usage/background.md).
+With [`[background] enabled`](../configuration/config-file.md#background), every tool except `context_compact` and `context_replace` gains an optional `background` parameter, MCP tools included. A call that sets it returns a task id immediately and delivers its result later as its own turn, which is what makes a twenty-minute build affordable. `context_compact` does no work of its own: it parks a request the loop drains once the batch's results are in, and detaching it would race that drain. `context_replace` hands a checkpoint its summary, and nothing waits on a task for that. See [Background tasks](../usage/background.md).
 
 ```text
 shell_execute({"command": "cargo test --all", "background": true})
@@ -386,4 +387,4 @@ This exists because the pushed `[Context budget]` block is rendered once, at the
 - `instructions`: what to preserve or drop. Active restrictions, authorizations, and commitments must still be preserved.
 - `keep_recent`: allow recent rounds to be kept verbatim. Default `true`; a tail is kept only when enough older history can be summarized. `false` requests no retained tail.
 
-There is a third tool, `context_replace`, that exists only inside a checkpoint turn and is how the agent submits its summary. It is deliberately absent from the ordinary catalog and from `[tools]` configuration. See [Compacting a session](../usage/sessions.md#compacting-a-session).
+The third tool, `context_replace`, is how the agent submits its summary from a checkpoint turn. It is in every catalog, so a checkpoint's request carries the same tool list the turn does and shares its prompt cache, and it is refused outside a checkpoint. It is deliberately outside `[tools]` configuration: no entry can disable it, since that would silently downgrade every compaction to the fallback summarizer. See [Compacting a session](../usage/sessions.md#compacting-a-session).

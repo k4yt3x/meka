@@ -65,10 +65,15 @@ pub(super) fn checkpoint_instruction(
     request: &CompactRequest,
     available: &prompt::AvailableTools,
 ) -> String {
-    let mut instruction = String::from(
-        "[Checkpoint]\nEarlier context will be replaced by your summary. This request's API tools \
-         replace the earlier tool list; `context_replace` is allowed even when ordinary tools are \
-         blocked. Preserve state, without starting new work.\n\n",
+    // The request carries the turn's whole catalog, so what answers here is said outright.
+    let names = available
+        .names()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut instruction = format!(
+        "[Checkpoint]\nEarlier context will be replaced by your summary. Available now: {names}; \
+         every other call is refused. Preserve state, without starting new work.\n\n"
     );
     if available.is_available("memory_write") {
         instruction.push_str(
@@ -500,7 +505,7 @@ impl Agent {
             match self
                 .run_checkpoint_turn(
                     &request,
-                    messages.as_slice(),
+                    messages,
                     cancellation.clone(),
                     &mut memories_written,
                 )
@@ -866,8 +871,11 @@ impl Agent {
     ///   than replacing that prompt.
     /// - It has tools, so the moment information is about to be destroyed is finally a moment the
     ///   agent can act in. `memory_write` is the point of the exercise.
-    /// - It sees full text (only images are stripped), so it judges what actually happened rather
-    ///   than a head-and-tail excerpt of it.
+    /// - It sees the conversation as the turn sends it, images included, so it judges what actually
+    ///   happened rather than a head-and-tail excerpt of it.
+    /// - It carries the turn's own tool list, so the request shares the turn's cached prefix and
+    ///   the summary costs a cache read of the conversation rather than a rewrite of it. What it
+    ///   may call is narrower than what it carries, and the rest is refused at dispatch.
     ///
     /// Cancelable through the caller's token. A bare `CancellationToken::new()` here would be a
     /// token with no signal source, and the checkpoint is the longest thing compaction does: up to
@@ -876,36 +884,40 @@ impl Agent {
     pub(super) async fn run_checkpoint_turn(
         &self,
         request: &CompactRequest,
-        messages: &[Message],
+        messages: &Conversation,
         cancellation: CancellationToken,
         // Accumulated in the caller's buffer rather than returned, so a checkpoint that writes a
         // memory and *then* fails or is canceled still reports what landed on disk.
         memories_written: &mut Vec<String>,
     ) -> Result<Option<Checkpoint>> {
         let attribution = self.compaction_attribution(request);
-        let slot: crate::tools::context::SubmissionSlot = Arc::new(std::sync::Mutex::new(
-            None::<crate::tools::context::Submission>,
-        ));
-        let tools = self.tool_registry.checkpoint_tools(
-            self.cells.permission.get(),
-            self.cells.permission.approvals(),
-            Arc::clone(&slot),
+        // The request carries what the turn's own builder sends from the same loaded set, so its
+        // prefix is the turn's and the prompt cache holds. The checkpoint's allow-list is narrower
+        // and is enforced at dispatch, through `admitted`.
+        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
+            messages.events(),
+            self.tool_registry.deferred_tool_delivery(),
         );
-        let definitions: Vec<ToolDefinition> = tools.iter().map(|tool| tool.definition()).collect();
-        let by_name: std::collections::HashMap<String, Arc<dyn crate::tools::Tool>> = tools
+        let active = self.tool_registry.active_tools(&loaded);
+        let definitions: Vec<ToolDefinition> = active.definitions;
+        let deferred_definitions: Vec<ToolDefinition> = active.deferred_definitions;
+        let admitted: std::collections::HashMap<String, Arc<dyn crate::tools::Tool>> = self
+            .tool_registry
+            .checkpoint_tools(
+                self.cells.permission.get(),
+                self.cells.permission.approvals(),
+            )
             .into_iter()
             .map(|tool| (tool.definition().name, tool))
             .collect();
+        let armed = self.tool_registry.arm_checkpoint();
 
         let system_prompt = match &self.options.system_prompt_override {
             Some(prompt) => prompt.clone(),
             None => prompt::build_system_prompt(self.system_prompt_inputs()),
         };
 
-        let mut checkpoint_messages: Vec<Message> = messages.to_vec();
-        for message in &mut checkpoint_messages {
-            strip_images(&mut message.content);
-        }
+        let mut checkpoint_messages: Vec<Message> = messages.as_slice().to_vec();
 
         // Deliver the instruction as a trailing text block on an existing user message when the
         // conversation already ends with one, and only otherwise as a message of its own.
@@ -916,8 +928,7 @@ impl Agent {
         // the request near-silently, because `compact_session` falls back to the
         // summarizer, and the instruction reads as part of the message it follows either
         // way.
-        let available =
-            prompt::AvailableTools::new(definitions.iter().map(|tool| tool.name.clone()));
+        let available = prompt::AvailableTools::new(admitted.keys().cloned());
         let instruction = checkpoint_instruction(request, &available);
         match checkpoint_messages.last_mut() {
             Some(last) if last.role == Role::User => {
@@ -939,6 +950,7 @@ impl Agent {
                 .complete_with_retry(
                     "the checkpoint's provider call",
                     CompletionRequest::new(&system_prompt, &checkpoint_messages, &definitions)
+                        .declaring(&deferred_definitions)
                         .attributed(attribution.clone()),
                     &cancellation,
                     &cancellation,
@@ -989,7 +1001,7 @@ impl Agent {
             checkpoint_messages.push(assistant_message);
             let mut results = Vec::with_capacity(tool_uses.len());
             for (tool_use_id, name, input) in tool_uses {
-                let output = match by_name.get(&name) {
+                let output = match admitted.get(&name) {
                     // Approvals put a call above the level to the user, and a checkpoint's writes
                     // are actions: `memory_write` overwrites an existing note in place, durably and
                     // instance-wide. Dispatching straight to `run_tool` would make the checkpoint
@@ -1006,7 +1018,6 @@ impl Agent {
                         } else {
                             super::dispatch::CallDoor::Checkpoint
                         };
-                        // No deferred tool is offered here, so nothing is loaded or blind.
                         self.run_admitted_call(
                             tool,
                             super::dispatch::ResolvedCall {
@@ -1014,7 +1025,7 @@ impl Agent {
                                 name: &name,
                                 input: &input,
                             },
-                            &[],
+                            &loaded,
                             &attribution,
                             cancellation.clone(),
                             door,
@@ -1051,12 +1062,12 @@ impl Agent {
                 content: results,
             });
 
-            if crate::sync::lock(&slot).is_some() {
+            if armed.is_submitted() {
                 break;
             }
         }
 
-        let submission = crate::sync::lock(&slot).take();
+        let submission = armed.finish();
 
         // The tool was called, or the summarizer writes the summary. There is deliberately no
         // rung in between that takes the turn's closing text: `Provider::complete` carries no
@@ -1608,6 +1619,132 @@ mod tests {
             serde_json::json!({"name": "note"}),
             "meka's own parameter is taken out at the checkpoint door too"
         );
+    }
+
+    /// The checkpoint's request is the turn's: the whole catalog, tools outside its allow-list
+    /// included, and the images the conversation holds. That is what lets the provider answer it
+    /// from the turn's cached prefix rather than re-read the conversation; what the checkpoint may
+    /// call is decided at dispatch.
+    #[tokio::test]
+    async fn the_checkpoint_request_carries_the_turns_catalog_and_images() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+            "summary", None,
+        )]));
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(StubTool {
+                name: "shell_execute".to_string(),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .expect("register stub");
+        let (agent, store) = agent_with_registry_and_checkpoint(provider.clone(), registry).await;
+        let mut messages = conversation();
+        messages.append(Message::user_with_images("and this", vec![
+            crate::image::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "QUJD".to_string(),
+            },
+        ]));
+        let outcome = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Manual),
+        )
+        .await;
+        assert_eq!(outcome.source, CompactionSource::Checkpoint);
+
+        let expected: Vec<String> = agent
+            .tool_registry
+            .active_tools(&[])
+            .definitions
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(
+            expected.iter().any(|name| name == "shell_execute"),
+            "the catalog holds a tool outside the allow-list, or the test proves nothing"
+        );
+        assert_eq!(
+            provider.completion_tools()[0],
+            expected,
+            "the checkpoint's catalog is the turn's"
+        );
+        let sent = &provider.completions()[0];
+        assert!(
+            sent.iter()
+                .flat_map(|message| message.content.iter())
+                .any(|block| matches!(block, ContentBlock::Image { .. })),
+            "the images go as they are"
+        );
+    }
+
+    /// A tool the request carries but the checkpoint does not admit is refused with a result the
+    /// model can read, and the checkpoint goes on to its submission: the catalog is the turn's for
+    /// the cache's sake, and the allow-list holds at dispatch.
+    #[tokio::test]
+    async fn a_call_outside_the_allow_list_is_refused_at_dispatch() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "shell_execute".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            replace_round("summary", None),
+        ]));
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(StubTool {
+                name: "shell_execute".to_string(),
+                calls: calls.clone(),
+            }))
+            .expect("register stub");
+        let (agent, store) = agent_with_registry_and_checkpoint(provider.clone(), registry).await;
+        let mut messages = conversation();
+        let outcome = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Manual),
+        )
+        .await;
+        assert_eq!(outcome.source, CompactionSource::Checkpoint);
+        assert!(
+            calls.lock().expect("calls").is_empty(),
+            "the refused tool never ran"
+        );
+
+        let completions = provider.completions();
+        let answer = completions[1]
+            .last()
+            .expect("the refusal went back to the model");
+        let (is_error, content) = answer
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    is_error, content, ..
+                } => Some((*is_error, content.clone())),
+                _ => None,
+            })
+            .expect("a tool result");
+        assert!(is_error);
+        let text: String = content
+            .iter()
+            .filter_map(|item| match item {
+                crate::conversation::ToolResultContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("not available during a checkpoint"), "{text}");
     }
 
     async fn agent_with_registry_and_checkpoint(
