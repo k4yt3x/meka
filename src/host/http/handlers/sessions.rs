@@ -1739,7 +1739,7 @@ pub(crate) struct PatchSessionRequest {
     #[serde(default)]
     pub(crate) profile: Option<String>,
     /// Project to move the session onto, which decides the memory tier its writes land in and the
-    /// tiers it sees. Must name a project in `config.toml`; empty takes the session off its
+    /// tiers it sees. Must name a project the store has; empty takes the session off its
     /// project. Absent → keep current. The next turn's context restates the memories the session
     /// now sees.
     #[serde(default)]

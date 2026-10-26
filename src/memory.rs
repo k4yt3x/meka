@@ -6,7 +6,7 @@
 //! policy, references, source, verification stamp and expiry. A memory is in one of two tiers:
 //! the global tier, which every session sees, or a project's, which the sessions on that project
 //! see beside the global ones. Neither tier is bound to a session or a directory: a project is a
-//! name the operator defines in `config.toml` and a session opens by name, and the motivating
+//! row the operator adds with `meka project add` and a session opens by name, and the motivating
 //! deployment is still a single always-on session reachable over chat, where the agent is closer
 //! to a person than to a checkout.
 //!

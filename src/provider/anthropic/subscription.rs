@@ -197,7 +197,7 @@ impl ClaudeSubscriptionProvider {
         self.resolved_effort.is_some()
     }
 
-    /// Mirrors Claude Code 2.1.301's beta assembly for a first-party OAuth turn, validated against
+    /// Mirrors Claude Code 2.1.310's beta assembly for a first-party OAuth turn, validated against
     /// live captures of its interactive CLI: Opus 5.5 and Opus 5 with tools, thinking on and
     /// display updates, fifteen betas in this order on Opus 5.5.
     ///
@@ -266,7 +266,7 @@ impl ClaudeSubscriptionProvider {
         parts.push("prompt-caching-scope-2026-01-05");
 
         // No `mid-conversation-system-2026-04-07`: the feature is generally available, and Claude
-        // Code 2.1.301 refuses to send that header even when `ANTHROPIC_BETAS` names it.
+        // Code 2.1.310 refuses to send that header even when `ANTHROPIC_BETAS` names it.
         if model_supports_per_turn_effort(model) {
             parts.push("per-turn-control-2026-07-01");
         }
@@ -1785,10 +1785,11 @@ mod tests {
 
     #[test]
     fn betas_modern_thinking_model_full_set() {
-        // Tools + thinking + the default display: matches the live Claude Code 2.1.301 interactive
-        // CLI wire capture on Opus 5.5 exactly, minus `context-1m-2025-08-07`, which this profile's
-        // window does not ask for. Display updates replace the redaction beta on a turn with
-        // thinking on.
+        // Tools + thinking + display updates. The live Claude Code 2.1.310 interactive CLI
+        // capture on Opus 5.5, taken with summaries on, is this list without the display beta,
+        // which the 2.1.301 capture with updates on showed in this position; both minus
+        // `context-1m-2025-08-07`, which this profile's window does not ask for. Display updates
+        // replace the redaction beta on a turn with thinking on.
         let betas = provider_full(
             "claude-opus-5-5",
             true,
@@ -1816,7 +1817,7 @@ mod tests {
                 "extended-cache-ttl-2025-04-11",
                 "cache-diagnosis-2026-04-07",
             ],
-            "Claude Code 2.1.301 CLI beta set"
+            "Claude Code 2.1.310 CLI beta set"
         );
     }
 
@@ -2187,7 +2188,7 @@ mod tests {
 
     #[test]
     fn mid_conversation_tool_changes_follow_the_catalog_s_denylist() {
-        // The gate is a denylist over Claude Code 2.1.301's catalog: every entry with the
+        // The gate is a denylist over Claude Code 2.1.310's catalog: every entry with the
         // capability gets it, the named older ones and Sonnet 5 do not.
         for model in [
             "claude-opus-4-8",
@@ -2625,7 +2626,7 @@ mod tests {
         }
     }
 
-    /// Claude Code 2.1.301 with `showThinkingSummaries` on, captured on Opus 5.5: the same set
+    /// Claude Code 2.1.310 with `showThinkingSummaries` on, captured on Opus 5.5: the same set
     /// as the default display minus the display-updates beta, and `display: "summarized"`.
     #[test]
     fn betas_under_summaries_match_the_2_1_301_capture() {

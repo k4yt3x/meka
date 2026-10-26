@@ -293,6 +293,10 @@ pub(crate) struct Attribution {
     /// one's last response. Claude Code reads that off the last assistant message in its history
     /// (`t0E`); meka's conversation doesn't carry request ids, so the provider deposits them here.
     pub(crate) previous_request: Option<PreviousRequestSlot>,
+    /// Where the last response's message id is kept, for `diagnostics.previous_message_id`, held
+    /// the way [`Self::previous_request`] is. A compaction's requests carry copies of both slots:
+    /// they name the same ids a turn's request would, and what they are answered with reaches
+    /// neither of the conversation's own.
     pub(crate) previous_message: Option<PreviousMessageSlot>,
     /// The session the request serves, when it serves one. A ChatGPT request carries it as the
     /// cache affinity the Codex client sends (`prompt_cache_key`, `session-id`, `thread-id`):
@@ -370,9 +374,9 @@ impl Attribution {
             .and_then(|slot| crate::sync::lock(slot).clone())
     }
 
-    /// Whether this request is a turn of the conversation rather than a side query such as a
-    /// compaction: only a turn carries a message slot, and only a turn reports
-    /// `diagnostics.previous_message_id`.
+    /// Whether this request reports `diagnostics.previous_message_id`: a turn of the conversation,
+    /// a worker's included, or a compaction carrying copies of the turn's slots. A request built
+    /// with no attribution, as the account calls are, carries no message slot and reports none.
     pub(crate) fn is_conversation_turn(&self) -> bool {
         self.previous_message.is_some()
     }

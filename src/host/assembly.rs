@@ -716,7 +716,7 @@ pub(crate) struct ResumedSession {
     /// the row at a level it never ran at, for every other reader of it.
     pub(crate) permission_to_record: Option<crate::permission::Permission>,
     /// The project the session of this run is on: `--project` for a fresh session, checked
-    /// against the file; a resumed row's own, moved by `--project` where `-r <id>` named it.
+    /// against the store; a resumed row's own, moved by `--project` where `-r <id>` named it.
     /// What the banner shows and the opening skill is checked against; the build reads a row's
     /// project off the row.
     pub(crate) project: Option<String>,

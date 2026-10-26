@@ -818,16 +818,17 @@ impl Agent {
         if self.role.is_root() {
             *crate::sync::lock(&self.context_compacted) = Some(compaction_kind);
         }
-        // `diagnostics.previous_message_id` names the response the conversation still ends on,
-        // which Claude Code reads off the last assistant message it sends. A compaction that
-        // summarized that response leaves nothing to name, the `null` a first request sends; a
-        // kept tail still carries it.
+        // `diagnostics.previous_message_id` and `cc_prev_req` name the response the conversation
+        // still ends on, which Claude Code reads off the last assistant message it sends. A
+        // compaction that summarized that response leaves nothing to name, the `null` and the
+        // absent segment a first request sends; a kept tail still carries both.
         if !messages
             .as_slice()
             .iter()
             .any(|message| message.role == Role::Assistant)
         {
             *crate::sync::lock(&self.previous_message) = None;
+            *crate::sync::lock(&self.previous_request) = None;
         }
 
         Ok(CompactOutcome {
@@ -841,17 +842,25 @@ impl Agent {
         })
     }
 
-    /// Who a compaction's requests are for. Claude Code's compaction names the response it
-    /// follows and the kind of compaction it is, and nothing about the prompt: its summary request
-    /// is the last user message the header reads, and that one carries no prompt id or origin.
+    /// Who a compaction's requests are for. Claude Code's compaction names the request and the
+    /// response it follows, as a turn's request does, and the kind of compaction it is, and
+    /// nothing about the prompt: its summary request is the last user message the header reads,
+    /// and that one carries no prompt id, origin or position.
+    ///
+    /// The two ids ride in copies of the conversation's slots rather than the slots themselves. A
+    /// compaction is a side query, not a message of the conversation, so what it is answered with
+    /// must not become the conversation's previous request or message: the turn after it names
+    /// the response the kept tail still ends on, or nothing, which `replace_with_summary` settles.
     fn compaction_attribution(&self, request: &CompactRequest) -> crate::provider::Attribution {
+        let copy_of = |slot: &Arc<std::sync::Mutex<Option<String>>>| {
+            Some(Arc::new(std::sync::Mutex::new(
+                crate::sync::lock(slot).clone(),
+            )))
+        };
         crate::provider::Attribution {
             worker: self.worker_identity(),
-            previous_request: Some(Arc::clone(&self.previous_request)),
-            // A compaction is a side query, not a message of the conversation: its response must
-            // not become the conversation's previous message, and Claude Code's side queries
-            // carry no `diagnostics` at all.
-            previous_message: None,
+            previous_request: copy_of(&self.previous_request),
+            previous_message: copy_of(&self.previous_message),
             session_id: self.cells.session_id.get(),
             compaction: Some(crate::provider::CompactionKind::from(request.trigger)),
             ..Default::default()
@@ -2561,17 +2570,19 @@ mod tests {
         assert_eq!(agent.take_context_compacted(), None);
     }
 
-    /// The previous message id names a response the request still carries. Summarizing it away
-    /// clears the id, the way a first request has none; a kept tail keeps it.
+    /// The previous message and request ids name a response the request still carries.
+    /// Summarizing it away clears both, the way a first request has neither; a kept tail keeps
+    /// both.
     #[tokio::test]
-    async fn a_compaction_that_summarizes_the_last_reply_forgets_its_message_id() {
-        for (keep_recent, expected) in [(false, None), (true, Some("msg_01last".to_string()))] {
+    async fn a_compaction_that_summarizes_the_last_reply_forgets_its_ids() {
+        for keep_recent in [false, true] {
             let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
                 "summary",
                 Some(keep_recent),
             )]));
             let (agent, store) = agent_with_checkpoint(provider, true).await;
             *crate::sync::lock(&agent.previous_message) = Some("msg_01last".to_string());
+            *crate::sync::lock(&agent.previous_request) = Some("req_011last".to_string());
             let mut messages = conversation();
 
             let outcome = compact(&agent, &store, &mut messages, CompactRequest {
@@ -2583,12 +2594,69 @@ mod tests {
             .await;
 
             assert_eq!(outcome.kept_recent, keep_recent);
+            let expected = |id: &str| keep_recent.then(|| id.to_string());
             assert_eq!(
                 *crate::sync::lock(&agent.previous_message),
-                expected,
+                expected("msg_01last"),
+                "keep_recent {keep_recent}"
+            );
+            assert_eq!(
+                *crate::sync::lock(&agent.previous_request),
+                expected("req_011last"),
                 "keep_recent {keep_recent}"
             );
         }
+    }
+
+    /// A compaction's requests name the conversation's previous request and response, as a
+    /// turn's do, through copies: what answers them moves neither of the conversation's slots.
+    #[tokio::test]
+    async fn a_compaction_s_requests_name_the_conversation_s_ids_without_moving_them() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![]));
+        let (agent, _store) = agent_with_checkpoint(provider, true).await;
+        *crate::sync::lock(&agent.previous_message) = Some("msg_01last".to_string());
+        *crate::sync::lock(&agent.previous_request) = Some("req_011last".to_string());
+
+        let attribution =
+            agent.compaction_attribution(&CompactRequest::new(CompactionTrigger::Manual));
+        assert_eq!(attribution.request_class(), Some("compaction"));
+        assert!(
+            attribution.is_conversation_turn(),
+            "the compaction reports `diagnostics`"
+        );
+        assert_eq!(
+            attribution.previous_message_id().as_deref(),
+            Some("msg_01last")
+        );
+        assert_eq!(
+            attribution.previous_request_id().as_deref(),
+            Some("req_011last")
+        );
+
+        attribution.record_request_id("req_011compaction");
+        crate::provider::record_message_id(
+            attribution.previous_message.as_ref().expect("a copy"),
+            "msg_01compaction",
+        );
+        assert_eq!(
+            attribution.previous_request_id().as_deref(),
+            Some("req_011compaction"),
+            "the copy took the compaction's own answer"
+        );
+        assert_eq!(
+            attribution.previous_message_id().as_deref(),
+            Some("msg_01compaction")
+        );
+        assert_eq!(
+            crate::sync::lock(&agent.previous_request).as_deref(),
+            Some("req_011last"),
+            "the conversation's request slot is untouched"
+        );
+        assert_eq!(
+            crate::sync::lock(&agent.previous_message).as_deref(),
+            Some("msg_01last"),
+            "the conversation's message slot is untouched"
+        );
     }
 
     /// `context_replace` knows more than the caller did, because it ran after reading the

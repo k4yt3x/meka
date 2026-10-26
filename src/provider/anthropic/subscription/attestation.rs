@@ -21,7 +21,7 @@ use crate::{
 
 /// Claude Code version whose wire this module mirrors. A bump is verified against a capture of
 /// the real client first, because the server refuses a version too old for a new model.
-pub(super) const CC_VERSION: &str = "2.1.301";
+pub(super) const CC_VERSION: &str = "2.1.310";
 
 /// Fingerprint salt. `MHE` in the shipped 2.1.241 binary, present unchanged in 2.1.263.
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
@@ -81,7 +81,7 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
 /// real attestation by [`patch_request_body`] after serialization.
 ///
 /// The optional segments follow in the order Claude Code's builder emits them (2.1.241 through
-/// 2.1.301, verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`,
+/// 2.1.310, verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`,
 /// `cc_prev_req`, `cc_prompt_id`, `cc_turn_origin`, and since 2.1.284 the pair `cc_prompt_index`
 /// and `cc_turn_index`, which go together or not at all. meka never has a workload, so that one
 /// is always absent; the rest appear exactly when their source does.
@@ -521,7 +521,7 @@ fn stainless_os() -> &'static str {
 /// Applies all HTTP headers Claude Code sends, in the order it sends them.
 ///
 /// The order is not cosmetic: HTTP/2 preserves it, so it is as much a client signature as the
-/// values are. What the 2.1.241 through 2.1.301 wire captures show is the Stainless SDK's
+/// values are. What the 2.1.241 through 2.1.310 wire captures show is the Stainless SDK's
 /// `Headers` object serialized in a case-sensitive sort (uppercase before lowercase), then the
 /// transport's own `Connection` / `Host` / `Accept-Encoding` / `Content-Length` after it.
 /// `reqwest`'s `HeaderMap` iterates in insertion order, so inserting in that order reproduces it.
@@ -585,7 +585,7 @@ pub(super) fn apply_headers(
         .header("Accept-Encoding", "gzip, deflate, br, zstd")
 }
 
-/// The headers Claude Code 2.1.301 adds about the request itself, in the sorted position the
+/// The headers Claude Code 2.1.310 adds about the request itself, in the sorted position the
 /// captures show them: `x-cc-*` ahead of `x-claude-code-*`, each group alphabetical. Two facts
 /// go out twice because Claude Code keeps a first-party name and a gateway-hint name for each
 /// and sends both to Anthropic.

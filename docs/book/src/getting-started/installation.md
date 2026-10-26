@@ -29,7 +29,10 @@ its own to build or pull: the binary is bind-mounted in, `~/.config/meka` read-o
 The agent starts at `unrestricted` with instructions saying it may install whatever the task needs,
 and that it must not create memories or scheduled jobs unless asked, since the store it writes is
 the host's. It is the answer to "let it do anything, just not to my machine": the container is
-disposable and the host config cannot be written. It picks podman over docker when both are present.
+disposable and the host config cannot be written. The store is the one host file the box shares,
+and nothing sandboxes a command at `unrestricted`, so a command in the box can read every
+credential in it: the boundary is around your filesystem, not your accounts. It picks podman over
+docker when both are present.
 
 ## Cargo install
 

@@ -7,57 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.84.0] - 2026-10-26
+
 ### Added
 
-- Projects: `meka project add <name>` names a memory tier a session opens by name.
-- `--project`, `/project`, HTTP `project` and an ACP config option put a session on one.
-- Memory has a global tier and one per project; `memory_write` and `memory_search` take `tier`.
-- `meka project add|list|rename|remove`; `--project` on `memory` commands and `session list`.
-- `GET /v1/projects`; `project` on the memory routes; `memory export` uses a directory per project.
-- `meka memory import <dir>` restores an export, stamps and read counts included, in one step.
-- `meka memory export` writes `export.toml` beside the files, carrying the snapshot's version.
+- Projects: `meka project add|list|rename|remove` define memory tiers beside the global one.
+- A session opens on a project with `--project`, `/project`, HTTP `project` or an ACP config option.
+- Only a project's sessions see its memories; `memory_write` and `memory_search` take `tier`.
+- `meka memory import <dir>` restores an export; `memory export` writes one directory per project.
+- `GET /v1/projects` lists projects; `project` on the memory routes and `session list` picks one.
 - `meka tool show <name>` prints a built-in tool's schema as the model receives it.
-- Every compaction is reported as what it was: what set it going, who wrote it, what it wrote.
+- Every compaction says what set it going, which strategy wrote it and which memories it wrote.
 - The screen shows a row for every compaction, automatic ones included, and a word while one runs.
-- An ACP client advertising `session.compaction` gets `compaction_update`, opened as work begins.
-- An ACP client advertising `session.notices` gets meka's advisories as `notice` updates.
-- `context.compacting` and `context.compaction_failed` events; `compactions` in the one-shot JSON.
-- `[permissions].network = "remote"`: a command and `web_fetch` reach other machines, not this one.
-- `agent_spawn` takes `network: "remote"`; a sub-agent's setting is any at or below its parent's.
-- Windows gains the `appcontainer` backend: the store is hidden and reads and the network are held.
+- HTTP: `context.compacting` and `context.compaction_failed` events; `compactions` in one-shot JSON.
+- ACP: `compaction_update` and `notice` updates for a client that advertises the capability.
+- `network = "remote"`, in `[permissions]` and on `agent_spawn`: other machines, not this one.
+- Windows: the `appcontainer` backend hides the store and holds the read boundary and the network.
 
 ### Changed
 
-- `meka memory list` and `meka session list` show a `Project` column once a project exists.
+- Inline memory bodies share a 32 KiB budget, `[memory] inline_max_bytes`; it was a fixed 4 KiB.
+- A memory write past the budget is refused; a body is shown whole or listed by description.
+- The status row, `meka memory list` and `meka session list` show the project once one exists.
 - The screen's banner names the build and counts the servers, skills, memories and instructions.
-- The screen's status row shows the project the session is on; `[display] status_row` lists it.
-- `clipboard-win` moves to 5.4.3, off a yanked release.
-- The ACP SDK moves to 3.5.0; `initialize` with a protocol version meka lacks is answered with 1.
-- Inline memory bodies share a 32 KiB budget, `[memory] inline_max_bytes`; it was 4 KiB and fixed.
-- A memory write that would take the inline bodies past the budget is refused, at every door alike.
-- An inline body is shown whole or listed by description; the memory section says which and why.
 - `context.compacted` and the `compaction` marker add `trigger`, `memories_written`, `kept_recent`.
+- A compaction from before 0.84 replays as an automatic one at the ceiling; see the upgrade guide.
 - The ACP `[meka]` chunk for a compaction uses the screen's words; see the upgrade guide.
 - Session archives are `format_version` 16; an older archive is brought forward on import.
-- A compaction from before 0.84 replays as an automatic one at the ceiling; see the upgrade guide.
-- Copying from the transcript no longer warns when no clipboard manager takes the text.
-- A value of the wrong type in a string argument is refused by name, on every tool.
+- A compaction's checkpoint keeps the turn's tools and images, so it reads the prompt cache.
+- `context_replace` is in every tool catalog and refuses to run outside a compaction.
 - **Breaking:** `[shell].sandbox_backend` refuses another platform's value; see the upgrade guide.
 - Windows takes `appcontainer` or `restricted-token` as its backend and warns once on the fallback.
-- A backend holds a network setting it cannot as the next narrower one, and startup says so once.
-- The scope lines name what the shell and `web_fetch` each reach where a backend narrows one.
+- A backend that cannot hold a network setting holds the next narrower one, and startup says so.
 - A confined command on Windows cannot read or set the clipboard, drive windows or inject input.
-- Landlock alone under `network = "none"` closes UDP too on kernel 7.2+; it closed TCP alone.
-- A compaction's checkpoint carries the turn's tool list and images, so it reads the prompt cache.
-- `context_replace` is in every catalog and refused outside a checkpoint; `[tools]` cannot drop it.
-- A Claude completion under `--no-stream`, or for a checkpoint or summary, is the stream folded.
+- Landlock under `network = "none"` closes UDP too on kernel 7.2+; it closed TCP alone.
+- An ACP `initialize` naming a protocol version meka lacks is answered with the one it speaks.
+- Claude subscription parity moves to Claude Code 2.1.310.
 
 ### Fixed
 
-- A warning a library logs is shown on the screen without its `log.*` location fields.
 - A thinking block that arrives mid-reply is stored where it arrived, as the live turn showed it.
-- Every tool reads a blank optional argument as left out; `checklist_edit` refused one as a value.
-- A list argument takes one bare string as its entry, drops a blank entry and refuses a wrong type.
+- Every tool reads a blank optional argument as left out and refuses a wrong type by field name.
+- A list argument takes one bare string as its entry and drops a blank entry.
+- A library's warning reaches the screen as its own line, without `log.*` location fields.
+- Copying from the transcript no longer warns when no clipboard manager takes the text.
 
 ### Security
 
@@ -2931,7 +2924,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.83.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.84.0...HEAD
+[0.84.0]: https://github.com/k4yt3x/meka/compare/0.83.0...0.84.0
 [0.83.0]: https://github.com/k4yt3x/meka/compare/0.82.0...0.83.0
 [0.82.0]: https://github.com/k4yt3x/meka/compare/0.81.0...0.82.0
 [0.81.0]: https://github.com/k4yt3x/meka/compare/0.80.0...0.81.0

@@ -533,8 +533,8 @@ pub(crate) struct WriteMemoryRequest {
     /// Omit to keep; send `""` to clear.
     #[serde(default)]
     pub(crate) expires: Option<String>,
-    /// The project to file the memory in, which must be one `config.toml` defines; `""` is the
-    /// global tier. Omit to keep an existing memory's tier, or to file a new one as global. Naming
+    /// The project to file the memory in, which must be one the store has; `""` is the global
+    /// tier. Omit to keep an existing memory's tier, or to file a new one as global. Naming
     /// the other tier for an existing memory moves it; a name a global memory and a project memory
     /// would share is refused.
     #[serde(default)]

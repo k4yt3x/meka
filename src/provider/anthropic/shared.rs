@@ -134,7 +134,7 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// first-party feature an arbitrary endpoint may not implement.
 ///
 /// The `max_tokens` sent when the profile states no `max_output_tokens`: 128000 under adaptive
-/// thinking, which is what Claude Code 2.1.301 sends for Opus 5.5 (verified by wire capture), the
+/// thinking, which is what Claude Code 2.1.310 sends for Opus 5.5 (verified by wire capture), the
 /// model `profile add` suggests, and the most every model that takes adaptive thinking accepts;
 /// 32000 otherwise, raised to twice the budget under budgeted thinking when that is more. Claude
 /// Code reads the figure off a per-model catalog, which says 64000 for the rest of the line-up;
@@ -229,7 +229,7 @@ pub(super) fn model_supports_temperature(model: &str) -> bool {
 
 /// Whether a Claude model accepts `output_config.effort`.
 ///
-/// A denylist mirroring Claude Code 2.1.301's own gate, which excludes the Claude 3.x line, Opus
+/// A denylist mirroring Claude Code 2.1.310's own gate, which excludes the Claude 3.x line, Opus
 /// 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5 and sends the field to everything else on the first-party
 /// endpoint. Same reasoning and same single caller as
 /// [`model_supports_mid_conversation_tool_changes`]: an unrecognized name here is one *newer* than
@@ -256,9 +256,9 @@ pub(super) fn model_supports_effort(model: &str) -> bool {
 /// The effort `claude-subscription` sends when the profile configures none.
 ///
 /// Claude Code reads a per-model `default_effort` out of a table bundled in its binary and clamps
-/// it to what that model accepts. `medium` is the 2.1.301 table's figure for Opus 5.5, the model
-/// `profile add` suggests; most other entries say `high`, Opus 4.7's says `xhigh`, and `high` is
-/// what Claude Code falls back to for a model the table does not list.
+/// it to what that model accepts. `medium` is the 2.1.310 table's figure for Opus 5.5, the model
+/// `profile add` suggests; most other entries say `high`, Opus 4.5 through 4.7 say `xhigh`, and
+/// `high` is what Claude Code falls back to for a model the table does not list.
 ///
 /// One constant, and deliberately not a transcription of that table. A per-model figure would be a
 /// fact about someone else's data that goes stale on their release schedule with nothing in the
@@ -270,7 +270,7 @@ pub(super) const DEFAULT_EFFORT: &str = "medium";
 /// Whether a Claude model takes Claude Code's per-turn effort statements (the
 /// `per-turn-control-2026-07-01` beta).
 ///
-/// An **allowlist**, because that is the direction Claude Code 2.1.301's own gate points: it
+/// An **allowlist**, because that is the direction Claude Code 2.1.310's own gate points: it
 /// reads the `per_turn_effort` capability off the model catalog bundled in its binary, and a
 /// model the catalog does not list gets nothing. The catalog grants it to Opus 5.5, Sonnet 5.5,
 /// Haiku 5.5 and Fable 5.1 alone, so an unrecognized name, which in practice means one newer than
@@ -292,7 +292,7 @@ pub(super) fn model_supports_per_turn_effort(model: &str) -> bool {
 /// Whether a Claude model accepts tool changes mid-conversation (the
 /// `mid-conversation-tool-changes-2026-07-01` beta).
 ///
-/// A **denylist**, mirroring Claude Code 2.1.301's gate model for model: it reads the
+/// A **denylist**, mirroring Claude Code 2.1.310's gate model for model: it reads the
 /// `mid_conv_tool_change` capability off its bundled catalog, which withholds it from the Claude
 /// 3.x line, Opus 4.0 through 4.7, Sonnet 4.0 through 5.0 and Haiku 4.5, and sends the beta to a
 /// model the catalog does not list. An unrecognized name here is one *newer* than the list, which

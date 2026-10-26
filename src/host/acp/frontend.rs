@@ -1602,7 +1602,7 @@ pub(super) fn build_mode_state(permission: &SharedPermission) -> SessionModeStat
 pub(super) const PERMISSION_CONFIG_ID: &str = "permission";
 /// The `configOptions` id for the profile picker. `modes` has no counterpart for this one.
 pub(super) const PROFILE_CONFIG_ID: &str = "profile";
-/// The project picker, offered only where `config.toml` defines a project.
+/// The project picker, offered only where the store has a project.
 pub(super) const PROJECT_CONFIG_ID: &str = "project";
 /// The `configOptions` id for the approvals switch, a boolean beside the two pickers.
 pub(super) const APPROVALS_CONFIG_ID: &str = "approvals";

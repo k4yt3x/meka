@@ -121,7 +121,7 @@ pub(crate) struct ImportSessionRecord {
     /// profile keeps it, and one written before the field existed adopts the importing
     /// installation's default, which is the only thing that can be known about it here.
     pub(crate) profile: String,
-    /// The project the archive recorded, checked by the planner against the configured projects
+    /// The project the archive recorded, checked by the planner against the projects the store has
     /// as the profile is, so no row names one this installation lacks.
     pub(crate) project: String,
     /// The title the archive carried, already through [`normalize_title`].
@@ -1231,8 +1231,8 @@ impl Store {
     }
 
     /// The project a session's row records, empty for none; `None` means the session is gone.
-    /// A name `config.toml` no longer defines is refused where the session next runs, with the
-    /// remedy, as a profile that left the file is.
+    /// A name the store no longer has is refused where the session next runs, with the remedy, as
+    /// a profile that left the file is.
     pub(crate) async fn recorded_project(&self, session_id: Uuid) -> Result<Option<String>> {
         let id = session_id.to_string();
         self.connection

@@ -733,7 +733,7 @@ impl mcp::auth::LoginPrompt for ScreenLogin {
 /// What `/project` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectVerb {
-    /// Bare `/project`: the picker over the configured projects.
+    /// Bare `/project`: the picker over the projects the store has.
     Picker,
     Open(String),
     Close,
