@@ -318,12 +318,19 @@ impl Agent {
             .then(|| crate::session::context_ceiling(window, self.options.context_ceiling_percent))
     }
 
-    /// Publish what is in context now and record it on the session row, so a resume seeds its
-    /// gauge from this measurement rather than an estimate. The write is best-effort: the gauge is
-    /// what decides, and a row that missed a write reads one measurement stale, which the next
-    /// turn corrects.
+    /// Publish what is in context now: to the cell the gauges read, to the frontend as a
+    /// measurement, and to the session row, so a resume seeds its gauge from this measurement
+    /// rather than an estimate. The write is best-effort: the gauge is what decides, and a row that
+    /// missed a write reads one measurement stale, which the next turn corrects.
     pub(super) async fn record_context_tokens(&self, total: u64) {
         self.cells.record_context_tokens(total);
+        self.cells
+            .frontend
+            .emit(FrontendEvent::ContextMeasured {
+                used: total,
+                window: self.context_window(),
+            })
+            .await;
         if let Some(session_id) = self.cells.session_id.get()
             && let Err(error) = self.store.save_context_tokens(session_id, total).await
         {

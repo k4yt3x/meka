@@ -453,10 +453,11 @@ pub(crate) async fn run_acp(
 
                     let permission = runtime.resident.cells().permission.clone();
                     let frontend = Arc::clone(&runtime.frontend);
+                    let seed = context_seed(runtime.resident.cells());
                     let entry = SessionEntry {
                         resident: runtime.resident,
                         title_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        frontend,
+                        frontend: Arc::clone(&frontend),
                     };
                     state.sessions.write().await.insert(session_id_str, entry);
 
@@ -475,11 +476,13 @@ pub(crate) async fn run_acp(
                         build_config_options(&state.shared, &permission, Some(session_uuid)).await;
                     emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
-                    responder.respond(
+                    let responded = responder.respond(
                         NewSessionResponse::new(session_id)
                             .modes(modes)
                             .config_options(config_options),
-                    )
+                    );
+                    frontend.emit(seed).await;
+                    responded
                 }
             },
             agent_client_protocol::on_receive_request!(),

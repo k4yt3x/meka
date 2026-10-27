@@ -52,8 +52,9 @@ test result: ok. 1674 passed; 0 failed
 That is the model's prompt. The screen does not echo it, any more than it prints a tool's output:
 a stage direction above the reply says what reported, `Background task 7f3a1c22 finished after
 12m 4s`, and the reply carries the result. Under `meka serve` the message reaches the feed as
-`message.appended` with a `background_report` block, and an ACP editor shows it as the user turn
-it is.
+`message.appended` with a `background_report` block. An ACP editor is told the same direction as a
+`notice`, with the tasks and their outcomes under `_meta.background`, or as a parenthesized chunk
+when it renders no notices; the prompt itself is shown to no editor.
 
 When the task ends while a turn is running, the outcome lands inside that turn instead, at its
 next tool-round boundary: behind the results of the round that was running, in the same message,
@@ -61,7 +62,7 @@ the way a message sent to a working agent does. The header is the same, and the 
 model to carry on rather than to answer. A turn that is one long reply has no boundary, so the
 outcome waits for it to end; nothing cuts a reply for a report. The screen says the same stage
 direction, `meka serve` puts a `task.reported` event on the turn with the text the model read, and
-an ACP editor shows it as a user turn. A resumed session replays the direction where the report
+an ACP editor gets the same notice. A resumed session replays the direction where the report
 landed, since the log records a report as a block of its own rather than as words.
 
 Running tasks also appear in the per-turn context under `[Background]`, so the agent can see what it already started and does not launch a second copy:

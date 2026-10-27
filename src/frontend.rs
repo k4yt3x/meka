@@ -527,6 +527,11 @@ pub(crate) enum FrontendEvent {
     },
     /// End-of-turn token-usage summary.
     TokenUsage(TokenUsage),
+    /// What is in context now: every input tier plus the output of the round the provider last
+    /// accepted, or meka's estimate after a rewrite (a compaction, a rewind, a resume). `window`
+    /// is the profile's, zero while unknown. Emitted where the gauge is recorded, so a client that
+    /// follows it moves once per provider round and on every turn, failed ones included.
+    ContextMeasured { used: u64, window: u64 },
     /// User-visible advisory raised by meka itself or by the provider layer (e.g. image redaction
     /// when the request body would exceed the API limit). The terminal frontends render it in the
     /// color its [`NoticeLevel`] asks for; `AcpFrontend` forwards it as an `AgentMessageChunk`
@@ -905,9 +910,9 @@ impl Notice {
         }
     }
 
-    /// A [`NoticeKind::StageDirection`] at `level`. Lowercase and without a final stop, since the
-    /// terminal wraps it in parentheses.
-    fn stage_direction(level: NoticeLevel, text: String) -> Self {
+    /// A [`NoticeKind::StageDirection`] at `level`. Without a final stop, since the terminal wraps
+    /// it in parentheses.
+    pub(crate) fn stage_direction(level: NoticeLevel, text: String) -> Self {
         Self {
             level,
             text,

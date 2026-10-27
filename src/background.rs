@@ -300,6 +300,33 @@ pub(crate) async fn claim_outcomes_now(
     only_what_was_won(ready, &claimed)
 }
 
+/// A task's label as a person or the model is shown it. Sanitized like an outcome: the label is
+/// derived from the tool's primary argument, which for `shell_execute` is a shell command line the
+/// *model* wrote, so it is no more trusted than the output it names.
+pub(crate) fn shown_label(task: &BackgroundTask) -> String {
+    elide(&crate::text::sanitize_text(&task.label), LABEL_MAX_CHARS)
+}
+
+/// The stage direction for a replayed report: the tasks `task_ids` name among `known`, said as
+/// the live run said them. A converted row names a task by its short id, so a prefix matches; a
+/// task the store no longer holds leaves the direction bare.
+pub(crate) fn replayed_report_direction(known: &[BackgroundTask], task_ids: &[String]) -> String {
+    let tasks: Vec<BackgroundTask> = task_ids
+        .iter()
+        .filter_map(|id| {
+            known
+                .iter()
+                .find(|task| task.id.starts_with(id.as_str()))
+                .cloned()
+        })
+        .collect();
+    if tasks.is_empty() {
+        "Background task report".to_string()
+    } else {
+        report_direction(&tasks)
+    }
+}
+
 /// The stage direction a screen says where a report lands: which tasks ended and how. The report
 /// itself is the model's to read and stays off the screen, as every tool's output does; the reply
 /// that follows carries what matters.
@@ -403,10 +430,7 @@ fn render_outcomes_with_trailer(tasks: &[BackgroundTask], trailer: &str) -> Stri
         rendered.push_str(&format!(
             "\n---\n\n**{}** ({}) {} after {}.\n",
             task.short_id(),
-            // Sanitized like the outcome below. The label is derived from the tool's primary
-            // argument, which for `shell_execute` is a shell command line the *model* wrote, so
-            // it is no more trusted than the output it names.
-            elide(&crate::text::sanitize_text(&task.label), LABEL_MAX_CHARS),
+            shown_label(task),
             task.status.headline(),
             format_elapsed(task.elapsed()),
         ));

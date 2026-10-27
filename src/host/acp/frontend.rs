@@ -129,18 +129,6 @@ pub(crate) struct AcpFrontend {
     /// signal carries no false positives. A per-session transport would need a per-session
     /// sibling.
     pub(super) transport_dead: Arc<std::sync::atomic::AtomicBool>,
-    /// Live context-occupancy counter shared with this session's agent through its
-    /// [`crate::session::SessionCells`]; read on every `TokenUsage` event to emit an
-    /// ACP `usage_update` so editors show "tokens used / context window".
-    pub(super) context_tokens: Arc<std::sync::atomic::AtomicU64>,
-    /// The resolved window for the `usage_update` `size` field, and the same cell the agent
-    /// publishes into on every provider switch. `0` until the agent is built, which suppresses the
-    /// update.
-    ///
-    /// Shared rather than pushed: a copy re-stored by hand from `session/set_config_option`
-    /// reports a mid-turn switch as occupancy measured against the profile the turn is still
-    /// running on, divided by the window of the one it has not moved to yet.
-    pub(super) context_window: Arc<std::sync::atomic::AtomicU64>,
     /// Accumulated live output per in-flight tool call, keyed by `tool_use_id`. ACP replaces a
     /// tool call's whole `content` array on each update rather than appending to it, so the
     /// running total has to be kept somewhere; the emitter sends deltas, and this is where
@@ -173,6 +161,9 @@ pub(super) const META_TERMINAL_EXIT: &str = "terminal_exit";
 /// The `_meta` key under which a `compaction_update` carries meka's facts about the compaction:
 /// what set it going, and once it lands, the fields of the `context.compacted` event.
 pub(super) const META_COMPACTION: &str = "compaction";
+/// The `_meta` key under which the notice for a background report carries the tasks that reported,
+/// each as the HTTP API's task object.
+pub(super) const META_BACKGROUND: &str = "background";
 /// Build the `_meta` map for one agent-owned-terminal frame.
 ///
 /// This is an extension, not ACP proper: it originates in codex-acp, claude-agent-acp emits the
@@ -201,8 +192,6 @@ impl AcpFrontend {
     pub(super) fn new(
         link: AcpClientLink,
         cwd: SharedCwd,
-        context_tokens: Arc<std::sync::atomic::AtomicU64>,
-        context_window: Arc<std::sync::atomic::AtomicU64>,
         cancel: crate::host::CancelCell,
     ) -> Self {
         let AcpClientLink {
@@ -218,8 +207,6 @@ impl AcpFrontend {
             sticky: crate::frontend::StickyApprovals::default(),
             client_state,
             transport_dead,
-            context_tokens,
-            context_window,
             live_output: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancel,
         }
@@ -583,22 +570,17 @@ impl Frontend for AcpFrontend {
                 // which is how the panel clears once everything is disposed of.
                 SessionUpdate::Plan(Plan::new(checklist_to_plan(&items)))
             }
-            FrontendEvent::TokenUsage(_) => {
-                // Mirror the screen's context gauge as an ACP `usage_update` so editors (e.g. Zed)
-                // show "tokens used / context window". `used` is read from the shared atomic the
-                // agent updates each round (current occupancy: all input tiers + output) rather
-                // than the event's per-turn total, which over-counts multi-round tool turns;
-                // `size` is the resolved window. Suppress until both are known.
-                let used = self
-                    .context_tokens
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let size = self
-                    .context_window
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if used == 0 || size == 0 {
+            // The turn's totals are the prompt response's; the gauge follows the measurement.
+            FrontendEvent::TokenUsage(_) => return,
+            // The screen's context gauge as an ACP `usage_update`, once per provider round and on
+            // every turn's rounds, so an editor's "tokens used / context window" moves while a long
+            // tool loop runs rather than when it ends. Nothing until the window is known: a `size`
+            // of zero is not a small window.
+            FrontendEvent::ContextMeasured { used, window } => {
+                if window == 0 {
                     return;
                 }
-                SessionUpdate::UsageUpdate(UsageUpdate::new(used, size))
+                SessionUpdate::UsageUpdate(UsageUpdate::new(used, window))
             }
             FrontendEvent::TurnStarted { .. } => {
                 // Tool calls begin and end inside a turn, so anything still open here belongs to a
@@ -610,20 +592,28 @@ impl Frontend for AcpFrontend {
                 self.live_output().clear();
                 return;
             }
-            // The report the model reads, shown as the user turn it is, as one delivered by a
-            // turn of its own is.
-            FrontendEvent::BackgroundReported { text, .. } => {
-                super::schedule::out_of_band_prompt_update(&text)
+            // What reported is said as the screen says it; the report is the model's to read.
+            FrontendEvent::BackgroundReported { tasks, .. } => {
+                background_report_update(&tasks, self.client_state.renders_notices())
             }
             // The message a turn opens with, or one an interrupt appends. What the editor did not
             // type is shown as the user turn it is, so the reply has its question above it; the
             // editor's own words and images are in its transcript already, and the context block
-            // is meka's, shown nowhere.
-            FrontendEvent::MessageAppended { message, .. } => {
+            // is meka's, shown nowhere. A report is said as what reported, as one read mid-turn
+            // is.
+            FrontendEvent::MessageAppended {
+                message, outcomes, ..
+            } => {
                 for block in &message.content {
                     let text = match block {
+                        crate::conversation::ContentBlock::BackgroundReport { .. } => {
+                            self.send_update(background_report_update(
+                                &outcomes,
+                                self.client_state.renders_notices(),
+                            ));
+                            continue;
+                        }
                         crate::conversation::ContentBlock::Scheduled { text, .. }
-                        | crate::conversation::ContentBlock::BackgroundReport { text, .. }
                         | crate::conversation::ContentBlock::Inbox { text, .. } => text,
                         crate::conversation::ContentBlock::Text { .. }
                         | crate::conversation::ContentBlock::TurnContext { .. }
@@ -944,6 +934,54 @@ pub(super) fn notice_update(
     SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
         agent_client_protocol::schema::v1::TextContent::new(text),
     )))
+}
+/// The update that says what reported, in the screen's words. A `notice` when the client renders
+/// one: the stage direction as its title, the tasks' labels as its description, and the tasks
+/// themselves under `_meta.background`, so a client that wants the outcome has it without the
+/// transcript carrying it. Otherwise the direction as a stage-direction chunk, as a nudge is said
+/// and as a replay says it. The report the model read stays out of the transcript either way, as
+/// every tool's output does.
+pub(super) fn background_report_update(
+    tasks: &[crate::store::background::BackgroundTask],
+    client_renders_notices: bool,
+) -> SessionUpdate {
+    let direction = crate::background::report_direction(tasks);
+    if !client_renders_notices {
+        return notice_update(
+            &crate::frontend::Notice::stage_direction(
+                crate::frontend::NoticeLevel::Info,
+                direction,
+            ),
+            false,
+        );
+    }
+    let description = match tasks {
+        [task] => crate::background::shown_label(task),
+        _ => tasks
+            .iter()
+            .map(|task| {
+                format!(
+                    "{} {}",
+                    task.short_id(),
+                    crate::background::shown_label(task)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    let views: Vec<crate::view::BackgroundTaskView> = tasks
+        .iter()
+        .cloned()
+        .map(crate::view::BackgroundTaskView::from)
+        .collect();
+    SessionUpdate::Notice(
+        agent_client_protocol::schema::v1::Notice::new(NoticeSeverity::Info, direction)
+            .description(description)
+            .meta(terminal_meta(
+                META_BACKGROUND,
+                serde_json::json!({ "tasks": views }),
+            )),
+    )
 }
 /// Every argument of a call awaiting approval, as a fenced block for the prompt's content.
 ///
@@ -1299,7 +1337,9 @@ pub(super) fn build_completion_content(
 /// the original turn. Used by `session/load` so an editor that just reopened a session replays the
 /// full history into its UI.
 ///
-/// A user turn's context block is not replayed, so the client sees only what the user typed.
+/// A user turn's context block is not replayed, so the client sees only what the user typed. A
+/// background report is said as the stage direction the live run showed, from the session's task
+/// rows in `tasks`, never as the words the model read.
 ///
 /// Tool calls track open `tool_use_id`s; any tool that never received a matching `ToolResult` (e.g.
 /// a crashed turn) is closed out with a `failed` `tool_call_update` so the client doesn't render a
@@ -1309,6 +1349,7 @@ pub(super) fn replay_session_updates(
     session_id: &SessionId,
     cwd: &SharedCwd,
     messages: &Conversation,
+    tasks: &[crate::store::background::BackgroundTask],
 ) {
     // Map each open `tool_use_id` to its tool name so the result update can format output per tool
     // and the orphan sweep can close stragglers.
@@ -1323,11 +1364,13 @@ pub(super) fn replay_session_updates(
             send_session_update(
                 connection,
                 session_id,
-                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                    agent_client_protocol::schema::v1::TextContent::new(format!(
-                        "\n\n({note})\n\n"
-                    )),
-                ))),
+                notice_update(
+                    &crate::frontend::Notice::stage_direction(
+                        crate::frontend::NoticeLevel::Info,
+                        note.to_string(),
+                    ),
+                    false,
+                ),
             );
         }
         match message.role {
@@ -1349,11 +1392,27 @@ pub(super) fn replay_session_updates(
                                 );
                             }
                         }
+                        // What reported, as the live run said it: a stage direction in the
+                        // transcript rather than a notice, which is a live event and not history.
+                        MekaContentBlock::BackgroundReport { task_ids, .. } => {
+                            send_session_update(
+                                connection,
+                                session_id,
+                                notice_update(
+                                    &crate::frontend::Notice::stage_direction(
+                                        crate::frontend::NoticeLevel::Info,
+                                        crate::background::replayed_report_direction(
+                                            tasks, task_ids,
+                                        ),
+                                    ),
+                                    false,
+                                ),
+                            );
+                        }
                         // What arrived for the model, as it read it: the editor showed it as the
                         // user turn it is while the run was live, and the replay says the same.
                         MekaContentBlock::Inbox { text, .. }
-                        | MekaContentBlock::Scheduled { text, .. }
-                        | MekaContentBlock::BackgroundReport { text, .. } => {
+                        | MekaContentBlock::Scheduled { text, .. } => {
                             send_session_update(
                                 connection,
                                 session_id,

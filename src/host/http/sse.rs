@@ -58,6 +58,7 @@ pub(crate) enum SseEventType {
     ContextCompacting,
     ContextCompacted,
     ContextCompactionFailed,
+    ContextMeasured,
     TurnStarted,
     TurnFinished,
     TurnFailed,
@@ -115,6 +116,7 @@ impl SseEventType {
             Self::ContextCompacting => "context.compacting",
             Self::ContextCompacted => "context.compacted",
             Self::ContextCompactionFailed => "context.compaction_failed",
+            Self::ContextMeasured => "context.measured",
             Self::TurnStarted => "turn.started",
             Self::TurnFinished => "turn.finished",
             Self::TurnFailed => "turn.failed",
@@ -350,6 +352,19 @@ pub(crate) fn translate(
         // Metadata-only: the recorder captures it for the blocking JSON / terminal SSE payload
         // but it gets no wire event of its own.
         FrontendEvent::TokenUsage(_) => return None,
+        // The occupancy `GET /context` answers with, pushed as it is measured: `used` after every
+        // provider round and every rewrite, `window` beside it once known.
+        FrontendEvent::ContextMeasured { used, window } => {
+            let mut data = serde_json::Map::new();
+            data.insert("used".into(), serde_json::json!(used));
+            if window > 0 {
+                data.insert("window".into(), serde_json::json!(window));
+            }
+            (
+                SseEventType::ContextMeasured,
+                serde_json::Value::Object(data),
+            )
+        }
         // Progress on one tool call, transient on the wire (`SseEventType::is_transient`): a
         // client appends the chunk to what it shows for the call, and the whole output still
         // arrives with `tool_call.completed`. Coalesced per call before it gets here, by

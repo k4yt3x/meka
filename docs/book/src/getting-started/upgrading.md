@@ -10,6 +10,40 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.84 to 0.85
+
+Nothing is renamed and the store is unchanged; the HTTP API grows a surface and two of its shapes
+change, and an ACP client sees two things differently.
+
+**The installation is managed over HTTP, under two new scopes.** `/v1/accounts`, `/v1/profiles`,
+`/v1/mcp` and `PUT /v1/instructions` do what `meka account`, `meka profile`, `meka mcp` and the
+instructions file do in a shell, and a change made through them is served at once, where an edit
+made in a shell still needs a restart. They sit behind `config:r` and `config:w`, which no existing
+token holds: grant them to the token that administers the installation and to no other, since
+`config:w` is shell on the host. `GET /v1/info` names where the installation is (`config_path`,
+`data_dir`) and when `config.toml` was last read and written. The server now starts with no
+profile configured, so an installation can be set up over the API; the refusal moved to the
+session that names none.
+
+**OpenAPI: the responses body's `outcome` schema is `ResponseOutcome`.** It takes the three
+answers an elicitation takes (`accept`, `decline`, `cancel`) beside the four an approval takes. A
+client generated from the spec regenerates; one that sends the approval answers is unaffected.
+
+**`context.measured` on the session feed.** After every provider round, and after a compaction or
+rewind, the feed says what is in context (`used`, and `window` once known), the figure
+`GET /v1/sessions/{id}/context` answers with, so a client that polled it for a gauge can follow the
+event instead. A client that ignores events it does not know needs no change.
+
+**An ACP client's gauge moves per round, and a background report is a notice.** `usage_update`
+arrives after every provider round, and once on `session/new`, `session/load`, `session/resume`
+and `session/fork` with what the session's row recorded, rather than at a turn's end. Finished
+background work is no longer pushed as a `user_message_chunk` carrying the report the model read:
+a client that advertised `session.notices` gets a `notice` titled in the screen's words, with the
+task's label as its `description` and the tasks under `_meta.background`; one that did not gets
+the same words as a parenthesized `agent_message_chunk`, which is also what a `session/load`
+replays where the report landed. A client that matched on the `[Background task` header reads the
+notice or the chunk instead. A scheduled job's prompt is still a `user_message_chunk`.
+
 ## 0.83 to 0.84
 
 Nothing is renamed; one value is refused where it never applied, the store is migrated on first

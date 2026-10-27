@@ -250,6 +250,19 @@ fn reopened_workspace(
         ..Default::default()
     }
 }
+/// The gauge a session was built with: the occupancy its row recorded, against its profile's
+/// window, for the editor's gauge to show before any turn measures it. The seed goes into the cell
+/// rather than through the agent's own recording, so no event says it unless a door does. A door
+/// that names a new id (`session/new`, `session/fork`) emits it after its response: a notification
+/// about an id the client has not been given yet is one it cannot route.
+pub(super) fn context_seed(cells: &crate::session::SessionCells) -> FrontendEvent {
+    FrontendEvent::ContextMeasured {
+        used: cells
+            .context_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+        window: cells.profile.context_window(),
+    }
+}
 /// `session/load`: reopen a previously persisted session and add it to the active sessions map.
 /// Replays the persisted history as `session/update` notifications so the client's UI rebuilds the
 /// conversation before the response goes out.
@@ -379,14 +392,47 @@ pub(super) async fn handle_load_session(
         return responder.respond_with_error(acp_error_for(&error, false));
     }
 
+    runtime
+        .frontend
+        .emit(context_seed(runtime.resident.cells()))
+        .await;
     // Replay before inserting so the client sees the rebuild stream before any new turn-related
     // update could race in.
+    let conversation = runtime.resident.conversation.lock().await;
+    // The rows are read for a conversation with a report to say, not on every load.
+    let holds_report = conversation.as_slice().iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                crate::conversation::ContentBlock::BackgroundReport { .. }
+            )
+        })
+    });
+    let tasks = if holds_report {
+        match state
+            .shared
+            .store
+            .background_store()
+            .list_background_tasks(session_uuid)
+            .await
+        {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                tracing::warn!("failed to read the background tasks for the replay: {error}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     replay_session_updates(
         &cx,
         &session_id,
         &runtime.resident.cells().cwd,
-        &*runtime.resident.conversation.lock().await,
+        &conversation,
+        &tasks,
     );
+    drop(conversation);
 
     let permission = runtime.resident.cells().permission.clone();
     let frontend = Arc::clone(&runtime.frontend);
@@ -579,16 +625,18 @@ pub(super) async fn handle_resume_session(
     // `session/list` names the first.
     let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     maybe_emit_session_title(&cx, &session_id, &title_sent, summary.title.clone());
+    let seed = context_seed(runtime.resident.cells());
     let entry = SessionEntry {
         resident: runtime.resident,
         title_sent,
-        frontend,
+        frontend: Arc::clone(&frontend),
     };
     state.sessions.write().await.insert(session_id_str, entry);
 
     let modes = build_mode_state(&permission);
     let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
     emit_available_commands(&cx, &session_id, &state.shared.skills).await;
+    frontend.emit(seed).await;
 
     responder.respond(
         ResumeSessionResponse::new()
@@ -835,10 +883,11 @@ pub(super) async fn handle_fork_session(
     };
     let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     maybe_emit_session_title(&cx, &session_id, &title_sent, title);
+    let seed = context_seed(runtime.resident.cells());
     let entry = SessionEntry {
         resident: runtime.resident,
         title_sent,
-        frontend,
+        frontend: Arc::clone(&frontend),
     };
     state.sessions.write().await.insert(session_id_str, entry);
 
@@ -848,11 +897,13 @@ pub(super) async fn handle_fork_session(
     let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
     emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
-    responder.respond(
+    let responded = responder.respond(
         ForkSessionResponse::new(session_id)
             .modes(modes)
             .config_options(config_options),
-    )
+    );
+    frontend.emit(seed).await;
+    responded
 }
 /// `session/close`: remove a session from the active map. Cancels any in-flight prompt for that
 /// session before removing it from the map so the agent loop unwinds. Detaches the session's tool
@@ -1225,23 +1276,10 @@ pub(super) async fn build_session_runtime(
     let permission = SharedPermission::new(permission, shared.config.enabled_permissions)
         .with_approvals(approvals);
 
-    // Shared with the agent (adopted inside `build_session_agent`) so the frontend can read the
-    // current context occupancy when emitting `usage_update`.
-    let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // The window the same `usage_update` divides by, made here for the same reason: the frontend
-    // exists before the agent and has to hold the cell the agent publishes into, rather than a copy
-    // something has to remember to re-store beside every provider switch.
-    let context_window = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Created here rather than beside the `SessionEntry` so the frontend and the entry share one
     // cell: the entry's cancel handler writes it, the frontend's client round-trips read it.
     let cancel = crate::host::CancelCell::default();
-    let acp_frontend = Arc::new(AcpFrontend::new(
-        link,
-        cwd.clone(),
-        Arc::clone(&context_tokens),
-        Arc::clone(&context_window),
-        cancel.clone(),
-    ));
+    let acp_frontend = Arc::new(AcpFrontend::new(link, cwd.clone(), cancel.clone()));
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 
     let resident = crate::host::open_session(
@@ -1260,9 +1298,9 @@ pub(super) async fn build_session_runtime(
                     .additional_readable_directories
                     .clone(),
             ),
-            context_tokens: Arc::clone(&context_tokens),
+            context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            context_window,
+            context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             project: None,
         },
         opening,

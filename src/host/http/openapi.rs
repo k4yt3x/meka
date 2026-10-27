@@ -148,7 +148,7 @@ use crate::host::http::{handlers, state::ServerState};
         crate::view::GateView,
         crate::host::http::handlers::jobs::CreateJobRequest,
         crate::host::http::handlers::jobs::CreateGate,
-        crate::host::http::handlers::jobs::BackgroundTaskView,
+        crate::view::BackgroundTaskView,
         crate::host::http::handlers::jobs::BackgroundTasksResponse,
         crate::view::SkillDetail,
         crate::host::http::handlers::stores::WriteSkillRequest,

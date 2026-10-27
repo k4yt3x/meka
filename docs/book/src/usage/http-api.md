@@ -776,6 +776,7 @@ Three limits. The event exists only when meka streams from its provider, so a se
 | `context.compacting` | `compaction_id`, `trigger` | A compaction began; the checkpoint turn or the summarizer is about to run |
 | `context.compacted` | `compaction_id`, `trigger`, `source`, `memories_written`, `kept_recent`, `replaced_count`, `generation` | The conversation was summarized and the window replaced |
 | `context.compaction_failed` | `compaction_id`, `trigger`, `error`, `interrupted` | The compaction that began under `compaction_id` ended without replacing the window |
+| `context.measured` | `used`, `window` when known | What is in context now, the figure `GET /v1/sessions/{id}/context` answers with: after every provider round, and after a compaction or rewind with the estimate it leaves |
 | `conversation.rewound` | `revision`, `total`, `turns_removed` | `POST /rewind` removed turns; emitted outside any turn, so it carries no `turn_id` |
 | `checklist.updated` | `items`, the whole open list as the session record carries it | A `checklist_*` call changed the list; empty once everything is disposed of |
 

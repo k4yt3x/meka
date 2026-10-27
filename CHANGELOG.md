@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.85.0] - 2026-10-27
+
 ### Added
 
 - HTTP: `/v1/accounts` lists, adds, renames, removes and logs in accounts, under `config:w`.
@@ -17,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP: a session with `supports_elicitation` gets an MCP elicitation as `elicitation_required`.
 - HTTP: `PUT /v1/instructions` writes `instructions.md`; sessions opened afterwards run under it.
 - `GET /v1/info` names `config_path`, `data_dir`, `config_loaded_at` and `config_modified_at`.
+- HTTP: a `context.measured` feed event says what is in context after every provider round.
 
 ### Changed
 
@@ -25,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An MCP server added, changed or removed over HTTP takes effect on the running server at once.
 - `meka account login` asks again after a paste that carries no code, as `meka mcp login` does.
 - OpenAPI: the responses body's `outcome` schema is `ResponseOutcome`, with elicitation answers.
+- ACP: `usage_update` follows every provider round and a reopened session, not the turn's end.
+- ACP: a background task's report is a `notice` in the screen's words, never a user message.
 
 ### Fixed
 
@@ -2952,7 +2957,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.84.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.85.0...HEAD
+[0.85.0]: https://github.com/k4yt3x/meka/compare/0.84.0...0.85.0
 [0.84.0]: https://github.com/k4yt3x/meka/compare/0.83.0...0.84.0
 [0.83.0]: https://github.com/k4yt3x/meka/compare/0.82.0...0.83.0
 [0.82.0]: https://github.com/k4yt3x/meka/compare/0.81.0...0.82.0

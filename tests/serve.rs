@@ -2945,6 +2945,63 @@ fn streaming_tool_call_emits_executing_and_completed_events() {
     );
 }
 
+/// The feed says the context occupancy as the provider measures it, once per accepted round, so a
+/// client's gauge moves while a tool loop runs rather than when `GET /context` is next asked.
+#[test]
+fn the_feed_carries_a_context_measurement_per_round() {
+    // A real tool round, and one that leaves nothing open: a checklist item would draw nudge
+    // rounds the script has no usage for.
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let target = work_dir.path().join("target.txt");
+    std::fs::write(&target, "hello\n").expect("write target");
+    let script = serde_json::json!([
+        [
+            { "type": "usage", "input_tokens": 1000 },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_read" },
+            { "type": "tool_use_end", "input": {"path": target.to_str().unwrap()} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "usage", "input_tokens": 2000 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[session]\ncontext_window = 200000\n", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": work_dir.path().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "read the target file", "stream": true}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let body = response.text().expect("body");
+
+    let mut measured = Vec::new();
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "event: context.measured"
+            && let Some(data) = lines.next().and_then(|data| data.strip_prefix("data: "))
+            && let Ok(data) = serde_json::from_str::<serde_json::Value>(data)
+        {
+            measured.push((data["used"].as_u64(), data["window"].as_u64()));
+        }
+    }
+    assert_eq!(
+        measured,
+        vec![(Some(1000), Some(200_000)), (Some(2000), Some(200_000))],
+        "one measurement per accepted round; body was:\n{body}"
+    );
+}
+
 /// `tool_call.composing` opens the window a client can draw "the agent is writing" over, and
 /// `tool_call.executing` closes it. The order is the whole point: the arguments -- for a tool that
 /// sends a message, the message -- are written between the two, so an indicator raised on the

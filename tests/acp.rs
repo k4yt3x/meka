@@ -752,7 +752,7 @@ fn acp_sends_an_advisory_as_a_notice_to_a_client_that_advertises_it() {
 }
 
 /// `session/prompt` reports session-cumulative token usage on the response, alongside the
-/// per-turn `usage_update` notification that carries the context gauge.
+/// `usage_update` notifications that carry the context gauge.
 #[test]
 fn acp_prompt_response_carries_token_usage() {
     let script = serde_json::json!([[
@@ -786,6 +786,101 @@ fn acp_prompt_response_carries_token_usage() {
     }
     // Omitted deliberately: meka doesn't meter reasoning separately from output.
     assert!(usage["thoughtTokens"].is_null(), "usage: {usage}");
+}
+
+/// The ACP config with a window the gauge can be divided by.
+const ACP_WINDOWED_CONFIG: &str = r#"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+context_window = 200000
+"#;
+
+/// The `usage_update` pairs among `updates`, as `(used, size)`, in order.
+fn usage_updates(updates: &[serde_json::Value]) -> Vec<(u64, u64)> {
+    updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "usage_update")
+        .map(|update| {
+            (
+                update["used"].as_u64().unwrap_or(0),
+                update["size"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+/// The context gauge follows the provider's measurement rather than the turn's end: a tool loop
+/// moves an editor's gauge once per accepted round, against the profile's window.
+#[test]
+fn acp_usage_update_follows_every_provider_round() {
+    let mut harness = AcpTestHarness::builder()
+        .config(ACP_WINDOWED_CONFIG)
+        .pre_spawn(|config_dir| {
+            // A real tool round, and one that leaves nothing open: a checklist item would draw
+            // nudge rounds the script has no usage for.
+            let target = fixture_beside(config_dir, "target.txt");
+            std::fs::write(&target, "hello\n").expect("write target");
+            serde_json::json!([
+                [
+                    { "type": "usage", "input_tokens": 1000 },
+                    { "type": "tool_use_start", "id": "call_1", "name": "file_read" },
+                    { "type": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
+                    { "type": "message_end", "stop_reason": "tool_use" }
+                ],
+                [
+                    { "type": "usage", "input_tokens": 2000 },
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
+                ]
+            ])
+        })
+        .build();
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "read the target file");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+
+    // The empty gauge first: `session/new` says it after its response, which is where the
+    // client first learns the id, so it is read with the prompt's updates.
+    assert_eq!(
+        usage_updates(&updates),
+        vec![(0, 200_000), (1000, 200_000), (2000, 200_000)],
+        "the new session's seed, then one usage_update per accepted round; updates:\n{updates:#?}"
+    );
+}
+
+/// A reopened session says the occupancy its row recorded ahead of any turn, so an editor's gauge
+/// is not empty until the first reply.
+#[test]
+fn a_loaded_session_says_its_recorded_occupancy_ahead_of_any_turn() {
+    let script = serde_json::json!([[
+        { "type": "usage", "input_tokens": 1234 },
+        { "type": "text", "text": "ok" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_WINDOWED_CONFIG, Some(script));
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "hello");
+    let (_updates, _response) = harness.collect_updates(&session_id, id);
+    harness.close_session(&session_id);
+
+    let cwd = harness.work_dir();
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(response["result"].is_object(), "{response}");
+    assert_eq!(
+        usage_updates(&updates),
+        vec![(1234, 200_000)],
+        "the load says the recorded occupancy once; updates:\n{updates:#?}"
+    );
 }
 
 /// A turn that reports `tool_use` but carries no tool-call block leaves the agent with nothing to
@@ -7396,19 +7491,8 @@ poll_interval = "200ms"
     );
 }
 
-/// A canceled task rides the editor's next prompt, in ACP as it does in `meka serve`.
-///
-/// ACP has no test for any of the background-outcome path, so every guard in it -- the poller's
-/// `wakes_a_host` branch, this fold, the `PromptRetention` it runs under -- could be deleted with
-/// the suite green. Seeded straight into the store rather than run for real: what is under test is
-/// what the editor's prompt carries, not whether `sleep` works.
-#[test]
-fn a_canceled_task_rides_the_editors_next_prompt() {
-    let script = serde_json::json!([[
-        { "type": "text", "text": "answered" },
-        { "type": "message_end", "stop_reason": "end_turn" }
-    ]]);
-    let config_toml = r#"
+/// The config the background tests run under.
+const ACP_BACKGROUND_CONFIG: &str = r#"
 [accounts.mock]
 backend = "anthropic-messages"
 
@@ -7419,29 +7503,56 @@ model = "claude-sonnet-4-5"
 [background]
 enabled = true
 "#;
-    let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
-    let session_id = harness.new_session();
 
-    // A terminal, undelivered, unannounced task: exactly what `/task cancel` leaves behind.
-    {
-        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
-        connection
-            .execute(
-                "INSERT INTO background_tasks \
-                 (id, session_id, tool, label, status, outcome, started_at, finished_at) \
-                 VALUES (?1, ?2, 'shell_execute', 'sleep 900', 'canceled', NULL, ?3, ?3)",
-                rusqlite::params![
-                    uuid::Uuid::new_v4().to_string(),
-                    &session_id,
-                    chrono::Utc::now().to_rfc3339(),
-                ],
-            )
-            .expect("seed the canceled task");
-    }
+/// A terminal, undelivered, unannounced task on `session_id`: exactly what `/task cancel` leaves
+/// behind, seeded straight into the store rather than run for real.
+fn seed_canceled_task(harness: &AcpTestHarness, session_id: &str) {
+    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    connection
+        .execute(
+            "INSERT INTO background_tasks \
+             (id, session_id, tool, label, status, outcome, started_at, finished_at) \
+             VALUES (?1, ?2, 'shell_execute', 'sleep 900', 'canceled', NULL, ?3, ?3)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                session_id,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("seed the canceled task");
+}
+
+/// The `session/update` payloads among `lines` of the kind `kind`.
+fn updates_of_kind(lines: &[String], kind: &str) -> Vec<serde_json::Value> {
+    lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|value| value["params"]["update"].clone())
+        .filter(|update| update["sessionUpdate"] == kind)
+        .collect()
+}
+
+/// A canceled task rides the editor's next prompt, in ACP as it does in `meka serve`, and the
+/// editor is told what reported in the screen's words: live as a stage direction, since this
+/// client renders no notice, and again on a replay. The report the model read is shown nowhere.
+///
+/// ACP has no other test for the background-outcome path, so every guard in it -- the poller's
+/// `wakes_a_host` branch, this fold, the `PromptRetention` it runs under -- could be deleted with
+/// the suite green. What is under test is what the editor's prompt carries and what the editor is
+/// shown, not whether `sleep` works.
+#[test]
+fn a_canceled_task_rides_the_editors_next_prompt() {
+    let script = serde_json::json!([[
+        { "type": "text", "text": "answered" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_BACKGROUND_CONFIG, Some(script));
+    let session_id = harness.new_session();
+    seed_canceled_task(&harness, &session_id);
 
     let id = harness.prompt(&session_id, "what is in this CSV?");
-    // Read to the response by hand, keeping the updates on the way: the report is shown to the
-    // editor during the prompt, as the user turn it is, and only there.
+    // Read to the response by hand, keeping the updates on the way: what reported is said to the
+    // editor during the prompt.
     let needle = format!("\"id\":{id}");
     let lines = read_until_with_dispatch(
         &mut harness.reader,
@@ -7459,26 +7570,56 @@ enabled = true
         response["result"]["stopReason"], "end_turn",
         "the prompt must run: {response}"
     );
-    let user_chunks: Vec<String> = lines
+    assert!(
+        updates_of_kind(&lines, "user_message_chunk").is_empty(),
+        "neither the report nor the editor's own words are shown as a user turn; transcript:\n{}",
+        lines.join("")
+    );
+    let directions: Vec<String> = updates_of_kind(&lines, "agent_message_chunk")
         .iter()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .map(|value| value["params"]["update"].clone())
-        .filter(|update| update["sessionUpdate"] == "user_message_chunk")
         .filter_map(|update| update["content"]["text"].as_str().map(str::to_string))
+        .filter(|text| text.contains("Background task"))
         .collect();
     assert_eq!(
-        user_chunks.len(),
+        directions.len(),
         1,
-        "the report is shown once, as a user turn; transcript:\n{}",
+        "what reported is said once, as a stage direction; transcript:\n{}",
         lines.join("")
     );
     assert!(
-        user_chunks[0].contains("was canceled"),
-        "and it is the report: {user_chunks:?}"
+        directions[0].contains("(Background task") && directions[0].contains("was canceled"),
+        "in the screen's words: {directions:?}"
     );
     assert!(
-        !user_chunks[0].contains("what is in this CSV?"),
-        "the editor's own words are not echoed back to it: {user_chunks:?}"
+        !lines.iter().any(|line| line.contains("[Background task")),
+        "the report the model read is shown nowhere; transcript:\n{}",
+        lines.join("")
+    );
+
+    // The replay says the same direction where the report landed, from the task rows.
+    harness.close_session(&session_id);
+    let cwd = harness.work_dir();
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(response["result"].is_object(), "{response}");
+    let replayed: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .filter(|update| {
+            update["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Background task"))
+        })
+        .collect();
+    assert_eq!(replayed.len(), 1, "updates:\n{updates:#?}");
+    assert_eq!(replayed[0]["sessionUpdate"], "agent_message_chunk");
+    assert_eq!(
+        replayed[0]["content"]["text"].as_str().unwrap_or_default(),
+        directions[0],
+        "live and replayed, one wording"
     );
 
     let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
@@ -7509,6 +7650,57 @@ enabled = true
     assert!(
         delivered.is_some(),
         "and riding a turn is a delivery, so it must be stamped"
+    );
+}
+
+/// A client that advertised `session.notices` is told what reported as a `notice`: the stage
+/// direction as its title, the task's label as its description, and the task itself under
+/// `_meta.background`, so the outcome is in the client's hands without the transcript carrying it.
+#[test]
+fn a_background_report_is_a_notice_to_a_client_that_renders_one() {
+    let script = serde_json::json!([[
+        { "type": "text", "text": "answered" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        ACP_BACKGROUND_CONFIG,
+        Some(script),
+        serde_json::json!({"session": {"notices": {}}}),
+    );
+    let session_id = harness.new_session();
+    seed_canceled_task(&harness, &session_id);
+
+    let id = harness.prompt(&session_id, "what is in this CSV?");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+
+    let notices: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "notice")
+        .collect();
+    assert_eq!(notices.len(), 1, "updates:\n{updates:#?}");
+    let notice = notices[0];
+    assert_eq!(notice["severity"], "info");
+    let title = notice["title"].as_str().unwrap_or_default();
+    assert!(
+        title.starts_with("Background task ") && title.contains("was canceled"),
+        "the title is the screen's direction: {notice}"
+    );
+    assert_eq!(notice["description"], "sleep 900", "{notice}");
+    let task = &notice["_meta"]["background"]["tasks"][0];
+    assert_eq!(task["status"], "canceled", "{notice}");
+    assert_eq!(task["label"], "sleep 900", "{notice}");
+    assert_eq!(task["tool"], "shell_execute", "{notice}");
+    assert!(
+        !updates.iter().any(|value| {
+            let update = &value["params"]["update"];
+            update["sessionUpdate"] == "user_message_chunk"
+                || update["content"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Background task"))
+        }),
+        "the notice replaces every chunk: {updates:#?}"
     );
 }
 

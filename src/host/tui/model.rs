@@ -1131,6 +1131,8 @@ impl Transcript {
             }
             // The turn's usage reaches the screen with its ending.
             FrontendEvent::TokenUsage(_) => {}
+            // The gauge reads the cells the screen shares with the agent, on every frame.
+            FrontendEvent::ContextMeasured { .. } => {}
             // A stage direction and an advisory are one register on the screen; the level is
             // what tells a warning from a note.
             FrontendEvent::Notice(notice) => {
@@ -1205,24 +1207,9 @@ impl Transcript {
         }
     }
 
-    /// The stage direction for a replayed report: the tasks the ids name, said as the live screen
-    /// said them. A converted row names a task by its short id, so a prefix matches; a task the
-    /// store no longer holds leaves the direction bare.
+    /// The stage direction for a replayed report, from the tasks the screen has read.
     fn replayed_report_direction(&self, task_ids: &[String]) -> String {
-        let tasks: Vec<crate::store::background::BackgroundTask> = task_ids
-            .iter()
-            .filter_map(|id| {
-                self.background_tasks
-                    .iter()
-                    .find(|task| task.id.starts_with(id.as_str()))
-                    .cloned()
-            })
-            .collect();
-        if tasks.is_empty() {
-            "Background task report".to_string()
-        } else {
-            crate::background::report_direction(&tasks)
-        }
+        crate::background::replayed_report_direction(&self.background_tasks, task_ids)
     }
 
     /// The items a run of log events shows, the way a resume shows them: what each side said, the

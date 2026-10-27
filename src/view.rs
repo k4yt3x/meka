@@ -601,6 +601,72 @@ impl ToolView {
     }
 }
 
+/// One background task as every JSON surface reports it: the task routes, and the `_meta` of the
+/// ACP notice that says what reported. `status` is the spelling of
+/// [`crate::store::background::TaskStatus`].
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+pub(crate) struct BackgroundTaskView {
+    pub(crate) id: String,
+    pub(crate) session_id: Uuid,
+    /// The tool that was backgrounded, e.g. `shell_execute`.
+    pub(crate) tool: String,
+    /// Human-readable summary of what was started.
+    pub(crate) label: String,
+    /// `running`, `completed`, `failed`, `canceled`, or `interrupted`.
+    pub(crate) status: String,
+    /// The tool's output for a terminal task, truncated when it was also spilled to the
+    /// scratchpad.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) outcome: Option<String>,
+    /// Scratchpad entry holding the full output, when it was too large to carry inline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scratchpad_entry: Option<String>,
+    pub(crate) started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) finished_at: Option<String>,
+    /// When subscribers were told, which is when `task.finished` fired for this task. Absent when
+    /// nobody has been told yet.
+    ///
+    /// A row migrated from before the split carries its `delivered_at` here, which records that
+    /// the outcome was reported rather than that any endpoint received it: the store cannot
+    /// know whether one was subscribed at the time.
+    ///
+    /// Separate from `delivered_at` because the two answer different questions and stopped
+    /// happening together: announcing needs nothing from a live session, while telling the agent
+    /// needs a turn. A client polling this after a `task.finished` can otherwise not tell
+    /// "announced, waiting for a turn" from "never announced at all".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) announced_at: Option<String>,
+    /// When the outcome was handed to the agent. Absent when it is still waiting to be delivered
+    /// on the session's next turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) delivered_at: Option<String>,
+    /// The session a backgrounded `agent_spawn` runs, once it has made one. Omitted on every
+    /// other task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) subagent_id: Option<Uuid>,
+}
+
+impl From<crate::store::background::BackgroundTask> for BackgroundTaskView {
+    fn from(task: crate::store::background::BackgroundTask) -> Self {
+        Self {
+            id: task.id,
+            session_id: task.session_id,
+            tool: task.tool,
+            label: task.label,
+            status: task.status.name().to_string(),
+            outcome: task.outcome,
+            scratchpad_entry: task.scratchpad_entry,
+            started_at: task.started_at.to_rfc3339(),
+            finished_at: task.finished_at.map(|at| at.to_rfc3339()),
+            announced_at: task.announced_at.map(|at| at.to_rfc3339()),
+            delivered_at: task.delivered_at.map(|at| at.to_rfc3339()),
+            subagent_id: task.subagent_id,
+        }
+    }
+}
+
 /// One compaction as every JSON surface reports it: the `context.compacted` event, the
 /// `compaction` marker on a summary message, and the one-shot report. `trigger` and `source` are
 /// the spellings of [`crate::conversation::CompactionTrigger`] and
