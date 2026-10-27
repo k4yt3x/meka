@@ -30,6 +30,16 @@ mod support;
 
 use support::Install;
 
+/// The account and profile every harness but [`ServeTestHarness::spawn_bare`] writes, served by the
+/// mock provider.
+const MOCK_PROFILE: &str = r#"[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+"#;
+
 struct ServeTestHarness {
     /// The server's directories. Exposed so a test can reach the session lock directory under the
     /// data dir, which is the only way to create the cross-process lock contention that
@@ -40,7 +50,9 @@ struct ServeTestHarness {
     token: String,
     /// Drained by the spawned reader thread and kept alive so that thread can exit cleanly.
     #[allow(dead_code, reason = "held so the reader thread can finish; never read")]
-    stderr_handle: std::thread::JoinHandle<String>,
+    /// The server's stderr, read to the end by a thread; printed when a test fails, since the
+    /// reason for a refusal the server sanitized is in the log.
+    stderr_handle: Option<std::thread::JoinHandle<String>>,
     client: reqwest::blocking::Client,
 }
 
@@ -86,6 +98,41 @@ impl ServeTestHarness {
         scopes: &[&str],
         environment: impl Fn(&Install) -> Vec<(String, String)>,
     ) -> Self {
+        Self::spawn_configured(
+            MOCK_PROFILE,
+            prelude,
+            extra_config,
+            script,
+            token,
+            scopes,
+            environment,
+        )
+    }
+
+    /// [`Self::spawn_with`] without the mock account and profile: `prelude` carries whatever
+    /// accounts and profiles the test wants, or none, which is the state an installation managed
+    /// over the API starts in.
+    fn spawn_bare(
+        prelude: &str,
+        extra_config: &str,
+        script: serde_json::Value,
+        token: &str,
+        scopes: &[&str],
+    ) -> Self {
+        Self::spawn_configured("", prelude, extra_config, script, token, scopes, |_| {
+            Vec::new()
+        })
+    }
+
+    fn spawn_configured(
+        profiles: &str,
+        prelude: &str,
+        extra_config: &str,
+        script: serde_json::Value,
+        token: &str,
+        scopes: &[&str],
+        environment: impl Fn(&Install) -> Vec<(String, String)>,
+    ) -> Self {
         let install = Install::new();
         install.write_script(&script);
 
@@ -108,13 +155,7 @@ impl ServeTestHarness {
             // `idle_timeout`, etc. without colliding with the per-token block.
             let config = format!(
                 r#"{prelude}
-[accounts.mock]
-backend = "anthropic-messages"
-
-[profiles.mock]
-account = "mock"
-model = "claude-sonnet-4-5"
-
+{profiles}
 [permissions]
 default = "unrestricted"
 # `workspace` included so it is reachable from a test at all. Leaving it out was a large part of
@@ -161,7 +202,7 @@ scopes = [{scopes_str}]
                         child,
                         base_url: format!("http://{bind}"),
                         token: token.to_string(),
-                        stderr_handle,
+                        stderr_handle: Some(stderr_handle),
                         client,
                     };
                 }
@@ -266,6 +307,12 @@ impl Drop for ServeTestHarness {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking()
+            && let Some(handle) = self.stderr_handle.take()
+            && let Ok(logs) = handle.join()
+        {
+            eprintln!("meka serve log:\n{logs}");
+        }
     }
 }
 
@@ -1891,6 +1938,102 @@ fn ready_probe_reports_subsystem_health() {
         body["mcp_servers_healthy"], true,
         "mcp_servers_healthy must be a boolean (true when no servers configured)"
     );
+}
+
+/// An installation managed over the API starts with no account and no profile, and the server has
+/// to be up for a client to add them: the readiness probe says what is missing, a session that
+/// names no profile is refused with the configuration's own sentence, and one that names a
+/// profile is refused by name.
+#[test]
+fn serve_starts_with_no_profile_configured() {
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+    ]);
+    let response = harness
+        .client
+        .get(format!("{}/v1/health/ready", harness.base_url))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 503);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["profile_configured"], false);
+
+    let profiles: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/profiles")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(profiles["profiles"], serde_json::json!([]));
+
+    let response = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 422);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
+    assert_eq!(
+        body["detail"],
+        "no profile configured; run `meka account add <name>`, then `meka profile add <name>`"
+    );
+
+    let response = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"profile": "work"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 422);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["detail"], "no profile named 'work' (none configured)");
+}
+
+/// Two profiles and no `default_profile` is a state a client can put an installation in, so the
+/// server starts on it: a session that names its profile is created and runs, one that names none
+/// is refused with the sentence that says which to pick.
+#[test]
+fn serve_starts_with_an_ambiguous_default_profile() {
+    let harness = ServeTestHarness::spawn_bare(
+        "[accounts.mock]\nbackend = \"anthropic-messages\"\n\n[profiles.work]\naccount = \"mock\"\n\
+         model = \"m\"\n\n[profiles.side]\naccount = \"mock\"\nmodel = \"m\"\n",
+        "",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let response = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 422);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(
+        body["detail"],
+        "multiple profiles configured (side, work) and no `default_profile`; pick one with `meka \
+         profile use <name>`"
+    );
+
+    let response = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"profile": "side"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 201);
+    let session: serde_json::Value = response.json().expect("parse");
+    assert_eq!(session["profile"], "side");
+    let id = session["id"].as_str().expect("id");
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "hi", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200);
+    let body: serde_json::Value = turn.json().expect("parse");
+    assert_eq!(assistant_text(&body), "hello from agent");
 }
 
 /// PATCH with insufficient scope (`sessions:r` only) returns 403.
@@ -19081,4 +19224,2364 @@ context_window = 32000
         "the profile did not move: {fetched}"
     );
     assert_eq!(fetched["project"], "", "{fetched}");
+}
+
+/// The HTTP equivalent of the first run on a fresh install, and of every `meka account` and
+/// `meka profile` verb after it, on a server that started with neither: an API-key account with
+/// its key, a subscription account without one, a profile the next session runs on without a
+/// restart, a second profile that makes the default ambiguous until one is chosen, the settings
+/// changed in one request, a rename that moves the session, and the removals in the order the
+/// references allow.
+#[test]
+fn accounts_and_profiles_are_managed_over_http() {
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "config:r",
+        "config:w",
+    ]);
+    let get = |path: &str| -> (u16, serde_json::Value) {
+        let response = harness
+            .request(reqwest::Method::GET, path)
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        (status, response.json().expect("parse"))
+    };
+    let send = |method: reqwest::Method,
+                path: &str,
+                body: serde_json::Value|
+     -> (u16, serde_json::Value) {
+        let response = harness
+            .request(method, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        let body = if status == 204 {
+            serde_json::Value::Null
+        } else {
+            response.json().expect("parse")
+        };
+        (status, body)
+    };
+
+    let (status, body) = get("/v1/accounts");
+    assert_eq!(status, 200);
+    assert_eq!(body, serde_json::json!({"accounts": []}));
+
+    // An API-key account carries its key; the reply says the credential is stored.
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/accounts",
+        serde_json::json!({"name": "work", "backend": "anthropic-messages", "api_key": "sk-ant-test"}),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["name"], "work");
+    assert_eq!(body["backend"], "anthropic-messages");
+    assert_eq!(body["authenticated"], "yes");
+    assert!(
+        body.get("api_key").is_none(),
+        "the key never comes back: {body}"
+    );
+
+    // Refused: a name in use, a key where none is taken, none where one is, an unknown backend,
+    // and a setting the backend never reads.
+    for (payload, expected) in [
+        (
+            serde_json::json!({"name": "work", "backend": "anthropic-messages", "api_key": "x"}),
+            "an account named 'work' already exists",
+        ),
+        (
+            serde_json::json!({"name": "sub", "backend": "claude-subscription", "api_key": "x"}),
+            "'claude-subscription' logs in through the browser and takes no API key; add the \
+             account without one and log in at `POST /v1/accounts/sub/login`",
+        ),
+        (
+            serde_json::json!({"name": "keyless", "backend": "openai-responses"}),
+            "a 'openai-responses' account needs `api_key`",
+        ),
+        (
+            serde_json::json!({"name": "odd", "backend": "frobnicate", "api_key": "x"}),
+            "",
+        ),
+        (
+            serde_json::json!({"name": "odd", "backend": "openai-responses", "api_key": "x", "client_id": "c"}),
+            "a 'openai-responses' account never reads `client_id`; drop it",
+        ),
+    ] {
+        let (status, body) = send(reqwest::Method::POST, "/v1/accounts", payload);
+        assert_eq!(status, 422, "{body}");
+        assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
+        if !expected.is_empty() {
+            assert_eq!(body["detail"], expected);
+        }
+    }
+
+    // A subscription account is added without a credential, and logged in separately.
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/accounts",
+        serde_json::json!({"name": "sub", "backend": "claude-subscription"}),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["authenticated"], "no");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/accounts/sub/login",
+        serde_json::json!({"api_key": "x"}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body["detail"].as_str().unwrap().starts_with(
+            "'sub' is a 'claude-subscription' account, which logs in through the browser"
+        ),
+        "{body}"
+    );
+
+    // The key on an API-key account rotates through the login.
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/accounts/work/login",
+        serde_json::json!({"api_key": "sk-ant-rotated"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["authenticated"], "yes");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/accounts/work/login",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "'work' is a 'anthropic-messages' account, which logs in with `api_key`"
+    );
+
+    // Nothing runs yet: no profile.
+    let (status, body) = get("/v1/profiles");
+    assert_eq!(status, 200);
+    assert_eq!(body["profiles"], serde_json::json!([]));
+    let (status, _) = send(reqwest::Method::POST, "/v1/sessions", serde_json::json!({}));
+    assert_eq!(status, 422);
+
+    // The first profile is the default by the sole-profile rule, and the server runs on it at
+    // once: no restart between the write and the session.
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/profiles",
+        serde_json::json!({"name": "main", "account": "work", "model": "m", "context_window": 50000}),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["name"], "main");
+    assert_eq!(body["account"], "work");
+    assert_eq!(body["backend"], "anthropic-messages");
+    assert_eq!(body["model"], "m");
+    assert_eq!(body["context_window"], 50000);
+    assert_eq!(body["active"], true);
+    assert!(
+        body.get("effort").is_none(),
+        "an unset key is absent: {body}"
+    );
+    let (status, session) = send(reqwest::Method::POST, "/v1/sessions", serde_json::json!({}));
+    assert_eq!(status, 201, "{session}");
+    assert_eq!(session["profile"], "main");
+    let session_id = session["id"].as_str().unwrap().to_string();
+    let turn = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{session_id}/turn"),
+        )
+        .json(&serde_json::json!({"message": "hi", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200);
+    let turn: serde_json::Value = turn.json().expect("parse");
+    assert_eq!(assistant_text(&turn), "hello from agent");
+    let (status, ready) = get("/v1/health/ready");
+    assert_eq!(status, 200, "{ready}");
+
+    // Refused: a name in use, an account not configured, a setting the backend never sends, a
+    // model that is blank.
+    for (payload, expected) in [
+        (
+            serde_json::json!({"name": "main", "account": "work", "model": "m"}),
+            "a profile named 'main' already exists",
+        ),
+        (
+            serde_json::json!({"name": "side", "account": "ghost", "model": "m"}),
+            "no account named 'ghost' (configured: work, sub)",
+        ),
+        (
+            serde_json::json!({"name": "side", "account": "sub", "model": "m", "cache_control": false}),
+            "a profile on 'sub', a 'claude-subscription' account, never sends `cache_control`; drop it",
+        ),
+        (
+            serde_json::json!({"name": "side", "account": "work", "model": " "}),
+            "profile 'side' names no model; set one with `meka profile set side model <model>`",
+        ),
+    ] {
+        let (status, body) = send(reqwest::Method::POST, "/v1/profiles", payload);
+        assert_eq!(status, 422, "{body}");
+        assert_eq!(body["detail"], expected);
+    }
+
+    // A second profile makes the default ambiguous, until one is chosen on its PATCH.
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/profiles",
+        serde_json::json!({"name": "side", "account": "work", "model": "m2"}),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["active"], false);
+    let (status, body) = send(reqwest::Method::POST, "/v1/sessions", serde_json::json!({}));
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("multiple profiles configured (main, side) and no `default_profile`"),
+        "{body}"
+    );
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/profiles/side",
+        serde_json::json!({"default": false}),
+    );
+    assert_eq!(status, 422, "{body}");
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/profiles/side",
+        serde_json::json!({"default": true, "effort": "high", "fallbacks": ["main"], "context_window": 40000}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["active"], true);
+    assert_eq!(body["effort"], "high");
+    assert_eq!(body["fallbacks"], serde_json::json!(["main"]));
+    assert_eq!(body["context_window"], 40000);
+    let (status, listing) = get("/v1/profiles");
+    assert_eq!(status, 200);
+    let active: Vec<&str> = listing["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|profile| profile["active"] == true)
+        .map(|profile| profile["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(active, vec!["side"]);
+    let (status, session) = send(reqwest::Method::POST, "/v1/sessions", serde_json::json!({}));
+    assert_eq!(status, 201, "{session}");
+    assert_eq!(session["profile"], "side");
+
+    // `null` removes a key, `""` removes a string key, and a key the backend never sends, a
+    // model removed, and an unknown key are each refused.
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/profiles/main",
+        serde_json::json!({"context_window": null, "effort": ""}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("context_window").is_none(), "{body}");
+    assert!(body.get("effort").is_none(), "{body}");
+    let (status, body) = get("/v1/profiles/main");
+    assert_eq!(status, 200);
+    assert_eq!(body["model"], "m");
+    assert_eq!(body["active"], false);
+    for (payload, expected) in [
+        (
+            serde_json::json!({"model": null}),
+            "profile 'main' names no model; set one with `meka profile set main model <model>`",
+        ),
+        (
+            serde_json::json!({"thinking": "adaptive", "name": "renamed"}),
+            "`name` renames the profile and is sent on its own; change its settings in another \
+             request",
+        ),
+        (serde_json::json!({"account": "sub"}), ""),
+        (
+            serde_json::json!({"fallbacks": []}),
+            "fallbacks must name at least one profile; send null to remove the setting",
+        ),
+    ] {
+        let (status, body) = send(reqwest::Method::PATCH, "/v1/profiles/main", payload);
+        assert_eq!(status, 422, "{body}");
+        if !expected.is_empty() {
+            assert_eq!(body["detail"], expected);
+        }
+    }
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/profiles/sub-only",
+        serde_json::json!({"model": "x"}),
+    );
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["type"], "https://meka.run/errors/not-found");
+    assert_eq!(
+        body["detail"],
+        "no profile named 'sub-only' (configured: main, side)"
+    );
+
+    // A rename moves the sessions recorded on the profile, and `default_profile` follows.
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/profiles/side",
+        serde_json::json!({"name": "primary"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name"], "primary");
+    assert_eq!(body["active"], true);
+    let (status, moved) = get(&format!("/v1/sessions/{}", session["id"].as_str().unwrap()));
+    assert_eq!(status, 200);
+    assert_eq!(moved["profile"], "primary");
+
+    // Removals: a profile another's `fallbacks` names, an account a profile names, then in order.
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        "/v1/profiles/main",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "profile(s) primary name 'main' in `fallbacks`; remove it from them first"
+    );
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        "/v1/accounts/work",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "account 'work' is named by profile(s) main, primary; remove them first"
+    );
+    let (status, _) = send(
+        reqwest::Method::DELETE,
+        "/v1/profiles/primary",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 204);
+    let (status, _) = send(
+        reqwest::Method::DELETE,
+        "/v1/profiles/main",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 204);
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        "/v1/profiles/main",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/accounts/work",
+        serde_json::json!({"name": "corp"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name"], "corp");
+    assert_eq!(body["authenticated"], "yes");
+    let (status, _) = send(
+        reqwest::Method::DELETE,
+        "/v1/accounts/corp",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 204);
+    let (status, _) = send(
+        reqwest::Method::DELETE,
+        "/v1/accounts/sub",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 204);
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        "/v1/accounts/sub",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["detail"], "no account named 'sub' (none configured)");
+    let (status, body) = get("/v1/accounts");
+    assert_eq!(status, 200);
+    assert_eq!(body, serde_json::json!({"accounts": []}));
+    let (status, ready) = get("/v1/health/ready");
+    assert_eq!(status, 503, "{ready}");
+    assert_eq!(ready["profile_configured"], false);
+}
+
+/// Every write to the installation needs `config:w`, and the reads `config:r`; a token holding
+/// every other scope gets 403 from each, and the listing of profiles stays open to any read.
+#[test]
+fn installation_routes_need_the_config_scopes() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "memory:r",
+        "memory:w",
+        "skills:r",
+        "skills:w",
+        "schedule:r",
+        "schedule:w",
+        "mcp:r",
+        "mcp:w",
+    ]);
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/accounts"),
+        (reqwest::Method::POST, "/v1/accounts"),
+        (reqwest::Method::PATCH, "/v1/accounts/mock"),
+        (reqwest::Method::DELETE, "/v1/accounts/mock"),
+        (reqwest::Method::POST, "/v1/accounts/mock/login"),
+        (reqwest::Method::GET, "/v1/profiles/mock"),
+        (reqwest::Method::POST, "/v1/profiles"),
+        (reqwest::Method::PATCH, "/v1/profiles/mock"),
+        (reqwest::Method::DELETE, "/v1/profiles/mock"),
+    ] {
+        let response = harness
+            .request(method.clone(), path)
+            .json(&serde_json::json!({"name": "x"}))
+            .send()
+            .expect("send");
+        assert_eq!(response.status(), 403, "{method} {path}");
+        let body: serde_json::Value = response.json().expect("parse");
+        assert_eq!(
+            body["type"], "https://meka.run/errors/auth-scope",
+            "{method} {path}"
+        );
+    }
+    let response = harness
+        .request(reqwest::Method::GET, "/v1/profiles")
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+}
+
+/// A write over HTTP goes through the same editor the CLI uses, so what the operator wrote by
+/// hand around the tables, comments included, is still there afterwards.
+#[test]
+fn an_installation_write_keeps_the_config_file_s_comments() {
+    let harness = ServeTestHarness::spawn_bare(
+        "# The operator's note above the accounts.\n[accounts.mock]\nbackend = \"anthropic-messages\" # keyed in the store\n",
+        "",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["config:r", "config:w"],
+    );
+    let response = harness
+        .request(reqwest::Method::POST, "/v1/profiles")
+        .json(&serde_json::json!({"name": "main", "account": "mock", "model": "m"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 201);
+    let response = harness
+        .request(reqwest::Method::PATCH, "/v1/profiles/main")
+        .json(&serde_json::json!({"effort": "low"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let contents = std::fs::read_to_string(harness.install.config_dir().join("config.toml"))
+        .expect("read config.toml");
+    assert!(
+        contents.contains("# The operator's note above the accounts."),
+        "{contents}"
+    );
+    assert!(contents.contains("# keyed in the store"), "{contents}");
+    assert!(
+        contents.contains("[profiles.main]\naccount = \"mock\"\nmodel = \"m\"\neffort = \"low\"\n"),
+        "{contents}"
+    );
+}
+
+/// The query parameter `key` out of an authorization URL, which is how the test plays the browser:
+/// the state the server minted is what the browser is sent back with.
+fn query_parameter(url: &str, key: &str) -> String {
+    reqwest::Url::parse(url)
+        .expect("an authorization URL")
+        .query_pairs()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_else(|| panic!("no `{key}` in {url}"))
+}
+
+/// A stand-in for an OAuth token endpoint: records every exchange it is sent and answers
+/// `bundle`, or 400 when the code is `bad`, which is how a test reaches the refused path without
+/// an authorization server.
+fn spawn_token_endpoint(bundle: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let port = support::spawn_http_listener(move |request| {
+        tx.send(format!(
+            "{} {}\n{}",
+            request.method, request.path, request.body
+        ))
+        .ok();
+        if request.body.contains("bad") {
+            let body = r#"{"error":"invalid_grant"}"#;
+            return format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+        }
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{bundle}",
+            bundle.len()
+        )
+    });
+    (format!("http://127.0.0.1:{port}/token"), rx)
+}
+
+/// A `claude-subscription` login over HTTP: begun with a URL minted under the account's own client
+/// id, completed with the code the person pastes back, exchanged at the account's own token
+/// endpoint. The endpoint is a stub answering a bundle, so what is pinned is the flow around the
+/// exchange: the state the URL carries is the one a paste has to bring back, a wrong one leaves
+/// the login pending, a refused exchange ends it, and a completed one answers again.
+#[test]
+fn a_claude_login_runs_over_http_against_the_account_s_token_endpoint() {
+    let (token_url, exchanges) = spawn_token_endpoint(
+        r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600,"account":{"uuid":"acct-uuid"}}"#,
+    );
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "config:r", "config:w",
+    ]);
+    let post = |path: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let response = harness
+            .request(reqwest::Method::POST, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        (response.status().as_u16(), response.json().expect("parse"))
+    };
+    let status_of = |login_id: &str| -> serde_json::Value {
+        harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/accounts/claude/login/{login_id}"),
+            )
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+
+    let (status, body) = post(
+        "/v1/accounts",
+        serde_json::json!({"name": "claude", "backend": "claude-subscription", "client_id": "cid-test", "oauth_token_url": token_url}),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["authenticated"], "no");
+
+    let (status, started) = post("/v1/accounts/claude/login", serde_json::json!({}));
+    assert_eq!(status, 202, "{started}");
+    assert_eq!(started["completes_with"], "code");
+    assert_eq!(started["listening"], false);
+    let url = started["authorization_url"].as_str().expect("a URL");
+    assert_eq!(query_parameter(url, "client_id"), "cid-test");
+    assert_eq!(query_parameter(url, "code_challenge_method"), "S256");
+    let state = query_parameter(url, "state");
+    let login_id = started["login_id"].as_str().expect("an id").to_string();
+    assert_eq!(status_of(&login_id)["status"], "pending");
+
+    // Another login's state leaves this one pending; a wrong paste is not the end of it.
+    let (status, body) = post(
+        &format!("/v1/accounts/claude/login/{login_id}"),
+        serde_json::json!({"code": "abc#not-this-state"}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "OAuth state mismatch; refusing the callback"
+    );
+    assert_eq!(status_of(&login_id)["status"], "pending");
+    // A blank line is refused at once rather than held until the login lapses.
+    let (status, body) = post(
+        &format!("/v1/accounts/claude/login/{login_id}"),
+        serde_json::json!({"code": "   "}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["detail"], "code cannot be empty");
+    assert_eq!(status_of(&login_id)["status"], "pending");
+
+    let (status, body) = post(
+        &format!("/v1/accounts/claude/login/{login_id}"),
+        serde_json::json!({"code": format!("abc#{state}")}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name"], "claude");
+    assert_eq!(body["authenticated"], "yes");
+    let exchange = exchanges
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the exchange reached the endpoint");
+    assert!(exchange.starts_with("POST /token\n"), "{exchange}");
+    for expected in [
+        r#""code":"abc""#,
+        r#""client_id":"cid-test""#,
+        &format!(r#""state":"{state}""#),
+        r#""redirect_uri":"https://platform.claude.com/oauth/code/callback""#,
+    ] {
+        assert!(exchange.contains(expected), "{expected} not in {exchange}");
+    }
+    assert_eq!(status_of(&login_id)["status"], "completed");
+    // Completed is completed: the same completion answers the account again.
+    let (status, body) = post(
+        &format!("/v1/accounts/claude/login/{login_id}"),
+        serde_json::json!({"code": format!("abc#{state}")}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        exchanges.recv_timeout(Duration::from_millis(300)).is_err(),
+        "nothing exchanged twice"
+    );
+
+    // A refused exchange ends the login: the code is spent.
+    let (status, started) = post("/v1/accounts/claude/login", serde_json::json!({}));
+    assert_eq!(status, 202, "{started}");
+    let state = query_parameter(started["authorization_url"].as_str().unwrap(), "state");
+    let second = started["login_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/accounts/claude/login/{login_id}")
+            )
+            .send()
+            .expect("send")
+            .status(),
+        404,
+        "beginning another login replaces the first"
+    );
+    let (status, body) = post(
+        &format!("/v1/accounts/claude/login/{second}"),
+        serde_json::json!({"code": format!("bad#{state}")}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("token exchange failed (400 Bad Request)"),
+        "{body}"
+    );
+    let failed = status_of(&second);
+    assert_eq!(failed["status"], "failed");
+    assert!(
+        failed["error"].as_str().unwrap().contains("400"),
+        "{failed}"
+    );
+    let (status, _) = post(
+        &format!("/v1/accounts/claude/login/{second}"),
+        serde_json::json!({"code": format!("abc#{state}")}),
+    );
+    assert_eq!(status, 422, "a failed login does not take another code");
+    let (status, body) = post(
+        "/v1/accounts/claude/login/not-a-login",
+        serde_json::json!({"code": "x"}),
+    );
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(
+        body["detail"],
+        "no login 'not-a-login' is pending for account 'claude'"
+    );
+}
+
+/// A `chatgpt-subscription` login over HTTP is sent back to the loopback listener the server
+/// holds and completes with nothing posted: the test plays the browser, following the redirect to
+/// the listener with the state the URL carries. A second login is completed by posting the
+/// callback URL instead, as a client whose browser is on another machine has it.
+#[test]
+fn a_codex_login_completes_from_the_loopback_listener_or_a_posted_callback() {
+    let (token_url, exchanges) =
+        spawn_token_endpoint(r#"{"access_token":"at-codex","refresh_token":"rt-codex"}"#);
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "config:r", "config:w",
+    ]);
+    let post = |path: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let response = harness
+            .request(reqwest::Method::POST, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        (response.status().as_u16(), response.json().expect("parse"))
+    };
+    let status_of = |login_id: &str| -> serde_json::Value {
+        harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/accounts/gpt/login/{login_id}"),
+            )
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+
+    let (status, body) = post(
+        "/v1/accounts",
+        serde_json::json!({"name": "gpt", "backend": "chatgpt-subscription", "client_id": "cidcodex", "oauth_token_url": token_url}),
+    );
+    assert_eq!(status, 201, "{body}");
+
+    let (status, started) = post("/v1/accounts/gpt/login", serde_json::json!({}));
+    assert_eq!(status, 202, "{started}");
+    assert_eq!(started["completes_with"], "callback_url");
+    assert_eq!(started["listening"], true, "{started}");
+    let url = started["authorization_url"].as_str().expect("a URL");
+    assert_eq!(query_parameter(url, "client_id"), "cidcodex");
+    assert_eq!(
+        query_parameter(url, "redirect_uri"),
+        "http://localhost:1455/auth/callback"
+    );
+    let state = query_parameter(url, "state");
+    let login_id = started["login_id"].as_str().unwrap().to_string();
+
+    // The browser, sent back to the listener.
+    let browser = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let landed = browser
+        .get(format!(
+            "http://127.0.0.1:1455/auth/callback?code=cbcode&state={state}"
+        ))
+        .send()
+        .expect("the listener answers the browser");
+    assert_eq!(landed.status(), 200);
+    assert!(landed.text().unwrap().contains("authorization successful"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = status_of(&login_id);
+        if status["status"] == "completed" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the login never completed from the callback: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let exchange = exchanges
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the exchange reached the endpoint");
+    for expected in [
+        "code=cbcode",
+        "client_id=cidcodex",
+        "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback",
+    ] {
+        assert!(exchange.contains(expected), "{expected} not in {exchange}");
+    }
+    let accounts: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/accounts")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        accounts["accounts"][0]["authenticated"], "yes",
+        "{accounts}"
+    );
+
+    // The second login, completed by the posted callback URL. A paste without a code leaves it
+    // pending.
+    let (status, started) = post("/v1/accounts/gpt/login", serde_json::json!({}));
+    assert_eq!(status, 202, "{started}");
+    let state = query_parameter(started["authorization_url"].as_str().unwrap(), "state");
+    let second = started["login_id"].as_str().unwrap().to_string();
+    let (status, body) = post(
+        &format!("/v1/accounts/gpt/login/{second}"),
+        serde_json::json!({"code": "https://example.test/nothing-here"}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "no 'code' and 'state' in that input; paste the full callback URL the browser was sent to"
+    );
+    assert_eq!(status_of(&second)["status"], "pending");
+    let (status, body) = post(
+        &format!("/v1/accounts/gpt/login/{second}"),
+        serde_json::json!({"code": format!("http://localhost:1455/auth/callback?code=pasted&state={state}")}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["authenticated"], "yes");
+    let exchange = exchanges
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the second exchange reached the endpoint");
+    assert!(exchange.contains("code=pasted"), "{exchange}");
+}
+
+/// A request waiting for a login to complete is answered when the login is replaced, not left to
+/// the login's lifetime: the exchange here hangs, so the completion is still waiting when a second
+/// login begins, and it answers 422 at once with why.
+#[test]
+fn a_completion_waiting_on_a_replaced_login_is_answered_at_once() {
+    let port = support::spawn_http_listener(|_request| {
+        std::thread::sleep(Duration::from_secs(30));
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string()
+    });
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "config:r", "config:w",
+    ]);
+    let post = |path: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let response = harness
+            .request(reqwest::Method::POST, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        (response.status().as_u16(), response.json().expect("parse"))
+    };
+    let (status, body) = post(
+        "/v1/accounts",
+        serde_json::json!({"name": "claude", "backend": "claude-subscription", "client_id": "cid-test", "oauth_token_url": format!("http://127.0.0.1:{port}/token")}),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, started) = post("/v1/accounts/claude/login", serde_json::json!({}));
+    assert_eq!(status, 202, "{started}");
+    let state = query_parameter(started["authorization_url"].as_str().unwrap(), "state");
+    let login_id = started["login_id"].as_str().unwrap().to_string();
+
+    // The completion, waiting on an exchange that never answers.
+    let (tx, rx) = std::sync::mpsc::channel::<(u16, serde_json::Value)>();
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        let response = client
+            .post(format!("{base_url}/v1/accounts/claude/login/{login_id}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"code": format!("abc#{state}")}))
+            .send()
+            .expect("send");
+        tx.send((response.status().as_u16(), response.json().expect("parse")))
+            .ok();
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        rx.try_recv().is_err(),
+        "the completion waits on the exchange"
+    );
+
+    let (status, second) = post("/v1/accounts/claude/login", serde_json::json!({}));
+    assert_eq!(status, 202, "{second}");
+    let (status, body) = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the waiting completion is answered when its login is replaced");
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "the login was replaced, or its subject removed"
+    );
+}
+
+/// An account whose credential refreshes under its name is not renamed while a session resident
+/// here runs on it: the session keeps the provider it was built with, and that provider's next
+/// refresh would write to a row that is gone. Once the session is deleted, the rename goes through.
+#[test]
+fn a_subscription_account_is_not_renamed_under_a_resident_session() {
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "config:r",
+        "config:w",
+    ]);
+    let send = |method: reqwest::Method,
+                path: &str,
+                body: serde_json::Value|
+     -> (u16, serde_json::Value) {
+        let response = harness
+            .request(method, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        (status, response.json().unwrap_or(serde_json::Value::Null))
+    };
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/accounts",
+        serde_json::json!({"name": "sub", "backend": "claude-subscription"}),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/profiles",
+        serde_json::json!({"name": "onsub", "account": "sub", "model": "m"}),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, session) = send(
+        reqwest::Method::POST,
+        "/v1/sessions",
+        serde_json::json!({"profile": "onsub"}),
+    );
+    assert_eq!(status, 201, "{session}");
+    let session_id = session["id"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/accounts/sub",
+        serde_json::json!({"name": "sub2"}),
+    );
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["type"], "https://meka.run/errors/account-in-use");
+
+    // A session on a profile since removed still runs on the provider it was built with.
+    let dropped = harness
+        .request(reqwest::Method::DELETE, "/v1/profiles/onsub")
+        .send()
+        .expect("send");
+    assert_eq!(dropped.status().as_u16(), 204);
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/accounts/sub",
+        serde_json::json!({"name": "sub2"}),
+    );
+    assert_eq!(status, 409, "{body}");
+
+    let deleted = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{session_id}"),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(deleted.status().as_u16(), 204);
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/accounts/sub",
+        serde_json::json!({"name": "sub2"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name"], "sub2");
+}
+
+/// MCP servers managed over HTTP, on a server that started with none: a stdio server added is
+/// connected and its tools listed without a restart, a change is applied by restarting it,
+/// `disabled` stops and starts it, a removal takes it out of the file, the manager and the tool
+/// lists, and the entry keeps what `config.toml` said around it.
+#[test]
+fn mcp_servers_are_managed_over_http() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mcp_stub_server.py"
+    );
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = state_dir.path().join("state.json");
+    std::fs::write(
+        &state_path,
+        r#"{"tools": ["search", "create_page"], "instructions": "call search first"}"#,
+    )
+    .expect("write state");
+    let harness = ServeTestHarness::spawn_with(
+        "# notes above the servers\n",
+        "",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "mcp:r", "config:r", "config:w"],
+    );
+    let send = |method: reqwest::Method,
+                path: &str,
+                body: serde_json::Value|
+     -> (u16, serde_json::Value) {
+        let response = harness
+            .request(method, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        let body = if status == 204 {
+            serde_json::Value::Null
+        } else {
+            response.json().expect("parse")
+        };
+        (status, body)
+    };
+    let get = |path: &str| -> (u16, serde_json::Value) {
+        let response = harness
+            .request(reqwest::Method::GET, path)
+            .send()
+            .expect("send");
+        (response.status().as_u16(), response.json().expect("parse"))
+    };
+    let wait_for_state = |name: &str, wanted: &str| -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (_, status) = get(&format!("/v1/mcp/{name}"));
+            if status["state"] == wanted {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "'{name}' never reached `{wanted}`: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let (status, body) = get("/v1/mcp");
+    assert_eq!(status, 200);
+    assert_eq!(body, serde_json::json!([]));
+
+    // Refused: a reserved name, keys that do not fit the transport, a secret a stdio server
+    // cannot present.
+    for (payload, expected) in [
+        (
+            serde_json::json!({"name": "meka", "transport": "stdio", "command": "python3"}),
+            "server name 'meka' is reserved",
+        ),
+        (
+            serde_json::json!({"name": "odd", "transport": "stdio", "url": "https://x.test"}),
+            "server 'odd' is stdio and needs `command`",
+        ),
+        (
+            serde_json::json!({"name": "odd", "transport": "http", "url": "https://x.test", "command": "x"}),
+            "server 'odd' is http; `command`, `args` and `env` are for a stdio server",
+        ),
+        (
+            serde_json::json!({"name": "odd", "transport": "stdio", "command": "x", "auth_token": "t"}),
+            "server 'odd' is stdio and has no HTTP credential; its secrets go in `env`",
+        ),
+    ] {
+        let (status, body) = send(reqwest::Method::POST, "/v1/mcp", payload);
+        assert_eq!(status, 422, "{body}");
+        assert_eq!(body["detail"], expected);
+    }
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp",
+        serde_json::json!({"name": "odd", "transport": "stdio", "command": "x", "frobnicate": 1}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field `frobnicate`"),
+        "{body}"
+    );
+
+    // Added, and connected without a restart.
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp",
+        serde_json::json!({
+            "name": "stub",
+            "transport": "stdio",
+            "command": "python3",
+            "args": [fixture, state_path.to_string_lossy()],
+            "env": {"STUB_MODE": "test"},
+            "permission": "read",
+        }),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["name"], "stub");
+    assert_eq!(body["transport"], "stdio");
+    assert_eq!(body["permission"], "read");
+    assert_eq!(body["env_keys"], serde_json::json!(["STUB_MODE"]));
+    assert_eq!(body["state"], "pending", "{body}");
+    let connected = wait_for_state("stub", "connected");
+    assert_eq!(connected["command"], "python3");
+    let (status, tools) = get("/v1/mcp/stub/tools");
+    assert_eq!(status, 200, "{tools}");
+    let names: Vec<&str> = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["raw_name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["create_page", "search"]);
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp",
+        serde_json::json!({"name": "stub", "transport": "stdio", "command": "python3"}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "server 'stub' already exists in config.toml"
+    );
+
+    // The session sees the server's tools, which is what a live add is for.
+    let session_id = create_session_id(&harness);
+    let (status, catalog) = get(&format!("/v1/sessions/{session_id}/tools"));
+    assert_eq!(status, 200, "{catalog}");
+    let catalog_names: Vec<&str> = catalog["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(
+        catalog_names
+            .iter()
+            .any(|name| name.starts_with("mcp__stub__")),
+        "{catalog_names:?}"
+    );
+
+    // A change restarts the server with the new entry; `disabled` stops it and starts it again.
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/mcp/stub",
+        serde_json::json!({"permission": null, "allowed_tools": ["search"], "env": null}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("permission").is_none(), "{body}");
+    assert_eq!(body["allowed_tools"], serde_json::json!(["search"]));
+    assert!(body.get("env_keys").is_none(), "{body}");
+    wait_for_state("stub", "connected");
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/mcp/stub",
+        serde_json::json!({"disabled": true}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["disabled"], true);
+    assert_eq!(body["state"], "disabled");
+    let (status, catalog) = get(&format!("/v1/sessions/{session_id}/tools"));
+    assert_eq!(status, 200, "{catalog}");
+    assert!(
+        !catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("mcp__stub__")),
+        "a disabled server's tools leave the session: {catalog}"
+    );
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/mcp/stub",
+        serde_json::json!({"disabled": false}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["disabled"], false);
+    wait_for_state("stub", "connected");
+    for (payload, expected) in [
+        (
+            serde_json::json!({"url": "https://x.test"}),
+            "server 'stub' is stdio; `url`, `headers` and `auth` are for an http server",
+        ),
+        (
+            serde_json::json!({"command": null}),
+            "server 'stub' is stdio and needs `command`",
+        ),
+    ] {
+        let (status, body) = send(reqwest::Method::PATCH, "/v1/mcp/stub", payload);
+        assert_eq!(status, 422, "{body}");
+        assert_eq!(body["detail"], expected);
+    }
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/mcp/ghost",
+        serde_json::json!({"disabled": true}),
+    );
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(
+        body["detail"],
+        "no MCP server named 'ghost' (configured: stub)"
+    );
+
+    // The file kept its comment, and the entry reads as `meka mcp add` would have written it.
+    let contents = std::fs::read_to_string(harness.install.config_dir().join("config.toml"))
+        .expect("read config.toml");
+    assert!(contents.contains("# notes above the servers"), "{contents}");
+    assert!(
+        contents.contains(
+            "[[mcp.servers]]\nname = \"stub\"\ntransport = \"stdio\"\ncommand = \"python3\"\n"
+        ),
+        "{contents}"
+    );
+    assert!(
+        contents.contains("allowed_tools = [\"search\"]"),
+        "{contents}"
+    );
+    assert!(!contents.contains("disabled"), "{contents}");
+
+    // Removed everywhere.
+    let (status, _) = send(
+        reqwest::Method::DELETE,
+        "/v1/mcp/stub",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 204);
+    let (status, body) = get("/v1/mcp");
+    assert_eq!(status, 200);
+    assert_eq!(body, serde_json::json!([]));
+    let (status, body) = get("/v1/mcp/stub");
+    assert_eq!(status, 404, "{body}");
+    let (status, catalog) = get(&format!("/v1/sessions/{session_id}/tools"));
+    assert_eq!(status, 200, "{catalog}");
+    assert!(
+        !catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("mcp__stub__")),
+        "a removed server's tools leave the session: {catalog}"
+    );
+    let contents = std::fs::read_to_string(harness.install.config_dir().join("config.toml"))
+        .expect("read config.toml");
+    assert!(!contents.contains("[[mcp.servers]]"), "{contents}");
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        "/v1/mcp/stub",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 404, "{body}");
+}
+
+/// An http server's credentials over HTTP: a bearer stored through the login, listed on the
+/// detail, refused beside an `auth` block, and cleared by the logout; an OAuth login begun
+/// against an endpoint that has no authorization server to discover is reported, not hung.
+#[test]
+fn mcp_credentials_are_managed_over_http() {
+    // Answers nothing useful, so a connect fails fast and an OAuth discovery finds nothing.
+    let port = support::spawn_http_listener(|_| {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+    });
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "mcp:r", "config:r", "config:w",
+    ]);
+    let send = |method: reqwest::Method,
+                path: &str,
+                body: serde_json::Value|
+     -> (u16, serde_json::Value) {
+        let response = harness
+            .request(method, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        let body = if status == 204 {
+            serde_json::Value::Null
+        } else {
+            response.json().expect("parse")
+        };
+        (status, body)
+    };
+
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp",
+        serde_json::json!({"name": "remote", "transport": "http", "url": format!("http://127.0.0.1:{port}/mcp"), "auth_token": "bearer-1"}),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["credentials"], serde_json::json!(["bearer token"]));
+
+    // A bearer and an `auth` block cannot both stand.
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/mcp/remote",
+        serde_json::json!({"auth": {"type": "oauth"}}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "server 'remote' would hold both an `auth` block and a stored bearer, which overrides it; \
+         set one or the other"
+    );
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp/remote/login",
+        serde_json::json!({"client_secret": "s"}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "server 'remote' has no `[auth]` block to present a client secret; add one with `type = \
+         \"oauth\"` or `\"client_credentials\"` first"
+    );
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp/remote/login",
+        serde_json::json!({"auth_token": "a", "client_secret": "b"}),
+    );
+    assert_eq!(status, 422, "{body}");
+
+    // The bearer rotates through the login; the logout clears it.
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp/remote/login",
+        serde_json::json!({"auth_token": "bearer-2"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["credentials"], serde_json::json!(["bearer token"]));
+    let (status, _) = send(
+        reqwest::Method::POST,
+        "/v1/mcp/remote/logout",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 204);
+    let (status, body) = send(
+        reqwest::Method::GET,
+        "/v1/mcp/remote",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("credentials").is_none(), "{body}");
+
+    // Dropping the bearer makes room for the block, and an OAuth login against an endpoint with
+    // nothing to discover ends with a reported failure rather than a URL.
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/mcp/remote",
+        serde_json::json!({"auth": {"type": "oauth", "scopes": ["read"]}}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["auth"], "oauth");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp/remote/login",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(body["type"], "https://meka.run/errors/provider");
+    assert_eq!(
+        body["detail"],
+        "the login did not complete; the reason is in the meka log"
+    );
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp/remote/login/not-a-login",
+        serde_json::json!({"code": "x"}),
+    );
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(
+        body["detail"],
+        "no login 'not-a-login' is pending for MCP server 'remote'"
+    );
+    let (status, _) = send(
+        reqwest::Method::DELETE,
+        "/v1/mcp/remote",
+        serde_json::Value::Null,
+    );
+    assert_eq!(status, 204);
+}
+
+/// An MCP server's OAuth login over HTTP, end to end, against one stub that plays both the server
+/// and its authorization server. The entry has no `auth` block, so the connect is refused with a
+/// challenge; the login finds nothing at the well-known paths and takes the origin's endpoints,
+/// registers a client, hands the URL out, is sent back to the loopback listener it holds, exchanges
+/// the code, stores the bundle and writes the `auth` block; the server is then restarted from that
+/// entry, connects with the bearer, and its tools reach a session.
+#[test]
+fn an_mcp_oauth_login_over_http_ends_in_a_connected_server() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let port = support::spawn_http_listener({
+        let seen = std::sync::Arc::clone(&seen);
+        move |request| {
+            let bearer = request
+                .headers
+                .get("authorization")
+                .cloned()
+                .unwrap_or_default();
+            seen.lock().unwrap().push(format!(
+                "{} {} [{bearer}] {}",
+                request.method, request.path, request.body
+            ));
+            let json = |body: String| {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            let path = request.path.split('?').next().unwrap_or_default();
+            match (request.method.as_str(), path) {
+                ("POST", "/register") => {
+                    let asked: serde_json::Value =
+                        serde_json::from_str(&request.body).unwrap_or_default();
+                    json(
+                        serde_json::json!({
+                            "client_id": "stub-client",
+                            "redirect_uris": asked["redirect_uris"],
+                        })
+                        .to_string(),
+                    )
+                }
+                ("POST", "/token") => json(
+                    r#"{"access_token":"tok-1","token_type":"bearer","expires_in":3600}"#
+                        .to_string(),
+                ),
+                ("POST", "/mcp") if bearer != "Bearer tok-1" => {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"mcp\"\r\n\
+                     Content-Length: 0\r\n\r\n"
+                        .to_string()
+                }
+                ("POST", "/mcp") => {
+                    let message: serde_json::Value =
+                        serde_json::from_str(&request.body).unwrap_or_default();
+                    let Some(id) = message.get("id").cloned() else {
+                        return "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n".to_string();
+                    };
+                    let result = match message["method"].as_str().unwrap_or_default() {
+                        "initialize" => serde_json::json!({
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "stub", "version": "0"},
+                        }),
+                        "tools/list" => serde_json::json!({
+                            "tools": [{
+                                "name": "echo",
+                                "description": "Echo the input",
+                                "inputSchema": {"type": "object", "properties": {}},
+                            }],
+                        }),
+                        "ping" => serde_json::json!({}),
+                        _ => {
+                            return json(
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": {"code": -32601, "message": "method not found"},
+                                })
+                                .to_string(),
+                            );
+                        }
+                    };
+                    json(
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                            .to_string(),
+                    )
+                }
+                ("GET", "/mcp") => {
+                    "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n".to_string()
+                }
+                _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string(),
+            }
+        }
+    });
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "mcp:r",
+        "config:r",
+        "config:w",
+    ]);
+    let send = |method: reqwest::Method,
+                path: &str,
+                body: serde_json::Value|
+     -> (u16, serde_json::Value) {
+        let response = harness
+            .request(method, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        (status, response.json().unwrap_or(serde_json::Value::Null))
+    };
+    let get = |path: &str| -> (u16, serde_json::Value) {
+        let response = harness
+            .request(reqwest::Method::GET, path)
+            .send()
+            .expect("send");
+        (
+            response.status().as_u16(),
+            response.json().unwrap_or(serde_json::Value::Null),
+        )
+    };
+    let wait_for = |what: &str, check: &mut dyn FnMut() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !check() {
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not happen in time; the stub saw:\n{}",
+                seen.lock().unwrap().join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp",
+        serde_json::json!({"name": "remote", "transport": "http", "url": format!("http://127.0.0.1:{port}/mcp")}),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert!(body.get("auth").is_none(), "no auth block yet: {body}");
+
+    let (status, started) = send(
+        reqwest::Method::POST,
+        "/v1/mcp/remote/login",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 202, "{started}");
+    assert_eq!(started["listening"], true, "{started}");
+    assert_eq!(started["completes_with"], "callback_url");
+    // The flow's own bound, the callback wait after the probe's: two and a half minutes.
+    let expires_at =
+        chrono::DateTime::parse_from_rfc3339(started["expires_at"].as_str().expect("expires_at"))
+            .expect("RFC 3339");
+    let now = chrono::Utc::now();
+    assert!(
+        expires_at > now + chrono::Duration::seconds(120)
+            && expires_at <= now + chrono::Duration::seconds(151),
+        "the lifetime is the flow's bound: {expires_at} against {now}"
+    );
+    let url = started["authorization_url"].as_str().expect("a URL");
+    assert!(
+        url.starts_with(&format!("http://127.0.0.1:{port}/authorize?")),
+        "the origin's endpoint is the fallback: {url}"
+    );
+    assert_eq!(query_parameter(url, "client_id"), "stub-client");
+    let redirect_uri = query_parameter(url, "redirect_uri");
+    let state = query_parameter(url, "state");
+    let login_id = started["login_id"].as_str().unwrap().to_string();
+
+    // A paste with no code in it, and one carrying another login's state, are each refused with
+    // the login kept, as an account's are.
+    let another = format!("{redirect_uri}?code=x&state=wrong");
+    for (paste, refusal) in [
+        ("nonsense", "missing 'code'"),
+        (another.as_str(), "state mismatch"),
+    ] {
+        let (status, body) = send(
+            reqwest::Method::POST,
+            &format!("/v1/mcp/remote/login/{login_id}"),
+            serde_json::json!({"code": paste}),
+        );
+        assert_eq!(status, 422, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(refusal)),
+            "{body}"
+        );
+        assert_eq!(
+            get(&format!("/v1/mcp/remote/login/{login_id}")).1["status"],
+            "pending"
+        );
+    }
+
+    // The browser, sent back to the listener the flow holds.
+    let browser = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    // A browser sent back with another login's state is refused by the listener, which keeps
+    // waiting for this login's.
+    let stale = browser
+        .get(format!("{redirect_uri}?code=x&state=wrong"))
+        .send()
+        .expect("the listener answers the stale tab");
+    assert_eq!(stale.status(), 400);
+    assert_eq!(
+        get(&format!("/v1/mcp/remote/login/{login_id}")).1["status"],
+        "pending"
+    );
+    let landed = browser
+        .get(format!("{redirect_uri}?code=cbcode&state={state}"))
+        .send()
+        .expect("the listener answers the browser");
+    assert_eq!(landed.status(), 200);
+    assert!(landed.text().unwrap().contains("Authorization successful"));
+
+    wait_for("the login completing", &mut || {
+        get(&format!("/v1/mcp/remote/login/{login_id}")).1["status"] == "completed"
+    });
+    let lines: Vec<String> = seen.lock().unwrap().clone();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("POST /token ") && line.contains("code=cbcode")),
+        "the code reached the token endpoint:\n{}",
+        lines.join("\n")
+    );
+
+    // Restarted from the entry the login wrote, and connected with the bearer it minted.
+    wait_for("the server connecting", &mut || {
+        get("/v1/mcp/remote").1["state"] == "connected"
+    });
+    let (status, detail) = get("/v1/mcp/remote");
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["auth"], "oauth", "{detail}");
+    assert_eq!(
+        detail["credentials"],
+        serde_json::json!(["OAuth tokens"]),
+        "{detail}"
+    );
+    let contents = std::fs::read_to_string(harness.install.config_dir().join("config.toml"))
+        .expect("read config.toml");
+    assert!(
+        contents.contains("[mcp.servers.auth]") && contents.contains("type = \"oauth\""),
+        "{contents}"
+    );
+    let lines: Vec<String> = seen.lock().unwrap().clone();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("POST /mcp [Bearer tok-1]")
+                && line.contains("\"initialize\"")),
+        "the server was connected with the bearer:\n{}",
+        lines.join("\n")
+    );
+    let (status, session) = send(reqwest::Method::POST, "/v1/sessions", serde_json::json!({}));
+    assert_eq!(status, 201, "{session}");
+    let session_id = session["id"].as_str().unwrap().to_string();
+    wait_for("the tools reaching a session", &mut || {
+        get(&format!("/v1/sessions/{session_id}/tools")).1["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "mcp__remote__echo"))
+    });
+}
+
+/// The rename and remove doors work on the raw document, so a stray key elsewhere in the file does
+/// not stop them at a terminal; over HTTP the catalog is rebuilt from what they leave, so such a
+/// file is refused ahead of the write, naming the line, and the file is left as it was.
+#[test]
+fn a_config_that_already_fails_to_parse_refuses_every_write_ahead_of_it() {
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "config:r", "config:w",
+    ]);
+    let send = |method: reqwest::Method,
+                path: &str,
+                body: Option<serde_json::Value>|
+     -> (u16, serde_json::Value) {
+        let mut request = harness.request(method, path);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().expect("send");
+        (
+            response.status().as_u16(),
+            response.json().unwrap_or(serde_json::Value::Null),
+        )
+    };
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/accounts",
+        Some(serde_json::json!({"name": "keyed", "backend": "anthropic-messages", "api_key": "k"})),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/profiles",
+        Some(serde_json::json!({"name": "work", "account": "keyed", "model": "m"})),
+    );
+    assert_eq!(status, 201, "{body}");
+    let path = harness.install.config_dir().join("config.toml");
+    let readable = std::fs::read_to_string(&path).expect("read config.toml");
+    std::fs::write(&path, format!("{readable}\n[display]\nbogus_key = 1\n"))
+        .expect("write config.toml");
+    let broken = std::fs::read_to_string(&path).expect("read config.toml");
+    for (method, route, body) in [
+        (
+            reqwest::Method::PATCH,
+            "/v1/accounts/keyed",
+            Some(serde_json::json!({"name": "moved"})),
+        ),
+        (reqwest::Method::DELETE, "/v1/profiles/work", None),
+        (
+            reqwest::Method::PATCH,
+            "/v1/profiles/work",
+            Some(serde_json::json!({"name": "other"})),
+        ),
+        (reqwest::Method::DELETE, "/v1/accounts/keyed", None),
+    ] {
+        let (status, body) = send(method.clone(), route, body);
+        assert_eq!(status, 422, "{method} {route}: {body}");
+        assert!(
+            body["detail"].as_str().is_some_and(|detail| {
+                detail.contains("already fails to parse") && detail.contains("bogus_key")
+            }),
+            "{method} {route}: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read config.toml"),
+            broken,
+            "{method} {route} wrote the file"
+        );
+    }
+    let (status, body) = send(reqwest::Method::GET, "/v1/accounts", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["accounts"][0]["name"], "keyed",
+        "the catalog is as it was: {body}"
+    );
+}
+
+/// A server's edit of `config.toml` and the change it makes to the running manager are one
+/// critical section, so writes to one server from several clients at once leave the manager on
+/// the entry the file states, and none is answered as a fault.
+#[test]
+fn concurrent_writes_to_one_mcp_server_leave_the_manager_on_the_file() {
+    let port = support::spawn_http_listener(|_request| {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+    });
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "mcp:r", "config:r", "config:w",
+    ]);
+    let faults = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut workers = Vec::new();
+    for worker in 0..8u64 {
+        let base_url = harness.base_url.clone();
+        let token = harness.token.clone();
+        let faults = std::sync::Arc::clone(&faults);
+        workers.push(std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("client");
+            for step in 0..40u64 {
+                let (method, path, body) = match (worker + step) % 3 {
+                    0 => (
+                        reqwest::Method::POST,
+                        "/v1/mcp",
+                        Some(serde_json::json!({"name": "storm", "transport": "http", "url": format!("http://127.0.0.1:{port}/mcp")})),
+                    ),
+                    1 => (
+                        reqwest::Method::PATCH,
+                        "/v1/mcp/storm",
+                        Some(serde_json::json!({"url": format!("http://127.0.0.1:{port}/mcp?step={step}")})),
+                    ),
+                    _ => (reqwest::Method::DELETE, "/v1/mcp/storm", None),
+                };
+                let mut request = client
+                    .request(method.clone(), format!("{base_url}{path}"))
+                    .header("Authorization", format!("Bearer {token}"));
+                if let Some(body) = &body {
+                    request = request.json(body);
+                }
+                let response = request.send().expect("send");
+                let status = response.status().as_u16();
+                if status >= 500 {
+                    faults.lock().unwrap().push(format!(
+                        "{method} {path} answered {status}: {}",
+                        response.text().unwrap_or_default()
+                    ));
+                }
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().expect("worker");
+    }
+    let faults = faults.lock().unwrap().clone();
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+    let contents = std::fs::read_to_string(harness.install.config_dir().join("config.toml"))
+        .expect("read config.toml");
+    let file: toml::Value = toml::from_str(&contents).expect("config.toml parses");
+    let in_file: Vec<(String, String)> = file
+        .get("mcp")
+        .and_then(|mcp| mcp.get("servers"))
+        .and_then(|servers| servers.as_array())
+        .map(|servers| {
+            servers
+                .iter()
+                .map(|server| {
+                    (
+                        server["name"].as_str().unwrap_or_default().to_string(),
+                        server["url"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let response = harness
+        .request(reqwest::Method::GET, "/v1/mcp")
+        .send()
+        .expect("send");
+    let listed: Vec<serde_json::Value> = response.json().expect("parse");
+    let in_manager: Vec<String> = listed
+        .iter()
+        .map(|server| server["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        in_manager,
+        in_file
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>(),
+        "the manager runs what the file states\n{contents}"
+    );
+    for (name, url) in &in_file {
+        let response = harness
+            .request(reqwest::Method::GET, &format!("/v1/mcp/{name}"))
+            .send()
+            .expect("send");
+        let detail: serde_json::Value = response.json().expect("parse");
+        assert_eq!(
+            detail["url"],
+            serde_json::Value::String(url.clone()),
+            "the manager runs the entry the file states: {detail}"
+        );
+    }
+}
+
+/// A `SIGTERM` ends every pending login: the completion request waiting on an exchange in flight
+/// is answered at once and the process exits within its grace, rather than holding the drain for
+/// as long as the exchange takes.
+#[cfg(unix)]
+#[test]
+fn a_shutdown_ends_a_pending_login_and_answers_its_completion() {
+    let port = support::spawn_http_listener(|_request| {
+        std::thread::sleep(Duration::from_secs(30));
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string()
+    });
+    let mut harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "config:r", "config:w",
+    ]);
+    let post = |path: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let response = harness
+            .request(reqwest::Method::POST, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        (response.status().as_u16(), response.json().expect("parse"))
+    };
+    let (status, body) = post(
+        "/v1/accounts",
+        serde_json::json!({"name": "claude", "backend": "claude-subscription", "client_id": "cid-test", "oauth_token_url": format!("http://127.0.0.1:{port}/token")}),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, started) = post("/v1/accounts/claude/login", serde_json::json!({}));
+    assert_eq!(status, 202, "{started}");
+    let state = query_parameter(started["authorization_url"].as_str().unwrap(), "state");
+    let login_id = started["login_id"].as_str().unwrap().to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<(u16, serde_json::Value)>();
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        let response = client
+            .post(format!("{base_url}/v1/accounts/claude/login/{login_id}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"code": format!("abc#{state}")}))
+            .send()
+            .expect("send");
+        tx.send((response.status().as_u16(), response.json().expect("parse")))
+            .ok();
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        rx.try_recv().is_err(),
+        "the completion waits on the exchange"
+    );
+
+    let signaled = Instant::now();
+    let kill_status = Command::new("kill")
+        .arg("-TERM")
+        .arg(harness.child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill_status.success(), "kill should succeed");
+    let (status, body) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the waiting completion is answered by the shutdown");
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["detail"], "the server is shutting down");
+    loop {
+        if harness.child.try_wait().expect("wait").is_some() {
+            break;
+        }
+        assert!(
+            signaled.elapsed() < Duration::from_secs(10),
+            "the process is still up {:?} after SIGTERM",
+            signaled.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A login is named by its id under the subject and the kind that began it: asked for under
+/// another account, or under an MCP server of the same name, it is not there; and the lifetime
+/// it answers with lies ahead.
+#[test]
+fn a_pending_login_answers_only_under_the_subject_and_kind_that_began_it() {
+    let port = support::spawn_http_listener(|_request| {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+    });
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "config:r", "config:w",
+    ]);
+    let send = |method: reqwest::Method,
+                path: &str,
+                body: Option<serde_json::Value>|
+     -> (u16, serde_json::Value) {
+        let mut request = harness.request(method, path);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().expect("send");
+        (
+            response.status().as_u16(),
+            response.json().unwrap_or(serde_json::Value::Null),
+        )
+    };
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/accounts",
+        Some(
+            serde_json::json!({"name": "dual", "backend": "claude-subscription", "client_id": "cid-test", "oauth_token_url": format!("http://127.0.0.1:{port}/token")}),
+        ),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/mcp",
+        Some(
+            serde_json::json!({"name": "dual", "transport": "http", "url": format!("http://127.0.0.1:{port}/mcp")}),
+        ),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, started) = send(
+        reqwest::Method::POST,
+        "/v1/accounts/dual/login",
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(status, 202, "{started}");
+    let login_id = started["login_id"].as_str().expect("an id").to_string();
+    let expires_at =
+        chrono::DateTime::parse_from_rfc3339(started["expires_at"].as_str().expect("expires_at"))
+            .expect("RFC 3339");
+    let now = chrono::Utc::now();
+    assert!(
+        expires_at > now && expires_at <= now + chrono::Duration::minutes(10),
+        "the lifetime lies ahead: {expires_at} against {now}"
+    );
+    let (status, body) = send(
+        reqwest::Method::GET,
+        &format!("/v1/accounts/dual/login/{login_id}"),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "pending");
+    for (method, path) in [
+        (
+            reqwest::Method::GET,
+            format!("/v1/mcp/dual/login/{login_id}"),
+        ),
+        (
+            reqwest::Method::GET,
+            format!("/v1/accounts/other/login/{login_id}"),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/v1/mcp/dual/login/{login_id}"),
+        ),
+    ] {
+        let body = (method == reqwest::Method::POST).then(|| serde_json::json!({"code": "x"}));
+        let (status, answer) = send(method.clone(), &path, body);
+        assert_eq!(status, 404, "{method} {path}: {answer}");
+    }
+}
+
+/// Every MCP write needs `config:w`, and the detail `config:r`.
+#[test]
+fn mcp_installation_routes_need_the_config_scopes() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "mcp:r",
+        "mcp:w",
+    ]);
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/mcp/x"),
+        (reqwest::Method::POST, "/v1/mcp"),
+        (reqwest::Method::PATCH, "/v1/mcp/x"),
+        (reqwest::Method::DELETE, "/v1/mcp/x"),
+        (reqwest::Method::POST, "/v1/mcp/x/login"),
+        (reqwest::Method::GET, "/v1/mcp/x/login/y"),
+        (reqwest::Method::POST, "/v1/mcp/x/login/y"),
+        (reqwest::Method::POST, "/v1/mcp/x/logout"),
+    ] {
+        let response = harness
+            .request(method.clone(), path)
+            .json(&serde_json::json!({"name": "x"}))
+            .send()
+            .expect("send");
+        assert_eq!(response.status(), 403, "{method} {path}");
+    }
+}
+
+/// An MCP server's elicitation on a session that declared `supports_elicitation`: the form parks
+/// as `elicitation_required` with the server's schema, an approval's answer is refused as the
+/// wrong kind, the accepted content reaches the server's answer, and the feed says the prompt
+/// closed. A session that declared nothing keeps the decline, said in a notice.
+#[test]
+fn an_mcp_elicitation_parks_on_the_feed_and_takes_the_answer() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mcp_stub_server.py"
+    );
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = state_dir.path().join("state.json");
+    std::fs::write(
+        &state_path,
+        r#"{"tools": ["search"], "elicit": {"message": "Name?", "schema": {"type": "object", "properties": {"name": {"type": "string"}}}}}"#,
+    )
+    .expect("write state");
+    let prelude = format!(
+        "[[mcp.servers]]\nname = \"stub\"\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = \
+         [{fixture:?}, {:?}]\n",
+        state_path.to_string_lossy()
+    );
+    // Two sessions share the script: the first declares the capability, the second does not.
+    let tool_round = serde_json::json!([
+        { "type": "tool_use_start", "id": "tu_1", "name": "mcp__stub__search" },
+        { "type": "tool_use_end", "input": {} },
+        { "type": "message_end", "stop_reason": "tool_use" }
+    ]);
+    let text_round = serde_json::json!([
+        { "type": "text", "text": "done" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]);
+    let script = serde_json::json!([tool_round, text_round, tool_round, text_round]);
+    let harness = ServeTestHarness::spawn_with(&prelude, "", script, "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "mcp:r",
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let servers: serde_json::Value = harness
+            .request(reqwest::Method::GET, "/v1/mcp")
+            .send()
+            .expect("list servers")
+            .json()
+            .expect("parse");
+        if servers
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|server| server["state"] == "connected")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stub never connected: {servers}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "working_directory": workspace.path().to_string_lossy(),
+            "capabilities": {"supports_elicitation": true},
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let id_for_stream = id.clone();
+    let stream_handle = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        let response = client
+            .post(format!("{base_url}/v1/sessions/{id_for_stream}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "search", "stream": true}))
+            .send()
+            .expect("stream POST");
+        let respond_client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("respond client");
+        let mut buffered = String::new();
+        let mut last_event: Option<String> = None;
+        let mut answered = false;
+        let reader = std::io::BufReader::new(response);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            buffered.push_str(&line);
+            buffered.push('\n');
+            if let Some(name) = line.strip_prefix("event: ") {
+                last_event = Some(name.trim().to_string());
+            } else if let Some(data) = line.strip_prefix("data: ")
+                && last_event.as_deref() == Some("elicitation_required")
+                && !answered
+            {
+                answered = true;
+                let payload: serde_json::Value =
+                    serde_json::from_str(data.trim()).expect("parse data");
+                assert_eq!(payload["server"], "stub", "{payload}");
+                assert_eq!(payload["kind"], "form", "{payload}");
+                assert_eq!(payload["message"], "Name?", "{payload}");
+                assert_eq!(
+                    payload["schema"]["properties"]["name"]["type"], "string",
+                    "the server's schema rides the event: {payload}"
+                );
+                assert_eq!(payload["expires_in_seconds"], 60, "{payload}");
+                let request_id = payload["request_id"].as_str().expect("id").to_string();
+                let record: serde_json::Value = respond_client
+                    .get(format!("{base_url}/v1/sessions/{id_for_stream}"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .send()
+                    .expect("get")
+                    .json()
+                    .expect("parse");
+                assert_eq!(record["approvals_pending"], 1, "{record}");
+                let url = format!("{base_url}/v1/sessions/{id_for_stream}/responses/{request_id}");
+                let wrong_kind = respond_client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .json(&serde_json::json!({"outcome": "allow"}))
+                    .send()
+                    .expect("respond send");
+                assert_eq!(wrong_kind.status(), 422);
+                let body: serde_json::Value = wrong_kind.json().expect("parse");
+                assert_eq!(
+                    body["detail"],
+                    format!(
+                        "request '{request_id}' is an elicitation; answer with accept, decline or cancel"
+                    )
+                );
+                let misplaced = respond_client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .json(&serde_json::json!({"outcome": "decline", "content": {"name": "x"}}))
+                    .send()
+                    .expect("respond send");
+                assert_eq!(misplaced.status(), 422);
+                let accepted = respond_client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .json(&serde_json::json!({"outcome": "accept", "content": {"name": "Ada"}}))
+                    .send()
+                    .expect("respond send");
+                assert_eq!(accepted.status(), 204);
+                let again = respond_client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .json(&serde_json::json!({"outcome": "decline"}))
+                    .send()
+                    .expect("respond send");
+                assert_eq!(again.status(), 404, "an answered prompt is gone");
+            }
+        }
+        (buffered, answered)
+    });
+    let (stream, answered) = stream_handle.join().expect("stream thread");
+    assert!(answered, "no elicitation_required arrived:\n{stream}");
+    let resolved = sse_event_data(&stream, "elicitation_resolved").expect("elicitation_resolved");
+    assert_eq!(resolved["outcome"], "accept", "{resolved}");
+    assert!(
+        sse_event_data(&stream, "turn.finished").is_some(),
+        "the turn ended:\n{stream}"
+    );
+    let messages: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("messages")
+        .json()
+        .expect("parse");
+    let transcript = messages.to_string();
+    assert!(
+        transcript.contains("Ada"),
+        "the accepted content reached the server's answer: {transcript}"
+    );
+
+    // Without the capability, the elicitation is declined and the transcript says so.
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": workspace.path().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let plain = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let turn: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{plain}/turn"))
+        .json(&serde_json::json!({"message": "search", "stream": false}))
+        .send()
+        .expect("turn")
+        .json()
+        .expect("parse");
+    let text = turn.to_string();
+    assert!(
+        text.contains("did not declare supports_elicitation"),
+        "the decline is said in the transcript: {text}"
+    );
+    assert!(text.contains("decline"), "{text}");
+}
+
+/// The standing instructions written over HTTP land in `instructions.md`, and the sessions that
+/// open afterwards run under them: the system prompt a later session measures is larger by the
+/// text written. A blank write removes the file. Where another source is in charge, the write is
+/// refused as the shadowed write it would be.
+#[test]
+fn instructions_are_written_over_http_and_reach_the_next_session() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "config:r",
+        "config:w",
+    ]);
+    let get = || -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, "/v1/instructions")
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    let overhead_of_a_fresh_session = || -> u64 {
+        let id = create_session_id(&harness);
+        let turn = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+            .json(&serde_json::json!({"message": "hi", "stream": false}))
+            .send()
+            .expect("turn");
+        assert_eq!(turn.status(), 200);
+        let context: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
+            .send()
+            .expect("context")
+            .json()
+            .expect("parse");
+        context["overhead"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("overhead measured: {context}"))
+    };
+
+    let before = get();
+    assert!(before.get("content").is_none(), "{before}");
+    assert_eq!(before["writable"], true, "{before}");
+    assert!(
+        before["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("instructions.md"),
+        "{before}"
+    );
+    let bare = overhead_of_a_fresh_session();
+
+    let text = "Always answer in haiku, and never in prose.\n".repeat(200);
+    let text = text.trim().to_string();
+    let response = harness
+        .request(reqwest::Method::PUT, "/v1/instructions")
+        .json(&serde_json::json!({"content": text}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let written: serde_json::Value = response.json().expect("parse");
+    assert_eq!(written["content"], text, "{written}");
+    assert!(
+        written["source"]
+            .as_str()
+            .unwrap()
+            .ends_with("instructions.md"),
+        "{written}"
+    );
+    assert_eq!(get()["content"], text);
+    let on_disk = std::fs::read_to_string(harness.install.config_dir().join("instructions.md"))
+        .expect("the file written");
+    assert_eq!(on_disk, text);
+    let instructed = overhead_of_a_fresh_session();
+    assert!(
+        instructed > bare + 1_000,
+        "a session opened after the write runs under it: {bare} tokens before, {instructed} after"
+    );
+
+    let response = harness
+        .request(reqwest::Method::PUT, "/v1/instructions")
+        .json(&serde_json::json!({"content": "  "}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let cleared: serde_json::Value = response.json().expect("parse");
+    assert!(cleared.get("content").is_none(), "{cleared}");
+    assert!(
+        !harness
+            .install
+            .config_dir()
+            .join("instructions.md")
+            .exists()
+    );
+
+    // A server that takes its instructions from the environment cannot be written to.
+    let shadowed = ServeTestHarness::spawn_with_env(
+        "",
+        "",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "config:w"],
+        |_| vec![("MEKA_INSTRUCTIONS".to_string(), "be brief".to_string())],
+    );
+    let body: serde_json::Value = shadowed
+        .request(reqwest::Method::GET, "/v1/instructions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(body["content"], "be brief", "{body}");
+    assert_eq!(body["writable"], false, "{body}");
+    assert!(body.get("path").is_none(), "{body}");
+    let response = shadowed
+        .request(reqwest::Method::PUT, "/v1/instructions")
+        .json(&serde_json::json!({"content": "be verbose"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 409);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.run/errors/store-read-only");
+    assert_eq!(
+        body["detail"],
+        "the standing instructions come from `MEKA_INSTRUCTIONS`, which `instructions.md` does \
+         not change"
+    );
+}
+
+/// `/v1/info` says where the installation is and whether its file has moved on since this process
+/// read it, which is what a client that administers it needs to know.
+#[test]
+fn info_reports_where_the_installation_is() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "config:w",
+    ]);
+    let info: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        info["config_path"].as_str().map(std::path::Path::new),
+        Some(harness.install.config_dir().join("config.toml").as_path()),
+        "{info}"
+    );
+    assert!(info["data_dir"].as_str().is_some(), "{info}");
+    let loaded = chrono::DateTime::parse_from_rfc3339(info["config_loaded_at"].as_str().unwrap())
+        .expect("RFC 3339");
+    let modified_before =
+        chrono::DateTime::parse_from_rfc3339(info["config_modified_at"].as_str().unwrap())
+            .expect("RFC 3339");
+    assert!(
+        modified_before <= loaded + chrono::Duration::seconds(1),
+        "{info}"
+    );
+
+    // A write this process makes moves the file past its own reading of it.
+    std::thread::sleep(Duration::from_millis(1_100));
+    let response = harness
+        .request(reqwest::Method::POST, "/v1/profiles")
+        .json(&serde_json::json!({"name": "side", "account": "mock", "model": "m"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 201);
+    let info: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let modified_after =
+        chrono::DateTime::parse_from_rfc3339(info["config_modified_at"].as_str().unwrap())
+            .expect("RFC 3339");
+    assert!(modified_after > loaded, "{info}");
 }

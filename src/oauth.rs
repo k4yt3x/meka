@@ -824,6 +824,50 @@ impl SubscriptionCredential {
     }
 }
 
+/// What a pasted line is taken as, when a browser login takes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Paste {
+    /// The URL the browser was sent to, for a browser that could not reach the listener.
+    CallbackUrl,
+    /// The code the authorization page shows, where no browser is sent back at all.
+    AuthorizationCode,
+}
+
+/// What completes a browser login once its URL is out: a loopback listener awaited for some
+/// seconds, a pasted line, or both raced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Completion {
+    /// How long the listener is held for the browser to be sent back, when one is held.
+    pub(crate) listener_seconds: Option<u64>,
+    /// What a pasted line is read as, when one is read.
+    pub(crate) paste: Option<Paste>,
+}
+
+/// How a browser login reaches the person who has to complete it: an account's, which `meka
+/// account add` and `login` run, and an MCP server's, which `meka mcp login` runs.
+///
+/// Three sides exist. The terminal prints the URL and reads a line from stdin; the screen puts
+/// both in one question; a request on the HTTP API carries the URL out and a paste back in. A
+/// host that has none installed refuses a server whose stored credential is missing with the
+/// command as the remedy, rather than printing a URL to a terminal nobody is watching.
+#[async_trait::async_trait]
+pub(crate) trait LoginPrompt: Send + Sync {
+    /// Show `url` to the person who has to authorize, who opens it where they choose.
+    fn authorize_at(&self, url: &str);
+    /// Say what completes the login now that the URL is out.
+    fn awaiting(&self, completion: Completion);
+    /// Whether a pasted line can be read beside a listener: a terminal on stdin, for a browser
+    /// that cannot reach the listener because meka runs on another host. A login with no
+    /// listener reads one regardless, since nothing else can complete it.
+    fn accepts_paste(&self) -> bool;
+    /// One pasted line. `Ok(None)` means nothing will ever be pasted (stdin closed), which leaves
+    /// a listener waiting alone.
+    async fn read_pasted_line(&self) -> std::result::Result<Option<String>, String>;
+    /// A pasted line that did not carry what the login needs, with why, so the person can paste
+    /// again.
+    fn paste_refused(&self, reason: &str);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

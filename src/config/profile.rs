@@ -431,6 +431,86 @@ pub(crate) fn require_model<'a>(
         ))),
     }
 }
+/// `config.toml`'s `[accounts.*]` and `[profiles.*]` as a process knows them, and the default
+/// they pick: what a run resolves at startup and every session on a host resolves against.
+///
+/// A snapshot, replaced whole and only by a write this process made through its own doors, after
+/// the document it wrote parsed. Never re-read per request: `config.toml` is hand-edited and has
+/// no change feed, so a half-written file could take a running server's sessions down, and which
+/// account a turn bills would depend on when the turn happened to run. A `meka profile add` in
+/// another process is therefore invisible to a running `meka serve` until restart, and
+/// `POST /v1/sessions` answers "not configured" about a profile `meka profile list` shows;
+/// documented for users at `docs/book/src/configuration/overview.md` § "When edits take effect".
+/// The credential behind an account is *not* snapshotted (see `CachedProvider` in the provider
+/// registry), because that one has a writer meka owns.
+#[derive(Debug, Clone)]
+pub(crate) struct ProfileCatalog {
+    pub(crate) accounts: std::collections::BTreeMap<String, AccountConfig>,
+    pub(crate) profiles: std::collections::BTreeMap<String, ProfileConfig>,
+    /// The profile a session that names none runs on, or the configuration's own explanation of
+    /// why there is none, as [`select_default`] decides it.
+    pub(crate) default_profile: std::result::Result<String, String>,
+}
+
+impl ProfileCatalog {
+    /// The catalog of a parsed `config.toml`: `requested` is `--profile`, else the file's
+    /// `default_profile` decides.
+    pub(crate) fn from_file(config_file: &ConfigFile, requested: Option<&str>) -> Self {
+        Self::select(
+            config_file.accounts.clone(),
+            config_file.profiles.clone(),
+            requested,
+            config_file.default_profile.as_deref(),
+        )
+    }
+
+    /// The catalog over `accounts` and `profiles`, the default selected as a run selects it:
+    /// `requested` is `--profile`, else `configured_default` is the file's `default_profile`.
+    pub(crate) fn select(
+        accounts: std::collections::BTreeMap<String, AccountConfig>,
+        profiles: std::collections::BTreeMap<String, ProfileConfig>,
+        requested: Option<&str>,
+        configured_default: Option<&str>,
+    ) -> Self {
+        let (requested, source) = match requested {
+            Some(name) => (Some(name.to_string()), ProfileRequest::Flag),
+            None => (
+                configured_default.map(str::to_string),
+                ProfileRequest::DefaultProfile,
+            ),
+        };
+        let default_profile = select_default(requested, source, &accounts, &profiles);
+        Self {
+            accounts,
+            profiles,
+            default_profile,
+        }
+    }
+}
+
+/// The profile a session that names none runs on, or why there is none: [`select_profile`]'s
+/// pick, followed through its account the way a run follows it, so a default on a missing account
+/// or an unknown backend is reported here rather than at the first session. The one definition,
+/// behind [`ProfileCatalog`]: a run at startup and a host after a write select the same way.
+fn select_default(
+    requested: Option<String>,
+    source: ProfileRequest,
+    accounts: &std::collections::BTreeMap<String, AccountConfig>,
+    profiles: &std::collections::BTreeMap<String, ProfileConfig>,
+) -> std::result::Result<String, String> {
+    let (selected, error) = select_profile(requested, source, profiles);
+    let Some(name) = selected else {
+        return Err(
+            error.unwrap_or_else(|| "no profile is configured; run `meka profile add`".to_string())
+        );
+    };
+    let profile = require_profile(&name, profiles).map_err(|error| error.to_string())?;
+    let account = account_for(&name, profile, accounts)?;
+    // Resolved with no device id: this asks whether the account's backend parses, which is the
+    // one refusal `resolve_profile` makes, and a device id is a provider's business.
+    resolve_profile(profile, account, None, None, String::new())?;
+    Ok(name)
+}
 /// Which tier asked for the profile [`select_profile`] could not find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileRequest {

@@ -28,6 +28,8 @@ If the set grows, split it into a directory instead. Every `*.md` file is concat
 
 The directory wins when it has content, so splitting a grown `instructions.md` is a rename rather than a migration. An empty `instructions/` falls back to the file rather than blanking your instructions. Under a custom [`MEKA_CONFIG_DIR`](../configuration/environment-variables.md), both paths follow it.
 
+A running `meka serve` writes `instructions.md` on request too, with `PUT /v1/instructions` under the `config:w` scope, and the sessions that open afterwards run under it; see [Managing the installation](http-api.md#managing-the-installation).
+
 Check what is actually in effect at any time:
 
 ```bash

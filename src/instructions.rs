@@ -89,6 +89,17 @@ impl Instructions {
     }
 }
 
+/// The split form, when it is in charge: `<config>/instructions/` with markdown in it. An empty
+/// directory stands aside for the file, so this is the one answer to whether a write to the file
+/// would reach a session.
+pub(crate) fn discover_directory() -> Option<Instructions> {
+    let dir = instructions_dir()?;
+    if !dir.is_dir() {
+        return None;
+    }
+    read_dir(&dir, FileFilter::MarkdownOnly)
+}
+
 /// Read the conventional location. `<config>/instructions/` takes precedence over
 /// `<config>/instructions.md`, so splitting a grown file is a rename rather than a migration.
 ///
@@ -96,10 +107,7 @@ impl Instructions {
 /// skipped, so a single bad file never hides the rest of a directory. Returns `None` for a set that
 /// is entirely whitespace, matching the treatment of an empty `--instructions`.
 pub(crate) fn discover() -> Option<Instructions> {
-    if let Some(dir) = instructions_dir()
-        && dir.is_dir()
-        && let Some(found) = read_dir(&dir, FileFilter::MarkdownOnly)
-    {
+    if let Some(found) = discover_directory() {
         return Some(found);
     }
     let file = instructions_file()?;

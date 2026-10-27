@@ -992,6 +992,9 @@ pub(crate) struct ElicitationPrompt {
     pub(crate) server_name: String,
     pub(crate) kind: ElicitationKind,
     pub(crate) message: String,
+    /// When the prompt is declined for the person unanswered: the MCP client's own bound, so a
+    /// frontend that waits or counts down does so to the instant the client holds it to.
+    pub(crate) deadline: tokio::time::Instant,
 }
 #[derive(Debug)]
 pub(crate) enum ElicitationKind {
@@ -1007,6 +1010,18 @@ pub(crate) enum ElicitationResponse {
     Accept { content: Option<serde_json::Value> },
     Decline,
     Cancel,
+}
+
+impl ElicitationResponse {
+    /// The answer's wire word, as `POST /responses/{request_id}` takes it and
+    /// `elicitation_resolved` reports it.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Self::Accept { .. } => "accept",
+            Self::Decline => "decline",
+            Self::Cancel => "cancel",
+        }
+    }
 }
 
 /// Single progress update forwarded to the frontend.
@@ -1139,6 +1154,7 @@ mod tests {
             .handle_elicitation(ElicitationPrompt {
                 server_name: "notion".to_string(),
                 message: "authorize?".to_string(),
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
                 kind: ElicitationKind::Url {
                     url: "https://example.com/".to_string(),
                 },

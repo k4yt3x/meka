@@ -28,6 +28,8 @@ scopes = ["sessions:r", "sessions:w"]
 
 On startup the server logs the bind address and begins accepting requests. All endpoints (except health probes and OpenAPI docs) require a valid `Authorization: Bearer <token>` header.
 
+The server starts whether or not a profile is configured, unlike every other way of running meka, so an installation managed over the API can come up before its first account and profile exist and have them added through [`POST /v1/accounts` and `POST /v1/profiles`](#managing-the-installation). Until a session can get a profile, `GET /v1/health/ready` answers `503` with `profile_configured: false`, and a `POST /v1/sessions` that names no profile is a `422` carrying the configuration's own sentence: no profile configured, or several and no `default_profile`. A body that names a configured `profile` is served either way.
+
 Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's session, and the server creates one per `POST /v1/sessions`, each naming its own profile. Address an existing session by id under `/v1/sessions/{id}`, and pass `profile` on the create request. `--profile` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the server rather than of one session.
 
 > **TLS**: `meka serve` speaks plain HTTP. For production, front it with a TLS-terminating reverse proxy (nginx, Caddy, Cloudflare Tunnel).
@@ -293,6 +295,7 @@ Sessions persist server-side until explicitly deleted or evicted by the idle tim
 | `supports_reasoning_stream` | `false` | Include `thinking.delta` events in the SSE stream |
 | `supports_permission_prompts` | `true` | The client can answer a mid-turn `permission_required` event |
 | `answers_prompts_on_return` | `false` | A prompt in a turn no request holds waits for this session's client to come back and answer it |
+| `supports_elicitation` | `false` | An MCP server's elicitation parks as an `elicitation_required` event for the client to answer; see [Elicitations](#elicitations) |
 
 Enabling `supports_reasoning_stream` costs a *streaming* turn its retry on a transient provider failure: the deltas have already reached you and a second attempt would repeat them, and reasoning is the first thing a turn produces. Blocking turns on the same session are unaffected, since they carry whole blocks rather than deltas.
 
@@ -763,6 +766,8 @@ Three limits. The event exists only when meka streams from its provider, so a se
 | `notice` | `level`, `text` | Provider advisories or warnings |
 | `permission_required` | `request_id`, `tool_name`, `input`, `expires_in_seconds`, `expires_at`, `subagent_id` when a sub-agent asked | Permission approval needed (approvals on, call above the level) |
 | `permission_resolved` | `request_id`, `outcome` (`allow`, `deny`, `allow_always`, `deny_always`, `expired` or `canceled`) | The parked prompt closed, however it closed |
+| `elicitation_required` | `request_id`, `server`, `kind` (`form` or `url`), `message`, `schema` on a form, `url` on a URL, `expires_in_seconds`, `expires_at` | An MCP server asked the person something, on a session with `supports_elicitation` |
+| `elicitation_resolved` | `request_id`, `outcome` (`accept`, `decline`, `cancel`, `expired` or `canceled`) | The parked elicitation closed, however it closed |
 
 #### Context
 
@@ -877,7 +882,7 @@ falls behind.
 | `session.updated` | the session record | A `PATCH` changed it, or a sub-agent's run on it began or ended |
 | `session.deleted` | `id`, `session_id` | A `DELETE`, or the idle sweep with `delete_on_idle` |
 | `turn.started`, `turn.finished`, `turn.failed`, `turn.canceled` | as on the session feed | Every turn on every session this process holds, deltas left out; a sub-agent's run reaches this feed as the `session.updated` on its record |
-| `permission_required`, `permission_resolved` | as on the session feed | A prompt was parked or closed, which moves `approvals_pending` |
+| `permission_required`, `permission_resolved`, `elicitation_required`, `elicitation_resolved` | as on the session feed | A prompt was parked or closed, which moves `approvals_pending` |
 
 A `session.updated` carries the whole record so a client replaces its row rather than patching
 it. The same `session.updated` goes to the session's own feed, so a client on one session also
@@ -989,9 +994,20 @@ However a prompt closes, answered by you or another client, expired, or canceled
 
 A request with `stream: false` never sees a `permission_required` event, so it is not an answerer. With approvals on, no feed reader attending, and no `answers_prompts_on_return` on the session, every call that would need approval is **refused without asking**; each refused tool appends a `notice` saying so and pointing at `attend=true` and the capability.
 
-**MCP elicitations** (interactive form prompts from MCP servers) are always auto-declined over HTTP; there is no channel for interactive input. A `notice` event is emitted when this happens.
-
 **Recommendation:** non-interactive callers (bots, bridges, scripts) should leave approvals off and create sessions at the level they need, so nothing is refused without asking. Use `stream: true`, or attend the feed, with approvals on if you need approval flow; declare `answers_prompts_on_return` on a session a person returns to.
+
+### Elicitations
+
+An MCP server may ask the person something mid-call: a **form**, a JSON Schema of fields to fill, or a **URL** to open and come back from. On a session that declared [`supports_elicitation`](#capabilities), the question parks as an `elicitation_required` event under the attendance rule approvals follow: someone attending, a streaming request or an `attend=true` reader, or `answers_prompts_on_return`. The event carries the server, the `kind`, the `message`, the `schema` or the `url`, and `expires_in_seconds` with `expires_at`: a minute, the MCP client's own bound, after which the server is told the person declined. The client answers at the same responses route a prompt takes:
+
+```
+POST /v1/sessions/{id}/responses/{request_id}
+Content-Type: application/json
+
+{"outcome": "accept", "content": {"name": "Ada"}}
+```
+
+`accept` carries `content`, an object of the fields the schema named (none for a URL the person opened); `decline` says the person would not; `cancel` says they dismissed it. An approval's answer to an elicitation, or an elicitation's to an approval, is a `422` naming the kind the request is, and `content` on anything but `accept` is one too. The feed says how the prompt closed with `elicitation_resolved`, `expired` when the minute ran out and `canceled` when the turn ended or nobody was left to answer, and the session record counts a parked elicitation in `approvals_pending` with the approvals. A session that did not declare the capability keeps the earlier behavior: the elicitation is declined without asking, and a `notice` says so.
 
 ## Authentication
 
@@ -1013,6 +1029,8 @@ Each token carries a set of scopes that control what it can access:
 | `schedule:w` | Create and cancel scheduled jobs. **A job's `prompt` runs a full turn with tools**, so this is deferred turn execution, not just bookkeeping. A job's optional `gate` runs a shell command or a read-only tool call and additionally requires `sessions:w` (see below) |
 | `mcp:r` | Read MCP server status and advertised tools |
 | `mcp:w` | Reconnect an MCP server |
+| `config:r` | Read the installation: accounts (never a credential), each profile's settings, each MCP server's entry (keys only for `env` and `headers`) |
+| `config:w` | Write the installation: add, rename and remove accounts, store their keys, add, change and remove profiles, set the default, add, change, remove and log in MCP servers. **This is the operator's own grant, and it is shell on the host**: an MCP server added with a `command` runs that command as the user `meka serve` runs as, so give it to the client that administers the installation and to nothing else |
 
 Discovery endpoints (`/v1/info`, `/v1/skills`, `/v1/mcp`, `/v1/profiles`, `/v1/projects`) accept any token with at least one read scope. Two deliberately do not: `GET /v1/skills/{name}` needs `skills:r` and `GET /v1/instructions` needs `sessions:r`, because both return instruction *text* rather than a listing.
 
@@ -1094,10 +1112,11 @@ Idempotency keys are **ignored for a held stream**; such a client reconnects thr
 | `POST /turn` (detached, with a key) | yes | the same `202` and turn record; the turn ran once |
 | `POST /v1/sessions/{id}/inbox` (with a key) | yes | the earlier item is answered, `replayed: true`; the key is on the row, so this holds across a restart |
 | `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/sessions/{id}/tasks/{task_id}`, `DELETE /v1/sessions/{id}/inbox/{item_id}` | yes | already-done is the same state; a withdrawn item answers **404** on the retry |
-| `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/projects/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure; treat it as success if you are retrying blind |
-| `PUT /v1/skills/{name}`, `PUT /v1/memory/{name}` | yes | same body writes the same skill file or memory row |
-| `POST /v1/projects` | yes, but | the project exists, so the retry answers **422** naming it; nothing is added twice |
-| `PATCH /v1/projects/{name}` | yes, but | the old name is gone, so the retry answers **404**; the project is under the new name |
+| `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/projects/{name}`, `/v1/accounts/{name}`, `/v1/profiles/{name}`, `/v1/mcp/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure; treat it as success if you are retrying blind |
+| `PUT /v1/skills/{name}`, `PUT /v1/memory/{name}`, `PUT /v1/instructions`, `PATCH /v1/profiles/{name}` (settings), `PATCH /v1/mcp/{name}`, `POST /v1/accounts/{name}/login` (`api_key`), `POST /v1/mcp/{name}/login` (a secret), `POST /v1/mcp/{name}/logout` | yes | same body writes the same skill file, memory row, instructions, keys or credential; a repeated MCP patch restarts the server again |
+| `POST /v1/accounts/{name}/login` (browser), `POST /v1/mcp/{name}/login` (browser), and their completions | yes, but | a second start replaces the first login, whose id then answers **404**; a completion answers again once completed, and **422** once failed |
+| `POST /v1/projects`, `POST /v1/accounts`, `POST /v1/profiles`, `POST /v1/mcp` | yes, but | the resource exists, so the retry answers **422** naming it; nothing is added twice |
+| `PATCH /v1/projects/{name}`, `PATCH /v1/accounts/{name}`, `PATCH /v1/profiles/{name}` (a `name`) | yes, but | the old name is gone, so the retry answers **404**; the resource is under the new name |
 | `POST /compact` | mostly | a second compaction summarizes the summary; fidelity drops, nothing is lost. It takes no `If-Match`, since it addresses no position in the history and a stale view costs a retry nothing it cannot undo |
 | `POST /rewind` | with `If-Match` | drops another turn without it. Under the `ETag` the first attempt was decided on, a retry after the first went through is refused with `412` |
 | `POST /sessions/import` | **no** | creates a second copy of the tree under new ids |
@@ -1141,7 +1160,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/auth-scope` | 403 | Token lacks the required scope |
 | `/errors/session-permission` | 403 | The token is fine; the *session* sits too low. Raise it with `PATCH /v1/sessions/{id}`; a better token will not help |
 | `/errors/session-not-found` | 404 | Unknown session id |
-| `/errors/not-found` | 404 | Unknown skill, memory, project, MCP server, background task, scheduled job, image blob, inbox item, or turn; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
+| `/errors/not-found` | 404 | Unknown skill, memory, project, account, profile, pending login, MCP server, background task, scheduled job, image blob, inbox item, or turn; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
 | `/errors/session-not-loaded` | 409 | The session exists but is not in memory; submit a turn to load it. Do **not** retry `POST /cancel`: there is no turn to cancel |
 | `/errors/session-locked` | 409 | Another meka process holds the session's lock (e.g. two `meka serve` instances sharing one store); wait or restart the other process |
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
@@ -1149,6 +1168,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/turn-mismatch` | 409 | `POST /cancel` named a turn that is not the one in flight; the `turn_id` member names the one that is. Nothing was canceled |
 | `/errors/inbox-appended` | 409 | The inbox item is already in the conversation, so only a turn can answer it now; nothing to withdraw |
 | `/errors/store-read-only` | 409 | The skill lives under a `[skills] additional_directories` directory; meka reads those but never writes to them, so writing here would shadow the file rather than change it |
+| `/errors/account-in-use` | 409 | A session resident on this server runs on the account named for a rename, and the account's credential refreshes under its name; delete the sessions or wait for them to be evicted |
 | `/errors/subagent-not-running` | 409 | The id names a sub-agent this process is not running, so there is no feed to read; its feed exists while its parent runs it, and `last_turn` on its record says how its last run ended |
 | `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation, which only its parent drives. Reading it is unaffected; the message names the parent and what to do there: `agent_followup` for a turn or a fork, `POST /v1/sessions/{parent}/responses/{request_id}` for an approval, the parent itself for a scheduled job, and the parent's feed for a sub-agent's `attend`. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
@@ -1214,11 +1234,27 @@ These endpoints help clients inspect the server's capabilities at runtime.
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
 | `GET /v1/health/ready` | None | Readiness probe: 200 if the store is healthy, at least one profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `profile_configured`, and `mcp_servers_healthy` (boolean, no server names). **`profile_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
 | `GET /v1/projects` | Any read scope | Projects, as `{"projects": [...]}`: every project, each with `name`, `created_at` (RFC 3339), `memories` (in its tier) and `sessions` (root sessions on it). `POST /v1/projects` adds one, `PATCH /v1/projects/{name}` renames one and `DELETE /v1/projects/{name}` removes one, under `memory:w`; see [Projects](projects.md#defining-a-project) |
-| `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `fallbacks`, the profiles a turn moves to when this one cannot serve it (omitted when it names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
-| `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `active` |
+| `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `fallbacks`, the profiles a turn moves to when this one cannot serve it (omitted when it names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `active: true` on the one a session gets when it names none. `POST`, `PATCH` and `DELETE` on `/v1/profiles` manage them under `config:w`; see [Managing the installation](#managing-the-installation) |
+| `GET /v1/info` | Any read scope | Server version and permission surface, `scopes`, the ones the calling token holds, so a client can show only the controls it may use, and where the installation is: `config_path`, `data_dir`, `config_loaded_at` and `config_modified_at` (see [Managing the installation](#managing-the-installation)). Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status, with the protocol version a connected one speaks |
 | `GET /v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI 3 spec |
+
+## Managing the installation
+
+What `meka account` and `meka profile` do in a shell, `/v1/accounts` and `/v1/profiles` do over HTTP, under `config:r` and `config:w`, so a client that administers an installation (a desktop app wrapping `meka serve`, a web UI on a server nobody logs in to) can take it from an empty `config.toml` to a running profile without a shell. Every write goes through the same editor the CLI uses: `config.toml` keeps its comments and its order, the same refusals apply in the same words, and a credential goes to the database and never to the file.
+
+An **account** is added with `POST /v1/accounts`, `{"name", "backend"}` and whatever of `base_url`, `oauth_token_url`, `client_id` and `interleaved_thinking` the backend reads; a setting the backend never reads is a `422` rather than written and ignored. An API-key backend takes its key as `api_key` in the same body, and the key is required there; a subscription backend takes none, is added unauthenticated, and is logged in afterwards. `POST /v1/accounts/{name}/login` with `{"api_key"}` rotates the key of an API-key account. On a subscription account it takes no body and begins the browser login `meka account login` runs at a terminal, answering `202` with `authorization_url`, the page the person opens, and a `login_id`; what the page gives is posted as `code` to `POST /v1/accounts/{name}/login/{login_id}`, which exchanges it, stores the credential and answers the account. `completes_with` says what that is: `code` on `claude-subscription`, where Anthropic's page shows a code to copy, and `callback_url` on `chatgpt-subscription`, where the browser is sent to `http://localhost:1455/auth/callback`. For the latter the server holds that loopback listener itself while the login is pending, when the port is free (`listening: true`), so a browser on the server's own machine completes the login with nothing posted; a client whose browser is elsewhere posts the URL the browser landed on. `GET /v1/accounts/{name}/login/{login_id}` says whether the login is `pending`, `completed` or `failed` and why. A login lapses after ten minutes, a wrong paste leaves it pending, an exchange the authorization server refuses ends it (the code is spent, so begin another), and beginning a login on an account that has one pending replaces it. `PATCH /v1/accounts/{name}` with `{"name"}` renames the account, moving its credential and every profile on it, and is the only change an account takes: its other settings are what a login was made against, so another endpoint or backend is another account. A subscription account is not renamed while a session resident on the server runs on it (`409` `account-in-use`): the session keeps the provider it was built with, and that provider refreshes the credential under the old name. `DELETE /v1/accounts/{name}` removes the account and the credential stored under its name, or a credential alone when no account claims it, and is a `422` while a profile names the account. `GET /v1/accounts` lists them with `authenticated` (`yes`, `no` or `unreadable`) and, when there are any, `orphaned_credentials`, the names a credential is stored under that no account claims.
+
+A **profile** is added with `POST /v1/profiles`, `{"name", "account", "model"}` and any of the [profile fields](../configuration/config-file.md#profile-fields); a field left out is left out of the profile, so its documented default applies, and `"default": true` makes it `default_profile`. The first profile needs no `default`: a sole profile is the default by the selection rule, and `active` says so. `GET /v1/profiles/{name}` answers every setting the profile states. `PATCH /v1/profiles/{name}` changes settings in one write: a key left out keeps its value, `null` removes the key (an empty string does the same on a string key), a value sets it, and `"default": true` makes the profile the default in the same write; `"default": false` is refused, since the default is unset by removing the profile or choosing another. A `{"name"}` on the `PATCH` renames the profile, moving every session recorded on it (one being created or repointed in that same instant may keep the old name, which `PATCH /v1/sessions/{id}` corrects), and is sent on its own. `DELETE /v1/profiles/{name}` removes it; sessions recorded on the name keep it and refuse to resume until it is configured again or they are moved, and a profile another's `fallbacks` names is a `422` until that list drops it. A setting the profile's backend never sends, a `model` that is blank, a fallback chain the profile could not run on, and an account that is not configured are each a `422` carrying the sentence `meka profile` would print. A `config.toml` that already fails to parse, a key added by hand while the server runs, refuses every account and profile write with a `422` naming the line until the file is repaired, since the running catalog is rebuilt from the file after each; the MCP routes work on the raw document, as `meka mcp` does, and go through.
+
+An **MCP server** is added with `POST /v1/mcp`, whose body is the `[[mcp.servers]]` entry as [the reference](../configuration/config-file.md#mcpservers) documents it, `name` and `transport` included, with `auth_token` or `client_secret` beside it for a secret the entry presents, which goes to the store; a key that does not fit the transport, a name in use or reserved, and a secret the entry cannot present are each a `422`. The server joins the running manager at once and connects in the background: the answer's `state` is `pending`, `GET /v1/mcp` says when it is `connected`, and its tools reach every session as they are listed. `GET /v1/mcp/{name}` answers the entry as `meka mcp get` prints it (keys only for `env` and `headers`, the kinds of credential stored, where a stored grant was minted against) and the connection state. `PATCH /v1/mcp/{name}` changes keys in place, each left out to keep, `null` to remove, a value to set, `auth_token` and `client_secret` included, and puts the changed server in place of the running one, which reconnects it; `{"disabled": true}` stops it and `{"disabled": false}` starts it, and either way the file keeps its comments. `name` and `transport` are not changed: another transport is another server. `DELETE /v1/mcp/{name}` removes the entry, closes the connection or ends a connect still in flight, drops the server's tools from every session and clears its credentials, revoking an OAuth grant at the provider first where it can. `POST /v1/mcp/{name}/login` with `{"auth_token"}` or `{"client_secret"}` stores the secret as `meka mcp login --auth-token-stdin` and `--client-secret-stdin` do, and with no body begins the OAuth login `meka mcp login` runs at a terminal, answered as an account's browser login is: `202` with the URL and a `login_id`, the loopback listener held by the server, a browser elsewhere answered by posting its callback URL to `POST /v1/mcp/{name}/login/{login_id}`, and `GET /v1/mcp/{name}/login/{login_id}` for where it stands; a paste with no code in it, or carrying another login's state, is a `422` that leaves the login pending, as an account's is; once the credential is stored the server is restarted from its entry as the file then states it, so an `auth` block the login wrote is in force; the restart connects in the background, so the completion's answer carries `state: pending` until it has. An MCP login lapses after two and a half minutes, the flow's own bound rather than an account's ten; `expires_at` says when. A login an endpoint cannot begin, one with nothing to discover, is a `502` with the reason in the meka log, and one on a `disabled` entry is a `422`. `POST /v1/mcp/{name}/logout` clears every credential stored for the server; a connection already open stays until the server is reconnected.
+
+The **standing instructions** are written with `PUT /v1/instructions`, `{"content": "..."}`, which lands in `instructions.md` in the config directory; a blank `content` removes the file. `GET /v1/instructions` says whether that file is what this server reads, `writable`, and names it in `path` when it is; when `--instructions`, `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE` or an `instructions/` directory with files in it stands above it, a write would change nothing a session sees and is refused with `409` naming the source. The sessions that open after the write run under it; one already open keeps what it opened under.
+
+`GET /v1/info` names `config_path` and `data_dir`, for a client that has to find the installation, and carries `config_loaded_at`, when this process read `config.toml` whole, beside `config_modified_at`, when the file was last written. A modification later than the load is an edit this process has not read whole: a write of its own, which it serves as described below, or a shell's, which waits for a restart.
+
+A write **applies at once**: the accounts and profiles every session on the server resolves against are replaced with what the file now holds, so the profile a client adds is the one its next `POST /v1/sessions` runs on, and the key it rotates is the one the next session presents. A session already resident keeps the provider it was built with until it is evicted or repinned, as it does across `meka account login` from a shell. An MCP server added, changed or removed is added to, restarted on or taken out of the running manager, so its tools come and go from every session without a restart. The reverse does not hold: an edit made by `meka profile add`, `meka mcp add` or by hand while the server runs is not seen until it restarts, as [When edits take effect](../configuration/overview.md#when-edits-take-effect) says.
 
 ## Session lifecycle
 
@@ -1467,7 +1503,7 @@ Key points:
 | POST | `/v1/sessions/{id}/inbox` | `sessions:w` | Enqueue a message: `steer` reaches the running turn, `interrupt` cuts its answer, `followup` waits |
 | GET | `/v1/sessions/{id}/inbox` | `sessions:r` | Inbox items the model has not been shown |
 | DELETE | `/v1/sessions/{id}/inbox/{item_id}` | `sessions:w` | Withdraw an item still waiting |
-| POST | `/v1/sessions/{id}/responses/{request_id}` | `sessions:w` | Resolve permission prompt |
+| POST | `/v1/sessions/{id}/responses/{request_id}` | `sessions:w` | Answer a parked prompt: an approval (`allow`, `deny`, `allow_always`, `deny_always`) or an elicitation (`accept` with `content`, `decline`, `cancel`) |
 | GET | `/v1/sessions/{id}/stream` | `sessions:r` | The session's event feed, across turns; `sessions:w` to load a session this process has not, and `?attend=true` (needs `sessions:w`) to be asked to approve gated calls. On a sub-agent's id, its own feed while its parent runs it, read-only |
 | GET | `/v1/stream` | `sessions:r` | The server feed: every change to a session record, across sessions |
 | POST | `/v1/sessions/{id}/compact` | `sessions:w` | Summarize the conversation now |
@@ -1492,8 +1528,28 @@ Key points:
 | DELETE | `/v1/memory/{name}` | `memory:w` | Delete a memory; `?project=<name>` when the name is in several projects |
 | GET | `/v1/mcp/{name}/tools` | `mcp:r` | Tools one MCP server advertises, each with its resolved permission, which step of the resolution chain decided it, whether config lets the agent see it, and whether a `readOnlyHint` the server sent was declined by `trust_read_only_hint = false` |
 | POST | `/v1/mcp/{name}/reconnect` | `mcp:w` | Reconnect an MCP server |
-| GET | `/v1/instructions` | `sessions:r` | Resolved standing instructions, without the per-session files `[instructions]` names |
+| GET | `/v1/instructions` | `sessions:r` | Resolved standing instructions, without the per-session files `[instructions]` names; `writable` and `path` say whether and where a `PUT` lands |
+| PUT | `/v1/instructions` | `config:w` | Write the standing instructions to `instructions.md`, `{"content": "..."}`, blank to remove; `409` when another source is in charge |
+| GET | `/v1/accounts` | `config:r` | Configured accounts, each with whether a credential is stored, and the credentials no account claims |
+| POST | `/v1/accounts` | `config:w` | Add an account, with its `api_key` on an API-key backend; answers `201` with the account |
+| PATCH | `/v1/accounts/{name}` | `config:w` | Rename an account, `{"name": "<new>"}`, moving its credential and every profile on it |
+| DELETE | `/v1/accounts/{name}` | `config:w` | Remove an account and its credential; `422` while a profile names it |
+| POST | `/v1/accounts/{name}/login` | `config:w` | Store a credential, `{"api_key": "<key>"}` on an API-key backend; with no body on a subscription backend, begin a browser login, `202` with the URL and a `login_id` |
+| GET | `/v1/accounts/{name}/login/{login_id}` | `config:r` | Whether a browser login is `pending`, `completed` or `failed` |
+| POST | `/v1/accounts/{name}/login/{login_id}` | `config:w` | Complete a browser login with what the browser gave, `{"code": "<code or callback URL>"}` |
 | GET | `/v1/profiles` | read | Configured profiles |
+| GET | `/v1/profiles/{name}` | `config:r` | One profile, with every setting it states |
+| GET | `/v1/mcp/{name}` | `config:r` | One MCP server's entry, the kinds of credential stored for it, and its connection state |
+| POST | `/v1/mcp` | `config:w` | Add an MCP server, the `[[mcp.servers]]` entry with `auth_token` or `client_secret` beside it; connects in the background; answers `201` |
+| PATCH | `/v1/mcp/{name}` | `config:w` | Change an MCP server's keys in place (`null` removes one) and restart it; `disabled` stops or starts it |
+| DELETE | `/v1/mcp/{name}` | `config:w` | Remove an MCP server, its connection, its tools from every session, and its credentials |
+| POST | `/v1/mcp/{name}/login` | `config:w` | Store `{"auth_token"}` or `{"client_secret"}` for an MCP server; with no body, begin its OAuth login in the browser, `202` with the URL and a `login_id` |
+| GET | `/v1/mcp/{name}/login/{login_id}` | `config:r` | Whether an MCP server's browser login is `pending`, `completed` or `failed` |
+| POST | `/v1/mcp/{name}/login/{login_id}` | `config:w` | Complete an MCP server's browser login with the callback URL, `{"code": "<URL>"}` |
+| POST | `/v1/mcp/{name}/logout` | `config:w` | Clear every credential stored for an MCP server |
+| POST | `/v1/profiles` | `config:w` | Add a profile; `"default": true` makes it the default; answers `201` with the profile |
+| PATCH | `/v1/profiles/{name}` | `config:w` | Change settings (`null` removes a key), make it the default, or rename it with `{"name": "<new>"}` sent alone |
+| DELETE | `/v1/profiles/{name}` | `config:w` | Remove a profile; `422` while another's `fallbacks` names it |
 | GET | `/v1/projects` | read | Every project, with when it was added and its memory and session counts |
 | POST | `/v1/projects` | `memory:w` | Add a project, `{"name": "<name>"}`; answers `201` with the project |
 | PATCH | `/v1/projects/{name}` | `memory:w` | Rename a project, `{"name": "<new>"}`, moving every session and memory on it |
@@ -1538,7 +1594,7 @@ A `connected` server in `GET /v1/mcp` carries `protocol_version`, the MCP revisi
 
 `POST /v1/mcp/{name}/reconnect` answers 200 with where the server now stands, which is not the same as "it worked": **read `state`, not the status code**. An attempt that ran and failed is a 200 carrying `state: "failed"`, not a 502. A server the startup sweep is still connecting comes back as `state: "pending"` with no attempt made, so a dashboard polling `GET /v1/mcp` during startup does not mistake "still coming up" for "down". The two non-200s are narrow: 422 when the server is `disabled` in config, and 502 when an already-connected server's transport could not be re-established within `[mcp] connect_timeout`. Neither carries the reason, which is in the meka log: a connector's reason has quoted a spawn command line and a URL with its key.
 
-MCP OAuth login and logout are deliberately absent: the flow prints a URL for a person to open in a browser and waits for the callback, which does not belong on a service-to-service surface. Use `meka mcp login` on the host. `/v1/profiles` is read-only for the same reason profile selection has no environment tier: an ambient value must never silently rebind which account a named profile bills.
+An MCP server's OAuth login runs over HTTP as an account's does, under `config:w`; see [Managing the installation](#managing-the-installation). A token holding `mcp:w` alone reconnects a server and nothing more.
 
 For full request/response schemas, see `/v1/openapi.json` on a running server, or browse it in one of the [tools below](#import-into-tools).
 

@@ -34,6 +34,9 @@ const RANKS: &[(&str, u32)] = &[
     // the subcommands and run their handlers, so `host` sits above `cli`.
     ("host", 1),
     ("cli", 2),
+    // The installation's editor: the doors both surfaces write `config.toml` and the credential
+    // rows through, below them so neither prompts nor bodies reach it.
+    ("installation", 3),
     // Presentation, reached only from the layers that own a terminal.
     ("relay", 2),
     ("render", 4),

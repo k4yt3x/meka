@@ -1,8 +1,8 @@
-//! `POST /v1/sessions/{id}/responses/{request_id}`: client responses to mid-turn
-//! `permission_required` SSE events. The HTTP API models only permission approvals; MCP
-//! elicitation auto-declines server-side without reaching the wire (service-to-service
-//! callers can't render interactive prompts). With only one outcome category the body has no
-//! `kind` discriminator: just `{"outcome": "..."}`.
+//! `POST /v1/sessions/{id}/responses/{request_id}`: client responses to the mid-turn
+//! `permission_required` and `elicitation_required` SSE events. One body for both, since the id
+//! says which prompt it names: an approval takes `allow`, `deny`, `allow_always` or
+//! `deny_always`, an elicitation `accept` with its `content`, `decline` or `cancel`, and an answer
+//! of the other kind is refused naming the kind.
 
 use axum::{
     body::Bytes,
@@ -13,27 +13,38 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::host::http::{
-    errors::{ErrorKind, ProblemDetail},
-    http_frontend::PermissionResolution,
-    reattach::require_session_exists,
-    scope,
-    state::ServerState,
+use crate::{
+    frontend::ElicitationResponse,
+    host::http::{
+        errors::{ErrorKind, ProblemDetail},
+        http_frontend::{PendingKind, PermissionResolution},
+        reattach::require_session_exists,
+        scope,
+        state::ServerState,
+    },
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResponseBody {
-    pub(crate) outcome: PermissionDecision,
+    pub(crate) outcome: ResponseOutcome,
+    /// What the form was filled with, on an `accept`: an object of the fields the schema named.
+    #[serde(default)]
+    pub(crate) content: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// The answers a parked prompt takes: the four an approval takes, and the three an elicitation
+/// takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PermissionDecision {
+pub(crate) enum ResponseOutcome {
     Allow,
     Deny,
     AllowAlways,
     DenyAlways,
+    Accept,
+    Decline,
+    Cancel,
 }
 
 #[utoipa::path(
@@ -42,7 +53,7 @@ pub(crate) enum PermissionDecision {
     tag = "turn",
     params(
         ("id" = Uuid, Path, description = "Session UUID"),
-        ("request_id" = String, Path, description = "Pending request id emitted by the matching permission_required SSE event."),
+        ("request_id" = String, Path, description = "Pending request id emitted by the matching `permission_required` or `elicitation_required` SSE event."),
     ),
     request_body = ResponseBody,
     responses(
@@ -51,7 +62,7 @@ pub(crate) enum PermissionDecision {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session or request not found / already resolved", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body, or the id names a sub-agent's conversation (`/errors/session-not-drivable`), which no payload makes acceptable", body = ProblemDetail),
+        (status = 422, description = "Invalid body, an answer of the other prompt's kind, `content` on anything but `accept`, or the id names a sub-agent's conversation (`/errors/session-not-drivable`), which no payload makes acceptable", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:w"]))
@@ -84,14 +95,60 @@ pub(crate) async fn respond(
         return Err(request_not_found(session_id, &request_id));
     };
 
-    let resolution = match body.outcome {
-        PermissionDecision::Allow => PermissionResolution::Allow,
-        PermissionDecision::AllowAlways => PermissionResolution::AllowAlways,
-        PermissionDecision::Deny => PermissionResolution::Deny,
-        PermissionDecision::DenyAlways => PermissionResolution::DenyAlways,
+    let Some(kind) = entry.frontend.pending_kind(&request_id) else {
+        return Err(request_not_found(session_id, &request_id));
     };
-
-    if entry.frontend.resolve_permission(&request_id, resolution) {
+    let mismatch = |sentence: &str| {
+        ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("request '{request_id}' {sentence}"),
+        )
+        .with("session_id", session_id.to_string())
+        .with("request_id", request_id.clone())
+    };
+    if body.content.is_some() && body.outcome != ResponseOutcome::Accept {
+        return Err(mismatch(
+            "takes `content` only on `accept`; drop it, or accept",
+        ));
+    }
+    let resolved =
+        match (kind, body.outcome) {
+            (PendingKind::Permission, ResponseOutcome::Allow) => entry
+                .frontend
+                .resolve_permission(&request_id, PermissionResolution::Allow),
+            (PendingKind::Permission, ResponseOutcome::AllowAlways) => entry
+                .frontend
+                .resolve_permission(&request_id, PermissionResolution::AllowAlways),
+            (PendingKind::Permission, ResponseOutcome::Deny) => entry
+                .frontend
+                .resolve_permission(&request_id, PermissionResolution::Deny),
+            (PendingKind::Permission, ResponseOutcome::DenyAlways) => entry
+                .frontend
+                .resolve_permission(&request_id, PermissionResolution::DenyAlways),
+            (PendingKind::Permission, _) => {
+                return Err(mismatch(
+                    "is an approval; answer with allow, deny, allow_always or deny_always",
+                ));
+            }
+            (PendingKind::Elicitation, ResponseOutcome::Accept) => entry
+                .frontend
+                .resolve_elicitation(&request_id, ElicitationResponse::Accept {
+                    content: body.content,
+                }),
+            (PendingKind::Elicitation, ResponseOutcome::Decline) => entry
+                .frontend
+                .resolve_elicitation(&request_id, ElicitationResponse::Decline),
+            (PendingKind::Elicitation, ResponseOutcome::Cancel) => entry
+                .frontend
+                .resolve_elicitation(&request_id, ElicitationResponse::Cancel),
+            (PendingKind::Elicitation, _) => {
+                return Err(mismatch(
+                    "is an elicitation; answer with accept, decline or cancel",
+                ));
+            }
+        };
+    if resolved {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(request_not_found(session_id, &request_id))

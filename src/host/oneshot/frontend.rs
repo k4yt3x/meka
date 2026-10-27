@@ -207,6 +207,7 @@ mod tests {
             .handle_elicitation(ElicitationPrompt {
                 server_name: "notion".to_string(),
                 message: "authorize?".to_string(),
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
                 kind: crate::frontend::ElicitationKind::Url {
                     url: "https://example.com/".to_string(),
                 },

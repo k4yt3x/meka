@@ -405,6 +405,8 @@ impl ServerFeed {
                 | SseEventType::TurnCanceled
                 | SseEventType::PermissionRequired
                 | SseEventType::PermissionResolved
+                | SseEventType::ElicitationRequired
+                | SseEventType::ElicitationResolved
         )
     }
 

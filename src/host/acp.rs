@@ -357,7 +357,7 @@ pub(crate) async fn run_acp(
                     // session recorded instead, which is what stops a resume moving the
                     // conversation to another provider.
                     let profile = match state.shared.default_profile() {
-                        Ok(profile) => profile.to_string(),
+                        Ok(profile) => profile,
                         Err(error) => {
                             return responder.respond_with_error(build_failure_error(
                                 "no default profile",

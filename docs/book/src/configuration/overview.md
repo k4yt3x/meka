@@ -133,9 +133,13 @@ Two consequences worth knowing:
 - **`meka profile add` or `meka account add` while a server is running does not reach it.** The new
   entry is on disk and the listings show it, but `POST /v1/sessions` and ACP's profile picker
   answer "not configured" until the server is restarted. The same applies to editing an existing
-  profile or account.
+  profile or account. The one exception is a write `meka serve` made itself: an account or profile
+  added, changed or removed through [its own API](../usage/http-api.md#managing-the-installation)
+  is served from the next session on, because the server reloads what it wrote.
 - **Editing your instructions files does not reach it either.** They are read once and go into the
-  cached prompt prefix that every session shares.
+  cached prompt prefix that every session shares. The same exception applies: `instructions.md`
+  written through `PUT /v1/instructions` is read again by the server that wrote it, for the
+  sessions that open from then on.
 
 Restart the server to pick either up. Everything else follows a live source and needs no restart:
 skills are re-read per turn, memories per turn, and MCP tool lists follow the server.

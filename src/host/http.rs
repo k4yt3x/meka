@@ -73,12 +73,11 @@ pub(crate) async fn run_serve(
     let max_body_bytes = serve.max_body_bytes;
     let bind_addr = serve.bind.clone();
 
+    // No default profile is demanded here, unlike `meka acp`: a session names its profile on
+    // `POST /v1/sessions` or takes the default at that point, which is where its absence is
+    // refused, and an installation managed over the API has no profile until a client adds one.
     let shared =
         Arc::new(crate::host::build_shared_deps(Arc::new(config), store, mcp_manager).await?);
-    // A host that creates sessions on the operator's behalf needs a profile to create them on, and
-    // is refused up front rather than at the first `session/new`. `-c` / `-r` are refused for both
-    // hosts precisely so a resume cannot make this exception apply here.
-    shared.default_profile()?;
 
     if !serve.webhooks.is_empty() {
         // Named at startup because an outbound request is the one thing meka does that leaves the
@@ -136,6 +135,9 @@ pub(crate) async fn run_serve(
 
     crate::host::wait_for_shutdown_signal().await;
     state.shutdown.cancel();
+    // Each pending login's completion request waits on its flow, an exchange in flight included,
+    // and would hold the drain for as long as that takes: ended here, it is answered at once.
+    handlers::installation::forget_every_pending_login(&state).await;
     state.sessions.cancel_every_turn().await;
     if drain_tx.send(()).is_err() {
         tracing::trace!("the accept loop had already stopped");
@@ -292,7 +294,43 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         .route("/v1/memory/{name}", put(handlers::stores::put_memory))
         .route("/v1/memory/{name}", delete(handlers::stores::delete_memory))
         .route("/v1/instructions", get(handlers::stores::instructions))
-        .route("/v1/profiles", get(handlers::stores::profiles))
+        .route("/v1/instructions", put(handlers::stores::put_instructions))
+        .route("/v1/accounts", get(handlers::installation::accounts))
+        .route("/v1/accounts", post(handlers::installation::create_account))
+        .route(
+            "/v1/accounts/{name}",
+            patch(handlers::installation::rename_account),
+        )
+        .route(
+            "/v1/accounts/{name}",
+            delete(handlers::installation::delete_account),
+        )
+        .route(
+            "/v1/accounts/{name}/login",
+            post(handlers::installation::login_account),
+        )
+        .route(
+            "/v1/accounts/{name}/login/{login_id}",
+            get(handlers::installation::login_status),
+        )
+        .route(
+            "/v1/accounts/{name}/login/{login_id}",
+            post(handlers::installation::complete_login),
+        )
+        .route("/v1/profiles", get(handlers::installation::profiles))
+        .route("/v1/profiles", post(handlers::installation::create_profile))
+        .route(
+            "/v1/profiles/{name}",
+            get(handlers::installation::get_profile),
+        )
+        .route(
+            "/v1/profiles/{name}",
+            patch(handlers::installation::patch_profile),
+        )
+        .route(
+            "/v1/profiles/{name}",
+            delete(handlers::installation::delete_profile),
+        )
         .route("/v1/projects", get(handlers::stores::projects))
         .route("/v1/projects", post(handlers::stores::create_project))
         .route(
@@ -304,6 +342,35 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             delete(handlers::stores::delete_project),
         )
         .route("/v1/mcp", get(handlers::info::mcp))
+        .route("/v1/mcp", post(handlers::installation::create_mcp_server))
+        .route(
+            "/v1/mcp/{name}",
+            get(handlers::installation::get_mcp_server),
+        )
+        .route(
+            "/v1/mcp/{name}",
+            patch(handlers::installation::patch_mcp_server),
+        )
+        .route(
+            "/v1/mcp/{name}",
+            delete(handlers::installation::delete_mcp_server),
+        )
+        .route(
+            "/v1/mcp/{name}/login",
+            post(handlers::installation::login_mcp_server),
+        )
+        .route(
+            "/v1/mcp/{name}/login/{login_id}",
+            get(handlers::installation::mcp_login_status),
+        )
+        .route(
+            "/v1/mcp/{name}/login/{login_id}",
+            post(handlers::installation::complete_mcp_login),
+        )
+        .route(
+            "/v1/mcp/{name}/logout",
+            post(handlers::installation::logout_mcp_server),
+        )
         .route("/v1/mcp/{name}/tools", get(handlers::info::mcp_tools))
         .route(
             "/v1/mcp/{name}/reconnect",

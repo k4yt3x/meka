@@ -174,8 +174,96 @@ async fn close_service(server_name: &str, mut service: McpRunningService) {
     }
 }
 
+/// One server's entry, validated: the name is one a tool prefix can carry and meka does not
+/// reserve, `${VAR}` is expanded once, and a secret the environment did not supply fails the
+/// entry closed. The one builder, so a server added while the process runs is held to what
+/// startup holds one to.
+fn build_entry(
+    original_config: &McpServerConfig,
+    token_store: Option<TokenStore>,
+    client_context: Arc<McpClientContext>,
+    tool_call_timeout: std::time::Duration,
+    connects: Arc<Connects>,
+) -> Result<Arc<ServerEntry>> {
+    // Apply env-var substitution (`${VAR}` / `${VAR:-default}`) once, up-front, so the rest of
+    // the pipeline sees only resolved values.
+    let mut config = original_config.clone();
+    let unresolved = crate::mcp::expand::expand_server_config(&mut config);
+    if !unresolved.names.is_empty() {
+        tracing::warn!(
+            "MCP server '{name}': unresolved env vars {names:?} left literal in config",
+            name = config.name,
+            names = unresolved.names
+        );
+    }
+
+    crate::mcp::sanitize::validate_server_name(&config.name).map_err(|message| {
+        MekaError::McpConnection {
+            server_name: if config.name.is_empty() {
+                "(empty)".to_string()
+            } else {
+                config.name.clone()
+            },
+            message,
+        }
+    })?;
+
+    let is_disabled = config.disabled.unwrap_or(false);
+    if is_disabled {
+        tracing::info!(
+            "MCP server '{name}' is disabled in config",
+            name = config.name
+        );
+    }
+    // A credential the environment did not supply is not sent as the literal `${NAME}`: the
+    // request cannot succeed, and the string names a secret the operator meant to keep out of
+    // the file. `config.toml`'s own `${VAR}` fails closed the same way.
+    let refused = (!is_disabled && unresolved.in_secret_bearing_fields).then(|| {
+        let what = unresolved.describe();
+        tracing::warn!(
+            "MCP server '{name}' will not connect: {what}, in its `args`, `env`, `url` or \
+             `headers`",
+            name = config.name
+        );
+        format!("{what}, in `args`, `env`, `url` or `headers`")
+    });
+    let initial_state = if is_disabled {
+        ServerState::Disabled
+    } else if let Some(error) = &refused {
+        ServerState::Failed {
+            error: error.clone(),
+            at: std::time::Instant::now(),
+        }
+    } else {
+        ServerState::Pending
+    };
+
+    Ok(Arc::new(ServerEntry {
+        server_name: config.name.clone(),
+        configured: original_config.clone(),
+        config,
+        token_store,
+        client_context,
+        state: RwLock::new(initial_state),
+        reconnect_lock: Mutex::new(()),
+        removed: CancellationToken::new(),
+        tool_call_timeout,
+        refused,
+        instructions: std::sync::RwLock::new(None),
+        request_timeout: OnceLock::new(),
+        background_retry: OnceLock::new(),
+        dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+        subscriptions: subscriptions::Subscriptions::default(),
+        legacy_era: std::sync::atomic::AtomicBool::new(false),
+        connects,
+    }))
+}
+
 pub(crate) struct McpClientManager {
-    servers: HashMap<String, Arc<ServerEntry>>,
+    /// Every configured server's entry, by name. Behind a lock because a server is added and
+    /// removed over HTTP while the process runs; a reader clones the `Arc` out and holds no
+    /// guard across an await.
+    servers: std::sync::RwLock<HashMap<String, Arc<ServerEntry>>>,
     /// The context every server's handler reports into; the ledgers a tool reads live on it.
     pub(crate) client_context: Arc<McpClientContext>,
     /// Global fallback permission from `[mcp].default_permission`. Consulted by
@@ -211,6 +299,9 @@ pub(crate) struct McpClientManager {
     connect_timeout: OnceLock<std::time::Duration>,
     /// The connects in flight on every entry, which [`Self::shutdown`] ends first.
     connects: Arc<Connects>,
+    /// What every entry is built with, kept for one added while the process runs.
+    token_store: Option<TokenStore>,
+    tool_call_timeout: std::time::Duration,
 }
 
 /// What one server's latest `tools/list` produced: the tools, and which of them ship deferred.
@@ -356,10 +447,18 @@ fn redact_mcp_error(error: MekaError) -> MekaError {
 pub(crate) struct ServerEntry {
     pub(crate) server_name: String,
     pub(crate) config: McpServerConfig,
+    /// The entry as `config.toml` states it, every `${VAR}` a reference still: what the doors
+    /// that show or edit the entry read, since what a reference expands to in [`Self::config`]
+    /// may be the secret it keeps out of the file.
+    pub(crate) configured: McpServerConfig,
     pub(crate) token_store: Option<TokenStore>,
     pub(crate) client_context: Arc<McpClientContext>,
     pub(crate) state: RwLock<ServerState>,
     pub(crate) reconnect_lock: Mutex<()>,
+    /// Cancelled when the manager takes the entry out, so a connect or a retry in flight on it
+    /// ends at once rather than at its bound, child and all; a shutdown ends every entry's through
+    /// `connects` instead.
+    pub(crate) removed: CancellationToken,
     /// Cap on one call to this server's tools: `ResolvedConfig::mcp_tool_timeout`, carried here
     /// because the adapter that makes the call holds the entry and nothing of the process.
     pub(crate) tool_call_timeout: std::time::Duration,
@@ -411,6 +510,12 @@ pub(crate) struct ServerEntry {
 }
 
 impl ServerEntry {
+    /// Whether this entry is one a connector connects: enabled, and not refused for a secret the
+    /// environment did not supply, which is failed for good.
+    fn wants_connecting(&self) -> bool {
+        !self.config.disabled.unwrap_or(false) && self.refused.is_none()
+    }
+
     /// The configured per-request bound, or [`DEFAULT_MCP_REQUEST_TIMEOUT`] before the connector
     /// has started (tests, and the window before `start_connector`).
     pub(crate) fn request_timeout(&self) -> std::time::Duration {
@@ -508,6 +613,18 @@ impl ServerEntry {
         }
     }
 
+    /// The refusal for a connection that landed after this entry was taken out or the stop fired:
+    /// nothing holds the entry to adopt it.
+    pub(crate) fn ended_refusal(&self) -> MekaError {
+        if self.removed.is_cancelled() {
+            return MekaError::McpConnection {
+                server_name: self.server_name.clone(),
+                message: "was removed".to_string(),
+            };
+        }
+        self.shutdown_refusal()
+    }
+
     /// The protocol version this entry's connection speaks, when it has one: the server's answer
     /// to the probe, or the one `initialize` settled on.
     pub(crate) async fn protocol_version(&self) -> Option<ProtocolVersion> {
@@ -525,9 +642,9 @@ impl ServerEntry {
     ///
     /// The one door onto `Connected`, for the first connect, the cold-start retry and a reconnect
     /// alike, so none of them can leave a subscription behind on the connection that closed, and
-    /// none can bring a server up behind a shutdown: a connect that lands once the stop has fired
-    /// is refused here, under the state lock the shutdown takes after firing it, and `service`
-    /// is closed, child and all. The set is carried over beside the connection rather
+    /// none can bring a server up behind a shutdown or a removal: a connect that lands once either
+    /// has fired is refused here, under the state lock the shutdown takes after firing it, and
+    /// `service` is closed, child and all. The set is carried over beside the connection rather
     /// than ahead of it, so a server slow to acknowledge its stream delays no tool discovery and
     /// no call waiting on a reconnect.
     pub(crate) async fn adopt_connection(
@@ -535,12 +652,12 @@ impl ServerEntry {
         service: McpRunningService,
     ) -> Result<()> {
         let mut state = self.state.write().await;
-        if self.connects.stopping().is_cancelled() {
+        if self.connects.stopping().is_cancelled() || self.removed.is_cancelled() {
             drop(state);
             // Closed rather than dropped: a drop leaves the transport to a task the runtime may
             // never poll again on its way out, and with it the child a stdio transport owns.
             close_service(&self.server_name, service).await;
-            return Err(self.shutdown_refusal());
+            return Err(self.ended_refusal());
         }
         self.record_instructions(
             service
@@ -630,6 +747,7 @@ impl ServerEntry {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
                     _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
                     _ = self.connects.stopping().cancelled() => return Err(self.shutdown_refusal()),
+                    _ = self.removed.cancelled() => return Err(self.ended_refusal()),
                 }
             }
             let handle = tokio::runtime::Handle::current();
@@ -644,6 +762,7 @@ impl ServerEntry {
                     tokio::select! {
                         biased;
                         _ = entry.connects.stopping().cancelled() => None,
+                        _ = entry.removed.cancelled() => None,
                         result = tokio::time::timeout(bound, connector::connect_server(&entry)) => {
                             Some(result.unwrap_or_else(|_elapsed| Err(MekaError::McpConnection {
                                 server_name: entry.server_name.clone(),
@@ -752,7 +871,17 @@ impl ServerEntry {
             // build, and the shape a shutting-down process ends in.
             return;
         };
-        match manager.refresh_server_tools(&self.server_name).await {
+        // This entry, and not whatever the manager holds under the name now: a server replaced
+        // while its reconnect ran has a new entry, whose listing is that entry's connect's to make.
+        let Some(entry) = manager.held(self) else {
+            tracing::debug!(
+                "MCP server '{server_name}' was removed while it reconnected; its tools are not \
+                 re-listed",
+                server_name = self.server_name
+            );
+            return;
+        };
+        match manager.refresh_server_tools(&entry).await {
             Ok(count) => tracing::info!(
                 "MCP server '{server_name}' re-registered {count} tool(s) after reconnect",
                 server_name = self.server_name
@@ -809,111 +938,25 @@ impl McpClientManager {
         let connects = Connects::new();
 
         for original_config in configs {
-            // Apply env-var substitution (`${VAR}` / `${VAR:-default}`) once, up-front, so the rest
-            // of the pipeline sees only resolved values.
-            let mut config = original_config.clone();
-            let unresolved = crate::mcp::expand::expand_server_config(&mut config);
-            if !unresolved.names.is_empty() {
-                tracing::warn!(
-                    "MCP server '{name}': unresolved env vars {names:?} left literal in config",
-                    name = config.name,
-                    names = unresolved.names
-                );
-            }
-
-            if config.name.is_empty() {
+            if servers.contains_key(&original_config.name) {
                 return Err(MekaError::McpConnection {
-                    server_name: "(empty)".to_string(),
-                    message: "server name must not be empty".to_string(),
-                });
-            }
-
-            // Reject anything that would collide with meka-internal names or our
-            // `mcp__<server>__<tool>` namespace separator.
-            if crate::mcp::sanitize::is_reserved_server_name(&config.name) {
-                return Err(MekaError::McpConnection {
-                    server_name: config.name.clone(),
-                    message: "server name is reserved (meka, ide, or mcp_*)".to_string(),
-                });
-            }
-
-            let normalized = crate::mcp::sanitize::normalize_server_name(&config.name);
-            if normalized != config.name {
-                return Err(MekaError::McpConnection {
-                    server_name: config.name.clone(),
-                    message: format!(
-                        "server name contains characters not allowed in tool prefixes (would normalize to '{normalized}')"
-                    ),
-                });
-            }
-
-            if config.name.contains("__") {
-                return Err(MekaError::McpConnection {
-                    server_name: config.name.clone(),
-                    message: "server name must not contain '__'".to_string(),
-                });
-            }
-
-            if servers.contains_key(&config.name) {
-                return Err(MekaError::McpConnection {
-                    server_name: config.name.clone(),
+                    server_name: original_config.name.clone(),
                     message: "duplicate server name".to_string(),
                 });
             }
-
-            let is_disabled = config.disabled.unwrap_or(false);
-            if is_disabled {
-                tracing::info!(
-                    "MCP server '{name}' is disabled in config",
-                    name = config.name
-                );
-            }
-            // A credential the environment did not supply is not sent as the literal `${NAME}`:
-            // the request cannot succeed, and the string names a secret the operator meant to
-            // keep out of the file. `config.toml`'s own `${VAR}` fails closed the same way.
-            let refused = (!is_disabled && unresolved.in_secret_bearing_fields).then(|| {
-                let what = unresolved.describe();
-                tracing::warn!(
-                    "MCP server '{name}' will not connect: {what}, in its `args`, `env`, `url` or \
-                     `headers`",
-                    name = config.name
-                );
-                format!("{what}, in `args`, `env`, `url` or `headers`")
-            });
-            let initial_state = if is_disabled {
-                ServerState::Disabled
-            } else if let Some(error) = &refused {
-                ServerState::Failed {
-                    error: error.clone(),
-                    at: std::time::Instant::now(),
-                }
-            } else {
-                ServerState::Pending
-            };
-
-            let entry = Arc::new(ServerEntry {
-                server_name: config.name.clone(),
-                config: config.clone(),
-                token_store: token_store.clone(),
-                client_context: Arc::clone(&client_context),
-                state: RwLock::new(initial_state),
-                reconnect_lock: Mutex::new(()),
+            let entry = build_entry(
+                original_config,
+                token_store.clone(),
+                Arc::clone(&client_context),
                 tool_call_timeout,
-                refused,
-                instructions: std::sync::RwLock::new(None),
-                request_timeout: OnceLock::new(),
-                background_retry: OnceLock::new(),
-                dropped_tools: std::sync::atomic::AtomicUsize::new(0),
-                subscriptions: subscriptions::Subscriptions::default(),
-                legacy_era: std::sync::atomic::AtomicBool::new(false),
-                connects: Arc::clone(&connects),
-            });
+                Arc::clone(&connects),
+            )?;
             // A refused entry is not pending: it is failed for good, and the connector's
             // post-settle retry only looks at what it was handed.
-            if !is_disabled && entry.refused.is_none() {
+            if entry.wants_connecting() {
                 pending.push(Arc::clone(&entry));
             }
-            servers.insert(config.name.clone(), entry);
+            servers.insert(original_config.name.clone(), entry);
         }
 
         // Initialize the watch with `true` when nothing will ever be pending (all servers disabled,
@@ -923,7 +966,7 @@ impl McpClientManager {
         let initial_settled = pending.is_empty();
         let (settled_tx, _) = tokio::sync::watch::channel(initial_settled);
         let manager = Arc::new(Self {
-            servers,
+            servers: std::sync::RwLock::new(servers),
             client_context,
             mcp_default_permission,
             deferral: OnceLock::new(),
@@ -933,6 +976,8 @@ impl McpClientManager {
             observers: tokio::sync::RwLock::new(Vec::new()),
             connect_timeout: OnceLock::new(),
             connects,
+            token_store,
+            tool_call_timeout,
         });
         Ok(manager)
     }
@@ -945,7 +990,14 @@ impl McpClientManager {
     /// without requiring them to re-subscribe. Both are given the whole [`ServerTools`], so a
     /// registry that subscribes later cannot end up with a different eager-vs-deferred split from
     /// one that was already here.
-    async fn update_server_tools(&self, server_name: &str, tools: ServerTools) {
+    async fn update_server_tools(&self, entry: &Arc<ServerEntry>, tools: ServerTools) {
+        let server_name = entry.server_name.as_str();
+        // A listing from an entry this manager no longer holds registers nothing: the server was
+        // removed or replaced while the listing ran, and the tools belong to no configured server.
+        if !self.holds(entry) {
+            tracing::debug!("MCP server '{server_name}' was removed before its tools arrived");
+            return;
+        }
         // Snapshot first, then fan out. [`Self::subscribe`] does the mirror image, and the pairing
         // is what closes the window where an observer subscribing concurrently is missed by the
         // fan-out *and* subscribes before the snapshot names the update.
@@ -964,8 +1016,12 @@ impl McpClientManager {
     /// The one door for all three discovery paths (the connector's first `tools/list`, the refresh
     /// a `tools/list_changed` notification triggers, and the re-list [`Self::refresh_server_tools`]
     /// runs after a reconnect), so none of them can classify a tool differently from the others.
-    pub(super) async fn register_server_tools(&self, server_name: &str, tools: Vec<McpTool>) {
-        self.update_server_tools(server_name, ServerTools::from_tools(tools))
+    pub(super) async fn register_server_tools(
+        &self,
+        entry: &Arc<ServerEntry>,
+        tools: Vec<McpTool>,
+    ) {
+        self.update_server_tools(entry, ServerTools::from_tools(tools))
             .await;
     }
 
@@ -1030,26 +1086,8 @@ impl McpClientManager {
         // Every entry gets the same bound, so the request helpers that only hold an
         // `Arc<ServerEntry>` honor the configured timeout rather than falling back to the
         // module default.
-        for entry in self.servers.values() {
-            if entry.request_timeout.set(runtime.connect_timeout).is_err() {
-                tracing::debug!(
-                    "MCP server {server_name} already has its request timeout",
-                    server_name = entry.server_name
-                );
-            }
-            if entry
-                .background_retry
-                .set(BackgroundRetry {
-                    manager: Arc::downgrade(self),
-                    mcp_default_permission: self.mcp_default_permission,
-                })
-                .is_err()
-            {
-                tracing::debug!(
-                    "MCP server {server_name} already has its background retry",
-                    server_name = entry.server_name
-                );
-            }
+        for (_, entry) in self.entries() {
+            self.wire_entry(&entry, runtime.connect_timeout);
         }
         let Some(pending) = crate::sync::lock(&self.pending_entries).take() else {
             return;
@@ -1089,7 +1127,7 @@ impl McpClientManager {
     /// session.
     pub(crate) async fn enabled_not_connected(&self) -> Vec<NotConnected> {
         let mut out = Vec::new();
-        for (name, entry) in &self.servers {
+        for (name, entry) in self.entries() {
             let state = entry.state().await;
             match state {
                 ServerState::Connected { .. } | ServerState::Disabled => {}
@@ -1122,7 +1160,7 @@ impl McpClientManager {
         // Server names cannot contain `__` (`sanitize::normalize_server_name`), so the first
         // occurrence splits server from tool.
         let (server_name, _tool) = rest.split_once("__")?;
-        let entry = self.servers.get(server_name)?;
+        let entry = self.entry(server_name)?;
         Some(format!(
             "MCP server '{}' {}",
             server_name,
@@ -1131,7 +1169,196 @@ impl McpClientManager {
     }
 
     pub(crate) fn server_entry(&self, server_name: &str) -> Option<Arc<ServerEntry>> {
-        self.servers.get(server_name).cloned()
+        self.entry(server_name)
+    }
+
+    /// `name`'s entry, cloned out from under the lock.
+    fn entry(&self, name: &str) -> Option<Arc<ServerEntry>> {
+        crate::sync::read(&self.servers).get(name).cloned()
+    }
+
+    /// Whether `entry` is the one this manager holds under its name. A removed server's entry
+    /// stays alive in the connect or the retry that was running on it, and what that finishes
+    /// must not stand in for a server the operator took out.
+    pub(crate) fn holds(&self, entry: &Arc<ServerEntry>) -> bool {
+        self.held(entry).is_some()
+    }
+
+    /// The handle this manager holds on `entry`, when it is the one held under the name: for an
+    /// entry that has only itself and needs the handle every door takes.
+    pub(crate) fn held(&self, entry: &ServerEntry) -> Option<Arc<ServerEntry>> {
+        self.entry(&entry.server_name)
+            .filter(|held| std::ptr::eq(Arc::as_ptr(held), entry))
+    }
+
+    /// Every entry, by name in name order, cloned out from under the lock so a caller can await
+    /// on each.
+    fn entries(&self) -> Vec<(String, Arc<ServerEntry>)> {
+        let mut entries: Vec<(String, Arc<ServerEntry>)> = crate::sync::read(&self.servers)
+            .iter()
+            .map(|(name, entry)| (name.clone(), Arc::clone(entry)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    /// Every configured server as `config.toml` states it, references unexpanded, for the doors
+    /// that take the configured list: a login, a logout, a detail shown to a client.
+    pub(crate) fn server_configs(&self) -> Vec<McpServerConfig> {
+        self.entries()
+            .into_iter()
+            .map(|(_, entry)| entry.configured.clone())
+            .collect()
+    }
+
+    /// Give an entry what every connect after the connector started needs: the request bound and
+    /// the background retry's handle on this manager. A second wiring of one entry is a no-op.
+    fn wire_entry(
+        self: &Arc<Self>,
+        entry: &Arc<ServerEntry>,
+        connect_timeout: std::time::Duration,
+    ) {
+        if entry.request_timeout.set(connect_timeout).is_err() {
+            tracing::debug!(
+                "MCP server {server_name} already has its request timeout",
+                server_name = entry.server_name
+            );
+        }
+        if entry
+            .background_retry
+            .set(BackgroundRetry {
+                manager: Arc::downgrade(self),
+                mcp_default_permission: self.mcp_default_permission,
+            })
+            .is_err()
+        {
+            tracing::debug!(
+                "MCP server {server_name} already has its background retry",
+                server_name = entry.server_name
+            );
+        }
+    }
+
+    /// Add a server to a running manager, as `POST /v1/mcp` does once the entry is in
+    /// `config.toml`, and connect it in the background: the entry is answered at once, `pending`
+    /// (or `disabled`, or `failed` for a secret the environment did not supply), and the connect
+    /// runs as the startup connector's would, retried on a cold-start failure. A name in use, or
+    /// one meka reserves, is refused.
+    pub(crate) fn add_server(
+        self: &Arc<Self>,
+        config: &McpServerConfig,
+    ) -> Result<Arc<ServerEntry>> {
+        let entry = build_entry(
+            config,
+            self.token_store.clone(),
+            Arc::clone(&self.client_context),
+            self.tool_call_timeout,
+            Arc::clone(&self.connects),
+        )?;
+        let mut servers = crate::sync::write(&self.servers);
+        if servers.contains_key(&config.name) {
+            return Err(MekaError::McpConnection {
+                server_name: config.name.clone(),
+                message: "duplicate server name".to_string(),
+            });
+        }
+        servers.insert(config.name.clone(), Arc::clone(&entry));
+        drop(servers);
+        let connect_timeout = self.request_timeout();
+        self.wire_entry(&entry, connect_timeout);
+        if entry.wants_connecting() {
+            let manager = Arc::clone(self);
+            let entry = Arc::clone(&entry);
+            let mcp_default_permission = self.mcp_default_permission;
+            tokio::spawn(async move {
+                // Under the lock `connect_one` asks its callers to hold, since a reconnect asked
+                // over HTTP could reach the entry while it connects.
+                {
+                    let _guard = entry.reconnect_lock.lock().await;
+                    connector::connect_one(
+                        Arc::clone(&entry),
+                        Arc::clone(&manager),
+                        mcp_default_permission,
+                        connect_timeout,
+                    )
+                    .await;
+                }
+                // As the connector's post-settle sweep does for a cold-start failure; not for an
+                // entry removed meanwhile, which the retry would only keep reconnecting.
+                if manager.holds(&entry)
+                    && matches!(entry.state().await, ServerState::Failed { .. })
+                {
+                    connector::retry_until_connected(
+                        entry,
+                        Arc::downgrade(&manager),
+                        mcp_default_permission,
+                        connect_timeout,
+                        connector::INITIAL_RETRY_BACKOFF,
+                    )
+                    .await;
+                }
+            });
+        }
+        Ok(entry)
+    }
+
+    /// Take a server out of a running manager, as `DELETE /v1/mcp/{name}` does once the entry is
+    /// out of `config.toml`: its connection is closed, and every session's registry drops its
+    /// tools. An unknown name is refused naming the configured ones.
+    pub(crate) async fn remove_server(&self, name: &str) -> Result<()> {
+        let entry = {
+            let mut servers = crate::sync::write(&self.servers);
+            let Some(entry) = servers.remove(name) else {
+                drop(servers);
+                return Err(MekaError::McpConnection {
+                    server_name: name.to_string(),
+                    message: self.unknown_server(name),
+                });
+            };
+            entry
+        };
+        // A connect or a retry in flight on the entry ends here, with the child a stdio connect was
+        // spawning, rather than at its bound on an entry nothing holds.
+        entry.removed.cancel();
+        // Left `Disabled`, as a shutdown leaves it, so a call still holding the entry is refused
+        // rather than handed a service that is closing.
+        let service = {
+            let mut state = entry.state.write().await;
+            match std::mem::replace(&mut *state, ServerState::Disabled) {
+                ServerState::Connected { service } => Some(service),
+                _ => None,
+            }
+        };
+        if let Some(service) = service {
+            match Arc::try_unwrap(service) {
+                Ok(owned) => close_service(name, owned).await,
+                Err(_held) => tracing::debug!(
+                    "MCP server '{name}' still had in-flight calls on removal; left to its drop guard"
+                ),
+            }
+        }
+        self.tools_snapshot.write().await.remove(name);
+        self.client_context.resource_updates.forget(name);
+        let gone = ServerTools {
+            tools: Vec::new(),
+            deferred: Vec::new(),
+        };
+        for observer in self.observers.read().await.iter() {
+            observer.server_tools_changed(name, &gone);
+        }
+        tracing::info!("removed MCP server '{name}' from the running manager");
+        Ok(())
+    }
+
+    /// Put `config` in place of the server of the same name: the one door for a change to a
+    /// configured server, which is a removal and an add, so a changed `url`, a flipped
+    /// `disabled` and a narrowed tool list all take effect the same way.
+    pub(crate) async fn replace_server(
+        self: &Arc<Self>,
+        config: &McpServerConfig,
+    ) -> Result<Arc<ServerEntry>> {
+        self.remove_server(&config.name).await?;
+        self.add_server(config)
     }
 
     /// Whether the server owning a namespaced tool name has yet to finish its first connection.
@@ -1152,7 +1379,7 @@ impl McpClientManager {
         else {
             return false;
         };
-        match self.servers.get(server) {
+        match self.entry(server) {
             Some(entry) => matches!(entry.state().await, ServerState::Pending),
             None => false,
         }
@@ -1160,9 +1387,7 @@ impl McpClientManager {
 
     /// The refusal for a server name that matches nothing, naming the servers that exist.
     fn unknown_server(&self, server_name: &str) -> String {
-        let mut known: Vec<&str> = self.servers.keys().map(String::as_str).collect();
-        known.sort_unstable();
-        crate::text::unknown_name("MCP server", server_name, known)
+        crate::text::unknown_name("MCP server", server_name, self.server_names())
     }
 
     /// Find a registered MCP tool by the name the model uses (`mcp__server__tool`).
@@ -1183,8 +1408,9 @@ impl McpClientManager {
             .map(Arc::clone)
     }
 
+    /// Every configured server's name, in name order.
     pub(crate) fn server_names(&self) -> Vec<String> {
-        self.servers.keys().cloned().collect()
+        self.entries().into_iter().map(|(name, _)| name).collect()
     }
 
     /// Returns `(server_name, instructions)` pairs for every connected server whose current
@@ -1193,14 +1419,13 @@ impl McpClientManager {
     /// instructions into the per-turn context.
     pub(crate) fn server_instructions(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for (name, entry) in &self.servers {
+        for (name, entry) in self.entries() {
             if let Some(text) = entry.instructions()
                 && !text.trim().is_empty()
             {
-                out.push((name.clone(), text));
+                out.push((name, text));
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 
@@ -1211,10 +1436,12 @@ impl McpClientManager {
     /// until something asks again. Errors propagate rather than publishing an empty set: a failed
     /// list means meka does not know what the server has, which is not the same as knowing it has
     /// nothing.
-    pub(crate) async fn refresh_server_tools(&self, server_name: &str) -> Result<usize> {
-        let adapters = self.discover_tools_for_server(server_name).await?;
+    pub(crate) async fn refresh_server_tools(&self, entry: &Arc<ServerEntry>) -> Result<usize> {
+        let adapters =
+            connector::build_mcp_tools(entry, self.mcp_default_permission, self.request_timeout())
+                .await?;
         let count = adapters.len();
-        self.register_server_tools(server_name, adapters).await;
+        self.register_server_tools(entry, adapters).await;
         Ok(count)
     }
 
@@ -1224,10 +1451,11 @@ impl McpClientManager {
         &self,
         server_name: &str,
     ) -> Result<Vec<McpTool>> {
-        let Some(entry) = self.servers.get(server_name) else {
+        let Some(entry) = self.entry(server_name) else {
             return Ok(Vec::new());
         };
-        connector::build_mcp_tools(entry, self.mcp_default_permission, self.request_timeout()).await
+        connector::build_mcp_tools(&entry, self.mcp_default_permission, self.request_timeout())
+            .await
     }
 
     /// [`Self::discover_tools_for_server`], classified the way the connector classifies a listing.
@@ -1255,7 +1483,7 @@ impl McpClientManager {
         server_name: &str,
         connect_timeout: std::time::Duration,
     ) -> Result<ServerState> {
-        let Some(entry) = self.servers.get(server_name).cloned() else {
+        let Some(entry) = self.entry(server_name) else {
             return Err(MekaError::McpConnection {
                 server_name: server_name.to_string(),
                 message: self.unknown_server(server_name),
@@ -1338,7 +1566,7 @@ impl McpClientManager {
         &self,
         server_name: &str,
     ) -> Result<Vec<AdvertisedTool>> {
-        let Some(entry) = self.servers.get(server_name) else {
+        let Some(entry) = self.entry(server_name) else {
             return Err(MekaError::McpConnection {
                 server_name: server_name.to_string(),
                 message: self.unknown_server(server_name),
@@ -1438,7 +1666,7 @@ impl McpClientManager {
             );
         }
 
-        for (server_name, entry) in &self.servers {
+        for (server_name, entry) in self.entries() {
             // Only Connected entries have a service to close; Pending / Failed / Disabled entries
             // are tear-down no-ops. Taken under the write lock so a concurrent reconnect can't
             // hand this loop a service it is about to replace.
@@ -1464,7 +1692,7 @@ impl McpClientManager {
             }
 
             match Arc::try_unwrap(service) {
-                Ok(owned_service) => close_service(server_name, owned_service).await,
+                Ok(owned_service) => close_service(&server_name, owned_service).await,
                 Err(_arc) => {
                     tracing::debug!(
                         "MCP server '{server_name}' still had in-flight calls after {SHUTDOWN_GRACE:?}; \
@@ -1506,8 +1734,8 @@ pub(crate) struct McpClientContext {
     pub(crate) progress: progress::ProgressRegistry,
     /// What servers have reported changed, for `mcp_resource_updates_list`.
     pub(crate) resource_updates: resource_updates::ResourceUpdates,
-    /// Who completes an interactive login, when anyone can. See [`auth::LoginPrompt`].
-    login_prompt: OnceLock<Arc<dyn auth::LoginPrompt>>,
+    /// Who completes an interactive login, when anyone can. See [`crate::oauth::LoginPrompt`].
+    login_prompt: OnceLock<Arc<dyn crate::oauth::LoginPrompt>>,
 }
 
 impl McpClientContext {
@@ -1517,13 +1745,13 @@ impl McpClientContext {
 
     /// Install the one prompt that can complete an interactive login. Only `meka mcp login` has
     /// one; a second install is a programming error and is ignored with a warning.
-    pub(crate) fn set_login_prompt(&self, prompt: Arc<dyn auth::LoginPrompt>) {
+    pub(crate) fn set_login_prompt(&self, prompt: Arc<dyn crate::oauth::LoginPrompt>) {
         if self.login_prompt.set(prompt).is_err() {
             tracing::warn!("MCP client context: login prompt already set");
         }
     }
 
-    pub(crate) fn login_prompt(&self) -> Option<Arc<dyn auth::LoginPrompt>> {
+    pub(crate) fn login_prompt(&self) -> Option<Arc<dyn crate::oauth::LoginPrompt>> {
         self.login_prompt.get().cloned()
     }
 
@@ -2299,11 +2527,13 @@ mod tests {
     fn pending_entry_for(config: McpServerConfig) -> Arc<ServerEntry> {
         Arc::new(ServerEntry {
             server_name: config.name.clone(),
+            configured: config.clone(),
             config,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            removed: CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
@@ -2359,11 +2589,7 @@ mod tests {
         .await
         .expect("prepare");
         context.set_manager(Arc::downgrade(&manager));
-        let entry = manager
-            .servers
-            .get("notion")
-            .cloned()
-            .expect("the configured entry");
+        let entry = manager.entry("notion").expect("the configured entry");
 
         // No registry attached yet: `build_shared_deps` starts the connector before any session
         // exists, so this is the ordering that made the marks vanish.
@@ -2432,11 +2658,7 @@ mod tests {
             .await
             .expect("prepare");
             context.set_manager(Arc::downgrade(&manager));
-            let entry = manager
-                .servers
-                .get("notion")
-                .cloned()
-                .expect("the configured entry");
+            let entry = manager.entry("notion").expect("the configured entry");
             connector::connect_one(
                 Arc::clone(&entry),
                 Arc::clone(&manager),
@@ -2466,6 +2688,89 @@ mod tests {
             }
         }
     }
+    /// A server removed while its connect is in flight does not come up under the removal: the
+    /// connection the connect finishes is closed rather than adopted, so no transport, no child
+    /// process and no tool outlives the entry the operator took out.
+    #[tokio::test]
+    async fn a_server_removed_while_connecting_is_not_adopted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path().join("stub.json");
+        std::fs::write(&state, r#"{"tools": ["search"]}"#).expect("write the stub's state");
+        let mut config = McpServerConfig::for_test("stub");
+        config.transport = McpTransport::Stdio;
+        config.url = None;
+        config.command = Some("python3".to_string());
+        config.args = Some(vec![
+            format!(
+                "{}/tests/fixtures/mcp_stub_server.py",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            state.display().to_string(),
+        ]);
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        let entry = manager.entry("stub").expect("the configured entry");
+        manager
+            .remove_server("stub")
+            .await
+            .expect("the configured entry is removed");
+        connector::connect_one(
+            Arc::clone(&entry),
+            Arc::clone(&manager),
+            None,
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            !matches!(entry.state().await, ServerState::Connected { .. }),
+            "a removed server's connect must not be adopted: {}",
+            entry.state().await.label()
+        );
+        assert!(
+            !manager.tools_snapshot.read().await.contains_key("stub"),
+            "a removed server registers no tools"
+        );
+        assert!(manager.server_names().is_empty());
+    }
+
+    /// The doors that show or edit an entry read it as `config.toml` states it: a `${VAR}` the
+    /// connect expands stays a reference there, since what it expands to may be the secret the
+    /// reference keeps out of the file.
+    #[tokio::test]
+    async fn the_entry_the_doors_read_keeps_its_references_unexpanded() {
+        let mut config = McpServerConfig::for_test("vault");
+        config.url = Some("https://example.test/${MEKA_TEST_UNSET_SECRET:-expanded}".to_string());
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        let entry = manager.entry("vault").expect("the configured entry");
+        assert_eq!(
+            entry.config.url.as_deref(),
+            Some("https://example.test/expanded"),
+            "the connect reads the expanded value"
+        );
+        assert_eq!(
+            manager.server_configs()[0].url.as_deref(),
+            Some("https://example.test/${MEKA_TEST_UNSET_SECRET:-expanded}"),
+            "the doors read the reference"
+        );
+    }
+
     /// A reconnect is a new session with the server, and its tool set is only knowable by asking.
     ///
     /// Ending the reconnect path at the transport is justified by "the tool adapters already exist
@@ -2517,11 +2822,7 @@ mod tests {
         context.set_manager(Arc::downgrade(&manager));
         let registry = crate::tools::ToolRegistry::new();
         crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
-        let entry = manager
-            .servers
-            .get("stub")
-            .cloned()
-            .expect("the configured entry");
+        let entry = manager.entry("stub").expect("the configured entry");
 
         connector::connect_one(
             Arc::clone(&entry),
@@ -2886,11 +3187,13 @@ mod tests {
         config.args = Some(vec!["3".to_string()]);
         Arc::new(ServerEntry {
             server_name: name.to_string(),
+            configured: config.clone(),
             config,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            removed: CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
@@ -3241,7 +3544,7 @@ mod tests {
     async fn a_registry_attaching_after_discovery_still_learns_which_tools_are_deferred() {
         let context = McpClientContext::new();
         let manager = McpClientManager::prepare(
-            &[],
+            &[McpServerConfig::for_test("notion")],
             None,
             None,
             context,
@@ -3249,9 +3552,10 @@ mod tests {
         )
         .await
         .expect("prepare");
+        let notion = manager.entry("notion").expect("the configured entry");
 
         manager
-            .update_server_tools("notion", ServerTools {
+            .update_server_tools(&notion, ServerTools {
                 tools: vec![
                     fixture_tool("mcp__notion__search"),
                     fixture_tool("mcp__notion__create_page"),
@@ -3287,11 +3591,16 @@ mod tests {
     async fn attach_registry_races_with_update_without_losing_tools() {
         use std::sync::Arc;
 
-        // Empty config: we don't need real servers to exercise the snapshot/registry plumbing,
-        // just the manager methods.
+        // Configured and never connected: the snapshot/registry plumbing is what is exercised,
+        // and a publish is taken only from an entry the manager holds.
+        let server_names: Vec<String> = (0..4).map(|index| format!("srv-{index}")).collect();
+        let configs: Vec<McpServerConfig> = server_names
+            .iter()
+            .map(|name| McpServerConfig::for_test(name))
+            .collect();
         let context = McpClientContext::new();
         let manager = McpClientManager::prepare(
-            &[],
+            &configs,
             None,
             None,
             context,
@@ -3299,8 +3608,6 @@ mod tests {
         )
         .await
         .expect("prepare");
-
-        let server_names: Vec<String> = (0..4).map(|index| format!("srv-{index}")).collect();
         let registry_count = 8;
         let registries: Vec<crate::tools::ToolRegistry> = (0..registry_count)
             .map(|_| crate::tools::ToolRegistry::new())
@@ -3312,8 +3619,9 @@ mod tests {
             let manager = Arc::clone(&manager);
             let name = name.clone();
             update_handles.push(tokio::spawn(async move {
+                let entry = manager.entry(&name).expect("the configured entry");
                 manager
-                    .update_server_tools(&name, ServerTools {
+                    .update_server_tools(&entry, ServerTools {
                         tools: vec![fixture_tool(&format!("mcp__{name}__ping"))],
                         deferred: Vec::new(),
                     })
@@ -3459,11 +3767,7 @@ mod tests {
             context.set_manager(Arc::downgrade(&manager));
             let registry = crate::tools::ToolRegistry::new();
             crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
-            let entry = manager
-                .servers
-                .get("stub")
-                .cloned()
-                .expect("the configured entry");
+            let entry = manager.entry("stub").expect("the configured entry");
             let stub = Self {
                 state: path,
                 log,
@@ -3731,6 +4035,50 @@ mod tests {
         assert!(
             matches!(stub.entry.state().await, ServerState::Pending),
             "nothing is recorded against a server that was never given its chance"
+        );
+    }
+
+    /// A connect still in flight when its server is removed ends with the removal, and the child
+    /// it was spawning dies, rather than running to its bound on an entry nothing holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_removal_ends_a_connect_in_flight_and_its_child() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "ignore_probe": true
+        }))
+        .await;
+        let marker = stub.state.display().to_string();
+        let children = move || -> usize {
+            std::process::Command::new("pgrep")
+                .args(["-f", &marker])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).lines().count())
+                .unwrap_or(0)
+        };
+        let connecting = tokio::spawn({
+            let entry = Arc::clone(&stub.entry);
+            let manager = Arc::clone(&stub.manager);
+            async move {
+                connector::connect_one(entry, manager, None, std::time::Duration::from_secs(60))
+                    .await;
+            }
+        });
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || children() >= 1).await,
+            "the probe child was never spawned"
+        );
+        stub.manager.remove_server("stub").await.expect("remove");
+        tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+            .await
+            .expect("the connect ends with the removal rather than running its course")
+            .expect("the connect task");
+        assert!(
+            eventually(std::time::Duration::from_secs(3), async || children() == 0).await,
+            "the child outlived the removal"
+        );
+        assert!(
+            matches!(stub.entry.state().await, ServerState::Disabled),
+            "the entry is left as a removal leaves it"
         );
     }
 

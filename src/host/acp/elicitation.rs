@@ -220,6 +220,7 @@ mod tests {
             server_name: "srv".to_string(),
             kind: ElicitationKind::Form { schema },
             message: "fill this in".to_string(),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         }
     }
 
@@ -231,6 +232,7 @@ mod tests {
                 url: "https://example.com/oauth".to_string(),
             },
             message: "authorize meka".to_string(),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         };
         let request = to_acp_request(&prompt, &session_id()).expect("url always converts");
         assert_eq!(request.message, "authorize meka");

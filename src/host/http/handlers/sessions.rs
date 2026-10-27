@@ -134,6 +134,11 @@ pub(crate) struct CapabilitiesBody {
     /// the last attending reader leaves. Default `false`.
     #[serde(default)]
     pub(crate) answers_prompts_on_return: bool,
+    /// When `true`, an MCP server's elicitation parks as an `elicitation_required` event for an
+    /// attending client to answer at the responses route, as an approval does; when `false` it
+    /// is declined with a notice. Default `false`.
+    #[serde(default)]
+    pub(crate) supports_elicitation: bool,
 }
 
 /// `#[serde(default)]` on a `bool` yields `false`; this is for the fields that default to `true`.
@@ -147,6 +152,7 @@ impl Default for CapabilitiesBody {
             supports_reasoning_stream: false,
             supports_permission_prompts: true,
             answers_prompts_on_return: false,
+            supports_elicitation: false,
         }
     }
 }
@@ -157,6 +163,7 @@ impl From<CapabilitiesBody> for SessionCapabilities {
             supports_reasoning_stream: body.supports_reasoning_stream,
             supports_permission_prompts: body.supports_permission_prompts,
             answers_prompts_on_return: body.answers_prompts_on_return,
+            supports_elicitation: body.supports_elicitation,
         }
     }
 }
@@ -198,10 +205,11 @@ pub(crate) struct SessionResponse {
     /// client asks a session it is driving; a listing does not pay a query per row for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) inbox_pending: Option<u64>,
-    /// Approval prompts parked on this session, waiting for a person. Reported for a session this
-    /// process holds, on the listing too, since the count is a fact of the resident frontend and
-    /// costs no query; it is what lets a session list say "waiting on a person" without a feed
-    /// per row. The prompts themselves are on the feed, which replays every one still parked.
+    /// Prompts parked on this session, approvals and elicitations, waiting for a person. Reported
+    /// for a session this process holds, on the listing too, since the count is a fact of the
+    /// resident frontend and costs no query; it is what lets a session list say "waiting on a
+    /// person" without a feed per row. The prompts themselves are on the feed, which replays
+    /// every one still parked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) approvals_pending: Option<u64>,
     /// The open checklist: every item the agent has committed to and not yet disposed of. Reported
@@ -338,16 +346,23 @@ pub(crate) async fn create_session(
         Some(name) => {
             // Before the row is written: a name that resolves to nothing would fail every later
             // turn on this session, and the write is what makes it stick.
-            crate::config::require_profile(&name, &state.shared.config.profiles).map_err(
-                |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
-            )?;
+            state
+                .shared
+                .providers
+                .require_profile(&name)
+                .map_err(|error| {
+                    ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+                })?;
             name
         }
-        None => state
-            .shared
-            .default_profile()
-            .map_err(|error| ProblemDetail::internal_sanitized("no default profile", error))?
-            .to_string(),
+        // The configuration's own sentence, as the 422 every other profile refusal is: an
+        // installation with no default has a profile for this session only if the body names one.
+        None => state.shared.default_profile().map_err(|error| {
+            ProblemDetail::for_error(
+                &crate::error::MekaError::Config(error.to_string()),
+                state.config.relay_provider_errors,
+            )
+        })?,
     };
     // The project, checked before the row is written for the reason the profile is; empty is
     // the one spelling for none, as it is on a `PATCH`.
@@ -1257,9 +1272,13 @@ async fn patch_dormant_session(
         None => None,
     };
     if let Some(profile) = profile {
-        crate::config::require_profile(profile, &state.shared.config.profiles).map_err(
-            |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
-        )?;
+        state
+            .shared
+            .providers
+            .require_profile(profile)
+            .map_err(|error| {
+                ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+            })?;
         let resolved =
             crate::provider::resolved_profile(&state.shared.providers, profile.to_string())
                 .await
@@ -1513,9 +1532,13 @@ pub(crate) async fn patch_session(
     // covers a missing credential as well as a missing profile.
     let new_profile = match body.profile.as_deref() {
         Some(name) => {
-            crate::config::require_profile(name, &state.shared.config.profiles).map_err(
-                |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
-            )?;
+            state
+                .shared
+                .providers
+                .require_profile(name)
+                .map_err(|error| {
+                    ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+                })?;
             // The profile as configured. A `PATCH` naming a profile moves the session to that
             // bundle entire, which is the only thing naming a profile can mean. Its failure is
             // discriminated rather than a blanket 422: `resolved_profile` reaches the credential

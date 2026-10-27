@@ -1043,6 +1043,7 @@ pub(crate) async fn import(
     // surface here, as 422 rather than 500: the envelope is the caller's, so a rejection is a
     // statement about their input. An archive that names no profile adopts this server's default,
     // which is the same profile `POST /v1/sessions` gives a body that names none.
+    let catalog = state.shared.providers.catalog();
     let crate::store::export::ImportPlan {
         records,
         blobs,
@@ -1051,8 +1052,8 @@ pub(crate) async fn import(
         export,
         crate::store::export::ImportInstallation {
             selected: None,
-            default: state.shared.default_profile.as_deref(),
-            configured: Some(&state.shared.config.profiles),
+            default: catalog.default_profile.as_deref().ok(),
+            configured: Some(&catalog.profiles),
             projects: state.shared.store.project_names().await.map_err(|error| {
                 ProblemDetail::internal_sanitized("failed to list projects", error)
             })?,

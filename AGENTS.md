@@ -468,7 +468,10 @@ entry to add.
 ## Layering
 
 The tree reads top-down. `src/main.rs` dispatches to `host/` and `cli/`; the screen's slash commands
-run the `cli` handlers, so `host` sits above `cli`. Both call `agent`, which calls `tools`, which
+run the `cli` handlers, so `host` sits above `cli`. Both edit the installation (`config.toml`'s
+accounts, profiles and MCP servers, and the credential rows) through `installation`, below them and
+above `mcp`: a prompt belongs to `cli`, a request body to `host`, the door to neither. Both call
+`agent`, which calls `tools`, which
 calls `provider` and `mcp`, which call `store`. `mcp` publishes its tools and never names a registry;
 `tools/mcp_adapter.rs` is where they become `Tool`s. `render` is reached only from `host`, `cli`
 and the frontend implementations; `streams` is the leaf that writes stderr for

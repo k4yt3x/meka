@@ -11,6 +11,11 @@ are resolved.
 
 ## `meka mcp` CLI
 
+A running `meka serve` offers the same verbs over HTTP, on `/v1/mcp` under the `config:w` scope,
+and a server added, changed or removed there joins, restarts on or leaves the running manager
+without a restart; see
+[Managing the installation](http-api.md#managing-the-installation).
+
 Manage configured servers without editing `config.toml` by hand:
 
 | Command | Action |
@@ -23,7 +28,7 @@ Manage configured servers without editing `config.toml` by hand:
 | `meka mcp enable <name>` | Clear the `disabled` flag, so the server connects on the next start. |
 | `meka mcp reconnect <name>` | Smoke-test a connect; exits non-zero with the error when it fails. |
 | `meka mcp tools <name> [--format json]` | Connect and list every advertised tool with its resolved permission, the chain step that decided it, and whether the current config allows it. Useful for populating `--allow-tool`, `--disable-tool`, or `--tool-permission` overrides without leaving the CLI. Under `json`, the object `GET /v1/mcp/{name}/tools` answers with (`server`, `tools[]` of `raw_name`, `description`, `required_permission`, `permission_source`, `allowed`, `loading`) plus `read_only_hint_declined`. |
-| `meka mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. With `--auth-token-stdin` or `--client-secret-stdin`, stores that secret and exits instead, which is also how you rotate one. |
+| `meka mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. With `--auth-token-stdin` or `--client-secret-stdin`, stores that secret and exits instead, which is also how you rotate one. A pasted callback the flow cannot read, or one carrying another login's state, is refused and asked for again. |
 | `meka mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear every stored credential for the server. |
 
 ### Credentials
@@ -126,8 +131,10 @@ authorized 'notion'
 On the screen:
 - `/mcp list` (or a bare `/mcp`): a picker of the configured servers with their state; Enter offers reconnect, login and logout for the picked one.
 - `/mcp reconnect <server>`: reconnect smoke-test.
-- `/mcp login <server>` / `/mcp logout <server>`: run the auth flow or revoke. On the screen the
-  URL and the paste field above are one question in the composer's place; Esc on it ends the login.
+- `/mcp login <server>` / `/mcp logout <server>`: run the auth flow or revoke; a login that stores
+  its credential restarts the screen's connection to the server with it. On the screen the
+  URL and the paste field above are one question in the composer's place; Esc on it ends the login,
+  and a paste the flow cannot read, or one carrying another login's state, is refused and asked again.
 - `/mcp <server>:<prompt> [args...]`: render a server-defined prompt as the next user turn.
 
 ## Resources and prompts
@@ -173,5 +180,5 @@ Both are tuning knobs: rarely needed, but useful if you're running ~30 stdio ser
 
 | Feature | meka behavior |
 |---------|----------------|
-| `elicitation/create` | Routed to the calling session's frontend (screen / ACP form or URL prompt) with a 60s timeout, when the server's in-flight tool calls all come from one session. Declined, with a warning, when no tool call is in flight, when the user does not answer in time, or when two sessions have calls in flight on the same server: the protocol ties an elicitation to nothing that names the call that provoked it, so routing it would be a guess. |
+| `elicitation/create` | Routed to the calling session's frontend (screen / ACP form or URL prompt, or an HTTP session's `elicitation_required` event when it declared `supports_elicitation`) with a 60s timeout, when the server's in-flight tool calls all come from one session. Declined, with a warning, when no tool call is in flight, when the user does not answer in time, or when two sessions have calls in flight on the same server: the protocol ties an elicitation to nothing that names the call that provoked it, so routing it would be a guess. |
 | `input_required` | How a 2026-07-28 server asks: inside the answer to `tools/call`, `resources/read` or `prompts/get`, instead of with a request of its own. An elicitation in a tool call's answer goes to the same prompt as above, and the call is sent again with the user's answer and the server's opaque state, up to ten rounds, all under the one tool-call timeout; an interrupt ends the wait for an answer as it ends the call. In a resource read or a prompt render there is no call to route it to, so it is declined. Sampling and roots are never asked for, because meka declares neither. |

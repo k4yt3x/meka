@@ -25,6 +25,8 @@ use super::{
 /// Kept sorted, and kept in lockstep with the scope table in the HTTP API docs and the `bearerAuth`
 /// description in [`crate::host::http::openapi`].
 pub(crate) const KNOWN_SCOPES: &[&str] = &[
+    "config:r",
+    "config:w",
     "mcp:r",
     "mcp:w",
     "memory:r",
@@ -43,8 +45,14 @@ pub(crate) const KNOWN_SCOPES: &[&str] = &[
 /// Any read scope is enough, deliberately: a token configured with `sessions:r` so a client can
 /// list sessions should also be able to see which model it is talking to, without an operator
 /// having to also grant `mcp:r` and `skills:r` for what is not sensitive information.
-pub(crate) const ANY_READ_SCOPES: &[&str] =
-    &["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r"];
+pub(crate) const ANY_READ_SCOPES: &[&str] = &[
+    "sessions:r",
+    "mcp:r",
+    "skills:r",
+    "memory:r",
+    "schedule:r",
+    "config:r",
+];
 
 // `ProblemDetail` is ~128 bytes and only constructed on the rejection path. Same trade-off as
 // `extract_bearer` in auth.rs; see the rationale there.
@@ -85,6 +93,12 @@ pub(crate) trait Required: Send + Sync + 'static {
     const SCOPES: &'static [&'static str];
 }
 
+/// `config.toml`'s accounts, profiles and MCP servers, and the instructions file: the
+/// installation itself.
+pub(crate) struct ConfigRead;
+/// Writes to the same. The widest grant on the API: an MCP server added as a command runs that
+/// command as the user `meka serve` runs as.
+pub(crate) struct ConfigWrite;
 pub(crate) struct McpRead;
 pub(crate) struct McpWrite;
 pub(crate) struct MemoryRead;
@@ -98,6 +112,12 @@ pub(crate) struct SkillsWrite;
 /// Any read scope at all: the read-only surfaces that describe the server rather than a store.
 pub(crate) struct AnyRead;
 
+impl Required for ConfigRead {
+    const SCOPES: &'static [&'static str] = &["config:r"];
+}
+impl Required for ConfigWrite {
+    const SCOPES: &'static [&'static str] = &["config:w"];
+}
 impl Required for McpRead {
     const SCOPES: &'static [&'static str] = &["mcp:r"];
 }

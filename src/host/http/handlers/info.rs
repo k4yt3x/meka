@@ -32,6 +32,24 @@ pub(crate) struct InfoResponse {
     /// The scopes the calling token holds, sorted. A client otherwise learns what it may do by
     /// collecting 403s.
     pub(crate) scopes: Vec<String>,
+    /// `config.toml`'s path, for a client that administers the installation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) config_path: Option<String>,
+    /// The data directory, where the store lives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) data_dir: Option<String>,
+    /// When this process read `config.toml` whole, RFC 3339: its start.
+    pub(crate) config_loaded_at: String,
+    /// When `config.toml` was last written, RFC 3339; absent when there is no file. Later than
+    /// `config_loaded_at` means the file has changed since this process read it whole, by a
+    /// write of its own, which it serves, or by a shell's, which waits for a restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) config_modified_at: Option<String>,
+}
+
+/// `when` as the wire carries a time.
+fn rfc3339(when: chrono::DateTime<chrono::Utc>) -> String {
+    when.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// `GET /v1/info`: server identity and the permission surface. Authenticated; admits any token
@@ -51,7 +69,7 @@ pub(crate) struct InfoResponse {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r"]))
+    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r", "config:r"]))
 )]
 pub(crate) async fn info(
     State(state): State<ServerState>,
@@ -60,6 +78,12 @@ pub(crate) async fn info(
     let config = &state.shared.config;
     let mut scopes: Vec<String> = scoped.principal.scopes.to_vec();
     scopes.sort_unstable();
+    let config_path = crate::paths::config_file_path();
+    let config_modified_at = config_path
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .map(|modified| rfc3339(chrono::DateTime::<chrono::Utc>::from(modified)));
     Ok(Json(InfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         default_permission: config.permission.to_string(),
@@ -69,6 +93,10 @@ pub(crate) async fn info(
             .map(|p| p.to_string())
             .collect(),
         scopes,
+        config_path: config_path.map(|path| path.display().to_string()),
+        data_dir: crate::paths::meka_data_dir().map(|path| path.display().to_string()),
+        config_loaded_at: rfc3339(state.started_at),
+        config_modified_at,
     }))
 }
 
@@ -84,7 +112,7 @@ pub(crate) async fn info(
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r"]))
+    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r", "config:r"]))
 )]
 pub(crate) async fn skills(
     State(state): State<ServerState>,
@@ -119,7 +147,7 @@ pub(crate) struct McpServerStateView {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r"]))
+    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r", "config:r"]))
 )]
 pub(crate) async fn mcp(
     State(state): State<ServerState>,

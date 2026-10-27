@@ -156,7 +156,8 @@ pub(crate) fn status_of(kind: ErrorKind) -> StatusCode {
         | ErrorKind::Idempotency
         | ErrorKind::InboxAppended
         | ErrorKind::TurnMismatch
-        | ErrorKind::StoreReadOnly => StatusCode::CONFLICT,
+        | ErrorKind::StoreReadOnly
+        | ErrorKind::AccountInUse => StatusCode::CONFLICT,
         ErrorKind::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
         ErrorKind::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         ErrorKind::InvalidBody | ErrorKind::SessionNotDrivable | ErrorKind::RequestTooLarge => {

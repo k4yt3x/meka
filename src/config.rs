@@ -25,10 +25,10 @@ mod serve;
 #[cfg(test)]
 pub(crate) use profile::PROFILE_KEY_ORDER;
 pub(crate) use profile::{
-    ANTHROPIC_MAX_REQUEST_BYTES, AccountConfig, Backend, DEFAULT_CONTEXT_WINDOW, ProfileConfig,
-    ProfileRequest, ProfileSettings, account_for, default_profile_on_disk, require_model,
-    require_profile, resolve_device_id, resolve_profile, select_profile, sort_account_keys,
-    sort_profile_keys, validate_max_output_tokens,
+    ANTHROPIC_MAX_REQUEST_BYTES, AccountConfig, Backend, DEFAULT_CONTEXT_WINDOW, ProfileCatalog,
+    ProfileConfig, ProfileRequest, ProfileSettings, account_for, default_profile_on_disk,
+    require_model, require_profile, resolve_device_id, resolve_profile, select_profile,
+    sort_account_keys, sort_profile_keys, validate_max_output_tokens,
 };
 
 pub(crate) use self::{mcp::*, serve::*};
@@ -1649,6 +1649,8 @@ pub(crate) struct CliOverrides {
     pub(crate) continue_last: bool,
     pub(crate) prompt: Option<String>,
     pub(crate) oneshot: bool,
+    /// `meka serve`, the host whose sessions each name their profile.
+    pub(crate) serve: bool,
 }
 
 /// What one invocation asked for: the prompt, the session to resume, and the overrides the command
@@ -1694,6 +1696,12 @@ pub(crate) struct RunRequest {
     /// CLI-flag override for `[serve].bind` (`meka serve --bind ...`). Wins over the config file
     /// when set.
     pub(crate) serve_bind_override: Option<String>,
+    /// Set for `meka serve`, whose sessions each name their profile on `POST /v1/sessions` or
+    /// take the default there: the default is asked for per creation, so its absence refuses that
+    /// creation and not the process, which an installation managed over the API brings up before
+    /// it has a profile at all. A `--profile` on the command line is still held to naming one at
+    /// startup, since a typo there is the operator's to fix and nothing over the API can.
+    pub(crate) profile_named_per_session: bool,
 }
 
 /// One configured profile as a listing shows it: its name, the account it bills, that account's
@@ -1734,6 +1742,10 @@ pub(crate) struct ResolvedConfig {
     /// side -p "..."` would otherwise move a whole history onto `side` because of one run.
     /// Everything else wants [`Self::default_profile`], where the flag is the point.
     pub(crate) configured_default_profile: Option<String>,
+    /// The accounts, the profiles and the default as one selection, which the hosts hand to the
+    /// provider registry and replace there after a write of their own; [`Self::accounts`] and
+    /// [`Self::profiles`] are the same maps for a reader that holds the config alone.
+    pub(crate) catalog: std::sync::Arc<ProfileCatalog>,
     /// Every configured account, by name. A profile's credential is stored under its account.
     pub(crate) accounts: std::collections::BTreeMap<String, AccountConfig>,
     /// Every configured profile, by name.
@@ -2487,19 +2499,19 @@ fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServer
 impl ResolvedConfig {
     pub(crate) fn resolve(overrides: CliOverrides) -> Self {
         let (config_file, config_error) = load_config_file();
+        // `--profile`, else `default_profile`, else the sole profile, followed through its
+        // account: the one selection, made here and replaced on a host only by a write of its
+        // own. A miss is a deferred error `validate()` raises, so `resolve` stays infallible.
+        let catalog = std::sync::Arc::new(ProfileCatalog::from_file(
+            &config_file,
+            overrides.profile.as_deref(),
+        ));
+        let (default_profile, mut provider_error) = match &catalog.default_profile {
+            Ok(name) => (Some(name.clone()), None),
+            Err(error) => (None, Some(error.clone())),
+        };
         let accounts = config_file.accounts;
         let profiles = config_file.profiles;
-        // `--profile`, else `default_profile`, else the sole profile. A miss is a deferred error
-        // `validate()` raises, so `resolve` stays infallible.
-        let (profile_request, requested_active) = match overrides.profile.clone() {
-            Some(name) => (ProfileRequest::Flag, Some(name)),
-            None => (
-                ProfileRequest::DefaultProfile,
-                config_file.default_profile.clone(),
-            ),
-        };
-        let (default_profile, mut provider_error) =
-            select_profile(requested_active, profile_request, &profiles);
         // Resolved a second time without the flag, for the ledger. Its error is discarded: a
         // default nothing can pick is already reported by the resolution above, and the migration's
         // own fallbacks handle having no answer.
@@ -2699,6 +2711,7 @@ impl ResolvedConfig {
             backend,
             default_profile,
             configured_default_profile,
+            catalog,
             accounts,
             profiles,
             provider_error,
@@ -2793,6 +2806,7 @@ impl ResolvedConfig {
                 oneshot: overrides.oneshot,
                 output_format: overrides.output_format,
                 serve_bind_override: None,
+                profile_named_per_session: overrides.serve,
             },
             #[cfg(any(debug_assertions, feature = "mock-provider"))]
             mock_provider: mock_provider_override(),
@@ -2975,10 +2989,11 @@ impl ResolvedConfig {
     /// picked at all, that its backend is one meka speaks, and that it names a model.
     ///
     /// Skipped entirely for a resume, because a resumed session answers all three from its own row
-    /// and never reads [`Self::default_profile`]. Each is re-asked against the profile that
-    /// actually applies, with a message naming it: `require_profile` for the first,
-    /// [`crate::provider::ProviderBuilder::build`]'s fallthrough for the second,
-    /// [`crate::provider::ProviderRegistry::resolve`] for the third.
+    /// and never reads [`Self::default_profile`], and for a `meka serve` given no `--profile`,
+    /// whose sessions each name their profile or take the default at their creation. Each is
+    /// re-asked against the profile that actually applies, with a message naming it:
+    /// `require_profile` for the first, [`crate::provider::ProviderBuilder::build`]'s fallthrough
+    /// for the second, [`crate::provider::ProviderRegistry::resolve`] for the third.
     ///
     /// Firing these unconditionally would do two bad things. A session whose profile is still
     /// configured could not be resumed at all, though its row holds the answer and `meka session
@@ -2988,9 +3003,12 @@ impl ResolvedConfig {
     ///
     /// Deferred, not dropped: a resume that finds no session, or a row with no recorded profile,
     /// still needs a default, and `resolve_session_profile` carries [`Self::provider_error`] into
-    /// that path so the same guidance appears there.
+    /// that path so the same guidance appears there, as `POST /v1/sessions` does for a body that
+    /// names no profile.
     fn validate_default_profile(&self) -> crate::error::Result<()> {
-        if self.request.session_resume.is_some() {
+        if self.request.session_resume.is_some()
+            || (self.request.profile_named_per_session && self.request.requested_profile.is_none())
+        {
             return Ok(());
         }
         if let Some(error) = &self.provider_error {

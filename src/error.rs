@@ -253,6 +253,9 @@ pub(crate) enum ErrorKind {
     /// Distinct from [`Self::InvalidBody`]: the request is well-formed and the remedy is to pick
     /// another name or edit that file directly, not to fix the payload.
     StoreReadOnly,
+    /// A session resident on this server runs on the account, whose credential refreshes under
+    /// its name: renamed under the session, the next refresh would write to a row that is gone.
+    AccountInUse,
     /// The id names a sub-agent's conversation, which only its parent can continue.
     ///
     /// Distinct from [`Self::InvalidBody`] for the reason [`Self::StoreReadOnly`] is: the request
@@ -359,7 +362,7 @@ pub(crate) enum ErrorKind {
 
 impl ErrorKind {
     /// Every entry of the catalog, for a reader that holds a `type` and wants the kind back.
-    pub(crate) const ALL: [Self; 29] = [
+    pub(crate) const ALL: [Self; 30] = [
         Self::Auth,
         Self::AuthScope,
         Self::SessionNotFound,
@@ -376,6 +379,7 @@ impl ErrorKind {
         Self::InboxAppended,
         Self::TurnMismatch,
         Self::StoreReadOnly,
+        Self::AccountInUse,
         Self::SessionNotDrivable,
         Self::SubagentNotRunning,
         Self::InvalidBody,
@@ -416,6 +420,7 @@ impl ErrorKind {
             Self::InboxAppended => "inbox-appended",
             Self::TurnMismatch => "turn-mismatch",
             Self::StoreReadOnly => "store-read-only",
+            Self::AccountInUse => "account-in-use",
             Self::SessionNotDrivable => "session-not-drivable",
             Self::SubagentNotRunning => "subagent-not-running",
             Self::InvalidBody => "invalid-body",
@@ -451,6 +456,7 @@ impl ErrorKind {
             Self::InboxAppended => "https://meka.run/errors/inbox-appended",
             Self::TurnMismatch => "https://meka.run/errors/turn-mismatch",
             Self::StoreReadOnly => "https://meka.run/errors/store-read-only",
+            Self::AccountInUse => "https://meka.run/errors/account-in-use",
             Self::SessionNotDrivable => "https://meka.run/errors/session-not-drivable",
             Self::SubagentNotRunning => "https://meka.run/errors/subagent-not-running",
             Self::InvalidBody => "https://meka.run/errors/invalid-body",
@@ -486,6 +492,7 @@ impl ErrorKind {
             Self::InboxAppended => "Inbox item already appended",
             Self::TurnMismatch => "Turn is not the one in flight",
             Self::StoreReadOnly => "Skill is in a read-only directory",
+            Self::AccountInUse => "A resident session runs on the account",
             Self::SessionNotDrivable => "Session is a sub-agent's conversation",
             Self::SubagentNotRunning => "Sub-agent is not running here",
             Self::InvalidBody => "Invalid request body",

@@ -1732,7 +1732,7 @@ pub(super) async fn build_config_options(
     };
     let mut options = vec![
         permission_config_option(permission),
-        profile_config_option(&shared.config.profiles, &current_profile),
+        profile_config_option(&shared.providers.catalog().profiles, &current_profile),
     ];
     // Offered only where there is a project to pick, so an installation without any shows the
     // pickers it always had. Read from the store at every build, so a project added while the

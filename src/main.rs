@@ -36,6 +36,7 @@ mod frontend;
 mod fs;
 mod host;
 mod image;
+mod installation;
 mod instructions;
 mod mcp;
 mod memory;
@@ -504,7 +505,9 @@ async fn async_main(
     }
 
     let mcp_context = mcp::McpClientContext::new();
-    let mcp_manager = if !config.mcp_servers.is_empty() {
+    // `meka serve` holds a manager with no servers too: a server added over its API joins the
+    // running manager, which has to exist for that.
+    let mcp_manager = if serve_mode || !config.mcp_servers.is_empty() {
         let manager = mcp::McpClientManager::prepare(
             &config.mcp_servers,
             config.mcp_default_permission,

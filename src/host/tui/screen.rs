@@ -1417,6 +1417,7 @@ impl Screen {
                             schema: serde_json::Value::Null,
                         },
                         message: String::new(),
+                        deadline: tokio::time::Instant::now(),
                     },
                     responder: elicitation.responder,
                 }

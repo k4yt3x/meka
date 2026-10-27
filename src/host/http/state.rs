@@ -50,6 +50,16 @@ pub(crate) struct ServerState {
     /// The feeds of the sub-agents this process is running; see
     /// [`super::http_frontend::SubagentFeed`].
     pub(crate) child_feeds: super::http_frontend::ChildFeeds,
+    /// Browser logins begun over HTTP and waiting for the person to finish them; see
+    /// [`super::handlers::installation::PendingLogin`].
+    pub(crate) pending_logins: super::handlers::installation::PendingLogins,
+    /// Holds an MCP server's edit of `config.toml` together with the change it makes to the
+    /// running manager: the config lock is released between the two, and two writes interleaved
+    /// across it leave the manager running an entry the file no longer states, or refusing one it
+    /// has.
+    pub(crate) mcp_doors: Arc<tokio::sync::Mutex<()>>,
+    /// When this process started, which is when it read `config.toml` whole.
+    pub(crate) started_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// One session `meka serve` holds open: the shared [`ResidentSession`] plus what only the HTTP
@@ -101,6 +111,9 @@ impl ServerState {
                 stream_replay_events,
             ))),
             child_feeds: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_logins: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_doors: Arc::new(tokio::sync::Mutex::new(())),
+            started_at: chrono::Utc::now(),
         }
     }
 

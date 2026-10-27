@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- HTTP: `/v1/accounts` lists, adds, renames, removes and logs in accounts, under `config:w`.
+- HTTP: a subscription account logs in through the browser: a URL to open, then the code posted.
+- HTTP: `/v1/profiles` adds, changes, renames and removes profiles and sets the default.
+- HTTP: `/v1/mcp` adds, changes, removes, logs in and logs out MCP servers, under `config:w`.
+- A `config:r` and `config:w` scope pair for the installation; `config:r` reads the profiles too.
+- HTTP: a session with `supports_elicitation` gets an MCP elicitation as `elicitation_required`.
+- HTTP: `PUT /v1/instructions` writes `instructions.md`; sessions opened afterwards run under it.
+- `GET /v1/info` names `config_path`, `data_dir`, `config_loaded_at` and `config_modified_at`.
+
+### Changed
+
+- `meka serve` starts with no profile configured; a session that names none is refused instead.
+- An account or profile written over HTTP is served at once; a shell's edit still needs a restart.
+- An MCP server added, changed or removed over HTTP takes effect on the running server at once.
+- `meka account login` asks again after a paste that carries no code, as `meka mcp login` does.
+- OpenAPI: the responses body's `outcome` schema is `ResponseOutcome`, with elicitation answers.
+
+### Fixed
+
+- `meka mcp login` waits the 120 s it announces for the callback; the connect's bound cut it at 30.
+- `meka mcp add`, `remove`, `enable` and `disable` run on a config with an unknown key elsewhere.
+
 ## [0.84.0] - 2026-10-26
 
 ### Added
@@ -46,6 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Claude subscription parity moves to Claude Code 2.1.310.
 
 ### Fixed
+- `/mcp login` reconnects the screen's server with the credential the login stored.
+- `meka mcp login` and `/mcp login` ask again after a pasted callback they cannot read.
 
 - A thinking block that arrives mid-reply is stored where it arrived, as the live turn showed it.
 - Every tool reads a blank optional argument as left out and refuses a wrong type by field name.

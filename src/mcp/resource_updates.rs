@@ -53,6 +53,12 @@ impl ResourceUpdates {
         state.insert(key, stamp);
     }
 
+    /// Drop every update recorded for `server_name`: the server is out of the configuration, and
+    /// a URI of its would send the agent to re-read what no tool can reach.
+    pub(crate) fn forget(&self, server_name: &str) {
+        crate::sync::lock(&self.ledger).retain(|(server, _), _| server != server_name);
+    }
+
     /// Snapshot every recorded update. Returned entries are sorted by server name then URI for
     /// stable output.
     pub(crate) fn snapshot(&self) -> Vec<(String, String, u64)> {
@@ -70,6 +76,20 @@ impl ResourceUpdates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forgotten_server_s_updates_leave_the_snapshot() {
+        let updates = ResourceUpdates::default();
+        updates.record("gone", "file:///a");
+        updates.record("kept", "file:///b");
+        updates.forget("gone");
+        let servers: Vec<String> = updates
+            .snapshot()
+            .into_iter()
+            .map(|(server, ..)| server)
+            .collect();
+        assert_eq!(servers, vec!["kept".to_string()]);
+    }
 
     #[test]
     fn a_recorded_update_appears_in_the_snapshot() {

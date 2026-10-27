@@ -315,21 +315,12 @@ pub(super) struct CachedProvider {
 ///
 /// Reuse does not extend to a credential that has moved: see [`CachedProvider`].
 pub(crate) struct ProviderRegistry {
-    /// `config.toml`'s `[accounts.*]`, as they stood when this process started. A snapshot for
-    /// the reason [`Self::profiles`] gives.
-    pub(super) accounts: std::collections::BTreeMap<String, crate::config::AccountConfig>,
-    /// `config.toml`'s `[profiles.*]`, as they stood when this process started.
-    ///
-    /// A snapshot on purpose, and the one place in this file where that is the right answer.
-    /// `config.toml` is hand-edited and has no change feed; re-reading it per request would mean a
-    /// half-written file could take a running server's sessions down, and would make which account
-    /// a turn bills depend on when the turn happened to run. So a `meka profile add` while
-    /// `meka serve` is up is invisible to it until restart, and `POST /v1/sessions` answers "not
-    /// configured" about a profile `meka profile list` shows. Documented for users at
-    /// `docs/book/src/configuration/overview.md` § "When edits take effect"; the credential behind
-    /// an account is *not* snapshotted (see [`CachedProvider`]), because that one has a writer
-    /// meka owns.
-    pub(super) profiles: std::collections::BTreeMap<String, crate::config::ProfileConfig>,
+    /// The accounts and profiles every resolution reads, and the default they pick; see
+    /// [`crate::config::ProfileCatalog`] for why it is a snapshot and when it is replaced.
+    pub(super) catalog: std::sync::RwLock<Arc<crate::config::ProfileCatalog>>,
+    /// `--profile` on this run, which selects the default over `default_profile` each time the
+    /// catalog is replaced, as it did at startup.
+    pub(super) requested_profile: Option<String>,
     /// `[session].context_window`, which a profile's own value takes precedence over.
     pub(super) session_context_window: Option<u64>,
     /// `[thinking].budget`, the seed a profile stating no `thinking_budget` of its own
@@ -367,8 +358,8 @@ pub(crate) struct ProviderRegistry {
 impl ProviderRegistry {
     pub(crate) fn new(config: &crate::config::ResolvedConfig, token_store: TokenStore) -> Self {
         Self {
-            accounts: config.accounts.clone(),
-            profiles: config.profiles.clone(),
+            catalog: std::sync::RwLock::new(Arc::clone(&config.catalog)),
+            requested_profile: config.request.requested_profile.clone(),
             session_context_window: config.session_context_window,
             default_thinking_budget: config.default_thinking_budget,
             device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -380,6 +371,33 @@ impl ProviderRegistry {
             #[cfg(test)]
             scripted_by_profile: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The accounts and profiles as this process knows them right now. A reader holds the
+    /// snapshot it took, so one request sees one catalog.
+    pub(crate) fn catalog(&self) -> Arc<crate::config::ProfileCatalog> {
+        Arc::clone(&crate::sync::read(&self.catalog))
+    }
+
+    /// Replace the catalog with what a parsed `config.toml` holds, after a write this process
+    /// made to the file.
+    ///
+    /// The built providers are dropped with it: one built from an account or a profile the file
+    /// no longer states this way must not serve the next ask. A provider already handed to a
+    /// session stays with that session until it is evicted or repinned, as it does across a
+    /// rotated credential.
+    pub(crate) fn replace_catalog(&self, config_file: &crate::config::ConfigFile) {
+        let catalog = crate::config::ProfileCatalog::from_file(
+            config_file,
+            self.requested_profile.as_deref(),
+        );
+        *crate::sync::write(&self.catalog) = Arc::new(catalog);
+        crate::sync::lock(&self.built).clear();
+    }
+
+    /// Whether `name` is a configured profile, refused naming the configured ones otherwise.
+    pub(crate) fn require_profile(&self, name: &str) -> Result<()> {
+        crate::config::require_profile(name, &self.catalog().profiles).map(|_| ())
     }
 
     /// The profiles `profile` falls back to, in order; empty for one that names none or that is
@@ -420,9 +438,11 @@ impl ProviderRegistry {
     /// is a map read. An account whose `backend` does not parse is skipped; `settings` reports
     /// it.
     pub(crate) async fn preload_device_ids(&self) {
+        let catalog = self.catalog();
         let pending: Vec<(String, crate::config::AccountConfig)> = {
             let cache = crate::sync::lock(&self.device_ids);
-            self.accounts
+            catalog
+                .accounts
                 .iter()
                 .filter(|(name, account)| {
                     !cache.contains_key(*name)
@@ -465,10 +485,10 @@ impl ProviderRegistry {
         }
     }
 
-    /// Every configured profile's name, sorted, as `config.toml` stood when this process started:
-    /// what `agent_spawn` offers when the profile a sub-agent runs on is the agent's to choose.
+    /// Every configured profile's name, sorted, as the catalog stands: what `agent_spawn` offers
+    /// when the profile a sub-agent runs on is the agent's to choose.
     pub(crate) fn profile_names(&self) -> Vec<String> {
-        self.profiles.keys().cloned().collect()
+        self.catalog().profiles.keys().cloned().collect()
     }
 
     /// The settings of the profile a session's row names, refused by name when `config.toml` no
@@ -476,8 +496,9 @@ impl ProviderRegistry {
     /// because quietly running the conversation somewhere else is the failure this arrangement
     /// exists to prevent.
     pub(crate) fn settings(&self, profile: &str) -> Result<crate::config::ProfileSettings> {
-        let configured = crate::config::require_profile(profile, &self.profiles)?;
-        let account = crate::config::account_for(profile, configured, &self.accounts)
+        let catalog = self.catalog();
+        let configured = crate::config::require_profile(profile, &catalog.profiles)?;
+        let account = crate::config::account_for(profile, configured, &catalog.accounts)
             .map_err(MekaError::Config)?;
         crate::config::resolve_profile(
             configured,
@@ -617,11 +638,12 @@ impl ProviderRegistry {
     /// accounts. Not cached: the cache is keyed by profile, and a view is asked once by a command
     /// that then exits.
     pub(crate) async fn resolve_account(&self, name: &str) -> Result<(Arc<dyn Provider>, Backend)> {
-        let account = self.accounts.get(name).ok_or_else(|| {
+        let catalog = self.catalog();
+        let account = catalog.accounts.get(name).ok_or_else(|| {
             MekaError::Config(crate::text::unknown_name(
                 "account",
                 name,
-                self.accounts.keys(),
+                catalog.accounts.keys(),
             ))
         })?;
         let backend = account
@@ -702,8 +724,10 @@ impl ProviderRegistry {
         token_store: TokenStore,
     ) -> Self {
         Self {
-            accounts,
-            profiles,
+            catalog: std::sync::RwLock::new(Arc::new(crate::config::ProfileCatalog::select(
+                accounts, profiles, None, None,
+            ))),
+            requested_profile: None,
             session_context_window: None,
             default_thinking_budget: Some(4_096),
             device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),

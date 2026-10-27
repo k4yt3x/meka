@@ -16,15 +16,18 @@ use super::{McpRunningService, handler::MekaClientHandler};
 use crate::{
     config::McpAuthConfig,
     error::{MekaError, Result},
+    oauth::{Completion, LoginPrompt, Paste},
     store::TokenStore,
 };
 
 /// The server URL a stored OAuth bundle was issued for, if it records one.
 ///
-/// rmcp writes `server_url` (older bundles: `issuer`) into the credential it hands the store. The
-/// row is keyed by `(server_name, kind)` and nothing else: point `[[mcp_servers]]` named `docs` at
-/// a different host and the token minted for the old one is presented to the new one, so
-/// `meka mcp get` shows the origin beside the URL for the two to be compared.
+/// rmcp 3.5 writes `issuer`, the authorization server's issuer from its metadata, into the
+/// credential it hands the store, and leaves it out when discovery fell back to the origin's
+/// endpoints; a bundle an earlier rmcp wrote carries `server_url`. The row is keyed by
+/// `(server_name, kind)` and nothing else: point `[[mcp_servers]]` named `docs` at a different host
+/// and the token minted for the old one is presented to the new one, so `meka mcp get` shows the
+/// origin beside the URL for the two to be compared.
 ///
 /// Best-effort by design, and `None` in three different ways that all mean the same thing to a
 /// caller: no bundle, a bundle that is not JSON, or one from a version of rmcp that recorded
@@ -349,26 +352,6 @@ fn validate_revocation_endpoint_origin(
         ));
     }
     Ok(())
-}
-
-/// How an interactive login reaches the person who has to complete it.
-///
-/// Installed by `meka mcp login`, which is the one command that runs with a person at a terminal.
-/// A host installs none, so a server whose stored credential is missing is refused with that
-/// command as the remedy, rather than the connector printing a URL and reading a terminal nobody is
-/// watching.
-#[async_trait::async_trait]
-pub(crate) trait LoginPrompt: Send + Sync {
-    /// Show `url` to the person who has to authorize, who opens it where they choose.
-    fn authorize_at(&self, url: &str);
-    /// Say the callback is awaited for `seconds`, and whether a pasted callback URL is taken too.
-    fn awaiting_callback(&self, seconds: u64, accepts_paste: bool);
-    /// Whether a pasted callback URL can be read at all: a terminal on stdin, for a browser that
-    /// cannot reach the listener because meka runs on another host.
-    fn accepts_paste(&self) -> bool;
-    /// One pasted line. `Ok(None)` means nothing will ever be pasted (stdin closed), which leaves
-    /// the listener waiting alone.
-    async fn read_pasted_line(&self) -> std::result::Result<Option<String>, String>;
 }
 
 pub(super) async fn connect_http_with_oauth(
@@ -805,12 +788,17 @@ async fn authenticate_oauth_authorization_code(
 
     login_prompt.authorize_at(&auth_url);
 
-    let (code, state) = await_oauth_callback(callback_listener, login_prompt.as_ref())
-        .await
-        .map_err(|error| MekaError::McpAuth {
-            server_name: server_name.to_string(),
-            message: format!("OAuth callback failed: {error}"),
-        })?;
+    let expected_state = state_in_authorization_url(&auth_url);
+    let (code, state) = await_oauth_callback(
+        callback_listener,
+        login_prompt.as_ref(),
+        expected_state.as_deref(),
+    )
+    .await
+    .map_err(|error| MekaError::McpAuth {
+        server_name: server_name.to_string(),
+        message: format!("OAuth callback failed: {error}"),
+    })?;
 
     oauth_state
         .handle_callback(&code, &state)
@@ -836,7 +824,7 @@ const CRLF_CRLF: &[u8] = b"\r\n\r\n";
 
 /// Overall wall-clock budget for the OAuth callback wait, shared by both the TCP accept path and
 /// the paste-URL fallback.
-const OAUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const OAUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Wait for the authorization code.
 ///
@@ -849,18 +837,33 @@ const OAUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 async fn await_oauth_callback(
     listener: tokio::net::TcpListener,
     prompt: &dyn LoginPrompt,
+    expected_state: Option<&str>,
 ) -> std::result::Result<(String, String), String> {
     let deadline = tokio::time::Instant::now() + OAUTH_CALLBACK_TIMEOUT;
     let accepts_paste = prompt.accepts_paste();
-    prompt.awaiting_callback(OAUTH_CALLBACK_TIMEOUT.as_secs(), accepts_paste);
+    prompt.awaiting(Completion {
+        listener_seconds: Some(OAUTH_CALLBACK_TIMEOUT.as_secs()),
+        paste: accepts_paste.then_some(Paste::CallbackUrl),
+    });
     if !accepts_paste {
-        return accept_http_callback(listener, deadline).await;
+        return accept_http_callback(listener, expected_state, deadline).await;
     }
 
     tokio::select! {
-        result = accept_http_callback(listener, deadline) => result,
-        result = read_pasted_callback(prompt, deadline) => result,
+        result = accept_http_callback(listener, expected_state, deadline) => result,
+        result = read_pasted_callback(prompt, expected_state, deadline) => result,
     }
+}
+
+/// This login's `state`, as the authorization URL carries it: what a callback must bring back to be
+/// this login's, checked ahead of the exchange so a stale tab or another login's paste is refused
+/// and the wait goes on.
+fn state_in_authorization_url(auth_url: &str) -> Option<String> {
+    url::Url::parse(auth_url)
+        .ok()?
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
 }
 
 /// Accept one HTTP request on the bound listener, validate it's the OAuth callback, extract `code`
@@ -868,6 +871,7 @@ async fn await_oauth_callback(
 /// preflights) until the shared deadline elapses.
 async fn accept_http_callback(
     listener: tokio::net::TcpListener,
+    expected_state: Option<&str>,
     overall_deadline: tokio::time::Instant,
 ) -> std::result::Result<(String, String), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -942,6 +946,24 @@ async fn accept_http_callback(
 
         let request = String::from_utf8_lossy(&buffer);
         match parse_callback_query(&request) {
+            Ok((_, state)) if expected_state.is_some_and(|expected| expected != state.as_str()) => {
+                // A stale tab, or another login's browser: not this login's code, and refused
+                // ahead of the exchange so the one this login asked for is still waited on.
+                tracing::warn!("OAuth state mismatch; refusing the callback");
+                let response_body = "<!DOCTYPE html><html><body>\
+                    <h1>Authorization refused</h1>\
+                    <p>This callback is not the login meka is waiting for.</p>\
+                    </body></html>";
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                if let Err(error) = stream.write_all(response.as_bytes()).await {
+                    tracing::debug!("failed to send callback response: {error}");
+                }
+                continue;
+            }
             Ok((code, state)) => {
                 let response_body = "<!DOCTYPE html><html><body>\
                     <h1>Authorization successful</h1>\
@@ -983,36 +1005,51 @@ async fn accept_http_callback(
     }
 }
 
-/// Paste-URL fallback for the OAuth callback: read a line the prompt hands over and extract the
-/// `code` and `state` from the pasted URL, for a browser that cannot reach the bound listener.
+/// Paste-URL fallback for the OAuth callback, for a browser that cannot reach the bound listener:
+/// read lines the prompt hands over until one carries a code and this login's `state`, refusing
+/// every other through the prompt and reading again, as the account flows do, since a line the
+/// person mistyped spends nothing.
 async fn read_pasted_callback(
     prompt: &dyn LoginPrompt,
+    expected_state: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> std::result::Result<(String, String), String> {
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(format!(
-            "authorization timed out after {}s",
-            OAUTH_CALLBACK_TIMEOUT.as_secs()
-        ));
-    }
-    match tokio::time::timeout(remaining, prompt.read_pasted_line()).await {
-        Err(_) => Err(format!(
-            "authorization timed out after {}s",
-            OAUTH_CALLBACK_TIMEOUT.as_secs()
-        )),
-        Ok(Err(error)) => Err(error),
-        // Nothing will be pasted: the prompt's input closed before the user pasted anything. Not
-        // fatal; the TCP branch of the `select!` keeps waiting.
-        Ok(Ok(None)) => std::future::pending().await,
-        Ok(Ok(Some(line))) => parse_pasted_callback(&line),
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "authorization timed out after {}s",
+                OAUTH_CALLBACK_TIMEOUT.as_secs()
+            ));
+        }
+        match tokio::time::timeout(remaining, prompt.read_pasted_line()).await {
+            Err(_) => {
+                return Err(format!(
+                    "authorization timed out after {}s",
+                    OAUTH_CALLBACK_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(Err(error)) => return Err(error),
+            // Nothing will be pasted: the prompt's input closed before the user pasted anything.
+            // Not fatal; the TCP branch of the `select!` keeps waiting.
+            Ok(Ok(None)) => return std::future::pending().await,
+            Ok(Ok(Some(line))) => match parse_pasted_callback(&line) {
+                Ok((code, state))
+                    if expected_state.is_none_or(|expected| expected == state.as_str()) =>
+                {
+                    return Ok((code, state));
+                }
+                Ok(_) => prompt.paste_refused("OAuth state mismatch; refusing the callback"),
+                Err(reason) => prompt.paste_refused(&reason),
+            },
+        }
     }
 }
 
 /// Extract `(code, state)` from a pasted callback URL. Accepts either the full URL or just the
 /// query string, percent-decodes the values, and surfaces the `error=…` parameter (sanitized) when
 /// the authorization server declines.
-fn parse_pasted_callback(input: &str) -> std::result::Result<(String, String), String> {
+pub(crate) fn parse_pasted_callback(input: &str) -> std::result::Result<(String, String), String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("no callback URL pasted".to_string());
@@ -2013,6 +2050,73 @@ mod tests {
             message.contains("meka mcp login acme"),
             "the refusal must name the remedy: {message}"
         );
+    }
+
+    /// A scripted prompt: the lines it hands over in order, and every refusal it was told.
+    struct ScriptedPrompt {
+        lines: std::sync::Mutex<std::collections::VecDeque<String>>,
+        refusals: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LoginPrompt for ScriptedPrompt {
+        fn authorize_at(&self, _url: &str) {}
+
+        fn awaiting(&self, _completion: Completion) {}
+
+        fn accepts_paste(&self) -> bool {
+            true
+        }
+
+        async fn read_pasted_line(&self) -> std::result::Result<Option<String>, String> {
+            Ok(self.lines.lock().unwrap().pop_front())
+        }
+
+        fn paste_refused(&self, reason: &str) {
+            self.refusals.lock().unwrap().push(reason.to_string());
+        }
+    }
+
+    /// A paste the flow cannot read, and one carrying another login's state, are each refused
+    /// through the prompt and read past, so the line that carries this login's code is the one
+    /// exchanged; a mistyped line spends nothing.
+    #[tokio::test]
+    async fn a_pasted_callback_is_refused_and_read_again_until_it_is_this_login_s() {
+        let prompt = ScriptedPrompt {
+            lines: std::sync::Mutex::new(
+                [
+                    "nonsense",
+                    "http://127.0.0.1:1/callback?code=a&state=theirs",
+                    "http://127.0.0.1:1/callback?code=b&state=ours",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ),
+            refusals: std::sync::Mutex::new(Vec::new()),
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (code, state) = read_pasted_callback(&prompt, Some("ours"), deadline)
+            .await
+            .expect("the third line is this login's");
+        assert_eq!((code.as_str(), state.as_str()), ("b", "ours"));
+        assert_eq!(*prompt.refusals.lock().unwrap(), [
+            "missing 'code' parameter in pasted URL",
+            "OAuth state mismatch; refusing the callback",
+        ]);
+    }
+
+    /// The `state` the authorization URL carries is the one a callback must bring back.
+    #[test]
+    fn the_authorization_url_names_the_state_a_callback_must_carry() {
+        assert_eq!(
+            state_in_authorization_url(
+                "http://127.0.0.1:1/authorize?response_type=code&state=s-1&redirect_uri=x"
+            )
+            .as_deref(),
+            Some("s-1")
+        );
+        assert_eq!(state_in_authorization_url("not a url"), None);
     }
 
     #[test]

@@ -40,9 +40,12 @@ pub(crate) struct McpConfig {
     pub(crate) servers: Option<Vec<McpServerConfig>>,
 }
 #[derive(Deserialize, Clone)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpServerConfig {
     pub(crate) name: String,
+    /// `stdio` or `http`.
+    #[cfg_attr(feature = "serve", schema(value_type = String))]
     pub(crate) transport: McpTransport,
     pub(crate) command: Option<String>,
     pub(crate) args: Option<Vec<String>>,
@@ -58,6 +61,7 @@ pub(crate) struct McpServerConfig {
     pub(crate) auth: Option<McpAuthConfig>,
     /// Server-wide permission override. Typed, like `[permissions]`, so a level meka does not have
     /// is refused where the file is parsed rather than when the server connects.
+    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
     pub(crate) permission: Option<Permission>,
     /// Optional allow-list of raw tool names (the server-advertised form, not the
     /// `mcp__<server>__<tool>` namespaced form). When set and non-empty, only these tools from
@@ -74,10 +78,12 @@ pub(crate) struct McpServerConfig {
     /// What becomes of this server's tools that [`Self::eager_load_tools`] does not name. `None`
     /// inherits `[mcp].deferral`, settled in [`crate::config::ResolvedConfig::resolve`] the way
     /// [`Self::required`] is, so every later reader holds a value.
+    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
     pub(crate) deferral: Option<Deferral>,
     /// Optional per-tool permission overrides keyed by raw tool name. Beats the server-level
     /// `permission` and the server's `readOnlyHint` annotation when resolving a tool's required
     /// permission at registration time. Typed for the same reason [`Self::permission`] is.
+    #[cfg_attr(feature = "serve", schema(value_type = Option<std::collections::HashMap<String, String>>))]
     pub(crate) tool_permissions: Option<std::collections::HashMap<String, Permission>>,
     /// Whether this server's `readOnlyHint` annotation may classify a tool as `read`. Defaults to
     /// true, so a server that says a tool only reads is believed.
@@ -285,6 +291,7 @@ impl From<McpTransport> for String {
 /// which is the same strictness [`McpServerConfig`] already has. A secret quietly ignored is worse
 /// than one refused: the connect fails later, somewhere else, for a reason that names nothing.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum McpAuthConfig {
     ClientCredentials {

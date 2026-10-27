@@ -152,12 +152,17 @@ pub(super) async fn retry_until_connected(
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
             _ = entry.connects.stopping().cancelled() => return,
+            _ = entry.removed.cancelled() => return,
         }
 
         // Nothing holds the manager any more, so there is no registry left to heal into.
         let Some(manager) = manager.upgrade() else {
             return;
         };
+        // The server was removed while this loop slept: an entry nothing holds is not healed.
+        if !manager.holds(&entry) {
+            return;
+        }
 
         // Cheap pre-check before taking the lock; something else may have healed the entry.
         if !matches!(entry.state().await, ServerState::Failed { .. }) {
@@ -277,6 +282,7 @@ pub(crate) async fn connect_one(
             tokio::select! {
                 biased;
                 _ = entry_for_connect.connects.stopping().cancelled() => None,
+                _ = entry_for_connect.removed.cancelled() => None,
                 result = tokio::time::timeout(connect_timeout, connect_server(&entry_for_connect)) => {
                     Some(result)
                 }
@@ -306,8 +312,8 @@ pub(crate) async fn connect_one(
             record_connect_failure(&entry, &server_name, cause).await;
             return;
         }
-        // Ended by a shutdown: the entry is about to be closed, and a failure recorded now would
-        // announce a server that was never given its chance.
+        // Ended by a shutdown or a removal: the entry is closed or out, and a failure recorded now
+        // would announce a server that was never given its chance.
         Ok(None) => return,
         Err(join_error) => {
             let cause = format!("connect task join error: {join_error}");
@@ -316,6 +322,13 @@ pub(crate) async fn connect_one(
         }
     };
 
+    // A server removed while this connect ran has nothing to adopt the connection: dropping it
+    // here closes it, where adopting it would keep a transport, a child process for a stdio
+    // server, open on an entry nothing holds.
+    if !manager.holds(&entry) {
+        tracing::debug!("MCP server '{server_name}' was removed while connecting; closing");
+        return;
+    }
     let version = connected
         .peer()
         .peer_info()
@@ -325,7 +338,7 @@ pub(crate) async fn connect_one(
     // `require_connected`; refused once a shutdown has begun, when there is nothing left to
     // register into.
     if let Err(error) = entry.adopt_connection(connected).await {
-        tracing::debug!("MCP server '{server_name}' connected as meka was shutting down: {error}");
+        tracing::debug!("MCP server '{server_name}' connected too late to be adopted: {error}");
         return;
     }
     drop(landing);
@@ -352,6 +365,13 @@ pub(crate) async fn connect_one(
         Ok(count) => {
             tracing::info!("MCP server '{server_name}' registered {count} tool(s)");
         }
+        // A removal closes the transport under a listing still in flight, which is the removal
+        // working and not the server failing.
+        Err(error) if !manager.holds(&entry) => {
+            tracing::debug!(
+                "MCP server '{server_name}' was removed while its tools were being listed: {error}"
+            );
+        }
         Err(error) => {
             tracing::warn!(
                 "MCP server '{server_name}' connected but tool discovery failed: {error}"
@@ -375,9 +395,7 @@ async fn discover_and_register_tools(
     )
     .await?;
     let registered_count = adapters.len();
-    manager
-        .register_server_tools(&entry.server_name, adapters)
-        .await;
+    manager.register_server_tools(entry, adapters).await;
     Ok(registered_count)
 }
 
@@ -916,11 +934,13 @@ mod tests {
     fn bare_entry(name: &str) -> Arc<ServerEntry> {
         Arc::new(ServerEntry {
             server_name: name.to_string(),
+            configured: McpServerConfig::for_test(name),
             config: McpServerConfig::for_test(name),
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
@@ -949,11 +969,13 @@ mod tests {
 
         let entry = Arc::new(ServerEntry {
             server_name: "ida".to_string(),
+            configured: config.clone(),
             config,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
@@ -1015,6 +1037,7 @@ mod tests {
             "environment variable(s) [\"TOKEN\"] are unset and named in `headers` or `env`";
         let entry = Arc::new(ServerEntry {
             server_name: "tenant".to_string(),
+            configured: config.clone(),
             config,
             token_store: None,
             client_context: McpClientContext::new(),
@@ -1023,6 +1046,7 @@ mod tests {
                 at: std::time::Instant::now(),
             }),
             reconnect_lock: Mutex::new(()),
+            removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: Some(reason.to_string()),
             instructions: std::sync::RwLock::new(None),
@@ -1076,11 +1100,13 @@ mod tests {
 
         let entry = Arc::new(ServerEntry {
             server_name: "hung".to_string(),
+            configured: config.clone(),
             config,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
@@ -1128,41 +1154,25 @@ mod tests {
     /// manager is returned strongly so a test can decide when to drop it.
     #[cfg(unix)]
     async fn failed_entry(name: &str, command: &str) -> (Arc<ServerEntry>, Arc<McpClientManager>) {
-        use std::sync::OnceLock;
         let mut config = McpServerConfig::for_test(name);
         config.transport = McpTransport::Stdio;
         config.command = Some(command.to_string());
         config.url = None;
-
-        let entry = Arc::new(ServerEntry {
-            server_name: name.to_string(),
-            config,
-            token_store: None,
-            client_context: McpClientContext::new(),
-            state: RwLock::new(ServerState::Failed {
-                error: "initial connect failed".to_string(),
-                at: std::time::Instant::now(),
-            }),
-            reconnect_lock: Mutex::new(()),
-            tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
-            refused: None,
-            instructions: std::sync::RwLock::new(None),
-            request_timeout: OnceLock::new(),
-            background_retry: std::sync::OnceLock::new(),
-            dropped_tools: std::sync::atomic::AtomicUsize::new(0),
-            subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
-            legacy_era: std::sync::atomic::AtomicBool::new(false),
-            connects: crate::mcp::Connects::new(),
-        });
+        // The manager's own entry, since the retry heals only an entry the manager holds.
         let manager = McpClientManager::prepare(
-            &[],
+            &[config],
             None,
             None,
             McpClientContext::new(),
             crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
         )
         .await
-        .expect("empty manager");
+        .expect("a manager over the one server");
+        let entry = manager.entry(name).expect("the configured entry");
+        *entry.state.write().await = ServerState::Failed {
+            error: "initial connect failed".to_string(),
+            at: std::time::Instant::now(),
+        };
         (entry, manager)
     }
 
@@ -1238,6 +1248,38 @@ mod tests {
         assert!(
             joined.is_ok(),
             "retry loop kept polling an entry that is no longer Failed"
+        );
+    }
+
+    /// A server removed while its cold-start retry sleeps is not reconnected by it: the loop
+    /// finds the manager no longer holds its entry and stands down, where it would otherwise keep
+    /// spawning the removed server's command for the life of the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_stops_once_the_server_is_removed() {
+        let (entry, manager) = failed_entry("removed", "/bin/false").await;
+        manager
+            .remove_server("removed")
+            .await
+            .expect("the configured entry is removed");
+        // The removal leaves the entry `Disabled`; put the failure back so the loop's own
+        // state check is not what ends it.
+        *entry.state.write().await = ServerState::Failed {
+            error: "still failing".to_string(),
+            at: std::time::Instant::now(),
+        };
+        let handle = tokio::spawn(retry_until_connected(
+            Arc::clone(&entry),
+            Arc::downgrade(&manager),
+            None,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+        ));
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            joined.is_ok(),
+            "retry loop kept reconnecting an entry the manager no longer holds"
         );
     }
 }

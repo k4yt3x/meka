@@ -1269,6 +1269,7 @@ impl Cli {
             prompt: self.prompt.clone(),
             oneshot: self.oneshot,
             output_format: self.format,
+            serve: matches!(self.command, Some(Command::Serve { .. })),
         }
     }
 }
@@ -1313,6 +1314,68 @@ pub(crate) fn write_json_listing(
     document.insert(nouns.to_string(), serde_json::to_value(items)?);
     write_json(&document)
 }
+/// The terminal's side of a browser login, an account's or an MCP server's: the URL on stderr,
+/// and the pasted line read from stdin. The screen has its own, since it owns both.
+pub(crate) struct TerminalLogin;
+
+#[async_trait::async_trait]
+impl crate::oauth::LoginPrompt for TerminalLogin {
+    fn authorize_at(&self, url: &str) {
+        // The URL, exactly once, and no browser launched: which browser, and on which machine, is
+        // the user's to decide, and a launch from an SSH session or a container reached nothing or
+        // the wrong desktop.
+        crate::streams::write_stderr_line(format!(
+            "To authorize, open this URL in your browser:\n\n{url}\n"
+        ));
+    }
+
+    fn awaiting(&self, completion: crate::oauth::Completion) {
+        use crate::oauth::Paste;
+
+        let line = match (completion.listener_seconds, completion.paste) {
+            (Some(seconds), Some(_)) => format!(
+                "Waiting up to {seconds}s for the callback, or paste the callback URL here and \
+                 press Enter:"
+            ),
+            (Some(seconds), None) => format!("Waiting up to {seconds}s for the callback."),
+            (None, Some(Paste::CallbackUrl)) => {
+                "Paste the full callback URL the browser was sent to and press Enter:".to_string()
+            }
+            (None, Some(Paste::AuthorizationCode)) => {
+                "After authorizing, paste the authorization code here and press Enter:".to_string()
+            }
+            (None, None) => return,
+        };
+        crate::streams::write_stderr_line(line);
+    }
+
+    fn accepts_paste(&self) -> bool {
+        std::io::IsTerminal::is_terminal(&std::io::stdin())
+    }
+
+    async fn read_pasted_line(&self) -> std::result::Result<Option<String>, String> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut reader = BufReader::new(tokio::io::stdin());
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Err(error) => Err(format!("failed to read stdin: {error}")),
+            // EOF: stdin was closed before the user pasted anything.
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(line)),
+        }
+    }
+
+    fn paste_refused(&self, reason: &str) {
+        // Said as a line of meka's own, which starts with a capital whatever the refusal does.
+        let mut line = reason.to_string();
+        if let Some(first) = line.get(..1) {
+            line.replace_range(..1, &first.to_ascii_uppercase());
+        }
+        crate::streams::write_stderr_line(line);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

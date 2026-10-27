@@ -19,7 +19,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
-    config::{AccountConfig, McpServerConfig, ProfileConfig, ProfileSummary},
+    config::{AccountConfig, McpServerConfig, ProfileConfig},
     mcp::AdvertisedTool,
     memory::Memory,
     permission::Permission,
@@ -176,19 +176,6 @@ pub(crate) struct ProfileView {
 }
 
 impl ProfileView {
-    /// The view of a profile a resolved config already summarized, as `meka serve` holds it.
-    pub(crate) fn from_summary(summary: &ProfileSummary, active: bool) -> Self {
-        Self {
-            name: summary.name.clone(),
-            account: summary.account.clone(),
-            backend: summary.backend.clone(),
-            model: summary.model.clone(),
-            fallbacks: summary.fallbacks.clone(),
-            vision: summary.vision,
-            active,
-        }
-    }
-
     /// The view of a profile as `config.toml` states it, with the backend looked up on the account
     /// it names, so a profile on a missing account is listed rather than dropped.
     pub(crate) fn from_config(
@@ -211,9 +198,10 @@ impl ProfileView {
     }
 }
 
-/// An account as `meka account list` prints it: the `[accounts.<name>]` settings and whether a
-/// credential is stored, never the credential. Accounts do not transit the HTTP API.
+/// An account as `meka account list` prints it and `GET /v1/accounts` answers with: the
+/// `[accounts.<name>]` settings and whether a credential is stored, never the credential.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct AccountView {
     pub(crate) name: String,
     pub(crate) backend: String,
@@ -237,16 +225,93 @@ impl AccountView {
     }
 }
 
+/// A profile with every setting `config.toml` states for it, as `GET /v1/profiles/{name}` answers:
+/// the listing's facts, and each key the profile sets beside them, absent where the documented
+/// default applies.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+pub(crate) struct ProfileDetailView {
+    pub(crate) name: String,
+    pub(crate) account: String,
+    /// The account's backend; omitted when the profile names an account that is not configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fallbacks: Vec<String>,
+    /// Whether this is the profile a session gets when it names none.
+    pub(crate) active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_request_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) vision: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) deferred_tools: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_control: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking_display: Option<String>,
+}
+
+impl ProfileDetailView {
+    /// The detail of a profile as `config.toml` states it, with the backend looked up on the
+    /// account it names.
+    pub(crate) fn from_config(
+        name: &str,
+        profile: &ProfileConfig,
+        accounts: &BTreeMap<String, AccountConfig>,
+        active: bool,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            account: profile.account.clone(),
+            backend: accounts
+                .get(&profile.account)
+                .map(|account| account.backend.clone()),
+            model: profile.model.clone(),
+            fallbacks: profile.fallbacks.clone(),
+            active,
+            context_window: profile.context_window,
+            max_output_tokens: profile.max_output_tokens,
+            max_request_bytes: profile.max_request_bytes,
+            effort: profile.effort.clone(),
+            vision: profile.vision,
+            deferred_tools: profile
+                .deferred_tools
+                .map(|setting| setting.name().to_string()),
+            thinking: profile.thinking.map(|mode| mode.name().to_string()),
+            thinking_budget: profile.thinking_budget,
+            cache_control: profile.cache_control,
+            thinking_display: profile
+                .thinking_display
+                .map(|display| display.name().to_string()),
+        }
+    }
+}
+
 /// A configured MCP server as `meka mcp list` prints it: what `config.toml` says about it, never a
 /// credential. `GET /v1/mcp` answers a different question, the live connection state, and has its
 /// own shape in the HTTP layer; the two share `name` alone.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct McpServerView {
     pub(crate) name: String,
     pub(crate) transport: &'static str,
     pub(crate) required: bool,
     pub(crate) disabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
     pub(crate) permission: Option<Permission>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) command: Option<String>,
@@ -273,10 +338,11 @@ impl From<&McpServerConfig> for McpServerView {
     }
 }
 
-/// One configured MCP server in full, for `meka mcp get`: the listing's fields plus what only the
-/// detail shows. Keys only for `env` and `headers`, as in the plain output, because a value there
-/// may be a secret.
+/// One configured MCP server in full, for `meka mcp get` and `GET /v1/mcp/{name}`: the listing's
+/// fields plus what only the detail shows. Keys only for `env` and `headers`, as in the plain
+/// output, because a value there may be a secret.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct McpServerDetail {
     #[serde(flatten)]
     pub(crate) server: McpServerView,
@@ -300,6 +366,7 @@ pub(crate) struct McpServerDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) disabled_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "serve", schema(value_type = Option<BTreeMap<String, String>>))]
     pub(crate) tool_permissions: Option<BTreeMap<String, Permission>>,
 }
 
@@ -818,21 +885,10 @@ mod tests {
         }
     }
 
-    /// A profile on an account that is not configured has no backend to report, and both
-    /// constructors say so the same way: the key is omitted, never sent as `""` by one host and
-    /// left out by the other.
+    /// A profile on an account that is not configured has no backend to report, and the listing
+    /// and the detail say so the same way: the key is omitted, never sent as `""`.
     #[test]
     fn a_profile_view_omits_the_backend_of_a_missing_account_however_it_is_built() {
-        let summary = ProfileSummary {
-            fallbacks: Vec::new(),
-            name: "orphan".to_string(),
-            account: "gone".to_string(),
-            backend: None,
-            model: None,
-            vision: true,
-        };
-        let from_summary =
-            serde_json::to_value(ProfileView::from_summary(&summary, false)).expect("json");
         let profile = ProfileConfig {
             account: "gone".to_string(),
             ..Default::default()
@@ -844,11 +900,17 @@ mod tests {
             false,
         ))
         .expect("json");
-        for document in [&from_summary, &from_config] {
+        let detail = serde_json::to_value(ProfileDetailView::from_config(
+            "orphan",
+            &profile,
+            &BTreeMap::new(),
+            false,
+        ))
+        .expect("json");
+        for document in [&from_config, &detail] {
             assert!(document.get("backend").is_none(), "{document}");
             assert_eq!(document["account"], "gone");
         }
-        assert_eq!(from_summary, from_config, "one record, one shape");
     }
 
     /// A gate's command is disclosed only to a reader allowed to see it, and the gate's kind and

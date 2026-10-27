@@ -29,8 +29,8 @@ use tokio::sync::{broadcast, oneshot};
 
 use super::sse::{EventIdGenerator, SseEvent, SseEventType, translate};
 use crate::frontend::{
-    APPROVAL_TIMEOUT, ElicitationPrompt, ElicitationResponse, Frontend, FrontendEvent, Notice,
-    PermissionOutcome, PermissionRequest, StickyApprovals,
+    APPROVAL_TIMEOUT, ElicitationKind, ElicitationPrompt, ElicitationResponse, Frontend,
+    FrontendEvent, Notice, PermissionOutcome, PermissionRequest, StickyApprovals,
 };
 
 /// How often the parked `request_permission` poll checks whether the SSE consumer has
@@ -61,7 +61,7 @@ pub(crate) struct HttpFrontend {
     /// `handle_elicitation`). The HTTP turn handler emits an SSE event with the `request_id`,
     /// then `POST /v1/sessions/{id}/responses/{request_id}` pushes the resolution through the
     /// matching oneshot.
-    pending: Arc<Mutex<HashMap<String, PermissionPending>>>,
+    pending: Arc<Mutex<HashMap<String, Pending>>>,
     /// Per-session capabilities, declared at session creation. Controls SSE event filtering
     /// (`supports_reasoning_stream`) and whether a gated tool parks for approval or is denied
     /// outright (`supports_permission_prompts`).
@@ -119,6 +119,12 @@ pub(crate) struct SessionCapabilities {
     /// Defaults to `false`: a session nobody declared this for refuses a gated call with nobody
     /// attending rather than holding the session for the prompt's lifetime.
     pub(crate) answers_prompts_on_return: bool,
+    /// When `true`, an MCP server's elicitation parks as an `elicitation_required` event for an
+    /// attending client to answer, under the attendance rule approvals follow; when `false` it
+    /// is declined with a notice. Defaults to `false`: a bridge that answers approvals has no
+    /// form to render, and a prompt nobody renders holds the call for its lifetime.
+    #[serde(default)]
+    pub(crate) supports_elicitation: bool,
 }
 
 impl Default for SessionCapabilities {
@@ -127,6 +133,7 @@ impl Default for SessionCapabilities {
             supports_reasoning_stream: false,
             supports_permission_prompts: true,
             answers_prompts_on_return: false,
+            supports_elicitation: false,
         }
     }
 }
@@ -136,10 +143,69 @@ use super::feed::{
 };
 pub(crate) use crate::host::scheduler::TurnSource;
 
-/// One parked permission request: the channel its answer arrives on. What the prompt is about
-/// rides the `permission_required` event, which the feed replays while the prompt is parked.
-pub(crate) struct PermissionPending {
-    pub(crate) sender: oneshot::Sender<PermissionResolution>,
+/// One parked prompt: the channel its answer arrives on. What the prompt is about rides the
+/// `permission_required` or `elicitation_required` event, which the feed replays while the prompt
+/// is parked.
+pub(crate) enum Pending {
+    Permission(oneshot::Sender<PermissionResolution>),
+    Elicitation(oneshot::Sender<ElicitationResponse>),
+}
+
+/// Which prompt a parked request is, so the responses door can hold an answer to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingKind {
+    Permission,
+    Elicitation,
+}
+
+/// The `elicitation_required` SSE event's payload: what a client needs to show the prompt and
+/// answer it.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ElicitationRequiredEvent {
+    /// Names the parked request on `POST /v1/sessions/{id}/responses/{request_id}`.
+    pub(crate) request_id: String,
+    /// The MCP server asking.
+    pub(crate) server: String,
+    /// `form`, a JSON Schema of fields to fill, or `url`, an address to open.
+    pub(crate) kind: &'static str,
+    pub(crate) message: String,
+    /// The schema the server sent, on a `form`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) schema: Option<serde_json::Value>,
+    /// The address to open, on a `url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
+    /// How long the request stays answerable before it is declined, counted from when it was
+    /// parked.
+    pub(crate) expires_in_seconds: u64,
+    /// RFC 3339, when the request is declined unanswered.
+    pub(crate) expires_at: String,
+}
+
+/// A parked elicitation's place in the lot, given up however the wait ends: the MCP side's own
+/// timeout drops the wait rather than answering it, and the turn's cancellation drops the call,
+/// so the drop is the one exit every ending shares.
+struct ParkedElicitation<'a> {
+    frontend: &'a HttpFrontend,
+    request_id: String,
+    closed_as: Option<&'static str>,
+}
+
+impl ParkedElicitation<'_> {
+    fn close(mut self, closed_as: &'static str) {
+        self.closed_as = Some(closed_as);
+    }
+}
+
+impl Drop for ParkedElicitation<'_> {
+    fn drop(&mut self) {
+        let closed_as = self.closed_as.unwrap_or("canceled");
+        crate::sync::lock(&self.frontend.pending).remove(&self.request_id);
+        self.frontend.push_sse(
+            SseEventType::ElicitationResolved,
+            serde_json::json!({ "request_id": self.request_id, "outcome": closed_as }),
+        );
+    }
 }
 
 /// The `permission_required` SSE event's payload: what a client needs to show the prompt and
@@ -305,11 +371,43 @@ impl HttpFrontend {
     ) -> bool {
         let entry = {
             let mut guard = crate::sync::lock(&self.pending);
-            guard.remove(request_id)
+            match guard.get(request_id) {
+                Some(Pending::Permission(_)) => guard.remove(request_id),
+                _ => None,
+            }
         };
         match entry {
-            Some(pending) => pending.sender.send(resolution).is_ok(),
-            None => false,
+            Some(Pending::Permission(sender)) => sender.send(resolution).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// [`Self::resolve_permission`] for a parked elicitation: true iff the entry existed, was an
+    /// elicitation, and the waiting call took the answer.
+    pub(crate) fn resolve_elicitation(
+        &self,
+        request_id: &str,
+        response: ElicitationResponse,
+    ) -> bool {
+        let entry = {
+            let mut guard = crate::sync::lock(&self.pending);
+            match guard.get(request_id) {
+                Some(Pending::Elicitation(_)) => guard.remove(request_id),
+                _ => None,
+            }
+        };
+        match entry {
+            Some(Pending::Elicitation(sender)) => sender.send(response).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// Which prompt `request_id` names, while it is parked.
+    pub(crate) fn pending_kind(&self, request_id: &str) -> Option<PendingKind> {
+        match crate::sync::lock(&self.pending).get(request_id) {
+            Some(Pending::Permission(_)) => Some(PendingKind::Permission),
+            Some(Pending::Elicitation(_)) => Some(PendingKind::Elicitation),
+            None => None,
         }
     }
 
@@ -665,15 +763,18 @@ impl HttpFrontend {
     }
 
     /// A pause is stateful, not additive. Replaying one the client already answered (or that
-    /// timed out) would put an approval prompt back on screen for a request that no longer
-    /// exists, and any decision sent for it comes back 404. Replay it only while it is still
-    /// actionable, which is exactly while it is still parked.
+    /// timed out) would put a prompt, an approval's or an elicitation's, back on screen for a
+    /// request that no longer exists, and any answer sent for it comes back 404. Replay it only
+    /// while it is still actionable, which is exactly while it is still parked.
     fn withhold_answered_prompts<Parked>(
         backlog: &mut Vec<SseEvent>,
         still_pending: &std::collections::HashMap<String, Parked>,
     ) {
         backlog.retain(|event| {
-            if event.event_type != SseEventType::PermissionRequired {
+            if !matches!(
+                event.event_type,
+                SseEventType::PermissionRequired | SseEventType::ElicitationRequired
+            ) {
                 return true;
             }
             event
@@ -871,7 +972,7 @@ impl Frontend for HttpFrontend {
         let parked_at = chrono::Utc::now();
         {
             let mut guard = crate::sync::lock(&self.pending);
-            guard.insert(request_id.clone(), PermissionPending { sender });
+            guard.insert(request_id.clone(), Pending::Permission(sender));
         }
 
         // Hold the feed lock across `ids.next()` + `sender.send()` to preserve monotonic id
@@ -964,16 +1065,94 @@ impl Frontend for HttpFrontend {
     }
 
     async fn handle_elicitation(&self, prompt: ElicitationPrompt) -> ElicitationResponse {
-        // The HTTP API doesn't expose MCP elicitation in either mode: service-to-service
-        // callers can't render interactive prompts (see HTTP API docs § Approvals). The
-        // notice surfaces the decline so operators can spot misconfigured servers that expect
-        // to drive elicitation interactively.
-        self.emit(FrontendEvent::Notice(Notice::elicitation_declined(
-            &prompt.server_name,
-            "the HTTP API does not expose interactive MCP prompts",
-        )))
-        .await;
-        ElicitationResponse::Decline
+        // Each decline made on the person's behalf is said in the transcript, since the tool call
+        // waiting on the answer fails next and nothing else names the cause.
+        if !self.capabilities.supports_elicitation {
+            self.emit(FrontendEvent::Notice(Notice::elicitation_declined(
+                &prompt.server_name,
+                "the session did not declare supports_elicitation",
+            )))
+            .await;
+            return ElicitationResponse::Decline;
+        }
+        if !self.prompt_answerable() {
+            self.emit(FrontendEvent::Notice(Notice::elicitation_declined(
+                &prompt.server_name,
+                "no client is attending this turn; open the feed with `attend=true`, or create \
+                 the session with `answers_prompts_on_return: true`",
+            )))
+            .await;
+            return ElicitationResponse::Decline;
+        }
+
+        let request_id = format!("req_{}", uuid::Uuid::new_v4());
+        let (sender, receiver) = oneshot::channel::<ElicitationResponse>();
+        let parked_at = chrono::Utc::now();
+        crate::sync::lock(&self.pending).insert(request_id.clone(), Pending::Elicitation(sender));
+        let parked = ParkedElicitation {
+            frontend: self,
+            request_id: request_id.clone(),
+            closed_as: None,
+        };
+        // The deadline is the MCP client's, which declines the prompt for the person when it
+        // passes; waited on here as the same instant, so the close this feed reports is the
+        // expiry, and not the drop of a wait the client's own timer ended first.
+        let remaining = prompt
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        let (kind, schema, url) = match &prompt.kind {
+            ElicitationKind::Form { schema } => ("form", Some(schema.clone()), None),
+            ElicitationKind::Url { url } => ("url", None, Some(url.clone())),
+        };
+        let payload = serde_json::to_value(ElicitationRequiredEvent {
+            request_id,
+            server: prompt.server_name.clone(),
+            kind,
+            message: prompt.message.clone(),
+            schema,
+            url,
+            // Whole seconds, rounded up: the wire says how long the person has, and the minute
+            // the client grants is a minute, not the 59 s left of it by the time this is built.
+            expires_in_seconds: remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0),
+            expires_at: (parked_at + remaining).to_rfc3339(),
+        })
+        .unwrap_or_else(|error| {
+            tracing::warn!("failed to serialize the elicitation_required payload: {error}");
+            serde_json::Value::Null
+        });
+        // Recorded like any other event: a client that reconnects mid-pause has to learn that
+        // the call is waiting on it, or the call sits there until the timeout.
+        self.push_sse(SseEventType::ElicitationRequired, payload);
+
+        // The same poll `request_permission` runs, for the same reason.
+        let disconnect_poll = async {
+            loop {
+                tokio::time::sleep(DISCONNECT_POLL_INTERVAL).await;
+                if self.prompt_abandoned() {
+                    break;
+                }
+            }
+        };
+        let (response, closed_as) = tokio::select! {
+            biased;
+            _ = disconnect_poll => {
+                tracing::info!(
+                    "nobody is left to answer elicitation_required from '{server}'; canceling",
+                    server = prompt.server_name,
+                );
+                (ElicitationResponse::Cancel, "canceled")
+            },
+            () = tokio::time::sleep_until(prompt.deadline) => (ElicitationResponse::Decline, "expired"),
+            answer = receiver => match answer {
+                Ok(response) => {
+                    let closed_as = response.name();
+                    (response, closed_as)
+                }
+                Err(_) => (ElicitationResponse::Cancel, "canceled"),
+            },
+        };
+        parked.close(closed_as);
+        response
     }
 
     // `delegate_fs_read` / `_fs_write` / `_execute` keep the trait defaults (all answer
@@ -2761,6 +2940,8 @@ mod tests {
         );
     }
 
+    /// A session that did not declare the capability keeps today's answer: declined, with the
+    /// reason in the transcript.
     #[tokio::test]
     async fn handle_elicitation_returns_decline_and_records_notice() {
         let frontend = HttpFrontend::new();
@@ -2770,6 +2951,7 @@ mod tests {
                 url: "https://example.com".into(),
             },
             message: "Open this URL?".into(),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(60),
         };
         let response = frontend.handle_elicitation(prompt).await;
         assert!(matches!(response, ElicitationResponse::Decline));
@@ -2781,6 +2963,109 @@ mod tests {
             )),
             "elicitation decline must surface a diagnostic Notice"
         );
+    }
+
+    /// An elicitation already answered is not replayed to a client that reconnects, as an
+    /// approval is not: a form for a request that no longer exists would be answered with a 404.
+    #[tokio::test]
+    async fn replay_drops_elicitations_that_are_no_longer_pending() {
+        let frontend = Arc::new(HttpFrontend::with_capabilities(SessionCapabilities {
+            supports_elicitation: true,
+            answers_prompts_on_return: true,
+            ..Default::default()
+        }));
+        frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
+        let (_receiver, _ids) = frontend.begin_turn(
+            uuid::Uuid::from_u128(0x9),
+            TurnSource::Client,
+            Opener {
+                holds: false,
+                renders: false,
+            },
+            Duration::ZERO,
+            16,
+        );
+        let asking = Arc::clone(&frontend);
+        let join = tokio::spawn(async move {
+            asking
+                .handle_elicitation(ElicitationPrompt {
+                    server_name: "github".into(),
+                    kind: ElicitationKind::Url {
+                        url: "https://example.com".into(),
+                    },
+                    message: "Open this URL?".into(),
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+                })
+                .await
+        });
+        wait_for_pending(&frontend, 1).await;
+        let parked = frontend.attach_stream(None, false).expect("feed installed");
+        let request_id = parked
+            .backlog
+            .iter()
+            .find(|event| event.event_type == SseEventType::ElicitationRequired)
+            .and_then(|event| event.data.get("request_id"))
+            .and_then(serde_json::Value::as_str)
+            .expect("a parked elicitation is replayed")
+            .to_string();
+        assert!(frontend.resolve_elicitation(&request_id, ElicitationResponse::Decline));
+        assert!(matches!(
+            join.await.expect("task"),
+            ElicitationResponse::Decline
+        ));
+        let after = frontend.attach_stream(None, false).expect("feed installed");
+        assert!(
+            !after
+                .backlog
+                .iter()
+                .any(|event| event.event_type == SseEventType::ElicitationRequired),
+            "an answered elicitation must not be replayed"
+        );
+    }
+
+    /// An elicitation nobody answers closes as `expired` on the feed: the wait ends on the
+    /// deadline the prompt carries, which is the MCP client's own, so the client's timer ending
+    /// the same instant does not turn the expiry into a `canceled`.
+    #[tokio::test]
+    async fn an_unanswered_elicitation_closes_as_expired_on_the_prompt_s_deadline() {
+        let frontend = Arc::new(HttpFrontend::with_capabilities(SessionCapabilities {
+            supports_elicitation: true,
+            answers_prompts_on_return: true,
+            ..Default::default()
+        }));
+        frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
+        let (_receiver, _ids) = frontend.begin_turn(
+            uuid::Uuid::from_u128(0x9),
+            TurnSource::Client,
+            Opener {
+                holds: false,
+                renders: false,
+            },
+            Duration::ZERO,
+            16,
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let prompt = ElicitationPrompt {
+            server_name: "github".into(),
+            kind: ElicitationKind::Url {
+                url: "https://example.com".into(),
+            },
+            message: "Open this URL?".into(),
+            deadline,
+        };
+        // Bounded as the MCP client bounds it: on the same instant.
+        let response = tokio::time::timeout_at(deadline, frontend.handle_elicitation(prompt)).await;
+        assert!(
+            matches!(response, Ok(ElicitationResponse::Decline)),
+            "the frontend's own wait ends the prompt"
+        );
+        let feed = frontend.attach_stream(None, false).expect("feed installed");
+        let resolved = feed
+            .backlog
+            .iter()
+            .find(|event| event.event_type == SseEventType::ElicitationResolved)
+            .expect("the close is on the feed");
+        assert_eq!(resolved.data["outcome"], "expired");
     }
 
     /// A sub-agent's sub-agent gets a feed of its own, registered beside the others and naming

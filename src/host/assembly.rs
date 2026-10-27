@@ -12,10 +12,6 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct SharedDeps {
     pub(crate) config: Arc<ResolvedConfig>,
-    /// The profile a session created here takes when it names none. `None` for a run that resumes
-    /// a session and has no default of its own, which only the screen and `--oneshot` allow; the
-    /// long-lived hosts refuse to start without one, through [`Self::default_profile`].
-    pub(crate) default_profile: Option<String>,
     pub(crate) store: Store,
     /// Providers by profile, built on demand.
     ///
@@ -34,11 +30,12 @@ pub(crate) struct SharedDeps {
     pub(crate) read_boundary: crate::workspace::ReadBoundary,
     /// The dispatcher a scheduled gate's tool probe resolves against.
     pub(crate) gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
-    /// The standing instructions, resolved once at startup, and where they came from. The text
-    /// alone: a session appends the files `[instructions].files` names when it opens, through
-    /// [`session_agent_options`].
-    pub(crate) user_instructions: Option<String>,
-    pub(crate) user_instructions_source: Option<String>,
+    /// The standing instructions and where they came from, resolved at startup and again when
+    /// `PUT /v1/instructions` writes them, so a session that opens after the write runs under
+    /// it; the text alone, since a session appends the files `[instructions].files` names when
+    /// it opens, through [`session_agent_options`]. A session already open keeps what it opened
+    /// under, as it keeps its provider.
+    pub(crate) instructions: Arc<std::sync::RwLock<Option<crate::instructions::Instructions>>>,
     /// Shared by every session this host builds, so two of them writing one file serialize.
     pub(crate) write_locks: crate::workspace::WriteLocks,
     /// Shared by every session this host builds, so the host can say which sub-agents are in a
@@ -209,7 +206,6 @@ pub(crate) async fn build_shared_deps(
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
 ) -> anyhow::Result<SharedDeps> {
     config.validate()?;
-    let default_profile = config.default_profile.clone();
 
     // Nothing is built here. The registry resolves a profile and loads its credential when a
     // session first asks, because which profiles this process will need is a property of the
@@ -304,15 +300,14 @@ pub(crate) async fn build_shared_deps(
         crate::instructions::warn_if_large(found);
         tracing::info!("instructions loaded from {source}", source = found.source);
     }
-    let user_instructions_source = instructions.as_ref().map(|found| found.source.to_string());
     let user_instructions_count = instructions.as_ref().map_or(0, |found| found.count());
-    let user_instructions = instructions.map(|found| found.text);
+    let user_instructions = instructions.as_ref().map(|found| found.text.clone());
 
     let mut agent_options = AgentOptions::from_config(
         &config,
         sandboxed_shell,
         gate_tools.clone(),
-        user_instructions.clone(),
+        user_instructions,
     );
     agent_options.user_instructions_count = user_instructions_count;
 
@@ -329,9 +324,7 @@ pub(crate) async fn build_shared_deps(
         sandbox,
         read_boundary,
         gate_tools,
-        user_instructions,
-        user_instructions_source,
-        default_profile,
+        instructions: Arc::new(std::sync::RwLock::new(instructions)),
         store,
         providers,
         mcp_manager,
@@ -496,6 +489,11 @@ pub(crate) async fn build_session_agent(
 /// the row, so the process has no one answer to give.
 fn session_agent_options(shared: &SharedDeps, directory: &std::path::Path) -> AgentOptions {
     let mut options = shared.agent_options.clone();
+    // The standing text as it stands now, not as the process started: a `PUT /v1/instructions`
+    // between the two is for the sessions that open after it.
+    let standing = crate::sync::read(&shared.instructions).clone();
+    options.user_instructions_count = standing.as_ref().map_or(0, |found| found.count());
+    options.user_instructions = standing.map(|found| found.text);
     if shared.config.instruction_files.is_empty() {
         return options;
     }
@@ -580,7 +578,7 @@ pub(crate) async fn resolve_profile_switch(
     shared: &SharedDeps,
     name: &str,
 ) -> anyhow::Result<crate::provider::ResolvedProfile> {
-    crate::config::require_profile(name, &shared.config.profiles)?;
+    shared.providers.require_profile(name)?;
     Ok(crate::provider::resolved_profile(&shared.providers, name.to_string()).await?)
 }
 /// The project a live session is asked to move onto, refused by name when the store has no such
@@ -1008,14 +1006,37 @@ impl SharedDeps {
         crate::host::relay_provider_errors(self.config.serve.as_ref())
     }
 
-    /// The default profile, or the configuration's own explanation of why there is none. A host
-    /// that creates sessions on the operator's behalf asks this once at startup.
-    pub(crate) fn default_profile(&self) -> anyhow::Result<&str> {
-        self.default_profile.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(self.config.provider_error.clone().unwrap_or_else(|| {
-                "no profile is configured; run `meka profile add`".to_string()
-            }))
-        })
+    /// The default profile, or the configuration's own explanation of why there is none. `meka
+    /// acp` asks this once at startup; `meka serve` asks it for each session that names no
+    /// profile, of the catalog as it stands then.
+    pub(crate) fn default_profile(&self) -> anyhow::Result<String> {
+        self.providers
+            .catalog()
+            .default_profile
+            .clone()
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Replace the accounts and profiles every session this host builds resolves against with
+    /// what `config.toml` holds, after a write this process made to it. A file that does not parse
+    /// leaves the catalog as it was: the add and edit doors refuse to produce one, and the HTTP
+    /// handlers refuse one that already fails to parse ahead of a rename or a remove, which work on
+    /// the raw document.
+    pub(crate) fn reload_profiles(&self) -> crate::error::Result<()> {
+        let config_file = crate::config::load_config_file_or_err()?;
+        self.providers.replace_catalog(&config_file);
+        Ok(())
+    }
+
+    /// Read the standing instructions again from the tier this process resolves them from, after
+    /// a write this process made to the conventional file, for the sessions that open after it.
+    pub(crate) fn reload_instructions(&self) -> crate::error::Result<()> {
+        let found = crate::instructions::resolve(&self.config.standing_instructions)?;
+        if let Some(found) = &found {
+            crate::instructions::warn_if_large(found);
+        }
+        *crate::sync::write(&self.instructions) = found;
+        Ok(())
     }
 }
 impl SharedDeps {

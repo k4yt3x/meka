@@ -23,7 +23,7 @@ use crate::{
         scope::{self},
         state::ServerState,
     },
-    view::{MemoryDetail, ProfileView, SkillDetail, ToolView},
+    view::{MemoryDetail, SkillDetail, ToolView},
 };
 
 /// Turn a store-layer `Err(String)` into a 422. Every one of them is a statement about the caller's
@@ -767,6 +767,54 @@ pub(crate) struct InstructionsResponse {
     /// The resolved instruction text the agent runs under, omitted when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<String>,
+    /// The file `PUT /v1/instructions` writes, `instructions.md` in the config directory, when
+    /// that file is what this server reads; absent when another source is in charge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
+    /// Whether `PUT /v1/instructions` would change what this server's sessions run under.
+    pub(crate) writable: bool,
+}
+
+/// Where a `PUT /v1/instructions` lands, or why it would change nothing: the conventional file is
+/// read only when nothing above it in the resolution is set, and the directory form beside it
+/// takes precedence over it.
+fn instructions_target(
+    config: &crate::config::ResolvedConfig,
+) -> std::result::Result<std::path::PathBuf, String> {
+    use crate::config::StandingInstructions;
+    let above = match &config.standing_instructions {
+        StandingInstructions::Flag(_) => Some("`--instructions`"),
+        StandingInstructions::Inline(_) => Some("`MEKA_INSTRUCTIONS`"),
+        StandingInstructions::File(_) => Some("`MEKA_INSTRUCTIONS_FILE`"),
+        StandingInstructions::Conflict => Some("`MEKA_INSTRUCTIONS` and `MEKA_INSTRUCTIONS_FILE`"),
+        StandingInstructions::Conventional => None,
+    };
+    if let Some(source) = above {
+        return Err(format!(
+            "the standing instructions come from {source}, which `instructions.md` does not change"
+        ));
+    }
+    if crate::instructions::discover_directory().is_some() {
+        return Err(
+            "the standing instructions come from the `instructions/` directory, which takes \
+             precedence over `instructions.md`"
+                .to_string(),
+        );
+    }
+    crate::instructions::instructions_file()
+        .ok_or_else(|| "failed to determine the config directory".to_string())
+}
+
+/// The instructions as this server holds them now, with where a write would land.
+fn instructions_response(state: &ServerState) -> InstructionsResponse {
+    let found = crate::sync::read(&state.shared.instructions).clone();
+    let path = instructions_target(&state.shared.config).ok();
+    InstructionsResponse {
+        source: found.as_ref().map(|found| found.source.to_string()),
+        content: found.map(|found| found.text),
+        writable: path.is_some(),
+        path: path.map(|path| path.display().to_string()),
+    }
 }
 
 /// `GET /v1/instructions`: the standing instructions this server's agents run under.
@@ -791,52 +839,75 @@ pub(crate) async fn instructions(
     // `get_skill`). A `schedule:r` token has no business reading the persona the agent runs under.
     // `sessions:r` is the right pairing because anyone who can read a session's messages can
     // already infer much of it.
-    Ok(Json(InstructionsResponse {
-        source: state.shared.user_instructions_source.clone(),
-        content: state.shared.user_instructions.clone(),
-    }))
+    Ok(Json(instructions_response(&state)))
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct ProfilesResponse {
-    pub(crate) profiles: Vec<ProfileView>,
+/// The body of `PUT /v1/instructions`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WriteInstructionsRequest {
+    /// The standing instructions, written whole to `instructions.md`; blank removes the file.
+    pub(crate) content: String,
 }
 
-/// `GET /v1/profiles`: configured profiles, with their account, backend and model only.
+/// `PUT /v1/instructions`: write the standing instructions to `instructions.md` in the config
+/// directory, and run the sessions that open from now on under them.
 ///
-/// Read-only by design, and the distinction is which fact is being written. A session *may* name a
-/// profile (`POST /v1/sessions`) and move to another (`PATCH /v1/sessions/{id}`), because that
-/// records a choice on one session's own row where the user can see it. What no request may do is
-/// edit the profiles themselves: what `work` means, and therefore which account it bills, comes
-/// from `config.toml` and nothing else. Letting a request redefine a profile is how an ambient
-/// value silently rebinds an account, which is the same reason there is no environment tier.
-///
-/// No credentials are returned: they live in the database, keyed by account name, and never
-/// transit this API.
+/// Refused when that file is not what this server reads: `--instructions`, `MEKA_INSTRUCTIONS`,
+/// `MEKA_INSTRUCTIONS_FILE` or the `instructions/` directory stands above it, so a write would
+/// change nothing a session sees, which is the one thing a write must not quietly do. Under
+/// `config:w`, with the rest of the installation: the text is the persona every session runs
+/// under.
 #[utoipa::path(
-    get,
-    path = "/v1/profiles",
-    tag = "discovery",
+    put,
+    path = "/v1/instructions",
+    tag = "installation",
+    request_body = WriteInstructionsRequest,
     responses(
-        (status = 200, description = "Configured profiles", body = ProfilesResponse),
+        (status = 200, description = "Written; the instructions as this server now holds them", body = InstructionsResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 409, description = "Another source is in charge of the instructions, so the file would change nothing; `detail` names it", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
+        (status = 422, description = "Invalid body", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r"]))
+    security(("bearerAuth" = ["config:w"]))
 )]
-pub(crate) async fn profiles(
+pub(crate) async fn put_instructions(
     State(state): State<ServerState>,
-    _scoped: scope::Scoped<scope::AnyRead>,
-) -> Result<Json<ProfilesResponse>, ProblemDetail> {
-    let config = &state.shared.config;
-    let active = config.default_profile.as_deref();
-    let profiles: Vec<ProfileView> = config
-        .profile_summaries
-        .iter()
-        .map(|summary| ProfileView::from_summary(summary, Some(summary.name.as_str()) == active))
-        .collect();
-    Ok(Json(ProfilesResponse { profiles }))
+    _scoped: scope::Scoped<scope::ConfigWrite>,
+    raw_body: Bytes,
+) -> Result<Json<InstructionsResponse>, ProblemDetail> {
+    let body: WriteInstructionsRequest = serde_json::from_slice(&raw_body)
+        .map_err(|error| ProblemDetail::invalid_body("instructions", error))?;
+    let path = instructions_target(&state.shared.config).map_err(|reason| {
+        ProblemDetail::new(ErrorKind::StoreReadOnly, StatusCode::CONFLICT, reason)
+    })?;
+    if body.content.trim().is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!("removed the standing instructions via HTTP"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ProblemDetail::internal_sanitized(
+                    "failed to remove the instructions file",
+                    error,
+                ));
+            }
+        }
+    } else {
+        crate::fs::write_file_atomic(&path, &body.content).map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to write the instructions file", error)
+        })?;
+        tracing::info!(
+            "wrote the standing instructions via HTTP ({bytes} bytes)",
+            bytes = body.content.len()
+        );
+    }
+    state.shared.reload_instructions().map_err(|error| {
+        ProblemDetail::internal_sanitized("failed to reload the instructions after a write", error)
+    })?;
+    Ok(Json(instructions_response(&state)))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -855,7 +926,7 @@ pub(crate) struct ProjectsResponse {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r"]))
+    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r", "config:r"]))
 )]
 pub(crate) async fn projects(
     State(state): State<ServerState>,

@@ -84,8 +84,10 @@ For each run meka picks one profile using this precedence:
 If none of these resolve (no profiles configured, or more than one with no `default_profile` /
 `--profile`), meka errors and points you at `meka profile add` / `meka profile use`. Resuming a
 session is the exception: it runs on the profile it recorded and never consults this, so an
-ambiguous default does not block `meka -c`. There is no environment-variable tier for profile
-selection; the config file (plus the per-run CLI flag) is the source of truth.
+ambiguous default does not block `meka -c`. `meka serve` is the other: it starts, and refuses the
+`POST /v1/sessions` that names no profile with the same sentence, since each of its sessions may
+name its own. There is no environment-variable tier for profile selection; the config file (plus
+the per-run CLI flag) is the source of truth.
 
 ### Timeouts
 
@@ -476,6 +478,9 @@ There is no `account set`. An account has three settings a user writes, and each
 thing a login was made against, so a change is an edit to `config.toml` followed by
 `meka account login <name>` when the endpoint moved.
 
+A running `meka serve` offers the same verbs over HTTP, on `/v1/accounts` under the `config:w`
+scope; see [Managing the installation](../usage/http-api.md#managing-the-installation).
+
 ## `meka profile` CLI
 
 Add, switch, edit and remove profiles. A profile holds no secret, so none of these commands runs a
@@ -489,6 +494,10 @@ login.
 | `meka profile use <name>` | Set `default_profile` to this profile. |
 | `meka profile remove <name>` | Remove the `[profiles.<name>]` entry from the config file. Warns if it clears a `default_profile` that other profiles are still competing for, and if any sessions are pinned to the profile it deleted (those refuse to resume until it is configured again, or moved with `meka -r <id> --profile <name>`). The account and its credential stay. |
 | `meka profile rename <name> <new-name>` | Rename the profile in place. The `[profiles.<name>]` table keeps its position and comments, `default_profile` follows when it named the profile, and every session recorded on it moves, sub-agent sessions and their pinned spawn terms included. Refused when the new name is taken, or when any session already records it. Stop running hosts first: one keeps the names it started with until restarted, and its sessions on the renamed profile are refused their next turn. |
+
+A running `meka serve` offers the same verbs over HTTP, on `/v1/profiles` under the `config:w`
+scope, and serves what it wrote without a restart; see
+[Managing the installation](../usage/http-api.md#managing-the-installation).
 
 ### Changing one setting
 

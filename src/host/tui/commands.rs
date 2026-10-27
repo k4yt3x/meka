@@ -351,7 +351,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             }
         }
         SlashCommand::McpLogin { server } => {
-            let (outcome, printed) = capture(crate::cli::mcp::run_login(
+            let (outcome, printed) = capture(crate::installation::mcp::login_server(
                 &config.mcp_servers,
                 token_store,
                 &server,
@@ -362,12 +362,22 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 ui.reply(printed);
             }
             match outcome {
-                Ok(()) => ui.note(format!("Authorized '{server}'.")),
+                Ok(()) => {
+                    ui.note(format!("Authorized '{server}'."));
+                    // The session's entry predates the `auth` block the login wrote: restarted
+                    // from the file, it connects with the credential, as an HTTP login's does.
+                    if let Some(manager) = mcp_manager.as_ref()
+                        && let Err(error) =
+                            crate::installation::mcp::restart_from_file(manager, &server).await
+                    {
+                        ui.reply(format!("failed to restart '{server}': {error}"));
+                    }
+                }
                 Err(error) => ui.reply(error.to_string()),
             }
         }
         SlashCommand::McpLogout { server } => {
-            let (outcome, printed) = capture(crate::cli::mcp::run_logout(
+            let (outcome, printed) = capture(crate::installation::mcp::logout_server(
                 &config.mcp_servers,
                 token_store,
                 &server,
@@ -674,14 +684,16 @@ impl ScreenLogin {
 }
 
 #[async_trait::async_trait]
-impl mcp::auth::LoginPrompt for ScreenLogin {
+impl crate::oauth::LoginPrompt for ScreenLogin {
     fn authorize_at(&self, url: &str) {
         *crate::sync::lock(&self.url) = Some(url.to_string());
     }
 
-    fn awaiting_callback(&self, seconds: u64, _accepts_paste: bool) {
-        self.seconds
-            .store(seconds, std::sync::atomic::Ordering::Relaxed);
+    fn awaiting(&self, completion: crate::oauth::Completion) {
+        self.seconds.store(
+            completion.listener_seconds.unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     fn accepts_paste(&self) -> bool {
@@ -711,6 +723,7 @@ impl mcp::auth::LoginPrompt for ScreenLogin {
                     "To authorize, open this URL in your browser: {url} (waiting up to \
                      {seconds}s for the callback)"
                 ),
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(seconds),
             },
             responder,
         });
@@ -727,6 +740,11 @@ impl mcp::auth::LoginPrompt for ScreenLogin {
             // The screen is gone; the listener alone may still be answered.
             Err(_) => Ok(None),
         }
+    }
+
+    fn paste_refused(&self, reason: &str) {
+        // The question is asked again by the next read; the reason reaches the screen's log.
+        tracing::warn!("{reason}");
     }
 }
 

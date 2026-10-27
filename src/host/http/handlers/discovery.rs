@@ -83,11 +83,9 @@ pub(crate) async fn ready(State(state): State<ServerState>) -> impl IntoResponse
         .await
         .is_ok();
     // Reads the configured profiles, which is what `profile_configured` is documented to report: a
-    // profile exists in `config.toml`. Reading the *default* profile's backend answered a different
-    // question that happens to coincide -- `build_shared_deps` refuses to start a host with no
-    // resolvable default, so neither expression can be false here -- and a host whose sessions each
-    // name their own profile is not one the default speaks for.
-    let profile_configured = !state.shared.config.profiles.is_empty();
+    // profile exists in `config.toml`. Not the *default* profile: a host whose sessions each name
+    // their own profile is not one the default speaks for, and `meka serve` runs with none.
+    let profile_configured = !state.shared.providers.catalog().profiles.is_empty();
 
     let mcp_healthy = match state.shared.mcp_manager.as_ref() {
         Some(manager) => !any_required_server_failed(&manager.enabled_not_connected().await),

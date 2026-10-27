@@ -52,9 +52,44 @@ pub(crate) fn is_reserved_server_name(name: &str) -> bool {
     name.to_ascii_lowercase().starts_with("mcp_")
 }
 
+/// Why `name` cannot name a server, when it cannot: it is empty, meka reserves it, or a tool
+/// prefix cannot carry it. One definition for every door an entry comes through, `config.toml`'s
+/// and the running manager's, so a name the file takes is a name the manager takes.
+pub(crate) fn validate_server_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("server name must not be empty".to_string());
+    }
+    if is_reserved_server_name(name) {
+        return Err(format!("server name '{name}' is reserved"));
+    }
+    let normalized = normalize_server_name(name);
+    if normalized != name {
+        return Err(format!(
+            "server name '{name}' has invalid characters; '{normalized}' would be accepted"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one predicate refuses what either door must: the empty name, which normalizes to a
+    /// non-empty one and would slip past the characters rule alone, a reserved name, and one a
+    /// tool prefix cannot carry.
+    #[test]
+    fn a_server_name_is_held_to_one_set_of_rules() {
+        assert_eq!(
+            validate_server_name("").unwrap_err(),
+            "server name must not be empty"
+        );
+        assert!(validate_server_name("meka").is_err());
+        assert!(validate_server_name("mcp_x").is_err());
+        assert!(validate_server_name("a__b").is_err());
+        assert!(validate_server_name("a b").is_err());
+        assert!(validate_server_name("exa-2").is_ok());
+    }
     use crate::text::sanitize_text;
 
     #[test]

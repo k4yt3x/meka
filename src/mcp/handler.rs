@@ -246,14 +246,14 @@ pub(super) async fn refresh_tools_after_list_changed(
         return;
     };
 
-    // Tool-permission resolution reads the server config and `mcp_default_permission` from the
-    // manager itself; no explicit permission needs to be threaded here.
-    match manager.discover_tools_for_server(server_name).await {
-        Ok(adapters) => {
-            // The same door the initial registration goes through, so a refresh cannot classify a
-            // tool differently from the listing it replaces. Routes through every attached
-            // registry so all active sessions observe the updated tool set.
-            manager.register_server_tools(server_name, adapters).await;
+    let Some(entry) = manager.server_entry(server_name) else {
+        tracing::debug!("tool list refresh skipped: '{server_name}' is not configured");
+        return;
+    };
+    // The same door the initial registration goes through, so a refresh cannot classify a tool
+    // differently from the listing it replaces, and every attached registry sees the new set.
+    match manager.refresh_server_tools(&entry).await {
+        Ok(_) => {
             tracing::info!("MCP server '{server_name}' tool registry refreshed");
         }
         Err(error) => {
@@ -268,6 +268,10 @@ pub(super) fn record_resource_update(server_name: &str, context: &McpClientConte
     tracing::info!("MCP server '{server_name}' reported resource updated: {uri}");
     context.resource_updates.record(server_name, uri);
 }
+
+/// How long a frontend has to answer an elicitation before it is declined for the person. The
+/// prompt carries the instant, so a frontend that waits it out itself ends on the same one.
+const ELICITATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Put a server's elicitation to `frontend` and answer with what the user said, or a decline when
 /// the user did not answer in time.
@@ -305,32 +309,29 @@ pub(super) async fn elicit(
         ),
     };
 
+    // Bounded so an unanswered prompt cannot stall an MCP tool call forever; an approval prompt
+    // waits longer because the turn is already paused on it. An elicitation is an MCP *request*,
+    // so a `Decline` is how the server learns the user did not answer; `notifications/cancelled`
+    // is for requests meka started. The frontend is handed the same instant, so one that waits
+    // it out itself reports the expiry rather than a cut.
+    let deadline = tokio::time::Instant::now() + ELICITATION_TIMEOUT;
     let prompt = ElicitationPrompt {
         server_name: server.to_string(),
         kind,
         message,
+        deadline,
     };
-
-    // Bounded so an unanswered prompt cannot stall an MCP tool call forever; an approval prompt
-    // waits longer because the turn is already paused on it. An elicitation is an MCP *request*,
-    // so a `Decline` is how the server learns the user did not answer; `notifications/cancelled`
-    // is for requests meka started.
-    const ELICITATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let response = match tokio::time::timeout(
-        ELICITATION_TIMEOUT,
-        frontend.handle_elicitation(prompt),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(_) => {
-            tracing::warn!(
-                "MCP server '{server}' elicitation timed out after {seconds}s; declining",
-                seconds = ELICITATION_TIMEOUT.as_secs()
-            );
-            ElicitationResponse::Decline
-        }
-    };
+    let response =
+        match tokio::time::timeout_at(deadline, frontend.handle_elicitation(prompt)).await {
+            Ok(response) => response,
+            Err(_) => {
+                tracing::warn!(
+                    "MCP server '{server}' elicitation timed out after {seconds}s; declining",
+                    seconds = ELICITATION_TIMEOUT.as_secs()
+                );
+                ElicitationResponse::Decline
+            }
+        };
 
     response.into_result()
 }
