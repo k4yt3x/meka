@@ -4397,6 +4397,32 @@ retention = "90d"
         resolved
     }
 
+    /// A default the catalog refuses stops a run that needs it now, and is deferred for a resume,
+    /// whose row holds the answer, and for a host that names a profile per session when none was
+    /// asked for on the command line.
+    #[test]
+    fn a_refused_default_is_deferred_only_where_the_profile_comes_later() {
+        let mut config = resolve_with_config(
+            "default_profile = \"missing\"\n[accounts.a]\nbackend = \
+             \"openai-chat-completions\"\nbase_url = \"http://127.0.0.1:9/\"\n[profiles.p]\naccount \
+             = \"a\"\nmodel = \"m\"\n",
+        );
+        assert!(
+            config.provider_error.is_some(),
+            "a default naming no profile is held as the error"
+        );
+        assert!(config.validate_default_profile().is_err());
+        config.request.profile_named_per_session = true;
+        config.request.requested_profile = None;
+        assert!(config.validate_default_profile().is_ok());
+        config.request.requested_profile = Some("p".to_string());
+        assert!(config.validate_default_profile().is_err());
+        config.request.profile_named_per_session = false;
+        config.request.requested_profile = None;
+        config.request.session_resume = Some(SessionResume::Last);
+        assert!(config.validate_default_profile().is_ok());
+    }
+
     /// The registry gating is tested in `crate::tools`, but nothing joined the two: a key that
     /// never reaches `ResolvedConfig` leaves the tools correctly gated on a flag that is always
     /// false, and every test on either side still passes.

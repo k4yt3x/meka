@@ -21169,6 +21169,25 @@ fn a_pending_login_answers_only_under_the_subject_and_kind_that_began_it() {
     }
 }
 
+/// Blank content removes the instructions file, and removing one that is not there is nothing
+/// to report: the same request twice answers the same way.
+#[test]
+fn blank_instructions_remove_the_file_and_are_idempotent() {
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "config:r", "config:w",
+    ]);
+    for _ in 0..2 {
+        let response = harness
+            .request(reqwest::Method::PUT, "/v1/instructions")
+            .json(&serde_json::json!({"content": ""}))
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response.json().unwrap_or(serde_json::Value::Null);
+        assert_eq!(status, 200, "{body}");
+    }
+}
+
 /// Every MCP write needs `config:w`, and the detail `config:r`.
 #[test]
 fn mcp_installation_routes_need_the_config_scopes() {

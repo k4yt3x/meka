@@ -440,6 +440,15 @@ impl ServerFeed {
 
 #[cfg(test)]
 mod tests {
+
+    /// The server feed carries the events that change a session's record and none of the words
+    /// streamed inside a turn.
+    #[test]
+    fn the_server_feed_mirrors_the_record_changing_events_alone() {
+        assert!(ServerFeed::mirrors(SseEventType::TurnStarted));
+        assert!(ServerFeed::mirrors(SseEventType::ElicitationResolved));
+        assert!(!ServerFeed::mirrors(SseEventType::AssistantTextDelta));
+    }
     use super::*;
 
     fn server_feed_with(published: u64, ring: usize) -> ServerFeed {

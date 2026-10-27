@@ -1090,6 +1090,66 @@ fn scripted_command(install: &Install, args: &[&str]) -> Command {
     install.meka(args)
 }
 
+/// A one-shot run with a server configured holds a manager for it, so the server is connected,
+/// or its failure to connect said, before the turn.
+#[test]
+fn a_oneshot_run_connects_a_configured_mcp_server() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"mock\"\n\n[permissions]\ndefault = \"read\"\nenabled = [\"read\"]\n\n\
+         [accounts.mock]\nbackend = \"openai-chat-completions\"\nbase_url = \
+         \"http://127.0.0.1:9/\"\n\n[profiles.mock]\naccount = \"mock\"\nmodel = \"mock-model\"\n\n\
+         [[mcp.servers]]\nname = \"stray\"\ntransport = \"http\"\nurl = \"http://127.0.0.1:9/mcp\"\n",
+    );
+    let output = scripted_command(&install, &["-p", "hi", "--oneshot"])
+        .output()
+        .expect("run meka");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("failed to connect to MCP server 'stray'"),
+        "the configured server was tried: {stderr}"
+    );
+}
+
+/// A pasted line carrying another login's state is refused at the terminal and the next line
+/// read; a closed input then ends a Claude login, which nothing else completes.
+#[test]
+fn a_terminal_login_refuses_a_stale_paste_and_reads_again() {
+    let port = support::spawn_http_listener(|_request| {
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string()
+    });
+    let install = Install::new();
+    install.write_config(&format!(
+        "[accounts.cl]\nbackend = \"claude-subscription\"\nclient_id = \"cid-test\"\noauth_token_url \
+         = \"http://127.0.0.1:{port}/token\"\n"
+    ));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_meka"));
+    let mut child = install
+        .env(&mut command)
+        .args(["account", "login", "cl"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn meka");
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(b"abc#wrongstate\n")
+            .expect("write the paste");
+    }
+    let output = child.wait_with_output().expect("wait for meka");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("OAuth state mismatch; refusing the callback"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("nothing was pasted"), "{stderr}");
+}
+
 /// `-p -` is the prompt on stdin, whole, with the newline a shell appends trimmed off.
 #[test]
 fn the_prompt_can_be_read_from_stdin() {

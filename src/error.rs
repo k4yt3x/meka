@@ -1273,6 +1273,19 @@ pub(crate) fn format_reqwest_error(error: &reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every kind carries a title beside its type, and the one a rename is refused with names
+    /// the cause.
+    #[test]
+    fn every_error_kind_has_a_title() {
+        for kind in super::ErrorKind::ALL {
+            assert!(!kind.title().is_empty(), "{}", kind.name());
+        }
+        assert_eq!(
+            super::ErrorKind::AccountInUse.title(),
+            "A resident session runs on the account"
+        );
+    }
     /// The store records a kind by its name and the HTTP host spells the same kind as a URI, so
     /// the two tables have to agree kind for kind: a name is its URI's last segment, every kind
     /// reads back from its name, and no two kinds share one.

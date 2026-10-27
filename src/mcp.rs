@@ -4038,6 +4038,51 @@ mod tests {
         );
     }
 
+    /// The manager holds the entry built under a name and not one taken out, whatever still runs
+    /// on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_removed_entry_is_no_longer_held() {
+        let stub = StubServer::prepare(serde_json::json!({"tools": ["search"]})).await;
+        assert!(stub.manager.holds(&stub.entry));
+        stub.manager.remove_server("stub").await.expect("remove");
+        assert!(!stub.manager.holds(&stub.entry));
+    }
+
+    /// A tool is reported as still connecting only while its server's first connect is pending,
+    /// and never for a name meka did not mint; and no server speaks instructions before it is
+    /// connected.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pending_server_s_tools_are_still_connecting_and_say_nothing_yet() {
+        let stub = StubServer::prepare(serde_json::json!({"tools": ["search"]})).await;
+        assert!(
+            stub.manager
+                .server_is_still_connecting("mcp__stub__search")
+                .await
+        );
+        assert!(
+            !stub
+                .manager
+                .server_is_still_connecting("mcp__other__search")
+                .await
+        );
+        assert!(
+            !stub
+                .manager
+                .server_is_still_connecting("shell_execute")
+                .await
+        );
+        assert!(stub.manager.server_instructions().is_empty());
+        stub.manager.remove_server("stub").await.expect("remove");
+        assert!(
+            !stub
+                .manager
+                .server_is_still_connecting("mcp__stub__search")
+                .await
+        );
+    }
+
     /// A connect still in flight when its server is removed ends with the removal, and the child
     /// it was spawning dies, rather than running to its bound on an entry nothing holds.
     #[cfg(unix)]
