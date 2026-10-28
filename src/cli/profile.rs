@@ -60,7 +60,9 @@ pub(crate) async fn run(
         } => run_set(name, key, value.as_deref(), *unset),
         ProfileAction::Use { name } => run_use(name),
         ProfileAction::Remove { name } => remove_profile(name, store).await,
-        ProfileAction::Rename { name, new_name } => rename_profile(name, new_name, store).await,
+        ProfileAction::Rename { name, new_name } => {
+            rename_profile(name, new_name, store).await.map(|_| ())
+        }
     }
 }
 

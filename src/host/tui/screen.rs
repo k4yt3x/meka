@@ -1418,6 +1418,7 @@ impl Screen {
                         },
                         message: String::new(),
                         deadline: tokio::time::Instant::now(),
+                        subagent_id: None,
                     },
                     responder: elicitation.responder,
                 }

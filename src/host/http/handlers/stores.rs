@@ -1038,12 +1038,13 @@ pub(crate) async fn rename_project(
         .rename_project(&name, new_name)
         .await
         .map_err(|error| project_refusal(error, state.config.relay_provider_errors))?;
-    let sessions = renamed.sessions_moved;
+    let sessions = renamed.sessions.len();
     let memories = renamed.memories_moved;
     tracing::info!(
         "renamed project '{name}' to '{new_name}' via HTTP; {sessions} session(s) and {memories} \
          memor(ies) follow"
     );
+    super::sessions::announce_sessions_moved(&state, &renamed.sessions).await;
     Ok(Json(renamed.project.into()))
 }
 

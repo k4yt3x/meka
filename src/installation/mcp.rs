@@ -139,15 +139,18 @@ pub(crate) const PROBE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duratio
 /// bounds the connect, the browser wait of a login included.
 pub(crate) async fn connect_alone(
     config: &McpServerConfig,
+    overlay: &crate::config::McpOverlay,
     mcp_default: Option<crate::permission::Permission>,
     token_store: &TokenStore,
     context: Arc<McpClientContext>,
     connect_timeout: std::time::Duration,
 ) -> Result<(Arc<McpClientManager>, bool)> {
     // None of the three probes calls a tool, so the per-call cap never applies and the default
-    // stands in rather than threading a `ResolvedConfig` these commands do not otherwise need.
-    let manager = McpClientManager::prepare(
+    // stands in rather than threading a `ResolvedConfig` these commands do not otherwise need;
+    // the overlay is threaded, since what a probe lists is what the entry runs under.
+    let manager = McpClientManager::prepare_with_overlay(
         std::slice::from_ref(config),
+        overlay.clone(),
         mcp_default,
         Some(token_store.clone()),
         context,
@@ -284,14 +287,18 @@ fn refuse_a_misplaced_secret(
     }
 }
 
-/// Connect `config` once with a person at hand for the browser step, and say whether it ended
-/// connected. Split from `login_server` so every way the flow can end short of `Connected`, an
-/// error included, reaches the one place that puts the previous bundle back.
+/// Connect `config` once with a person at hand for the browser step, and say why it ended short of
+/// `Connected`, or `None` for a connect that landed. Split from `login_server` so every way the
+/// flow can end short, an error included, reaches the one place that puts the previous bundle
+/// back. The reason is the bare cause the connector recorded on the flow's own entry, URLs
+/// redacted: the connect's error is answered as a state there, and a login that fails on it would
+/// otherwise say only that it did not complete.
 async fn login_flow(
     config: &McpServerConfig,
+    overlay: &crate::config::McpOverlay,
     token_store: &TokenStore,
     prompt: Arc<dyn crate::oauth::LoginPrompt>,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let context = McpClientContext::new();
     // The one place a person is there to finish a browser login, so the one place the client is
     // given a way to ask them.
@@ -301,14 +308,27 @@ async fn login_flow(
     // of would be cut short.
     let (manager, connected) = connect_alone(
         config,
+        overlay,
         None,
         token_store,
         context,
         crate::mcp::auth::OAUTH_CALLBACK_TIMEOUT + PROBE_CONNECT_TIMEOUT,
     )
     .await?;
+    let reason = if connected {
+        None
+    } else {
+        let recorded = match manager.server_entry(&config.name) {
+            Some(entry) => match entry.state().await {
+                crate::mcp::ServerState::Failed { error, .. } => Some(error),
+                _ => None,
+            },
+            None => None,
+        };
+        Some(recorded.unwrap_or_else(|| "the OAuth flow did not complete".to_string()))
+    };
     manager.shutdown_arc().await;
-    Ok(connected)
+    Ok(reason)
 }
 
 /// Put `name` back on a running manager from the entry as `config.toml` now states it, once a
@@ -338,6 +358,7 @@ pub(crate) async fn restart_from_file(
 /// not assume. A stdio server has nothing to log in to.
 pub(crate) async fn login_server(
     servers: &[McpServerConfig],
+    overlay: &crate::config::McpOverlay,
     token_store: &TokenStore,
     name: &str,
     prompt: Arc<dyn crate::oauth::LoginPrompt>,
@@ -403,27 +424,29 @@ pub(crate) async fn login_server(
         .clear_mcp_credentials_of_kind(name, crate::store::McpCredentialKind::OAuth)
         .await?;
 
-    let connected = login_flow(&config, token_store, prompt).await;
-    let connected = match connected {
-        Ok(true) => true,
-        Ok(false) | Err(_) => {
-            if let Some(bundle) = &previous_bundle
-                && let Err(error) = token_store
-                    .save_mcp_credentials(name, crate::store::McpCredentialKind::OAuth, bundle)
-                    .await
-            {
-                tracing::warn!(
-                    "failed to restore the previous OAuth bundle for '{name}' after an incomplete \
-                     login: {error}"
-                );
-            }
-            false
-        }
+    let failure = match login_flow(&config, overlay, token_store, prompt).await {
+        Ok(None) => None,
+        Ok(Some(reason)) => Some(Ok(reason)),
+        Err(error) => Some(Err(error)),
     };
-    if !connected {
-        return Err(MekaError::McpAuth {
-            server_name: config.name.clone(),
-            message: "the OAuth flow did not complete".to_string(),
+    if let Some(failure) = failure {
+        if let Some(bundle) = &previous_bundle
+            && let Err(error) = token_store
+                .save_mcp_credentials(name, crate::store::McpCredentialKind::OAuth, bundle)
+                .await
+        {
+            tracing::warn!(
+                "failed to restore the previous OAuth bundle for '{name}' after an incomplete \
+                 login: {error}"
+            );
+        }
+        return Err(match failure {
+            // The flow's own word on why the login did not complete; an error is its own class.
+            Ok(reason) => MekaError::McpAuth {
+                server_name: config.name.clone(),
+                message: reason,
+            },
+            Err(error) => error,
         });
     }
 
@@ -689,12 +712,8 @@ pub(crate) async fn edit_server(
                     .find(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(name))
             })
             .ok_or_else(unknown)?;
-        // Rendered as the root of a document of its own: a table on its own prints its keys and
-        // not the sub-tables under it, which an `auth` block is.
-        let mut standalone = toml_edit::DocumentMut::new();
-        *standalone.as_table_mut() = entry_table.clone();
         let mut config: McpServerConfig =
-            toml::from_str(&standalone.to_string()).map_err(|error| {
+            toml::from_str(&render_entry(entry_table)).map_err(|error| {
                 config_err(format!(
                     "server '{name}' in config.toml does not parse: {error}"
                 ))
@@ -971,6 +990,21 @@ pub(crate) fn server_config_to_table(config: &McpServerConfig) -> toml_edit::Tab
         table.insert("tool_permissions", toml_edit::Item::Table(tpt));
     }
     table
+}
+
+/// An entry's table rendered as the root of a document of its own: a table on its own prints its
+/// keys and not the sub-tables under it, which an `auth` block is.
+pub(crate) fn render_entry(table: &toml_edit::Table) -> String {
+    let mut standalone = toml_edit::DocumentMut::new();
+    *standalone.as_table_mut() = table.clone();
+    standalone.to_string()
+}
+
+/// Whether two entries are one entry as `config.toml` states it: equal as the file would be
+/// written from each, since a door may hand the manager a copy that says what the writer leaves
+/// unsaid, a `false` or an empty list, and the file reads that back as unsaid.
+pub(crate) fn same_entry(a: &McpServerConfig, b: &McpServerConfig) -> bool {
+    render_entry(&server_config_to_table(a)) == render_entry(&server_config_to_table(b))
 }
 
 /// `map` as an inline table, keys in order so the TOML diff is review-friendly.

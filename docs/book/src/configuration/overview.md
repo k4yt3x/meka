@@ -141,8 +141,12 @@ Two consequences worth knowing:
   written through `PUT /v1/instructions` is read again by the server that wrote it, for the
   sessions that open from then on.
 
-Restart the server to pick either up. Everything else follows a live source and needs no restart:
-skills are re-read per turn, memories per turn, and MCP tool lists follow the server.
+Restart the server to pick either up, or ask `meka serve` to read the file again with
+[`POST /v1/config/reload`](../usage/http-api.md#managing-the-installation), which applies the
+accounts, profiles, MCP server entries and `instructions.md` as they stand and nothing else: not
+the `[mcp]` table's own keys, nor any other section. Everything
+else follows a live source and needs no restart: skills are re-read per turn, memories per turn,
+and MCP tool lists follow the server.
 
 A **rotated credential** sits between the two, and the distinction matters if you are rotating
 because a key leaked. `meka account login <name>` from a second process is picked up without a

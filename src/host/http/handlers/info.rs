@@ -38,17 +38,18 @@ pub(crate) struct InfoResponse {
     /// The data directory, where the store lives.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) data_dir: Option<String>,
-    /// When this process read `config.toml` whole, RFC 3339: its start.
+    /// When this process last read `config.toml` whole, RFC 3339: its start, or the last
+    /// `POST /v1/config/reload`.
     pub(crate) config_loaded_at: String,
     /// When `config.toml` was last written, RFC 3339; absent when there is no file. Later than
     /// `config_loaded_at` means the file has changed since this process read it whole, by a
-    /// write of its own, which it serves, or by a shell's, which waits for a restart.
+    /// write of its own, which it serves, or by a shell's, which `POST /v1/config/reload` applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) config_modified_at: Option<String>,
 }
 
 /// `when` as the wire carries a time.
-fn rfc3339(when: chrono::DateTime<chrono::Utc>) -> String {
+pub(crate) fn rfc3339(when: chrono::DateTime<chrono::Utc>) -> String {
     when.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -95,7 +96,7 @@ pub(crate) async fn info(
         scopes,
         config_path: config_path.map(|path| path.display().to_string()),
         data_dir: crate::paths::meka_data_dir().map(|path| path.display().to_string()),
-        config_loaded_at: rfc3339(state.started_at),
+        config_loaded_at: rfc3339(*crate::sync::lock(&state.config_loaded_at)),
         config_modified_at,
     }))
 }

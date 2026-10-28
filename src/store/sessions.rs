@@ -1143,21 +1143,31 @@ impl Store {
     }
 
     /// Move every session on `profile` to `new_profile`, the pinned spawn terms of a sub-agent
-    /// included, and answer how many rows moved.
+    /// included, and answer the ids of the rows that moved, so a host can announce each as its
+    /// row now reads.
     ///
     /// One transaction, because a follow-up runs a pinned worker on its row while `session show`
     /// and an export read the spec: rows moved without specs would show a worker pinned to a
     /// name nothing is configured under.
-    pub(crate) async fn rename_profile(&self, profile: &str, new_profile: &str) -> Result<u64> {
+    pub(crate) async fn rename_profile(
+        &self,
+        profile: &str,
+        new_profile: &str,
+    ) -> Result<Vec<Uuid>> {
         let profile = profile.to_string();
         let new_profile = new_profile.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection.transaction()?;
-                let moved = transaction.execute(
-                    "UPDATE sessions SET profile = ?2 WHERE profile = ?1",
-                    rusqlite::params![profile, new_profile],
-                )?;
+                let moved: Vec<Uuid> = transaction
+                    .prepare("UPDATE sessions SET profile = ?2 WHERE profile = ?1 RETURNING id")?
+                    .query_map(rusqlite::params![profile, new_profile], |row| {
+                        let id: String = row.get(0)?;
+                        Uuid::parse_str(&id).map_err(|error| {
+                            rusqlite::Error::InvalidParameterName(error.to_string())
+                        })
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
                 // `json_valid` first: `json_extract` raises on a spec that is not JSON, which an
                 // import writes verbatim from its archive, and one such row must not block every
                 // rename. It is left as it is, like any spec the rename has no name to move.
@@ -1172,7 +1182,7 @@ impl Store {
                     rusqlite::params![profile, new_profile],
                 )?;
                 transaction.commit()?;
-                Ok(moved as u64)
+                Ok(moved)
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to rename a profile: {error}")))
@@ -5718,7 +5728,11 @@ mod tests {
             .await
             .expect("malformed");
 
-        let moved = store.rename_profile("old", "new").await.expect("rename");
+        let moved = store
+            .rename_profile("old", "new")
+            .await
+            .expect("rename")
+            .len();
 
         assert_eq!(moved, 4, "the root and all three children moved");
         assert_eq!(
@@ -9688,5 +9702,38 @@ mod tests {
             .await
             .expect("move off");
         assert_eq!(info(plain).await, "");
+    }
+
+    /// A moved row whose id is not one meka wrote fails the rename rather than going unannounced:
+    /// the ids answered are the rows moved.
+    #[tokio::test]
+    async fn a_profile_rename_refuses_a_session_row_whose_id_is_not_an_id() {
+        let store = Store::for_test().await;
+        let root = store
+            .create_session(None, "old".to_string())
+            .await
+            .expect("root");
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute("UPDATE sessions SET id = 'not-an-id' WHERE id = ?1", [
+                    root.to_string()
+                ])
+            })
+            .await
+            .expect("a hand edit");
+        let error = store
+            .rename_profile("old", "new")
+            .await
+            .expect_err("the row cannot be announced");
+        assert!(error.to_string().contains("failed to rename"), "{error}");
+        assert_eq!(
+            store
+                .count_sessions_recording_profile("old")
+                .await
+                .expect("count"),
+            1,
+            "nothing moved"
+        );
     }
 }

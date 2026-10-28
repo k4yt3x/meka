@@ -281,6 +281,7 @@ pub(crate) async fn run_get(
 /// the CLI to discover names.
 pub(crate) async fn run_tools(
     servers: &[McpServerConfig],
+    overlay: &crate::config::McpOverlay,
     mcp_default: Option<crate::permission::Permission>,
     token_store: &TokenStore,
     name: &str,
@@ -291,6 +292,7 @@ pub(crate) async fn run_tools(
     let context = McpClientContext::new();
     let (manager, connected) = connect_alone(
         &config,
+        overlay,
         mcp_default,
         token_store,
         Arc::clone(&context),
@@ -390,6 +392,7 @@ fn warn_about_dropped_tools(dropped: usize) {
 /// with the error otherwise. Does not mutate config.
 pub(crate) async fn run_reconnect(
     servers: &[McpServerConfig],
+    overlay: &crate::config::McpOverlay,
     token_store: &TokenStore,
     name: &str,
 ) -> Result<()> {
@@ -400,6 +403,7 @@ pub(crate) async fn run_reconnect(
     // the per-tool resolution falls through to its strict default.
     let (manager, connected) = connect_alone(
         &config,
+        overlay,
         None,
         token_store,
         Arc::clone(&context),
@@ -511,7 +515,11 @@ struct ResolvedAddArgs {
 /// Persists the server into `config.toml`, then for an HTTP server probes the endpoint (RFC 6750 /
 /// RFC 9728) and, when auth is required or `--auth oauth` was passed and `--no-login` was not, runs
 /// the OAuth flow at once. A failed flow purges the entry just written and exits non-zero.
-pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
+pub(crate) async fn run_add(
+    args: AddArgs,
+    overlay: &crate::config::McpOverlay,
+    token_store: &TokenStore,
+) -> Result<()> {
     let resolved = resolve_add_args(args)?;
     let config = resolved_to_server_config(&resolved);
     let secrets = ServerSecrets {
@@ -539,7 +547,7 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
     let result: Result<()> = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => Err(MekaError::Interrupted),
-        r = probe_then_login(&resolved, token_store) => r,
+        r = probe_then_login(&resolved, overlay, token_store) => r,
     };
 
     if let Err(error) = result {
@@ -561,7 +569,11 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
 /// The "everything that can fail post-persist" block: probe, decide whether to auto-login, and run
 /// the OAuth flow when warranted. Extracted so [`run_add`] can race it against a SIGINT handler and
 /// roll back on either error path from one place.
-async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) -> Result<()> {
+async fn probe_then_login(
+    resolved: &ResolvedAddArgs,
+    overlay: &crate::config::McpOverlay,
+    token_store: &TokenStore,
+) -> Result<()> {
     // The caller has already established HTTP transport, no `auth_token` and a URL; an absent URL
     // here is a bug in that caller, reported rather than panicked on so the rollback still runs.
     let Some(url) = resolved.url.as_deref() else {
@@ -613,6 +625,7 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
     );
     login_server(
         std::slice::from_ref(&server_config),
+        overlay,
         token_store,
         &resolved.name,
         Arc::new(TerminalLogin),
@@ -1064,9 +1077,10 @@ pub(crate) async fn run_mcp_subcommand(
     }
     let token_store = store.token_store();
     match action {
+        // Shown as the servers run: what an entry leaves unsaid, under the `[mcp]` defaults.
         crate::cli::McpAction::List { format } => {
             crate::cli::mcp::list_servers(
-                &config.mcp_servers,
+                &config.mcp_servers_as_served(),
                 None,
                 &token_store,
                 *format,
@@ -1075,14 +1089,22 @@ pub(crate) async fn run_mcp_subcommand(
             .await?
         }
         crate::cli::McpAction::Get { name, format } => {
-            crate::cli::mcp::run_get(&config.mcp_servers, name, &token_store, *format).await?
+            crate::cli::mcp::run_get(&config.mcp_servers_as_served(), name, &token_store, *format)
+                .await?
         }
         crate::cli::McpAction::Reconnect { name } => {
-            crate::cli::mcp::run_reconnect(&config.mcp_servers, &token_store, name).await?
+            crate::cli::mcp::run_reconnect(
+                &config.mcp_servers,
+                &config.mcp_overlay,
+                &token_store,
+                name,
+            )
+            .await?
         }
         crate::cli::McpAction::Tools { name, format } => {
             crate::cli::mcp::run_tools(
                 &config.mcp_servers,
+                &config.mcp_overlay,
                 config.mcp_default_permission,
                 &token_store,
                 name,
@@ -1121,6 +1143,7 @@ pub(crate) async fn run_mcp_subcommand(
                 None => {
                     crate::cli::mcp::login_server(
                         &config.mcp_servers,
+                        &config.mcp_overlay,
                         &token_store,
                         name,
                         Arc::new(TerminalLogin),
@@ -1192,6 +1215,7 @@ pub(crate) async fn run_mcp_subcommand(
                     disabled: *disabled,
                     required: *required,
                 },
+                &config.mcp_overlay,
                 &token_store,
             )
             .await?
@@ -1643,6 +1667,7 @@ mod tests {
 
             let error = login_server(
                 std::slice::from_ref(&server),
+                &crate::config::McpOverlay::default(),
                 &store,
                 "api",
                 Arc::new(TerminalLogin),
@@ -1717,7 +1742,12 @@ mod tests {
         let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
         // Loopback discard port: `run_add` must refuse before it can probe, so nothing dials out.
-        let result = run_add(bare_add("api", Some("http://127.0.0.1:9/mcp")), &store).await;
+        let result = run_add(
+            bare_add("api", Some("http://127.0.0.1:9/mcp")),
+            &crate::config::McpOverlay::default(),
+            &store,
+        )
+        .await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
         let error = result.expect_err("a name with a stored credential must be refused");

@@ -965,9 +965,11 @@ async fn accept_http_callback(
                 continue;
             }
             Ok((code, state)) => {
+                // No claim of success: the exchange comes after this page, and may still fail.
                 let response_body = "<!DOCTYPE html><html><body>\
-                    <h1>Authorization successful</h1>\
-                    <p>You can close this tab and return to meka.</p>\
+                    <h1>Return to meka</h1>\
+                    <p>The authorization was received; meka is completing the login. \
+                    You can close this tab.</p>\
                     </body></html>";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

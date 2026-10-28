@@ -295,13 +295,15 @@ pub(crate) async fn connect_one(
     let landing = entry.connects.connecting();
     let connected = match connect_task.await {
         Ok(Some(Ok(Ok(service)))) => service,
-        // Store the bare cause. `MekaError::McpConnection` renders as
-        // "MCP connection error: <server>: <message>", and every consumer of this string
-        // (`meka mcp list`, the turn-gate summary, the agent-facing tool error) already names the
-        // server, so keeping the prefix would say it twice.
+        // Store the bare cause. `MekaError::McpConnection` and `McpAuth` render as
+        // "MCP <class> error: <server>: <message>", and every consumer of this string
+        // (`meka mcp list`, the turn-gate summary, the agent-facing tool error, a login's reason)
+        // already names the server, so keeping the prefix would say it twice.
         Ok(Some(Ok(Err(error)))) => {
             let cause = match &error {
-                MekaError::McpConnection { message, .. } => message.clone(),
+                MekaError::McpConnection { message, .. } | MekaError::McpAuth { message, .. } => {
+                    message.clone()
+                }
                 other => other.to_string(),
             };
             record_connect_failure(&entry, &server_name, cause).await;

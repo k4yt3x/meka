@@ -819,14 +819,15 @@ pub(crate) async fn browser_login(
         // The accept carries the timeout that bounds the whole wait; the paste reader parks on a
         // closed input so a non-interactive stdin can never win the race against a real callback.
         Some(listener) if pastes => tokio::select! {
-            result = accept_codex_callback(listener, callback_timeout) => {
+            result = accept_codex_callback(listener, &login.state, callback_timeout) => {
                 let (code, state) = result?;
                 (code, Some(state))
             }
             result = read_paste(&login, prompt, true) => result?,
         },
         Some(listener) => {
-            let (code, state) = accept_codex_callback(listener, callback_timeout).await?;
+            let (code, state) =
+                accept_codex_callback(listener, &login.state, callback_timeout).await?;
             (code, Some(state))
         }
         // Bounded like the listener's wait: a login nobody completes ends, rather than holding
@@ -979,11 +980,15 @@ fn build_codex_authorize_url(
     Ok(url.to_string())
 }
 
-/// Wait on the loopback listener for the browser to be sent back, answering it a page, and give
-/// the code and state it carried; refuses after `timeout`, and on an authorization the server
-/// refused.
+/// Wait on the loopback listener for the browser to be sent back under this login's
+/// `expected_state`, answering it a page, and give the code and state it carried; refuses after
+/// `timeout`, and on an authorization the server refused. A callback under another state, a stale
+/// tab or another login's browser, is answered a refusal and the wait goes on, ahead of the
+/// exchange, so the code this login asked for is still waited on. The page claims no success: the
+/// exchange comes after, and may still fail.
 async fn accept_codex_callback(
     listener: tokio::net::TcpListener,
+    expected_state: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<(String, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1037,10 +1042,29 @@ async fn accept_codex_callback(
 
         let request = String::from_utf8_lossy(&buffer);
         match parse_codex_callback_query(&request) {
+            CodexCallback::Match { state, .. } if state != expected_state => {
+                tracing::warn!("OAuth state mismatch; refusing the callback");
+                let body = b"<!DOCTYPE html><html><body>\
+                    <h1>Authorization refused</h1>\
+                    <p>This callback is not the login meka is waiting for.</p>\
+                    </body></html>";
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if let Err(error) = stream.write_all(response.as_bytes()).await {
+                    tracing::debug!("failed to answer the callback client: {error}");
+                }
+                if let Err(error) = stream.write_all(body).await {
+                    tracing::debug!("failed to answer the callback client: {error}");
+                }
+                continue;
+            }
             CodexCallback::Match { code, state } => {
                 let body = b"<!DOCTYPE html><html><body>\
-                    <h1>Codex authorization successful</h1>\
-                    <p>You can close this tab and return to meka.</p>\
+                    <h1>Return to meka</h1>\
+                    <p>The authorization was received; meka is completing the login. \
+                    You can close this tab.</p>\
                     </body></html>";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1866,6 +1890,59 @@ mod tests {
         assert!(url.contains("code_challenge=challenge"));
         assert!(url.contains("state=state"));
         assert!(url.contains("code_challenge_method=S256"));
+    }
+
+    /// A callback under another login's state, a stale tab or another login's browser, is
+    /// refused by the listener and the wait goes on, so the code this login asked for still
+    /// lands; the page claims no success, since the exchange comes after it.
+    #[tokio::test]
+    async fn the_loopback_listener_refuses_a_stale_state_and_keeps_listening() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let accept = tokio::spawn(accept_codex_callback(
+            listener,
+            "good",
+            std::time::Duration::from_secs(10),
+        ));
+        let answer = |query: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect");
+            stream
+                .write_all(
+                    format!("GET /auth/callback?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .expect("write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.expect("read");
+            response
+        };
+
+        let refused = answer("code=c1&state=stale").await;
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        assert!(refused.contains("Authorization refused"), "{refused}");
+        assert!(
+            !accept.is_finished(),
+            "the wait goes on past a callback that is not this login's"
+        );
+
+        let accepted = answer("code=c2&state=good").await;
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+        assert!(
+            !accepted.contains("successful"),
+            "no claim of success ahead of the exchange: {accepted}"
+        );
+        let (code, state) = accept
+            .await
+            .expect("join")
+            .expect("the login's own callback");
+        assert_eq!((code.as_str(), state.as_str()), ("c2", "good"));
     }
 
     #[test]

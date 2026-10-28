@@ -103,6 +103,158 @@ impl<'a> Reload<'a> {
     }
 }
 
+/// What `POST /v1/config/reload` applied.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ReloadResponse {
+    /// RFC 3339, when this read of `config.toml` was made; `GET /v1/info` reports the same instant
+    /// from now on.
+    pub(crate) config_loaded_at: String,
+    /// MCP servers the file names that were not running, started.
+    pub(crate) servers_added: Vec<String>,
+    /// MCP servers whose entry changed, restarted on the file's.
+    pub(crate) servers_restarted: Vec<String>,
+    /// MCP servers the file no longer names, taken out of the running manager.
+    pub(crate) servers_removed: Vec<String>,
+}
+
+/// `POST /v1/config/reload`: read `config.toml` again and serve what a write over HTTP would
+/// have: the accounts and profiles, the MCP servers brought to the file's entries, and the standing
+/// instructions. Every other section is read at startup alone.
+#[utoipa::path(
+    post,
+    path = "/v1/config/reload",
+    tag = "installation",
+    responses(
+        (status = 200, description = "What the reload applied", body = ReloadResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 422, description = "`config.toml` fails to parse, or holds an MCP server entry startup would refuse; nothing was applied", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["config:w"]))
+)]
+pub(crate) async fn reload_config(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::ConfigWrite>,
+) -> Result<Json<ReloadResponse>, ProblemDetail> {
+    // Taken ahead of the read: a write holds it across its edit of the file and its change to the
+    // manager, so the file read under it is the file as every write left it, and no write lands
+    // between this read and what it brings the manager to.
+    let _doors = state.mcp_doors.lock().await;
+    let wanted = {
+        let _reads = state.shared.hold_config_reads();
+        let config_file = crate::config::load_config_file_or_err().map_err(|error| {
+            refused(format!(
+                "config.toml fails to parse; repair it first: {sentence}",
+                sentence = error.sentence()
+            ))
+        })?;
+        let wanted = config_file
+            .mcp
+            .as_ref()
+            .and_then(|mcp| mcp.servers.clone())
+            .unwrap_or_default();
+        refuse_mcp_entries(&wanted)?;
+        // The accounts and profiles, as a write of theirs replaces them.
+        state.shared.providers.replace_catalog(&config_file);
+        wanted
+    };
+    let servers = reconcile_servers(&state, &wanted).await?;
+    // The file is read and served; the standing instructions are another file's, read next.
+    let loaded_at = chrono::Utc::now();
+    *crate::sync::lock(&state.config_loaded_at) = loaded_at;
+    state.shared.reload_instructions().map_err(|error| {
+        ProblemDetail::internal_sanitized("failed to reload the standing instructions", error)
+    })?;
+    tracing::info!(
+        "reloaded config.toml via HTTP: {added} MCP server(s) added, {restarted} restarted, \
+         {removed} removed",
+        added = servers.added.len(),
+        restarted = servers.restarted.len(),
+        removed = servers.removed.len()
+    );
+    Ok(Json(ReloadResponse {
+        // As `GET /v1/info` spells it, so the two instants compare equal.
+        config_loaded_at: super::info::rfc3339(loaded_at),
+        servers_added: servers.added,
+        servers_restarted: servers.restarted,
+        servers_removed: servers.removed,
+    }))
+}
+
+/// What the file's MCP entries are refused for ahead of any change, by the predicate startup asks
+/// of them. Refused here, nothing is served; refused by the manager, the entries before it would
+/// be.
+fn refuse_mcp_entries(wanted: &[crate::config::McpServerConfig]) -> Result<(), ProblemDetail> {
+    crate::mcp::sanitize::validate_server_entries(wanted).map_err(|message| {
+        refused(format!(
+            "config.toml holds an MCP server entry meka refuses; repair it first: {message}"
+        ))
+    })
+}
+
+/// The MCP servers a reload changed, by name.
+#[derive(Default)]
+struct ReconciledServers {
+    added: Vec<String>,
+    restarted: Vec<String>,
+    removed: Vec<String>,
+}
+
+/// Bring the running manager to `wanted`, the file's entries: a server the file names and the
+/// manager does not run is started, one whose entry differs is restarted on the file's, one the
+/// file no longer names is taken out. A server whose entry is unchanged is left as it is,
+/// connected or not, so a reload is not a reconnect. A server without a manager (MCP disabled at
+/// startup) has nothing to bring anywhere.
+async fn reconcile_servers(
+    state: &ServerState,
+    wanted: &[crate::config::McpServerConfig],
+) -> Result<ReconciledServers, ProblemDetail> {
+    let Some(manager) = state.shared.mcp_manager.clone() else {
+        return Ok(ReconciledServers::default());
+    };
+    let running: std::collections::BTreeMap<String, crate::config::McpServerConfig> = manager
+        .server_configs()
+        .into_iter()
+        .map(|config| (config.name.clone(), config))
+        .collect();
+    let mut changed = ReconciledServers::default();
+    for config in wanted {
+        match running.get(&config.name) {
+            Some(current) if crate::installation::mcp::same_entry(current, config) => {}
+            Some(_) => {
+                // A login in flight was made against the entry the file no longer states. Under
+                // the lock, unlike at the write doors, since which entries changed is known only
+                // under it: a login whose flow has ended waits here for the lock and is cut at the
+                // grace, its restart left to this reload. What its flow wrote after this read, the
+                // `auth` block, shows as a modification later than the read, like any shell's.
+                forget_pending_logins(state, &config.name, false).await;
+                manager.replace_server(config).await.map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to restart the server", error)
+                })?;
+                changed.restarted.push(config.name.clone());
+            }
+            None => {
+                manager.add_server(config).map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to start the server", error)
+                })?;
+                changed.added.push(config.name.clone());
+            }
+        }
+    }
+    for name in running.keys() {
+        if wanted.iter().any(|config| &config.name == name) {
+            continue;
+        }
+        forget_pending_logins(state, name, false).await;
+        manager.remove_server(name).await.map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to remove the server", error)
+        })?;
+        changed.removed.push(name.to_string());
+    }
+    Ok(changed)
+}
+
 // ----- Accounts ----------------------------------------------------------------------------------
 
 /// What `GET /v1/accounts` answers.
@@ -213,7 +365,7 @@ pub(crate) async fn create_account(
     ] {
         if given && !backend.reads_account_key(key) {
             return Err(refused(format!(
-                "a '{backend}' account never reads `{key}`; drop it"
+                "an account on '{backend}' never reads `{key}`; drop it"
             )));
         }
     }
@@ -228,7 +380,9 @@ pub(crate) async fn create_account(
             Some(crate::store::AuthCredential::ApiKey(key))
         }
         (account::CredentialKind::ApiKey, None) => {
-            return Err(refused(format!("a '{backend}' account needs `api_key`")));
+            return Err(refused(format!(
+                "an account on '{backend}' needs `api_key`"
+            )));
         }
         (_, Some(_)) => {
             return Err(refused(format!(
@@ -790,13 +944,13 @@ pub(crate) async fn login_account(
         (account::CredentialKind::ApiKey, Some(key)) => crate::store::AuthCredential::ApiKey(key),
         (account::CredentialKind::ApiKey, None) => {
             return Err(refused(format!(
-                "'{name}' is a '{backend}' account, which logs in with `api_key`"
+                "'{name}' is on '{backend}', which logs in with `api_key`"
             )));
         }
         (_, Some(_)) => {
             return Err(refused(format!(
-                "'{name}' is a '{backend}' account, which logs in through the browser and takes \
-                 no API key"
+                "'{name}' is on '{backend}', which logs in through the browser and takes no API \
+                 key"
             )));
         }
         (_, None) => {
@@ -1466,6 +1620,7 @@ pub(crate) async fn patch_profile(
     let account = profile.account.clone();
     let changes = body.into_changes()?;
     let reload = Reload::ahead_of_write(&state)?;
+    let mut moved = Vec::new();
     let final_name = match new_name {
         Some(new_name) => {
             if make_default || !changes.is_empty() {
@@ -1474,7 +1629,7 @@ pub(crate) async fn patch_profile(
                      another request",
                 ));
             }
-            profile::rename_profile(&name, &new_name, &state.shared.store)
+            moved = profile::rename_profile(&name, &new_name, &state.shared.store)
                 .await
                 .map_err(|error| door_refusal("failed to rename the profile", error))?;
             tracing::info!("renamed profile '{name}' to '{new_name}' via HTTP");
@@ -1498,6 +1653,9 @@ pub(crate) async fn patch_profile(
         }
     };
     reload.after_write()?;
+    // After the catalog knows the new name, so a client that refetches on the announcement
+    // finds the profile the record names.
+    super::sessions::announce_sessions_moved(&state, &moved).await;
     let catalog = state.shared.providers.catalog();
     Ok(Json(profile_detail(&catalog, &final_name)?))
 }
@@ -1579,6 +1737,10 @@ pub(crate) struct McpServerStatus {
     pub(crate) detail: crate::view::McpServerDetail,
     /// `pending`, `connected`, `failed` or `disabled`.
     pub(crate) state: String,
+    /// Why the last connect failed, on a `failed` server, with URLs redacted as the connector
+    /// records them: a client that manages servers without a shell has no log to read it from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
 }
 
 async fn server_status(
@@ -1586,20 +1748,32 @@ async fn server_status(
     manager: &crate::mcp::McpClientManager,
     name: &str,
 ) -> Result<McpServerStatus, ProblemDetail> {
-    let config = configured_server(manager, name)?;
+    // What the server runs under: the entry as the file states it, with what it leaves unsaid
+    // filled in, as the manager fills its running copy.
+    let config = manager
+        .overlay()
+        .settled(&configured_server(manager, name)?);
     let detail =
         crate::installation::mcp::server_detail(&config, &state.shared.store.token_store())
             .await
             .map_err(|error| {
                 ProblemDetail::internal_sanitized("failed to read the server", error)
             })?;
-    let connection = match manager.server_entry(name) {
-        Some(entry) => entry.state().await.label().to_string(),
-        None => crate::mcp::ServerState::Disabled.label().to_string(),
+    let (connection, error) = match manager.server_entry(name) {
+        Some(entry) => {
+            let state = entry.state().await;
+            let error = match &state {
+                crate::mcp::ServerState::Failed { error, .. } => Some(error.clone()),
+                _ => None,
+            };
+            (state.label().to_string(), error)
+        }
+        None => (crate::mcp::ServerState::Disabled.label().to_string(), None),
     };
     Ok(McpServerStatus {
         detail,
         state: connection,
+        error,
     })
 }
 
@@ -2008,6 +2182,7 @@ pub(crate) async fn login_mcp_server(
     let manager = mcp_manager(&state)?;
     configured_server(&manager, &name)?;
     let configs = manager.server_configs();
+    let overlay = manager.overlay().clone();
     let token_store = state.shared.store.token_store();
     let secret = match (body.auth_token, body.client_secret) {
         (Some(_), Some(_)) => {
@@ -2042,6 +2217,7 @@ pub(crate) async fn login_mcp_server(
             let login_prompt: Arc<dyn crate::oauth::LoginPrompt> = prompt;
             let result = crate::installation::mcp::login_server(
                 &configs,
+                &overlay,
                 &token_store,
                 &server,
                 login_prompt,
@@ -2055,11 +2231,19 @@ pub(crate) async fn login_mcp_server(
                 }
                 Err(error) => {
                     tracing::warn!("the browser login for MCP server '{server}' failed: {error}");
-                    Err(match error.kind() {
-                        // What was asked cannot be done as asked, in the door's own words; a
-                        // URL in them may name a key, as a connector's reason may.
-                        ErrorKind::InvalidBody => {
+                    // An auth failure carries the reason the flow recorded, a URL in which may
+                    // name a key, as a connector's reason may; its kind's sentence names nothing,
+                    // and the client managing servers over HTTP has no log to read one from.
+                    Err(match (&error, error.kind()) {
+                        // What was asked cannot be done as asked, in the door's own words.
+                        (_, ErrorKind::InvalidBody) => {
                             LoginFailure::Refused(crate::text::redact_urls(&error.sentence()))
+                        }
+                        (crate::error::MekaError::McpAuth { message, .. }, _) => {
+                            LoginFailure::Upstream(format!(
+                                "the login did not complete: {}",
+                                crate::text::redact_urls(message)
+                            ))
                         }
                         _ => LoginFailure::Upstream(
                             "the login did not complete; the reason is in the meka log".to_string(),

@@ -71,6 +71,25 @@ pub(crate) fn validate_server_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The one predicate asked of a file's entries before a manager is made of them, at startup and
+/// on a reload: each name is one [`validate_server_name`] accepts, and none is named twice. The
+/// refusal names the entry itself.
+pub(crate) fn validate_server_entries(
+    configs: &[crate::config::McpServerConfig],
+) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for config in configs {
+        validate_server_name(&config.name)?;
+        if !seen.insert(config.name.as_str()) {
+            return Err(format!(
+                "server '{name}' is named twice",
+                name = config.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +108,26 @@ mod tests {
         assert!(validate_server_name("a__b").is_err());
         assert!(validate_server_name("a b").is_err());
         assert!(validate_server_name("exa-2").is_ok());
+    }
+
+    /// The set rule refuses a name the name rule refuses, and a name used twice, naming it.
+    #[test]
+    fn a_set_of_entries_is_held_to_one_name_each() {
+        let entries = |names: &[&str]| -> Vec<crate::config::McpServerConfig> {
+            names
+                .iter()
+                .map(|name| crate::config::McpServerConfig::for_test(name))
+                .collect()
+        };
+        validate_server_entries(&entries(&["a", "b"])).expect("distinct names pass");
+        assert_eq!(
+            validate_server_entries(&entries(&["a", "b", "a"])).unwrap_err(),
+            "server 'a' is named twice"
+        );
+        assert_eq!(
+            validate_server_entries(&entries(&["meka"])).unwrap_err(),
+            validate_server_name("meka").unwrap_err()
+        );
     }
     use crate::text::sanitize_text;
 

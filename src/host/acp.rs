@@ -358,10 +358,11 @@ pub(crate) async fn run_acp(
                     // conversation to another provider.
                     let profile = match state.shared.default_profile() {
                         Ok(profile) => profile,
-                        Err(error) => {
+                        // In the shell's words: an editor's user has a terminal beside it.
+                        Err(refusal) => {
                             return responder.respond_with_error(build_failure_error(
                                 "no default profile",
-                                &error,
+                                &anyhow::Error::from(refusal),
                                 state.shared.relay_provider_errors(),
                             ));
                         }

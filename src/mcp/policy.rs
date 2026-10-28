@@ -25,8 +25,9 @@ pub(crate) fn tool_is_allowed(server_config: &McpServerConfig, tool_raw_name: &s
 
 /// What becomes of one of this server's tools: eager when its
 /// [`eager_load_tools`][McpServerConfig::eager_load_tools] names it, else the server's `deferral`,
-/// which [`crate::config::ResolvedConfig::resolve`] settled from `[mcp].deferral`. Mirrors
-/// [`tool_is_allowed`]'s shape, and is the one definition every registration path classifies by.
+/// which the manager's overlay settles from `[mcp].deferral` onto the runtime copy of an entry;
+/// the entry as the file states it may leave it unsaid. Mirrors [`tool_is_allowed`]'s shape, and
+/// is the one definition every registration path classifies by.
 pub(crate) fn tool_exposure(server_config: &McpServerConfig, tool_raw_name: &str) -> Deferral {
     let named_eager = server_config
         .eager_load_tools

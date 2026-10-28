@@ -116,13 +116,13 @@ pub(crate) async fn remove_profile(name: &str, store: &crate::store::Store) -> a
     Ok(())
 }
 
-/// Rename `[profiles.<name>]`, moving every session recorded on it: `meka profile rename` and
-/// `PATCH /v1/profiles/{name}` with a `name`.
+/// Rename `[profiles.<name>]`, moving every session recorded on it and answering their ids:
+/// `meka profile rename` and `PATCH /v1/profiles/{name}` with a `name`.
 pub(crate) async fn rename_profile(
     name: &str,
     new_name: &str,
     store: &crate::store::Store,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<uuid::Uuid>> {
     if new_name.trim().is_empty() {
         anyhow::bail!("profile name cannot be empty");
     }
@@ -151,14 +151,18 @@ pub(crate) async fn rename_profile(
     if let Err(error) = rename_profile_under_lock(name, new_name) {
         if let Err(undo) = store.rename_profile(new_name, name).await {
             tracing::warn!(
-                "failed to move {moved} session(s) back to '{name}': {undo}; they now run on \
-                 '{new_name}'"
+                "failed to move {count} session(s) back to '{name}': {undo}; they now run on \
+                 '{new_name}'",
+                count = moved.len()
             );
         }
         return Err(error);
     }
-    tracing::info!("renamed profile '{name}' to '{new_name}'; {moved} session(s) follow");
-    Ok(())
+    tracing::info!(
+        "renamed profile '{name}' to '{new_name}'; {count} session(s) follow",
+        count = moved.len()
+    );
+    Ok(moved)
 }
 
 /// Refuse a rename that names no profile or takes a name in use.
@@ -609,9 +613,11 @@ fn upsert_profile_document(
     let mut profile = toml_edit::Item::Table(profile);
     config::sort_profile_keys(&mut profile);
     ensure_section_table(document, "profiles")?.insert(name, profile);
-    // No `default_profile`. A sole profile is the default by the selection rule, and `use` is the
-    // one command that sets the key; written here too, `add` on a config whose key had been
-    // deleted by hand silently rebound every new session to the profile just added.
+    // No `default_profile` for the profile written. A sole profile is the default by the selection
+    // rule, and `use` is the command that points the key at a profile; written here too, `add` on
+    // a config whose key had been deleted by hand silently rebound every new session to the
+    // profile just added. `write_profile` names the one that was alone when this one joins it,
+    // which rebinds nothing.
     Ok(())
 }
 
@@ -675,6 +681,7 @@ pub(crate) fn write_profile(
             table_names(&document, "accounts")
         ));
     }
+    let alone = table_names(&document, "profiles");
     let before = document.to_string();
     upsert_profile_document(&mut document, name, account, model, tuning)?;
     let after = document.to_string();
@@ -683,6 +690,15 @@ pub(crate) fn write_profile(
         *document
             .entry("default_profile")
             .or_insert(toml_edit::Item::None) = toml_edit::value(name);
+    } else if document.get("default_profile").is_none()
+        && let [alone] = alone.as_slice()
+    {
+        // A sole profile is the default by the selection rule, so a second one joining it would
+        // leave the installation with none, and nothing in the answer to the add would say so.
+        // Naming the one that was alone moves no session: every new one was already on it.
+        *document
+            .entry("default_profile")
+            .or_insert(toml_edit::Item::None) = toml_edit::value(alone);
     }
     crate::fs::write_file_atomic(&path, &document.to_string())?;
     Ok(())
@@ -1106,7 +1122,7 @@ mod tests {
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
         let error = match result {
-            Ok(()) => panic!("a rename onto a recorded name must be refused"),
+            Ok(_) => panic!("a rename onto a recorded name must be refused"),
             Err(error) => error.to_string(),
         };
         assert!(
@@ -1147,8 +1163,8 @@ mod tests {
         let taken = rename_profile("work", "personal", &store).await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
-        let message = |result: anyhow::Result<()>| match result {
-            Ok(()) => panic!("the rename must be refused"),
+        let message = |result: anyhow::Result<Vec<uuid::Uuid>>| match result {
+            Ok(_) => panic!("the rename must be refused"),
             Err(error) => error.to_string(),
         };
         assert!(message(unknown).contains("no profile named 'nope'"));
@@ -1378,6 +1394,44 @@ model = "untouched"
             !contents.contains("gone"),
             "a refused write leaves nothing: {contents}"
         );
+    }
+
+    /// A sole profile is the default by the selection rule, so the second profile added names the
+    /// first as `default_profile`, and new sessions stay where they were; a third changes nothing,
+    /// and `--default` on the second wins.
+    #[test]
+    fn a_second_profile_keeps_the_first_as_the_default() {
+        let add = |dir: &std::path::Path, name: &str, make_default: bool| {
+            // SAFETY: as above.
+            let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+            unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir) };
+            let written = write_profile(name, "work", "m", &ProfileTuning::default(), make_default);
+            unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+            written.expect("a configured account");
+            std::fs::read_to_string(dir.join("config.toml")).expect("read back")
+        };
+        let account = "[accounts.work]\nbackend = \"anthropic-messages\"\n";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), account).expect("write config");
+        let first = add(dir.path(), "work", false);
+        assert!(!first.contains("default_profile"), "{first}");
+        let second = add(dir.path(), "cheap", false);
+        assert!(second.contains("default_profile = \"work\""), "{second}");
+        assert!(
+            second.find("default_profile") < second.find("[accounts"),
+            "the key precedes every table: {second}"
+        );
+        let third = add(dir.path(), "third", false);
+        assert_eq!(third.matches("default_profile").count(), 1, "{third}");
+        assert!(third.contains("default_profile = \"work\""), "{third}");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), account).expect("write config");
+        add(dir.path(), "work", false);
+        let chosen = add(dir.path(), "cheap", true);
+        assert!(chosen.contains("default_profile = \"cheap\""), "{chosen}");
+        assert_eq!(chosen.matches("default_profile").count(), 1, "{chosen}");
     }
 
     /// `default_profile` is written only for a profile the locked file has.

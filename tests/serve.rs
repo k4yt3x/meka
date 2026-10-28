@@ -1978,7 +1978,8 @@ fn serve_starts_with_no_profile_configured() {
     assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
     assert_eq!(
         body["detail"],
-        "no profile configured; run `meka account add <name>`, then `meka profile add <name>`"
+        "no profile configured; add an account with `POST /v1/accounts`, then a profile with \
+         `POST /v1/profiles`"
     );
 
     let response = harness
@@ -2013,8 +2014,8 @@ fn serve_starts_with_an_ambiguous_default_profile() {
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(
         body["detail"],
-        "multiple profiles configured (side, work) and no `default_profile`; pick one with `meka \
-         profile use <name>`"
+        "multiple profiles configured (side, work) and no `default_profile`; pick one with `PATCH \
+         /v1/profiles/{name}` and `\"default\": true`"
     );
 
     let response = harness
@@ -17455,6 +17456,410 @@ fn open_server_feed(
     request.send().expect("send")
 }
 
+/// `POST /v1/config/reload` serves what the file now holds, as a write over HTTP would have: a
+/// profile added by hand is listed, an MCP server added by hand is started and one removed by hand
+/// is taken out, the standing instructions are read again, and `config_loaded_at` moves to the
+/// read. A file that fails to parse, or that names a server twice, applies nothing.
+#[test]
+fn a_reload_serves_what_the_file_now_holds() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "config:r",
+        "config:w",
+        "mcp:r",
+    ]);
+    let config_path = harness.install.config_dir().join("config.toml");
+    let get = |path: &str| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, path)
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    let names = |listing: &serde_json::Value, key: &str| -> Vec<String> {
+        listing[key]
+            .as_array()
+            .or_else(|| listing.as_array())
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|entry| entry["name"].as_str().map(str::to_string))
+            .collect()
+    };
+    let loaded_at = |value: &serde_json::Value| {
+        chrono::DateTime::parse_from_rfc3339(value.as_str().expect("an instant")).expect("rfc3339")
+    };
+    let before = loaded_at(&get("/v1/info")["config_loaded_at"]);
+
+    // Edited by hand while the server runs: not seen until the reload.
+    let original = std::fs::read_to_string(&config_path).expect("read config");
+    let by_hand = format!(
+        "{original}\n[profiles.by-hand]\naccount = \"mock\"\nmodel = \"m\"\n\n[[mcp.servers]]\n\
+         name = \"late\"\ntransport = \"stdio\"\ncommand = \"/nonexistent/meka-late-server\"\n"
+    );
+    std::fs::write(&config_path, &by_hand).expect("write config");
+    std::fs::write(
+        harness.install.config_dir().join("instructions.md"),
+        "Answer in haiku.\n",
+    )
+    .expect("write instructions");
+    assert!(!names(&get("/v1/profiles"), "profiles").contains(&"by-hand".to_string()));
+    assert!(!names(&get("/v1/mcp"), "servers").contains(&"late".to_string()));
+
+    // The instant is spelled to the second, so a read in the start's second would not show.
+    std::thread::sleep(Duration::from_millis(1100));
+    let reloaded = harness
+        .request(reqwest::Method::POST, "/v1/config/reload")
+        .send()
+        .expect("send");
+    assert_eq!(
+        reloaded.status(),
+        200,
+        "{}",
+        reloaded.text().unwrap_or_default()
+    );
+    let applied: serde_json::Value = reloaded.json().expect("parse");
+    assert_eq!(
+        applied["servers_added"],
+        serde_json::json!(["late"]),
+        "{applied}"
+    );
+    assert_eq!(
+        applied["servers_restarted"],
+        serde_json::json!([]),
+        "{applied}"
+    );
+    assert_eq!(
+        applied["servers_removed"],
+        serde_json::json!([]),
+        "{applied}"
+    );
+    let read_at = loaded_at(&applied["config_loaded_at"]);
+    assert!(read_at > before, "{applied}");
+    assert_eq!(
+        loaded_at(&get("/v1/info")["config_loaded_at"]),
+        read_at,
+        "the info route reports the read"
+    );
+    assert!(names(&get("/v1/profiles"), "profiles").contains(&"by-hand".to_string()));
+    assert!(names(&get("/v1/mcp"), "servers").contains(&"late".to_string()));
+    let instructions = get("/v1/instructions");
+    assert!(
+        instructions["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("haiku"),
+        "{instructions}"
+    );
+
+    // Taken out by hand: taken out of the manager on the next reload.
+    std::fs::write(
+        &config_path,
+        format!("{original}\n[profiles.by-hand]\naccount = \"mock\"\nmodel = \"m\"\n"),
+    )
+    .expect("write config");
+    let applied: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/config/reload")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        applied["servers_removed"],
+        serde_json::json!(["late"]),
+        "{applied}"
+    );
+    assert!(!names(&get("/v1/mcp"), "servers").contains(&"late".to_string()));
+
+    // A file that fails to parse applies nothing.
+    std::fs::write(&config_path, format!("{by_hand}\n[nonsense\n")).expect("write config");
+    let refused = harness
+        .request(reqwest::Method::POST, "/v1/config/reload")
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "{}",
+        refused.text().unwrap_or_default()
+    );
+    assert!(!names(&get("/v1/mcp"), "servers").contains(&"late".to_string()));
+
+    // One that names a server twice, which startup refuses, applies nothing either: not the
+    // profile beside it, not the first of the two entries.
+    let twice = "[[mcp.servers]]\nname = \"twice\"\ntransport = \"stdio\"\ncommand = \
+                 \"/nonexistent/meka-twice-server\"\n";
+    std::fs::write(
+        &config_path,
+        format!(
+            "{original}\n[profiles.unserved]\naccount = \"mock\"\nmodel = \"m\"\n\n{twice}\n{twice}"
+        ),
+    )
+    .expect("write config");
+    let refused = harness
+        .request(reqwest::Method::POST, "/v1/config/reload")
+        .send()
+        .expect("send");
+    assert_eq!(refused.status(), 422);
+    let problem = refused.text().unwrap_or_default();
+    assert!(problem.contains("'twice' is named twice"), "{problem}");
+    assert!(!names(&get("/v1/profiles"), "profiles").contains(&"unserved".to_string()));
+    assert!(!names(&get("/v1/mcp"), "servers").contains(&"twice".to_string()));
+}
+
+/// The `[mcp]` defaults reach a server however it reaches the running manager: one made at startup,
+/// one a reload of an unchanged file leaves alone rather than restarts, and one added over HTTP,
+/// which a reload leaves alone too.
+#[test]
+fn the_mcp_defaults_reach_a_server_added_later_and_a_reload_restarts_nothing() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mcp_stub_server.py"
+    );
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = state_dir.path().join("state.json");
+    std::fs::write(&state_path, r#"{"tools": ["search"]}"#).expect("write state");
+    let entry = |name: &str| {
+        format!(
+            "[[mcp.servers]]\nname = {name:?}\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = \
+             [{fixture:?}, {:?}]\n",
+            state_path.to_string_lossy()
+        )
+    };
+    let prelude = format!(
+        "[mcp]\ndeferral = \"eager\"\ndefault_required = true\n\n{}",
+        entry("stub")
+    );
+    let harness =
+        ServeTestHarness::spawn_with(&prelude, "", mock_simple_turn(), "sk_test_token", &[
+            "mcp:r", "config:r", "config:w",
+        ]);
+    let loading_of = |name: &str| -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status: serde_json::Value = harness
+                .request(reqwest::Method::GET, &format!("/v1/mcp/{name}"))
+                .send()
+                .expect("send")
+                .json()
+                .expect("parse");
+            if status["state"] == "connected" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "'{name}' never connected: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let tools: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/mcp/{name}/tools"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        tools["tools"][0]["loading"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a tool with a loading: {tools}"))
+            .to_string()
+    };
+    assert_eq!(
+        loading_of("stub"),
+        "eager",
+        "the file's default, at startup"
+    );
+    let status: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/mcp/stub")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        status["required"], true,
+        "the status reports what the server runs under: {status}"
+    );
+
+    let applied: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/config/reload")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        applied["servers_restarted"],
+        serde_json::json!([]),
+        "an unchanged entry is left alone: {applied}"
+    );
+    assert_eq!(loading_of("stub"), "eager", "and keeps the default");
+
+    // With a key the file's writer leaves out, which reads back unsaid.
+    let added = harness
+        .request(reqwest::Method::POST, "/v1/mcp")
+        .json(&serde_json::json!({
+            "name": "later",
+            "transport": "stdio",
+            "command": "python3",
+            "args": [fixture, state_path.to_string_lossy()],
+            "disabled": false,
+            "env": {},
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(added.status(), 201, "{}", added.text().unwrap_or_default());
+    assert_eq!(
+        loading_of("later"),
+        "eager",
+        "one added over HTTP inherits the default"
+    );
+    let applied: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/config/reload")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        applied["servers_restarted"],
+        serde_json::json!([]),
+        "an entry the body spelled as the file leaves it unsaid is no change: {applied}"
+    );
+    let patched = harness
+        .request(reqwest::Method::PATCH, "/v1/mcp/later")
+        .json(&serde_json::json!({ "allowed_tools": [] }))
+        .send()
+        .expect("send");
+    assert_eq!(
+        patched.status(),
+        200,
+        "{}",
+        patched.text().unwrap_or_default()
+    );
+    let applied: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/config/reload")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        applied["servers_restarted"],
+        serde_json::json!([]),
+        "and so is one a patch spelled that way: {applied}"
+    );
+}
+
+/// A server that failed to connect says why on its status, URLs redacted as the connector records
+/// them, since a client managing servers over HTTP has no log to read the reason from.
+#[test]
+fn a_failed_mcp_server_says_why_on_its_status() {
+    let prelude = "[[mcp.servers]]\nname = \"broken\"\ntransport = \"stdio\"\ncommand = \
+                   \"/nonexistent/meka-broken-server\"\n";
+    let harness =
+        ServeTestHarness::spawn_with(prelude, "", mock_simple_turn(), "sk_test_token", &[
+            "config:r",
+        ]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let status: serde_json::Value = harness
+            .request(reqwest::Method::GET, "/v1/mcp/broken")
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if status["state"] == "failed" {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server never failed: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let error = status["error"].as_str().unwrap_or_default();
+    assert!(!error.is_empty(), "a failed server says why: {status}");
+}
+
+/// A profile or project rename rewrites the row under a client's listing, so each session it
+/// moved is announced on the server feed as `session.updated`, as `GET /v1/sessions/{id}` now
+/// answers for it.
+#[test]
+fn a_rename_puts_each_moved_session_on_the_server_feed() {
+    let prelude = "default_profile = \"main\"\n\n[accounts.mock]\nbackend = \
+                   \"anthropic-messages\"\n\n[profiles.main]\naccount = \"mock\"\nmodel = \
+                   \"m\"\n\n[profiles.side]\naccount = \"mock\"\nmodel = \"m\"\n";
+    let harness =
+        ServeTestHarness::spawn_bare(prelude, "", mock_simple_turn(), "sk_test_token", &[
+            "sessions:r",
+            "sessions:w",
+            "config:w",
+            "memory:w",
+        ]);
+    add_project(&harness, "movie");
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "working_directory": std::env::temp_dir().to_string_lossy(),
+            "profile": "side",
+            "project": "movie",
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(
+        create.status(),
+        201,
+        "{}",
+        create.text().unwrap_or_default()
+    );
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let updated_record = |body: &str, needle: &str| -> serde_json::Value {
+        let mut lines = body.lines();
+        while let Some(line) = lines.next() {
+            if line.trim() == "event: session.updated"
+                && let Some(data) = lines.next().and_then(|data| data.strip_prefix("data: "))
+                && let Ok(data) = serde_json::from_str::<serde_json::Value>(data)
+                && data["id"] == id
+                && data.to_string().contains(needle)
+            {
+                return data;
+            }
+        }
+        panic!("no session.updated naming {needle} for {id}:\n{body}");
+    };
+
+    let feed = open_server_feed(&harness, None);
+    let renamed = harness
+        .request(reqwest::Method::PATCH, "/v1/profiles/side")
+        .json(&serde_json::json!({"name": "side2"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        renamed.status(),
+        200,
+        "{}",
+        renamed.text().unwrap_or_default()
+    );
+    let body = read_feed_until(feed, |text| text.contains("side2"));
+    let record = updated_record(&body, "side2");
+    assert_eq!(record["profile"], "side2", "{record}");
+
+    let feed = open_server_feed(&harness, None);
+    let renamed = harness
+        .request(reqwest::Method::PATCH, "/v1/projects/movie")
+        .json(&serde_json::json!({"name": "film"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        renamed.status(),
+        200,
+        "{}",
+        renamed.text().unwrap_or_default()
+    );
+    let body = read_feed_until(feed, |text| text.contains("film"));
+    let record = updated_record(&body, "film");
+    assert_eq!(record["project"], "film", "{record}");
+}
+
 /// A `PATCH` naming a profile or a project claims the session while it writes, as a rewind does,
 /// and neither is a turn: the reply, the record each puts on the server feed and a `GET` after
 /// them all say `turn_in_flight: false`.
@@ -19356,7 +19761,7 @@ fn accounts_and_profiles_are_managed_over_http() {
         ),
         (
             serde_json::json!({"name": "keyless", "backend": "openai-responses"}),
-            "a 'openai-responses' account needs `api_key`",
+            "an account on 'openai-responses' needs `api_key`",
         ),
         (
             serde_json::json!({"name": "odd", "backend": "frobnicate", "api_key": "x"}),
@@ -19364,7 +19769,7 @@ fn accounts_and_profiles_are_managed_over_http() {
         ),
         (
             serde_json::json!({"name": "odd", "backend": "openai-responses", "api_key": "x", "client_id": "c"}),
-            "a 'openai-responses' account never reads `client_id`; drop it",
+            "an account on 'openai-responses' never reads `client_id`; drop it",
         ),
     ] {
         let (status, body) = send(reqwest::Method::POST, "/v1/accounts", payload);
@@ -19390,9 +19795,10 @@ fn accounts_and_profiles_are_managed_over_http() {
     );
     assert_eq!(status, 422, "{body}");
     assert!(
-        body["detail"].as_str().unwrap().starts_with(
-            "'sub' is a 'claude-subscription' account, which logs in through the browser"
-        ),
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("'sub' is on 'claude-subscription', which logs in through the browser"),
         "{body}"
     );
 
@@ -19412,7 +19818,7 @@ fn accounts_and_profiles_are_managed_over_http() {
     assert_eq!(status, 422, "{body}");
     assert_eq!(
         body["detail"],
-        "'work' is a 'anthropic-messages' account, which logs in with `api_key`"
+        "'work' is on 'anthropic-messages', which logs in with `api_key`"
     );
 
     // Nothing runs yet: no profile.
@@ -19483,7 +19889,8 @@ fn accounts_and_profiles_are_managed_over_http() {
         assert_eq!(body["detail"], expected);
     }
 
-    // A second profile makes the default ambiguous, until one is chosen on its PATCH.
+    // A second profile names the one that was alone as the default, so the installation keeps
+    // its default rather than lapsing into none, until another is chosen on its PATCH.
     let (status, body) = send(
         reqwest::Method::POST,
         "/v1/profiles",
@@ -19491,15 +19898,19 @@ fn accounts_and_profiles_are_managed_over_http() {
     );
     assert_eq!(status, 201, "{body}");
     assert_eq!(body["active"], false);
-    let (status, body) = send(reqwest::Method::POST, "/v1/sessions", serde_json::json!({}));
-    assert_eq!(status, 422, "{body}");
-    assert!(
-        body["detail"]
-            .as_str()
-            .unwrap()
-            .starts_with("multiple profiles configured (main, side) and no `default_profile`"),
-        "{body}"
-    );
+    let (status, listing) = get("/v1/profiles");
+    assert_eq!(status, 200);
+    let active: Vec<&str> = listing["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|profile| profile["active"] == true)
+        .map(|profile| profile["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(active, vec!["main"], "{listing}");
+    let (status, session) = send(reqwest::Method::POST, "/v1/sessions", serde_json::json!({}));
+    assert_eq!(status, 201, "{session}");
+    assert_eq!(session["profile"], "main");
     let (status, body) = send(
         reqwest::Method::PATCH,
         "/v1/profiles/side",
@@ -19999,7 +20410,7 @@ fn a_codex_login_completes_from_the_loopback_listener_or_a_posted_callback() {
         .send()
         .expect("the listener answers the browser");
     assert_eq!(landed.status(), 200);
-    assert!(landed.text().unwrap().contains("authorization successful"));
+    assert!(landed.text().unwrap().contains("Return to meka"));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let status = status_of(&login_id);
@@ -20594,9 +21005,12 @@ fn mcp_credentials_are_managed_over_http() {
     );
     assert_eq!(status, 502, "{body}");
     assert_eq!(body["type"], "https://meka.run/errors/provider");
-    assert_eq!(
-        body["detail"],
-        "the login did not complete; the reason is in the meka log"
+    // The reason the connector recorded, since a client managing servers over HTTP has no log.
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("the login did not complete: ")
+            && detail.contains("failed to start OAuth authorization"),
+        "{body}"
     );
     let (status, body) = send(
         reqwest::Method::POST,
@@ -20831,7 +21245,7 @@ fn an_mcp_oauth_login_over_http_ends_in_a_connected_server() {
         .send()
         .expect("the listener answers the browser");
     assert_eq!(landed.status(), 200);
-    assert!(landed.text().unwrap().contains("Authorization successful"));
+    assert!(landed.text().unwrap().contains("Return to meka"));
 
     wait_for("the login completing", &mut || {
         get(&format!("/v1/mcp/remote/login/{login_id}")).1["status"] == "completed"
@@ -21422,6 +21836,23 @@ fn an_mcp_elicitation_parks_on_the_feed_and_takes_the_answer() {
                     .send()
                     .expect("respond send");
                 assert_eq!(misplaced.status(), 422);
+                // A form's accept carries its fields: nothing is not an answer the server can
+                // read, and the prompt stays parked for the real one.
+                let empty = respond_client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .json(&serde_json::json!({"outcome": "accept"}))
+                    .send()
+                    .expect("respond send");
+                assert_eq!(empty.status(), 422);
+                let body: serde_json::Value = empty.json().expect("parse");
+                assert!(
+                    body["detail"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("is a form; `accept` carries `content`"),
+                    "{body}"
+                );
                 let accepted = respond_client
                     .post(&url)
                     .header("Authorization", format!("Bearer {token}"))

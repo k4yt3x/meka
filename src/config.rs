@@ -26,9 +26,9 @@ mod serve;
 pub(crate) use profile::PROFILE_KEY_ORDER;
 pub(crate) use profile::{
     ANTHROPIC_MAX_REQUEST_BYTES, AccountConfig, Backend, DEFAULT_CONTEXT_WINDOW, ProfileCatalog,
-    ProfileConfig, ProfileRequest, ProfileSettings, account_for, default_profile_on_disk,
-    require_model, require_profile, resolve_device_id, resolve_profile, select_profile,
-    sort_account_keys, sort_profile_keys, validate_max_output_tokens,
+    ProfileConfig, ProfileRefusal, ProfileRequest, ProfileSettings, account_for,
+    default_profile_on_disk, require_model, require_profile, resolve_device_id, resolve_profile,
+    select_profile, sort_account_keys, sort_profile_keys, validate_max_output_tokens,
 };
 
 pub(crate) use self::{mcp::*, serve::*};
@@ -1418,7 +1418,7 @@ fn warn_about_inert_profile_keys(
         for (key, is_set) in set {
             if is_set && !backend.reads_account_key(key) {
                 tracing::warn!(
-                    "account '{name}' sets `{key}`, which a '{backend}' account never reads"
+                    "account '{name}' sets `{key}`, which an account on '{backend}' never reads"
                 );
             }
         }
@@ -1834,8 +1834,11 @@ pub(crate) struct ResolvedConfig {
     /// resolution in `src/mcp.rs` doesn't have to re-read the config file. `None` means "no
     /// `[mcp]` default configured"; resolution falls through to the hardcoded `Unrestricted`.
     pub(crate) mcp_default_permission: Option<Permission>,
-    /// `[mcp].deferral`, for the MCP meta-tools: every server's own copy is settled on its entry.
-    pub(crate) mcp_deferral: Deferral,
+    /// `[mcp].default_required`, `[mcp].deferral` and the `--eager-load-tool` values: settled by
+    /// the manager onto each entry it makes, onto what a listing shows
+    /// ([`Self::mcp_servers_as_served`]), and read for the MCP meta-tools. Never settled onto
+    /// [`Self::mcp_servers`], the entries as the file states them.
+    pub(crate) mcp_overlay: McpOverlay,
     /// Non-secret projection of the configured profiles, for `GET /v1/profiles`.
     ///
     /// A projection rather than the profiles themselves, so a field added to [`ProfileConfig`]
@@ -2457,46 +2460,45 @@ fn parse_sandbox_backend_override(value: &str) -> Option<SandboxBackend> {
     }
 }
 
-/// Merge `--eager-load-tool SERVER:TOOL` CLI values into the matching server's
-/// [`McpServerConfig::eager_load_tools`] list. A malformed entry or an unknown server name warns
-/// and is skipped. Appends to the configured list, without repeating an entry already there.
-fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServerConfig]) {
+/// The `--eager-load-tool SERVER:TOOL` values, for the overlay the manager settles onto each
+/// entry it makes. A malformed value warns and is skipped; one naming no configured server warns
+/// and is kept, since the entry may be added while the process runs.
+fn eager_load_overrides(
+    raw_pairs: &[String],
+    servers: &[McpServerConfig],
+) -> Vec<EagerLoadOverride> {
+    let mut overrides = Vec::new();
     for raw in raw_pairs {
-        let (server_name, tool_name) = match raw.split_once(':') {
-            Some((server, tool)) => {
-                let server = server.trim();
-                let tool = tool.trim();
-                if server.is_empty() || tool.is_empty() {
-                    tracing::warn!("ignoring --eager-load-tool '{raw}': expected SERVER:TOOL");
-                    continue;
-                }
-                (server, tool)
-            }
-            None => {
-                tracing::warn!("ignoring --eager-load-tool '{raw}': expected SERVER:TOOL");
-                continue;
-            }
+        let Some(eager) = EagerLoadOverride::parse(raw) else {
+            tracing::warn!("ignoring --eager-load-tool '{raw}': expected SERVER:TOOL");
+            continue;
         };
-        match servers.iter_mut().find(|server| server.name == server_name) {
-            Some(server) => {
-                let list = server.eager_load_tools.get_or_insert_with(Vec::new);
-                if !list.iter().any(|existing| existing == tool_name) {
-                    list.push(tool_name.to_string());
-                }
-            }
-            None => {
-                let refusal = crate::text::unknown_name(
-                    "MCP server",
-                    server_name,
-                    servers.iter().map(|server| server.name.as_str()),
-                );
-                tracing::warn!("--eager-load-tool '{raw}': {refusal}");
-            }
+        if !servers.iter().any(|server| server.name == eager.server) {
+            let refusal = crate::text::unknown_name(
+                "MCP server",
+                &eager.server,
+                servers.iter().map(|server| server.name.as_str()),
+            );
+            tracing::warn!(
+                "--eager-load-tool '{raw}': {refusal}; kept for a server added while this process \
+                 runs"
+            );
         }
+        overrides.push(eager);
     }
+    overrides
 }
 
 impl ResolvedConfig {
+    /// The MCP servers as they run: each entry with what it leaves unsaid filled in under the
+    /// `[mcp]` defaults, for a listing. [`Self::mcp_servers`] stays the file's word.
+    pub(crate) fn mcp_servers_as_served(&self) -> Vec<McpServerConfig> {
+        self.mcp_servers
+            .iter()
+            .map(|server| self.mcp_overlay.settled(server))
+            .collect()
+    }
+
     pub(crate) fn resolve(overrides: CliOverrides) -> Self {
         let (config_file, config_error) = load_config_file();
         // `--profile`, else `default_profile`, else the sole profile, followed through its
@@ -2508,7 +2510,7 @@ impl ResolvedConfig {
         ));
         let (default_profile, mut provider_error) = match &catalog.default_profile {
             Ok(name) => (Some(name.clone()), None),
-            Err(error) => (None, Some(error.clone())),
+            Err(error) => (None, Some(error.to_string())),
         };
         let accounts = config_file.accounts;
         let profiles = config_file.profiles;
@@ -2564,7 +2566,7 @@ impl ResolvedConfig {
         let background = ResolvedBackgroundConfig::resolve(config_file.background);
         let subagents = ResolvedSubagentsConfig::resolve(config_file.subagents);
         let file_mcp = config_file.mcp.unwrap_or_default();
-        let mut mcp_servers = file_mcp.servers.unwrap_or_default();
+        let mcp_servers = file_mcp.servers.unwrap_or_default();
         let mcp_default_required = file_mcp.default_required.unwrap_or(false);
         let mcp_grace = file_mcp.grace.unwrap_or(DEFAULT_MCP_GRACE);
         let mcp_connect_timeout = file_mcp
@@ -2579,17 +2581,14 @@ impl ResolvedConfig {
             .unwrap_or(DEFAULT_MCP_HTTP_CONCURRENCY);
         let mcp_default_permission = file_mcp.default_permission;
         let mcp_deferral = file_mcp.deferral.unwrap_or_default();
-        apply_cli_eager_load_overrides(&overrides.eager_load_tools, &mut mcp_servers);
-        // Settle `required` here so no later consumer has to remember that `None` means "inherit
-        // `default_required`". Everything downstream reads a plain `Some(bool)`, and the default
-        // deliberately isn't carried on `ResolvedConfig`: a second copy of the same answer is one
-        // a future reader could gate on, believing it still decides turns on its own. It doesn't.
-        for server in &mut mcp_servers {
-            server.required = Some(server.required.unwrap_or(mcp_default_required));
-            // Settled for the same reason. The default is carried as well, unlike `required`'s,
-            // because the MCP meta-tools belong to no server and follow the install's answer.
-            server.deferral = Some(server.deferral.unwrap_or(mcp_deferral));
-        }
+        // Not settled onto the entries here: the manager settles the overlay where it makes an
+        // entry, so one added over HTTP or by a reload inherits what one made at startup did, and
+        // the entry as the file states it stays what the doors compare.
+        let mcp_overlay = McpOverlay {
+            required: mcp_default_required,
+            deferral: mcp_deferral,
+            eager_load_tools: eager_load_overrides(&overrides.eager_load_tools, &mcp_servers),
+        };
 
         let profile_summaries: Vec<ProfileSummary> = profiles
             .iter()
@@ -2771,7 +2770,7 @@ impl ResolvedConfig {
                 .and_then(|settings| settings.max_output_tokens),
             mcp_servers,
             mcp_default_permission,
-            mcp_deferral,
+            mcp_overlay,
             profile_summaries,
             instruction_files,
             standing_instructions,
@@ -3016,9 +3015,7 @@ impl ResolvedConfig {
         }
         if self.backend.is_none() {
             return Err(crate::error::MekaError::Config(
-                "no profile configured; run `meka account add <name>`, then `meka profile add \
-                 <name>`"
-                    .to_string(),
+                ProfileRefusal::NoProfiles.to_string(),
             ));
         }
         require_model(
@@ -3479,78 +3476,62 @@ mod tests {
         }
     }
 
+    /// The overlay a run resolves from `--eager-load-tool` adds each named tool to its server's
+    /// list once, beside what the file states, and never reaches another server.
     #[test]
-    fn eager_load_override_appends_to_matching_server() {
+    fn eager_load_overrides_settle_onto_the_named_server_once() {
         let mut servers = vec![fixture_server("notion"), fixture_server("github")];
+        servers[0].eager_load_tools = Some(vec!["search".to_string()]);
         let raw = vec![
             "notion:search".to_string(),
+            "notion:fetch".to_string(),
             "github:create_issue".to_string(),
         ];
-        apply_cli_eager_load_overrides(&raw, &mut servers);
-
+        let overlay = McpOverlay {
+            eager_load_tools: eager_load_overrides(&raw, &servers),
+            ..Default::default()
+        };
+        let settled: Vec<McpServerConfig> = servers
+            .iter()
+            .map(|server| overlay.settled(server))
+            .collect();
         assert_eq!(
-            servers[0].eager_load_tools.as_deref(),
-            Some(&["search".to_string()][..])
+            settled[0].eager_load_tools.as_deref(),
+            Some(&["search".to_string(), "fetch".to_string()][..]),
+            "appended once each to the file's list"
         );
         assert_eq!(
-            servers[1].eager_load_tools.as_deref(),
+            settled[1].eager_load_tools.as_deref(),
             Some(&["create_issue".to_string()][..])
         );
-    }
-
-    #[test]
-    fn eager_load_override_appends_to_existing_list() {
-        let mut servers = vec![fixture_server("notion")];
-        servers[0].eager_load_tools = Some(vec!["search".to_string()]);
-        apply_cli_eager_load_overrides(&["notion:fetch".to_string()], &mut servers);
-        assert_eq!(
-            servers[0].eager_load_tools.as_deref(),
-            Some(&["search".to_string(), "fetch".to_string()][..])
-        );
-    }
-
-    #[test]
-    fn eager_load_override_dedupes_existing_entry() {
-        let mut servers = vec![fixture_server("notion")];
-        servers[0].eager_load_tools = Some(vec!["search".to_string()]);
-        apply_cli_eager_load_overrides(&["notion:search".to_string()], &mut servers);
         assert_eq!(
             servers[0].eager_load_tools.as_deref(),
             Some(&["search".to_string()][..]),
-            "duplicate tool name must not double the list"
+            "the entry as the file states it is untouched"
         );
     }
 
+    /// A value missing either side of the colon is dropped; one naming a server the file does
+    /// not hold yet is kept, for the entry a later add may make; both sides are trimmed.
     #[test]
-    fn eager_load_override_skips_unknown_server() {
-        let mut servers = vec![fixture_server("notion")];
-        apply_cli_eager_load_overrides(&["nope:search".to_string()], &mut servers);
-        // The matching `notion` entry must remain untouched; the unknown `nope` entry simply
-        // produces a warn log (not captured here).
-        assert!(servers[0].eager_load_tools.is_none());
-    }
-
-    #[test]
-    fn eager_load_override_skips_malformed_values() {
-        let mut servers = vec![fixture_server("notion")];
+    fn eager_load_overrides_keep_every_well_formed_value() {
+        let servers = vec![fixture_server("notion")];
         let raw = vec![
+            "later:search".to_string(),
             "no-colon".to_string(),
             ":missing-server".to_string(),
             "missing-tool:".to_string(),
-            "".to_string(),
+            String::new(),
+            "  notion : search  ".to_string(),
         ];
-        apply_cli_eager_load_overrides(&raw, &mut servers);
-        assert!(servers[0].eager_load_tools.is_none());
-    }
-
-    #[test]
-    fn eager_load_override_trims_whitespace() {
-        let mut servers = vec![fixture_server("notion")];
-        apply_cli_eager_load_overrides(&["  notion : search  ".to_string()], &mut servers);
-        assert_eq!(
-            servers[0].eager_load_tools.as_deref(),
-            Some(&["search".to_string()][..])
-        );
+        let eager = |server: &str| EagerLoadOverride {
+            server: server.to_string(),
+            tool: "search".to_string(),
+        };
+        assert_eq!(eager_load_overrides(&raw, &servers), vec![
+            eager("later"),
+            eager("notion")
+        ]);
     }
 
     #[test]
@@ -4462,11 +4443,11 @@ agent_managed = true
         ]);
     }
 
-    /// `default_required` is only a default for `required`; every consumer downstream reads the
-    /// per-server flag, so if this resolution stopped happening `default_required = true` would
-    /// silently stop gating.
+    /// `default_required` is carried for the manager to settle onto every entry it makes, where
+    /// the per-server flag is read; the servers keep what they state, so the entry as the file
+    /// states it is what a reload compares. The settling itself is pinned beside the manager.
     #[test]
-    fn default_required_seeds_required_and_per_server_wins() {
+    fn default_required_is_carried_and_each_server_keeps_its_own_word() {
         let resolved = resolve_with_config(
             r#"
 [mcp]
@@ -4492,8 +4473,13 @@ required = false
                 .unwrap_or_else(|| panic!("{n} present"))
                 .required
         };
-        assert_eq!(by_name("gates"), Some(true), "inherits default_required");
-        assert_eq!(by_name("optout"), Some(false), "explicit opt-out wins");
+        assert_eq!(by_name("gates"), None, "left for the manager to settle");
+        assert_eq!(
+            by_name("optout"),
+            Some(false),
+            "an explicit opt-out is the file's word"
+        );
+        assert!(resolved.mcp_overlay.required);
     }
 
     /// Unset, the key takes the endpoint's answer: native where the endpoint is fixed or official,
@@ -4528,10 +4514,11 @@ required = false
         }
     }
 
-    /// `[mcp].deferral` is settled onto every server that states none, a server's own setting
-    /// wins, and the install's answer is carried for the meta-tools; unset, everything defers.
+    /// `[mcp].deferral` is carried for the manager to settle onto every entry it makes and for
+    /// the meta-tools; the servers keep what they state, so the entry as the file states it is
+    /// what a reload compares. Unset, everything defers.
     #[test]
-    fn deferral_seeds_each_server_and_per_server_wins() {
+    fn deferral_is_carried_and_each_server_keeps_its_own_word() {
         let resolved = resolve_with_config(
             r#"
 [mcp]
@@ -4557,9 +4544,9 @@ deferral = "hidden"
                 .unwrap_or_else(|| panic!("{n} present"))
                 .deferral
         };
-        assert_eq!(by_name("follows"), Some(Deferral::Eager));
+        assert_eq!(by_name("follows"), None, "left for the manager to settle");
         assert_eq!(by_name("locked"), Some(Deferral::Hidden));
-        assert_eq!(resolved.mcp_deferral, Deferral::Eager);
+        assert_eq!(resolved.mcp_overlay.deferral, Deferral::Eager);
 
         let unset = resolve_with_config(
             r#"
@@ -4569,8 +4556,8 @@ transport = "http"
 url = "http://localhost/mcp"
 "#,
         );
-        assert_eq!(unset.mcp_servers[0].deferral, Some(Deferral::Deferred));
-        assert_eq!(unset.mcp_deferral, Deferral::Deferred);
+        assert_eq!(unset.mcp_servers[0].deferral, None);
+        assert_eq!(unset.mcp_overlay.deferral, Deferral::Deferred);
         assert!(
             toml::from_str::<McpServerConfig>(
                 "name = \"s\"\ntransport = \"http\"\nderferral = \"eager\""
@@ -4601,7 +4588,8 @@ transport = "stdio"
 command = "ida-mcp"
 "#,
         );
-        assert_eq!(resolved.mcp_servers[0].required, Some(false));
+        assert_eq!(resolved.mcp_servers[0].required, None);
+        assert!(!resolved.mcp_overlay.required);
         assert!(resolved.retention.is_none(), "no cleanup by default");
         assert!(
             resolved.turn_retention.is_none(),

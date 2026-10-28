@@ -295,6 +295,10 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         .route("/v1/memory/{name}", delete(handlers::stores::delete_memory))
         .route("/v1/instructions", get(handlers::stores::instructions))
         .route("/v1/instructions", put(handlers::stores::put_instructions))
+        .route(
+            "/v1/config/reload",
+            post(handlers::installation::reload_config),
+        )
         .route("/v1/accounts", get(handlers::installation::accounts))
         .route("/v1/accounts", post(handlers::installation::create_account))
         .route(

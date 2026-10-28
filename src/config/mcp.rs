@@ -39,7 +39,7 @@ pub(crate) struct McpConfig {
     pub(crate) http_concurrency: Option<usize>,
     pub(crate) servers: Option<Vec<McpServerConfig>>,
 }
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, PartialEq)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpServerConfig {
@@ -119,6 +119,68 @@ pub(crate) struct McpServerConfig {
     /// even try", `required` says "if trying failed, stop the turn". Resolved once in
     /// [`crate::config::ResolvedConfig::resolve`], so every later consumer reads a plain `bool`.
     pub(crate) required: Option<bool>,
+}
+
+/// What a run lays over every entry the manager makes: the `[mcp]` defaults, `default_required`
+/// and `deferral`, for what an entry leaves unsaid, and the tools `--eager-load-tool` names on it.
+/// Settled onto the runtime copy of every entry and onto the copy a view shows, never onto the
+/// entry as the file states it, which the doors edit and compare, so a server restarted from the
+/// file runs under what one made at startup ran under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct McpOverlay {
+    pub(crate) required: bool,
+    pub(crate) deferral: Deferral,
+    /// Each `--eager-load-tool SERVER:TOOL` that names a configured server.
+    pub(crate) eager_load_tools: Vec<EagerLoadOverride>,
+}
+
+/// One `--eager-load-tool SERVER:TOOL`: a tool the run loads eagerly on the named server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EagerLoadOverride {
+    pub(crate) server: String,
+    pub(crate) tool: String,
+}
+
+impl EagerLoadOverride {
+    /// Parse `SERVER:TOOL`, both sides trimmed; `None` for a value missing either.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        let (server, tool) = raw.split_once(':')?;
+        let (server, tool) = (server.trim(), tool.trim());
+        if server.is_empty() || tool.is_empty() {
+            return None;
+        }
+        Some(Self {
+            server: server.to_string(),
+            tool: tool.to_string(),
+        })
+    }
+}
+
+impl McpOverlay {
+    /// Fill in what `config` leaves unsaid, and add the tools the run loads eagerly on it, once
+    /// each.
+    pub(crate) fn settle(&self, config: &mut McpServerConfig) {
+        config.required.get_or_insert(self.required);
+        config.deferral.get_or_insert(self.deferral);
+        for tool in self
+            .eager_load_tools
+            .iter()
+            .filter(|eager| eager.server == config.name)
+            .map(|eager| &eager.tool)
+        {
+            let list = config.eager_load_tools.get_or_insert_with(Vec::new);
+            if !list.iter().any(|existing| existing == tool) {
+                list.push(tool.clone());
+            }
+        }
+    }
+
+    /// `config` with the overlay settled: what a server runs under, for a view that reports it.
+    pub(crate) fn settled(&self, config: &McpServerConfig) -> McpServerConfig {
+        let mut settled = config.clone();
+        self.settle(&mut settled);
+        settled
+    }
 }
 
 #[cfg(test)]
@@ -290,7 +352,7 @@ impl From<McpTransport> for String {
 /// `deny_unknown_fields` so a key this does not model is refused rather than silently dropped,
 /// which is the same strictness [`McpServerConfig`] already has. A secret quietly ignored is worse
 /// than one refused: the connect fails later, somewhere else, for a reason that names nothing.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum McpAuthConfig {

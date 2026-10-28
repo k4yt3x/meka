@@ -29,8 +29,8 @@ use tokio::sync::{broadcast, oneshot};
 
 use super::sse::{EventIdGenerator, SseEvent, SseEventType, translate};
 use crate::frontend::{
-    APPROVAL_TIMEOUT, ElicitationKind, ElicitationPrompt, ElicitationResponse, Frontend,
-    FrontendEvent, Notice, PermissionOutcome, PermissionRequest, StickyApprovals,
+    APPROVAL_TIMEOUT, ELICITATION_TIMEOUT, ElicitationKind, ElicitationPrompt, ElicitationResponse,
+    Frontend, FrontendEvent, Notice, PermissionOutcome, PermissionRequest, StickyApprovals,
 };
 
 /// How often the parked `request_permission` poll checks whether the SSE consumer has
@@ -148,14 +148,22 @@ pub(crate) use crate::host::scheduler::TurnSource;
 /// is parked.
 pub(crate) enum Pending {
     Permission(oneshot::Sender<PermissionResolution>),
-    Elicitation(oneshot::Sender<ElicitationResponse>),
+    /// `form` says the prompt is a form, whose `accept` carries the fields its schema named; an
+    /// `accept` with nothing is refused at the responses door rather than forwarded empty.
+    Elicitation {
+        sender: oneshot::Sender<ElicitationResponse>,
+        form: bool,
+    },
 }
 
 /// Which prompt a parked request is, so the responses door can hold an answer to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingKind {
     Permission,
-    Elicitation,
+    /// `form` as on [`Pending::Elicitation`].
+    Elicitation {
+        form: bool,
+    },
 }
 
 /// The `elicitation_required` SSE event's payload: what a client needs to show the prompt and
@@ -180,6 +188,9 @@ pub(crate) struct ElicitationRequiredEvent {
     pub(crate) expires_in_seconds: u64,
     /// RFC 3339, when the request is declined unanswered.
     pub(crate) expires_at: String,
+    /// The sub-agent whose MCP server asked, when one did, as `permission_required` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) subagent_id: Option<uuid::Uuid>,
 }
 
 /// A parked elicitation's place in the lot, given up however the wait ends: the MCP side's own
@@ -188,6 +199,8 @@ pub(crate) struct ElicitationRequiredEvent {
 struct ParkedElicitation<'a> {
     frontend: &'a HttpFrontend,
     request_id: String,
+    /// Whose feed mirrors the close, when a sub-agent's server asked.
+    subagent_id: Option<uuid::Uuid>,
     closed_as: Option<&'static str>,
 }
 
@@ -201,9 +214,13 @@ impl Drop for ParkedElicitation<'_> {
     fn drop(&mut self) {
         let closed_as = self.closed_as.unwrap_or("canceled");
         crate::sync::lock(&self.frontend.pending).remove(&self.request_id);
-        self.frontend.push_sse(
+        let resolved = serde_json::json!({ "request_id": self.request_id, "outcome": closed_as });
+        self.frontend
+            .push_sse(SseEventType::ElicitationResolved, resolved.clone());
+        self.frontend.mirror_to_subagent(
+            self.subagent_id,
             SseEventType::ElicitationResolved,
-            serde_json::json!({ "request_id": self.request_id, "outcome": closed_as }),
+            &resolved,
         );
     }
 }
@@ -392,12 +409,12 @@ impl HttpFrontend {
         let entry = {
             let mut guard = crate::sync::lock(&self.pending);
             match guard.get(request_id) {
-                Some(Pending::Elicitation(_)) => guard.remove(request_id),
+                Some(Pending::Elicitation { .. }) => guard.remove(request_id),
                 _ => None,
             }
         };
         match entry {
-            Some(Pending::Elicitation(sender)) => sender.send(response).is_ok(),
+            Some(Pending::Elicitation { sender, .. }) => sender.send(response).is_ok(),
             _ => false,
         }
     }
@@ -406,7 +423,9 @@ impl HttpFrontend {
     pub(crate) fn pending_kind(&self, request_id: &str) -> Option<PendingKind> {
         match crate::sync::lock(&self.pending).get(request_id) {
             Some(Pending::Permission(_)) => Some(PendingKind::Permission),
-            Some(Pending::Elicitation(_)) => Some(PendingKind::Elicitation),
+            Some(Pending::Elicitation { form, .. }) => {
+                Some(PendingKind::Elicitation { form: *form })
+            }
             None => None,
         }
     }
@@ -1064,6 +1083,17 @@ impl Frontend for HttpFrontend {
         outcome
     }
 
+    /// An approval's half hour on a session whose client answers on return and holds no request
+    /// on the turn, as an approval gets there; the minute otherwise. The server's own bound on
+    /// its request is the server's, so the longer wait holds only where the server waits too.
+    fn elicitation_timeout(&self) -> Duration {
+        if self.waits_for_return() {
+            APPROVAL_TIMEOUT
+        } else {
+            ELICITATION_TIMEOUT
+        }
+    }
+
     async fn handle_elicitation(&self, prompt: ElicitationPrompt) -> ElicitationResponse {
         // Each decline made on the person's behalf is said in the transcript, since the tool call
         // waiting on the answer fails next and nothing else names the cause.
@@ -1088,10 +1118,14 @@ impl Frontend for HttpFrontend {
         let request_id = format!("req_{}", uuid::Uuid::new_v4());
         let (sender, receiver) = oneshot::channel::<ElicitationResponse>();
         let parked_at = chrono::Utc::now();
-        crate::sync::lock(&self.pending).insert(request_id.clone(), Pending::Elicitation(sender));
+        crate::sync::lock(&self.pending).insert(request_id.clone(), Pending::Elicitation {
+            sender,
+            form: matches!(prompt.kind, ElicitationKind::Form { .. }),
+        });
         let parked = ParkedElicitation {
             frontend: self,
             request_id: request_id.clone(),
+            subagent_id: prompt.subagent_id,
             closed_as: None,
         };
         // The deadline is the MCP client's, which declines the prompt for the person when it
@@ -1115,6 +1149,7 @@ impl Frontend for HttpFrontend {
             // the client grants is a minute, not the 59 s left of it by the time this is built.
             expires_in_seconds: remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0),
             expires_at: (parked_at + remaining).to_rfc3339(),
+            subagent_id: prompt.subagent_id,
         })
         .unwrap_or_else(|error| {
             tracing::warn!("failed to serialize the elicitation_required payload: {error}");
@@ -1122,7 +1157,12 @@ impl Frontend for HttpFrontend {
         });
         // Recorded like any other event: a client that reconnects mid-pause has to learn that
         // the call is waiting on it, or the call sits there until the timeout.
-        self.push_sse(SseEventType::ElicitationRequired, payload);
+        self.push_sse(SseEventType::ElicitationRequired, payload.clone());
+        self.mirror_to_subagent(
+            prompt.subagent_id,
+            SseEventType::ElicitationRequired,
+            &payload,
+        );
 
         // The same poll `request_permission` runs, for the same reason.
         let disconnect_poll = async {
@@ -2952,6 +2992,7 @@ mod tests {
             },
             message: "Open this URL?".into(),
             deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+            subagent_id: None,
         };
         let response = frontend.handle_elicitation(prompt).await;
         assert!(matches!(response, ElicitationResponse::Decline));
@@ -2962,6 +3003,43 @@ mod tests {
                 FrontendEvent::Notice(notice) if notice.text.contains("github")
             )),
             "elicitation decline must surface a diagnostic Notice"
+        );
+    }
+
+    /// A session whose client answers prompts on return gets an approval's half hour on an
+    /// elicitation parked in a turn no request holds; every other session gets the minute.
+    #[test]
+    fn an_elicitation_waits_for_a_client_that_answers_on_return() {
+        assert_eq!(
+            HttpFrontend::new().elicitation_timeout(),
+            ELICITATION_TIMEOUT
+        );
+
+        let frontend = Arc::new(HttpFrontend::with_capabilities(SessionCapabilities {
+            supports_elicitation: true,
+            answers_prompts_on_return: true,
+            ..Default::default()
+        }));
+        frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
+        assert_eq!(
+            frontend.elicitation_timeout(),
+            APPROVAL_TIMEOUT,
+            "no request holds the turn, so the client is waited for"
+        );
+        let (_receiver, _ids) = frontend.begin_turn(
+            uuid::Uuid::from_u128(0x9),
+            TurnSource::Client,
+            Opener {
+                holds: true,
+                renders: false,
+            },
+            Duration::ZERO,
+            16,
+        );
+        assert_eq!(
+            frontend.elicitation_timeout(),
+            ELICITATION_TIMEOUT,
+            "a held turn is stopped for absence anyway"
         );
     }
 
@@ -2995,6 +3073,7 @@ mod tests {
                     },
                     message: "Open this URL?".into(),
                     deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+                    subagent_id: None,
                 })
                 .await
         });
@@ -3052,6 +3131,7 @@ mod tests {
             },
             message: "Open this URL?".into(),
             deadline,
+            subagent_id: None,
         };
         // Bounded as the MCP client bounds it: on the same instant.
         let response = tokio::time::timeout_at(deadline, frontend.handle_elicitation(prompt)).await;

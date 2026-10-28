@@ -326,8 +326,8 @@ impl From<&McpServerConfig> for McpServerView {
         Self {
             name: config.name.clone(),
             transport: config.transport.name(),
-            // `required` is settled during config resolution, so `None` only shows up for a config
-            // assembled outside that path; it means the same thing as false.
+            // `required` is settled by the manager onto what it runs and by a listing's caller
+            // onto what it shows, so `None` is a config assembled outside both, read as false.
             required: config.required.unwrap_or(false),
             disabled: config.disabled.unwrap_or(false),
             permission: config.permission,

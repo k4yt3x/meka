@@ -54,12 +54,14 @@ pub(crate) struct ServerState {
     /// [`super::handlers::installation::PendingLogin`].
     pub(crate) pending_logins: super::handlers::installation::PendingLogins,
     /// Holds an MCP server's edit of `config.toml` together with the change it makes to the
-    /// running manager: the config lock is released between the two, and two writes interleaved
-    /// across it leave the manager running an entry the file no longer states, or refusing one it
-    /// has.
+    /// running manager, and a reload's read of the file together with what it brings the manager
+    /// to: the config lock is released between the two, and two writes interleaved across it
+    /// leave the manager running an entry the file no longer states, or refusing one it has.
     pub(crate) mcp_doors: Arc<tokio::sync::Mutex<()>>,
-    /// When this process started, which is when it read `config.toml` whole.
-    pub(crate) started_at: chrono::DateTime<chrono::Utc>,
+    /// When this process last read `config.toml` whole: at its start, and on each
+    /// `POST /v1/config/reload`. A write of its own reloads the tables it wrote and moves nothing
+    /// here, since the file was not read whole.
+    pub(crate) config_loaded_at: Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
 }
 
 /// One session `meka serve` holds open: the shared [`ResidentSession`] plus what only the HTTP
@@ -113,7 +115,7 @@ impl ServerState {
             child_feeds: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_logins: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             mcp_doors: Arc::new(tokio::sync::Mutex::new(())),
-            started_at: chrono::Utc::now(),
+            config_loaded_at: Arc::new(std::sync::Mutex::new(chrono::Utc::now())),
         }
     }
 

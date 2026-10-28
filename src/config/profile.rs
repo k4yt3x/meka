@@ -447,9 +447,9 @@ pub(crate) fn require_model<'a>(
 pub(crate) struct ProfileCatalog {
     pub(crate) accounts: std::collections::BTreeMap<String, AccountConfig>,
     pub(crate) profiles: std::collections::BTreeMap<String, ProfileConfig>,
-    /// The profile a session that names none runs on, or the configuration's own explanation of
-    /// why there is none, as [`select_default`] decides it.
-    pub(crate) default_profile: std::result::Result<String, String>,
+    /// The profile a session that names none runs on, or why there is none, as
+    /// [`select_default`] decides it, for the host to word.
+    pub(crate) default_profile: std::result::Result<String, ProfileRefusal>,
 }
 
 impl ProfileCatalog {
@@ -497,20 +497,84 @@ fn select_default(
     source: ProfileRequest,
     accounts: &std::collections::BTreeMap<String, AccountConfig>,
     profiles: &std::collections::BTreeMap<String, ProfileConfig>,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<String, ProfileRefusal> {
     let (selected, error) = select_profile(requested, source, profiles);
     let Some(name) = selected else {
-        return Err(
-            error.unwrap_or_else(|| "no profile is configured; run `meka profile add`".to_string())
-        );
+        return Err(error.unwrap_or(ProfileRefusal::NoProfiles));
     };
-    let profile = require_profile(&name, profiles).map_err(|error| error.to_string())?;
-    let account = account_for(&name, profile, accounts)?;
+    let profile = require_profile(&name, profiles)
+        .map_err(|error| ProfileRefusal::Unrunnable(error.to_string()))?;
+    let account = account_for(&name, profile, accounts).map_err(ProfileRefusal::Unrunnable)?;
     // Resolved with no device id: this asks whether the account's backend parses, which is the
     // one refusal `resolve_profile` makes, and a device id is a provider's business.
-    resolve_profile(profile, account, None, None, String::new())?;
+    resolve_profile(profile, account, None, None, String::new())
+        .map_err(ProfileRefusal::Unrunnable)?;
     Ok(name)
 }
+/// Why no profile is selected: the facts, for each host to word with its own remedy, since the
+/// shell's command is the wrong advice to a client that administers the installation over HTTP.
+/// `Display` is the shell's sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfileRefusal {
+    /// No profile is configured at all.
+    NoProfiles,
+    /// Several are, and `default_profile` names none of them.
+    NoDefault { configured: Vec<String> },
+    /// The one asked for, by `--profile` or by `default_profile`, is not configured; `configured`
+    /// is what is, possibly nothing.
+    Unknown {
+        requested: String,
+        source: ProfileRequest,
+        configured: Vec<String>,
+    },
+    /// Selected, and then found unable to run: its account or its settings, in the sentence `meka
+    /// profile` prints, which names no host's door.
+    Unrunnable(String),
+}
+
+impl std::fmt::Display for ProfileRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProfiles => formatter.write_str(
+                "no profile configured; run `meka account add <name>`, then `meka profile add \
+                 <name>`",
+            ),
+            // Names `meka profile use`, which is what actually writes `default_profile`. Saying
+            // only "set `default_profile`" sends the reader to hand-edit a file for something a
+            // command does, and this state is most often reached by `meka profile remove`
+            // dropping a pointer to the profile it deleted.
+            Self::NoDefault { configured } => write!(
+                formatter,
+                "multiple profiles configured ({}) and no `default_profile`; pick one with `meka \
+                 profile use <name>`",
+                configured.join(", ")
+            ),
+            // The remedy differs by where the name came from. Telling someone who just typed
+            // `--profile typo` to "pass `--profile`" is advice they have already taken; telling
+            // someone whose `default_profile` names a deleted profile to run `meka profile list`
+            // is not enough.
+            Self::Unknown {
+                requested,
+                source,
+                configured,
+            } => write!(
+                formatter,
+                "{}; {}",
+                crate::text::unknown_name("profile", requested, configured),
+                match (source, configured.is_empty()) {
+                    (_, true) => "create one with `meka profile add <name>`",
+                    (ProfileRequest::Flag, false) => "pass a configured name to `--profile`",
+                    (ProfileRequest::DefaultProfile, false) =>
+                        "point `default_profile` at one with `meka profile use <name>`",
+                }
+            ),
+            Self::Unrunnable(sentence) => formatter.write_str(sentence),
+        }
+    }
+}
+
+impl std::error::Error for ProfileRefusal {}
+
 /// Which tier asked for the profile [`select_profile`] could not find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileRequest {
@@ -521,53 +585,35 @@ pub(crate) enum ProfileRequest {
 }
 /// Resolve which profile is active given an explicit request (from `--profile` or
 /// `default_profile`) and the configured profiles. Returns `(default_profile, profile_error)`:
-/// exactly one is `Some`. A deferred error string (rather than a hard failure) keeps
+/// exactly one is `Some`. A deferred refusal (rather than a hard failure) keeps
 /// [`ResolvedConfig::resolve`] infallible; `validate()` surfaces it later with guidance.
 pub(crate) fn select_profile(
     requested: Option<String>,
-    // Where `requested` came from, because the remedy differs. Telling someone who just typed
-    // `--profile typo` to "pass `--profile`" is advice they have already taken; telling someone
-    // whose `default_profile` names a deleted profile to run `meka profile list` is not enough.
+    // Where `requested` came from, because the remedy differs; see [`ProfileRefusal::Unknown`].
     source: ProfileRequest,
     profiles: &std::collections::BTreeMap<String, ProfileConfig>,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<ProfileRefusal>) {
+    let configured = || profiles.keys().cloned().collect::<Vec<_>>();
     match requested {
         Some(name) => match require_profile(&name, profiles) {
             Ok(_) => (Some(name), None),
-            Err(refusal) => (
+            Err(_) => (
                 None,
-                Some(format!(
-                    "{refusal}; {}",
-                    match (source, profiles.is_empty()) {
-                        (_, true) => "create one with `meka profile add <name>`",
-                        (ProfileRequest::Flag, false) => "pass a configured name to `--profile`",
-                        (ProfileRequest::DefaultProfile, false) =>
-                            "point `default_profile` at one with `meka profile use <name>`",
-                    }
-                )),
+                Some(ProfileRefusal::Unknown {
+                    requested: name,
+                    source,
+                    configured: configured(),
+                }),
             ),
         },
         None => match profiles.len() {
-            0 => (
-                None,
-                Some(
-                    "no profile configured; run `meka account add <name>`, then `meka profile add \
-                     <name>`"
-                        .to_string(),
-                ),
-            ),
+            0 => (None, Some(ProfileRefusal::NoProfiles)),
             1 => (profiles.keys().next().cloned(), None),
-            // Names `meka profile use`, which is what actually writes `default_profile`. Saying
-            // only "set `default_profile`" sends the reader to hand-edit a file for something a
-            // command does, and this state is most often reached by `meka profile remove`
-            // dropping a pointer to the profile it deleted.
             _ => (
                 None,
-                Some(format!(
-                    "multiple profiles configured ({}) and no `default_profile`; pick one with \
-                     `meka profile use <name>`",
-                    profiles.keys().cloned().collect::<Vec<_>>().join(", ")
-                )),
+                Some(ProfileRefusal::NoDefault {
+                    configured: configured(),
+                }),
             ),
         },
     }
@@ -1002,7 +1048,12 @@ mod tests {
         let providers = profiles_from(&[]);
         let (active, error) = select_profile(None, ProfileRequest::DefaultProfile, &providers);
         assert!(active.is_none());
-        assert!(error.expect("error expected").contains("profile add"));
+        assert!(
+            error
+                .expect("error expected")
+                .to_string()
+                .contains("profile add")
+        );
     }
 
     #[test]
@@ -1013,7 +1064,7 @@ mod tests {
         ]);
         let (active, error) = select_profile(None, ProfileRequest::DefaultProfile, &providers);
         assert!(active.is_none());
-        let error = error.expect("error expected");
+        let error = error.expect("error expected").to_string();
         assert!(error.contains("multiple profiles"));
         // The error lists the configured names so the user knows what to pick.
         assert!(error.contains("work") && error.contains("personal"));
@@ -1031,6 +1082,7 @@ mod tests {
         assert!(
             error
                 .expect("error expected")
+                .to_string()
                 .contains("no profile named 'missing'")
         );
     }

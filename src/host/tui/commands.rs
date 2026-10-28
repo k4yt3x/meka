@@ -336,6 +336,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         SlashCommand::McpReconnect { server } => {
             let (outcome, printed) = capture(crate::cli::mcp::run_reconnect(
                 &config.mcp_servers,
+                &config.mcp_overlay,
                 token_store,
                 &server,
             ))
@@ -353,6 +354,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         SlashCommand::McpLogin { server } => {
             let (outcome, printed) = capture(crate::installation::mcp::login_server(
                 &config.mcp_servers,
+                &config.mcp_overlay,
                 token_store,
                 &server,
                 Arc::new(ScreenLogin::new(ui.clone(), server.clone())),
@@ -724,6 +726,7 @@ impl crate::oauth::LoginPrompt for ScreenLogin {
                      {seconds}s for the callback)"
                 ),
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(seconds),
+                subagent_id: None,
             },
             responder,
         });

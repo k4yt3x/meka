@@ -3302,6 +3302,36 @@ fn account_and_profile_lists_print_json_under_the_http_names() {
     assert_eq!(beta["active"], false);
 }
 
+/// `meka mcp list`, `meka mcp get` and `meka mcp tools` report what a server runs under: an entry
+/// that states neither `required` nor `deferral` shows the `[mcp]` defaults, as the running
+/// manager applies them, rather than the built-in ones.
+#[test]
+fn mcp_views_report_the_file_s_defaults_for_what_an_entry_leaves_unsaid() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mcp_stub_server.py"
+    );
+    let install = Install::new();
+    let state_path = install.work_dir().join("state.json");
+    std::fs::write(&state_path, r#"{"tools": ["search"]}"#).expect("write state");
+    install.write_config(&format!(
+        "[mcp]\ndefault_required = true\ndeferral = \"eager\"\n\n[[mcp.servers]]\nname = \
+         \"stub\"\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = [{fixture:?}, {:?}]\n",
+        state_path.to_string_lossy()
+    ));
+
+    let listed = json_stdout(run_isolated(&install, &["mcp", "list", "--format", "json"]));
+    assert_eq!(listed["servers"][0]["required"], true, "{listed}");
+    let shown = json_stdout(run_isolated(&install, &[
+        "mcp", "get", "stub", "--format", "json",
+    ]));
+    assert_eq!(shown["required"], true, "{shown}");
+    let tools = json_stdout(run_isolated(&install, &[
+        "mcp", "tools", "stub", "--format", "json",
+    ]));
+    assert_eq!(tools["tools"][0]["loading"], "eager", "{tools}");
+}
+
 /// `mcp list` and `mcp get` under `--format json` carry the configuration and the kinds of secret,
 /// never a value that could be one: `env` and `headers` reach the document as their keys alone.
 #[test]

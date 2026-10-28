@@ -111,8 +111,9 @@ once, in either mode.
 ## `default_profile`
 
 Top-level field naming the profile to use when `--profile` isn't passed. Set it with
-`meka profile use <name>`; `meka profile add` never writes it, since a sole profile is the default
-by the selection rule.
+`meka profile use <name>`. A sole profile is the default by the selection rule, so the first
+`meka profile add` leaves the key unset; the second names the profile that was alone, unless it
+takes `--default` itself, so the default stays where it was.
 
 ## Account fields
 
@@ -488,7 +489,7 @@ login.
 
 | Command | Action |
 |---|---|
-| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5-5` on a Claude account and `gpt-6-astra` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget`, `--max-request-bytes`, `--cache-control` and `--thinking-display <DISPLAY>`, so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Does not touch `default_profile`. |
+| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5-5` on a Claude account and `gpt-6-astra` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget`, `--max-request-bytes`, `--cache-control` and `--thinking-display <DISPLAY>`, so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Writes `default_profile` only when a second profile joins a sole one, naming the one that was alone. |
 | `meka profile list` | List configured profiles with account, backend, model and the default marker; `--format json` prints the same as one document. Names any profile whose account is not configured. |
 | `meka profile set <name> <key> <value>` | Change one setting on an existing profile, in place. `--unset` in place of the value removes the key instead. See [Changing one setting](#changing-one-setting). |
 | `meka profile use <name>` | Set `default_profile` to this profile. |

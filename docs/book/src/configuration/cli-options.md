@@ -405,7 +405,7 @@ meka --sandbox-backend landlock
 
 Eager-load a specific MCP tool for this session, bypassing the `tool_load` round-trip. The tool's schema ships in the cacheable tools-array prefix from turn 1 instead of being deferred. Mirrors the per-server [`eager_load_tools`](./config-file.md#mcpservers) config field: repeatable, raw tool names (the server-advertised form, not `mcp__<server>__<tool>`).
 
-Particularly useful for scripted runs that know up front which tools they'll need. The flag *appends to* whatever `eager_load_tools` lists in `config.toml` for that server; it doesn't replace existing entries. Unknown server names log a warning and are skipped.
+Particularly useful for scripted runs that know up front which tools they'll need. The flag *appends to* whatever `eager_load_tools` lists in `config.toml` for that server; it doesn't replace existing entries. A server name the file does not hold logs a warning and is kept, for a server of that name added while the process runs.
 
 ```bash
 meka --eager-load-tool notion:search --eager-load-tool github:create_issue \

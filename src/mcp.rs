@@ -180,6 +180,7 @@ async fn close_service(server_name: &str, mut service: McpRunningService) {
 /// startup holds one to.
 fn build_entry(
     original_config: &McpServerConfig,
+    overlay: &crate::config::McpOverlay,
     token_store: Option<TokenStore>,
     client_context: Arc<McpClientContext>,
     tool_call_timeout: std::time::Duration,
@@ -189,6 +190,11 @@ fn build_entry(
     // the pipeline sees only resolved values.
     let mut config = original_config.clone();
     let unresolved = crate::mcp::expand::expand_server_config(&mut config);
+    // Settled here, the one place every entry is made, so no reader downstream has to remember
+    // that `None` means "inherit the `[mcp]` default" or that the CLI asked for a tool to load
+    // eagerly: the runtime copy reads the whole word, while `configured` stays the entry as it
+    // was handed in, for the doors that show, edit or compare it.
+    overlay.settle(&mut config);
     if !unresolved.names.is_empty() {
         tracing::warn!(
             "MCP server '{name}': unresolved env vars {names:?} left literal in config",
@@ -197,16 +203,8 @@ fn build_entry(
         );
     }
 
-    crate::mcp::sanitize::validate_server_name(&config.name).map_err(|message| {
-        MekaError::McpConnection {
-            server_name: if config.name.is_empty() {
-                "(empty)".to_string()
-            } else {
-                config.name.clone()
-            },
-            message,
-        }
-    })?;
+    sanitize::validate_server_entries(std::slice::from_ref(original_config))
+        .map_err(MekaError::Config)?;
 
     let is_disabled = config.disabled.unwrap_or(false);
     if is_disabled {
@@ -272,10 +270,11 @@ pub(crate) struct McpClientManager {
     /// `readOnlyHint`. `None` means "no user default": resolution falls through to the
     /// hardcoded strict `Unrestricted`.
     mcp_default_permission: Option<Permission>,
-    /// `[mcp].deferral`, for the meta-tools, which belong to no server. Set once by the host after
-    /// [`Self::prepare`]; left unset by a test or a `meka mcp` command, where it reads as the
-    /// default.
-    deferral: OnceLock<crate::config::Deferral>,
+    /// What the run lays over every entry this manager makes, the `[mcp]` defaults and the
+    /// `--eager-load-tool` values, read for the meta-tools too, which belong to no server. Set by
+    /// [`Self::prepare_with_overlay`]; a manager a test makes without one reads the built-in
+    /// defaults.
+    overlay: OnceLock<crate::config::McpOverlay>,
     /// Flipped to `true` by the background connector once every enabled entry has reached a
     /// terminal state (Connected or Failed). The turn gate watches this via
     /// [`Self::await_settled`] / [`Self::all_ready`].
@@ -447,9 +446,11 @@ fn redact_mcp_error(error: MekaError) -> MekaError {
 pub(crate) struct ServerEntry {
     pub(crate) server_name: String,
     pub(crate) config: McpServerConfig,
-    /// The entry as `config.toml` states it, every `${VAR}` a reference still: what the doors
-    /// that show or edit the entry read, since what a reference expands to in [`Self::config`]
-    /// may be the secret it keeps out of the file.
+    /// The entry as it was handed in, from `config.toml` or a door's body, every `${VAR}` a
+    /// reference still and a `required` or `deferral` it leaves out left out: what the doors that
+    /// show, edit or compare the entry read, since what a reference expands to in [`Self::config`]
+    /// may be the secret it keeps out of the file, and a default settled there is not the file's
+    /// word. A reload compares it with the file as the file would be written from each.
     pub(crate) configured: McpServerConfig,
     pub(crate) token_store: Option<TokenStore>,
     pub(crate) client_context: Arc<McpClientContext>,
@@ -922,12 +923,37 @@ impl McpClientManager {
     /// Spawns no process or network work; [`Self::start_connector`] does, once the registries have
     /// subscribed, so the connector can register tools into them as each server comes up without
     /// any registry having to exist before config validation.
+    #[cfg(test)]
+    pub(crate) async fn prepare(
+        configs: &[McpServerConfig],
+        mcp_default_permission: Option<Permission>,
+        token_store: Option<TokenStore>,
+        client_context: Arc<McpClientContext>,
+        tool_call_timeout: std::time::Duration,
+    ) -> Result<Arc<Self>> {
+        Self::prepare_with_overlay(
+            configs,
+            crate::config::McpOverlay::default(),
+            mcp_default_permission,
+            token_store,
+            client_context,
+            tool_call_timeout,
+        )
+        .await
+    }
+
+    /// Validate configs and build a manager with every entry `Disabled` or `Pending`, under the
+    /// overlay a host resolved, settled onto every entry made now or added later. Spawns
+    /// no process or network work; [`Self::start_connector`] does, once the registries have
+    /// subscribed, so the connector can register tools into them as each server comes up without
+    /// any registry having to exist before config validation.
     #[allow(
         clippy::unused_async,
         reason = "the signature is the boundary every host and test calls, and the credential check it is likely to grow will await the store"
     )]
-    pub(crate) async fn prepare(
+    pub(crate) async fn prepare_with_overlay(
         configs: &[McpServerConfig],
+        overlay: crate::config::McpOverlay,
         mcp_default_permission: Option<Permission>,
         token_store: Option<TokenStore>,
         client_context: Arc<McpClientContext>,
@@ -937,15 +963,11 @@ impl McpClientManager {
         let mut pending: Vec<Arc<ServerEntry>> = Vec::new();
         let connects = Connects::new();
 
+        sanitize::validate_server_entries(configs).map_err(MekaError::Config)?;
         for original_config in configs {
-            if servers.contains_key(&original_config.name) {
-                return Err(MekaError::McpConnection {
-                    server_name: original_config.name.clone(),
-                    message: "duplicate server name".to_string(),
-                });
-            }
             let entry = build_entry(
                 original_config,
+                &overlay,
                 token_store.clone(),
                 Arc::clone(&client_context),
                 tool_call_timeout,
@@ -969,7 +991,7 @@ impl McpClientManager {
             servers: std::sync::RwLock::new(servers),
             client_context,
             mcp_default_permission,
-            deferral: OnceLock::new(),
+            overlay: OnceLock::from(overlay),
             settled: settled_tx,
             pending_entries: std::sync::Mutex::new(Some(pending)),
             tools_snapshot: tokio::sync::RwLock::new(HashMap::new()),
@@ -1051,15 +1073,15 @@ impl McpClientManager {
         observers.retain(|observer| observer.identity() != identity);
     }
 
-    /// Record `[mcp].deferral` for the meta-tools; a second call is ignored.
-    pub(crate) fn set_deferral(&self, deferral: crate::config::Deferral) {
-        // `set` fails only when the slot is already filled, which is the documented no-op.
-        let _already_set = self.deferral.set(deferral);
+    /// What every entry is settled under, or the built-in defaults on a manager made without a
+    /// resolved config.
+    pub(crate) fn overlay(&self) -> &crate::config::McpOverlay {
+        self.overlay.get_or_init(Default::default)
     }
 
     /// What becomes of the meta-tools: `[mcp].deferral`, or its default when nothing recorded it.
     pub(crate) fn deferral(&self) -> crate::config::Deferral {
-        self.deferral.get().copied().unwrap_or_default()
+        self.overlay().deferral
     }
 
     /// The bound to put on an MCP request made outside the connector.
@@ -1071,8 +1093,8 @@ impl McpClientManager {
     }
 
     /// Spawn the background connector. Consumes the `Pending` entry list stashed by
-    /// [`Self::prepare`] so subsequent calls are no-ops. Safe to call on managers with no pending
-    /// entries.
+    /// [`Self::prepare_with_overlay`] so subsequent calls are no-ops. Safe to call on managers
+    /// with no pending entries.
     ///
     /// The connector writes tool discoveries through [`Self::update_server_tools`], which fans out
     /// to every observer subscribed via [`Self::subscribe`]. The caller does not pass a specific
@@ -1133,9 +1155,8 @@ impl McpClientManager {
                 ServerState::Connected { .. } | ServerState::Disabled => {}
                 other => out.push(NotConnected {
                     name: name.clone(),
-                    // `required` is settled in `ResolvedConfig::from_cli`, so `None` here can only
-                    // mean a config built outside that path (tests, `meka mcp add`); treat it as
-                    // optional, matching the default.
+                    // Settled when the entry was made, so `None` is unreachable; read as optional,
+                    // the default, rather than panicked on.
                     required: entry.config.required.unwrap_or(false),
                     state: other,
                 }),
@@ -1250,6 +1271,7 @@ impl McpClientManager {
     ) -> Result<Arc<ServerEntry>> {
         let entry = build_entry(
             config,
+            self.overlay(),
             self.token_store.clone(),
             Arc::clone(&self.client_context),
             self.tool_call_timeout,
@@ -1857,7 +1879,12 @@ pub(crate) async fn read_resource(
         peer: Peer<RoleClient>,
         mut params: ReadResourceRequestParams,
     ) -> std::result::Result<ReadResourceResult, ServiceError> {
-        let mut rounds = handler::Rounds::new(&entry.server_name, None);
+        // No frontend, so no elicitation to bound; the call's own bound is passed for shape.
+        let mut rounds = handler::Rounds::new(
+            &entry.server_name,
+            None,
+            tokio::time::Instant::now() + entry.tool_call_timeout,
+        );
         loop {
             (params.input_responses, params.request_state) = rounds.carry();
             match peer.read_resource_once(params.clone()).await? {
@@ -1932,7 +1959,12 @@ pub(crate) async fn get_prompt(
         peer: Peer<RoleClient>,
         mut params: GetPromptRequestParams,
     ) -> std::result::Result<GetPromptResult, ServiceError> {
-        let mut rounds = handler::Rounds::new(&entry.server_name, None);
+        // No frontend, so no elicitation to bound; the call's own bound is passed for shape.
+        let mut rounds = handler::Rounds::new(
+            &entry.server_name,
+            None,
+            tokio::time::Instant::now() + entry.tool_call_timeout,
+        );
         loop {
             (params.input_responses, params.request_state) = rounds.carry();
             match peer.get_prompt_once(params.clone()).await? {
@@ -2516,6 +2548,107 @@ mod tests {
             "an MCP call runs in the server's own process, which meka does not sandbox; the \
              `workspace` gate depends on this being true"
         );
+    }
+
+    /// The overlay reaches every entry the manager makes, at startup, when one is added later and
+    /// when one is restarted from the file, while the entry as the file states it keeps what it
+    /// left unsaid and the tools the CLI named, so a reload that compares the file with it sees no
+    /// change.
+    #[tokio::test]
+    async fn the_overlay_settles_onto_every_entry_the_manager_makes() {
+        let overlay = crate::config::McpOverlay {
+            required: true,
+            deferral: crate::config::Deferral::Eager,
+            eager_load_tools: vec![crate::config::EagerLoadOverride {
+                server: "follows".to_string(),
+                tool: "search".to_string(),
+            }],
+        };
+        let mut locked = McpServerConfig::for_test("locked");
+        locked.required = Some(false);
+        locked.deferral = Some(crate::config::Deferral::Hidden);
+        let manager = McpClientManager::prepare_with_overlay(
+            &[McpServerConfig::for_test("follows"), locked],
+            overlay,
+            None,
+            None,
+            McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        let settled = |name: &str| {
+            let entry = manager.entry(name).expect("entry");
+            (
+                entry.config.required,
+                entry.config.deferral,
+                entry.config.eager_load_tools.clone(),
+                entry.configured.required,
+                entry.configured.deferral,
+                entry.configured.eager_load_tools.clone(),
+            )
+        };
+        let eager = Some(vec!["search".to_string()]);
+        assert_eq!(
+            settled("follows"),
+            (
+                Some(true),
+                Some(crate::config::Deferral::Eager),
+                eager.clone(),
+                None,
+                None,
+                None
+            ),
+            "the runtime copy inherits and loads the named tool, the file's word stays as written"
+        );
+        assert_eq!(
+            settled("locked"),
+            (
+                Some(false),
+                Some(crate::config::Deferral::Hidden),
+                None,
+                Some(false),
+                Some(crate::config::Deferral::Hidden),
+                None
+            ),
+            "an entry's own word wins, and a tool named on another server does not reach it"
+        );
+
+        manager
+            .add_server(&McpServerConfig::for_test("later"))
+            .expect("add");
+        assert_eq!(
+            settled("later"),
+            (
+                Some(true),
+                Some(crate::config::Deferral::Eager),
+                None,
+                None,
+                None,
+                None
+            ),
+            "one added later inherits the same"
+        );
+        manager
+            .replace_server(&McpServerConfig::for_test("follows"))
+            .await
+            .expect("replace");
+        assert_eq!(
+            settled("follows").2,
+            eager,
+            "one restarted from the file keeps the tool the run named"
+        );
+        assert_eq!(
+            manager
+                .server_configs()
+                .into_iter()
+                .find(|config| config.name == "follows")
+                .expect("the entry")
+                .eager_load_tools,
+            None,
+            "what the doors compare is the file's entry"
+        );
+        assert_eq!(manager.deferral(), crate::config::Deferral::Eager);
     }
 
     fn pending_entry(name: &str, transport: McpTransport) -> Arc<ServerEntry> {

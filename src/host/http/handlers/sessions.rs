@@ -355,11 +355,12 @@ pub(crate) async fn create_session(
                 })?;
             name
         }
-        // The configuration's own sentence, as the 422 every other profile refusal is: an
-        // installation with no default has a profile for this session only if the body names one.
-        None => state.shared.default_profile().map_err(|error| {
+        // The configuration's own facts with this API's remedy, as the 422 every other profile
+        // refusal is: an installation with no default has a profile for this session only if the
+        // body names one.
+        None => state.shared.default_profile().map_err(|refusal| {
             ProblemDetail::for_error(
-                &crate::error::MekaError::Config(error.to_string()),
+                &crate::error::MekaError::Config(profile_refusal_sentence(&refusal)),
                 state.config.relay_provider_errors,
             )
         })?,
@@ -1124,56 +1125,7 @@ pub(crate) async fn get_session(
     Path(id): Path<Uuid>,
 ) -> Result<Json<SessionResponse>, ProblemDetail> {
     if let Some(entry) = state.sessions.read().await.get(&id).cloned() {
-        let updated_at = entry
-            .updated_at
-            .read()
-            .ok()
-            .map(|guard| guard.to_rfc3339())
-            .unwrap_or_default();
-        // The row, read rather than tolerated. `profile` is the billing record and `""` is not a
-        // profile, so a read that fails is a 500 rather than a 200 nobody can act on; a resident
-        // entry whose row is gone is a session that is not there.
-        let info = state
-            .shared
-            .store
-            .session_info(id)
-            .await
-            .map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to look up session", error)
-                    .with("session_id", id.to_string())
-            })?
-            .ok_or_else(|| session_not_found(id))?;
-        let inbox_pending = state
-            .shared
-            .store
-            .inbox_store()
-            .pending_count(id)
-            .await
-            .map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to count inbox items", error)
-                    .with("session_id", id.to_string())
-            })?;
-        return Ok(Json(SessionResponse {
-            session: SessionView {
-                id: entry.id,
-                created_at: entry.created_at.to_rfc3339(),
-                updated_at,
-                working_directory: Some(entry.cells().cwd.get()),
-                permission: Some(entry.cells().permission.get()),
-                approvals: entry.cells().permission.approvals(),
-                profile: info.profile,
-                project: info.project,
-                title: info.title,
-                parent_id: info.parent_id,
-                pinned_at: info.pinned_at,
-                last_turn: info.last_turn,
-            },
-            capabilities: entry.capabilities,
-            turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
-            inbox_pending: Some(inbox_pending),
-            approvals_pending: Some(entry.frontend.approvals_pending()),
-            checklist: Some(entry.agent.cells().checklist.get().items),
-        }));
+        return Ok(Json(resident_record(&state, &entry, id).await?));
     }
     let summary = state
         .shared
@@ -1355,6 +1307,128 @@ async fn requested_project_move(
         .await
         .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?;
     Ok(Some(project.to_string()))
+}
+
+/// Why no profile is selected, worded for this API: the shell's sentence names `meka account
+/// add` and `meka profile use`, which a client managing the installation over HTTP cannot run,
+/// where it can `POST /v1/accounts`, `POST /v1/profiles` and set `"default": true` on a `PATCH`.
+pub(crate) fn profile_refusal_sentence(refusal: &crate::config::ProfileRefusal) -> String {
+    use crate::config::{ProfileRefusal, ProfileRequest};
+    match refusal {
+        ProfileRefusal::NoProfiles => "no profile configured; add an account with `POST \
+                                       /v1/accounts`, then a profile with `POST /v1/profiles`"
+            .to_string(),
+        ProfileRefusal::NoDefault { configured } => format!(
+            "multiple profiles configured ({}) and no `default_profile`; pick one with `PATCH \
+             /v1/profiles/{{name}}` and `\"default\": true`",
+            configured.join(", ")
+        ),
+        ProfileRefusal::Unknown {
+            requested,
+            source,
+            configured,
+        } => format!(
+            "{}; {}",
+            crate::text::unknown_name("profile", requested, configured),
+            match (source, configured.is_empty()) {
+                (_, true) => "add one with `POST /v1/profiles`",
+                (ProfileRequest::Flag, false) =>
+                    "the server was started with `--profile`; restart it with a configured name",
+                (ProfileRequest::DefaultProfile, false) =>
+                    "point `default_profile` at one with `PATCH /v1/profiles/{name}` and \
+                     `\"default\": true`",
+            }
+        ),
+        ProfileRefusal::Unrunnable(sentence) => sentence.clone(),
+    }
+}
+
+/// A resident session as `GET /v1/sessions/{id}` answers for it: the row under what this process
+/// knows, the cells, the turn in flight, the parked prompts and the inbox.
+async fn resident_record(
+    state: &ServerState,
+    entry: &SessionEntry,
+    id: Uuid,
+) -> Result<SessionResponse, ProblemDetail> {
+    let updated_at = entry
+        .updated_at
+        .read()
+        .ok()
+        .map(|guard| guard.to_rfc3339())
+        .unwrap_or_default();
+    // The row, read rather than tolerated. `profile` is the billing record and `""` is not a
+    // profile, so a read that fails is a 500 rather than a 200 nobody can act on; a resident
+    // entry whose row is gone is a session that is not there.
+    let info = state
+        .shared
+        .store
+        .session_info(id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to look up session", error)
+                .with("session_id", id.to_string())
+        })?
+        .ok_or_else(|| session_not_found(id))?;
+    let inbox_pending = state
+        .shared
+        .store
+        .inbox_store()
+        .pending_count(id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to count inbox items", error)
+                .with("session_id", id.to_string())
+        })?;
+    Ok(SessionResponse {
+        session: SessionView {
+            id: entry.id,
+            created_at: entry.created_at.to_rfc3339(),
+            updated_at,
+            working_directory: Some(entry.cells().cwd.get()),
+            permission: Some(entry.cells().permission.get()),
+            approvals: entry.cells().permission.approvals(),
+            profile: info.profile,
+            project: info.project,
+            title: info.title,
+            parent_id: info.parent_id,
+            pinned_at: info.pinned_at,
+            last_turn: info.last_turn,
+        },
+        capabilities: entry.capabilities,
+        turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
+        inbox_pending: Some(inbox_pending),
+        approvals_pending: Some(entry.frontend.approvals_pending()),
+        checklist: Some(entry.agent.cells().checklist.get().items),
+    })
+}
+
+/// Put each session a rename moved on the feeds, as `GET /v1/sessions/{id}` now answers for it: a
+/// profile or project rename rewrites the row under a client's listing, and one that shows the
+/// name learns of it here rather than on its next refetch. A row gone by now is skipped; a read
+/// that fails is logged, since the rename itself has landed.
+pub(crate) async fn announce_sessions_moved(state: &ServerState, ids: &[Uuid]) {
+    for id in ids {
+        let live = state.sessions.read().await.get(id).cloned();
+        let record = match &live {
+            Some(entry) => resident_record(state, entry, *id).await,
+            None => dormant_record(state, *id).await,
+        };
+        match record {
+            Ok(record) => announce_session(
+                state,
+                crate::host::http::sse::SseEventType::SessionUpdated,
+                &record,
+                live.as_ref(),
+            ),
+            Err(error) if error.status == StatusCode::NOT_FOUND.as_u16() => {}
+            Err(error) => {
+                tracing::warn!(
+                    "failed to read session {id} for the feed after a rename: {detail}",
+                    detail = error.detail.as_deref().unwrap_or(&error.title)
+                );
+            }
+        }
+    }
 }
 
 /// A session's record as its row states it, for a session this process does not hold: not

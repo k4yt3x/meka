@@ -888,8 +888,12 @@ mod tests {
             server_config.transport = McpTransport::Stdio;
             server_config.url = None;
             server_config.command = Some("/bin/false".to_string());
-            let manager = McpClientManager::prepare(
+            let manager = McpClientManager::prepare_with_overlay(
                 &[server_config],
+                crate::config::McpOverlay {
+                    deferral,
+                    ..Default::default()
+                },
                 None,
                 None,
                 McpClientContext::new(),
@@ -897,7 +901,6 @@ mod tests {
             )
             .await
             .expect("prepare with one server should succeed");
-            manager.set_deferral(deferral);
             let registry = ToolRegistry::new();
             register_all(&registry, manager);
             let registered = registry.get("mcp_resource_list").is_some();

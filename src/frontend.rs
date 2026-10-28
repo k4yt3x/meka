@@ -38,6 +38,12 @@ use crate::{checklist::ChecklistItem, stats::TokenUsage};
 /// they leave a prompt.
 pub(crate) const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// How long a frontend has to answer an MCP server's elicitation before it is declined for the
+/// person, unless the frontend says otherwise ([`Frontend::elicitation_timeout`]). Shorter than
+/// an approval's bound: an approval pauses a turn that is already waiting, while an elicitation
+/// holds an MCP request open against a server with a patience of its own.
+pub(crate) const ELICITATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Trait the agent loop talks through to surface output and ask the user to approve tool calls.
 /// Implementations are responsible for rendering mode, newline spacing, and any inter-event
 /// formatting.
@@ -53,6 +59,15 @@ pub(crate) trait Frontend: Send + Sync {
     /// turn (Ctrl+C, `session/cancel`), which ACP will surface later. Today's screen collapses it
     /// to deny semantics.
     async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome;
+
+    /// How long an elicitation put to this frontend stays answerable before it is declined for
+    /// the person: [`ELICITATION_TIMEOUT`], unless the host knows its client comes back to
+    /// answer, as the HTTP host does for a session that answers prompts on return. The MCP server
+    /// holds its own request open for as long as it chooses, so a longer wait is an offer, not a
+    /// promise.
+    fn elicitation_timeout(&self) -> std::time::Duration {
+        ELICITATION_TIMEOUT
+    }
 
     /// The frontend a sub-agent of this one runs under: its prompts and elicitations forwarded
     /// here, its tool calls rolled into the `agent_spawn` call's activity, everything else
@@ -808,9 +823,18 @@ impl Frontend for PermissionForwardingFrontend {
     /// behalf without ever asking.
     async fn handle_elicitation(
         &self,
-        prompt: crate::frontend::ElicitationPrompt,
+        mut prompt: crate::frontend::ElicitationPrompt,
     ) -> crate::frontend::ElicitationResponse {
+        // Left alone when already set, as an approval's is: the grandchild is the one asking.
+        if prompt.subagent_id.is_none() {
+            prompt.subagent_id = self.subagent_id;
+        }
         self.delegate.handle_elicitation(prompt).await
+    }
+
+    /// The parent's patience, since the parent's frontend is where the prompt is answered.
+    fn elicitation_timeout(&self) -> std::time::Duration {
+        self.delegate.elicitation_timeout()
     }
 }
 
@@ -1000,6 +1024,9 @@ pub(crate) struct ElicitationPrompt {
     /// When the prompt is declined for the person unanswered: the MCP client's own bound, so a
     /// frontend that waits or counts down does so to the instant the client holds it to.
     pub(crate) deadline: tokio::time::Instant,
+    /// The sub-agent whose MCP call is asking, stamped by the forwarding frontend on the prompt's
+    /// way to the parent's, so a client can say whose tool it is; `None` for the root's own call.
+    pub(crate) subagent_id: Option<Uuid>,
 }
 #[derive(Debug)]
 pub(crate) enum ElicitationKind {
@@ -1160,6 +1187,7 @@ mod tests {
                 server_name: "notion".to_string(),
                 message: "authorize?".to_string(),
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                subagent_id: None,
                 kind: ElicitationKind::Url {
                     url: "https://example.com/".to_string(),
                 },
@@ -1283,6 +1311,55 @@ mod tests {
             })
             .await;
         assert_eq!(outcome, PermissionOutcome::Deny);
+    }
+
+    /// A sub-agent's elicitation reaches the parent's frontend naming the sub-agent, as its
+    /// approval does, so a client can say whose tool is asking; one already named, a
+    /// grandchild's, is left alone.
+    #[tokio::test]
+    async fn permission_forwarding_frontend_names_the_sub_agent_on_an_elicitation() {
+        struct Capturing(std::sync::Mutex<Option<ElicitationPrompt>>);
+
+        #[async_trait]
+        impl Frontend for Capturing {
+            async fn emit(&self, _event: FrontendEvent) {}
+
+            async fn request_permission(&self, _request: PermissionRequest) -> PermissionOutcome {
+                PermissionOutcome::Deny
+            }
+
+            async fn handle_elicitation(&self, prompt: ElicitationPrompt) -> ElicitationResponse {
+                *crate::sync::lock(&self.0) = Some(prompt);
+                ElicitationResponse::Decline
+            }
+        }
+
+        let capturing = Arc::new(Capturing(std::sync::Mutex::new(None)));
+        let delegate: Arc<dyn Frontend> = capturing.clone();
+        let child = Uuid::new_v4();
+        let forwarder = PermissionForwardingFrontend::new(delegate, None, Some(child));
+        let prompt = |subagent_id| ElicitationPrompt {
+            server_name: "notion".to_string(),
+            kind: ElicitationKind::Url {
+                url: "https://example.com/".to_string(),
+            },
+            message: "authorize?".to_string(),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            subagent_id,
+        };
+        let shown = |capturing: &Capturing| {
+            crate::sync::lock(&capturing.0)
+                .take()
+                .expect("the prompt reached the delegate")
+                .subagent_id
+        };
+
+        forwarder.handle_elicitation(prompt(None)).await;
+        assert_eq!(shown(&capturing), Some(child));
+
+        let grandchild = Uuid::new_v4();
+        forwarder.handle_elicitation(prompt(Some(grandchild))).await;
+        assert_eq!(shown(&capturing), Some(grandchild));
     }
 
     #[tokio::test]

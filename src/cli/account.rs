@@ -190,7 +190,7 @@ fn drop_inert_settings(mut settings: OAuthSettings, backend: config::Backend) ->
     }
     if !dropped.is_empty() {
         tracing::warn!(
-            "ignoring {dropped}: a '{backend}' account never reads it",
+            "ignoring {dropped}: an account on '{backend}' never reads it",
             dropped = dropped.join(", "),
         );
     }

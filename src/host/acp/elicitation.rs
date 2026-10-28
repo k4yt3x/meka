@@ -221,6 +221,7 @@ mod tests {
             kind: ElicitationKind::Form { schema },
             message: "fill this in".to_string(),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            subagent_id: None,
         }
     }
 
@@ -233,6 +234,7 @@ mod tests {
             },
             message: "authorize meka".to_string(),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            subagent_id: None,
         };
         let request = to_acp_request(&prompt, &session_id()).expect("url always converts");
         assert_eq!(request.message, "authorize meka");

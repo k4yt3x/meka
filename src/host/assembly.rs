@@ -18,6 +18,10 @@ pub(crate) struct SharedDeps {
     /// A registry rather than one `Arc<dyn Provider>` because a session records the profile it
     /// runs with, and one `meka serve` may host sessions naming different ones.
     pub(crate) providers: Arc<crate::provider::ProviderRegistry>,
+    /// Holds a read of `config.toml` together with the serving of what it holds: a write's own
+    /// reload of the tables it wrote and a reload of the whole file each parse and then swap, and
+    /// of two running at once the staler parse must not be served last.
+    config_reads: Arc<std::sync::Mutex<()>>,
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
     pub(crate) skills: Arc<crate::skills::SkillCache>,
     pub(crate) memories: Arc<crate::store::memory::MemoryStore>,
@@ -327,6 +331,7 @@ pub(crate) async fn build_shared_deps(
         instructions: Arc::new(std::sync::RwLock::new(instructions)),
         store,
         providers,
+        config_reads: Arc::new(std::sync::Mutex::new(())),
         mcp_manager,
         skills,
         memories,
@@ -1006,15 +1011,13 @@ impl SharedDeps {
         crate::host::relay_provider_errors(self.config.serve.as_ref())
     }
 
-    /// The default profile, or the configuration's own explanation of why there is none. `meka
-    /// acp` asks this once at startup; `meka serve` asks it for each session that names no
-    /// profile, of the catalog as it stands then.
-    pub(crate) fn default_profile(&self) -> anyhow::Result<String> {
-        self.providers
-            .catalog()
-            .default_profile
-            .clone()
-            .map_err(anyhow::Error::msg)
+    /// The default profile, or why there is none, for the host to word. `meka acp` asks this
+    /// once at startup; `meka serve` asks it for each session that names no profile, of the
+    /// catalog as it stands then.
+    pub(crate) fn default_profile(
+        &self,
+    ) -> std::result::Result<String, crate::config::ProfileRefusal> {
+        self.providers.catalog().default_profile.clone()
     }
 
     /// Replace the accounts and profiles every session this host builds resolves against with
@@ -1023,9 +1026,16 @@ impl SharedDeps {
     /// handlers refuse one that already fails to parse ahead of a rename or a remove, which work on
     /// the raw document.
     pub(crate) fn reload_profiles(&self) -> crate::error::Result<()> {
+        let _reads = self.hold_config_reads();
         let config_file = crate::config::load_config_file_or_err()?;
         self.providers.replace_catalog(&config_file);
         Ok(())
+    }
+
+    /// Hold a read of `config.toml` and the serving of what it holds as one critical section, for
+    /// a reader that serves the file itself. Never held across an await.
+    pub(crate) fn hold_config_reads(&self) -> std::sync::MutexGuard<'_, ()> {
+        crate::sync::lock(&self.config_reads)
     }
 
     /// Read the standing instructions again from the tier this process resolves them from, after

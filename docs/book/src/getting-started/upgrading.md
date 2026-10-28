@@ -21,9 +21,12 @@ instructions file do in a shell, and a change made through them is served at onc
 made in a shell still needs a restart. They sit behind `config:r` and `config:w`, which no existing
 token holds: grant them to the token that administers the installation and to no other, since
 `config:w` is shell on the host. `GET /v1/info` names where the installation is (`config_path`,
-`data_dir`) and when `config.toml` was last read and written. The server now starts with no
-profile configured, so an installation can be set up over the API; the refusal moved to the
-session that names none.
+`data_dir`) and when `config.toml` was last read and written, and `POST /v1/config/reload` reads
+the file again for an edit made in a shell. The server now starts with no profile configured, so
+an installation can be set up over the API; the refusal moved to the session that names none, and
+over HTTP it names `POST /v1/accounts` and `POST /v1/profiles` rather than the shell's commands.
+Adding a second profile names the one that was alone as `default_profile`, in a shell as over
+HTTP, where it used to leave the installation with no default.
 
 **OpenAPI: the responses body's `outcome` schema is `ResponseOutcome`.** It takes the three
 answers an elicitation takes (`accept`, `decline`, `cancel`) beside the four an approval takes. A

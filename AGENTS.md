@@ -298,8 +298,9 @@ output; don't demote it to `info!`.
   > the sole profile; a sub-agent's row records the profile its `agent_spawn` call named, else its
   parent's live profile, which it keeps following. Accounts are managed by `meka account` (`add`/`login`/`list`/`rename`/`remove`) and
   profiles by `meka profile` (`add`/`set`/`use`/`list`/`rename`/`remove`), mirroring `meka mcp`: `use` is the
-  only command that sets `default_profile` (`profile remove` unsets it when it named the removed
-  profile), `account login` rotates a credential without touching the account or its profiles,
+  command that points `default_profile` at a profile (`profile remove` unsets it when it named the
+  removed profile; `profile add` names the profile that was alone when a second joins it, so the
+  default stays put), `account login` rotates a credential without touching the account or its profiles,
   `account remove` refuses while a profile names the account, and a `rename` moves the name
   everywhere it is recorded (the credential row and every profile's `account`; `default_profile`,
   every session row and each pinned sub-agent spec) and changes no setting.

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.85.0] - 2026-10-27
+## [0.85.0] - 2026-10-28
 
 ### Added
 
@@ -15,26 +15,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP: a subscription account logs in through the browser: a URL to open, then the code posted.
 - HTTP: `/v1/profiles` adds, changes, renames and removes profiles and sets the default.
 - HTTP: `/v1/mcp` adds, changes, removes, logs in and logs out MCP servers, under `config:w`.
-- A `config:r` and `config:w` scope pair for the installation; `config:r` reads the profiles too.
-- HTTP: a session with `supports_elicitation` gets an MCP elicitation as `elicitation_required`.
 - HTTP: `PUT /v1/instructions` writes `instructions.md`; sessions opened afterwards run under it.
-- `GET /v1/info` names `config_path`, `data_dir`, `config_loaded_at` and `config_modified_at`.
+- HTTP: `POST /v1/config/reload` applies a shell's edits: accounts, profiles, MCP, instructions.
+- HTTP: a `config:r` and `config:w` scope pair for the installation; `config:r` reads profiles too.
+- HTTP: `GET /v1/info` names `config_path`, `data_dir`, `config_loaded_at`, `config_modified_at`.
+- HTTP: a session with `supports_elicitation` gets an MCP elicitation as `elicitation_required`.
 - HTTP: a `context.measured` feed event says what is in context after every provider round.
 
 ### Changed
 
-- `meka serve` starts with no profile configured; a session that names none is refused instead.
-- An account or profile written over HTTP is served at once; a shell's edit still needs a restart.
-- An MCP server added, changed or removed over HTTP takes effect on the running server at once.
-- `meka account login` asks again after a paste that carries no code, as `meka mcp login` does.
-- OpenAPI: the responses body's `outcome` schema is `ResponseOutcome`, with elicitation answers.
+- **Breaking:** OpenAPI: the responses body's `outcome` schema is `ResponseOutcome`.
+- **Breaking:** ACP: a background report is a `notice` or an agent chunk, never a user message.
 - ACP: `usage_update` follows every provider round and a reopened session, not the turn's end.
-- ACP: a background task's report is a `notice` in the screen's words, never a user message.
+- `meka serve` starts with no profile configured; a session that names none is refused instead.
+- An account or profile written over HTTP is served at once; a shell's edit needs a reload.
+- An MCP server added, changed or removed over HTTP takes effect on the running server at once.
+- HTTP: a session refused for want of a profile names this API's remedy, not a shell command.
+- HTTP: an elicitation waits an approval's 30 minutes on a session that answers prompts on return.
+- Adding a second profile names the one that was alone as `default_profile`; the default stays put.
+- `meka account login` asks again after a paste that carries no code, as `meka mcp login` does.
+- A failed MCP server's reason is the bare cause for an auth failure, as for a connection failure.
+- `--eager-load-tool` naming a server not yet configured applies once that server is added.
 
 ### Fixed
 
 - `meka mcp login` waits the 120 s it announces for the callback; the connect's bound cut it at 30.
+- `meka mcp login` says why a flow did not complete, not only that it did not.
 - `meka mcp add`, `remove`, `enable` and `disable` run on a config with an unknown key elsewhere.
+- A browser login's loopback page refuses a stale callback and keeps waiting; it claims no success.
+- HTTP: `GET /v1/mcp/{name}` says why a `failed` server failed; a login's 502 carries its reason.
+- HTTP: an `accept` without `content` on a form elicitation is a 422, not an empty acceptance.
+- HTTP: `elicitation_required` carries `subagent_id` when a sub-agent's server asked.
+- HTTP: a profile or project rename puts each moved session on the server feed.
 
 ## [0.84.0] - 2026-10-26
 

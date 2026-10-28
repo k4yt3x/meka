@@ -112,42 +112,50 @@ pub(crate) async fn respond(
             "takes `content` only on `accept`; drop it, or accept",
         ));
     }
-    let resolved =
-        match (kind, body.outcome) {
-            (PendingKind::Permission, ResponseOutcome::Allow) => entry
-                .frontend
-                .resolve_permission(&request_id, PermissionResolution::Allow),
-            (PendingKind::Permission, ResponseOutcome::AllowAlways) => entry
-                .frontend
-                .resolve_permission(&request_id, PermissionResolution::AllowAlways),
-            (PendingKind::Permission, ResponseOutcome::Deny) => entry
-                .frontend
-                .resolve_permission(&request_id, PermissionResolution::Deny),
-            (PendingKind::Permission, ResponseOutcome::DenyAlways) => entry
-                .frontend
-                .resolve_permission(&request_id, PermissionResolution::DenyAlways),
-            (PendingKind::Permission, _) => {
-                return Err(mismatch(
-                    "is an approval; answer with allow, deny, allow_always or deny_always",
-                ));
-            }
-            (PendingKind::Elicitation, ResponseOutcome::Accept) => entry
-                .frontend
-                .resolve_elicitation(&request_id, ElicitationResponse::Accept {
-                    content: body.content,
-                }),
-            (PendingKind::Elicitation, ResponseOutcome::Decline) => entry
-                .frontend
-                .resolve_elicitation(&request_id, ElicitationResponse::Decline),
-            (PendingKind::Elicitation, ResponseOutcome::Cancel) => entry
-                .frontend
-                .resolve_elicitation(&request_id, ElicitationResponse::Cancel),
-            (PendingKind::Elicitation, _) => {
-                return Err(mismatch(
-                    "is an elicitation; answer with accept, decline or cancel",
-                ));
-            }
-        };
+    let resolved = match (kind, body.outcome) {
+        (PendingKind::Permission, ResponseOutcome::Allow) => entry
+            .frontend
+            .resolve_permission(&request_id, PermissionResolution::Allow),
+        (PendingKind::Permission, ResponseOutcome::AllowAlways) => entry
+            .frontend
+            .resolve_permission(&request_id, PermissionResolution::AllowAlways),
+        (PendingKind::Permission, ResponseOutcome::Deny) => entry
+            .frontend
+            .resolve_permission(&request_id, PermissionResolution::Deny),
+        (PendingKind::Permission, ResponseOutcome::DenyAlways) => entry
+            .frontend
+            .resolve_permission(&request_id, PermissionResolution::DenyAlways),
+        (PendingKind::Permission, _) => {
+            return Err(mismatch(
+                "is an approval; answer with allow, deny, allow_always or deny_always",
+            ));
+        }
+        // A form's answer is its fields: an `accept` with none would reach the server as an
+        // empty acceptance of a schema that asked for something.
+        (PendingKind::Elicitation { form: true }, ResponseOutcome::Accept)
+            if body.content.is_none() =>
+        {
+            return Err(mismatch(
+                "is a form; `accept` carries `content`, the fields its schema names",
+            ));
+        }
+        (PendingKind::Elicitation { .. }, ResponseOutcome::Accept) => entry
+            .frontend
+            .resolve_elicitation(&request_id, ElicitationResponse::Accept {
+                content: body.content,
+            }),
+        (PendingKind::Elicitation { .. }, ResponseOutcome::Decline) => entry
+            .frontend
+            .resolve_elicitation(&request_id, ElicitationResponse::Decline),
+        (PendingKind::Elicitation { .. }, ResponseOutcome::Cancel) => entry
+            .frontend
+            .resolve_elicitation(&request_id, ElicitationResponse::Cancel),
+        (PendingKind::Elicitation { .. }, _) => {
+            return Err(mismatch(
+                "is an elicitation; answer with accept, decline or cancel",
+            ));
+        }
+    };
     if resolved {
         Ok(StatusCode::NO_CONTENT)
     } else {

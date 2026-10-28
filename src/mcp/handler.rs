@@ -228,7 +228,8 @@ impl ClientHandler for MekaClientHandler {
                     return Ok(ElicitationResponse::Decline.into_result());
                 }
             };
-            Ok(elicit(server.as_ref(), frontend.as_ref(), request).await)
+            // A request of the server's own carries no call to bound it by.
+            Ok(elicit(server.as_ref(), frontend.as_ref(), request, None).await)
         }
     }
 }
@@ -269,10 +270,6 @@ pub(super) fn record_resource_update(server_name: &str, context: &McpClientConte
     context.resource_updates.record(server_name, uri);
 }
 
-/// How long a frontend has to answer an elicitation before it is declined for the person. The
-/// prompt carries the instant, so a frontend that waits it out itself ends on the same one.
-const ELICITATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Put a server's elicitation to `frontend` and answer with what the user said, or a decline when
 /// the user did not answer in time.
 ///
@@ -283,6 +280,7 @@ pub(super) async fn elicit(
     server: &str,
     frontend: &dyn Frontend,
     request: ElicitRequestParams,
+    call_deadline: Option<tokio::time::Instant>,
 ) -> ElicitResult {
     use crate::frontend::{ElicitationKind, ElicitationPrompt};
 
@@ -309,17 +307,23 @@ pub(super) async fn elicit(
         ),
     };
 
-    // Bounded so an unanswered prompt cannot stall an MCP tool call forever; an approval prompt
-    // waits longer because the turn is already paused on it. An elicitation is an MCP *request*,
-    // so a `Decline` is how the server learns the user did not answer; `notifications/cancelled`
-    // is for requests meka started. The frontend is handed the same instant, so one that waits
-    // it out itself reports the expiry rather than a cut.
-    let deadline = tokio::time::Instant::now() + ELICITATION_TIMEOUT;
+    // Bounded so an unanswered prompt cannot stall an MCP tool call forever, by the frontend's
+    // own patience: a minute, or an approval's half hour where the host knows its client comes
+    // back. An elicitation is an MCP *request*, so a `Decline` is how the server learns the user
+    // did not answer; `notifications/cancelled` is for requests meka started. The frontend is
+    // handed the same instant, so one that waits it out itself reports the expiry rather than a
+    // cut.
+    // Never past the call that asked: the call is cut at its own bound and the prompt canceled
+    // with it, so a longer wait would be advertised and not kept.
+    let asked_at = tokio::time::Instant::now();
+    let patience = asked_at + frontend.elicitation_timeout();
+    let deadline = call_deadline.map_or(patience, |call| call.min(patience));
     let prompt = ElicitationPrompt {
         server_name: server.to_string(),
         kind,
         message,
         deadline,
+        subagent_id: None,
     };
     let response =
         match tokio::time::timeout_at(deadline, frontend.handle_elicitation(prompt)).await {
@@ -327,7 +331,7 @@ pub(super) async fn elicit(
             Err(_) => {
                 tracing::warn!(
                     "MCP server '{server}' elicitation timed out after {seconds}s; declining",
-                    seconds = ELICITATION_TIMEOUT.as_secs()
+                    seconds = deadline.saturating_duration_since(asked_at).as_secs()
                 );
                 ElicitationResponse::Decline
             }
@@ -346,12 +350,15 @@ pub(super) async fn fulfill_input_requests(
     server: &str,
     frontend: Option<&Arc<dyn Frontend>>,
     requests: InputRequests,
+    call_deadline: Option<tokio::time::Instant>,
 ) -> std::result::Result<InputResponses, ServiceError> {
     let mut responses = InputResponses::new();
     for (key, request) in requests {
         let asked = match request {
             InputRequest::Elicitation(request) => match frontend {
-                Some(frontend) => elicit(server, frontend.as_ref(), request.params).await,
+                Some(frontend) => {
+                    elicit(server, frontend.as_ref(), request.params, call_deadline).await
+                }
                 None => {
                     tracing::warn!(
                         "MCP server '{server}' requested elicitation on a call with no prompt to \
@@ -396,16 +403,23 @@ const STATE_ONLY_ROUND_PAUSE: std::time::Duration = std::time::Duration::from_mi
 pub(super) struct Rounds<'a> {
     server: &'a str,
     frontend: Option<&'a Arc<dyn Frontend>>,
+    /// The call's own bound, which an elicitation it raises cannot outlive.
+    deadline: tokio::time::Instant,
     input_responses: Option<InputResponses>,
     request_state: Option<String>,
     sent: usize,
 }
 
 impl<'a> Rounds<'a> {
-    pub(super) fn new(server: &'a str, frontend: Option<&'a Arc<dyn Frontend>>) -> Self {
+    pub(super) fn new(
+        server: &'a str,
+        frontend: Option<&'a Arc<dyn Frontend>>,
+        deadline: tokio::time::Instant,
+    ) -> Self {
         Self {
             server,
             frontend,
+            deadline,
             input_responses: None,
             request_state: None,
             sent: 0,
@@ -436,8 +450,10 @@ impl<'a> Rounds<'a> {
         if requests.is_empty() {
             tokio::time::sleep(STATE_ONLY_ROUND_PAUSE).await;
         } else {
-            self.input_responses =
-                Some(fulfill_input_requests(self.server, self.frontend, requests).await?);
+            self.input_responses = Some(
+                fulfill_input_requests(self.server, self.frontend, requests, Some(self.deadline))
+                    .await?,
+            );
         }
         self.request_state = result.request_state;
         Ok(())
@@ -524,7 +540,7 @@ impl McpTool {
         // One deadline for every round: a server that asks and asks again is still one tool call
         // to the turn, and the model's wait is what the timeout bounds.
         let deadline = tokio::time::Instant::now() + self.entry.tool_call_timeout;
-        let mut rounds = Rounds::new(self.entry.server_name(), Some(&context.frontend));
+        let mut rounds = Rounds::new(self.entry.server_name(), Some(&context.frontend), deadline);
         loop {
             (params.input_responses, params.request_state) = rounds.carry();
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(params.clone()));
@@ -1115,7 +1131,7 @@ mod tests {
     /// declined, not failed; and the cap counts requests sent.
     #[tokio::test]
     async fn rounds_carry_state_refuse_undeclared_asks_and_stop_at_the_cap() {
-        let mut rounds = Rounds::new("srv", None);
+        let mut rounds = Rounds::new("srv", None, far_deadline());
         assert_eq!(rounds.carry(), (None, None));
         rounds
             .absorb(input_required(serde_json::json!({
@@ -1168,7 +1184,7 @@ mod tests {
         );
         assert_eq!(state, None);
 
-        let mut capped = Rounds::new("srv", None);
+        let mut capped = Rounds::new("srv", None, far_deadline());
         for _ in 0..DEFAULT_MRTR_MAX_ROUNDS {
             capped.carry();
         }
@@ -1179,6 +1195,11 @@ mod tests {
             capped.absorb(again).await,
             Err(ServiceError::InputRequiredRoundsExceeded { .. })
         ));
+    }
+
+    /// A call bound no test reaches.
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
     }
 
     /// A frontend that keeps the last prompt it was shown and accepts it.
@@ -1213,6 +1234,72 @@ mod tests {
         }
     }
 
+    /// The bound on an elicitation is the frontend's own: one that says it waits only so long has
+    /// the prompt declined for the person when that passes, however long it would itself hold it.
+    #[tokio::test]
+    async fn an_elicitation_is_bounded_by_the_frontends_own_patience() {
+        struct Impatient;
+
+        #[async_trait::async_trait]
+        impl Frontend for Impatient {
+            async fn emit(&self, _event: crate::frontend::FrontendEvent) {}
+
+            async fn request_permission(
+                &self,
+                _request: crate::frontend::PermissionRequest,
+            ) -> crate::frontend::PermissionOutcome {
+                crate::frontend::PermissionOutcome::Allow
+            }
+
+            fn elicitation_timeout(&self) -> std::time::Duration {
+                std::time::Duration::from_millis(50)
+            }
+
+            async fn handle_elicitation(
+                &self,
+                _prompt: crate::frontend::ElicitationPrompt,
+            ) -> ElicitationResponse {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                ElicitationResponse::Accept { content: None }
+            }
+        }
+
+        let form: ElicitRequestParams = serde_json::from_value(serde_json::json!({
+            "mode": "form", "message": "Name?",
+            "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
+        }))
+        .expect("a form request");
+        let started = std::time::Instant::now();
+        let result = elicit("srv", &Impatient, form, None).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the frontend's bound ends the wait"
+        );
+        assert!(
+            matches!(result.action, ElicitationAction::Decline),
+            "{:?}",
+            result.action
+        );
+    }
+
+    /// An elicitation raised inside a call never outlives the call: the prompt's deadline is the
+    /// call's own when that comes first, so what the client is told it has is what it has.
+    #[tokio::test]
+    async fn an_elicitation_never_outlives_the_call_that_asked() {
+        let frontend = CapturingFrontend::default();
+        let form: ElicitRequestParams = serde_json::from_value(serde_json::json!({
+            "mode": "form", "message": "Name?",
+            "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
+        }))
+        .expect("a form request");
+        let call_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        elicit("srv", &frontend, form, Some(call_deadline)).await;
+        assert!(
+            frontend.shown().deadline <= call_deadline,
+            "the prompt ends with the call"
+        );
+    }
+
     /// A form elicitation reaches the frontend as the form it is, message and schema intact, and
     /// a URL one as the URL to open; neither as the placeholder an unknown kind gets.
     #[tokio::test]
@@ -1225,7 +1312,7 @@ mod tests {
             "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
         }))
         .expect("a form request");
-        elicit("srv", &frontend, form).await;
+        elicit("srv", &frontend, form, None).await;
         let prompt = frontend.shown();
         assert_eq!(prompt.server_name, "srv");
         assert_eq!(prompt.message, "Name?");
@@ -1241,7 +1328,7 @@ mod tests {
             "elicitationId": "e1"
         }))
         .expect("a url request");
-        elicit("srv", &frontend, url).await;
+        elicit("srv", &frontend, url, None).await;
         let prompt = frontend.shown();
         assert_eq!(prompt.message, "Sign in");
         assert!(

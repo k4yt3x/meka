@@ -508,15 +508,15 @@ async fn async_main(
     // `meka serve` holds a manager with no servers too: a server added over its API joins the
     // running manager, which has to exist for that.
     let mcp_manager = if serve_mode || !config.mcp_servers.is_empty() {
-        let manager = mcp::McpClientManager::prepare(
+        let manager = mcp::McpClientManager::prepare_with_overlay(
             &config.mcp_servers,
+            config.mcp_overlay.clone(),
             config.mcp_default_permission,
             Some(token_store.clone()),
             Arc::clone(&mcp_context),
             config.mcp_tool_timeout,
         )
         .await?;
-        manager.set_deferral(config.mcp_deferral);
         mcp_context.set_manager(Arc::downgrade(&manager));
         Some(manager)
     } else {

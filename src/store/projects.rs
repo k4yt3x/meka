@@ -28,7 +28,8 @@ pub(crate) struct ProjectRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenamedProject {
     pub(crate) project: ProjectRecord,
-    pub(crate) sessions_moved: u64,
+    /// The sessions that followed the name, for a host to announce each as its row now reads.
+    pub(crate) sessions: Vec<uuid::Uuid>,
     pub(crate) memories_moved: u64,
 }
 
@@ -212,10 +213,15 @@ impl Store {
                     "UPDATE projects SET name = ?2 WHERE name = ?1",
                     rusqlite::params![name, new_name],
                 )?;
-                let sessions = transaction.execute(
-                    "UPDATE sessions SET project = ?2 WHERE project = ?1",
-                    rusqlite::params![name, new_name],
-                )?;
+                let sessions = transaction
+                    .prepare("UPDATE sessions SET project = ?2 WHERE project = ?1 RETURNING id")?
+                    .query_map(rusqlite::params![name, new_name], |row| {
+                        let id: String = row.get(0)?;
+                        uuid::Uuid::parse_str(&id).map_err(|error| {
+                            rusqlite::Error::InvalidParameterName(error.to_string())
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<uuid::Uuid>>>()?;
                 let memories = transaction.execute(
                     "UPDATE memories SET project = ?2 WHERE project = ?1",
                     rusqlite::params![name, new_name],
@@ -226,7 +232,7 @@ impl Store {
                 transaction.commit()?;
                 Ok(Decided::Done(RenamedProject {
                     project,
-                    sessions_moved: sessions as u64,
+                    sessions,
                     memories_moved: memories as u64,
                 }))
             })
@@ -379,7 +385,7 @@ mod tests {
 
         let renamed = store.rename_project("webdev", "web").await.expect("rename");
         assert_eq!(
-            (renamed.sessions_moved, renamed.memories_moved),
+            (renamed.sessions.len(), renamed.memories_moved),
             (2, 1),
             "the root and its sub-agent, plus the one memory"
         );
@@ -448,5 +454,36 @@ mod tests {
         assert!(store.project_names().await.expect("names").is_empty());
         let gone = store.remove_project("webdev").await.expect_err("gone");
         assert!(matches!(gone, MekaError::UnknownProject { .. }), "{gone}");
+    }
+
+    /// A moved row whose id is not one meka wrote fails the rename rather than going unannounced:
+    /// the ids answered are the rows moved.
+    #[tokio::test]
+    async fn a_rename_refuses_a_session_row_whose_id_is_not_an_id() {
+        let store = Store::for_test().await;
+        store.add_project("webdev").await.expect("added");
+        let root = store
+            .create_session_in_project_for_test(None, "profile", "webdev")
+            .await
+            .expect("a session on webdev");
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute("UPDATE sessions SET id = 'not-an-id' WHERE id = ?1", [
+                    root.to_string()
+                ])
+            })
+            .await
+            .expect("a hand edit");
+        let error = store
+            .rename_project("webdev", "web")
+            .await
+            .expect_err("the row cannot be announced");
+        assert!(error.to_string().contains("failed to rename"), "{error}");
+        assert_eq!(
+            store.project_names().await.expect("names"),
+            ["webdev"],
+            "nothing moved"
+        );
     }
 }
