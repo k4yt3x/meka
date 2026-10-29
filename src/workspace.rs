@@ -486,6 +486,20 @@ pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
     "/Library/Developer",
     "/dev",
 ];
+#[cfg(target_os = "freebsd")]
+pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/lib",
+    "/libexec",
+    "/etc",
+    "/dev",
+    "/proc",
+    "/var/db",
+    "/compat",
+    "/usr/local",
+];
 #[cfg(windows)]
 pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[];
 
