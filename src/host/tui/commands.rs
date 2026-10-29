@@ -229,10 +229,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 // whole story.
                 (None, Some(_)) => {
                     agent.reset_conversation_markers(messages).await;
-                    ui.note(format!(
-                        "Rewound {turns} turn{}.",
-                        if turns == 1 { "" } else { "s" }
-                    ));
+                    ui.note(super::model::rewound_note(turns));
                     ui.reload();
                 }
                 (_, None) if turns == 0 => {

@@ -21,7 +21,7 @@ rank  module          holds
  2    cli             clap definitions and one handler file per subcommand group
  2    relay           tracing output routed to the screen, or to stderr
  3    installation    the doors that edit config.toml and the credential rows: accounts, profiles, MCP servers
- 4    render          the screen's rows and skins, the approval block, status lines, the one-shot's answer
+ 4    render          the screen's rows and markdown layout, the approval block, status lines, the one-shot's answer
  5    agent           the turn loop, tool dispatch, compaction, recovery
  5    view            the JSON record shapes --format json and the HTTP API share
  6    tools           the Tool trait, the registry, the built-ins, MCP tools as Tools

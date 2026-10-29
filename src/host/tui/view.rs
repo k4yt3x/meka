@@ -37,27 +37,13 @@ const BANNER_MARK: [&str; 3] = ["█▄ ▄█", "█ ▀ █", "█   █"];
 /// The columns between the banner and the left edge of the screen; one row stands above it.
 const BANNER_GAP: usize = 2;
 
-/// The answer's text as lines: what has settled through markdown, and while it streams, the
-/// unterminated tail as plain text so a token shows the moment it arrives.
+/// The answer's text as lines, laid out as markdown, while it streams too.
 fn text_lines(text: &str, streaming: bool, width: usize, reasoning: bool) -> Vec<Line<'static>> {
-    let (settled, open) = if streaming {
-        match text.rfind('\n') {
-            Some(cut) => text.split_at(cut + 1),
-            None => ("", text),
-        }
-    } else {
-        (text, "")
-    };
-    let mut lines = if reasoning {
-        draw::thinking_lines(settled, width)
-    } else {
-        draw::markdown_lines(settled, width)
-    };
-    if !open.is_empty() {
-        let style = if reasoning { gray() } else { Style::default() };
-        lines.extend(draw::plain_lines(open, width, style));
+    match (streaming, reasoning) {
+        (true, _) => draw::streaming_lines(text, width, reasoning),
+        (false, true) => draw::thinking_lines(text, width),
+        (false, false) => draw::markdown_lines(text, width),
     }
-    lines
 }
 
 /// Whether a tool's result is drawn as an item of its own, so the call's row shows nothing of it.
@@ -573,6 +559,13 @@ impl Viewport {
         self.cache
             .get(&entry.id)
             .map_or(0, |cached| cached.lines.len())
+    }
+
+    /// Lay every item out at `width`, so a frame drawn at it does no more than place the rows.
+    pub(crate) fn lay_out_all(&mut self, transcript: &Transcript, width: usize) {
+        for entry in transcript.drawn() {
+            self.lay_out(entry, width);
+        }
     }
 
     /// Draw the transcript into `area`.
@@ -1231,36 +1224,58 @@ mod tests {
         }
     }
 
-    /// While an answer streams, the row after its last newline is plain text, so a token shows
-    /// at once; once it ends, the same row is markdown.
+    /// While an answer streams, the row after its last newline is laid out as markdown on its own:
+    /// an item still arriving already hangs under its marker. What it says yet never reaches back
+    /// into the rows above, which a `2` behind an item or a `1` behind a line would as a
+    /// paragraph's next word, and `---` under a paragraph as its heading underline; a line inside
+    /// a code block still open is a code row, not markdown.
     #[test]
-    fn the_open_row_is_plain_until_the_answer_ends() {
-        let streaming = entry(
-            Item::Text {
-                text: "Done.\n\n- item".into(),
-                streaming: true,
-            },
-            false,
-        );
-        let rows = plain(&entry_lines(&streaming, 40));
+    fn the_open_row_is_laid_out_as_it_will_be_once_it_ends() {
+        let rows = |text: &str| {
+            plain(&entry_lines(
+                &entry(
+                    Item::Text {
+                        text: text.into(),
+                        streaming: true,
+                    },
+                    false,
+                ),
+                30,
+            ))
+        };
         assert_eq!(
-            rows.last().map(String::as_str),
-            Some("  - item"),
-            "{rows:?}"
+            rows("Done.\n\n1. an item still arriving, past the width"),
+            vec![
+                "  Done.",
+                "",
+                "  1. an item still arriving,",
+                "     past the width",
+            ]
         );
-        let ended = entry(
-            Item::Text {
-                text: "Done.\n\n- item".into(),
-                streaming: false,
-            },
-            false,
+        let underlined = entry_lines(
+            &entry(
+                Item::Text {
+                    text: "Done.\n---".into(),
+                    streaming: true,
+                },
+                false,
+            ),
+            30,
         );
-        let rows = plain(&entry_lines(&ended, 40));
         assert!(
-            rows.last()
-                .is_some_and(|row| row.contains('•') && row.ends_with("item")),
-            "the same row is a bullet once the answer ends: {rows:?}"
+            underlined
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.content.contains("Done."))
+                .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)),
+            "a paragraph is not made a heading by the line arriving under it: {underlined:?}"
         );
+        assert_eq!(rows("1. a\n2"), vec!["  1. a", "  2"]);
+        assert_eq!(rows("Steps:\n1"), vec!["  Steps:", "  1"]);
+        assert_eq!(rows("```\nlet x = 1;\n# not a heading"), vec![
+            "  let x = 1;",
+            "  # not a heading"
+        ]);
     }
 
     /// Every kind of item puts its glyph in column 0 and its text at the edge, so the whole
@@ -2360,6 +2375,36 @@ mod tests {
             Some(Color::Red),
             "the mode is red, as the composer's glyph is"
         );
+    }
+
+    /// Items laid out ahead at a width are not laid out again by a frame drawn at it, so a frame
+    /// after a resize does no more than place the rows its layout already made.
+    #[test]
+    fn a_frame_at_the_width_laid_out_ahead_lays_nothing_out() {
+        let mut transcript = Transcript::new(settings());
+        transcript.push(Item::note("outcome"));
+        transcript.push(Item::Text {
+            text: "An answer long enough to wrap at the width it is drawn at.".into(),
+            streaming: false,
+        });
+        let mut viewport = Viewport::new();
+        let rows_made = |viewport: &Viewport| -> Vec<*const ratatui::text::Line<'static>> {
+            let mut made: Vec<_> = viewport
+                .cache
+                .values()
+                .map(|cached| cached.lines.as_ptr())
+                .collect();
+            made.sort();
+            made
+        };
+        viewport.lay_out_all(&transcript, 30);
+        let ahead = rows_made(&viewport);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 8)).expect("terminal");
+        terminal
+            .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+            .expect("a frame");
+        assert_eq!(rows_made(&viewport), ahead);
     }
 
     /// A collapsible item lights up under the mouse: its dimmed text turns white while the

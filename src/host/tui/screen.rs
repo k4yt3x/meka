@@ -464,6 +464,7 @@ impl Screen {
             Some(floor) => Some(floor),
             None => self.launch.transcript.log_end().map(|end| end + 1),
         };
+        let read_rewound = !self.launch.transcript.knows_rewound();
         self.history_loading = true;
         let generation = self.history_generation;
         let store = self.launch.store.clone();
@@ -490,10 +491,20 @@ impl Screen {
                     Vec::new()
                 }
             };
+            // Read here, off the screen's path, since a log a rewind is in is read whole for it.
+            let rewound = if read_rewound {
+                Some(store.rewound(session_id).await.unwrap_or_else(|error| {
+                    tracing::warn!("failed to read what the session's rewinds took: {error}");
+                    Vec::new()
+                }))
+            } else {
+                None
+            };
             ui.send(UiEvent::HistoryPage {
                 above: true,
                 page,
                 tasks,
+                rewound,
                 generation,
             });
         });
@@ -546,6 +557,7 @@ impl Screen {
                 above: false,
                 page,
                 tasks,
+                rewound: None,
                 generation,
             });
         });
@@ -592,10 +604,15 @@ impl Screen {
                     tracing::warn!("failed to read the session's turns: {error}");
                     Vec::new()
                 });
+            let rewound = store.rewound(session_id).await.unwrap_or_else(|error| {
+                tracing::warn!("failed to read what the session's rewinds took: {error}");
+                Vec::new()
+            });
             ui.send(UiEvent::Reloaded {
                 log_end,
                 page,
                 turns,
+                rewound,
                 generation,
             });
         });
@@ -998,6 +1015,7 @@ impl Screen {
                 log_end,
                 page,
                 turns,
+                rewound,
                 generation,
             } => {
                 if generation != self.history_generation {
@@ -1006,6 +1024,7 @@ impl Screen {
                 self.history_loading = false;
                 self.launch.transcript.reset(log_end);
                 self.launch.transcript.set_turn_records(turns);
+                self.launch.transcript.set_rewound(rewound);
                 self.launch.transcript.load_page_above(page);
                 self.viewport.scroll_to_bottom();
             }
@@ -1013,6 +1032,7 @@ impl Screen {
                 above,
                 page,
                 tasks,
+                rewound,
                 generation,
             } => {
                 if generation != self.history_generation {
@@ -1020,6 +1040,9 @@ impl Screen {
                 }
                 self.history_loading = false;
                 self.launch.transcript.remember_background_tasks(tasks);
+                if let Some(rewound) = rewound {
+                    self.launch.transcript.set_rewound(rewound);
+                }
                 if above {
                     self.launch.transcript.load_page_above(page);
                 } else {
@@ -3202,6 +3225,41 @@ fn signal_shell_group(pid: Option<u32>) {
 static MOUSE_TAKEN: AtomicBool = AtomicBool::new(false);
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
+/// Draw the screen as one frame, inside a synchronized update, so a terminal that honors one shows
+/// the whole redraw at once rather than tearing between the rows.
+fn draw_screen(screen: &mut Screen, terminal: &mut DefaultTerminal) {
+    screen.dirty = false;
+    // The frame's slow part, laying the transcript out at the width it is drawn at, is done before
+    // the update opens. At a new size ratatui clears the terminal ahead of the frame, inside the
+    // update, and a terminal holds an update only so long before it shows what it has, which
+    // would be the cleared screen while the layout ran.
+    match terminal.size() {
+        Ok(size) => screen
+            .viewport
+            .lay_out_all(&screen.launch.transcript, usize::from(size.width)),
+        Err(error) => tracing::debug!("failed to read the terminal's size: {error}"),
+    }
+    let mut out = std::io::stdout();
+    let synchronized =
+        crossterm::execute!(out, crossterm::terminal::BeginSynchronizedUpdate).is_ok();
+    let drawn = terminal.draw(|frame| screen.draw(frame));
+    if let Ok(completed) = &drawn {
+        screen.remember_drawn(completed.buffer);
+    }
+    if synchronized
+        && let Err(error) = crossterm::execute!(out, crossterm::terminal::EndSynchronizedUpdate)
+    {
+        tracing::debug!("failed to end the synchronized update: {error}");
+    }
+    if let Err(error) = drawn {
+        tracing::error!("failed to draw the screen: {error}");
+        screen.hang_up();
+    }
+    // After the draw, so the page asked for is the one the frame on screen is next to, not the
+    // one a stale layout would have named.
+    screen.pump_history();
+}
+
 /// Give back what [`enter_terminal`] took beyond what ratatui restores. Safe to call twice: a
 /// mode is given back once.
 fn give_back_terminal_modes() {
@@ -3315,7 +3373,15 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
                 Some(Ok(Event::Key(key))) => screen.handle_key(key, &mut terminal).await,
                 Some(Ok(Event::Mouse(mouse))) => screen.handle_mouse(mouse),
                 Some(Ok(Event::Paste(text))) => screen.paste(text),
-                Some(Ok(Event::Resize(_, _))) => screen.dirty = true,
+                // Drawn at once rather than at the next tick, while the terminal shows its own
+                // idea of the old rows at the new size; but only at the size the window has: a
+                // drag sends one event a step, and a step it has moved past is left to the tick.
+                Some(Ok(Event::Resize(columns, rows))) => {
+                    screen.dirty = true;
+                    if crossterm::terminal::size().is_ok_and(|size| size == (columns, rows)) {
+                        draw_screen(&mut screen, &mut terminal);
+                    }
+                }
                 Some(Ok(_)) => {}
                 Some(Err(error)) => {
                     tracing::error!("failed to read the terminal: {error}");
@@ -3335,29 +3401,7 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
                 screen.withdraw_stopped_questions();
                 screen.open_pending_question();
                 if screen.dirty {
-                    screen.dirty = false;
-                    // One atomic frame: a terminal that supports synchronized output shows the
-                    // whole redraw at once rather than tearing between the rows.
-                    let mut out = std::io::stdout();
-                    let synchronized =
-                        crossterm::execute!(out, crossterm::terminal::BeginSynchronizedUpdate).is_ok();
-                    let drawn = terminal.draw(|frame| screen.draw(frame));
-                    if let Ok(completed) = &drawn {
-                        screen.remember_drawn(completed.buffer);
-                    }
-                    if synchronized
-                        && let Err(error) =
-                            crossterm::execute!(out, crossterm::terminal::EndSynchronizedUpdate)
-                    {
-                        tracing::debug!("failed to end the synchronized update: {error}");
-                    }
-                    if let Err(error) = drawn {
-                        tracing::error!("failed to draw the screen: {error}");
-                        screen.hang_up();
-                    }
-                    // After the draw, so the page asked for is the one the frame on screen is
-                    // next to, not the one a stale layout would have named.
-                    screen.pump_history();
+                    draw_screen(&mut screen, &mut terminal);
                 }
             }
         }

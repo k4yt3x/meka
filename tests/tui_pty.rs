@@ -627,6 +627,42 @@ fn a_scheduled_fire_is_announced_as_a_stage_direction_above_its_reply() {
     assert_set_off_by_one_blank(rows, announced, announced, "the fire's direction");
 }
 
+/// A rewind takes its turn off the screen as well as out of the conversation: the turn before it
+/// stays, and one row says how many turns went, then and when the session is resumed.
+#[test]
+fn a_rewind_takes_its_turns_off_the_screen() {
+    let install = screen_install("read", "", "");
+    let screens = run_screen(&install, TWO_TURNS, &[
+        "FIRST_PROMPT",
+        "SECOND_PROMPT",
+        "/rewind",
+        "/exit",
+    ]);
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter().any(|row| row.contains("First answer.")),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("SECOND_PROMPT") || row.contains("Second answer.")),
+        "the rewound turn is gone: {rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| row == "• Rewound 1 turn."),
+        "{rows:#?}"
+    );
+    let resumed = run_screen(&install, TWO_TURNS, &["/exit"]);
+    let rows = final_screen(&resumed);
+    assert!(
+        rows.iter().any(|row| row.contains("First answer."))
+            && rows.iter().any(|row| row == "• Rewound 1 turn.")
+            && !rows.iter().any(|row| row.contains("Second answer.")),
+        "a resume shows what the rewind left: {rows:#?}"
+    );
+}
+
 /// A refused command answers in a panel, quoting the value as a value, and the panel leaves no
 /// row behind once Esc closes it.
 #[test]
@@ -1205,6 +1241,118 @@ fn a_terminal_that_dies_without_a_signal_leaves_the_same_way() {
         "the dead terminal is an interrupted leave: {screens:#?}"
     );
     assert!(survivors.is_empty(), "the command died with the screen");
+}
+
+/// A resize repaints the whole screen as one synchronized update: the clear ratatui writes at a new
+/// size lands inside it, so a terminal that honors one never shows the cleared screen, and nothing
+/// the terminal held before survives the frame after it, whatever its reflow left.
+#[test]
+fn a_resize_repaints_in_one_synchronized_update() {
+    let install = screen_install("read", "", "");
+    install.write_script(TWO_TURNS);
+    let mut master: RawFd = -1;
+    let size = libc::winsize {
+        ws_row: ROWS,
+        ws_col: COLUMNS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let prepared = PreparedExec::meka(&install, &["-c"]);
+    // SAFETY: as in `drive_run_sized`.
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &size as *const libc::winsize as *mut libc::winsize,
+        )
+    };
+    assert!(pid >= 0, "forkpty failed");
+    if pid == 0 {
+        // SAFETY: as in `drive_run_sized`.
+        unsafe { prepared.exec() }
+    }
+    keep_master_here(master);
+    // Everything the child writes until it has been quiet for `quiet`, or the deadline.
+    let read_until_quiet = |quiet: Duration| -> Vec<u8> {
+        let mut raw = Vec::new();
+        let mut buffer = [0u8; 65536];
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last = Instant::now();
+        while Instant::now() < deadline && last.elapsed() < quiet {
+            // SAFETY: `master` is open, and the buffer outlives the call.
+            let read = unsafe {
+                let mut poll = libc::pollfd {
+                    fd: master,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if libc::poll(&mut poll, 1, 50) > 0 && poll.revents & libc::POLLIN != 0 {
+                    libc::read(master, buffer.as_mut_ptr().cast(), buffer.len())
+                } else {
+                    -1
+                }
+            };
+            if read > 0 {
+                raw.extend_from_slice(&buffer[..read as usize]);
+                last = Instant::now();
+            }
+        }
+        raw
+    };
+    let opening = read_until_quiet(Duration::from_millis(2500));
+    let narrower = COLUMNS - 30;
+    let mut parser = vt100::Parser::new(ROWS, COLUMNS, 0);
+    parser.process(&opening);
+    parser.screen_mut().set_size(ROWS, narrower);
+    for row in 1..=ROWS {
+        parser.process(
+            format!("\x1b[{row};1H{}", "\u{2592}".repeat(usize::from(narrower))).as_bytes(),
+        );
+    }
+    let resized = libc::winsize {
+        ws_row: ROWS,
+        ws_col: narrower,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `master` is open; the kernel tells the child of the new size with a SIGWINCH.
+    unsafe {
+        libc::ioctl(master, libc::TIOCSWINSZ, &resized as *const libc::winsize);
+    }
+    let redraw = read_until_quiet(Duration::from_millis(1000));
+    parser.process(&redraw);
+    let rows: Vec<String> = parser.screen().rows(0, narrower).collect();
+    // SAFETY: the master is closed and the child reaped here and nowhere else.
+    unsafe {
+        libc::close(master);
+        libc::kill(pid, libc::SIGKILL);
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0);
+    }
+    assert!(!redraw.is_empty(), "the resize is redrawn");
+    let at = |marker: &[u8]| -> Vec<usize> {
+        redraw
+            .windows(marker.len())
+            .enumerate()
+            .filter(|(_, window)| *window == marker)
+            .map(|(index, _)| index)
+            .collect()
+    };
+    let (opens, closes, clears) = (at(b"\x1b[?2026h"), at(b"\x1b[?2026l"), at(b"\x1b[2J"));
+    assert!(!clears.is_empty(), "a new size is repainted from a clear");
+    assert!(
+        clears.iter().all(|clear| opens
+            .iter()
+            .zip(&closes)
+            .any(|(open, close)| open < clear && clear < close)),
+        "every clear is inside a synchronized update: opens {opens:?}, closes {closes:?}, clears \
+         {clears:?}"
+    );
+    assert!(
+        rows.iter().all(|row| !row.contains('\u{2592}')),
+        "every cell is written: {rows:#?}"
+    );
 }
 
 /// Run the screen with a `!command` going, then close the terminal under it: the exit status it

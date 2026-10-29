@@ -34,6 +34,27 @@ pub(crate) struct LogRow {
     pub(crate) event: crate::conversation::Event,
 }
 
+/// Where a row sits in the log: its id, and the turn that wrote it, `None` for a row written
+/// between turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowStamp {
+    id: i64,
+    turn_id: Option<Uuid>,
+}
+
+/// A stretch of a session's log its conversation no longer holds, which a replay of the session
+/// on the screen leaves out: the rows a rewind took, or a prompt a turn took back to join a message
+/// to it, with the row that took it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Rewound {
+    pub(crate) rows: std::ops::RangeInclusive<i64>,
+    /// The row a rewind was written in, which a replay says it in; `None` for a prompt taken back.
+    pub(crate) said_at: Option<i64>,
+    /// The turns a rewind took: the turns its rows were written in, or where none names one, the
+    /// turns as the rewind counted them.
+    pub(crate) turns: usize,
+}
+
 /// A page of the log, oldest row first, and whether the log goes on past it in the direction
 /// it was read.
 #[derive(Debug, Clone, Default)]
@@ -2702,6 +2723,79 @@ impl Store {
             .map_err(|error| MekaError::Database(format!("failed to read the log's end: {error}")))
     }
 
+    /// The stretches of the session's log its conversation no longer holds, for the screen, which
+    /// shows a session as the conversation it continues rather than the log it keeps.
+    ///
+    /// A rewind is written between turns, and takes what it took and any rewind inside it. A turn
+    /// writes the same repair to take its prompt back: to join a message to it, which brings the
+    /// prompt straight back in the joined message, or to withdraw it when the provider refused it,
+    /// which the live run left on the screen and so does a replay. Only an empty repair takes
+    /// anything, so a session without one answers without decoding its log.
+    pub(crate) async fn rewound(&self, session_id: Uuid) -> Result<Vec<Rewound>> {
+        let taken = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                // A row that is not JSON is left to the decode, which skips it with a warning, as
+                // every reader of the log does, rather than failing the question for the session.
+                connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ?1 AND kind = ?2 \
+                     AND CASE WHEN json_valid(content) \
+                     THEN json_array_length(content, '$.Repair.messages') END = 0)",
+                    rusqlite::params![session_id.to_string(), REPAIR_KIND],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to look for the log's rewinds: {error}"))
+            })?;
+        if !taken {
+            return Ok(Vec::new());
+        }
+        let stored = self.load_rows(session_id, RowRange::All).await?;
+        let events: Vec<(RowStamp, crate::conversation::Event)> =
+            log_page(stored, usize::MAX, false, &self.warned_rows)
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let stamp = RowStamp {
+                        id: row.id,
+                        turn_id: row.turn_id,
+                    };
+                    (stamp, row.event)
+                })
+                .collect();
+        Ok(crate::conversation::rewinds(&events)
+            .into_iter()
+            .filter_map(|taken| match (taken.rejoined, taken.at.turn_id) {
+                // A prompt that came straight back joined, whatever its row names: in a log
+                // written before turns were recorded, none does.
+                (true, _) => Some(Rewound {
+                    rows: taken.first.id..=taken.at.id,
+                    said_at: None,
+                    turns: 0,
+                }),
+                (false, None) => {
+                    let turns: std::collections::HashSet<Uuid> = events
+                        .iter()
+                        .filter(|(stamp, _)| (taken.first.id..taken.at.id).contains(&stamp.id))
+                        .filter_map(|(stamp, _)| stamp.turn_id)
+                        .collect();
+                    Some(Rewound {
+                        rows: taken.first.id..=taken.at.id - 1,
+                        said_at: Some(taken.at.id),
+                        turns: if turns.is_empty() {
+                            taken.turns
+                        } else {
+                            turns.len()
+                        },
+                    })
+                }
+                (false, Some(_)) => None,
+            })
+            .collect())
+    }
+
     /// Up to `rows` rows of the log below `before` (from the end when `None`), oldest first, and
     /// whether older rows remain. The session index serves the walk in row order, so a page costs
     /// its rows however long the log is. A row this build cannot read is skipped with a warning,
@@ -4936,6 +5030,172 @@ mod tests {
              not counted twice"
         );
         assert!(!store.session_exists(child).await.expect("exists"));
+    }
+
+    /// What a session's conversation no longer holds is read back by row. A rewind, written
+    /// between turns, takes the turns it took and says how many; a turn taking its prompt back to
+    /// join a message to it takes the prompt and its own row; a prompt withdrawn because the
+    /// provider refused it takes nothing, since the live run left it on the screen. A session with
+    /// no empty repair has nothing taken.
+    #[tokio::test]
+    async fn a_rewound_stretch_is_read_back_by_row() {
+        use crate::conversation::{ContentBlock, Conversation, Event, Message};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        assert_eq!(store.rewound(id).await.expect("read"), Vec::new());
+
+        let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+        for turn in [one, two] {
+            store
+                .turn_store()
+                .open_turn(id, turn, "screen", "2026-10-29T00:00:00+00:00")
+                .await
+                .expect("open");
+        }
+        let mut conversation = Conversation::new();
+        // A prompt opens with its context block, which is how it is stored: as the blocks it is.
+        let prompt = Message::user_turn("now", "two?", Vec::new());
+        let mut both = prompt.clone();
+        both.content.push(ContentBlock::Text {
+            text: "and this".to_string(),
+        });
+        for (turn, event) in [
+            (
+                one,
+                Event::Append(Message::user_turn("now", "one?", Vec::new())),
+            ),
+            (one, Event::Append(Message::assistant_text("One."))),
+            (two, Event::Append(prompt)),
+            (two, Event::Repair {
+                replaced_count: 1,
+                messages: Vec::new(),
+            }),
+            (two, Event::Append(both)),
+            (two, Event::Append(Message::assistant_text("Two."))),
+        ] {
+            store
+                .save_event(id, &event, Some(turn))
+                .await
+                .expect("save");
+            conversation = Conversation::from_events(
+                conversation
+                    .events()
+                    .iter()
+                    .cloned()
+                    .chain([event])
+                    .collect(),
+            );
+        }
+        let rewind = conversation.rewind(1).expect("a turn to rewind");
+        store
+            .save_rewind(id, &rewind)
+            .await
+            .expect("save the rewind");
+        let rows: Vec<i64> = store
+            .log_page_before(id, None, 20)
+            .await
+            .expect("read the log")
+            .rows
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        // The seed row, turn one's two, turn two's four, the rewind.
+        assert_eq!(store.rewound(id).await.expect("read"), vec![
+            Rewound {
+                rows: rows[3]..=rows[4],
+                said_at: None,
+                turns: 0,
+            },
+            Rewound {
+                rows: rows[3]..=rows[6],
+                said_at: Some(rows[7]),
+                turns: 1,
+            },
+        ]);
+
+        // A second rewind takes turn one and the first rewind's row with it: the turns its rows
+        // were written in, two, though it dropped one turn of the view.
+        let rewind = conversation.rewind(1).expect("a turn to rewind");
+        store
+            .save_rewind(id, &rewind)
+            .await
+            .expect("save the rewind");
+        let last = store
+            .last_log_row(id)
+            .await
+            .expect("read the end")
+            .expect("rows");
+        assert!(
+            store.rewound(id).await.expect("read").contains(&Rewound {
+                rows: rows[1]..=last - 1,
+                said_at: Some(last),
+                turns: 2,
+            }),
+            "{:?}",
+            store.rewound(id).await
+        );
+
+        // A repair row that is not JSON, as a hand edit or a torn write leaves one, is skipped
+        // with the rest of what cannot be read rather than failing the question.
+        let torn = plain_session(&store, "words").await;
+        let session = torn.to_string();
+        store
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "INSERT INTO messages (session_id, kind, content, created_at) \
+                     VALUES (?1, ?2, '{not json', ?3)",
+                    rusqlite::params![session, REPAIR_KIND, chrono::Utc::now().to_rfc3339()],
+                )
+            })
+            .await
+            .expect("insert the corrupt row");
+        assert_eq!(store.rewound(torn).await.expect("read"), Vec::new());
+
+        // A join in a log written before turns were recorded names no turn, and is a join all the
+        // same: the message it joined brings the prompt back.
+        let unturned = plain_session(&store, "words").await;
+        let prompt = Message::user_turn("then", "old?", Vec::new());
+        let mut joined = prompt.clone();
+        joined.content.push(ContentBlock::Text {
+            text: "and this".to_string(),
+        });
+        for event in [
+            Event::Append(prompt),
+            Event::Repair {
+                replaced_count: 1,
+                messages: Vec::new(),
+            },
+            Event::Append(joined),
+        ] {
+            store
+                .save_event(unturned, &event, None)
+                .await
+                .expect("save");
+        }
+        let taken = store.rewound(unturned).await.expect("read");
+        assert!(
+            taken.len() == 1 && taken.iter().all(|stretch| stretch.said_at.is_none()),
+            "{taken:?}"
+        );
+
+        let refused = plain_session(&store, "words").await;
+        let turn = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(refused, turn, "screen", "2026-10-29T00:00:00+00:00")
+            .await
+            .expect("open");
+        for event in [Event::Append(Message::user("refused?")), Event::Repair {
+            replaced_count: 1,
+            messages: Vec::new(),
+        }] {
+            store
+                .save_event(refused, &event, Some(turn))
+                .await
+                .expect("save");
+        }
+        assert_eq!(store.rewound(refused).await.expect("read"), Vec::new());
     }
 
     /// A rewind and a withdrawal take the one door into `messages`, so an image inside the repair

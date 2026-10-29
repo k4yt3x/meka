@@ -249,6 +249,10 @@ pub(crate) struct Transcript {
     background_tasks: Vec<crate::store::background::BackgroundTask>,
     /// The recorded turns of the session, by id, for the row that closes each turn on a replay.
     turn_records: std::collections::HashMap<Uuid, TurnRecord>,
+    /// The stretches of the log the session's conversation no longer holds, which a replay leaves
+    /// out, so the screen shows the conversation that goes on rather than the log; `None` until
+    /// they are read after a reset.
+    rewound: Option<Vec<crate::store::Rewound>>,
     /// When the running turn started, for the duration its closing row states.
     turn_started: Option<DateTime<Utc>>,
     /// The closing row of a turn that failed or was interrupted, held until the row that says so
@@ -280,6 +284,7 @@ impl Transcript {
             settings,
             background_tasks: Vec::new(),
             turn_records: std::collections::HashMap::new(),
+            rewound: None,
             turn_started: None,
             pending_turn_end: None,
             thinking_shown: false,
@@ -400,6 +405,30 @@ impl Transcript {
             .collect();
     }
 
+    /// What the session's conversation no longer holds of its log, which a replay leaves out.
+    pub(crate) fn set_rewound(&mut self, rewound: Vec<crate::store::Rewound>) {
+        self.rewound = Some(rewound);
+    }
+
+    /// Whether the session's rewound stretches have been read since the window was reset.
+    pub(crate) fn knows_rewound(&self) -> bool {
+        self.rewound.is_some()
+    }
+
+    /// `page` without the rows the conversation no longer holds, read before anything else is, so
+    /// a rewound turn closes nowhere either, at a page's edge included. The page's span is the
+    /// page as read, which is what the next read starts from.
+    fn without_rewound(&self, mut page: crate::store::LogPage) -> crate::store::LogPage {
+        page.rows.retain(|row| {
+            !self
+                .rewound
+                .iter()
+                .flatten()
+                .any(|stretch| stretch.rows.contains(&row.id))
+        });
+        page
+    }
+
     /// The row that closes the recorded turn `turn`, or `None` while the turn is still open, when
     /// its record is unknown, or when the summary is switched off.
     fn turn_end_entry(&mut self, turn: Uuid) -> Option<Entry> {
@@ -463,6 +492,7 @@ impl Transcript {
         self.log_end = log_end;
         self.orphan_results.clear();
         self.turn_records.clear();
+        self.rewound = None;
         self.turn_started = None;
         self.pending_turn_end = None;
         self.tail.retain(|entry| {
@@ -505,6 +535,7 @@ impl Transcript {
         let Some((first_row, last_row)) = page_span(&page) else {
             return;
         };
+        let page = self.without_rewound(page);
         // The first page after a reset is the newest, so its last turn ends with the log.
         let closes_log = self.pages.is_empty() && self.window.is_empty();
         let (mut entries, mut ends_with_turn_end) =
@@ -515,8 +546,8 @@ impl Transcript {
         // unless that page already opens with the row.
         if let Some(below) = self.pages.front()
             && !below.starts_with_turn_end
-            && let (Some(ended), Some(next)) = (last_turn, below.first_turn)
-            && ended != next
+            && let Some(ended) = last_turn
+            && below.first_turn != Some(ended)
             && let Some(entry) = self.turn_end_entry(ended)
         {
             entries.push(entry);
@@ -552,6 +583,7 @@ impl Transcript {
             self.attached = true;
             return;
         };
+        let page = self.without_rewound(page);
         let (mut entries, ends_with_turn_end) = self.build_entries(&page.rows, true, !page.more);
         let (first_turn, last_turn) = edge_turns(&page);
         // The join with the page above: the turn its last row belongs to ends here when this
@@ -559,8 +591,8 @@ impl Transcript {
         let mut starts_with_turn_end = false;
         if let Some(above) = self.pages.back()
             && !above.ends_with_turn_end
-            && let (Some(ended), Some(next)) = (above.last_turn, first_turn)
-            && ended != next
+            && let Some(ended) = above.last_turn
+            && first_turn != Some(ended)
             && let Some(entry) = self.turn_end_entry(ended)
         {
             entries.insert(0, entry);
@@ -1226,9 +1258,8 @@ impl Transcript {
     ) -> (Vec<Entry>, bool) {
         use crate::conversation::Event;
         let mut out: Vec<Entry> = Vec::new();
-        // The turn of the last row that named one: a turn ends where the next row names another,
-        // and the last turn of the log ends with the log. A row naming no turn, written before
-        // turns were recorded, changes nothing.
+        // The turn of the last row: a turn ends where the next row names another or none, and the
+        // last turn of the log ends with the log.
         let mut turn: Option<Uuid> = None;
         let find_call = |out: &[Entry], id: &str| {
             out.iter().rposition(
@@ -1236,15 +1267,16 @@ impl Transcript {
             )
         };
         for row in rows {
-            if let (Some(ended), Some(next)) = (turn, row.turn_id)
-                && ended != next
+            if let Some(ended) = turn
+                && row.turn_id != Some(ended)
                 && let Some(entry) = self.turn_end_entry(ended)
             {
                 out.push(entry);
             }
-            if row.turn_id.is_some() {
-                turn = row.turn_id;
-            }
+            // A row naming no turn was written between turns, as a rewind or a `/compact` is, so
+            // the turn before it has ended; in a log written before turns were recorded, no row
+            // names one.
+            turn = row.turn_id;
             let event = &row.event;
             let message = match event {
                 Event::Append(message) => message,
@@ -1253,14 +1285,28 @@ impl Transcript {
                     out.push(entry);
                     continue;
                 }
+                // A rewind is written between turns. One in a turn is the turn taking its prompt
+                // back, to join a message to it or to offer its items again, which the live run
+                // said nothing about either.
                 Event::Repair {
                     replaced_count,
                     messages,
-                } if messages.is_empty() => {
-                    let entry = self.entry(Item::note(format!(
-                        "Rewound {replaced_count} message{}.",
-                        if *replaced_count == 1 { "" } else { "s" }
-                    )));
+                } if messages.is_empty() && row.turn_id.is_none() => {
+                    // Without the session's rewound stretches, which a failed read leaves the
+                    // screen, the rows stay and the note counts what the row itself records.
+                    let rewind = self
+                        .rewound
+                        .iter()
+                        .flatten()
+                        .find(|stretch| stretch.said_at == Some(row.id));
+                    let note = match rewind {
+                        Some(rewind) => rewound_note(rewind.turns),
+                        None => format!(
+                            "Rewound {replaced_count} message{}.",
+                            if *replaced_count == 1 { "" } else { "s" }
+                        ),
+                    };
+                    let entry = self.entry(Item::note(note));
                     out.push(entry);
                     continue;
                 }
@@ -1458,11 +1504,12 @@ fn page_span(page: &crate::store::LogPage) -> Option<(i64, i64)> {
     Some((page.rows.first()?.id, page.rows.last()?.id))
 }
 
-/// The turns of a page's first and last rows that name one.
+/// The turns of a page's first and last rows, `None` for a row naming none, which was written
+/// between turns.
 fn edge_turns(page: &crate::store::LogPage) -> (Option<Uuid>, Option<Uuid>) {
     (
-        page.rows.iter().find_map(|row| row.turn_id),
-        page.rows.iter().rev().find_map(|row| row.turn_id),
+        page.rows.first().and_then(|row| row.turn_id),
+        page.rows.last().and_then(|row| row.turn_id),
     )
 }
 
@@ -1511,6 +1558,11 @@ fn change_from_input(name: &str, input: &serde_json::Value) -> Option<TextChange
         old: Some(text(old)?),
         new: Some(text(new)?),
     })
+}
+
+/// The row a rewind leaves where the turns it took were, live and on a replay alike.
+pub(crate) fn rewound_note(turns: usize) -> String {
+    format!("Rewound {turns} turn{}.", if turns == 1 { "" } else { "s" })
 }
 
 #[cfg(test)]
@@ -2061,7 +2113,8 @@ mod tests {
         assert!(transcript.is_attached() && transcript.has_more_above());
     }
 
-    /// A compaction and a rewind show as rows of their own; a repair shows nothing.
+    /// A compaction and a rewind show as rows of their own, a rewind the screen has not read the
+    /// session's rewinds for counting the messages its row records; a repair shows nothing.
     #[test]
     fn a_boundary_and_a_rewind_are_rows_and_a_repair_is_not() {
         let mut transcript = transcript();
@@ -2389,6 +2442,120 @@ mod tests {
             !shown.iter().any(|item| matches!(item, Item::Prompt { text, .. } if text.contains("[Scheduled") || text.contains("[Background"))),
             "nothing meka wrote is shown as a prompt: {shown:?}"
         );
+    }
+
+    /// A replay leaves out the rows a rewind took, with the rows closing their turns, and says at
+    /// the rewind how many turns went from there. The turn before it closes ahead of that note,
+    /// since a rewind is written between turns, and once, wherever a page's edge falls. A turn
+    /// taking its prompt back to join a message to it is no rewind: the prompt shows once, in the
+    /// message it joined, with no note. A prompt withdrawn because the provider refused it stays,
+    /// as it did live, with no note either.
+    #[test]
+    fn a_replay_leaves_out_what_a_rewind_took() {
+        use crate::store::Rewound;
+        let turns = [
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        ];
+        let taken = || Event::Repair {
+            replaced_count: 1,
+            messages: Vec::new(),
+        };
+        let log = vec![
+            (Some(turns[0]), asked("one?")),
+            (Some(turns[0]), said("One.")),
+            (Some(turns[1]), asked("two?")),
+            (Some(turns[1]), taken()),
+            (Some(turns[1]), asked("two? and this")),
+            (Some(turns[1]), said("Two.")),
+            (Some(turns[2]), asked("three?")),
+            (Some(turns[2]), said("Three.")),
+            (None, taken()),
+            (None, taken()),
+            (Some(turns[3]), asked("four?")),
+            (Some(turns[3]), said("Four.")),
+        ];
+        // Turn two joined a message to its prompt at row 4; turn three was rewound at row 9, then
+        // turn two at row 10, which took from the prompt the joined message stands for.
+        let joined = Rewound {
+            rows: 3..=4,
+            said_at: None,
+            turns: 0,
+        };
+        let rewound = vec![
+            joined.clone(),
+            Rewound {
+                rows: 7..=8,
+                said_at: Some(9),
+                turns: 1,
+            },
+            Rewound {
+                rows: 3..=9,
+                said_at: Some(10),
+                turns: 2,
+            },
+        ];
+        let page = |rows: &[(Option<Uuid>, Event)], first: i64, more: bool| LogPage {
+            rows: rows
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(offset, (turn_id, event))| LogRow {
+                    id: first + offset as i64,
+                    turn_id,
+                    event,
+                })
+                .collect(),
+            more,
+        };
+        let replayed = |pages: Vec<LogPage>, rewound: Vec<Rewound>| {
+            let mut transcript = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+            transcript.set_turn_records(
+                turns
+                    .iter()
+                    .map(|turn| closed_turn(*turn, TurnStatus::Succeeded))
+                    .collect(),
+            );
+            transcript.set_rewound(rewound);
+            for page in pages {
+                transcript.load_page_above(page);
+            }
+            transcript
+        };
+        let whole = replayed(vec![page(&log, 1, false)], rewound.clone());
+        assert_eq!(kinds(&whole), vec![
+            "prompt", "text", "end", "note", "prompt", "text", "end"
+        ]);
+        assert!(
+            matches!(items(&whole)[3], Item::Notice { text, .. } if text == "Rewound 2 turns."),
+            "{:?}",
+            items(&whole)
+        );
+        for edge in 1..log.len() {
+            let split = replayed(
+                vec![
+                    page(&log[edge..], edge as i64 + 1, true),
+                    page(&log[..edge], 1, false),
+                ],
+                rewound.clone(),
+            );
+            assert_eq!(kinds(&split), kinds(&whole), "split after row {edge}");
+        }
+        let joined_only = replayed(vec![page(&log[..6], 1, false)], vec![joined]);
+        assert_eq!(kinds(&joined_only), vec![
+            "prompt", "text", "end", "prompt", "text", "end"
+        ]);
+        assert!(
+            matches!(items(&joined_only)[3], Item::Prompt { text, .. } if text == "two? and this"),
+            "{:?}",
+            items(&joined_only)
+        );
+        let withdrawn = replayed(vec![page(&log[..4], 1, false)], Vec::new());
+        assert_eq!(kinds(&withdrawn), vec![
+            "prompt", "text", "end", "prompt", "end"
+        ]);
     }
 
     /// On a replay each recorded turn closes where its rows end: inside a page where the next

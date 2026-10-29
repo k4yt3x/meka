@@ -430,9 +430,11 @@ pub(crate) fn wrap_to_width(text: &str, max_columns: usize, max_rows: usize) -> 
             // emits a marker, which fits any budget at all.
             break;
         }
-        // Break at the last space that fits, but never inside a leading run of them: breaking there
-        // emits a row that is empty once trimmed and silently drops the line's indentation.
+        // Break at the last space that fits, the one just past a full row included, but never
+        // inside a leading run of them: breaking there emits a row that is empty once trimmed and
+        // silently drops the line's indentation.
         let split = match head.rfind(' ') {
+            _ if rest[head.len()..].starts_with(' ') && !head.trim().is_empty() => head.len(),
             Some(index) if !head[..index].trim().is_empty() => index,
             _ => head.len(),
         };
@@ -1365,6 +1367,12 @@ mod tests {
             "aaaaa",
             "bbbbbbbbbb"
         ]);
+    }
+
+    /// A row that fills the width up to a space breaks at that space, not at the one before it.
+    #[test]
+    fn a_row_full_up_to_a_space_breaks_at_that_space() {
+        assert_eq!(wrap_to_width("aaa bbb ccc", 7, 3), ["aaa bbb", "ccc"]);
     }
 
     /// When the text does not fit, the last two rows are a count of what was skipped and the end

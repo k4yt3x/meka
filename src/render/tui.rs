@@ -1,10 +1,9 @@
 //! The transcript's text as the terminal UI draws it: markdown, code fences, tool output and
 //! plain text, laid out at a width as ratatui lines, and the rows every item is dressed in.
 //!
-//! The markdown pipeline is the one the write-once renderer uses: meka parses CommonMark into the
-//! document `termimad` lays out ([`super::markdown`]), the skins are the same two, and a fenced
-//! block is pulled out and highlighted by `syntect` for the same reason it is there: termimad
-//! paints a block in one flat color. Only the last step differs, in that the formatted rows become
+//! Markdown is laid out here from the blocks [`super::markdown`] reads: prose wraps at spaces,
+//! under the marker of every list item and the bar of every quote it sits in, and a table's cells
+//! wrap in columns fitted to the width; a code block is highlighted by `syntect`. The rows are
 //! lines the UI owns rather than bytes on a stream, which is what lets it draw them again at
 //! another width.
 //!
@@ -13,8 +12,6 @@
 //! error, nothing for the answer. The palette is the terminal's foreground, gray, red and yellow.
 //! No glyph has an emoji presentation: a terminal that draws U+26A0 as a picture draws it the
 //! size of two cells in a color of its own, and the gutter is meant to be a mark, not a picture.
-
-use std::sync::OnceLock;
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -55,92 +52,6 @@ pub(crate) fn gray() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-/// Where termimad puts a bar between two cells, a junction in the rule under the header, and an
-/// edge of either. Private-use characters, so [`space_table`] can find them after layout and
-/// replace each with the gap the screen draws: termimad takes one character per border and the
-/// screen wants a wider one, which no single character is.
-const TABLE_BAR: char = '\u{E000}';
-const TABLE_JUNCTION: char = '\u{E001}';
-const TABLE_EDGE: char = '\u{E002}';
-/// What a bar between two cells becomes on screen, and the gap the rule leaves under it.
-const TABLE_GAP: &str = "  ";
-
-/// Tables without vertical bars: one rule under each header cell, a gap between cells, nothing
-/// framing the table. The screen's answer skin alone; the write-once renderer keeps termimad's
-/// borders.
-static QUIET_TABLE_BORDERS: termimad::TableBorderChars = termimad::TableBorderChars {
-    horizontal: '─',
-    vertical: TABLE_BAR,
-    top_left_corner: TABLE_EDGE,
-    top_right_corner: TABLE_EDGE,
-    bottom_right_corner: TABLE_EDGE,
-    bottom_left_corner: TABLE_EDGE,
-    top_junction: TABLE_JUNCTION,
-    right_junction: TABLE_EDGE,
-    bottom_junction: TABLE_JUNCTION,
-    left_junction: TABLE_EDGE,
-    cross: TABLE_JUNCTION,
-};
-
-/// Replace the border characters of a laid-out table with the gaps the screen draws: nothing at
-/// either edge, two columns between cells, and the same two under them in the rule. Every row of
-/// one table is the same width, so one table is either widened whole or, when a widened row would
-/// not fit, left with one column between cells, which keeps its rows aligned either way.
-fn space_table(lines: &mut [Line<'static>], width: usize) {
-    let is_border = |character: char| {
-        character == TABLE_BAR || character == TABLE_JUNCTION || character == TABLE_EDGE
-    };
-    for line in lines.iter_mut() {
-        let text: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        let borders = text
-            .chars()
-            .filter(|&character| is_border(character))
-            .count();
-        if borders == 0 {
-            continue;
-        }
-        // termimad pads a row to the whole width; the cells end where the trailing blank starts.
-        let content = display_width(text.trim_end());
-        // The first and last borders are the table's edges, which go; each one between two cells
-        // widens by the gap less the column it already took.
-        let between = borders.saturating_sub(2);
-        let widened = content.saturating_sub(2) + between * (TABLE_GAP.len() - 1);
-        let (gap, rule_gap) = if widened <= width {
-            (TABLE_GAP, TABLE_GAP)
-        } else {
-            (" ", "─")
-        };
-        let mut seen = 0;
-        for span in &mut line.spans {
-            if !span.content.contains(is_border) {
-                continue;
-            }
-            let replaced: String = span
-                .content
-                .chars()
-                .map(|character| {
-                    if !is_border(character) {
-                        return character.to_string();
-                    }
-                    seen += 1;
-                    if seen == 1 || seen == borders {
-                        String::new()
-                    } else if character == TABLE_JUNCTION {
-                        rule_gap.to_string()
-                    } else {
-                        gap.to_string()
-                    }
-                })
-                .collect();
-            span.content = replaced.into();
-        }
-    }
-}
-
 /// The one accent on the screen: what inline code is drawn in, and the cursor of a picker. The
 /// terminal's own cyan, so it follows the theme the terminal has rather than one meka ships.
 pub(crate) const ACCENT: Color = Color::Cyan;
@@ -150,142 +61,560 @@ pub(crate) const ACCENT: Color = Color::Cyan;
 /// stands out of nothing.
 pub(crate) const WHITE: Color = Color::Rgb(255, 255, 255);
 
-/// The answer's skin: emphasis by weight rather than hue, so a bold word is bold and not the
-/// red of an error; code in the one accent; everything structural (bullets, rules, the quote
-/// bar) in the gray the rest of the chrome is. Every color is the terminal's own palette, which
-/// is what keeps the answer legible on a light theme as on a dark one. The write-once renderer
-/// keeps its theme-derived skin.
-fn answer_skin() -> &'static ratskin::RatSkin {
-    static SKIN: OnceLock<ratskin::RatSkin> = OnceLock::new();
-    SKIN.get_or_init(|| {
-        let mut skin = quiet_skin();
-        // The screen's tables have no vertical bars; one-shot keeps termimad's borders.
-        skin.table_border_chars = &QUIET_TABLE_BORDERS;
-        ratskin::RatSkin { skin }
-    })
-}
-
-/// The reasoning skin, one gray throughout.
-fn reasoning_skin() -> &'static ratskin::RatSkin {
-    static SKIN: OnceLock<ratskin::RatSkin> = OnceLock::new();
-    SKIN.get_or_init(|| {
-        let mut skin = thinking_skin().clone();
-        skin.table_border_chars = &QUIET_TABLE_BORDERS;
-        ratskin::RatSkin { skin }
-    })
-}
-
-/// Markdown laid out at `width` in the answer's skin.
+/// Markdown laid out at `width` in the answer's look.
 pub(crate) fn markdown_lines(markdown: &str, width: usize) -> Vec<Line<'static>> {
-    lay_out(markdown, width, answer_skin(), true)
+    lay_out(markdown, width, &ANSWER)
 }
 
-/// Markdown laid out at `width` in the reasoning skin, with every fenced block in the same gray.
+/// Markdown laid out at `width` in the reasoning's look.
 pub(crate) fn thinking_lines(markdown: &str, width: usize) -> Vec<Line<'static>> {
-    lay_out(markdown, width, reasoning_skin(), false)
+    lay_out(markdown, width, &REASONING)
 }
 
-/// One piece of a markdown source: prose for termimad, or a fenced block for syntect.
-enum Segment {
-    Prose(String),
-    Fence {
-        language: Option<String>,
-        body: Vec<String>,
-    },
+/// An answer still streaming as lines: what has settled laid out as markdown, and the line still
+/// arriving under it laid out on its own, so a token shows the moment it arrives and nothing the
+/// line says yet reaches back into the rows above: `2` behind an item is not yet the next item's
+/// number, nor a word of the item, and `---` under a paragraph does not make it a heading. A line
+/// inside a code block the settled text has not closed is laid out with it, as the code row it
+/// is; a line that continues a block above it, as an item's second line does, settles into place
+/// when it ends. `reasoning` picks the reasoning's look.
+pub(crate) fn streaming_lines(text: &str, width: usize, reasoning: bool) -> Vec<Line<'static>> {
+    let look = if reasoning { &REASONING } else { &ANSWER };
+    let (settled, open) = match text.rfind('\n') {
+        Some(cut) => text.split_at(cut + 1),
+        None => ("", text),
+    };
+    if open.is_empty() || ends_inside_a_fence(settled) {
+        return lay_out(text, width, look);
+    }
+    let mut lines = lay_out(settled, width, look);
+    // A blank line ends the block above, so the line arriving starts one of its own.
+    if settled.ends_with("\n\n") && !lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines.extend(lay_out(open, width, look));
+    lines
 }
 
-/// Cut `markdown` at its fences. Segmenting on fences rather than on blank lines is what keeps a
-/// block containing a blank line whole, and what keeps a `# comment` inside a block from being
-/// read as a heading.
-fn segments(markdown: &str) -> Vec<Segment> {
-    let mut segments = Vec::new();
-    let mut prose = String::new();
-    let mut fence: Option<(Option<String>, Vec<String>)> = None;
-    for line in markdown.lines() {
-        match fence.as_mut() {
-            Some((_, body)) => {
-                if is_code_fence(line) {
-                    let (language, body) = fence.take().unwrap_or_default();
-                    segments.push(Segment::Fence { language, body });
-                } else {
-                    body.push(line.to_string());
-                }
-            }
-            None if is_code_fence(line) => {
-                if !prose.is_empty() {
-                    segments.push(Segment::Prose(std::mem::take(&mut prose)));
-                }
-                fence = Some((parse_fence_language(line).map(str::to_string), Vec::new()));
-            }
-            None => {
-                prose.push_str(line);
-                prose.push('\n');
-            }
-        }
-    }
-    // A fence the stream has not closed yet is still a block: it renders as code until it does.
-    if let Some((language, body)) = fence {
-        segments.push(Segment::Fence { language, body });
-    }
-    if !prose.is_empty() {
-        segments.push(Segment::Prose(prose));
-    }
-    segments
-}
+/// The narrowest text a list item or a quote indents its blocks to. Narrower, an item's marker
+/// takes a row of its own, a quote drops its bar, and the blocks keep the width: an indent that
+/// leaves a word or two per row no longer reads as nesting.
+const MIN_NESTED_WIDTH: usize = 10;
+/// The columns between two cells of a table, and under them in its rule.
+const TABLE_GAP: usize = 2;
+const BULLET: char = '•';
+const QUOTE_BAR: char = '▐';
+const RULE: char = '―';
+const TABLE_RULE: char = '─';
 
-fn lay_out(
-    markdown: &str,
-    width: usize,
-    skin: &ratskin::RatSkin,
+/// The styles a document is drawn in.
+struct Look {
+    /// Prose and table cells.
+    text: Style,
+    /// A heading at each level, from `#` down.
+    headings: [Style; 6],
+    /// What each emphasis lays over the style under it, in this order, so code in struck text
+    /// keeps the code's color.
+    italic: Style,
+    strikeout: Style,
+    bold: Style,
+    code: Style,
+    /// A code block's rows when they are not highlighted for their language.
+    code_block: Style,
+    /// Bullets, rules and a table's rule.
+    structure: Style,
+    quote_bar: Style,
+    /// Whether a code block is highlighted for its language rather than drawn in `code_block`.
     highlight: bool,
-) -> Vec<Line<'static>> {
+}
+
+/// The answer's look: emphasis by weight rather than hue, so a bold word is bold and not the red
+/// of an error; code in the one accent; the structure in the gray the rest of the chrome is.
+/// Every color is the terminal's own palette, which is what keeps the answer legible on a light
+/// theme as on a dark one.
+const ANSWER: Look = Look {
+    text: Style::new(),
+    headings: [Style::new().add_modifier(Modifier::BOLD); 6],
+    italic: Style::new().add_modifier(Modifier::ITALIC),
+    strikeout: Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::CROSSED_OUT),
+    bold: Style::new().add_modifier(Modifier::BOLD),
+    code: Style::new().fg(ACCENT),
+    code_block: Style::new(),
+    structure: Style::new().fg(Color::DarkGray),
+    quote_bar: Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD),
+    highlight: true,
+};
+
+/// The gray of the reasoning's look, and of its underlined headings.
+const REASONING_HEADING: Style = Style::new()
+    .fg(Color::DarkGray)
+    .add_modifier(Modifier::UNDERLINED);
+
+/// The reasoning's look: one gray throughout, code included, so it reads as a footnote beside the
+/// answer and is told apart from it without being read. Emphasis survives as an attribute alone,
+/// and a heading is underlined, the first bold as well.
+const REASONING: Look = Look {
+    text: Style::new().fg(Color::DarkGray),
+    headings: [
+        REASONING_HEADING.add_modifier(Modifier::BOLD),
+        REASONING_HEADING,
+        REASONING_HEADING,
+        REASONING_HEADING,
+        REASONING_HEADING,
+        REASONING_HEADING,
+    ],
+    italic: Style::new().add_modifier(Modifier::ITALIC),
+    strikeout: Style::new().add_modifier(Modifier::CROSSED_OUT),
+    bold: Style::new().add_modifier(Modifier::BOLD),
+    code: Style::new(),
+    code_block: Style::new().fg(Color::DarkGray),
+    structure: Style::new().fg(Color::DarkGray),
+    quote_bar: Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD),
+    highlight: false,
+};
+
+fn lay_out(markdown: &str, width: usize, look: &Look) -> Vec<Line<'static>> {
     let width = width.max(MIN_OUTPUT_WIDTH);
     let markdown = crate::text::expand_tabs(markdown);
-    let mut lines = Vec::new();
-    for segment in segments(&markdown) {
-        // A fence is a block of its own: exactly one blank row sets it off from the prose on either
-        // side, whether or not termimad ended the prose on one.
-        if !lines.is_empty() {
-            while lines.last().is_some_and(is_blank) {
-                lines.pop();
-            }
-            lines.push(Line::default());
-        }
-        match segment {
-            Segment::Prose(prose) => {
-                // The blank a heading or a table owes the line after it, inserted here as on the
-                // write-once path: GFM reads a non-blank line after a table as one more row.
-                let prose = normalize_spacing(&prose, false);
-                let document = markdown::MarkdownDoc::parse(&prose);
-                // Wider than a terminal row is a width termimad would never see, so the cast cannot
-                // lose anything that could have been drawn.
-                let fitted = u16::try_from(width).unwrap_or(u16::MAX);
-                let mut laid_out = skin.parse(document.to_minimad(), fitted);
-                space_table(&mut laid_out, width);
-                lines.extend(laid_out);
-            }
-            Segment::Fence { language, body } => {
-                let rows = if highlight {
-                    code_lines(&body, language.as_deref())
-                } else {
-                    let style = gray();
-                    body.into_iter()
-                        .map(|row| Line::from(Span::styled(row, style)))
-                        .collect()
-                };
-                // Folded at the edge rather than clipped there, as the terminal folds a one-shot's
-                // output: at a column, never at a space, because a code row's spaces are content
-                // and its indentation is where a break at a space would land.
-                lines.extend(rows.iter().flat_map(|row| wrap_line_at_columns(row, width)));
-            }
-        }
-    }
+    // The blank a table owes the line after it: GFM reads a non-blank line after a table as one
+    // more row.
+    let markdown = normalize_spacing(&markdown);
+    let mut lines = look.blocks(&markdown::parse(&markdown), width, false);
     // A document ends where its last row does; the blank that separates it from the next block is
     // the transcript's to draw.
     while lines.last().is_some_and(is_blank) {
         lines.pop();
     }
     lines
+}
+
+impl Look {
+    /// `blocks` at `width`, one blank row between two of them unless `tight`, as the blocks of an
+    /// item in a tight list are.
+    fn blocks(&self, blocks: &[markdown::Block], width: usize, tight: bool) -> Vec<Line<'static>> {
+        let mut rows = Vec::new();
+        for block in blocks {
+            let block_rows = self.block(block, width);
+            if block_rows.is_empty() {
+                continue;
+            }
+            if !tight && !rows.is_empty() {
+                rows.push(Line::default());
+            }
+            rows.extend(block_rows);
+        }
+        rows
+    }
+
+    fn block(&self, block: &markdown::Block, width: usize) -> Vec<Line<'static>> {
+        match block {
+            markdown::Block::Paragraph(runs) => self.prose(runs, self.text, width),
+            markdown::Block::Heading { level, runs } => {
+                let heading = self
+                    .headings
+                    .get(usize::from(*level).saturating_sub(1))
+                    .copied()
+                    .unwrap_or(self.text);
+                self.prose(runs, heading, width)
+            }
+            markdown::Block::Code { language, rows } => self.code(rows, language.as_deref(), width),
+            markdown::Block::List {
+                start,
+                loose,
+                items,
+            } => self.list(*start, *loose, items, width),
+            markdown::Block::Quote(blocks) => self.quote(blocks, width),
+            markdown::Block::Table(table) => self.table(table, width),
+            markdown::Block::Rule => vec![Line::from(Span::styled(
+                RULE.to_string().repeat(width),
+                self.structure,
+            ))],
+        }
+    }
+
+    /// The style of `run` over `base`.
+    fn run_style(&self, base: Style, run: &markdown::OwnedCompound) -> Style {
+        let mut style = base;
+        for (applies, emphasis) in [
+            (run.italic, self.italic),
+            (run.strikeout, self.strikeout),
+            (run.bold, self.bold),
+            (run.code, self.code),
+        ] {
+            if applies {
+                style = style.patch(emphasis);
+            }
+        }
+        style
+    }
+
+    /// The characters of `runs`, each in its run's style over `base`.
+    fn characters(&self, runs: &[markdown::OwnedCompound], base: Style) -> Vec<(char, Style)> {
+        runs.iter()
+            .flat_map(|run| {
+                let style = self.run_style(base, run);
+                run.text.chars().map(move |character| (character, style))
+            })
+            .collect()
+    }
+
+    /// Runs wrapped at `width`, at a space and nowhere else a word goes on: a change of style
+    /// inside a word, or the `(` before a code span, is no place to break.
+    fn prose(
+        &self,
+        runs: &[markdown::OwnedCompound],
+        base: Style,
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        self.characters(runs, base)
+            .split(|(character, _)| *character == '\n')
+            .flat_map(|row| fold_characters(row, width, Breaks::Words))
+            .collect()
+    }
+
+    fn code(&self, rows: &[String], language: Option<&str>, width: usize) -> Vec<Line<'static>> {
+        let lines = if self.highlight {
+            code_lines(rows, language)
+        } else {
+            rows.iter()
+                .map(|row| Line::from(Span::styled(row.clone(), self.code_block)))
+                .collect()
+        };
+        // Folded at the edge rather than clipped there, as the terminal folds a one-shot's output:
+        // at a column, never at a space, because a code row's spaces are content and its
+        // indentation is where a break at a space would land.
+        lines
+            .iter()
+            .flat_map(|row| wrap_line_at_columns(row, width))
+            .collect()
+    }
+
+    /// A list's items, each behind its marker with its blocks hanging at the marker's width: a
+    /// bullet, or a number right-aligned to the widest in the list, as a browser draws one.
+    fn list(
+        &self,
+        start: Option<u64>,
+        loose: bool,
+        items: &[Vec<markdown::Block>],
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        let markers: Vec<Span<'static>> = match start {
+            Some(first) => {
+                let number = |index: usize| first.saturating_add(index as u64);
+                let widest = format!("{}.", number(items.len().saturating_sub(1))).len();
+                (0..items.len())
+                    .map(|index| {
+                        Span::styled(
+                            format!("{:>widest$} ", format!("{}.", number(index))),
+                            self.text,
+                        )
+                    })
+                    .collect()
+            }
+            None => vec![Span::styled(format!("{BULLET} "), self.structure); items.len()],
+        };
+        let mut rows = Vec::new();
+        for (item, marker) in items.iter().zip(markers) {
+            if loose && !rows.is_empty() {
+                rows.push(Line::default());
+            }
+            let indent = display_width(&marker.content);
+            if width < indent + MIN_NESTED_WIDTH {
+                rows.push(Line::from(marker));
+                rows.extend(self.blocks(item, width, !loose));
+                continue;
+            }
+            let item_rows = self.blocks(item, width - indent, !loose);
+            if item_rows.is_empty() {
+                rows.push(Line::from(marker));
+                continue;
+            }
+            let pad = Span::raw(" ".repeat(indent));
+            for (index, mut row) in item_rows.into_iter().enumerate() {
+                if index == 0 {
+                    row.spans.insert(0, marker.clone());
+                } else if !is_blank(&row) {
+                    row.spans.insert(0, pad.clone());
+                }
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    /// A table, its columns fitted to the width: as wide as their widest cells when those fit,
+    /// else each as wide as its longest word where those fit, the rest shared by how much more
+    /// each column holds, so an identifier stays whole while the prose beside it wraps. A cell
+    /// wraps in its column as prose does, and a header cell is centered unless its column says
+    /// otherwise, as a browser draws one. Columns too many for the width are drawn a row at a
+    /// time.
+    fn table(&self, table: &markdown::Table, width: usize) -> Vec<Line<'static>> {
+        let columns = table.alignments.len();
+        let rows: Vec<(bool, &Vec<Vec<markdown::OwnedCompound>>)> = table
+            .head
+            .iter()
+            .map(|row| (true, row))
+            .chain(table.rows.iter().map(|row| (false, row)))
+            .collect();
+        let gaps = TABLE_GAP * columns.saturating_sub(1);
+        if columns == 0 || width < gaps + columns {
+            let mut lines = Vec::new();
+            for (_, row) in &rows {
+                let mut runs = Vec::new();
+                for (index, cell) in row.iter().enumerate() {
+                    if index > 0 {
+                        runs.push(markdown::OwnedCompound {
+                            text: " · ".to_string(),
+                            ..markdown::OwnedCompound::default()
+                        });
+                    }
+                    runs.extend(cell.iter().cloned());
+                }
+                lines.extend(self.prose(&runs, self.text, width));
+            }
+            return lines;
+        }
+        let cells: Vec<Vec<Vec<(char, Style)>>> = rows
+            .iter()
+            .map(|(_, row)| {
+                (0..columns)
+                    .map(|column| {
+                        row.get(column)
+                            .map(|cell| self.characters(cell, self.text))
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .collect();
+        let widest = |measure: fn(&[(char, Style)]) -> usize| -> Vec<usize> {
+            (0..columns)
+                .map(|column| {
+                    cells
+                        .iter()
+                        .filter_map(|row| row.get(column))
+                        .map(|cell| measure(cell))
+                        .max()
+                        .unwrap_or(0)
+                        .max(1)
+                })
+                .collect()
+        };
+        let widths = fit_columns(
+            &widest(characters_width),
+            &widest(longest_unbreakable),
+            width - gaps,
+        );
+        let gap = Span::raw(" ".repeat(TABLE_GAP));
+        let mut lines = Vec::new();
+        for ((head, _), row) in rows.iter().zip(&cells) {
+            let wrapped: Vec<Vec<Line<'static>>> = row
+                .iter()
+                .zip(&widths)
+                .map(|(cell, &column_width)| {
+                    if cell.is_empty() {
+                        Vec::new()
+                    } else {
+                        fold_characters(cell, column_width, Breaks::Words)
+                    }
+                })
+                .collect();
+            let height = wrapped.iter().map(Vec::len).max().unwrap_or(0).max(1);
+            for index in 0..height {
+                let mut spans = Vec::new();
+                for (column, (cell, &column_width)) in wrapped.iter().zip(&widths).enumerate() {
+                    if column > 0 {
+                        spans.push(gap.clone());
+                    }
+                    let alignment = match table.alignments.get(column) {
+                        Some(pulldown_cmark::Alignment::None) | None if *head => {
+                            pulldown_cmark::Alignment::Center
+                        }
+                        Some(alignment) => *alignment,
+                        None => pulldown_cmark::Alignment::None,
+                    };
+                    let row = cell.get(index).cloned().unwrap_or_default();
+                    spans.extend(aligned(row, column_width, alignment).spans);
+                }
+                lines.push(Line::from(spans));
+            }
+            if *head {
+                let rule: Vec<String> = widths
+                    .iter()
+                    .map(|&column_width| TABLE_RULE.to_string().repeat(column_width))
+                    .collect();
+                lines.push(Line::from(Span::styled(
+                    rule.join(&" ".repeat(TABLE_GAP)),
+                    self.structure,
+                )));
+            }
+        }
+        lines
+    }
+
+    /// A quote's blocks behind its bar on every row, the blank ones between its blocks included.
+    fn quote(&self, blocks: &[markdown::Block], width: usize) -> Vec<Line<'static>> {
+        let bar = Span::styled(QUOTE_BAR.to_string(), self.quote_bar);
+        let indent = display_width(&bar.content) + 1;
+        if width < indent + MIN_NESTED_WIDTH {
+            return self.blocks(blocks, width, false);
+        }
+        self.blocks(blocks, width - indent, false)
+            .into_iter()
+            .map(|mut row| {
+                if is_blank(&row) {
+                    return Line::from(bar.clone());
+                }
+                row.spans.insert(0, Span::raw(" "));
+                row.spans.insert(0, bar.clone());
+                row
+            })
+            .collect()
+    }
+}
+
+/// Each column's width, `available` shared among them: the widest cells when they fit; else each
+/// column's longest word first and what is left by how much more each column holds; else, when
+/// even the longest words do not fit, those cut down widest first.
+fn fit_columns(natural: &[usize], shortest: &[usize], available: usize) -> Vec<usize> {
+    if natural.iter().sum::<usize>() <= available {
+        return natural.to_vec();
+    }
+    let floor: usize = shortest.iter().sum();
+    if floor > available {
+        return capped(shortest, available);
+    }
+    let wants: Vec<usize> = natural
+        .iter()
+        .zip(shortest)
+        .map(|(natural, shortest)| natural.saturating_sub(*shortest))
+        .collect();
+    shortest
+        .iter()
+        .zip(apportion_extra(available - floor, &wants))
+        .map(|(shortest, extra)| shortest + extra)
+        .collect()
+}
+
+/// `widths` cut to fit `available` widest first: each to the largest width at which they all fit,
+/// a narrower one keeping its own, so a column whose longest word is too wide gives up the excess
+/// and the others keep their words whole. The columns the cut leaves over go back to the columns
+/// cut, one each.
+fn capped(widths: &[usize], available: usize) -> Vec<usize> {
+    let total = |cap: usize| widths.iter().map(|width| (*width).min(cap)).sum::<usize>();
+    let mut cap = widths.iter().copied().max().unwrap_or(0);
+    while cap > 1 && total(cap) > available {
+        cap -= 1;
+    }
+    let mut left = available.saturating_sub(total(cap));
+    widths
+        .iter()
+        .map(|&width| {
+            let mut fitted = width.min(cap);
+            if fitted < width && left > 0 {
+                fitted += 1;
+                left -= 1;
+            }
+            fitted
+        })
+        .collect()
+}
+
+/// `total` shared in proportion to `weights`, nothing to a weight of zero, the columns rounding
+/// leaves over going to the largest remainders.
+fn apportion_extra(total: usize, weights: &[usize]) -> Vec<usize> {
+    let sum: usize = weights.iter().sum();
+    if sum == 0 {
+        return vec![0; weights.len()];
+    }
+    let mut shares: Vec<usize> = weights.iter().map(|weight| total * weight / sum).collect();
+    let mut left = total - shares.iter().sum::<usize>();
+    let mut by_remainder: Vec<usize> = (0..weights.len()).collect();
+    by_remainder.sort_by_key(|&index| {
+        std::cmp::Reverse(total * weights.get(index).copied().unwrap_or(0) % sum)
+    });
+    for index in by_remainder {
+        if left == 0 {
+            break;
+        }
+        if let (Some(share), Some(weight)) = (shares.get_mut(index), weights.get(index))
+            && *weight > 0
+        {
+            *share += 1;
+            left -= 1;
+        }
+    }
+    shares
+}
+
+fn characters_width(characters: &[(char, Style)]) -> usize {
+    character_columns(characters).into_iter().sum()
+}
+
+/// The columns each character takes: a grapheme cluster's on its first character and none on the
+/// rest, measured as [`display_width`] measures, so an emoji its presentation selector widens is
+/// as wide as a terminal draws it.
+fn character_columns(characters: &[(char, Style)]) -> Vec<usize> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let text: String = characters.iter().map(|(character, _)| character).collect();
+    let mut columns = vec![0; characters.len()];
+    let mut index = 0;
+    for cluster in text.graphemes(true) {
+        if let Some(slot) = columns.get_mut(index) {
+            *slot = display_width(cluster);
+        }
+        index += cluster.chars().count();
+    }
+    columns
+}
+
+/// The widest run of `characters` no row may break inside: a word between spaces, or less where
+/// it holds ideographs to break between.
+fn longest_unbreakable(characters: &[(char, Style)]) -> usize {
+    let breaks = ideographic_breaks(characters);
+    let columns = character_columns(characters);
+    let mut longest = 0;
+    let mut current = 0;
+    for (index, (character, _)) in characters.iter().enumerate() {
+        if *character == ' ' {
+            current = 0;
+            continue;
+        }
+        if breaks.get(index) == Some(&true) {
+            current = 0;
+        }
+        current += columns.get(index).copied().unwrap_or(0);
+        longest = longest.max(current);
+    }
+    longest
+}
+
+/// `row` padded to `width` on the side `alignment` leaves free.
+fn aligned(
+    row: Line<'static>,
+    width: usize,
+    alignment: pulldown_cmark::Alignment,
+) -> Line<'static> {
+    let free = width.saturating_sub(
+        row.spans
+            .iter()
+            .map(|span| display_width(&span.content))
+            .sum(),
+    );
+    let left = match alignment {
+        pulldown_cmark::Alignment::Center => free / 2,
+        pulldown_cmark::Alignment::Right => free,
+        pulldown_cmark::Alignment::Left | pulldown_cmark::Alignment::None => 0,
+    };
+    let mut spans = vec![Span::raw(" ".repeat(left))];
+    spans.extend(row.spans);
+    spans.push(Span::raw(" ".repeat(free - left)));
+    Line::from(spans)
 }
 
 pub(crate) fn is_blank(line: &Line<'static>) -> bool {
@@ -324,8 +653,8 @@ pub(crate) fn code_lines(body: &[String], language: Option<&str>) -> Vec<Line<'s
 }
 
 /// A syntect style as a ratatui one, decoding the palette the code theme encodes: foreground
-/// only, for the reason the skins drop their backgrounds, which is that a hardcoded dark
-/// background fights any terminal not already using one.
+/// only, for the reason no look has a background, which is that a hardcoded dark background
+/// fights any terminal not already using one.
 fn syntect_style(style: syntect::highlighting::Style) -> Style {
     match palette_slot(style.foreground) {
         Some(slot) => Style::default().fg(Color::Indexed(slot)),
@@ -372,19 +701,28 @@ pub(crate) fn plain_lines(text: &str, width: usize, style: Style) -> Vec<Line<'s
 /// inside a word otherwise, every character keeping the style it came with. What the terminal
 /// would otherwise clip at the right edge is what this keeps.
 pub(crate) fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
-    fold_line(line, width, true)
+    fold_line(line, width, Breaks::Spaces)
 }
 
 /// [`wrap_line`] breaking at a column only, every space kept: for text whose spaces are content,
 /// such as a code row, where a break at a space would land on its indentation.
 pub(crate) fn wrap_line_at_columns(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
-    fold_line(line, width, false)
+    fold_line(line, width, Breaks::Columns)
 }
 
-/// The rows of `line` within `width`, broken at the last space in a row when `at_spaces` and at the
-/// column otherwise.
-fn fold_line(line: &Line<'static>, width: usize, at_spaces: bool) -> Vec<Line<'static>> {
-    let width = width.max(1);
+/// Where a row may break.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Breaks {
+    /// At a column only, every space kept.
+    Columns,
+    /// At a space, which is drawn on neither row.
+    Spaces,
+    /// At a space, with every space around the break dropped: prose, where a space at either end
+    /// of a row is nothing to read.
+    Words,
+}
+
+fn fold_line(line: &Line<'static>, width: usize, breaks: Breaks) -> Vec<Line<'static>> {
     let characters: Vec<(char, Style)> = line
         .spans
         .iter()
@@ -395,39 +733,120 @@ fn fold_line(line: &Line<'static>, width: usize, at_spaces: bool) -> Vec<Line<'s
                 .collect::<Vec<_>>()
         })
         .collect();
+    fold_characters(&characters, width, breaks)
+}
+
+/// The rows of `characters` within `width`, broken where `breaks` allows, and inside a word where
+/// no break falls in a row.
+fn fold_characters(
+    characters: &[(char, Style)],
+    width: usize,
+    breaks: Breaks,
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
     if characters.is_empty() {
         return vec![Line::default()];
     }
+    let is_space = |index: usize| {
+        characters
+            .get(index)
+            .is_some_and(|(character, _)| *character == ' ')
+    };
+    let ideographic = if breaks == Breaks::Words {
+        ideographic_breaks(characters)
+    } else {
+        Vec::new()
+    };
+    let starts_a_row = |index: usize| ideographic.get(index) == Some(&true);
+    let widths = character_columns(characters);
     let mut rows = Vec::new();
     let mut start = 0;
     while start < characters.len() {
         let mut end = start;
         let mut columns = 0;
-        let mut last_space = None;
+        // Where the row would end and the next one start, at the last break that fits.
+        let mut last_break = None;
         while let Some((character, _)) = characters.get(end) {
-            let advance = crate::text::char_width(*character);
+            let advance = widths.get(end).copied().unwrap_or(0);
             if columns + advance > width && end > start {
                 break;
             }
-            if at_spaces && *character == ' ' {
-                last_space = Some(end);
+            if *character == ' ' {
+                last_break = Some((end, end + 1));
+            } else if end > start && starts_a_row(end) {
+                last_break = Some((end, end));
             }
             columns += advance;
             end += 1;
         }
-        let (row_end, next) = if end < characters.len() && last_space.is_some_and(|at| at > start) {
-            // The space is where the row breaks, and it is not drawn on either side.
-            let at = last_space.unwrap_or(end);
-            (at, at + 1)
+        let (mut row_end, mut next) = if end == characters.len() || breaks == Breaks::Columns {
+            (end, end)
+        } else if is_space(end) {
+            // The row is full up to a space, which is the break.
+            (end, end + 1)
+        } else if starts_a_row(end) {
+            (end, end)
+        } else if let Some((at, after)) = last_break.filter(|&(at, _)| at > start) {
+            (at, after)
         } else {
             (end, end)
         };
-        rows.push(join_characters(
-            characters.get(start..row_end).unwrap_or_default(),
-        ));
+        if breaks == Breaks::Words {
+            while row_end > start && is_space(row_end - 1) {
+                row_end -= 1;
+            }
+            while is_space(next) {
+                next += 1;
+            }
+        }
+        // A row of spaces alone, trimmed to nothing, goes with the break.
+        if row_end > start || breaks != Breaks::Words {
+            rows.push(join_characters(
+                characters.get(start..row_end).unwrap_or_default(),
+            ));
+        }
         start = next;
     }
+    if rows.is_empty() {
+        rows.push(Line::default());
+    }
     rows
+}
+
+/// Where a row may start with no space before it, by index: beside an ideograph, wherever the
+/// Unicode line-breaking algorithm (UAX #14) allows a break, which keeps a closing mark such as
+/// `，` off the start of a row. Only there: the same algorithm breaks after a hyphen or a slash,
+/// which would split an identifier or a path a reader copies, and a terminal breaks those at
+/// spaces. Hangul is left to its spaces, which Korean is written with.
+fn ideographic_breaks(characters: &[(char, Style)]) -> Vec<bool> {
+    use unicode_linebreak::{BreakClass, BreakOpportunity, break_property, linebreaks};
+    let mut starts = vec![false; characters.len()];
+    if characters.iter().all(|(character, _)| character.is_ascii()) {
+        return starts;
+    }
+    let is_ideographic = |index: usize| {
+        characters.get(index).is_some_and(|(character, _)| {
+            matches!(
+                break_property(u32::from(*character)),
+                BreakClass::Ideographic | BreakClass::ConditionalJapaneseStarter
+            )
+        })
+    };
+    let text: String = characters.iter().map(|(character, _)| character).collect();
+    let offsets: Vec<usize> = text.char_indices().map(|(offset, _)| offset).collect();
+    for (offset, opportunity) in linebreaks(&text) {
+        if opportunity != BreakOpportunity::Allowed {
+            continue;
+        }
+        if let Ok(index) = offsets.binary_search(&offset)
+            && index > 0
+            && (is_ideographic(index - 1) || is_ideographic(index))
+            && let Some(start) = starts.get_mut(index)
+        {
+            *start = true;
+        }
+    }
+    starts
 }
 
 /// Characters back into spans, one span per run of one style.
@@ -582,16 +1001,7 @@ pub(crate) fn thinking_row(
     // screen's own.
     let mut preview = Vec::new();
     for run in thinking_preview_runs(thinking) {
-        let mut style = gray();
-        if run.bold {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if run.italic {
-            style = style.add_modifier(Modifier::ITALIC);
-        }
-        if run.strikeout {
-            style = style.add_modifier(Modifier::CROSSED_OUT);
-        }
+        let style = REASONING.run_style(REASONING.text, &run);
         preview.push(Span::styled(run.text, style));
     }
     spans.extend(cut_spans(preview, budget));
@@ -1078,6 +1488,200 @@ mod tests {
         assert!(rows.iter().all(|row| display_width(row) <= 30), "{rows:?}");
     }
 
+    /// A code block is drawn as written whatever opens it: a `#` line in a tilde fence or in an
+    /// indented block is code, not a heading owed a blank row.
+    #[test]
+    fn a_code_block_s_rows_are_drawn_as_written() {
+        assert_eq!(
+            plain(&markdown_lines("~~~sh\n# comment\necho hi\n~~~\n", 40)),
+            vec!["# comment", "echo hi"]
+        );
+        assert_eq!(
+            plain(&markdown_lines("    # indented\n    echo\n", 40)),
+            vec!["# indented", "echo"]
+        );
+    }
+
+    /// Prose never draws a row of nothing: spaces wider than the width, as an indented line of
+    /// raw HTML can open with, go with the break.
+    #[test]
+    fn prose_draws_no_empty_row() {
+        let rows = plain(&markdown_lines(
+            "<div>\n                              <span>inner</span>\n</div>\n",
+            MIN_OUTPUT_WIDTH,
+        ));
+        assert!(rows.iter().all(|row| !row.is_empty()), "{rows:?}");
+    }
+
+    /// An item hangs under its own text whatever its marker, a number right-aligned to the widest
+    /// in its list as a bullet does, and every block nested in it hangs there too: a list, a
+    /// paragraph after that list, a fenced block.
+    #[test]
+    fn a_wrapped_item_hangs_under_its_text_and_so_do_its_blocks() {
+        let rows = plain(&markdown_lines(
+            "9. nine\n10. a tenth item whose text runs past the width it is laid out at\n",
+            30,
+        ));
+        assert_eq!(rows, vec![
+            " 9. nine",
+            "10. a tenth item whose text",
+            "    runs past the width it is",
+            "    laid out at",
+        ]);
+        let rows = plain(&markdown_lines(
+            "1. one\n   - a nested bullet that runs past the width\n\n   a later paragraph of the \
+             item\n\n   ```sh\n   echo hi\n   ```\n",
+            30,
+        ));
+        assert_eq!(rows, vec![
+            "1. one",
+            "",
+            "   • a nested bullet that runs",
+            "     past the width",
+            "",
+            "   a later paragraph of the",
+            "   item",
+            "",
+            "   echo hi",
+        ]);
+    }
+
+    /// A row breaks at a space and nowhere else a word goes on: not between `(` and the code span
+    /// it opens, however the style changes there.
+    #[test]
+    fn a_change_of_style_inside_a_word_is_no_place_to_break() {
+        let rows = plain(&markdown_lines(
+            "falls back by design (`xdp-portal-config.c` in it).\n",
+            30,
+        ));
+        assert_eq!(rows, vec![
+            "falls back by design",
+            "(xdp-portal-config.c in it)."
+        ]);
+    }
+
+    /// A row that fills the width up to a space breaks at that space, not at the one before it.
+    #[test]
+    fn a_row_full_up_to_a_space_breaks_at_that_space() {
+        assert_eq!(plain(&wrap_line(&Line::from("aaa bbb ccc"), 7)), vec![
+            "aaa bbb", "ccc"
+        ]);
+        assert_eq!(
+            plain(&markdown_lines("aaaaaaaaa bbbbbbbbbb ccc\n", 20)),
+            vec!["aaaaaaaaa bbbbbbbbbb", "ccc"]
+        );
+    }
+
+    /// A quote's bar is on every row of what it holds: a list in it, and the blank between its
+    /// blocks.
+    #[test]
+    fn a_quote_bars_every_row_it_holds() {
+        let rows = plain(&markdown_lines(
+            "> A quote.\n>\n> - an item in it that runs past the width\n",
+            30,
+        ));
+        assert_eq!(rows, vec![
+            "▐ A quote.",
+            "▐",
+            "▐ • an item in it that runs",
+            "▐   past the width",
+        ]);
+    }
+
+    /// A link's destination follows its text unless the text is the destination: an autolink, an
+    /// email and a link written with its own URL as its text each show it once, and an image
+    /// inside a link shows its own and the link's.
+    #[test]
+    fn a_link_shows_its_destination_once() {
+        let rows = plain(&markdown_lines(
+            "<https://a.example> [https://b.example](https://b.example) <me@c.example> \
+             [docs](https://d.example)\n",
+            200,
+        ));
+        assert_eq!(rows, vec![
+            "https://a.example https://b.example me@c.example docs (https://d.example)"
+        ]);
+        assert_eq!(
+            plain(&markdown_lines(
+                "[![build](https://e.example/badge.svg)](https://e.example)\n",
+                200
+            )),
+            vec!["build (https://e.example/badge.svg) (https://e.example)"],
+            "a linked image shows where both go"
+        );
+        assert_eq!(
+            plain(&markdown_lines("see [](https://f.example) here\n", 200)),
+            vec!["see https://f.example here"],
+            "a link with no text shows its destination as its text"
+        );
+    }
+
+    /// Text written without spaces breaks between its characters where the Unicode line-breaking
+    /// algorithm allows, so a row is filled rather than left with the word before it; a closing
+    /// mark never starts a row, so the character before it goes down with it.
+    #[test]
+    fn ideographic_text_breaks_between_its_characters() {
+        let rows = plain(&markdown_lines(
+            "Wide: 中文字符的换行测试，这是一段很长的中文文本。\n",
+            24,
+        ));
+        assert_eq!(rows, vec![
+            "Wide: 中文字符的换行测",
+            "试，这是一段很长的中文文",
+            "本。"
+        ]);
+    }
+
+    /// An emoji a presentation selector widens is measured as a terminal draws it, two columns,
+    /// so no row of them is wider than its width, in prose or in a table.
+    #[test]
+    fn an_emoji_is_measured_as_it_is_drawn() {
+        for source in [
+            format!("{}\n", "\u{26a0}\u{fe0f} ".repeat(10)),
+            "| \u{2714}\u{fe0f} done | b |\n|---|---|\n| x | y |\n".to_string(),
+        ] {
+            for lines in [markdown_lines(&source, 20), thinking_lines(&source, 20)] {
+                for row in plain(&lines) {
+                    assert!(display_width(&row) <= 20, "{row:?}");
+                }
+            }
+        }
+        let rows = plain(&markdown_lines(
+            "| \u{2714}\u{fe0f} done | b |\n|---|---|\n| x | y |\n",
+            40,
+        ));
+        assert_eq!(
+            display_width(&rows[0]),
+            display_width(&rows[1]),
+            "the header and its rule are as wide: {rows:?}"
+        );
+    }
+
+    /// No row is wider than the width it was laid out at, however deep its nesting: past the
+    /// depth an indent leaves room for, an item's marker takes a row of its own and a quote drops
+    /// its bar, and the blocks keep the width.
+    #[test]
+    fn no_row_is_wider_than_its_width_however_deep_the_nesting() {
+        let mut source = String::new();
+        for depth in 0..12 {
+            source.push_str(&format!(
+                "{}- level {depth} with a few words to wrap\n",
+                "  ".repeat(depth)
+            ));
+        }
+        source.push_str("\n> > > > > > > > > > a deeply quoted line of words\n");
+        for width in MIN_OUTPUT_WIDTH..=40 {
+            for lines in [
+                markdown_lines(&source, width),
+                thinking_lines(&source, width),
+            ] {
+                for row in plain(&lines) {
+                    assert!(display_width(&row) <= width, "{width}: {row:?}");
+                }
+            }
+        }
+    }
+
     /// A fenced block is highlighted by its language rather than painted flat, and the fence lines
     /// themselves are not shown as text.
     /// A fenced row wider than the width folds at the width with every character kept: a code
@@ -1235,13 +1839,15 @@ mod tests {
             WARNING_GLYPH,
             ERROR_GLYPH,
             CONNECTOR,
-            TABLE_GAP,
             crate::host::tui::view::BACK_TO_BOTTOM,
         ] {
             assert!(
                 !glyph.chars().any(is_emoji_range),
                 "{glyph:?} would draw as a picture"
             );
+        }
+        for glyph in [BULLET, QUOTE_BAR, RULE, TABLE_RULE] {
+            assert!(!is_emoji_range(glyph), "{glyph:?} would draw as a picture");
         }
         use crate::checklist::{ChecklistItem, ChecklistStatus};
         let items: Vec<ChecklistItem> = [
@@ -1287,9 +1893,8 @@ mod tests {
         assert_eq!(span.style.fg, None, "{heading:?}");
     }
 
-    /// A table is laid out with two columns between its cells, a rule under each header cell,
-    /// nothing at its edges, and no bars; one that would not fit widened keeps one column
-    /// between cells, every row of it alike.
+    /// A table is laid out with two columns between its cells, a rule under each header cell and
+    /// nothing at its edges, a header cell centered over its column.
     #[test]
     fn a_table_has_a_gap_between_its_cells_and_a_rule_under_its_header() {
         let rows = plain(&markdown_lines(
@@ -1301,28 +1906,46 @@ mod tests {
             vec!["Area   State", "─────  ─────", "Build  green"],
             "{rows:?}"
         );
-        assert!(
-            rows.iter()
-                .all(|row| !row.contains(['\u{E000}', '\u{E001}', '\u{E002}'])),
-            "no border character reaches the screen: {rows:?}"
-        );
-        let tight = plain(&markdown_lines(
-            "| Area | State |\n|---|---|\n| Build | green |\n",
-            MIN_OUTPUT_WIDTH,
+    }
+
+    /// A table too wide for the width gives each column its longest word first, so an identifier
+    /// stays whole and the prose beside it wraps, at spaces, in what is left; a word too wide for
+    /// any column gives up its own columns, not the words beside it.
+    #[test]
+    fn a_table_too_wide_keeps_its_words_whole() {
+        let rows = plain(&markdown_lines(
+            "| Key | What it does |\n|---|---|\n| `session.context_window` | The window a session \
+             is measured against |\n",
+            40,
         ));
-        let widths: std::collections::BTreeSet<usize> =
-            tight.iter().map(|row| display_width(row)).collect();
-        assert_eq!(
-            widths.len(),
-            1,
-            "every row of a table is as wide as the rest: {tight:?}"
-        );
-        assert!(
-            tight
-                .iter()
-                .all(|row| display_width(row) <= MIN_OUTPUT_WIDTH),
-            "{tight:?}"
-        );
+        assert_eq!(rows, vec![
+            "         Key              What it does",
+            "──────────────────────  ────────────────",
+            "session.context_window  The window a",
+            "                        session is",
+            "                        measured against",
+        ]);
+        let rows = plain(&markdown_lines(
+            "| Link | Note |\n|---|---|\n| https://example.com/a/very/long/path/that/goes/on/and/on | \
+             describing everything here |\n",
+            40,
+        ));
+        for word in ["describing", "everything"] {
+            assert!(
+                rows.iter().any(|row| row.contains(word)),
+                "a word that fits its column stays whole beside one too wide for it: {rows:?}"
+            );
+        }
+        for width in MIN_OUTPUT_WIDTH..=40 {
+            let rows = plain(&markdown_lines(
+                "| a | b | c |\n|---|---|---|\n| one two | three four five | six |\n",
+                width,
+            ));
+            assert!(
+                rows.iter().all(|row| display_width(row) <= width),
+                "{width}: {rows:?}"
+            );
+        }
     }
 
     /// Reasoning is one gray throughout, code included, so it reads as a footnote beside the

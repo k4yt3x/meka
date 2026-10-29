@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The screen draws a line as markdown while it streams, not as raw text until the line ends.
+- A table's columns fit by word: an identifier stays whole while the prose beside it wraps.
+- Turns `/rewind` drops leave the screen, on a resume too, and its row counts turns.
+
+### Fixed
+
+- A wrapped list item, numbered or nested, continues under its own text rather than at the edge.
+- The screen no longer breaks a line inside a word, as between `(` and the code span it opens.
+- A paragraph after a nested list stays in its item instead of being drawn as a bullet.
+- A list or code block inside a quote or a list item keeps the quote's bar and the item's indent.
+- A link shows its URL once, as its text when it has none, and a linked image shows both URLs.
+- Chinese and Japanese text wraps between characters, and a closing mark never starts a row.
+- A row that fills the width exactly up to a space no longer breaks one word early.
+- A `#` line in a `~~~` or indented code block no longer gets a blank row after it.
+- A resume shows a joined prompt once, and a refused one as it was, with no `Rewound` row.
+- An emoji its presentation selector widens no longer pushes a row past the window's edge.
+- Resizing the window no longer flashes a blank screen: the new layout is ready before the repaint.
+
 ### Security
 
 - RUSTSEC-2026-0414: `pulldown-cmark` moves to 0.13.5.

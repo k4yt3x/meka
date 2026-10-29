@@ -23,8 +23,8 @@ in context, the model's window, the share used), and `2 background tasks` and `1
 any run.
 [`display.status_row`](../configuration/config-file.md#displaystatus_row) picks the
 facts after the level and their order, and can add the profile's model. Type and press **Enter**. What you sent stays on the transcript behind the same `>` in the same gray
-block, in white, and the answer streams in under it as it arrives, word by word, settling into
-rendered markdown as each line completes.
+block, in white, and the answer streams in under it as it arrives, word by word, as rendered
+markdown: a list item hangs under its marker, and a table's columns fit the window.
 
 While the agent works, a row of its own appears above the composer, under the blank line that
 always keeps the conversation off it: a spinner in column 0, then what the agent is doing
@@ -164,8 +164,9 @@ The screen opens on the last page of the session's log and reads the page above 
 scroll near the top, so a resumed session shows its last turns at once and the first scroll up
 reaches the ones before, however far back the session goes. What is held is bounded: scrolling far
 up lets the newest pages go, and scrolling back down reads them again; returning to the bottom
-always shows the end of the log with this run's rows after it. Older history shows what the log
-holds, with a row for each compaction, in the words it was announced with, and each rewind.
+always shows the end of the log with this run's rows after it. Older history shows the
+conversation the log records, with a row for each compaction, in the words it was announced with;
+the turns a [rewind](#rewind) dropped are left out, and one row in their place says how many went.
 
 The screen captures the mouse so that the wheel, a click and a drag reach it. Dragging over the
 transcript selects the text it covers, and releasing copies it: to the terminal's own clipboard
@@ -343,9 +344,9 @@ Every compaction, this command's and the automatic ones, leaves a dim row saying
 
 ### `/rewind`
 
-`/rewind` drops the most recent turn from the conversation, so the model no longer sees it or your prompt that started it. `/rewind N` drops the last `N`. The cut always lands on a turn boundary, so a tool call is never separated from its result. A compaction summary opens a turn of its own, so rewinding past everything after a compaction takes the summary with it and leaves the conversation empty; the turns it replaced stay behind the boundary on disk.
+`/rewind` drops the most recent turn from the conversation, so the model no longer sees it or your prompt that started it. `/rewind N` drops the last `N`. The cut always lands on a turn boundary, so a tool call is never separated from its result. A compaction summary opens a turn of its own, so rewinding past everything after a compaction takes the summary with it and leaves the conversation empty; the turns it replaced stay behind the boundary on disk, and leave the screen with the summary that stood for them.
 
-Like `/compact`, nothing is deleted: the dropped turns stay in the event log on disk, and `meka session export` still shows them with a marker where the rewind happened.
+The dropped turns leave the screen too, now and whenever the session is resumed, and one row in their place says how many went. Nothing is deleted, though: like `/compact`, the turns stay in the event log on disk, and `meka session export` still shows them with a marker where the rewind happened.
 
 Use it to take back a prompt that sent the agent down the wrong path without paying for a summary, or to recover a session the provider has started rejecting. meka repairs a rejection it causes itself (see below), but content that entered the conversation earlier is out of its reach; rewinding past it is the way back. `meka session rewind <id>` does the same to a session you are not currently in.
 

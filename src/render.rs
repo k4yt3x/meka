@@ -1,6 +1,6 @@
-//! Rendering the hosts share: the code theme and the skins the screen draws with, both built on the
-//! terminal's own palette, the thinking row's preview, the stage directions a replay stands for,
-//! the status lines, and the helpers for one-off CLI messages.
+//! Rendering the hosts share: the code theme the screen draws with, built on the terminal's own
+//! palette, the thinking row's preview, the stage directions a replay stands for, the status
+//! lines, and the helpers for one-off CLI messages.
 
 use std::{
     io::{self, Write},
@@ -9,13 +9,12 @@ use std::{
 
 mod markdown;
 
-use crossterm::style::{Attribute, Color, Stylize};
+use crossterm::style::{Color, Stylize};
 use syntect::{
     easy::HighlightLines,
     highlighting::Theme,
     parsing::{SyntaxReference, SyntaxSet},
 };
-use termimad::{Alignment, CompoundStyle, MadSkin};
 
 mod history;
 mod output;
@@ -44,54 +43,71 @@ use crate::text::{
 /// narrowest width that still works costs nothing that was not already lost.
 pub(crate) const MIN_OUTPUT_WIDTH: usize = 20;
 
-/// Ensure blank lines after markdown headers and tables when followed by non-empty content. Skips
-/// content inside code fences.
-fn normalize_spacing(text: &str, starts_inside_fence: bool) -> String {
+/// Which fenced code block a run of markdown lines is in, by CommonMark's rule: a fence of three
+/// or more backticks or tildes opens one, and only a run of its own character at least as long
+/// closes it.
+#[derive(Default)]
+struct Fences {
+    open: Option<(char, usize)>,
+}
+
+impl Fences {
+    /// Read the next line, and say whether it belongs to a fenced block, its fences included.
+    fn read(&mut self, line: &str) -> bool {
+        let trimmed = line.trim_start();
+        let run = |marker: char| {
+            trimmed
+                .chars()
+                .take_while(|&character| character == marker)
+                .count()
+        };
+        match self.open {
+            Some((marker, length)) => {
+                if run(marker) >= length && trimmed.trim_start_matches(marker).trim().is_empty() {
+                    self.open = None;
+                }
+                true
+            }
+            None => {
+                self.open = ['`', '~']
+                    .into_iter()
+                    .map(|marker| (marker, run(marker)))
+                    .find(|&(_, length)| length >= 3);
+                self.open.is_some()
+            }
+        }
+    }
+}
+
+/// Whether `markdown` ends inside a fenced code block it has not closed.
+fn ends_inside_a_fence(markdown: &str) -> bool {
+    let mut fences = Fences::default();
+    for line in markdown.lines() {
+        fences.read(line);
+    }
+    fences.open.is_some()
+}
+
+/// `text` with a blank line after each table that a line other than a row follows: GFM reads such
+/// a line as one more row, and a model writing prose straight under a table means a paragraph. The
+/// body of a fenced code block is left as written.
+fn normalize_spacing(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut result = Vec::with_capacity(lines.len());
-    // The caller may already have consumed an opening fence out of the buffer, in which case these
-    // lines are a code-block body even though nothing here says so. Assuming otherwise rewrites the
-    // user's code: a `# comment` line reads as a markdown header and gets a blank line inserted
-    // after it, inside their snippet.
-    let mut in_fence = starts_inside_fence;
-
+    let mut fences = Fences::default();
     for (index, line) in lines.iter().enumerate() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        }
-
         result.push(*line);
-
-        if in_fence {
+        if fences.read(line) {
             continue;
         }
-
-        let next_line = lines.get(index + 1);
-        let next_is_non_empty = next_line.is_some_and(|next| !next.trim().is_empty());
-
-        if !next_is_non_empty {
-            continue;
-        }
-
-        let trimmed = line.trim_start();
-
-        // Blank line after headers (e.g., `## Title`)
-        let is_header = trimmed.starts_with('#')
-            && trimmed
-                .find(|character: char| character != '#')
-                .is_some_and(|position| trimmed.as_bytes().get(position) == Some(&b' '));
-
-        // Blank line after table rows when next line is clearly not a table row. A line starting
-        // with `|` might be an incomplete table row from streaming, so only treat lines NOT
-        // starting with `|` as table-ending.
-        let is_table_end = is_table_line(line)
-            && next_line.is_some_and(|next| !next.trim_start().starts_with('|'));
-
-        if is_header || is_table_end {
+        if is_table_line(line)
+            && lines
+                .get(index + 1)
+                .is_some_and(|next| !next.trim().is_empty() && !next.trim_start().starts_with('|'))
+        {
             result.push("");
         }
     }
-
     let mut output = result.join("\n");
     if text.ends_with('\n') {
         output.push('\n');
@@ -188,74 +204,6 @@ fn code_theme() -> Theme {
         },
         scopes,
     }
-}
-
-/// The skin for an answer: the terminal's own colors, emphasis by weight, the accent on inline
-/// code, structure in gray, and no background behind code, which would fight any terminal not
-/// already using that shade. The screen draws with this skin too, so a one-shot answer and an
-/// interactive one read alike.
-pub(crate) fn quiet_skin() -> MadSkin {
-    let mut strikeout = CompoundStyle::with_attr(Attribute::CrossedOut);
-    strikeout.set_fg(Color::DarkGrey);
-    let mut skin = MadSkin {
-        bold: CompoundStyle::with_attr(Attribute::Bold),
-        italic: CompoundStyle::with_attr(Attribute::Italic),
-        strikeout,
-        // crossterm's `Cyan` is the bright slot; `DarkCyan` is ANSI 6, the accent.
-        inline_code: CompoundStyle::with_fg(Color::DarkCyan),
-        ellipsis: CompoundStyle::with_fg(Color::DarkGrey),
-        ..MadSkin::default()
-    };
-    // A fenced block never reaches termimad (syntect draws it); an indented one does, and takes
-    // the plain foreground.
-    skin.code_block.compound_style = CompoundStyle::default();
-    for header in &mut skin.headers {
-        header.compound_style = CompoundStyle::with_attr(Attribute::Bold);
-        // `MadSkin::default()` centers the first header. Centering a heading mid-transcript reads
-        // as a formatting glitch rather than structure.
-        header.align = Alignment::Left;
-    }
-    skin.bullet.set_fg(Color::DarkGrey);
-    skin.quote_mark.set_fg(Color::DarkGrey);
-    skin.horizontal_rule.set_fg(Color::DarkGrey);
-    skin.table.compound_style = CompoundStyle::with_fg(Color::DarkGrey);
-    skin
-}
-
-/// The skin for a block that must read as a footnote rather than as the answer.
-///
-/// Every element resolves to one color, so emphasis survives only as an attribute: `**a header**`
-/// arrives as bold gray rather than as the theme's heading color. The gray is how reasoning is
-/// told apart from the reply without reading it, which a block painted in the answer's palette
-/// loses.
-///
-/// Built from `MadSkin::default` rather than `default_dark`, because the only thing wanted from the
-/// base is its attributes (`Bold`, `Italic`, `CrossedOut`); every color it ships is overwritten
-/// below. `MadSkin::set_fg` deliberately skips the code and table styles, so those are set by hand.
-fn thinking_skin() -> &'static MadSkin {
-    static THINKING_SKIN: OnceLock<MadSkin> = OnceLock::new();
-    THINKING_SKIN.get_or_init(|| {
-        let mut skin = MadSkin::default();
-        skin.set_fg(Color::DarkGrey);
-        skin.inline_code.set_fg(Color::DarkGrey);
-        skin.code_block.compound_style.set_fg(Color::DarkGrey);
-        skin.table.compound_style.set_fg(Color::DarkGrey);
-        // `MadSkin::default` gives both code styles a gray background. A background is a second
-        // color by another name, and it fights any terminal not already using that shade.
-        skin.inline_code.object_style.background_color = None;
-        skin.code_block.compound_style.object_style.background_color = None;
-        for header in &mut skin.headers {
-            // Same reason as `markdown_skin`: a centered heading mid-transcript reads as a glitch.
-            header.align = Alignment::Left;
-        }
-        skin
-    })
-}
-
-/// A markdown code-fence line, e.g. ```` ```rust ```` or a bare ```` ``` ````. Indentation is
-/// tolerated.
-fn is_code_fence(line: &str) -> bool {
-    line.trim_start().starts_with("```")
 }
 
 /// Extract the language token from an opening code fence: ```` ```rust ````→`Some("rust")`,
@@ -1023,80 +971,48 @@ mod tests {
         assert!(!is_table_line("| no trailing pipe"));
     }
 
+    /// A code block's body is left as written whatever its fence: a tilde fence, and a longer
+    /// backtick fence holding a shorter one, which does not close it.
     #[test]
-    fn normalize_spacing_adds_blank_line() {
-        let input = "## Title\nBody text";
-        let output = normalize_spacing(input, false);
-        assert_eq!(output, "## Title\n\nBody text");
-    }
-
-    #[test]
-    fn normalize_spacing_already_has_blank_line() {
-        let input = "## Title\n\nBody text";
-        let output = normalize_spacing(input, false);
-        assert_eq!(output, "## Title\n\nBody text");
-    }
-
-    #[test]
-    fn normalize_spacing_header_at_end() {
-        let input = "## Title";
-        let output = normalize_spacing(input, false);
-        assert_eq!(output, "## Title");
-    }
-
-    #[test]
-    fn normalize_spacing_inside_code_fence() {
-        let input = "```\n## Not a header\ncode\n```";
-        let output = normalize_spacing(input, false);
-        assert_eq!(output, "```\n## Not a header\ncode\n```");
-    }
-
-    #[test]
-    fn normalize_spacing_multiple_levels() {
-        let input = "# H1\ntext\n### H3\nmore text";
-        let output = normalize_spacing(input, false);
-        assert_eq!(output, "# H1\n\ntext\n### H3\n\nmore text");
-    }
-
-    #[test]
-    fn normalize_spacing_preserves_trailing_newline() {
-        let input = "## Title\nBody\n";
-        let output = normalize_spacing(input, false);
-        assert_eq!(output, "## Title\n\nBody\n");
-    }
-
-    #[test]
-    fn normalize_spacing_no_space_after_hash_is_not_header() {
-        let input = "##not a header\ntext";
-        let output = normalize_spacing(input, false);
-        assert_eq!(output, "##not a header\ntext");
+    fn normalize_spacing_leaves_every_fenced_body_alone() {
+        for input in [
+            "~~~\n| A | B |\ncode\n~~~\n",
+            "````md\n```\n| A | B |\ncode\n```\n````\n",
+        ] {
+            assert_eq!(normalize_spacing(input), input);
+        }
+        assert_eq!(
+            normalize_spacing("~~~\n~~~\n| A |\ntext\n"),
+            "~~~\n~~~\n| A |\n\ntext\n",
+            "a closed fence ends the code"
+        );
     }
 
     #[test]
     fn normalize_spacing_table_then_text() {
         let input = "| A | B |\n|---|---|\n| 1 | 2 |\n> blockquote";
-        let output = normalize_spacing(input, false);
+        let output = normalize_spacing(input);
         assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |\n\n> blockquote");
     }
 
     #[test]
     fn normalize_spacing_table_already_has_blank_line() {
         let input = "| A | B |\n|---|---|\n| 1 | 2 |\n\n> blockquote";
-        let output = normalize_spacing(input, false);
+        let output = normalize_spacing(input);
         assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |\n\n> blockquote");
     }
 
     #[test]
     fn normalize_spacing_table_inside_code_fence() {
         let input = "```\n| A | B |\n| 1 | 2 |\ncode\n```";
-        let output = normalize_spacing(input, false);
+        let output = normalize_spacing(input);
         assert_eq!(output, "```\n| A | B |\n| 1 | 2 |\ncode\n```");
     }
 
     #[test]
     fn normalize_spacing_table_at_end() {
         let input = "| A | B |\n|---|---|\n| 1 | 2 |";
-        let output = normalize_spacing(input, false);
+        let output = normalize_spacing(input);
         assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |");
     }
 

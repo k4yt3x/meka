@@ -74,6 +74,9 @@ pub(crate) enum UiEvent {
         page: crate::store::LogPage,
         /// The session's recorded turns, which close each turn's rows on the replay.
         turns: Vec<crate::store::turns::TurnRecord>,
+        /// The stretches of the log the session's conversation no longer holds, which the replay
+        /// leaves out.
+        rewound: Vec<crate::store::Rewound>,
         /// The window it was read for; the screen drops a read for a window it has let go of.
         generation: u64,
     },
@@ -83,6 +86,10 @@ pub(crate) enum UiEvent {
         page: crate::store::LogPage,
         /// The session's task rows as of the read, for the direction a replayed report says.
         tasks: Vec<crate::store::background::BackgroundTask>,
+        /// The stretches of the log the session's conversation no longer holds, read with the
+        /// first page after the window was reset and with no other: they change only by a
+        /// reload, which reads them again.
+        rewound: Option<Vec<crate::store::Rewound>>,
         /// The window it was read for, as on [`Self::Reloaded`].
         generation: u64,
     },

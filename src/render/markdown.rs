@@ -1,45 +1,15 @@
-//! CommonMark to minimad translation.
+//! CommonMark read into the blocks the screen lays out.
 //!
-//! termimad renders markdown with minimad, whose parser understands a small dialect rather than
-//! CommonMark: only `*`/`**` for emphasis (never `_`/`__`), only `* ` for list items (never `-` or
-//! `+`), no ordered lists, no links, no escapes. Feeding it markdown as models actually write it
-//! meant either accepting mangled output or rewriting the text to fit the dialect, and rewriting is
-//! guesswork that damages content: `snake_case` is not emphasis, and `    - x` may be an indented
-//! code block rather than a list.
-//!
-//! So meka does the parsing. A real CommonMark parser produces the document structure, this module
-//! translates it into the AST minimad would have produced, and termimad still owns everything it is
-//! good at: wrapping, table layout, and the skin. Markers never survive into the rendered text,
-//! because the text handed to termimad carries no markup at all.
-//!
-//! The AST borrows its strings ([`Compound::src`] is a `&str`), so translation happens in two
-//! passes: [`MarkdownDoc::parse`] collects owned lines, and [`MarkdownDoc::to_minimad`] builds the
-//! borrowed view. That keeps the whole thing in safe Rust.
+//! A real CommonMark parser produces the document structure, and this module reads it into a small
+//! tree: paragraphs and headings of styled runs, code rows, lists of items, quotes, tables and
+//! rules. The screen ([`super::tui`]) lays the tree out at a width, which is where nesting becomes
+//! indentation: an item's blocks are laid out narrower by its marker and a quote's by its bar, so
+//! a row that wraps stays under the text it continues. Markers never survive into a run's text,
+//! because a run carries the styles they stood for.
 
-use pulldown_cmark::{
-    Alignment as CmarkAlignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
-};
-use termimad::minimad::{
-    Alignment, Composite, CompositeStyle, Compound, Line, TableRow, TableRule, Text,
-};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-/// A parsed markdown document, owning the text its minimad view borrows.
-pub(super) struct MarkdownDoc {
-    lines: Vec<OwnedLine>,
-}
-
-/// Owned mirror of minimad's [`Line`], holding `String`s where it holds `&str`.
-enum OwnedLine {
-    Composite {
-        style: CompositeStyle,
-        compounds: Vec<OwnedCompound>,
-    },
-    TableRow(Vec<Vec<OwnedCompound>>),
-    TableRule(Vec<Alignment>),
-    HorizontalRule,
-}
-
-/// Owned mirror of minimad's [`Compound`]: a run of text plus the styles covering it.
+/// A run of text plus the styles covering it.
 ///
 /// Readable outside the module because it is also what [`inline_runs`] hands back, for the callers
 /// that lay text out themselves and want only the styling this module resolves.
@@ -52,100 +22,100 @@ pub(super) struct OwnedCompound {
     pub(super) strikeout: bool,
 }
 
-impl OwnedCompound {
-    fn to_minimad(&self) -> Compound<'_> {
-        let mut compound = Compound::raw_str(&self.text);
-        compound.bold = self.bold;
-        compound.italic = self.italic;
-        compound.code = self.code;
-        compound.strikeout = self.strikeout;
-        compound
+/// One block of a document.
+pub(super) enum Block {
+    /// Text that wraps at the width: a paragraph, the text of an item in a tight list, or a block
+    /// of raw HTML. A `\n` in a run is a hard break.
+    Paragraph(Vec<OwnedCompound>),
+    Heading {
+        level: u8,
+        runs: Vec<OwnedCompound>,
+    },
+    /// Rows drawn as written: a fenced or indented code block.
+    Code {
+        language: Option<String>,
+        rows: Vec<String>,
+    },
+    /// `start` is an ordered list's first number, `None` for bullets. A loose list (CommonMark's
+    /// term for one whose items or their blocks the source separates with blank lines) keeps a
+    /// blank between its items and between the blocks of one item.
+    List {
+        start: Option<u64>,
+        loose: bool,
+        items: Vec<Vec<Block>>,
+    },
+    Quote(Vec<Block>),
+    Table(Table),
+    Rule,
+}
+
+/// A table's cells, each a list of runs, and how each column aligns them.
+#[derive(Default)]
+pub(super) struct Table {
+    pub(super) alignments: Vec<Alignment>,
+    pub(super) head: Option<Vec<Vec<OwnedCompound>>>,
+    pub(super) rows: Vec<Vec<Vec<OwnedCompound>>>,
+}
+
+/// `markdown` as blocks.
+pub(super) fn parse(markdown: &str) -> Vec<Block> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let mut builder = Builder::default();
+    for event in Parser::new_ext(markdown, options) {
+        builder.handle(event);
     }
+    builder.finish()
 }
 
 /// The styled runs of `markdown`, with its block structure discarded.
 ///
-/// For a caller that has already flattened its text to one line and does its own layout, so
-/// termimad has nothing left to do: what it wants from this module is only the answer to "which
-/// part of this was emphasis", which is the half a hand-rolled scanner gets wrong. CommonMark
-/// emphasis is context-sensitive enough that `snake_case` and `2 * 3 * 4` both hinge on rules worth
-/// having a real parser for.
+/// For a caller that has already flattened its text to one line and does its own layout: what it
+/// wants from this module is only the answer to "which part of this was emphasis", which is the
+/// half a hand-rolled scanner gets wrong. CommonMark emphasis is context-sensitive enough that
+/// `snake_case` and `2 * 3 * 4` both hinge on rules worth having a real parser for.
 ///
 /// Blocks are concatenated in order with nothing between them, since a caller in this position has
-/// no rows to separate: a heading's text is its runs, and a blank line contributes none.
+/// no rows to separate. An ordered item keeps its number, which the text may refer to; a bullet is
+/// dropped.
 pub(super) fn inline_runs(markdown: &str) -> Vec<OwnedCompound> {
-    MarkdownDoc::parse(markdown)
-        .lines
-        .into_iter()
-        .flat_map(|line| match line {
-            OwnedLine::Composite { compounds, .. } => compounds,
-            OwnedLine::TableRow(cells) => cells.into_iter().flatten().collect(),
-            OwnedLine::TableRule(_) | OwnedLine::HorizontalRule => Vec::new(),
-        })
-        .collect()
-}
-
-fn to_composite(style: CompositeStyle, compounds: &[OwnedCompound]) -> Composite<'_> {
-    Composite {
-        style,
-        compounds: compounds.iter().map(OwnedCompound::to_minimad).collect(),
-    }
-}
-
-impl MarkdownDoc {
-    pub(super) fn parse(markdown: &str) -> Self {
-        let mut options = Options::empty();
-        options.insert(Options::ENABLE_TABLES);
-        options.insert(Options::ENABLE_STRIKETHROUGH);
-        options.insert(Options::ENABLE_TASKLISTS);
-        let mut builder = Builder::default();
-        for event in Parser::new_ext(markdown, options) {
-            builder.handle(event);
-        }
-        builder.finish();
-        let mut lines = builder.lines;
-        // The streaming flush hands over one settled block at a time, so whether this document is
-        // followed by a blank line is knowable only from the source: a chunk cut at a blank line
-        // ends with one and keeps its separator, while the tail drained at end-of-turn does not and
-        // would otherwise render a stray empty line after the last block.
-        if !markdown.ends_with("\n\n") {
-            while matches!(lines.last(), Some(OwnedLine::Composite { compounds, .. }) if compounds.is_empty())
-            {
-                lines.pop();
+    fn collect(blocks: Vec<Block>, runs: &mut Vec<OwnedCompound>) {
+        for block in blocks {
+            match block {
+                Block::Paragraph(text) | Block::Heading { runs: text, .. } => runs.extend(text),
+                Block::Code { rows, .. } => runs.push(OwnedCompound {
+                    text: rows.join(" "),
+                    ..OwnedCompound::default()
+                }),
+                Block::List { start, items, .. } => {
+                    for (index, item) in items.into_iter().enumerate() {
+                        if let Some(first) = start {
+                            runs.push(OwnedCompound {
+                                text: format!("{}. ", first.saturating_add(index as u64)),
+                                ..OwnedCompound::default()
+                            });
+                        }
+                        collect(item, runs);
+                    }
+                }
+                Block::Quote(blocks) => collect(blocks, runs),
+                Block::Table(table) => {
+                    runs.extend(table.head.into_iter().chain(table.rows).flatten().flatten())
+                }
+                Block::Rule => {}
             }
         }
-        Self { lines }
     }
-
-    /// Borrowed minimad view, ready for `FmtText::from_text`.
-    pub(super) fn to_minimad(&self) -> Text<'_> {
-        Text {
-            lines: self
-                .lines
-                .iter()
-                .map(|line| match line {
-                    OwnedLine::Composite { style, compounds } => {
-                        Line::Normal(to_composite(*style, compounds))
-                    }
-                    OwnedLine::TableRow(cells) => Line::TableRow(TableRow {
-                        cells: cells
-                            .iter()
-                            .map(|cell| to_composite(CompositeStyle::Paragraph, cell))
-                            .collect(),
-                    }),
-                    OwnedLine::TableRule(alignments) => Line::TableRule(TableRule {
-                        cells: alignments.clone(),
-                    }),
-                    OwnedLine::HorizontalRule => Line::HorizontalRule,
-                })
-                .collect(),
-        }
-    }
+    let mut runs = Vec::new();
+    collect(parse(markdown), &mut runs);
+    runs
 }
 
 /// Nesting counters rather than booleans: `**a *b* c**` closes the inner emphasis without ending
 /// the outer one, so a boolean would drop the rest of the bold run.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct InlineStyle {
     bold: usize,
     italic: usize,
@@ -153,54 +123,45 @@ struct InlineStyle {
     strikeout: usize,
 }
 
-/// What kind of list a level is, and how far its ordered counter has advanced.
-enum ListLevel {
-    Bullet,
-    /// Ordered lists have no minimad equivalent, so the number is rendered as text and this tracks
-    /// the next one to emit.
-    Ordered(u64),
+/// A container whose events are still arriving.
+enum Open {
+    Quote(Vec<Block>),
+    List {
+        start: Option<u64>,
+        loose: bool,
+        items: Vec<Vec<Block>>,
+    },
+    Item(Vec<Block>),
 }
 
+#[derive(Default)]
 struct Builder {
-    lines: Vec<OwnedLine>,
-    /// Inline runs accumulated for the composite currently being built.
-    compounds: Vec<OwnedCompound>,
-    style: CompositeStyle,
-    inline: InlineStyle,
-    lists: Vec<ListLevel>,
-    /// Paragraphs opened inside the current list item. A loose item (one blank lines separate
-    /// from its neighbors) wraps its text in a paragraph, and that first paragraph is the item:
-    /// giving it a paragraph's style would drop the bullet. Later paragraphs of the same item have
-    /// no minimad shape of their own and render as paragraphs.
-    item_paragraphs: usize,
-    /// Set while inside a blockquote, so paragraphs within it keep the quote styling that minimad
-    /// expresses per line rather than as a container.
-    quote_depth: usize,
+    /// The document's own blocks, outside every container.
+    blocks: Vec<Block>,
+    open: Vec<Open>,
+    /// Inline runs of the text block being read.
+    runs: Vec<OwnedCompound>,
+    /// The level of the heading being read, while one is.
+    heading: Option<u8>,
+    /// The language and body of the code block being read, while one is.
+    code: Option<(Option<String>, String)>,
+    /// The raw HTML block being read, while one is.
+    html: Option<String>,
     table: Option<TableState>,
-    /// Destination of the link currently being built, appended after its text.
-    link_target: Option<String>,
+    inline: InlineStyle,
+    /// The links being read, innermost last: an image inside a link is one.
+    links: Vec<OpenLink>,
 }
 
-impl Default for Builder {
-    fn default() -> Self {
-        Self {
-            lines: Vec::new(),
-            compounds: Vec::new(),
-            style: CompositeStyle::Paragraph,
-            inline: InlineStyle::default(),
-            lists: Vec::new(),
-            item_paragraphs: 0,
-            quote_depth: 0,
-            table: None,
-            link_target: None,
-        }
-    }
+/// A link being read: where it goes, and the text it shows so far.
+struct OpenLink {
+    target: String,
+    shown: String,
 }
 
 #[derive(Default)]
 struct TableState {
-    alignments: Vec<Alignment>,
-    in_head: bool,
+    table: Table,
     row: Vec<Vec<OwnedCompound>>,
     cell: Vec<OwnedCompound>,
 }
@@ -210,78 +171,101 @@ impl Builder {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
-            Event::Text(text) => self.push_text(&text),
+            Event::Text(text) => match &mut self.code {
+                Some((_, body)) => body.push_str(&text),
+                None => self.push_text(&text),
+            },
             Event::Code(text) => {
                 self.inline.code += 1;
                 self.push_text(&text);
                 self.inline.code -= 1;
             }
-            // A soft break is a newline inside one paragraph. Joining with a space is what lets
-            // termimad re-wrap the paragraph to the terminal width instead of preserving whatever
-            // width the model happened to write at.
+            // A soft break is a newline inside one paragraph. Joining with a space is what lets the
+            // paragraph wrap to the terminal's width instead of the one the model wrote at.
             Event::SoftBreak => self.push_text(" "),
-            Event::HardBreak => self.flush_composite(),
+            Event::HardBreak => self.push_text("\n"),
             Event::Rule => {
-                self.flush_composite();
-                self.lines.push(OwnedLine::HorizontalRule);
-                self.push_blank_line();
+                self.flush_text();
+                self.push_block(Block::Rule);
             }
             Event::TaskListMarker(checked) => {
                 self.push_text(if checked { "[x] " } else { "[ ] " });
             }
-            // No minimad equivalent, and dropping them would lose content the model wrote. Raw
-            // text is the honest rendering.
-            Event::Html(text) | Event::InlineHtml(text) => self.push_text(&text),
-            Event::InlineMath(text) | Event::DisplayMath(text) => self.push_text(&text),
+            // Raw text is the honest rendering of what has no terminal form, and dropping it would
+            // lose content the model wrote.
+            Event::Html(text) => match &mut self.html {
+                Some(body) => body.push_str(&text),
+                None => self.push_text(&text),
+            },
+            Event::InlineHtml(text) | Event::InlineMath(text) | Event::DisplayMath(text) => {
+                self.push_text(&text);
+            }
             Event::FootnoteReference(text) => self.push_text(&format!("[{text}]")),
         }
     }
 
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
+            // No flush: an item's task marker arrives ahead of the paragraph it belongs to. A
+            // paragraph directly in an item is what makes its list loose.
             Tag::Paragraph => {
-                if self.lists.is_empty() || self.item_paragraphs > 0 {
-                    self.style = self.block_style();
-                }
-                if !self.lists.is_empty() {
-                    self.item_paragraphs += 1;
+                if matches!(self.open.last(), Some(Open::Item(_)))
+                    && let Some(Open::List { loose, .. }) = self.open.iter_mut().rev().nth(1)
+                {
+                    *loose = true;
                 }
             }
-            Tag::Heading { level, .. } => self.style = CompositeStyle::Header(header_depth(level)),
+            Tag::Heading { level, .. } => {
+                self.flush_text();
+                self.heading = Some(header_depth(level));
+            }
             Tag::BlockQuote(_) => {
-                self.quote_depth += 1;
-                self.style = CompositeStyle::Quote;
+                self.flush_text();
+                self.open.push(Open::Quote(Vec::new()));
             }
-            Tag::CodeBlock(_) => self.style = CompositeStyle::Code,
-            Tag::List(first) => {
-                // A nested list opens while the parent item's own text is still pending. Without
-                // flushing, that text is swallowed into the first child item.
-                self.flush_composite();
-                self.lists.push(match first {
-                    Some(start) => ListLevel::Ordered(start),
-                    None => ListLevel::Bullet,
+            Tag::CodeBlock(kind) => {
+                self.flush_text();
+                let language = match kind {
+                    CodeBlockKind::Fenced(info) => {
+                        super::parse_fence_language(&info).map(str::to_string)
+                    }
+                    CodeBlockKind::Indented => None,
+                };
+                self.code = Some((language, String::new()));
+            }
+            Tag::HtmlBlock => {
+                self.flush_text();
+                self.html = Some(String::new());
+            }
+            // A nested list opens while its parent item's own text is still pending.
+            Tag::List(start) => {
+                self.flush_text();
+                self.open.push(Open::List {
+                    start,
+                    loose: false,
+                    items: Vec::new(),
                 });
             }
-            Tag::Item => self.start_item(),
+            Tag::Item => self.open.push(Open::Item(Vec::new())),
             Tag::Table(alignments) => {
-                self.flush_composite();
+                self.flush_text();
                 self.table = Some(TableState {
-                    alignments: alignments.iter().map(convert_alignment).collect(),
+                    table: Table {
+                        alignments,
+                        ..Table::default()
+                    },
                     ..TableState::default()
                 });
             }
-            Tag::TableHead => {
-                if let Some(table) = &mut self.table {
-                    table.in_head = true;
-                }
-            }
-            Tag::TableRow | Tag::TableCell => {}
             Tag::Emphasis => self.inline.italic += 1,
             Tag::Strong => self.inline.bold += 1,
             Tag::Strikethrough => self.inline.strikeout += 1,
             // Terminals can't follow a link, so the destination is rendered alongside the text.
             Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
-                self.link_target = Some(dest_url.to_string());
+                self.links.push(OpenLink {
+                    target: dest_url.to_string(),
+                    shown: String::new(),
+                });
             }
             _ => {}
         }
@@ -289,46 +273,57 @@ impl Builder {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            // A tight item ends without a separator: consecutive items belong to one list.
-            TagEnd::Item => self.flush_composite(),
-            // A paragraph inside an item is what a loose list is made of, and the blank line the
-            // source put between its items is kept, since a run of long items reads as one slab
-            // without it.
-            TagEnd::Paragraph if !self.lists.is_empty() => {
-                self.flush_composite();
-                self.push_blank_line();
+            TagEnd::Paragraph => self.flush_text(),
+            TagEnd::Heading(_) => {
+                self.flush_text();
+                self.heading = None;
             }
-            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock => self.end_block(),
-            TagEnd::BlockQuote(_) => {
-                self.flush_composite();
-                self.quote_depth = self.quote_depth.saturating_sub(1);
-                self.style = self.block_style();
-                self.end_block();
+            TagEnd::CodeBlock => {
+                if let Some((language, body)) = self.code.take() {
+                    let rows = body.lines().map(str::to_string).collect();
+                    self.push_block(Block::Code { language, rows });
+                }
             }
-            TagEnd::List(_) => {
-                self.lists.pop();
-                self.end_block();
+            TagEnd::HtmlBlock => {
+                if let Some(body) = self.html.take() {
+                    let text = body.trim_end_matches('\n');
+                    if !text.is_empty() {
+                        self.push_block(Block::Paragraph(vec![OwnedCompound {
+                            text: text.to_string(),
+                            ..OwnedCompound::default()
+                        }]));
+                    }
+                }
             }
-            TagEnd::Table => {
-                self.table = None;
-                self.end_block();
+            TagEnd::BlockQuote(_) | TagEnd::List(_) | TagEnd::Item => {
+                self.flush_text();
+                if let Some(open) = self.open.pop() {
+                    self.close(open);
+                }
             }
             TagEnd::TableHead => {
                 // pulldown-cmark delimits the header row with `TableHead` itself and emits no
-                // `TableRow` around it, so it has to be closed here; otherwise its cells stay
-                // pending and merge into the first body row, producing one row of doubled width.
-                self.flush_table_row();
-                if let Some(table) = &mut self.table {
-                    table.in_head = false;
-                    let alignments = table.alignments.clone();
-                    self.lines.push(OwnedLine::TableRule(alignments));
+                // `TableRow` around it, so it is closed here or its cells merge into the first
+                // body row.
+                if let Some(state) = &mut self.table {
+                    state.table.head = Some(std::mem::take(&mut state.row));
                 }
             }
-            TagEnd::TableRow => self.flush_table_row(),
+            TagEnd::TableRow => {
+                if let Some(state) = &mut self.table {
+                    let row = std::mem::take(&mut state.row);
+                    state.table.rows.push(row);
+                }
+            }
             TagEnd::TableCell => {
-                if let Some(table) = &mut self.table {
-                    let cell = std::mem::take(&mut table.cell);
-                    table.row.push(cell);
+                if let Some(state) = &mut self.table {
+                    let cell = std::mem::take(&mut state.cell);
+                    state.row.push(cell);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(state) = self.table.take() {
+                    self.push_block(Block::Table(state.table));
                 }
             }
             TagEnd::Emphasis => self.inline.italic = self.inline.italic.saturating_sub(1),
@@ -337,13 +332,15 @@ impl Builder {
                 self.inline.strikeout = self.inline.strikeout.saturating_sub(1);
             }
             TagEnd::Link | TagEnd::Image => {
-                if let Some(target) = self.link_target.take() {
-                    let already_shown = self
-                        .compounds
-                        .last()
-                        .is_some_and(|last| last.text.trim() == target);
-                    if !already_shown && !target.is_empty() {
-                        self.push_text(&format!(" ({target})"));
+                if let Some(link) = self.links.pop() {
+                    let shown = link.shown.trim();
+                    // An autolink's text is its destination, an email's less the scheme.
+                    let already_shown =
+                        shown == link.target || link.target.strip_prefix("mailto:") == Some(shown);
+                    if shown.is_empty() {
+                        self.push_text(&link.target);
+                    } else if !already_shown && !link.target.is_empty() {
+                        self.push_text(&format!(" ({})", link.target));
                     }
                 }
             }
@@ -351,34 +348,44 @@ impl Builder {
         }
     }
 
-    /// The style a fresh block takes: inside a blockquote everything stays quoted, because minimad
-    /// marks quoting per line rather than wrapping a range of lines.
-    fn block_style(&self) -> CompositeStyle {
-        if self.quote_depth > 0 {
-            CompositeStyle::Quote
-        } else {
-            CompositeStyle::Paragraph
+    /// A container whose end has arrived, as the block it is, placed in the one around it.
+    fn close(&mut self, open: Open) {
+        match open {
+            Open::Quote(blocks) => self.push_block(Block::Quote(blocks)),
+            Open::List {
+                start,
+                loose,
+                items,
+            } => self.push_block(Block::List {
+                start,
+                loose,
+                items,
+            }),
+            Open::Item(blocks) => match self.open.last_mut() {
+                Some(Open::List { items, .. }) => items.push(blocks),
+                // An item outside a list is no event pulldown-cmark emits; its blocks are kept.
+                _ => {
+                    for block in blocks {
+                        self.push_block(block);
+                    }
+                }
+            },
         }
     }
 
-    fn start_item(&mut self) {
-        // Close the previous item before adopting this one's style, so sibling items don't merge.
-        self.flush_composite();
-        self.item_paragraphs = 0;
-        // minimad caps nesting at three levels; deeper items clamp rather than disappear.
-        let depth = self.lists.len().saturating_sub(1).min(3) as u8;
-        match self.lists.last_mut() {
-            Some(ListLevel::Ordered(next)) => {
-                let number = *next;
-                *next += 1;
-                // No ordered-list concept in minimad, so the marker is rendered as text. Using a
-                // bullet composite as well would show "• 1." for every item, and dropping the
-                // number would renumber the model's instructions.
-                self.style = CompositeStyle::Paragraph;
-                let indent = "  ".repeat(depth as usize);
-                self.push_text(&format!("{indent}{number}. "));
-            }
-            _ => self.style = CompositeStyle::ListItem(depth),
+    fn push_block(&mut self, block: Block) {
+        match self.open.last_mut() {
+            Some(Open::Quote(blocks) | Open::Item(blocks)) => blocks.push(block),
+            Some(Open::List { items, .. }) => items.push(vec![block]),
+            None => self.blocks.push(block),
+        }
+    }
+
+    /// The runs inline text goes to: the cell being read, or the text block's.
+    fn active_runs(&mut self) -> &mut Vec<OwnedCompound> {
+        match &mut self.table {
+            Some(state) => &mut state.cell,
+            None => &mut self.runs,
         }
     }
 
@@ -386,74 +393,44 @@ impl Builder {
         if text.is_empty() {
             return;
         }
-        if let Some(table) = &mut self.table {
-            push_run(&mut table.cell, text, &self.inline);
-            return;
+        for link in &mut self.links {
+            link.shown.push_str(text);
         }
-        push_run(&mut self.compounds, text, &self.inline);
+        let inline = self.inline;
+        push_run(self.active_runs(), text, &inline);
     }
 
-    /// Close a top-level block and separate it from the next one.
-    ///
-    /// minimad has no notion of a block: it renders a list of lines, so the blank line between two
-    /// paragraphs has to be an explicit empty line or the whole document renders as one dense
-    /// slab. Only at the outermost level, since items within a list and rows within a table are
-    /// meant to be adjacent.
-    fn end_block(&mut self) {
-        self.flush_composite();
-        if self.lists.is_empty() && self.quote_depth == 0 && self.table.is_none() {
-            self.push_blank_line();
-        }
-    }
-
-    fn push_blank_line(&mut self) {
-        // Never two in a row: markdown collapses runs of blank lines, and doubling them up here
-        // would spread a document out further every time a block nested.
-        if matches!(self.lines.last(), Some(OwnedLine::Composite { compounds, .. }) if compounds.is_empty())
-        {
+    /// The pending runs as the paragraph or heading they are.
+    fn flush_text(&mut self) {
+        if self.runs.is_empty() {
             return;
         }
-        self.lines.push(OwnedLine::Composite {
-            style: CompositeStyle::Paragraph,
-            compounds: Vec::new(),
-        });
-    }
-
-    fn flush_composite(&mut self) {
-        if self.compounds.is_empty() {
-            return;
-        }
-        let compounds = std::mem::take(&mut self.compounds);
-        self.lines.push(OwnedLine::Composite {
-            style: self.style,
-            compounds,
-        });
-    }
-
-    fn flush_table_row(&mut self) {
-        let Some(table) = &mut self.table else {
-            return;
+        let runs = std::mem::take(&mut self.runs);
+        let block = match self.heading {
+            Some(level) => Block::Heading { level, runs },
+            None => Block::Paragraph(runs),
         };
-        if table.row.is_empty() {
-            return;
-        }
-        let row = std::mem::take(&mut table.row);
-        self.lines.push(OwnedLine::TableRow(row));
+        self.push_block(block);
     }
 
-    fn finish(&mut self) {
-        self.flush_composite();
+    fn finish(mut self) -> Vec<Block> {
+        self.flush_text();
+        self.end(TagEnd::CodeBlock);
+        while let Some(open) = self.open.pop() {
+            self.close(open);
+        }
+        self.blocks
     }
 }
 
-/// Append `text` to `compounds`, merging into the previous run when the styles match so a
-/// paragraph doesn't become one compound per event.
-fn push_run(compounds: &mut Vec<OwnedCompound>, text: &str, inline: &InlineStyle) {
+/// Append `text` to `runs`, merging into the previous run when the styles match so a paragraph
+/// doesn't become one run per event.
+fn push_run(runs: &mut Vec<OwnedCompound>, text: &str, inline: &InlineStyle) {
     let bold = inline.bold > 0;
     let italic = inline.italic > 0;
     let code = inline.code > 0;
     let strikeout = inline.strikeout > 0;
-    if let Some(last) = compounds.last_mut()
+    if let Some(last) = runs.last_mut()
         && last.bold == bold
         && last.italic == italic
         && last.code == code
@@ -462,7 +439,7 @@ fn push_run(compounds: &mut Vec<OwnedCompound>, text: &str, inline: &InlineStyle
         last.text.push_str(text);
         return;
     }
-    compounds.push(OwnedCompound {
+    runs.push(OwnedCompound {
         text: text.to_string(),
         bold,
         italic,
@@ -479,14 +456,5 @@ fn header_depth(level: HeadingLevel) -> u8 {
         HeadingLevel::H4 => 4,
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
-    }
-}
-
-fn convert_alignment(alignment: &CmarkAlignment) -> Alignment {
-    match alignment {
-        CmarkAlignment::None => Alignment::Unspecified,
-        CmarkAlignment::Left => Alignment::Left,
-        CmarkAlignment::Center => Alignment::Center,
-        CmarkAlignment::Right => Alignment::Right,
     }
 }
