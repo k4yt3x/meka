@@ -2365,7 +2365,7 @@ pub(crate) async fn login_mcp_server(
                 }
             })
             .await?;
-            tracing::info!("logged in MCP server '{server}' from the browser");
+            tracing::info!("logged in MCP server '{server}' via HTTP");
             Ok(())
         },
     )
@@ -2385,7 +2385,7 @@ fn mcp_login_problem(
     server: &str,
     error: crate::error::MekaError,
 ) -> ProblemDetail {
-    tracing::warn!("the browser login for MCP server '{server}' failed: {error}");
+    tracing::warn!("the login for MCP server '{server}' failed: {error}");
     match &error {
         crate::error::MekaError::McpCredentialInTheWay { .. } => {
             door_problem(state, "the MCP login failed", error)

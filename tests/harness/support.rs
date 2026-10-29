@@ -247,14 +247,14 @@ pub(crate) struct CapturedRequest {
     pub(crate) body: String,
 }
 
-/// A local HTTP/1.1 listener that answers every request with whatever `handler` returns, byte
-/// for byte, starting at the status line. Each connection is served on its own thread, so a
-/// handler that deliberately stalls (to hold a client in a request while a test signals it) does
-/// not block the next connection.
+/// A local HTTP/1.1 listener that answers every request with whatever `handler` returns, starting
+/// at the status line. Each connection is served on its own thread, so a handler that deliberately
+/// stalls (to hold a client in a request while a test signals it) does not block the next
+/// connection.
 ///
 /// Enough of HTTP to stand in for a webhook receiver or an MCP endpoint's auth challenge: the
 /// request line, headers, and a `Content-Length` body. Chunked bodies and keep-alive are not
-/// handled; each connection carries one request.
+/// handled; each connection carries one request, and every response says `Connection: close`.
 pub(crate) fn spawn_http_listener<F>(handler: F) -> u16
 where
     F: Fn(&CapturedRequest) -> String + Send + Sync + 'static,
@@ -271,6 +271,15 @@ where
                     return;
                 };
                 let response = handler(&request);
+                // One request per connection, said in the response: an HTTP/1.1 client otherwise
+                // pools the connection this thread is about to close and sends its next request
+                // into it, which fails a POST it may not retry.
+                let response = match response.split_once("\r\n") {
+                    Some((status_line, rest)) => {
+                        format!("{status_line}\r\nConnection: close\r\n{rest}")
+                    }
+                    None => response,
+                };
                 // A client that hung up before reading its answer is not this listener's
                 // failure to report; the test asserts on what the client did.
                 stream

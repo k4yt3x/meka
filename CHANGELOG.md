@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- RUSTSEC-2026-0414: `pulldown-cmark` moves to 0.13.5.
+
 ## [0.85.0] - 2026-10-28
 
 ### Added

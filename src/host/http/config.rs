@@ -441,8 +441,7 @@ impl ResolvedServeConfig {
             }
             if webhook.url.starts_with("http://") {
                 advisories.push(format!(
-                    "webhook {endpoint} uses plaintext http; deliveries are signed but not \
-                     encrypted"
+                    "webhook {endpoint} uses plaintext http, so its deliveries are not encrypted"
                 ));
             }
         }
@@ -553,6 +552,10 @@ mod tests {
                     .iter()
                     .any(|line| line.contains("plaintext http")),
             "{advisories:?}"
+        );
+        assert!(
+            advisories.iter().all(|line| !line.contains(" signed")),
+            "an unsigned webhook is never called signed: {advisories:?}"
         );
         assert!(
             advisories.iter().all(|line| !line.contains("SECRET")),
