@@ -534,6 +534,9 @@ pub(super) const REPAIR_KIND: &str = "repair";
 /// The `kind` for `Event::Redact` rows, mirroring [`REPAIR_KIND`]: the images it names keep
 /// their rows, and the replay puts the placeholder over them.
 pub(super) const REDACT_KIND: &str = "redact";
+/// The `kind` for `Event::Unsign` rows, mirroring [`REDACT_KIND`]: the messages it changes keep
+/// their rows, and the replay takes their Claude thinking out.
+pub(super) const UNSIGN_KIND: &str = "unsign";
 /// The `messages` row a session's title is read from, as a `WHERE` over `messages` correlated to
 /// `sessions s`: the first user message that carries words. A `user` row is text by construction; a
 /// `user_blocks` row is a JSON array of blocks and is passed over while none of them carries a
@@ -749,6 +752,10 @@ pub(super) fn encode_event_for_db(
             let content = serde_json::to_string(event)?;
             Ok((REDACT_KIND.to_string(), content))
         }
+        Event::Unsign => {
+            let content = serde_json::to_string(event)?;
+            Ok((UNSIGN_KIND.to_string(), content))
+        }
     }
 }
 /// Decode one persisted row back into an [`crate::conversation::Event`]. Returns `Ok(None)` when
@@ -789,7 +796,11 @@ pub(super) fn decode_event_from_row(
                 Err(error) => Err(error),
             }
         }
-        kind if kind == COMPACT_BOUNDARY_KIND || kind == REPAIR_KIND || kind == REDACT_KIND => {
+        kind if kind == COMPACT_BOUNDARY_KIND
+            || kind == REPAIR_KIND
+            || kind == REDACT_KIND
+            || kind == UNSIGN_KIND =>
+        {
             let event: Event = serde_json::from_str(&row.content)?;
             Ok(Some(event))
         }
@@ -2890,12 +2901,14 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.query_row(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind IN (?2, ?3, ?4)",
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind IN (?2, ?3, ?4, \
+                     ?5)",
                     rusqlite::params![
                         session_id.to_string(),
                         COMPACT_BOUNDARY_KIND,
                         REPAIR_KIND,
-                        REDACT_KIND
+                        REDACT_KIND,
+                        UNSIGN_KIND
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -4669,12 +4682,13 @@ mod tests {
                     item: None,
                 }],
             },
+            Event::Unsign,
         ] {
             store.save_event(id, &event, None).await.expect("save");
         }
         let events = store.load_events_with_timestamps(id).await.expect("load");
         let replayed = materialize_annotated(&events).revision;
-        assert_eq!(replayed, 3, "one of each rewriting kind");
+        assert_eq!(replayed, 4, "one of each rewriting kind");
         assert_eq!(store.count_rewrites(id).await.expect("count"), replayed);
     }
 

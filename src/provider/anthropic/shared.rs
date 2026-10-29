@@ -511,11 +511,13 @@ pub(super) fn convert_messages_to_claude_content(
         })
         .collect();
 
-    // Strip trailing thinking blocks from the last assistant message (Claude API requirement).
+    // Strip trailing thinking blocks from an assistant message the request ends on (Claude API
+    // requirement). Only there: one with a message after it, the reply a thinking-only nudge
+    // answers, goes out whole as every later request sends it, since Claude rejects a block whose
+    // earlier conversation changed and the nudge exists to keep that reasoning.
     if let Some(last_assistant) = claude_messages
-        .iter_mut()
-        .rev()
-        .find(|message| message.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .last_mut()
+        .filter(|message| message.get("role").and_then(|r| r.as_str()) == Some("assistant"))
         && let Some(content) = last_assistant
             .get_mut("content")
             .and_then(|c| c.as_array_mut())
@@ -1476,6 +1478,53 @@ mod tests {
         assert_eq!(
             content[0]["cache_control"],
             serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    /// A reply of nothing but thinking, answered by a nudge, goes out whole: the request after the
+    /// model's next reply sends it so, and Claude rejects a block whose earlier conversation
+    /// changed between the two. Only a request that ends on an assistant message loses its
+    /// trailing thinking.
+    #[test]
+    fn a_thinking_only_reply_followed_by_a_nudge_keeps_its_thinking() {
+        let signed = ContentBlock::Thinking {
+            thinking: "the reasoning".to_string(),
+            opaque: Some(OpaqueReasoning::Signed {
+                signature: "sig".to_string(),
+            }),
+        };
+        let reply = Message {
+            role: Role::Assistant,
+            content: vec![signed.clone()],
+        };
+        let nudged = convert_messages_to_claude_content(
+            &[
+                Message::user("a question"),
+                reply,
+                Message::user("Please reply"),
+            ],
+            None,
+        );
+        assert_eq!(
+            nudged[1]["content"],
+            serde_json::json!([{"type": "thinking", "thinking": "the reasoning", "signature": "sig"}])
+        );
+
+        let ending = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "an answer".to_string(),
+                },
+                signed,
+            ],
+        };
+        let ended =
+            convert_messages_to_claude_content(&[Message::user("a question"), ending], None);
+        assert_eq!(
+            ended[1]["content"],
+            serde_json::json!([{"type": "text", "text": "an answer"}]),
+            "a request ending on the assistant still strips"
         );
     }
 

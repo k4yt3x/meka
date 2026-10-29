@@ -1311,7 +1311,7 @@ impl Transcript {
                     continue;
                 }
                 // A repair rewrites rows the log keeps; the log is what is shown.
-                Event::Repair { .. } | Event::Redact { .. } => continue,
+                Event::Repair { .. } | Event::Redact { .. } | Event::Unsign => continue,
             };
             if let Some(note) = crate::render::nudge_direction(message) {
                 let entry = self.entry(Item::note(note));

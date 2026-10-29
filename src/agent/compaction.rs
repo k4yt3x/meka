@@ -163,6 +163,19 @@ pub(super) fn compute_compaction_split(
     }
 }
 
+/// Take the thinking Claude checks out of a compaction's own copy of the conversation, for a
+/// request Claude rejected over a thinking block's signature. Returns whether there was any.
+fn remove_claude_thinking(messages: &mut [Message]) -> bool {
+    let mut removed = false;
+    for message in messages {
+        if let Some(without) = message.without_claude_thinking() {
+            *message = without;
+            removed = true;
+        }
+    }
+    removed
+}
+
 /// The section of a summary message that quotes the request a running turn is answering. One
 /// definition, so the writer and [`carries_the_request`] cannot disagree about its shape.
 fn request_section(words: &str) -> String {
@@ -946,6 +959,7 @@ impl Agent {
             _ => checkpoint_messages.push(Message::user(instruction)),
         }
 
+        let mut thinking_removed = false;
         for _ in 0..CHECKPOINT_MAX_ITERATIONS {
             // Checked per round as well as inside the tools, so an interrupt ends the checkpoint at
             // the next boundary instead of running out the whole iteration budget. Returning `None`
@@ -955,25 +969,41 @@ impl Agent {
                 tracing::warn!("checkpoint turn interrupted; summarizing instead");
                 return Ok(None);
             }
-            let completed = match self
-                .complete_with_retry(
-                    "the checkpoint's provider call",
-                    CompletionRequest::new(&system_prompt, &checkpoint_messages, &definitions)
-                        .declaring(&deferred_definitions)
-                        .attributed(attribution.clone()),
-                    &cancellation,
-                    &cancellation,
-                )
-                .await
-            {
-                Ok(completed) => completed,
-                // A stop that landed on the reply itself rather than between rounds: the same
-                // outcome as the check above, for the same reason.
-                Err(MekaError::Interrupted) => {
-                    tracing::warn!("checkpoint turn interrupted; summarizing instead");
-                    return Ok(None);
+            let completed = loop {
+                match self
+                    .complete_with_retry(
+                        "the checkpoint's provider call",
+                        CompletionRequest::new(&system_prompt, &checkpoint_messages, &definitions)
+                            .declaring(&deferred_definitions)
+                            .attributed(attribution.clone()),
+                        &cancellation,
+                        &cancellation,
+                    )
+                    .await
+                {
+                    Ok(completed) => break completed,
+                    // A stop that landed on the reply itself rather than between rounds: the same
+                    // outcome as the check above, for the same reason.
+                    Err(MekaError::Interrupted) => {
+                        tracing::warn!("checkpoint turn interrupted; summarizing instead");
+                        return Ok(None);
+                    }
+                    // Answered as the turn answers it, on this copy: the summarizer the caller
+                    // falls back to writes no memory and reads truncated text, so a rejection the
+                    // copy without its thinking would take costs more than the thinking.
+                    Err(error)
+                        if error.rejects_thinking_signature()
+                            && !thinking_removed
+                            && remove_claude_thinking(&mut checkpoint_messages) =>
+                    {
+                        thinking_removed = true;
+                        tracing::warn!(
+                            "provider rejected a thinking block's signature; continuing the \
+                             checkpoint without the thinking"
+                        );
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             };
             let crate::provider::Completion {
                 message: assistant_message,
@@ -1136,23 +1166,47 @@ impl Agent {
         // A summary is not worth reasoning over, so this one request turns thinking off. The
         // override travels with the request rather than living on the shared provider, so a
         // sibling sub-agent's in-flight turn keeps whatever thinking its profile configured.
+        // Sent under a token nothing fires: the caller's may already have, and the summary is the
+        // one thing a stop must not deny. See `complete_with_retry`.
+        let unfired = CancellationToken::new();
+        let mut thinking_removed = false;
+        let completed = loop {
+            let completed = self
+                .complete_with_retry(
+                    "the summarizer's provider call",
+                    CompletionRequest::new(&system_prompt, &compact_messages, &[])
+                        .attributed(self.compaction_attribution(request))
+                        .without_thinking(),
+                    cancellation,
+                    &unfired,
+                )
+                .await;
+            // The thinking goes out with the rest, since leaving it out unasked would cost the
+            // summary whatever the model reads from it. This request has its own system prompt and
+            // no tools, though, so every block in it is bound to another conversation, and an
+            // account that enforces Claude's check rejects it. The copy is thrown away after, so
+            // retrying without the thinking costs this one summary alone.
+            match completed {
+                Err(error)
+                    if error.rejects_thinking_signature()
+                        && !thinking_removed
+                        && remove_claude_thinking(&mut compact_messages) =>
+                {
+                    thinking_removed = true;
+                    tracing::warn!(
+                        "provider rejected a thinking block's signature; summarizing without the \
+                         thinking"
+                    );
+                }
+                completed => break completed,
+            }
+        };
         let crate::provider::Completion {
             message: summary_message,
             usage,
             notices,
             ..
-        } = self
-            .complete_with_retry(
-                "the summarizer's provider call",
-                CompletionRequest::new(&system_prompt, &compact_messages, &[])
-                    .attributed(self.compaction_attribution(request))
-                    .without_thinking(),
-                cancellation,
-                // Sent under a token nothing fires: the caller's may already have, and the
-                // summary is the one thing a stop must not deny. See `complete_with_retry`.
-                &CancellationToken::new(),
-            )
-            .await?;
+        } = completed?;
         tracing::debug!(
             "summary usage: input={} cache_creation={} cache_read={} output={}",
             usage.input_tokens,
@@ -2348,6 +2402,156 @@ mod tests {
             vec![crate::provider::ThinkingOverride::Inherit],
             "the turn after it inherits the profile's setting"
         );
+    }
+
+    /// The summary goes out with the conversation's thinking, and only a rejection of a thinking
+    /// block's signature, which Claude answers wherever it enforces its check since the summary
+    /// has its own system prompt and no tools, sends it again without.
+    #[tokio::test]
+    async fn a_summary_rejected_over_a_thinking_signature_is_asked_again_without_the_thinking() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::FailInvalidRequest {
+                message: crate::error::THINKING_BINDING_REJECTION_FOR_TEST.to_string(),
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "the summary".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, store) = agent_with_checkpoint(provider.clone(), false).await;
+        let mut messages = Conversation::new();
+        for round in 0..6 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: format!("reasoning {round}"),
+                        opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                            signature: format!("sig {round}"),
+                        }),
+                    },
+                    ContentBlock::Text {
+                        text: format!("answer {round}"),
+                    },
+                ],
+            });
+        }
+
+        let outcome = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Manual),
+        )
+        .await;
+        assert_eq!(outcome.source, CompactionSource::Summarizer);
+        assert!(the_summary_message(&messages).contains("the summary"));
+
+        let sent = provider.completions();
+        let carries_signed = |messages: &[Message]| {
+            messages
+                .iter()
+                .any(|message| message.without_claude_thinking().is_some())
+        };
+        assert_eq!(sent.len(), 2, "the rejected summary and the one after it");
+        assert!(carries_signed(&sent[0]), "sent with the thinking first");
+        assert!(!carries_signed(&sent[1]), "and again without it");
+    }
+
+    /// A checkpoint rejected over a thinking block's signature carries on without the thinking
+    /// rather than falling back to the summarizer, which writes no memory: its copy is its own, so
+    /// the conversation is untouched.
+    #[tokio::test]
+    async fn a_checkpoint_rejected_over_a_thinking_signature_carries_on_without_the_thinking() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::FailInvalidRequest {
+                message: crate::error::THINKING_BINDING_REJECTION_FOR_TEST.to_string(),
+            }],
+            replace_round("what I was doing", None),
+        ]));
+        let (agent, store) = agent_with_checkpoint(provider.clone(), true).await;
+        let mut messages = Conversation::new();
+        for round in 0..6 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: format!("reasoning {round}"),
+                        opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                            signature: format!("sig {round}"),
+                        }),
+                    },
+                    ContentBlock::Text {
+                        text: format!("answer {round}"),
+                    },
+                ],
+            });
+        }
+
+        let outcome = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Manual),
+        )
+        .await;
+        assert_eq!(outcome.source, CompactionSource::Checkpoint);
+        assert!(the_summary_message(&messages).contains("what I was doing"));
+
+        let sent = provider.completions();
+        assert_eq!(sent.len(), 2, "the rejected round and the one after it");
+        assert!(sent[0].iter().any(Message::carries_claude_thinking));
+        assert!(!sent[1].iter().any(Message::carries_claude_thinking));
+    }
+
+    /// A summary rejected for another reason is not sent again without the thinking: that would
+    /// cost the summary the reasoning for a rejection the thinking did not earn.
+    #[tokio::test]
+    async fn a_summary_rejected_for_another_reason_keeps_its_thinking() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::FailInvalidRequest {
+                message: "API returned status 400 Bad Request: max_tokens too large".to_string(),
+            },
+        ]]));
+        let (agent, store) = agent_with_checkpoint(provider.clone(), false).await;
+        let mut messages = Conversation::new();
+        messages.append(Message::user("a question"));
+        messages.append(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "reasoning".to_string(),
+                    opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                        signature: "sig".to_string(),
+                    }),
+                },
+                ContentBlock::Text {
+                    text: "an answer".to_string(),
+                },
+            ],
+        });
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session"),
+        );
+        let error = agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Manual),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("rejected");
+        assert!(!error.rejects_thinking_signature(), "{error}");
+        assert_eq!(provider.completions().len(), 1, "not sent again");
     }
 
     #[tokio::test]

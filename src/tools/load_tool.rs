@@ -661,7 +661,7 @@ pub(crate) fn extract_loaded_tool_names_from_events(
                 }
             }
             // Touches images only; no tool call is added or removed by it.
-            Event::Redact { .. } => {}
+            Event::Redact { .. } | Event::Unsign => {}
             Event::CompactBoundary {
                 loaded_tools_snapshot,
                 ..

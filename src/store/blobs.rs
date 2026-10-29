@@ -47,7 +47,7 @@ fn messages_in(event: &mut Event) -> Vec<&mut Message> {
         Event::Append(message) => vec![message],
         Event::CompactBoundary { summary, .. } => vec![summary],
         Event::Repair { messages, .. } => messages.iter_mut().collect(),
-        Event::Redact { .. } => Vec::new(),
+        Event::Redact { .. } | Event::Unsign => Vec::new(),
     }
 }
 

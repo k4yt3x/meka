@@ -249,7 +249,7 @@ process's PID and lock a session forever.
 |--------|------|-------------|
 | `id` | INTEGER | Auto-incrementing primary key |
 | `session_id` | TEXT (UUID) | Foreign key to `sessions.id` |
-| `kind` | TEXT | `user_blocks` (a turn: its `turn_context` and `text` blocks and any images), `user` (a plain text message meka wrote), `assistant`, `tool_results`, `compact_boundary`, `repair`, or `redact` |
+| `kind` | TEXT | `user_blocks` (a turn: its `turn_context` and `text` blocks and any images), `user` (a plain text message meka wrote), `assistant`, `tool_results`, `compact_boundary`, `repair`, `redact`, or `unsign` |
 | `content` | TEXT | Message content (plain text or JSON) |
 | `created_at` | TEXT (RFC 3339) | When the message was saved |
 
@@ -690,6 +690,8 @@ On the `5xx` path it does one thing more before touching anything. The retry seq
 Nothing outside those two shapes degrades at all, because a degraded retry that succeeds only because the network came back would keep the loss. Excluded, then: a dropped connection, which never delivered the request for anything to judge; a `429`, which is a statement about rate rather than about what was sent; a failure that arrives partway through a stream, after some of the answer has reached you, both because re-sending would print it twice and because the stream cannot tell an overload from anything else; and anything at all once the retries have *not* been exhausted. If a step it did try does not help, it says so and points here before the turn fails.
 
 One cause of that refusal has its own fix. A session recorded by 0.41 can hold a `tool_result` whose content is a bare JSON string, a shape meka does not read: the row is dropped as the session loads, which leaves the `tool_use` it answered unanswered, and the provider rejects the next turn over the mismatch. Run the [one-shot upgrade script](../getting-started/upgrading.md), which converts those rows in place, rather than rewinding past a turn you wanted to keep.
+
+One rejection reaches past the window those steps work in, and meka answers it on its own. Claude ties each thinking block to the conversation ahead of it, the tool list included, and on the accounts where Anthropic enforces that check it rejects a request that sends a block back after that conversation changed: most changes to the tool list, a compaction that keeps recent turns verbatim behind its summary, or a repair above can each make every later request fail. When Claude rejects a thinking block that way, or one whose signature it cannot verify at all, meka sends the conversation again without its thinking, back to the last compaction. The model no longer gets that reasoning back, and the turn goes on. Nothing on disk is rewritten: an accepted resend is recorded in the log as the point the thinking stopped being sent, so a resume sends the same, and an export marks that point and still shows the reasoning's readable text. A rejected one restores the thinking, and the steps above take their turn. A compaction does the same for its own requests, the checkpoint's and the summarizer's. On an account that does not enforce the check the rejection never comes, and nothing changes.
 
 ## Removing sessions
 

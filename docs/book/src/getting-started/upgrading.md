@@ -10,6 +10,14 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.85 to 0.86
+
+Nothing is renamed and no key is refused; one archive version moves.
+
+**Session archives are `format_version` 17.** A 0.85 archive imports as it is; a 0.86 archive can
+record where a session stopped sending Claude its earlier thinking, which 0.85 refuses to read by
+its version.
+
 ## 0.84 to 0.85
 
 One config key is retired, and the store gains a table and a column, which the first run adds on

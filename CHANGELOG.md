@@ -7,11 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.86.0] - 2026-10-29
+
 ### Changed
 
 - The screen draws a line as markdown while it streams, not as raw text until the line ends.
 - A table's columns fit by word: an identifier stays whole while the prose beside it wraps.
 - Turns `/rewind` drops leave the screen, on a resume too, and its row counts turns.
+- Session archives are `format_version` 17; a 0.85 archive is read as it is.
 
 ### Fixed
 
@@ -23,10 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Chinese and Japanese text wraps between characters, and a closing mark never starts a row.
 - A row that fills the width exactly up to a space no longer breaks one word early.
 - A `#` line in a `~~~` or indented code block no longer gets a blank row after it.
-- A resume shows a joined prompt once, and a refused one as it was, with no `Rewound` row.
+- A resume shows a joined prompt once, and a rejected one as it was, with no `Rewound` row.
 - An emoji its presentation selector widens no longer pushes a row past the window's edge.
 - Resizing the window no longer flashes a blank screen: the new layout is ready before the repaint.
-- Claude no longer refuses every turn once an MCP server renames or drops a tool the agent loaded.
+- Claude no longer rejects every turn once an MCP server renames or drops a tool the agent loaded.
+- A Claude session whose earlier thinking the API rejects resends without it instead of failing.
+- A reply of only thinking keeps that thinking when meka asks the model to answer in words.
 
 ### Security
 
@@ -3007,7 +3012,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.85.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.86.0...HEAD
+[0.86.0]: https://github.com/k4yt3x/meka/compare/0.85.0...0.86.0
 [0.85.0]: https://github.com/k4yt3x/meka/compare/0.84.0...0.85.0
 [0.84.0]: https://github.com/k4yt3x/meka/compare/0.83.0...0.84.0
 [0.83.0]: https://github.com/k4yt3x/meka/compare/0.82.0...0.83.0

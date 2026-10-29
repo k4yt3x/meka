@@ -964,6 +964,16 @@ impl MekaError {
         )
     }
 
+    /// Whether Claude rejected the request over the signature of a `thinking` block it was sent
+    /// back, which the same conversation without its thinking answers. Two rejections open with
+    /// [`THINKING_SIGNATURE_REJECTION`]: a block whose earlier conversation has changed since it
+    /// was produced (on an account that enforces the check), and one whose signature the API
+    /// cannot verify at all. The text is all there is to match: the API gives either no code
+    /// beyond `invalid_request_error`.
+    pub(crate) fn rejects_thinking_signature(&self) -> bool {
+        matches!(self, Self::InvalidRequest(message) if message.contains(THINKING_SIGNATURE_REJECTION))
+    }
+
     /// When the upstream said the profile would serve again, for the breaker that skips the
     /// profile until then; `None` when it said nothing.
     pub(crate) fn resumes_after(&self) -> Option<Duration> {
@@ -993,6 +1003,22 @@ impl MekaError {
 }
 
 pub(crate) type Result<T> = std::result::Result<T, MekaError>;
+
+/// How Claude's rejection of a replayed thinking block's signature opens, the backticks its own:
+/// "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a
+/// different conversation." The second sentence is absent when the signature cannot be verified.
+pub(crate) const THINKING_SIGNATURE_REJECTION: &str = "Invalid `signature` in `thinking` block";
+
+/// The message [`provider_http_error`] builds from Claude's rejection of a thinking block bound to
+/// a different conversation, as `claude-subscription` answered it on 2026-10-29 for Haiku 5.5
+/// after a tool joined the request.
+#[cfg(test)]
+pub(crate) const THINKING_BINDING_REJECTION_FOR_TEST: &str = "API returned status 400 Bad Request: \
+    {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.1.\
+    content.0: Invalid `signature` in `thinking` block. The block is bound to a different \
+    conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \
+    \\\"drop_block\\\". The `tools` list differs from the one this block was created with.\"},\
+    \"request_id\":\"req_011CgWJHoMS32WKHmmHBhMZz\"}";
 
 /// A failure whose message has already been printed in meka's own format.
 ///
@@ -1621,6 +1647,39 @@ mod tests {
     }
 
     use super::*;
+
+    /// Both of Claude's rejections over a thinking block's signature are recognized from the 400 it
+    /// answers: one bound to a different conversation and one it cannot verify at all. Another
+    /// invalid request, or the same words on another kind of failure, is not one.
+    #[test]
+    fn a_rejected_thinking_signature_is_told_from_other_rejections() {
+        let rejection = |body: &str| {
+            provider_http_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                body,
+                None,
+                ProviderRequest::Completion,
+                None,
+            )
+        };
+        let unverifiable = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.3.content.0: Invalid `signature` in `thinking` block"}}"#;
+        assert!(
+            MekaError::InvalidRequest(THINKING_BINDING_REJECTION_FOR_TEST.to_string())
+                .rejects_thinking_signature()
+        );
+        assert!(rejection(unverifiable).rejects_thinking_signature());
+
+        let other = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 900000 > 128000"}}"#;
+        assert!(!rejection(other).rejects_thinking_signature());
+        let server_error = provider_http_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            unverifiable,
+            None,
+            ProviderRequest::Completion,
+            None,
+        );
+        assert!(!server_error.rejects_thinking_signature());
+    }
 
     /// A missing profile is refused in the one "no such name" sentence, with what exists beside it.
     #[test]

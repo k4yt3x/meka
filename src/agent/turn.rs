@@ -1146,6 +1146,7 @@ impl Agent {
                 request_in_flight: Some(request_in_flight).filter(|words| !words.trim().is_empty()),
                 tiers_tried: 0,
                 pending_repair: None,
+                thinking_removal_tried: false,
                 user_saved: opening.user_eagerly_saved,
                 inbox_ids: opening.inbox_ids.clone(),
                 thinking_only_nudged: false,
@@ -1643,6 +1644,13 @@ impl Agent {
                             }
                         }
                         return Err(error);
+                    }
+                    // Ahead of the degrade tiers, which reach only what this turn appended and so
+                    // would destroy it for a rejection it did not earn.
+                    if error.rejects_thinking_signature()
+                        && run.recovery.remove_rejected_thinking(messages)
+                    {
+                        continue;
                     }
                     run.recovery
                         .repair_rejected_content(self, messages, error, run.cancellation.token())
@@ -7563,6 +7571,176 @@ mod tests {
                 .all(|block| !matches!(block, ContentBlock::Image { .. })),
             "the repair must be persisted, not just applied in memory"
         );
+    }
+
+    /// A turn whose provider rejects the signature of a thinking block from an earlier turn, as
+    /// Claude does once the conversation ahead of the block has changed, is retried without the
+    /// conversation's Claude thinking, and the removal is persisted so a resume sends what was
+    /// accepted. The degrade tiers, which reach only this turn's content, are not what answers it.
+    #[tokio::test]
+    async fn a_rejected_thinking_signature_is_answered_by_the_conversation_without_its_thinking() {
+        use crate::{
+            conversation::OpaqueReasoning,
+            provider::mock::{MockEvent, MockProvider, MockStopReason},
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            thinking_round("the first reasoning", "the first answer"),
+            vec![MockEvent::FailInvalidRequest {
+                message: crate::error::THINKING_BINDING_REJECTION_FOR_TEST.to_string(),
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "the second answer".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, store) = agent_for_test(provider.clone()).await;
+        let mut messages = Conversation::new();
+        for prompt in ["first", "second"] {
+            let outcome = agent
+                .run_turn(
+                    &mut messages,
+                    crate::agent::TurnInput::from_parts(prompt.to_string(), Vec::new())
+                        .expect("a prompt"),
+                    crate::agent::TurnCancellation::new(),
+                )
+                .await
+                .expect("the turn recovers instead of dying");
+            assert_eq!(outcome, TurnOutcome::EndTurn);
+        }
+
+        let streams = provider.streams();
+        assert_eq!(
+            streams.len(),
+            3,
+            "the turn, the rejected request, the retry"
+        );
+        assert!(carries_claude_thinking(&streams[1].messages));
+        assert!(!carries_claude_thinking(&streams[2].messages));
+        assert_eq!(
+            streams[2].messages.last().map(Message::text_content),
+            Some("second".to_string()),
+            "the retry is the same turn"
+        );
+
+        let session_id = agent.session_id().expect("session created");
+        let events = store.load_events(session_id).await.expect("load events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, crate::conversation::Event::Unsign))
+                .count(),
+            1,
+            "recorded by reference, once: {events:?}"
+        );
+        let reloaded = Conversation::from_events(events);
+        assert!(
+            reloaded
+                .as_slice()
+                .last()
+                .is_some_and(|reply| reply.text_content() == "the second answer"),
+            "the reply after it"
+        );
+        assert!(!carries_claude_thinking(reloaded.as_slice()), "persisted");
+        assert!(
+            reloaded.iter().flat_map(|message| &message.content).any(|block| matches!(
+                block,
+                ContentBlock::Thinking { thinking, opaque: None } if thinking == "the first reasoning"
+            )),
+            "the reasoning stays readable"
+        );
+        assert!(
+            !reloaded
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::Thinking {
+                    opaque: Some(OpaqueReasoning::Signed { .. }),
+                    ..
+                })),
+            "no signature survives"
+        );
+    }
+
+    /// A removal the provider rejects too was not the fix: the thinking goes back as it was, the
+    /// store keeps no trace of the attempt, and the turn is not retried a third time.
+    #[tokio::test]
+    async fn a_rejection_the_removal_does_not_answer_puts_the_thinking_back() {
+        use crate::provider::mock::{MockEvent, MockProvider};
+        let rejection = || {
+            vec![MockEvent::FailInvalidRequest {
+                message: crate::error::THINKING_BINDING_REJECTION_FOR_TEST.to_string(),
+            }]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            thinking_round("the first reasoning", "the first answer"),
+            rejection(),
+            rejection(),
+        ]));
+        let (agent, store) = agent_for_test(provider.clone()).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the first turn");
+        let error = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("second".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("rejected twice");
+        assert!(error.rejects_thinking_signature(), "{error}");
+        assert_eq!(provider.streams().len(), 3, "one retry, not a loop");
+        assert!(carries_claude_thinking(messages.as_slice()), "put back");
+
+        let session_id = agent.session_id().expect("session created");
+        let events = store.load_events(session_id).await.expect("load events");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                crate::conversation::Event::Repair { .. } | crate::conversation::Event::Unsign
+            )),
+            "{events:?}"
+        );
+        assert!(carries_claude_thinking(
+            Conversation::from_events(events).as_slice()
+        ));
+    }
+
+    /// A round that thinks under a Claude signature and then answers.
+    fn thinking_round(thinking: &str, answer: &str) -> Vec<crate::provider::mock::MockEvent> {
+        use crate::provider::mock::{MockEvent, MockStopReason};
+        vec![
+            MockEvent::ThinkingDelta {
+                text: thinking.to_string(),
+            },
+            MockEvent::ThinkingComplete {
+                opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                    signature: "sig".to_string(),
+                }),
+            },
+            MockEvent::Text {
+                text: answer.to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]
+    }
+
+    /// Whether any message carries thinking Claude would check when it is sent back.
+    fn carries_claude_thinking(messages: &[Message]) -> bool {
+        messages.iter().any(Message::carries_claude_thinking)
     }
 
     /// A stop that lands before the provider has answered has judged nothing. On the streaming

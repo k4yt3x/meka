@@ -115,6 +115,10 @@ pub(super) struct TurnRecovery {
     /// A repair applied to the in-memory conversation but not yet proven good by a 2xx, so not yet
     /// persisted. Dropped back into the log on success, undone on a second rejection.
     pub(super) pending_repair: Option<crate::conversation::Event>,
+    /// Whether [`Self::remove_rejected_thinking`] has been tried since the last accepted request,
+    /// so a removal the provider rejected anyway is not tried again. Whether one is riding the
+    /// request in flight is read off [`Self::pending_repair`] instead, which cannot disagree.
+    pub(super) thinking_removal_tried: bool,
     /// Whether this turn's prompt is on disk. True from the start when the eager persist before
     /// the first provider call succeeded; otherwise the lazy path retries it against the first
     /// response.
@@ -213,7 +217,46 @@ impl TurnRecovery {
     pub(super) fn after_conversation_rewrite(&mut self) {
         self.suspect_floor = SUSPECT_FLOOR_AFTER_REWRITE;
         self.tiers_tried = 0;
+        self.thinking_removal_tried = false;
         self.user_saved = true;
+    }
+
+    /// Retry without the conversation's Claude thinking, after the provider rejected the signature
+    /// of a thinking block sent back. Returns whether there was any to remove.
+    ///
+    /// Claude binds each block to the conversation ahead of it: the system prompt, the tool set
+    /// and every earlier message. That conversation changes under a live session (a tool joining
+    /// or leaving the declared set, a compaction's verbatim tail, a degraded result), and an
+    /// account that enforces the check rejects every later request carrying a block from before
+    /// the change. Nothing the degrade tiers reach is to blame, so without this the session fails
+    /// every turn from then on. A conversation with no thinking has nothing to check, and the
+    /// blocks produced after the removal are bound to the conversation as it is now sent. One
+    /// repair rides a request at a time, so a request that also carries content the provider
+    /// rejects fails whichever it checks first, as it did before.
+    ///
+    /// Everything since the last compaction, not only this turn: the rejected block can be anywhere
+    /// in it. Applied as the pending repair, an [`crate::conversation::Event::Unsign`], so the 2xx
+    /// that vindicates it persists it and a resume sends what was accepted, and a rejected retry
+    /// puts the thinking back.
+    pub(super) fn remove_rejected_thinking(&mut self, messages: &mut Conversation) -> bool {
+        if self.thinking_removal_tried {
+            return false;
+        }
+        let carrying = messages
+            .as_slice()
+            .iter()
+            .filter(|message| message.carries_claude_thinking())
+            .count();
+        let Some(event) = messages.unsign_thinking() else {
+            return false;
+        };
+        tracing::warn!(
+            "provider rejected a thinking block's signature; retrying without the thinking of \
+             {carrying} message(s)"
+        );
+        self.thinking_removal_tried = true;
+        self.pending_repair = Some(event);
+        true
     }
 
     /// Degrade the content appended since the last accepted request and retry, after the provider
@@ -393,14 +436,14 @@ impl TurnRecovery {
         true
     }
 
-    /// Put back what [`Self::repair_rejected_content`] degraded, after the retry carrying it was
-    /// refused too.
+    /// Put back what [`Self::repair_rejected_content`] degraded or
+    /// [`Self::remove_rejected_thinking`] took, after the retry carrying it was rejected too.
     ///
-    /// The tier was therefore not the fix, and the conversation is left byte-identical to before
+    /// The repair was therefore not the fix, and the conversation is left byte-identical to before
     /// the attempt: the cost of guessing wrong has to be one round trip, never a destroyed tool
-    /// result. [`Self::tiers_tried`] deliberately survives, so the next attempt measures the *next*
-    /// tier against the conversation this one restored rather than re-running the one just
-    /// disproved.
+    /// result. [`Self::tiers_tried`] and [`Self::thinking_removal_tried`] deliberately survive, so
+    /// the next attempt measures the *next* tier against the conversation this one restored rather
+    /// than re-running the one just disproved.
     ///
     /// Called on every failing exit from the round, not only the ones another tier can answer.
     /// A repair the turn then dies on was never vindicated, and leaving it applied in memory while
@@ -409,24 +452,32 @@ impl TurnRecovery {
     pub(super) fn undo_rejected_repair(&mut self, messages: &mut Conversation) {
         if self.pending_repair.take().is_some() && messages.pop_repair() {
             tracing::warn!(
-                "degrading this turn's content did not satisfy the provider; restored it unchanged"
+                "the repaired request did not satisfy the provider; restored it unchanged"
             );
         }
     }
 
     /// Put back a repair the provider never judged, because the request carrying it was dropped
-    /// before an answer came. Unlike [`Self::undo_rejected_repair`], the tier is not counted as
+    /// before an answer came. Unlike [`Self::undo_rejected_repair`], the repair is not counted as
     /// tried: nothing disproved it, and the next refusal should try it again rather than skip to
-    /// the one after and destroy more than it had to.
+    /// the tier after and destroy more than it had to.
     pub(super) fn unjudge_repair(&mut self, messages: &mut Conversation) {
+        let thinking_removal = matches!(
+            self.pending_repair,
+            Some(crate::conversation::Event::Unsign)
+        );
         if self.pending_repair.take().is_some() && messages.pop_repair() {
-            self.tiers_tried = self.tiers_tried.saturating_sub(1);
+            if thinking_removal {
+                self.thinking_removal_tried = false;
+            } else {
+                self.tiers_tried = self.tiers_tried.saturating_sub(1);
+            }
         }
     }
 
     /// Forget what this turn has already tried, because the provider just accepted a request.
     ///
-    /// Both counters exist to stop a turn re-running a recovery that has already been disproved,
+    /// Each of these exists to stop a turn re-running a recovery that has already been disproved,
     /// and a 2xx is what disproves the disproof. Keyed on acceptance rather than on a vindicated
     /// repair because when the outage reprieve does its job no repair was ever applied, so there
     /// is nothing to vindicate, and the reprieve would stay spent for the rest of the turn. It also
@@ -437,14 +488,16 @@ impl TurnRecovery {
     /// as often as the turn makes real progress, which the tool loop already bounds.
     pub(super) fn note_request_accepted(&mut self) {
         self.tiers_tried = 0;
+        self.thinking_removal_tried = false;
         self.outage_reprieve_used = false;
     }
 
     /// Persist the repair a 2xx has just vindicated.
     ///
     /// Ordering carries the correctness: [`crate::conversation::Event::Repair`] replaces the
-    /// *trailing* messages on replay, so this runs after the prompt is guaranteed on disk and
-    /// before anything else is appended, or a row written in between would be swallowed
+    /// *trailing* messages on replay and [`crate::conversation::Event::Unsign`] changes every
+    /// message ahead of it, so this runs after the prompt is guaranteed on disk and before
+    /// anything else is appended, or a row written in between would be swallowed or stripped
     /// instead. A failed write still leaves the in-memory conversation repaired, so the turn
     /// completes; the cost is that a resume re-reads the rejected content and pays one more
     /// round trip to heal it again.
@@ -487,9 +540,10 @@ impl TurnRecovery {
     /// Ask once for a user-visible response after a turn that made no tool call and produced only
     /// thinking (or nothing at all), which would otherwise end silently.
     ///
-    /// The nudge is appended after the assistant message so the thinking-only turn is not the
-    /// trailing assistant message: Claude strips trailing thinking blocks only from the last
-    /// assistant turn, so keeping it non-last preserves its thinking block on the retry request.
+    /// The nudge is appended after the assistant message so the request does not end on the
+    /// thinking-only turn: the Claude encoder strips trailing thinking only from an assistant
+    /// message a request ends on, so keeping it non-last preserves its thinking block on the retry
+    /// request.
     ///
     /// Memory moves only once the pair is on disk. The two are one unit, and a save that fails
     /// ends the turn: appending first would leave the reasoning in the conversation with nothing
@@ -1112,6 +1166,7 @@ mod tests {
             request_in_flight: None,
             tiers_tried: 1,
             pending_repair,
+            thinking_removal_tried: false,
             user_saved: false,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,
@@ -1186,6 +1241,7 @@ mod tests {
             request_in_flight: None,
             tiers_tried: 1,
             pending_repair,
+            thinking_removal_tried: false,
             user_saved: false,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,
@@ -1216,6 +1272,109 @@ mod tests {
         );
     }
 
+    /// The removal of the conversation's Claude thinking is tried once per stretch of failure: a
+    /// request that carried it and was rejected leaves it spent, one dropped before the provider
+    /// answered leaves it to try again without charging a tier for it, and either way the thinking
+    /// is back as it was. A conversation with no Claude thinking has nothing to remove.
+    #[test]
+    fn a_thinking_removal_is_spent_by_a_rejection_and_not_by_an_unjudged_request() {
+        let signed = Message {
+            role: crate::conversation::Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "reasoning".to_string(),
+                    opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                        signature: "sig".to_string(),
+                    }),
+                },
+                ContentBlock::Text {
+                    text: "an answer".to_string(),
+                },
+            ],
+        };
+        let mut messages = Conversation::new();
+        messages.append(Message::user("a question"));
+        messages.append(signed.clone());
+        messages.append(Message::user("a follow-up"));
+        let mut recovery = TurnRecovery {
+            suspect_floor: 0,
+            prompt_only_events: 0,
+            retention: crate::conversation::PromptRetention::Keep,
+            overflow_retries: 0,
+            requested_compactions: 0,
+            ceiling_compacted: false,
+            request_in_flight: None,
+            tiers_tried: 1,
+            pending_repair: None,
+            thinking_removal_tried: false,
+            user_saved: true,
+            inbox_ids: Vec::new(),
+            thinking_only_nudged: false,
+            checklist_nudges: 0,
+            checklist_nudges_this_turn: 0,
+            outage_reprieve_used: false,
+        };
+        let carries_signed = |messages: &Conversation| {
+            messages
+                .iter()
+                .any(|message| message.without_claude_thinking().is_some())
+        };
+
+        assert!(recovery.remove_rejected_thinking(&mut messages));
+        assert!(!carries_signed(&messages));
+        assert_eq!(messages.len(), 3);
+        recovery.unjudge_repair(&mut messages);
+        assert!(carries_signed(&messages), "put back");
+        assert_eq!(recovery.tiers_tried, 1, "no tier was charged for it");
+
+        assert!(
+            recovery.remove_rejected_thinking(&mut messages),
+            "unjudged, so tried again"
+        );
+        recovery.undo_rejected_repair(&mut messages);
+        assert!(carries_signed(&messages), "put back");
+        assert!(
+            !recovery.remove_rejected_thinking(&mut messages),
+            "rejected, so spent"
+        );
+        assert!(recovery.pending_repair.is_none());
+
+        // A degrade tier applied after the rejected removal, then dropped unanswered, gives back
+        // its tier and leaves the removal spent.
+        recovery.pending_repair = Some(messages.replace_tail(1, vec![Message::user("degraded")]));
+        recovery.unjudge_repair(&mut messages);
+        assert_eq!(recovery.tiers_tried, 0, "the tier given back");
+        assert_eq!(
+            messages.as_slice().last().map(Message::text_content),
+            Some("a follow-up".to_string())
+        );
+        assert!(
+            !recovery.remove_rejected_thinking(&mut messages),
+            "still spent"
+        );
+
+        recovery.after_conversation_rewrite();
+        assert!(
+            recovery.remove_rejected_thinking(&mut messages),
+            "rewritten, so available"
+        );
+        recovery.undo_rejected_repair(&mut messages);
+        assert!(!recovery.remove_rejected_thinking(&mut messages));
+
+        recovery.note_request_accepted();
+        let mut plain = Conversation::new();
+        plain.append(Message::user("a question"));
+        plain.append(Message::assistant_text("an answer"));
+        assert!(
+            !recovery.remove_rejected_thinking(&mut plain),
+            "nothing to remove"
+        );
+        assert!(
+            recovery.remove_rejected_thinking(&mut messages),
+            "accepted, so available"
+        );
+    }
+
     /// The wait is the length the provider asked for, not the constant.
     ///
     /// [`crate::provider::retry::outage_reprieve`] has its own unit tests, and they pin every
@@ -1243,6 +1402,7 @@ mod tests {
             request_in_flight: None,
             tiers_tried: 0,
             pending_repair: None,
+            thinking_removal_tried: false,
             user_saved: true,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,
@@ -1309,6 +1469,7 @@ mod tests {
             request_in_flight: None,
             tiers_tried: 0,
             pending_repair: None,
+            thinking_removal_tried: false,
             user_saved: true,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,
@@ -1810,6 +1971,7 @@ mod tests {
             request_in_flight: None,
             tiers_tried: 1,
             pending_repair: None,
+            thinking_removal_tried: false,
             user_saved: true,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,

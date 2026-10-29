@@ -318,6 +318,14 @@ pub(crate) enum Event {
     /// `Agent::run_turn`, records it before appending the round's own messages, so the view it
     /// addresses is the view the request was built from.
     Redact { images: Vec<RedactedImage> },
+    /// Takes the thinking Claude checks out of every message the view holds at this point (see
+    /// [`Message::without_claude_thinking`]), after Claude rejected a thinking block's signature:
+    /// a rejected block fails every later request that carries it, wherever it sits. Recorded by
+    /// reference, like [`Self::Redact`], rather than as a [`Self::Repair`] carrying copies: the
+    /// copies would be every message since the last compaction, dated now, and a turn retention
+    /// sweep would keep them for a window past the rows they copied. A message appended after it
+    /// keeps its own thinking.
+    Unsign,
 }
 
 pub(crate) use crate::image::RedactedImage;
@@ -647,14 +655,34 @@ impl Conversation {
         event
     }
 
-    /// Undo the most recent [`Self::replace_tail`], restoring the messages it replaced.
+    /// Record that the thinking Claude checks is no longer sent for anything the view holds, when
+    /// it holds some. Returns the event so the caller can persist it; see [`Event::Unsign`].
+    pub(crate) fn unsign_thinking(&mut self) -> Option<Event> {
+        if !self
+            .materialized
+            .iter()
+            .any(Message::carries_claude_thinking)
+        {
+            return None;
+        }
+        let event = Event::Unsign;
+        self.events.push(event.clone());
+        self.rebuild_materialized();
+        Some(event)
+    }
+
+    /// Undo the most recent [`Self::replace_tail`] or [`Self::unsign_thinking`], restoring the
+    /// messages it changed.
     ///
     /// The inverse of [`Self::pop_unsaved`] for repairs: `run_turn` degrades content, retries, and
     /// calls this when the retry fails too, so a misdiagnosed rejection leaves the conversation
     /// byte-identical instead of permanently losing a good tool result. Returns whether anything
-    /// was undone; a trailing event that isn't a `Repair` is left alone.
+    /// was undone; a trailing event that is neither is left alone.
     pub(crate) fn pop_repair(&mut self) -> bool {
-        if !matches!(self.events.last(), Some(Event::Repair { .. })) {
+        if !matches!(
+            self.events.last(),
+            Some(Event::Repair { .. } | Event::Unsign)
+        ) {
             return false;
         }
         self.events.pop();
@@ -975,6 +1003,14 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
                     };
                     if let Some(placed) = placed.get_mut(at) {
                         redact_image(&mut placed.message, image);
+                    }
+                }
+            }
+            Event::Unsign => {
+                revision = revision.saturating_add(1);
+                for placed in &mut placed {
+                    if let Some(without) = placed.message.without_claude_thinking() {
+                        placed.message = without;
                     }
                 }
             }
@@ -1804,6 +1840,46 @@ impl Message {
         }
     }
 
+    /// Whether this message carries thinking Claude checks when it is sent back: a block under
+    /// Claude's signature, or a redacted one.
+    pub(crate) fn carries_claude_thinking(&self) -> bool {
+        self.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Thinking {
+                    opaque: Some(OpaqueReasoning::Signed { .. }),
+                    ..
+                } | ContentBlock::RedactedThinking { .. }
+            )
+        })
+    }
+
+    /// A copy of this message without the thinking Claude checks when it is sent back, or `None`
+    /// when it carries none: a signed block keeps its readable text and loses its signature, which
+    /// is what keeps it off the Claude wire, and a redacted block, all signature, goes whole. What
+    /// a request rejected over a thinking block's signature is retried with.
+    pub(crate) fn without_claude_thinking(&self) -> Option<Message> {
+        if !self.carries_claude_thinking() {
+            return None;
+        }
+        let content = self
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Thinking {
+                    thinking,
+                    opaque: Some(OpaqueReasoning::Signed { .. }),
+                } => ContentBlock::replayable_thinking(thinking.clone(), None),
+                ContentBlock::RedactedThinking { .. } => None,
+                other => Some(other.clone()),
+            })
+            .collect();
+        Some(Message {
+            role: self.role.clone(),
+            content,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn tool_uses(&self) -> Vec<&ContentBlock> {
         self.content
@@ -1967,6 +2043,14 @@ pub(crate) fn format_session_as_markdown(
                     write_message_markdown(&mut output, message, scratchpad_entries);
                 }
                 writeln!(output, "</details>\n").ok();
+            }
+            Event::Unsign => {
+                writeln!(
+                    output,
+                    "*The thinking above is no longer sent to the model: Claude rejected a thinking \
+                     block's signature.*\n"
+                )
+                .ok();
             }
         }
     }
@@ -2655,6 +2739,134 @@ mod tests {
     fn message_log_pop_unsaved_on_empty() {
         let mut log = Conversation::new();
         assert!(log.pop_unsaved().is_none());
+    }
+
+    /// Taking the Claude thinking out of a message leaves the reasoning readable and nothing
+    /// Claude would check: a signed block loses its signature and keeps its text, one with no text
+    /// goes, a redacted block goes, and another wire's reasoning stays as it was.
+    #[test]
+    fn a_message_without_claude_thinking_keeps_the_readable_reasoning() {
+        let signed = |thinking: &str| ContentBlock::Thinking {
+            thinking: thinking.to_string(),
+            opaque: Some(OpaqueReasoning::Signed {
+                signature: "sig".to_string(),
+            }),
+        };
+        let sealed = ContentBlock::Thinking {
+            thinking: "summary".to_string(),
+            opaque: Some(OpaqueReasoning::Sealed {
+                encrypted_content: "sealed".to_string(),
+                id: None,
+            }),
+        };
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![
+                signed("the reasoning"),
+                signed(""),
+                ContentBlock::RedactedThinking {
+                    data: "redacted".to_string(),
+                },
+                sealed.clone(),
+                ContentBlock::Text {
+                    text: "the answer".to_string(),
+                },
+            ],
+        };
+        let without = message.without_claude_thinking().expect("it carried some");
+        assert_eq!(
+            serde_json::to_value(&without.content).expect("serializes"),
+            serde_json::to_value(vec![
+                ContentBlock::Thinking {
+                    thinking: "the reasoning".to_string(),
+                    opaque: None,
+                },
+                sealed.clone(),
+                ContentBlock::Text {
+                    text: "the answer".to_string(),
+                },
+            ])
+            .expect("serializes")
+        );
+        assert!(without.without_claude_thinking().is_none());
+        assert!(
+            Message::assistant_text("plain")
+                .without_claude_thinking()
+                .is_none()
+        );
+        assert!(
+            Message {
+                role: Role::Assistant,
+                content: vec![sealed],
+            }
+            .without_claude_thinking()
+            .is_none(),
+            "another wire's reasoning is not Claude's to check"
+        );
+    }
+
+    /// An unsign takes the Claude thinking out of the messages ahead of it and leaves one appended
+    /// after it signed, the same on a reload; it is undone like a repair, and an export marks
+    /// where it happened while keeping each message once.
+    #[test]
+    fn an_unsign_strips_the_thinking_ahead_of_it_and_no_further() {
+        let signed = |thinking: &str| Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: thinking.to_string(),
+                    opaque: Some(OpaqueReasoning::Signed {
+                        signature: "sig".to_string(),
+                    }),
+                },
+                ContentBlock::Text {
+                    text: "an answer".to_string(),
+                },
+            ],
+        };
+        let mut log = Conversation::new();
+        log.append(Message::user("first question"));
+        log.append(signed("first reasoning"));
+        log.append(Message::user("second question"));
+        assert!(matches!(log.unsign_thinking(), Some(Event::Unsign)));
+        log.append(signed("second reasoning"));
+
+        for view in [
+            log.as_slice().to_vec(),
+            Conversation::from_events(log.events().to_vec())
+                .as_slice()
+                .to_vec(),
+        ] {
+            assert_eq!(view.len(), 4);
+            assert!(!view[1].carries_claude_thinking());
+            assert!(matches!(
+                &view[1].content[0],
+                ContentBlock::Thinking { thinking, opaque: None } if thinking == "first reasoning"
+            ));
+            assert!(view[3].carries_claude_thinking(), "appended after it");
+        }
+
+        let markdown = format_session_as_markdown(
+            uuid::Uuid::nil(),
+            log.events(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            markdown.contains("no longer sent to the model"),
+            "{markdown}"
+        );
+        assert_eq!(markdown.matches("first question").count(), 1, "{markdown}");
+
+        let mut undone = Conversation::new();
+        undone.append(Message::user("a question"));
+        undone.append(signed("reasoning"));
+        assert!(undone.unsign_thinking().is_some());
+        assert!(undone.pop_repair());
+        assert!(undone.as_slice()[1].carries_claude_thinking(), "put back");
+        let mut plain = Conversation::new();
+        plain.append(Message::user("a question"));
+        assert!(plain.unsign_thinking().is_none(), "nothing to take");
+        assert_eq!(plain.events().len(), 1);
     }
 
     #[test]

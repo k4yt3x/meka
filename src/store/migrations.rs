@@ -3183,6 +3183,9 @@ const ARCHIVE_FORMAT_0_78: u64 = 14;
 /// The archive `format_version` 0.79 through 0.83 wrote, whose boundaries record nothing about
 /// their compaction.
 const ARCHIVE_FORMAT_0_83: u64 = 15;
+/// The archive `format_version` 0.84 and 0.85 wrote, whose events never record that Claude's
+/// thinking stopped being sent.
+const ARCHIVE_FORMAT_0_85: u64 = 16;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -3753,7 +3756,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_77)
         | Some(ARCHIVE_FORMAT_0_78_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_78)
-        | Some(ARCHIVE_FORMAT_0_83) => {}
+        | Some(ARCHIVE_FORMAT_0_83)
+        | Some(ARCHIVE_FORMAT_0_85) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -9103,6 +9107,59 @@ mod tests {
             document, once,
             "a replay over a converted archive is a no-op"
         );
+    }
+
+    /// A format 16 archive is today's shape less an event it never wrote, so it imports as it
+    /// is, under the current version.
+    #[test]
+    fn a_format_16_archive_imports_as_it_is() {
+        let mut document = serde_json::json!({
+            "format_version": 16,
+            "meka_version": "0.85.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "working_directory": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_workspace_directories": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "project": "",
+                "stats": {
+                    "turns": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 1, "turn_index": 1},
+                },
+                "turns": [],
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "event": {"Repair": {"replaced_count": 1, "messages": []}},
+                    "turn_id": null,
+                }],
+                "scratchpad_entries": {},
+            }],
+        });
+        let before = document["sessions"].clone();
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document["sessions"], before, "nothing to convert");
+        assert_eq!(document["format_version"], current);
+        let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
+            .expect("a format 16 archive reads");
+        assert_eq!(export.sessions[0].events.len(), 1);
     }
 
     /// A row written before the memory columns loads by its priority, since priority 0 was the

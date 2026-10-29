@@ -154,6 +154,8 @@ fn append_messages(events: &[Event]) -> Vec<&Message> {
             Event::CompactBoundary { .. } => {}
             // Skipped: it changes an image into a note, and images are not searchable either way.
             Event::Redact { .. } => {}
+            // Skipped: it takes signatures and redacted blocks, and neither holds a word.
+            Event::Unsign => {}
             // Applied rather than skipped: a repaired message is what the model actually saw, so
             // searching the superseded original would surface content that is no longer in the
             // conversation. Unlike a boundary this can shift indices, but only across a repair,
