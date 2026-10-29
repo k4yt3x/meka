@@ -584,13 +584,22 @@ pub(super) fn convert_deferred_tools_to_claude_tools(
 }
 
 /// Append `deferred` to the body's `tools`, creating the array for a request whose active tools
-/// are none, and keep a `tool_reference` block in the history only where this request declares
-/// its tool. The API expands a reference against the `tools` array, so one naming a tool that is
-/// not there (a server withdrew it, or the session moved to a profile that appends) is sent as the
-/// text of its name instead, in place, with any cache marker the block carries.
+/// are none, and keep a `tool_reference` block in the history only where this request can send it.
+/// The API refuses a reference to a tool its `tools` array lacks (a server withdrew or renamed it,
+/// or the session moved to a profile that appends), and a result mixing references with anything
+/// else. So a result of references keeps those this request declares and leaves the rest out (a
+/// tool now active is in the array whole); one with none declared, or with other content beside
+/// them, sends each as the text of its name, in place.
 pub(super) fn declare_deferred_tools(body: &mut serde_json::Value, deferred: &[ToolDefinition]) {
     let declared: HashSet<&str> = deferred.iter().map(|tool| tool.name.as_str()).collect();
-    let result_blocks = body
+    let is_reference = |item: &serde_json::Value| item["type"] == "tool_reference";
+    let is_declared_reference = |item: &serde_json::Value| {
+        is_reference(item)
+            && item["tool_name"]
+                .as_str()
+                .is_some_and(|name| declared.contains(name))
+    };
+    let results = body
         .get_mut("messages")
         .and_then(serde_json::Value::as_array_mut)
         .into_iter()
@@ -598,21 +607,21 @@ pub(super) fn declare_deferred_tools(body: &mut serde_json::Value, deferred: &[T
         .filter_map(|message| message.get_mut("content")?.as_array_mut())
         .flatten()
         .filter(|block| block["type"] == "tool_result")
-        .filter_map(|block| block.get_mut("content")?.as_array_mut())
-        .flatten();
-    for item in result_blocks {
-        if item["type"] != "tool_reference" {
+        .filter_map(|block| block.get_mut("content")?.as_array_mut());
+    for items in results {
+        if items.iter().all(is_reference) && items.iter().any(is_declared_reference) {
+            items.retain(is_declared_reference);
             continue;
         }
-        let name = item["tool_name"].as_str().unwrap_or_default();
-        if declared.contains(name) {
-            continue;
-        }
-        let name = serde_json::Value::String(name.to_string());
-        if let Some(fields) = item.as_object_mut() {
-            fields.remove("tool_name");
-            fields.insert("type".to_string(), "text".into());
-            fields.insert("text".to_string(), name);
+        for item in items.iter_mut().filter(|item| is_reference(item)) {
+            let name = serde_json::Value::String(
+                item["tool_name"].as_str().unwrap_or_default().to_string(),
+            );
+            if let Some(fields) = item.as_object_mut() {
+                fields.remove("tool_name");
+                fields.insert("type".to_string(), "text".into());
+                fields.insert("text".to_string(), name);
+            }
         }
     }
     if deferred.is_empty() {
@@ -1877,24 +1886,32 @@ mod tests {
         assert!(nothing.get("tools").is_none());
     }
 
-    /// A reference the request cannot back is sent as text: the API expands a reference against
-    /// the `tools` array and rejects one it cannot find there. The block keeps its place and its
-    /// cache marker, so the breakpoint the converter set stays where it was.
+    /// A result whose references outlive some of their tools (a server renamed or withdrew one)
+    /// keeps the references the request declares and leaves the rest out: the API refuses a
+    /// reference it cannot find in `tools`, and text beside a reference as well. The result block
+    /// keeps the breakpoint the converter set on it.
     #[test]
-    fn a_reference_to_a_tool_the_request_does_not_declare_is_text() {
-        let mut body = serde_json::json!({
-            "messages": [{
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_1",
-                    "content": [
-                        {"type": "tool_reference", "tool_name": "mcp__kv__probe"},
-                        {"type": "tool_reference", "tool_name": "mcp__gone__tool", "cache_control": {"type": "ephemeral"}},
-                    ],
-                    "is_error": false,
-                }],
+    fn a_result_keeps_only_the_references_the_request_declares() {
+        let reference = |tool_name: &str| ToolResultContent::ToolReference {
+            tool_name: tool_name.to_string(),
+        };
+        let message = crate::conversation::Message {
+            role: crate::conversation::Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: vec![
+                    reference("mcp__gone__tool"),
+                    reference("mcp__kv__probe"),
+                    reference("mcp__gone__other"),
+                ],
+                is_error: false,
             }],
+        };
+        let mut body = serde_json::json!({
+            "messages": convert_messages_to_claude_content(
+                &[message],
+                Some(CacheBreakpoint::Ephemeral),
+            ),
         });
         let deferred = [ToolDefinition::new(
             "mcp__kv__probe",
@@ -1902,18 +1919,68 @@ mod tests {
             serde_json::json!({"type": "object"}),
         )];
         declare_deferred_tools(&mut body, &deferred);
-        let content = &body["messages"][0]["content"][0]["content"];
-        assert_eq!(content[0]["type"], "tool_reference", "{content}");
-        assert_eq!(content[1]["type"], "text", "{content}");
-        assert_eq!(content[1]["text"], "mcp__gone__tool");
-        assert!(content[1].get("tool_name").is_none());
-        assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
-
-        declare_deferred_tools(&mut body, &[]);
-        let content = &body["messages"][0]["content"][0]["content"];
+        let result = &body["messages"][0]["content"][0];
         assert_eq!(
-            content[0]["type"], "text",
-            "nothing declared, nothing referenced: {content}"
+            result["content"],
+            serde_json::json!([{"type": "tool_reference", "tool_name": "mcp__kv__probe"}]),
+            "{result}"
+        );
+        assert_eq!(result["cache_control"]["type"], "ephemeral", "{result}");
+    }
+
+    /// A result with no reference the request can send names its tools in text, in place: every
+    /// reference when none is declared, and every reference beside other content, which no
+    /// declaration makes sendable.
+    #[test]
+    fn a_result_with_no_sendable_reference_names_its_tools_in_text() {
+        let result = |content: serde_json::Value| {
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": content}],
+                }],
+            })
+        };
+        let deferred = [ToolDefinition::new(
+            "mcp__kv__probe",
+            "probe",
+            serde_json::json!({"type": "object"}),
+        )];
+
+        let mut gone = result(serde_json::json!([
+            {"type": "tool_reference", "tool_name": "mcp__gone__tool"},
+            {"type": "tool_reference", "tool_name": "mcp__gone__other"},
+        ]));
+        declare_deferred_tools(&mut gone, &deferred);
+        assert_eq!(
+            gone["messages"][0]["content"][0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "mcp__gone__tool"},
+                {"type": "text", "text": "mcp__gone__other"},
+            ])
+        );
+
+        let mut beside_text = result(serde_json::json!([
+            {"type": "text", "text": "loaded"},
+            {"type": "tool_reference", "tool_name": "mcp__kv__probe"},
+        ]));
+        declare_deferred_tools(&mut beside_text, &deferred);
+        assert_eq!(
+            beside_text["messages"][0]["content"][0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "loaded"},
+                {"type": "text", "text": "mcp__kv__probe"},
+            ])
+        );
+
+        let mut undeclared = result(serde_json::json!([
+            {"type": "tool_reference", "tool_name": "mcp__kv__probe"},
+        ]));
+        declare_deferred_tools(&mut undeclared, &[]);
+        assert_eq!(
+            undeclared["messages"][0]["content"][0]["content"],
+            serde_json::json!([{"type": "text", "text": "mcp__kv__probe"}]),
+            "nothing declared, nothing referenced"
         );
     }
 

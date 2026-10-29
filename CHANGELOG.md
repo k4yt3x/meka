@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A resume shows a joined prompt once, and a refused one as it was, with no `Rewound` row.
 - An emoji its presentation selector widens no longer pushes a row past the window's edge.
 - Resizing the window no longer flashes a blank screen: the new layout is ready before the repaint.
+- Claude no longer refuses every turn once an MCP server renames or drops a tool the agent loaded.
 
 ### Security
 
