@@ -32,20 +32,6 @@ pub(crate) struct InfoResponse {
     /// The scopes the calling token holds, sorted. A client otherwise learns what it may do by
     /// collecting 403s.
     pub(crate) scopes: Vec<String>,
-    /// `config.toml`'s path, for a client that administers the installation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) config_path: Option<String>,
-    /// The data directory, where the store lives.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) data_dir: Option<String>,
-    /// When this process last read `config.toml` whole, RFC 3339: its start, or the last
-    /// `POST /v1/config/reload`.
-    pub(crate) config_loaded_at: String,
-    /// When `config.toml` was last written, RFC 3339; absent when there is no file. Later than
-    /// `config_loaded_at` means the file has changed since this process read it whole, by a
-    /// write of its own, which it serves, or by a shell's, which `POST /v1/config/reload` applies.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) config_modified_at: Option<String>,
 }
 
 /// `when` as the wire carries a time.
@@ -79,12 +65,6 @@ pub(crate) async fn info(
     let config = &state.shared.config;
     let mut scopes: Vec<String> = scoped.principal.scopes.to_vec();
     scopes.sort_unstable();
-    let config_path = crate::paths::config_file_path();
-    let config_modified_at = config_path
-        .as_ref()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .and_then(|metadata| metadata.modified().ok())
-        .map(|modified| rfc3339(chrono::DateTime::<chrono::Utc>::from(modified)));
     Ok(Json(InfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         default_permission: config.permission.to_string(),
@@ -94,10 +74,6 @@ pub(crate) async fn info(
             .map(|p| p.to_string())
             .collect(),
         scopes,
-        config_path: config_path.map(|path| path.display().to_string()),
-        data_dir: crate::paths::meka_data_dir().map(|path| path.display().to_string()),
-        config_loaded_at: rfc3339(*crate::sync::lock(&state.config_loaded_at)),
-        config_modified_at,
     }))
 }
 
@@ -137,13 +113,24 @@ pub(crate) struct McpServerStateView {
     pub(crate) protocol_version: Option<String>,
 }
 
-/// `GET /v1/mcp`: configured MCP servers and their current connection state.
+/// What `GET /v1/mcp` answers.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct McpServersResponse {
+    pub(crate) servers: Vec<McpServerStateView>,
+    /// Names a credential is stored under that no entry claims, which `DELETE /v1/mcp/{name}`
+    /// clears. Absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) orphaned_credentials: Vec<String>,
+}
+
+/// `GET /v1/mcp`: configured MCP servers and their current connection state, and the names a
+/// credential is stored under that no entry claims.
 #[utoipa::path(
     get,
     path = "/v1/mcp",
     tag = "discovery",
     responses(
-        (status = 200, description = "Per-server connection state", body = [McpServerStateView]),
+        (status = 200, description = "Per-server connection state", body = McpServersResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -153,9 +140,12 @@ pub(crate) struct McpServerStateView {
 pub(crate) async fn mcp(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::AnyRead>,
-) -> Result<Json<Vec<McpServerStateView>>, ProblemDetail> {
+) -> Result<Json<McpServersResponse>, ProblemDetail> {
     let Some(manager) = state.shared.mcp_manager.as_ref() else {
-        return Ok(Json(Vec::new()));
+        return Ok(Json(McpServersResponse {
+            servers: Vec::new(),
+            orphaned_credentials: Vec::new(),
+        }));
     };
     let names = manager.server_names();
     let mut servers = Vec::with_capacity(names.len());
@@ -176,7 +166,27 @@ pub(crate) async fn mcp(
             protocol_version,
         });
     }
-    Ok(Json(servers))
+    // Against the file's entries as well as the manager's: an entry added in a shell and not yet
+    // served is configured, and its credential is no orphan to clear. A file that fails to parse
+    // reads as empty, which leaves the manager's word.
+    let mut claimed = manager.server_configs();
+    let (config_file, _) = crate::config::load_config_file();
+    claimed.extend(
+        config_file
+            .mcp
+            .and_then(|mcp| mcp.servers)
+            .unwrap_or_default(),
+    );
+    let orphaned_credentials =
+        crate::installation::mcp::orphaned_credentials(&claimed, &state.shared.store.token_store())
+            .await
+            .map_err(|error| {
+                ProblemDetail::internal_sanitized("failed to read the credentials", error)
+            })?;
+    Ok(Json(McpServersResponse {
+        servers,
+        orphaned_credentials,
+    }))
 }
 
 /// `GET /v1/mcp/{name}/tools`: what one MCP server advertises, with resolved permissions.

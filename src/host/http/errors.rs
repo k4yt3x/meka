@@ -138,6 +138,123 @@ const RELAYED_RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_s
 
 pub(crate) use crate::error::ErrorKind;
 
+/// A refusal whose remedy is a command, worded with this API's route where its display names
+/// the shell's: the one place every route words them, so a refusal reads the same whichever route
+/// raised it. `None` for every other error, whose sentence is the same on every surface.
+fn api_sentence(error: &MekaError) -> Option<String> {
+    Some(match error {
+        MekaError::McpCredentialInTheWay {
+            server_name,
+            obstacle,
+        } => {
+            let remedy = match obstacle {
+                crate::error::McpCredentialObstacle::BearerOverridesLogin => {
+                    format!("`POST /v1/mcp/{server_name}/logout`")
+                }
+                crate::error::McpCredentialObstacle::LeftFromRemovedServer => {
+                    format!("`DELETE /v1/mcp/{server_name}`")
+                }
+            };
+            obstacle.sentence(server_name, &remedy)
+        }
+        MekaError::McpLoginRequired { server_name } => format!(
+            "MCP server '{server_name}' has no OAuth credentials for its URL; log in with \
+             `POST /v1/mcp/{server_name}/login`"
+        ),
+        MekaError::McpSecretForAnotherUrl {
+            server_name,
+            secret,
+            stored_for,
+        } => {
+            let key = match secret {
+                crate::error::McpSecretKind::Bearer => "auth_token",
+                crate::error::McpSecretKind::ClientSecret => "client_secret",
+            };
+            secret.sentence(
+                server_name,
+                stored_for.as_deref(),
+                &format!("`POST /v1/mcp/{server_name}/login` and `{key}`"),
+            )
+        }
+        MekaError::ProfileDefaultStillNeeded { name, remaining } => format!(
+            "'{name}' is the default profile and {remaining} would remain; make one of them the \
+             default first with `PATCH /v1/profiles/{{name}}` and `\"default\": true`",
+            remaining = remaining.join(", ")
+        ),
+        MekaError::AccountCredentialKind {
+            account,
+            backend,
+            key_given: true,
+        } => format!(
+            "'{account}' is on '{backend}', which logs in through the browser and takes no API \
+             key; drop `api_key`"
+        ),
+        MekaError::AccountCredentialKind {
+            account,
+            backend,
+            key_given: false,
+        } => format!("'{account}' is on '{backend}', which takes an API key; send it as `api_key`"),
+        MekaError::AccountCredentialLeftOver { account } => format!(
+            "'{account}' has a stored credential left over from a removed account; clear it first \
+             with `DELETE /v1/accounts/{account}`"
+        ),
+        MekaError::ProfileNamesNoModel { profile } => {
+            format!("profile '{profile}' names no model; give it one as `model`")
+        }
+        MekaError::ProfileRecordedBySessions { profile, sessions } => format!(
+            "{sessions} session(s) already record the profile '{profile}'; move them first with \
+             `PATCH /v1/sessions/{{id}}` and `profile`"
+        ),
+        // The shell's sentence names `meka account add` and `meka profile use`, which a client
+        // managing the installation over HTTP cannot run, where it can `POST /v1/accounts`,
+        // `POST /v1/profiles` and set `"default": true` on a `PATCH`.
+        MekaError::ProfileUnselected(refusal) => {
+            use crate::error::{ProfileRefusal, ProfileRequest};
+            match refusal {
+                ProfileRefusal::NoProfiles => "no profile configured; add an account with `POST \
+                                               /v1/accounts`, then a profile with `POST \
+                                               /v1/profiles`"
+                    .to_string(),
+                ProfileRefusal::NoDefault { configured } => format!(
+                    "multiple profiles configured ({}) and no `default_profile`; pick one with \
+                     `PATCH /v1/profiles/{{name}}` and `\"default\": true`",
+                    configured.join(", ")
+                ),
+                ProfileRefusal::Unknown {
+                    requested,
+                    source,
+                    configured,
+                } => format!(
+                    "{}; {}",
+                    crate::text::unknown_name("profile", requested, configured),
+                    match (source, configured.is_empty()) {
+                        (_, true) => "add one with `POST /v1/profiles`",
+                        (ProfileRequest::Flag, false) => {
+                            "the server was started with `--profile`; restart it with a \
+                             configured name"
+                        }
+                        (ProfileRequest::DefaultProfile, false) => {
+                            "point `default_profile` at one with `PATCH /v1/profiles/{name}` and \
+                             `\"default\": true`"
+                        }
+                    }
+                ),
+            }
+        }
+        MekaError::ProfilePinnedBySubagents { profile, under } => {
+            crate::error::profile_pinned_sentence(profile, under, "`DELETE /v1/sessions/{id}`")
+        }
+        _ => return None,
+    })
+}
+
+/// What this API says about `error`: [`api_sentence`]'s wording where a refusal names a remedy,
+/// the sentence every surface shares otherwise. For a route that reports an error inside a body
+/// rather than as the problem it answers with.
+pub(crate) fn api_wording(error: &MekaError) -> String {
+    api_sentence(error).unwrap_or_else(|| error.sentence())
+}
+
 /// The status each catalog entry answers with where the kind alone decides it. Two vary by site
 /// and take their common one here: `Idempotency` is 429 at the cache cap, and `InvalidBody` is
 /// 400 for a path or query the router refused; those sites say so themselves.
@@ -157,6 +274,7 @@ pub(crate) fn status_of(kind: ErrorKind) -> StatusCode {
         | ErrorKind::InboxAppended
         | ErrorKind::TurnMismatch
         | ErrorKind::StoreReadOnly
+        | ErrorKind::InstructionsOverridden
         | ErrorKind::AccountInUse => StatusCode::CONFLICT,
         ErrorKind::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
         ErrorKind::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -168,7 +286,7 @@ pub(crate) fn status_of(kind: ErrorKind) -> StatusCode {
         | ErrorKind::ProviderUnavailable
         | ErrorKind::ProviderExhausted
         | ErrorKind::ContextOverflow => StatusCode::BAD_GATEWAY,
-        ErrorKind::McpUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorKind::McpUnavailable | ErrorKind::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
         ErrorKind::StreamDetached | ErrorKind::SseLag | ErrorKind::Internal => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -237,7 +355,7 @@ impl ProblemDetail {
             }
             _ => {}
         }
-        let mut problem = Self::new(kind, status_of(kind), error.sentence());
+        let mut problem = Self::new(kind, status_of(kind), api_wording(error));
         // An extension member rather than a replacement for `detail`, because the two carry
         // different things and neither substitutes for the other. `detail` is meka's own sentence
         // and for a context overflow it is the entire remedy ("compact it before retrying"), which

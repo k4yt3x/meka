@@ -234,7 +234,10 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                             config::MemoryConfig::inline_max_bytes(file.memory.as_ref());
                         let permission = config::default_permission_on_disk()?;
                         let context = store::migrations::Context::adopting(adopted.as_deref())
-                            .starting_at(&permission.to_string());
+                            .starting_at(&permission.to_string())
+                            .binding_mcp_credentials_to(installation::mcp::endpoints_of(
+                                &file.mcp_servers(),
+                            ));
                         (
                             Some((adopted, file.profiles)),
                             Some(permission),
@@ -486,13 +489,15 @@ async fn async_main(
     // Before the store is opened or a credential resolved, so a misconfigured profile is reported
     // as such rather than as a credential error.
     config.validate()?;
+    config.warn_about_inert_profile_keys();
 
     // The file's default rather than this run's level: a row the migration stamps is read by every
     // later process, and a `--permission` given once must not become what old sessions run at.
     let store = Store::open(
         None,
         &store::migrations::Context::adopting(config.configured_default_profile.as_deref())
-            .starting_at(&config::default_permission_on_disk()?.to_string()),
+            .starting_at(&config::default_permission_on_disk()?.to_string())
+            .binding_mcp_credentials_to(installation::mcp::endpoints_of(&config.mcp_servers)),
     )
     .await?;
     let token_store = store.token_store();

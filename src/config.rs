@@ -27,8 +27,9 @@ pub(crate) use profile::PROFILE_KEY_ORDER;
 pub(crate) use profile::{
     ANTHROPIC_MAX_REQUEST_BYTES, AccountConfig, Backend, DEFAULT_CONTEXT_WINDOW, ProfileCatalog,
     ProfileConfig, ProfileRefusal, ProfileRequest, ProfileSettings, account_for,
-    default_profile_on_disk, require_model, require_profile, resolve_device_id, resolve_profile,
-    select_profile, sort_account_keys, sort_profile_keys, validate_max_output_tokens,
+    default_profile_on_disk, refuse_an_unrunnable_profile, refuse_unrunnable_profiles,
+    require_model, require_profile, resolve_device_id, resolve_profile, select_profile,
+    sort_account_keys, sort_profile_keys, validate_max_output_tokens,
 };
 
 pub(crate) use self::{mcp::*, serve::*};
@@ -1725,9 +1726,6 @@ pub(crate) struct ProfileSummary {
 /// [`ResolvedConfig::resolve`].
 #[derive(Debug)]
 pub(crate) struct ResolvedConfig {
-    /// Backend of the selected profile's account; `None` when no profile could be selected or its
-    /// account's backend is not one meka knows, in which case [`Self::provider_error`] says so.
-    pub(crate) backend: Option<Backend>,
     /// Name of the selected profile.
     ///
     /// The process default only. A session records the profile it runs with and resolves that one
@@ -1760,7 +1758,6 @@ pub(crate) struct ResolvedConfig {
     /// `config.toml` failed to read or parse. Raised by [`Self::validate`] before anything else,
     /// since every other field is a default that silently ignores what the user wrote.
     pub(crate) config_error: Option<String>,
-    pub(crate) model: Option<String>,
     pub(crate) permission: Permission,
     pub(crate) enabled_permissions: EnabledPermissions,
     /// What a new session's approvals switch starts as. A resumed session brings its own.
@@ -1798,12 +1795,6 @@ pub(crate) struct ResolvedConfig {
     /// Resolved `[session].turn_retention`. `None`, the default, keeps every turn for the life of
     /// its session.
     pub(crate) turn_retention: Option<std::time::Duration>,
-    pub(crate) thinking: crate::config::ThinkingMode,
-    /// The selected profile's resolved thinking budget, the sibling of [`Self::thinking`] and
-    /// [`Self::max_output_tokens`]. Answers "what would a brand-new session get", which is exactly
-    /// what [`ResolvedConfig::validate_default_profile`] needs to check the pair against each
-    /// other. Not the seed: that is [`Self::default_thinking_budget`].
-    pub(crate) thinking_budget: u64,
     pub(crate) auto_compact: bool,
     /// `[session].context_ceiling_percent`, or [`DEFAULT_CONTEXT_CEILING_PERCENT`]; validated to 1
     /// through 100 by [`Self::validate`].
@@ -1826,9 +1817,6 @@ pub(crate) struct ResolvedConfig {
     /// Whether the selected profile's model accepts image input (the ACP `image` prompt
     /// capability). Resolved from `[profiles.<name>].vision`, defaulting to `true`.
     pub(crate) vision: bool,
-    /// Per-request output (completion) token cap from `[profiles.<name>].max_output_tokens`.
-    /// `None` leaves each backend's built-in default in place.
-    pub(crate) max_output_tokens: Option<u64>,
     pub(crate) mcp_servers: Vec<McpServerConfig>,
     /// Parsed [`Permission`] from `[mcp].default_permission`, carried so per-turn tool-permission
     /// resolution in `src/mcp.rs` doesn't have to re-read the config file. `None` means "no
@@ -1839,6 +1827,16 @@ pub(crate) struct ResolvedConfig {
     /// ([`Self::mcp_servers_as_served`]), and read for the MCP meta-tools. Never settled onto
     /// [`Self::mcp_servers`], the entries as the file states them.
     pub(crate) mcp_overlay: McpOverlay,
+    /// When this read of `config.toml` was made, and the file's modification time as it was
+    /// then: the whole read a host reports until it makes another.
+    pub(crate) read_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) file_modified: Option<std::time::SystemTime>,
+    /// The file this resolution read, section by section, which a long-lived host compares the
+    /// file with to say what only a restart applies ([`sections_awaiting_restart`]).
+    pub(crate) started_on: toml::Table,
+    /// The command line this resolved under, which a long-lived host resolves the file again
+    /// under to hold an edit to what startup would refuse.
+    pub(crate) overrides: CliOverrides,
     /// Non-secret projection of the configured profiles, for `GET /v1/profiles`.
     ///
     /// A projection rather than the profiles themselves, so a field added to [`ProfileConfig`]
@@ -2191,6 +2189,179 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
     Ok(ConfigFileLock::Held { _lock: lock })
 }
 
+impl ConfigFile {
+    /// The `[[mcp.servers]]` entries, as written.
+    pub(crate) fn mcp_servers(&self) -> Vec<McpServerConfig> {
+        self.mcp
+            .as_ref()
+            .and_then(|mcp| mcp.servers.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// When `config.toml` was last written, as the file system records it; `None` without a file.
+pub(crate) fn config_file_modified() -> Option<std::time::SystemTime> {
+    let path = config_file_path()?;
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// One read of `config.toml`: the text as read, when, and the file's modification time as it
+/// was then, which a host compares with the file's now to say whether an edit is unread. The one
+/// reader [`ResolvedConfig::resolve`] and a long-lived host's serving of the file share, so both
+/// parse the same text the same way.
+pub(crate) struct ConfigRead {
+    /// Taken ahead of the read, so a write landing between the two reads as a change this read
+    /// predates rather than as read.
+    pub(crate) modified: Option<std::time::SystemTime>,
+    pub(crate) at: chrono::DateTime<chrono::Utc>,
+    path: Option<PathBuf>,
+    /// The text, `None` without a file, or why it could not be read.
+    text: std::result::Result<Option<String>, String>,
+}
+
+impl ConfigRead {
+    /// Read `config.toml` now.
+    pub(crate) fn now() -> Self {
+        let modified = config_file_modified();
+        let at = chrono::Utc::now();
+        let path = config_file_path();
+        let text = match &path {
+            None => Ok(None),
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(contents) => Ok(Some(contents)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(format!("failed to read {}: {}", path.display(), error)),
+            },
+        };
+        Self {
+            modified,
+            at,
+            path,
+            text,
+        }
+    }
+
+    /// The text parsed, with any error that stopped it from parsing; see [`load_config_file`].
+    pub(crate) fn parse(&self) -> (ConfigFile, Option<String>) {
+        match &self.text {
+            Ok(None) => (ConfigFile::default(), None),
+            Ok(Some(contents)) => match toml::from_str(contents) {
+                Ok(config) => (config, None),
+                Err(error) => (
+                    ConfigFile::default(),
+                    Some(format!(
+                        "failed to parse {}: {}",
+                        self.path
+                            .as_deref()
+                            .unwrap_or_else(|| std::path::Path::new("config.toml"))
+                            .display(),
+                        error
+                    )),
+                ),
+            },
+            Err(error) => (ConfigFile::default(), Some(error.clone())),
+        }
+    }
+
+    /// Why the text does not parse, for a caller that is not at the operator's terminal: the line
+    /// and the parser's message, without the excerpt of the file a terminal error quotes, since a
+    /// line can hold a header's or an environment variable's value, which no listing shows.
+    /// `None` when it parses.
+    pub(crate) fn parse_refusal(&self) -> Option<String> {
+        match &self.text {
+            Ok(None) => None,
+            Ok(Some(contents)) => {
+                let error = toml::from_str::<ConfigFile>(contents).err()?;
+                Some(match error.span() {
+                    Some(span) => format!(
+                        "line {}: {}",
+                        contents[..span.start.min(contents.len())]
+                            .matches('\n')
+                            .count()
+                            + 1,
+                        error.message()
+                    ),
+                    None => error.message().to_string(),
+                })
+            }
+            Err(error) => Some(error.clone()),
+        }
+    }
+
+    /// The text parsed, refused as [`load_config_file_or_err`] refuses.
+    pub(crate) fn parse_or_err(&self) -> crate::error::Result<ConfigFile> {
+        match self.parse() {
+            (_, Some(error)) => Err(crate::error::MekaError::Config(error)),
+            (config_file, None) => Ok(config_file),
+        }
+    }
+
+    /// The text as a plain TOML table, section by section, for [`sections_awaiting_restart`]:
+    /// empty for a file that is absent, `None` for one that cannot be read or does not parse as
+    /// `config.toml`.
+    pub(crate) fn sections(&self) -> Option<toml::Table> {
+        if self.parse().1.is_some() {
+            return None;
+        }
+        match &self.text {
+            Ok(Some(contents)) => contents.parse::<toml::Table>().ok(),
+            Ok(None) => Some(toml::Table::new()),
+            Err(_) => None,
+        }
+    }
+}
+
+/// The sections of `config.toml` a long-lived host reads at startup alone, in the file's order:
+/// every one but `default_profile`, `[accounts.*]`, `[profiles.*]`, `[[mcp.servers]]` and
+/// `[thinking]`, and `[session].context_window`, which serving the file applies with the profiles
+/// they complete. `[mcp]` and `[session]` are here for their other keys.
+const SECTIONS_READ_AT_STARTUP: &[&str] = &[
+    "mcp",
+    "permissions",
+    "shell",
+    "tools",
+    "subagents",
+    "instructions",
+    "skills",
+    "memory",
+    "schedule",
+    "background",
+    "session",
+    "web",
+    "display",
+    "serve",
+];
+
+/// The keys of a section in [`SECTIONS_READ_AT_STARTUP`] that serving the file applies all the
+/// same.
+const KEYS_SERVED_WITH_THE_PROFILES: &[(&str, &str)] =
+    &[("mcp", "servers"), ("session", "context_window")];
+
+/// The sections read at startup alone whose content `now` states differently from `started`, the
+/// file this process started on: what only a restart applies.
+pub(crate) fn sections_awaiting_restart(
+    started: &toml::Table,
+    now: &toml::Table,
+) -> Vec<&'static str> {
+    let read_at_startup = |table: &toml::Table, section: &str| -> Option<toml::Value> {
+        let mut value = table.get(section)?.clone();
+        if let Some(keys) = value.as_table_mut() {
+            for (_, served) in KEYS_SERVED_WITH_THE_PROFILES
+                .iter()
+                .filter(|(of, _)| *of == section)
+            {
+                keys.remove(*served);
+            }
+        }
+        Some(value).filter(|value| value.as_table().is_none_or(|table| !table.is_empty()))
+    };
+    SECTIONS_READ_AT_STARTUP
+        .iter()
+        .copied()
+        .filter(|section| read_at_startup(started, section) != read_at_startup(now, section))
+        .collect()
+}
+
 /// Load `config.toml`, returning the parsed file and any error that stopped it from parsing.
 ///
 /// Warning and falling back to `ConfigFile::default()` is the worst of the options: one mistyped
@@ -2211,24 +2382,7 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
 /// re-reads the file itself, and each must fail on a *read* error rather than substitute an empty
 /// document, or the write-back truncates what it couldn't read.
 pub(crate) fn load_config_file() -> (ConfigFile, Option<String>) {
-    let Some(path) = config_file_path() else {
-        return (ConfigFile::default(), None);
-    };
-
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => match toml::from_str(&contents) {
-            Ok(config) => (config, None),
-            Err(error) => (
-                ConfigFile::default(),
-                Some(format!("failed to parse {}: {}", path.display(), error)),
-            ),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (ConfigFile::default(), None),
-        Err(error) => (
-            ConfigFile::default(),
-            Some(format!("failed to read {}: {}", path.display(), error)),
-        ),
-    }
+    ConfigRead::now().parse()
 }
 
 /// [`load_config_file`] for callers that read profiles but have no `validate()` to route the error
@@ -2240,11 +2394,7 @@ pub(crate) fn load_config_file() -> (ConfigFile, Option<String>) {
 /// `upsert_profile_document`, which replaces the profile's table wholesale and drops every field
 /// the flags did not set.
 pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
-    let (config_file, error) = load_config_file();
-    match error {
-        Some(error) => Err(crate::error::MekaError::Config(error)),
-        None => Ok(config_file),
-    }
+    ConfigRead::now().parse_or_err()
 }
 
 /// Resolve the runtime permission level and the set of enabled levels from the layered config
@@ -2500,7 +2650,18 @@ impl ResolvedConfig {
     }
 
     pub(crate) fn resolve(overrides: CliOverrides) -> Self {
-        let (config_file, config_error) = load_config_file();
+        Self::resolve_from(overrides, &ConfigRead::now())
+    }
+
+    /// [`Self::resolve`] over a read already made: a long-lived host asks it of the file it is
+    /// about to serve, under the overrides it started with, to hold that file to what startup
+    /// would refuse.
+    pub(crate) fn resolve_from(overrides: CliOverrides, read: &ConfigRead) -> Self {
+        let file_modified = read.modified;
+        let read_at = read.at;
+        let started_on = read.sections().unwrap_or_default();
+        let resolved_overrides = overrides.clone();
+        let (config_file, config_error) = read.parse();
         // `--profile`, else `default_profile`, else the sole profile, followed through its
         // account: the one selection, made here and replaced on a host only by a write of its
         // own. A miss is a deferred error `validate()` raises, so `resolve` stays infallible.
@@ -2655,10 +2816,6 @@ impl ResolvedConfig {
             }
             None => None,
         };
-        let backend = active_settings.as_ref().map(|settings| settings.backend);
-        let model = active_settings
-            .as_ref()
-            .and_then(|settings| settings.model.clone());
 
         let file_permissions = config_file.permissions.unwrap_or_default();
         let (permission, enabled_permissions, requested_permission) = resolve_permission(
@@ -2707,7 +2864,6 @@ impl ResolvedConfig {
         }
 
         Self {
-            backend,
             default_profile,
             configured_default_profile,
             catalog,
@@ -2715,7 +2871,6 @@ impl ResolvedConfig {
             profiles,
             provider_error,
             config_error,
-            model,
             permission,
             enabled_permissions,
             approvals: file_permissions.approvals.unwrap_or(false),
@@ -2741,15 +2896,6 @@ impl ResolvedConfig {
             sandbox_backend,
             retention: file_session.retention,
             turn_retention: file_session.turn_retention,
-            thinking: active_settings
-                .as_ref()
-                .map(|settings| settings.thinking)
-                .unwrap_or_default(),
-            thinking_budget: active_settings
-                .as_ref()
-                .map(|settings| settings.thinking_budget)
-                .or(default_thinking_budget)
-                .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
             auto_compact: file_session.auto_compact.unwrap_or(true),
             context_ceiling_percent: file_session
                 .context_ceiling_percent
@@ -2765,12 +2911,13 @@ impl ResolvedConfig {
             vision: active_settings
                 .as_ref()
                 .is_none_or(|settings| settings.vision),
-            max_output_tokens: active_settings
-                .as_ref()
-                .and_then(|settings| settings.max_output_tokens),
             mcp_servers,
             mcp_default_permission,
             mcp_overlay,
+            read_at,
+            file_modified,
+            started_on,
+            overrides: resolved_overrides,
             profile_summaries,
             instruction_files,
             standing_instructions,
@@ -2836,6 +2983,12 @@ impl ResolvedConfig {
         crate::paths::skill_roots(&self.skills_additional_directories)
     }
 
+    /// Say once, at startup, which profile keys their backend never reads. Apart from
+    /// [`Self::validate`], which a host asks again of every file it serves and which says nothing.
+    pub(crate) fn warn_about_inert_profile_keys(&self) {
+        warn_about_inert_profile_keys(&self.accounts, &self.profiles);
+    }
+
     pub(crate) fn validate(&self) -> crate::error::Result<()> {
         // Profile-selection failure (none / ambiguous / unknown name) is reported first with its
         // specific guidance. Ahead of the provider check: with an unparsed config there are no
@@ -2847,7 +3000,9 @@ impl ResolvedConfig {
         self.validate_default_profile()?;
         validate_fallback_chains(&self.accounts, &self.profiles, self.session_context_window)
             .map_err(crate::error::MekaError::Config)?;
-        warn_about_inert_profile_keys(&self.accounts, &self.profiles);
+        // Every profile, not the default alone: a session or a fallback may name any of them, and
+        // a host serves them all.
+        refuse_unrunnable_profiles(&self.accounts, &self.profiles, self.default_thinking_budget)?;
         // Zero would refuse every inline memory at every door while the model is still offered
         // `load: inline`; the switch for a session without memories is `enabled`.
         if self.memory_inline_max_bytes == 0 {
@@ -2984,21 +3139,15 @@ impl ResolvedConfig {
         Ok(())
     }
 
-    /// Everything this run needs to be true of the **process default** profile: that one could be
-    /// picked at all, that its backend is one meka speaks, and that it names a model.
+    /// That a profile could be picked for a run that names none: the **process default**'s
+    /// selection. Whether a profile can run is not asked here: every profile is held to
+    /// [`refuse_unrunnable_profiles`] after this, the one predicate.
     ///
-    /// Skipped entirely for a resume, because a resumed session answers all three from its own row
-    /// and never reads [`Self::default_profile`], and for a `meka serve` given no `--profile`,
-    /// whose sessions each name their profile or take the default at their creation. Each is
-    /// re-asked against the profile that actually applies, with a message naming it:
-    /// `require_profile` for the first, [`crate::provider::ProviderBuilder::build`]'s fallthrough
-    /// for the second, [`crate::provider::ProviderRegistry::resolve`] for the third.
-    ///
-    /// Firing these unconditionally would do two bad things. A session whose profile is still
-    /// configured could not be resumed at all, though its row holds the answer and `meka session
-    /// list` prints it. And a session whose profile *has* been deleted would be refused with
-    /// whichever of these tripped first rather than with the specific "no profile named 'work'": a
-    /// generic message masking a precise one, and only when two or more profiles happen to remain.
+    /// Skipped for a resume, because a resumed session answers it from its own row and never
+    /// reads [`Self::default_profile`], and for a `meka serve` given no `--profile`, whose sessions
+    /// each name their profile or take the default at their creation. Firing it unconditionally
+    /// would refuse resuming a session whose profile is configured, because two or more profiles
+    /// remain and none is the default, though its row holds the answer.
     ///
     /// Deferred, not dropped: a resume that finds no session, or a row with no recorded profile,
     /// still needs a default, and `resolve_session_profile` carries [`Self::provider_error`] into
@@ -3010,26 +3159,12 @@ impl ResolvedConfig {
         {
             return Ok(());
         }
-        if let Some(error) = &self.provider_error {
-            return Err(crate::error::MekaError::Config(error.clone()));
+        // The selection alone: whether the profile selected can run is asked of every profile
+        // after this, by the one predicate.
+        match &self.catalog.default_profile {
+            Ok(_) => Ok(()),
+            Err(refusal) => Err(crate::error::MekaError::ProfileUnselected(refusal.clone())),
         }
-        if self.backend.is_none() {
-            return Err(crate::error::MekaError::Config(
-                ProfileRefusal::NoProfiles.to_string(),
-            ));
-        }
-        require_model(
-            self.default_profile.as_deref().unwrap_or("?"),
-            self.model.as_deref(),
-        )?;
-        validate_max_output_tokens(
-            self.default_profile.as_deref().unwrap_or("?"),
-            self.backend,
-            self.max_output_tokens,
-            self.thinking,
-            self.thinking_budget,
-        )?;
-        Ok(())
     }
 }
 
@@ -3509,6 +3644,36 @@ mod tests {
             Some(&["search".to_string()][..]),
             "the entry as the file states it is untouched"
         );
+    }
+
+    /// What a restart alone applies: a section read at startup whose content moved, `[mcp]` for
+    /// its own keys and never for `[[mcp.servers]]`, which serving the file applies, and nothing
+    /// for a section written out empty where it was absent.
+    #[test]
+    fn the_sections_awaiting_a_restart_are_those_read_at_startup_alone() {
+        let table = |text: &str| text.parse::<toml::Table>().expect("toml");
+        let started = table(
+            "default_profile = \"a\"\n[mcp]\ngrace = \"5s\"\n[[mcp.servers]]\nname = \"x\"\n\
+             transport = \"stdio\"\ncommand = \"c\"\n",
+        );
+        let served_only = table(
+            "default_profile = \"b\"\n[profiles.p]\naccount = \"a\"\nmodel = \"m\"\n[mcp]\n\
+             grace = \"5s\"\n[[mcp.servers]]\nname = \"y\"\ntransport = \"stdio\"\ncommand = \
+             \"c\"\n[display]\n",
+        );
+        assert_eq!(
+            sections_awaiting_restart(&started, &served_only),
+            Vec::<&str>::new(),
+            "the served sections, and an empty table, are no restart"
+        );
+        let startup_only = table(
+            "default_profile = \"a\"\n[mcp]\ngrace = \"9s\"\n[[mcp.servers]]\nname = \"x\"\n\
+             transport = \"stdio\"\ncommand = \"c\"\n[permissions]\ndefault = \"read\"\n",
+        );
+        assert_eq!(sections_awaiting_restart(&started, &startup_only), [
+            "mcp",
+            "permissions"
+        ]);
     }
 
     /// A value missing either side of the colon is dropped; one naming a server the file does
@@ -5346,26 +5511,51 @@ url = "https://api.example.com/mcp"
 type = "client_credentials"
 client_id = "my-client"
 scopes = ["read", "write"]
-resource = "https://api.example.com"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let servers = config.mcp.unwrap().servers.unwrap();
         assert_eq!(servers.len(), 1);
         let auth = servers[0].auth.as_ref().expect("auth should be present");
         match auth {
-            McpAuthConfig::ClientCredentials {
-                client_id,
-                scopes,
-                resource,
-            } => {
+            McpAuthConfig::ClientCredentials { client_id, scopes } => {
                 assert_eq!(client_id, "my-client");
                 assert_eq!(
                     scopes.as_deref(),
                     Some(["read".to_string(), "write".to_string()].as_slice())
                 );
-                assert_eq!(resource.as_deref(), Some("https://api.example.com"));
             }
             other => panic!("expected ClientCredentials, got {other:?}"),
+        }
+    }
+
+    /// The resource a token is asked for is the server's own URL, which the MCP authorization
+    /// spec fixes, so no key states it: one written is refused by name, as every retired key is.
+    #[test]
+    fn a_resource_key_on_an_auth_block_is_refused_by_name() {
+        for kind in ["client_credentials", "client_credentials_jwt"] {
+            let toml_str = format!(
+                r#"
+[[mcp.servers]]
+name = "api"
+transport = "http"
+url = "https://api.example.com/mcp"
+
+[mcp.servers.auth]
+type = "{kind}"
+client_id = "my-client"
+signing_key_path = "/path/to/key.pem"
+resource = "https://api.example.com"
+"#
+            );
+            let toml_str = if kind == "client_credentials" {
+                toml_str.replace("signing_key_path = \"/path/to/key.pem\"\n", "")
+            } else {
+                toml_str
+            };
+            let error = toml::from_str::<ConfigFile>(&toml_str)
+                .expect_err("a resource key is refused")
+                .to_string();
+            assert!(error.contains("resource"), "{kind}: {error}");
         }
     }
 
@@ -5393,13 +5583,11 @@ scopes = ["admin"]
                 signing_key_path,
                 signing_algorithm,
                 scopes,
-                resource,
             } => {
                 assert_eq!(client_id, "my-client");
                 assert_eq!(signing_key_path, "/path/to/key.pem");
                 assert_eq!(signing_algorithm.as_deref(), Some("ES256"));
                 assert_eq!(scopes.as_deref(), Some(["admin".to_string()].as_slice()));
-                assert!(resource.is_none());
             }
             other => panic!("expected ClientCredentialsJwt, got {other:?}"),
         }
@@ -5879,8 +6067,16 @@ thinking = "budgeted"
             std::env::remove_var("MEKA_CONFIG_DIR");
         }
 
+        let settings = resolve_profile(
+            &from_profile.profiles["local"],
+            &from_profile.accounts["local"],
+            from_profile.session_context_window,
+            from_profile.default_thinking_budget,
+            String::new(),
+        )
+        .expect("the profile resolves");
         assert_eq!(
-            from_profile.thinking,
+            settings.thinking,
             crate::config::ThinkingMode::Budgeted,
             "the profile's thinking mode is the only thing that decides this now"
         );
@@ -6488,7 +6684,6 @@ refuse_private_destinations = true
         server.auth = Some(McpAuthConfig::ClientCredentials {
             client_id: "public-client-id".to_string(),
             scopes: None,
-            resource: None,
         });
 
         let rendered = format!("{server:?}");

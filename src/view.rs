@@ -207,6 +207,15 @@ pub(crate) struct AccountView {
     pub(crate) backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) base_url: Option<String>,
+    /// The OAuth token endpoint the account's logins and refreshes post to, when it states one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) oauth_token_url: Option<String>,
+    /// The OAuth client the account's grants are minted under, when it states one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) client_id: Option<String>,
+    /// Whether the interleaved-thinking beta is sent, when the account states it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) interleaved_thinking: Option<bool>,
     /// `yes`, `no`, or `unreadable`: the same three answers as the plain column, because a row
     /// meka cannot deserialize is neither logged in nor logged out.
     pub(crate) authenticated: &'static str,
@@ -220,6 +229,9 @@ impl AccountView {
             name: name.to_string(),
             backend: account.backend.clone(),
             base_url: account.base_url.clone(),
+            oauth_token_url: account.oauth_token_url.clone(),
+            client_id: account.client_id.clone(),
+            interleaved_thinking: account.interleaved_thinking,
             authenticated,
         }
     }
@@ -339,35 +351,59 @@ impl From<&McpServerConfig> for McpServerView {
 }
 
 /// One configured MCP server in full, for `meka mcp get` and `GET /v1/mcp/{name}`: the listing's
-/// fields plus what only the detail shows. Keys only for `env` and `headers`, as in the plain
-/// output, because a value there may be a secret.
+/// fields plus every other key the entry states, as written, so an editor can show and change
+/// them. Keys only for `env` and `headers`, as in the plain output, because a value there may be
+/// a secret. `required` and `deferral` are what the server runs under, the `[mcp]` default filled
+/// in; `inherited` names those the entry leaves unsaid.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct McpServerDetail {
     #[serde(flatten)]
     pub(crate) server: McpServerView,
+    /// `eager`, `deferred` or `hidden`: what the server's tools run under.
+    pub(crate) deferral: &'static str,
+    /// Of `required` and `deferral`, those the entry leaves unsaid and takes from `[mcp]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inherited: Vec<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) env_keys: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) header_keys: Vec<String>,
-    /// The kinds of credential stored for the server, by the labels the plain output uses.
+    /// The kinds of credential stored for the server and presented to its `url`, by the labels
+    /// the plain output uses.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) credentials: Vec<&'static str>,
+    /// The kinds stored under the server's name for another endpoint, which a connect does not
+    /// present: a `url` moved by hand, or a credential no server claimed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) credentials_for_another_endpoint: Vec<CredentialElsewhereView>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) credential_origin: Option<String>,
-    /// Absent when there is no origin, or no `url` for it to disagree with.
+    pub(crate) headers_helper: Option<String>,
+    /// The `auth` block as written, its `type` and the keys that type takes; none is a secret.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) credential_origin_matches_url: Option<bool>,
-    /// The `type` value as written in `config.toml`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) auth: Option<&'static str>,
+    pub(crate) auth: Option<crate::config::McpAuthConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) allowed_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) disabled_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) eager_load_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trust_read_only_hint: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "serve", schema(value_type = Option<BTreeMap<String, String>>))]
     pub(crate) tool_permissions: Option<BTreeMap<String, Permission>>,
+}
+
+/// A credential stored under a server's name for an endpoint other than its `url`.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+pub(crate) struct CredentialElsewhereView {
+    /// The kind, by the label the plain output uses.
+    pub(crate) kind: &'static str,
+    /// The origin it was stored for; absent for one bound to no server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stored_for: Option<String>,
 }
 
 /// One tool an MCP server advertises, with its permission resolved: what `meka mcp tools` prints

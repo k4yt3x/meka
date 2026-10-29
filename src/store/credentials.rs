@@ -89,6 +89,14 @@ impl std::fmt::Display for McpCredentialKind {
         formatter.write_str(self.name())
     }
 }
+impl From<crate::error::McpSecretKind> for McpCredentialKind {
+    fn from(secret: crate::error::McpSecretKind) -> Self {
+        match secret {
+            crate::error::McpSecretKind::Bearer => Self::Bearer,
+            crate::error::McpSecretKind::ClientSecret => Self::ClientSecret,
+        }
+    }
+}
 impl std::str::FromStr for McpCredentialKind {
     type Err = String;
 
@@ -123,6 +131,37 @@ pub(crate) struct TokenStore {
     pub(super) _ephemeral_lock_dir: Option<Arc<EphemeralLockDir>>,
 }
 impl TokenStore {
+    /// How many times each MCP server's credentials have changed, by any process's write, a token
+    /// refresh aside: what a running manager entry records when it is built, so a host serving
+    /// the installation can tell a server whose credential changed under it from one running the
+    /// credential it was built with. A server never written is absent, which reads as zero.
+    pub(crate) async fn mcp_credential_generations(
+        &self,
+    ) -> Result<std::collections::HashMap<String, u64>> {
+        self.connection
+            .call(|connection| -> rusqlite::Result<_> {
+                let mut statement = connection
+                    .prepare("SELECT server, generation FROM mcp_credential_generations")?;
+                let generations = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .map(|row| {
+                        row.map(|(server, generation)| {
+                            (server, u64::try_from(generation).unwrap_or(0))
+                        })
+                    })
+                    .collect::<rusqlite::Result<std::collections::HashMap<String, u64>>>()?;
+                Ok(generations)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to read MCP credential generations: {error}"
+                ))
+            })
+    }
+
     /// Try to take the lock that serializes one account's credential rotation across processes.
     /// `None` means another meka is already refreshing that account.
     ///
@@ -407,7 +446,7 @@ impl TokenStore {
             })
     }
 
-    /// One server's stored secret of `kind`, or `None`.
+    /// One server's stored secret of `kind`, with the endpoint it was stored for, or `None`.
     ///
     /// Matching on `kind` as well as the name is what makes "this server has no bearer" and "this
     /// server has an OAuth bundle" different answers, rather than handing an OAuth blob to a caller
@@ -416,19 +455,24 @@ impl TokenStore {
         &self,
         server_name: &str,
         kind: McpCredentialKind,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<McpCredential>> {
         let server_name = server_name.to_string();
         let kind = kind.name();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let result = connection.query_row(
-                    "SELECT secret FROM mcp_credentials WHERE server = ?1 AND kind = ?2",
+                    "SELECT secret, endpoint FROM mcp_credentials WHERE server = ?1 AND kind = ?2",
                     rusqlite::params![server_name, kind],
-                    |row| row.get::<_, String>(0),
+                    |row| {
+                        Ok(McpCredential {
+                            secret: row.get(0)?,
+                            endpoint: row.get(1)?,
+                        })
+                    },
                 );
 
                 match result {
-                    Ok(secret) => Ok(Some(secret)),
+                    Ok(credential) => Ok(Some(credential)),
                     Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                     Err(error) => Err(error),
                 }
@@ -478,9 +522,10 @@ impl TokenStore {
             })
     }
 
-    /// Persist (or replace) one of an MCP server's secrets unconditionally, for a caller whose
-    /// value is not derived from a stored one: `meka mcp add` / `login` reading from stdin, and the
-    /// interactive authorization flow depositing its first bundle.
+    /// Persist (or replace) one of an MCP server's secrets unconditionally, bound to `endpoint`,
+    /// the one a connect presents it to, for a caller whose value is not derived from a stored
+    /// one: `meka mcp add` / `login` reading from stdin, and the interactive authorization flow
+    /// depositing its first bundle.
     ///
     /// The conflict target is the whole key, so writing one kind leaves the server's other kinds
     /// untouched. That is what lets a confidential client hold its client secret while its OAuth
@@ -490,23 +535,32 @@ impl TokenStore {
         server_name: &str,
         kind: McpCredentialKind,
         secret: &str,
+        endpoint: &str,
     ) -> Result<()> {
         let server_name = server_name.to_string();
         let kind = kind.name();
         let secret = secret.to_string();
+        let endpoint = endpoint.to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "INSERT INTO mcp_credentials (server, kind, secret, updated_at)
-                     VALUES (?1, ?2, ?3, ?4)
+                let transaction = connection.transaction()?;
+                // The same secret for the same endpoint again is no write: the row, its time and
+                // the count stay.
+                let changed = transaction.execute(
+                    "INSERT INTO mcp_credentials (server, kind, secret, updated_at, endpoint)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(server, kind) DO UPDATE SET
                          secret = excluded.secret,
-                         updated_at = excluded.updated_at",
-                    rusqlite::params![server_name, kind, secret, now],
+                         updated_at = excluded.updated_at,
+                         endpoint = excluded.endpoint
+                     WHERE mcp_credentials.secret != excluded.secret
+                        OR mcp_credentials.endpoint != excluded.endpoint",
+                    rusqlite::params![server_name, kind, secret, now, endpoint],
                 )?;
-                Ok(())
+                count_a_write(&transaction, &server_name, changed)?;
+                transaction.commit()
             })
             .await
             .map_err(|error| {
@@ -529,11 +583,13 @@ impl TokenStore {
         let kind = kind.name();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
+                let transaction = connection.transaction()?;
+                let changed = transaction.execute(
                     "DELETE FROM mcp_credentials WHERE server = ?1 AND kind = ?2",
                     rusqlite::params![server_name, kind],
                 )?;
-                Ok(())
+                count_a_write(&transaction, &server_name, changed)?;
+                transaction.commit()
             })
             .await
             .map_err(|error| {
@@ -546,11 +602,13 @@ impl TokenStore {
         let server_name = server_name.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
+                let transaction = connection.transaction()?;
+                let changed = transaction.execute(
                     "DELETE FROM mcp_credentials WHERE server = ?1",
                     rusqlite::params![server_name],
                 )?;
-                Ok(())
+                count_a_write(&transaction, &server_name, changed)?;
+                transaction.commit()
             })
             .await
             .map_err(|error| {
@@ -607,6 +665,43 @@ impl TokenStore {
             })
     }
 }
+/// Count a write of `server`'s credentials in the transaction that makes it, so the count and the
+/// write land together: [`TokenStore::mcp_credential_generations`]. A statement that changed no
+/// row, a clear of nothing or the same secret again, is not counted, or the server it names would
+/// be restarted for a change that is not one.
+fn count_a_write(
+    transaction: &rusqlite::Transaction<'_>,
+    server: &str,
+    changed_rows: usize,
+) -> rusqlite::Result<()> {
+    if changed_rows == 0 {
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT INTO mcp_credential_generations (server, generation) VALUES (?1, 1)
+         ON CONFLICT(server) DO UPDATE SET generation = generation + 1",
+        rusqlite::params![server],
+    )?;
+    Ok(())
+}
+/// One stored MCP secret and the endpoint it was stored for: the server's URL in the canonical
+/// form a connect compares, empty for one no server claims.
+#[derive(Clone)]
+pub(crate) struct McpCredential {
+    pub(crate) secret: String,
+    pub(crate) endpoint: String,
+}
+
+impl std::fmt::Debug for McpCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpCredential")
+            .field("secret", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
 /// What an account authenticates with, as the `account_credentials` row serializes it.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum AuthCredential {
@@ -662,6 +757,92 @@ impl std::fmt::Debug for AuthCredential {
 mod tests {
     use super::*;
 
+    /// Each write of a server's credentials counts, in the database, so a host can tell an entry
+    /// built before one whichever process made it; a token refresh does not count, or every
+    /// refresh would restart the server it refreshed.
+    #[tokio::test]
+    async fn credential_writes_are_counted_per_server_and_a_refresh_is_not() {
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let store = Store::open(Some(&path), &Default::default())
+            .await
+            .expect("open");
+        let tokens = store.token_store();
+        let generation = |generations: std::collections::HashMap<String, u64>, server: &str| {
+            generations.get(server).copied().unwrap_or(0)
+        };
+        assert_eq!(
+            generation(
+                tokens.mcp_credential_generations().await.expect("read"),
+                "exa"
+            ),
+            0
+        );
+        tokens
+            .save_mcp_credentials(
+                "exa",
+                McpCredentialKind::OAuth,
+                r#"{"access_token":"a"}"#,
+                "https://srv.example/mcp",
+            )
+            .await
+            .expect("save");
+        assert!(
+            tokens
+                .replace_mcp_credentials(
+                    "exa",
+                    r#"{"access_token":"a"}"#,
+                    r#"{"access_token":"b"}"#
+                )
+                .await
+                .expect("refresh"),
+            "the refresh matched"
+        );
+        tokens
+            .clear_mcp_credentials_of_kind("exa", McpCredentialKind::OAuth)
+            .await
+            .expect("clear");
+        tokens
+            .clear_mcp_credentials("exa")
+            .await
+            .expect("clear all");
+        // None of these changes a row: nothing is left to clear, and the bearer is stored once.
+        tokens
+            .clear_mcp_credentials("exa")
+            .await
+            .expect("clear nothing");
+        for _ in 0..2 {
+            tokens
+                .save_mcp_credentials(
+                    "other",
+                    McpCredentialKind::Bearer,
+                    "same",
+                    "https://srv.example/mcp",
+                )
+                .await
+                .expect("save the same bearer");
+        }
+        let another = Store::open(Some(&path), &Default::default())
+            .await
+            .expect("a second handle, as another process holds");
+        let generations = another
+            .token_store()
+            .mcp_credential_generations()
+            .await
+            .expect("read");
+        assert_eq!(
+            generation(generations.clone(), "exa"),
+            2,
+            "the save and the clear count, the refresh and the clears of nothing do not, and \
+             another handle reads it"
+        );
+        assert_eq!(
+            generation(generations, "other"),
+            1,
+            "the same secret stored again is one write"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_credentials_round_trip() {
         let store = Store::for_test().await;
@@ -681,6 +862,7 @@ mod tests {
                 "srv",
                 crate::store::McpCredentialKind::OAuth,
                 r#"{"tokens":{"access_token":"at1"}}"#,
+                "https://srv.example/mcp",
             )
             .await
             .expect("save");
@@ -689,6 +871,7 @@ mod tests {
                 .load_mcp_credentials("srv", crate::store::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some(r#"{"tokens":{"access_token":"at1"}}"#)
         );
@@ -699,6 +882,7 @@ mod tests {
                 "srv",
                 crate::store::McpCredentialKind::OAuth,
                 r#"{"tokens":{"access_token":"at2"}}"#,
+                "https://srv.example/mcp",
             )
             .await
             .expect("save again");
@@ -707,6 +891,7 @@ mod tests {
                 .load_mcp_credentials("srv", crate::store::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some(r#"{"tokens":{"access_token":"at2"}}"#)
         );
@@ -729,11 +914,21 @@ mod tests {
         let store = Store::for_test().await;
         let token_store = store.token_store();
         token_store
-            .save_mcp_credentials("a", crate::store::McpCredentialKind::OAuth, "alpha")
+            .save_mcp_credentials(
+                "a",
+                crate::store::McpCredentialKind::OAuth,
+                "alpha",
+                "https://srv.example/mcp",
+            )
             .await
             .expect("save a");
         token_store
-            .save_mcp_credentials("b", crate::store::McpCredentialKind::OAuth, "beta")
+            .save_mcp_credentials(
+                "b",
+                crate::store::McpCredentialKind::OAuth,
+                "beta",
+                "https://srv.example/mcp",
+            )
             .await
             .expect("save b");
         token_store
@@ -752,6 +947,7 @@ mod tests {
                 .load_mcp_credentials("b", crate::store::McpCredentialKind::OAuth)
                 .await
                 .unwrap()
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some("beta")
         );
@@ -774,12 +970,17 @@ mod tests {
             McpCredentialKind::OAuth,
         ] {
             token_store
-                .save_mcp_credentials("api", kind, "not-a-real-secret")
+                .save_mcp_credentials("api", kind, "not-a-real-secret", "https://srv.example/mcp")
                 .await
                 .expect("save");
         }
         token_store
-            .save_mcp_credentials("docs", McpCredentialKind::OAuth, "not-a-real-secret")
+            .save_mcp_credentials(
+                "docs",
+                McpCredentialKind::OAuth,
+                "not-a-real-secret",
+                "https://srv.example/mcp",
+            )
             .await
             .expect("save");
 
@@ -811,11 +1012,17 @@ mod tests {
                 "api",
                 McpCredentialKind::ClientSecret,
                 "cs-not-a-real-secret",
+                "https://srv.example/mcp",
             )
             .await
             .expect("save client secret");
         token_store
-            .save_mcp_credentials("api", McpCredentialKind::OAuth, r#"{"access_token":"at1"}"#)
+            .save_mcp_credentials(
+                "api",
+                McpCredentialKind::OAuth,
+                r#"{"access_token":"at1"}"#,
+                "https://srv.example/mcp",
+            )
             .await
             .expect("save bundle");
 
@@ -837,6 +1044,7 @@ mod tests {
                 .load_mcp_credentials("api", McpCredentialKind::OAuth)
                 .await
                 .expect("load bundle")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some(r#"{"access_token":"at2"}"#),
             "the refresh should have moved the bundle"
@@ -846,6 +1054,7 @@ mod tests {
                 .load_mcp_credentials("api", McpCredentialKind::ClientSecret)
                 .await
                 .expect("load client secret")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some("cs-not-a-real-secret"),
             "the refresh must not have touched the client secret"
@@ -891,7 +1100,7 @@ mod tests {
             (McpCredentialKind::OAuth, r#"{"access_token":"at1"}"#),
         ] {
             token_store
-                .save_mcp_credentials("api", kind, secret)
+                .save_mcp_credentials("api", kind, secret, "https://srv.example/mcp")
                 .await
                 .expect("save");
         }
@@ -1307,6 +1516,7 @@ mod tests {
                 "docs",
                 crate::store::McpCredentialKind::OAuth,
                 "{\"token\":\"original\"}",
+                "https://srv.example/mcp",
             )
             .await
             .expect("save");
@@ -1338,6 +1548,7 @@ mod tests {
                 .load_mcp_credentials("docs", crate::store::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some("{\"token\":\"first\"}"),
             "the stored credential must never move backwards"
@@ -1462,6 +1673,7 @@ mod tests {
                 "linear",
                 crate::store::McpCredentialKind::OAuth,
                 r#"{"tokens":{"access_token":"at"}}"#,
+                "https://srv.example/mcp",
             )
             .await
             .expect("save linear");

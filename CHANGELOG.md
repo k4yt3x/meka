@@ -11,42 +11,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- HTTP: `/v1/accounts` lists, adds, renames, removes and logs in accounts, under `config:w`.
-- HTTP: a subscription account logs in through the browser: a URL to open, then the code posted.
-- HTTP: `/v1/profiles` adds, changes, renames and removes profiles and sets the default.
-- HTTP: `/v1/mcp` adds, changes, removes, logs in and logs out MCP servers, under `config:w`.
-- HTTP: `PUT /v1/instructions` writes `instructions.md`; sessions opened afterwards run under it.
-- HTTP: `POST /v1/config/reload` applies a shell's edits: accounts, profiles, MCP, instructions.
-- HTTP: a `config:r` and `config:w` scope pair for the installation; `config:r` reads profiles too.
-- HTTP: `GET /v1/info` names `config_path`, `data_dir`, `config_loaded_at`, `config_modified_at`.
-- HTTP: a session with `supports_elicitation` gets an MCP elicitation as `elicitation_required`.
+- HTTP: `/v1/accounts`, `/v1/profiles` and `/v1/mcp` manage the installation without a shell.
+- HTTP: new `config:r` and `config:w` scopes guard them; `config:w` is as powerful as a shell.
+- HTTP: subscription accounts and MCP servers log in through the browser, no terminal needed.
+- HTTP: `PUT /v1/instructions` writes the standing instructions for sessions opened after it.
+- HTTP: a write applies at once, MCP servers included; a tool policy change keeps the connection.
+- HTTP: `POST /v1/config/reload` applies a shell's edits; `GET /v1/config` says what awaits one.
+- HTTP: a write or a reload refuses a file the next start would refuse, naming the setting.
+- HTTP: an MCP elicitation reaches a session with `supports_elicitation` as `elicitation_required`.
 - HTTP: a `context.measured` feed event says what is in context after every provider round.
+- `meka mcp get` and `GET /v1/mcp/{name}` show every key as written and which `[mcp]` supplies.
 
 ### Changed
 
+- **Breaking:** A start refuses any profile that cannot run, not only the default.
+- **Breaking:** `meka profile remove` refuses the default while two or more profiles would remain.
+- **Breaking:** An MCP credential is sent only to the endpoint it was stored for.
+- **Breaking:** An unset `${VAR}` in an MCP `url` refuses the upgrade and storing its secret.
+- **Breaking:** `meka account add` refuses an OAuth flag its backend never reads, not drops it.
+- **Breaking:** `GET /v1/mcp` answers an object holding `servers` and `orphaned_credentials`.
+- **Breaking:** `meka mcp get --format json` carries `auth` whole and renames the origin fields.
 - **Breaking:** OpenAPI: the responses body's `outcome` schema is `ResponseOutcome`.
 - **Breaking:** ACP: a background report is a `notice` or an agent chunk, never a user message.
 - ACP: `usage_update` follows every provider round and a reopened session, not the turn's end.
 - `meka serve` starts with no profile configured; a session that names none is refused instead.
-- An account or profile written over HTTP is served at once; a shell's edit needs a reload.
-- An MCP server added, changed or removed over HTTP takes effect on the running server at once.
-- HTTP: a session refused for want of a profile names this API's remedy, not a shell command.
-- HTTP: an elicitation waits an approval's 30 minutes on a session that answers prompts on return.
-- Adding a second profile names the one that was alone as `default_profile`; the default stays put.
-- `meka account login` asks again after a paste that carries no code, as `meka mcp login` does.
-- A failed MCP server's reason is the bare cause for an auth failure, as for a connection failure.
-- `--eager-load-tool` naming a server not yet configured applies once that server is added.
+- Adding a second profile makes the first one `default_profile`, so the default stays put.
+- HTTP: the profile `meka serve --profile` names stays the default; it is not renamed or removed.
+- `meka profile rename` refuses only while a session or a pinned sub-agent runs on the new name.
+- HTTP refusals name this API's remedy, never a shell command.
+- A failed MCP server shows its bare cause, and the login or secret it needs when that is why.
+- `meka mcp login` keeps the stored login until the new one succeeds.
+- Account and profile names are refused with whitespace at either end.
+- `meka account add` and `rename` refuse a name a removed account's credential is still under.
+- `--eager-load-tool` may name an MCP server that is added later.
+
+### Removed
+
+- **Breaking:** `resource` in `[mcp.servers.auth]`; the server's `url` is the resource.
 
 ### Fixed
 
-- `meka mcp login` waits the 120 s it announces for the callback; the connect's bound cut it at 30.
-- `meka mcp login` says why a flow did not complete, not only that it did not.
-- `meka mcp add`, `remove`, `enable` and `disable` run on a config with an unknown key elsewhere.
-- A browser login's loopback page refuses a stale callback and keeps waiting; it claims no success.
-- HTTP: `GET /v1/mcp/{name}` says why a `failed` server failed; a login's 502 carries its reason.
-- HTTP: an `accept` without `content` on a form elicitation is a 422, not an empty acceptance.
-- HTTP: `elicitation_required` carries `subagent_id` when a sub-agent's server asked.
-- HTTP: a profile or project rename puts each moved session on the server feed.
+- `meka mcp logout` and `remove` revoke a stored OAuth grant at the provider; they sent nothing.
+- A `client_credentials` MCP server connects without a `resource` key; it was always refused.
+- An MCP login completes against an authorization server that sends `iss` (RFC 9207).
+- `meka mcp login` waits the full 120 s it announces for the browser; it stopped at 30.
+- Browser logins say why they failed and keep waiting through a stale tab or a codeless paste.
+- `meka mcp add`, `remove`, `enable` and `disable` work on a config with an unknown key elsewhere.
+- A server's own MCP elicitation ends with its call; accepting a URL sends no content.
+- `meka account remove` refuses before deleting anything; a failed `account add` leaves no entry.
+- HTTP: a project rename announces each moved session on the server feed.
 
 ## [0.84.0] - 2026-10-26
 

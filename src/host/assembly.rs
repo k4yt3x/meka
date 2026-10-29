@@ -18,10 +18,6 @@ pub(crate) struct SharedDeps {
     /// A registry rather than one `Arc<dyn Provider>` because a session records the profile it
     /// runs with, and one `meka serve` may host sessions naming different ones.
     pub(crate) providers: Arc<crate::provider::ProviderRegistry>,
-    /// Holds a read of `config.toml` together with the serving of what it holds: a write's own
-    /// reload of the tables it wrote and a reload of the whole file each parse and then swap, and
-    /// of two running at once the staler parse must not be served last.
-    config_reads: Arc<std::sync::Mutex<()>>,
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
     pub(crate) skills: Arc<crate::skills::SkillCache>,
     pub(crate) memories: Arc<crate::store::memory::MemoryStore>,
@@ -45,6 +41,393 @@ pub(crate) struct SharedDeps {
     /// Shared by every session this host builds, so the host can say which sub-agents are in a
     /// turn.
     pub(crate) running_subagents: crate::session::RunningSubagents,
+    /// Holds each write of the installation together with the read that serves the file after
+    /// it: the file's own lock is released between an edit and its serving, and two writes
+    /// interleaved across it would leave the manager running an entry the file no longer states,
+    /// or the catalog a staler parse. Taken by [`Self::write_installation`] alone.
+    installation_doors: Arc<tokio::sync::Mutex<()>>,
+    /// The last whole read of `config.toml`: the one the process started on, and each serving of
+    /// the file since.
+    whole_read: Arc<std::sync::Mutex<WholeRead>>,
+}
+
+/// One whole read of `config.toml`: when it was made, and the file's modification time as it was
+/// then, which a host compares with the file's now to say whether an edit is unread.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WholeRead {
+    pub(crate) at: chrono::DateTime<chrono::Utc>,
+    pub(crate) modified: Option<std::time::SystemTime>,
+}
+
+/// Why `config.toml` cannot be served as it stands: it fails to parse, holds an MCP server entry
+/// the manager would refuse, or holds anything else startup would refuse. A write is refused for
+/// it before anything is written.
+#[derive(Debug)]
+pub(crate) enum Unservable {
+    /// Where the file fails to parse, and why, without quoting it.
+    Parse(String),
+    /// What the entry is refused for, naming it.
+    Entry(String),
+    /// What startup refuses the file for, typed, so a surface words a refusal whose remedy is a
+    /// command with its own.
+    Startup(crate::error::MekaError),
+}
+
+impl std::fmt::Display for Unservable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.worded(crate::error::MekaError::sentence))
+    }
+}
+
+impl std::error::Error for Unservable {}
+
+impl Unservable {
+    /// Why the file cannot be served, a startup refusal in `word`'s terms: the shell's sentence
+    /// by [`Display`](std::fmt::Display), a surface's own by its wording.
+    pub(crate) fn worded(&self, word: impl Fn(&crate::error::MekaError) -> String) -> String {
+        match self {
+            Self::Parse(sentence) => {
+                format!("config.toml fails to parse; repair it first: {sentence}")
+            }
+            Self::Entry(message) => format!(
+                "config.toml holds an MCP server entry meka refuses; repair it first: {message}"
+            ),
+            Self::Startup(error) => format!(
+                "config.toml holds a setting meka refuses at startup; repair it first: {}",
+                word(error)
+            ),
+        }
+    }
+
+    /// The sentence for a file found unservable after a write landed in it, in `word`'s terms:
+    /// an edit from outside broke it in between, so the write is in the file and not served.
+    pub(crate) fn after_the_write(
+        &self,
+        word: impl Fn(&crate::error::MekaError) -> String,
+    ) -> String {
+        let (what, sentence) = match self {
+            Self::Parse(sentence) => ("fails to parse", sentence.clone()),
+            Self::Entry(message) => ("holds an MCP server entry meka refuses", message.clone()),
+            Self::Startup(error) => ("holds a setting meka refuses at startup", word(error)),
+        };
+        format!(
+            "the change is written, but config.toml as it now stands {what}, so it is not served; \
+             repair it: {sentence}"
+        )
+    }
+}
+
+/// What serving the file brought the running manager to, by server name.
+#[derive(Debug, Default)]
+pub(crate) struct ServedServers {
+    /// Servers the file names that were not running, started.
+    pub(crate) added: Vec<String>,
+    /// Servers whose connection or credential changed, restarted on the file's entry.
+    pub(crate) restarted: Vec<String>,
+    /// Servers whose tool policy alone changed, given it on the connection they hold.
+    pub(crate) reconfigured: Vec<String>,
+    /// Servers the file no longer names, taken out.
+    pub(crate) removed: Vec<String>,
+}
+
+/// Why a write of the installation did not end with the file served.
+#[derive(Debug)]
+pub(crate) enum InstallationFailure<E> {
+    /// The file as it stood could not be served, so nothing was written.
+    Unservable(Unservable),
+    /// The edit refused or failed, in its own terms.
+    Edit(E),
+    /// The edit landed and the file could not be served after it.
+    Unserved(ServeFailure),
+}
+
+/// Why the file could not be served after a write landed in it.
+#[derive(Debug)]
+pub(crate) enum ServeFailure {
+    /// An edit from outside, landing between the write and its serving, left the file as it now
+    /// stands unservable.
+    Unservable(Unservable),
+    /// The store or the manager failed the serving.
+    Fault(crate::error::MekaError),
+}
+
+impl std::fmt::Display for ServeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unservable(unservable) => {
+                f.write_str(&unservable.after_the_write(crate::error::MekaError::sentence))
+            }
+            Self::Fault(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Why a write of the standing instructions did not end with them read again.
+#[derive(Debug)]
+pub(crate) enum InstructionsFailure<E> {
+    /// The write failed, in its own terms.
+    Write(E),
+    /// The write landed and the instructions could not be read again.
+    Reload(crate::error::MekaError),
+}
+
+impl From<InstallationFailure<crate::error::MekaError>> for crate::error::MekaError {
+    /// A write of the installation whose edit speaks in [`crate::error::MekaError`], as one: the
+    /// file's own defect as the refusal it is, the edit's and the serving's as they are.
+    fn from(failure: InstallationFailure<crate::error::MekaError>) -> Self {
+        match failure {
+            InstallationFailure::Unservable(unservable) => {
+                crate::installation::refusal(unservable.to_string())
+            }
+            InstallationFailure::Unserved(ServeFailure::Unservable(unservable)) => {
+                crate::installation::refusal(
+                    unservable.after_the_write(crate::error::MekaError::sentence),
+                )
+            }
+            InstallationFailure::Edit(error)
+            | InstallationFailure::Unserved(ServeFailure::Fault(error)) => error,
+        }
+    }
+}
+
+impl SharedDeps {
+    /// The last whole read of `config.toml`.
+    pub(crate) fn whole_read(&self) -> WholeRead {
+        *crate::sync::lock(&self.whole_read)
+    }
+
+    /// The sections of `config.toml` that state something else than the file this process
+    /// started on and are read at startup alone, so only a restart applies them.
+    /// None while the file fails to parse: what it would change cannot be told, and the parse error
+    /// is what a write or a reload answers.
+    pub(crate) fn sections_awaiting_restart(&self) -> Vec<&'static str> {
+        match crate::config::ConfigRead::now().sections() {
+            Some(now) => crate::config::sections_awaiting_restart(&self.config.started_on, &now),
+            None => Vec::new(),
+        }
+    }
+
+    /// Write the installation: the one sequence every edit of `config.toml`'s accounts, profiles
+    /// and MCP servers, and of the credentials stored for them, runs through on a host that
+    /// serves the file. Under [`Self::installation_doors`], the file is read once and refused as
+    /// [`Unservable`] when it could not be served; `edit` is handed that parse to decide on, the
+    /// existence of what it names included, and runs its door; the file is then read whole,
+    /// held to everything startup holds it to, and served ([`Self::serve_installation`]). An
+    /// `edit` that changes nothing serves the file as it stands, which is a reload. The parse is
+    /// [`Self::servable`]'s.
+    ///
+    /// An `edit` that fails undoes what it wrote, and the file is served all the same when it has
+    /// moved since the read, so the host never runs something other than what the file states.
+    pub(crate) async fn write_installation<T, E>(
+        &self,
+        edit: impl AsyncFnOnce(&crate::config::ConfigFile) -> std::result::Result<T, E>,
+    ) -> std::result::Result<(T, ServedServers), InstallationFailure<E>> {
+        let _doors = self.installation_doors.lock().await;
+        let read = crate::config::ConfigRead::now();
+        let config_file = self
+            .servable(&read, read.modified != self.whole_read().modified)
+            .map_err(InstallationFailure::Unservable)?;
+        let value = match edit(&config_file).await {
+            Ok(value) => value,
+            Err(error) => {
+                if crate::config::config_file_modified() != read.modified
+                    && let Err(failure) = self.serve_installation().await
+                {
+                    tracing::warn!(
+                        "failed to serve config.toml after a write that failed: {failure}"
+                    );
+                }
+                return Err(InstallationFailure::Edit(error));
+            }
+        };
+        let served = self
+            .serve_installation()
+            .await
+            .map_err(InstallationFailure::Unserved)?;
+        Ok((value, served))
+    }
+
+    /// Write the standing instructions with `write` and read them again for the sessions that
+    /// open after it, under [`Self::installation_doors`]: serving the installation reads the same
+    /// file, and a read it made before this write must not land after this one's.
+    pub(crate) async fn write_instructions<E>(
+        &self,
+        write: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), InstructionsFailure<E>> {
+        let _doors = self.installation_doors.lock().await;
+        write().map_err(InstructionsFailure::Write)?;
+        self.reload_instructions()
+            .map_err(InstructionsFailure::Reload)
+    }
+
+    /// The file as parsed, or why it could not be served, which a write is refused for and a door
+    /// that begins what it later commits asks first: a parse error, an MCP server entry the
+    /// manager would refuse, and, when the file changed since it was last read whole, whatever
+    /// else startup refuses, asked of the file resolved under the command line this process
+    /// started with. A file unchanged since then was held to that already, by startup or by the
+    /// serving that recorded the read.
+    pub(crate) fn installation_as_written(
+        &self,
+    ) -> std::result::Result<crate::config::ConfigFile, Unservable> {
+        let read = crate::config::ConfigRead::now();
+        self.servable(&read, read.modified != self.whole_read().modified)
+    }
+
+    /// `read` as parsed, or why it could not be served: a parse error, an MCP server entry the
+    /// manager would refuse, and, when `in_full`, whatever else startup refuses, asked of the file
+    /// resolved under the command line this process started with.
+    fn servable(
+        &self,
+        read: &crate::config::ConfigRead,
+        in_full: bool,
+    ) -> std::result::Result<crate::config::ConfigFile, Unservable> {
+        if let Some(refusal) = read.parse_refusal() {
+            return Err(Unservable::Parse(refusal));
+        }
+        let config_file = read
+            .parse_or_err()
+            .map_err(|error| Unservable::Parse(error.sentence()))?;
+        crate::mcp::sanitize::validate_server_entries(&config_file.mcp_servers())
+            .map_err(Unservable::Entry)?;
+        if in_full {
+            let resolved =
+                crate::config::ResolvedConfig::resolve_from(self.config.overrides.clone(), read);
+            resolved.validate().map_err(Unservable::Startup)?;
+            // Each reason names an operator's path or an expanded URL, a webhook's carrying its
+            // secret, so it goes to the log and the refusal names the section.
+            refuse_an_unbuildable_web_client(&resolved).map_err(|error| {
+                tracing::warn!("config.toml's `[web]` cannot be started on: {error}");
+                Unservable::Startup(crate::error::MekaError::Config(
+                    "the `[web]` settings build no client; the server log says why".to_string(),
+                ))
+            })?;
+            #[cfg(feature = "serve")]
+            if self.config.overrides.serve {
+                crate::host::http::resolve_serve(resolved.serve).map_err(|refusal| {
+                    tracing::warn!("config.toml's `[serve]` cannot be started on: {refusal}");
+                    Unservable::Startup(crate::error::MekaError::Config(
+                        "the `[serve]` settings cannot be started on; the server log says why"
+                            .to_string(),
+                    ))
+                })?;
+            }
+        }
+        Ok(config_file)
+    }
+
+    /// Read `config.toml` whole and serve what it holds: the read is held to everything startup
+    /// holds a file to, the accounts and profiles replace the catalog, an account stating no
+    /// device id is given one, the MCP servers are brought to the file's entries, the standing
+    /// instructions are read again, and the read is recorded. Asked under
+    /// [`Self::installation_doors`] by [`Self::write_installation`] alone.
+    async fn serve_installation(&self) -> std::result::Result<ServedServers, ServeFailure> {
+        let read = crate::config::ConfigRead::now();
+        // In full whatever changed: a door validates what it writes, and an edit from outside
+        // landing between the read a door decided on and this one is in the file served.
+        let config_file = self
+            .servable(&read, true)
+            .map_err(ServeFailure::Unservable)?;
+        let wanted = config_file.mcp_servers();
+        self.providers.replace_catalog(&config_file);
+        // As at startup, so a session's first use of an account writes nothing into the file this
+        // read did not see; the write is meka's own and counts as read.
+        let wrote_device_ids = self.providers.preload_device_ids().await;
+        let served = self
+            .reconcile_servers(&wanted)
+            .await
+            .map_err(ServeFailure::Fault)?;
+        *crate::sync::lock(&self.whole_read) = WholeRead {
+            at: read.at,
+            modified: if wrote_device_ids {
+                crate::config::config_file_modified()
+            } else {
+                read.modified
+            },
+        };
+        // The file is read and served; the standing instructions are another source's, read next.
+        // One that cannot be read keeps the last text in force and is the log's to say: the write
+        // this serves has landed, and answering it as a fault would invite a retry of a done write.
+        if let Err(error) = self.reload_instructions() {
+            tracing::warn!(
+                "failed to read the standing instructions again; sessions keep the last text: \
+                 {error}"
+            );
+        }
+        tracing::debug!(
+            "served config.toml: {added} MCP server(s) added, {restarted} restarted, \
+             {reconfigured} reconfigured, {removed} removed",
+            added = served.added.len(),
+            restarted = served.restarted.len(),
+            reconfigured = served.reconfigured.len(),
+            removed = served.removed.len()
+        );
+        Ok(served)
+    }
+
+    /// The profile `--profile` named when this host started, which the catalog selects as the
+    /// default for as long as it runs.
+    pub(crate) fn requested_profile(&self) -> Option<&str> {
+        self.config.request.requested_profile.as_deref()
+    }
+
+    /// Bring the running manager to `wanted`, the file's entries: a server the file names and the
+    /// manager does not run is started; one whose credentials have been written since its entry
+    /// was built, or whose connection differs as the file would be written from each, is
+    /// restarted on the file's entry; one whose tool policy alone differs takes it in place; one
+    /// the file no longer names is taken out. Any other server is left as it is, connected or not,
+    /// so serving the file is not a reconnect. A host without a manager (MCP disabled at startup)
+    /// has nothing to bring anywhere.
+    async fn reconcile_servers(
+        &self,
+        wanted: &[crate::config::McpServerConfig],
+    ) -> crate::error::Result<ServedServers> {
+        let Some(manager) = self.mcp_manager.as_ref() else {
+            return Ok(ServedServers::default());
+        };
+        let generations = self
+            .store
+            .token_store()
+            .mcp_credential_generations()
+            .await?;
+        let generation = |name: &str| generations.get(name).copied().unwrap_or(0);
+        let running: std::collections::BTreeMap<String, Arc<crate::mcp::ServerEntry>> = manager
+            .server_names()
+            .into_iter()
+            .filter_map(|name| manager.server_entry(&name).map(|entry| (name, entry)))
+            .collect();
+        let mut served = ServedServers::default();
+        for config in wanted {
+            let Some(entry) = running.get(&config.name) else {
+                manager.add_server(config, generation(&config.name))?;
+                served.added.push(config.name.clone());
+                continue;
+            };
+            let running_entry = entry.configured();
+            let restart = entry.credential_generation != generation(&config.name)
+                || !crate::installation::mcp::same_connection(&running_entry, config);
+            if restart {
+                manager
+                    .replace_server(config, generation(&config.name))
+                    .await?;
+                served.restarted.push(config.name.clone());
+            } else if !crate::installation::mcp::same_entry(&running_entry, config) {
+                // A listing the new policy cannot be had under restarts the server instead.
+                if manager.reconfigure_server(config).await? {
+                    served.reconfigured.push(config.name.clone());
+                } else {
+                    served.restarted.push(config.name.clone());
+                }
+            }
+        }
+        for name in running.keys() {
+            if wanted.iter().any(|config| &config.name == name) {
+                continue;
+            }
+            manager.remove_server(name).await?;
+            served.removed.push(name.clone());
+        }
+        Ok(served)
+    }
 }
 /// Whether a host may repeat an upstream's own response text to its caller: `[serve]
 /// relay_provider_errors`, on unless the operator turned it off.
@@ -200,6 +583,20 @@ pub(crate) async fn apply_recorded_bindings(
     apply_recorded_project(shared, agent, session_id).await
 }
 
+/// Refuse `[web]` settings no client can be built from. Built here and dropped, because what it
+/// produces is a refusal rather than a client: every registry builds its own from the same
+/// settings, and the one thing no session can do is fail the *process* before it exists. Otherwise
+/// a `ca_cert_file` that is not there or a proxy URL that is not one surfaces on the first turn,
+/// per session, as whatever that host reports a registry failure as, which on `serve` hands the
+/// operator's path to a remote caller. Asked at startup and of every file served.
+fn refuse_an_unbuildable_web_client(config: &ResolvedConfig) -> crate::error::Result<()> {
+    crate::tools::build_web_client(
+        &config.web_client,
+        crate::tools::web::web_fetch_refuses_own_addresses(config.network),
+    )
+    .map(|_| ())
+}
+
 /// Build the process-wide [`SharedDeps`] for `meka acp`. Sets up the provider, MCP wiring, skill
 /// cache, sandbox capability probe, and the shared `agent_options` template. Each ACP session later
 /// calls [`build_session_agent`] against the resulting struct to spin up its own per-session
@@ -220,7 +617,7 @@ pub(crate) async fn build_shared_deps(
     ));
     // Once, off the worker threads: a first ask would otherwise resolve a subscription profile's
     // device id inline, writing `config.toml` under the config lock on whatever thread asked.
-    providers.preload_device_ids().await;
+    let wrote_device_ids = providers.preload_device_ids().await;
     // Test-only: hand the registry a scripted provider to return for every profile, whichever host
     // this process is. Installed rather than swapped into a rebuilt registry, so a harness driving
     // sessions on different profiles gets the script for all of them.
@@ -238,15 +635,7 @@ pub(crate) async fn build_shared_deps(
         )));
     }
 
-    // Built once here and dropped, because what it produces is a refusal rather than a client:
-    // every registry builds its own from the same `[web]` settings, and the one thing no session
-    // can do is fail the *process* before it exists. Otherwise a `ca_cert_file` that is not there
-    // or a proxy URL that is not one surfaces on the first turn, per session, as whatever that host
-    // reports a registry failure as, which on `serve` hands the operator's path to a remote caller.
-    crate::tools::build_web_client(
-        &config.web_client,
-        crate::tools::web::web_fetch_refuses_own_addresses(config.network),
-    )?;
+    refuse_an_unbuildable_web_client(&config)?;
 
     // Detection, not configuration: which backend this machine can run is probed once here, and
     // the startup warning about an unusable or improvable sandbox is given from the same answer.
@@ -323,6 +712,16 @@ pub(crate) async fn build_shared_deps(
         manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(&config));
     }
 
+    // A device id the preload wrote is meka's own write of the file this read saw, so the read
+    // takes the file's time after it rather than reporting the write as an edit unread.
+    let whole_read = Arc::new(std::sync::Mutex::new(WholeRead {
+        at: config.read_at,
+        modified: if wrote_device_ids {
+            crate::config::config_file_modified()
+        } else {
+            config.file_modified
+        },
+    }));
     Ok(SharedDeps {
         config,
         sandbox,
@@ -331,7 +730,6 @@ pub(crate) async fn build_shared_deps(
         instructions: Arc::new(std::sync::RwLock::new(instructions)),
         store,
         providers,
-        config_reads: Arc::new(std::sync::Mutex::new(())),
         mcp_manager,
         skills,
         memories,
@@ -339,6 +737,8 @@ pub(crate) async fn build_shared_deps(
         agent_options,
         write_locks: crate::workspace::WriteLocks::default(),
         running_subagents: crate::session::RunningSubagents::default(),
+        installation_doors: Arc::new(tokio::sync::Mutex::new(())),
+        whole_read,
     })
 }
 /// Per-session agent assembly behind [`build_session_agent`]. Builds the tool registry (with the
@@ -1018,24 +1418,6 @@ impl SharedDeps {
         &self,
     ) -> std::result::Result<String, crate::config::ProfileRefusal> {
         self.providers.catalog().default_profile.clone()
-    }
-
-    /// Replace the accounts and profiles every session this host builds resolves against with
-    /// what `config.toml` holds, after a write this process made to it. A file that does not parse
-    /// leaves the catalog as it was: the add and edit doors refuse to produce one, and the HTTP
-    /// handlers refuse one that already fails to parse ahead of a rename or a remove, which work on
-    /// the raw document.
-    pub(crate) fn reload_profiles(&self) -> crate::error::Result<()> {
-        let _reads = self.hold_config_reads();
-        let config_file = crate::config::load_config_file_or_err()?;
-        self.providers.replace_catalog(&config_file);
-        Ok(())
-    }
-
-    /// Hold a read of `config.toml` and the serving of what it holds as one critical section, for
-    /// a reader that serves the file itself. Never held across an await.
-    pub(crate) fn hold_config_reads(&self) -> std::sync::MutexGuard<'_, ()> {
-        crate::sync::lock(&self.config_reads)
     }
 
     /// Read the standing instructions again from the tier this process resolves them from, after

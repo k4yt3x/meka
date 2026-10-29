@@ -360,7 +360,7 @@ pub(crate) async fn create_session(
         // body names one.
         None => state.shared.default_profile().map_err(|refusal| {
             ProblemDetail::for_error(
-                &crate::error::MekaError::Config(profile_refusal_sentence(&refusal)),
+                &crate::error::MekaError::ProfileUnselected(refusal),
                 state.config.relay_provider_errors,
             )
         })?,
@@ -1307,40 +1307,6 @@ async fn requested_project_move(
         .await
         .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?;
     Ok(Some(project.to_string()))
-}
-
-/// Why no profile is selected, worded for this API: the shell's sentence names `meka account
-/// add` and `meka profile use`, which a client managing the installation over HTTP cannot run,
-/// where it can `POST /v1/accounts`, `POST /v1/profiles` and set `"default": true` on a `PATCH`.
-pub(crate) fn profile_refusal_sentence(refusal: &crate::config::ProfileRefusal) -> String {
-    use crate::config::{ProfileRefusal, ProfileRequest};
-    match refusal {
-        ProfileRefusal::NoProfiles => "no profile configured; add an account with `POST \
-                                       /v1/accounts`, then a profile with `POST /v1/profiles`"
-            .to_string(),
-        ProfileRefusal::NoDefault { configured } => format!(
-            "multiple profiles configured ({}) and no `default_profile`; pick one with `PATCH \
-             /v1/profiles/{{name}}` and `\"default\": true`",
-            configured.join(", ")
-        ),
-        ProfileRefusal::Unknown {
-            requested,
-            source,
-            configured,
-        } => format!(
-            "{}; {}",
-            crate::text::unknown_name("profile", requested, configured),
-            match (source, configured.is_empty()) {
-                (_, true) => "add one with `POST /v1/profiles`",
-                (ProfileRequest::Flag, false) =>
-                    "the server was started with `--profile`; restart it with a configured name",
-                (ProfileRequest::DefaultProfile, false) =>
-                    "point `default_profile` at one with `PATCH /v1/profiles/{name}` and \
-                     `\"default\": true`",
-            }
-        ),
-        ProfileRefusal::Unrunnable(sentence) => sentence.clone(),
-    }
 }
 
 /// A resident session as `GET /v1/sessions/{id}` answers for it: the row under what this process

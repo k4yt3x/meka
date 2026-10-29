@@ -190,6 +190,95 @@ pub(crate) enum MekaError {
         message: String,
     },
 
+    /// An OAuth server has no stored credential and nobody is at hand to log it in. The display
+    /// is the shell's sentence; a surface with a login of its own words it from the field.
+    #[error(
+        "MCP server '{server_name}' has no OAuth credentials for its URL; log in with `meka mcp login {server_name}`"
+    )]
+    McpLoginRequired { server_name: String },
+
+    /// The secret stored for an MCP server was given for another endpoint, so it is not presented
+    /// to the one the server's `url` names now. The display is the shell's sentence; a surface
+    /// with a way of its own to store a secret words it from the fields.
+    #[error("{}", .secret.shell_sentence(.server_name, .stored_for.as_deref()))]
+    McpSecretForAnotherUrl {
+        server_name: String,
+        secret: McpSecretKind,
+        /// The origin it was stored for, `None` for one stored for no configured server.
+        stored_for: Option<String>,
+    },
+
+    /// `default_profile` names a profile a door was asked to remove while `remaining` would be
+    /// left, so nothing would pick one. The display is the shell's sentence; a door with a remedy
+    /// of its own words it from the fields.
+    #[error("'{name}' is the default profile and {} would remain; point `default_profile` at one of them first with `meka profile use <name>`", .remaining.join(", "))]
+    ProfileDefaultStillNeeded {
+        name: String,
+        remaining: Vec<String>,
+    },
+
+    /// A credential stored for an MCP server stands in the way of what a door was asked. The
+    /// display is the shell's sentence; a door with a remedy of its own words it from the
+    /// obstacle.
+    #[error("{}", .obstacle.shell_sentence(.server_name))]
+    McpCredentialInTheWay {
+        server_name: String,
+        obstacle: McpCredentialObstacle,
+    },
+
+    /// The credential a door was handed is not the kind the account's backend takes: a key for
+    /// one that logs in through the browser (`key_given`), or none for one that takes a key. The
+    /// display is the shell's sentence; a door with a remedy of its own words it from the fields.
+    #[error("{}", account_credential_shell_sentence(.account, .backend, *.key_given))]
+    AccountCredentialKind {
+        account: String,
+        backend: String,
+        key_given: bool,
+    },
+
+    /// A credential is stored under an account name no account claims, so a door adding or
+    /// renaming an account to that name would adopt or overwrite a secret nobody configured it
+    /// with. The display is the shell's sentence; a door with a remedy of its own words it from
+    /// the fields.
+    #[error(
+        "'{account}' has a stored credential left over from a removed account; clear it first with `meka account remove {account}`"
+    )]
+    AccountCredentialLeftOver { account: String },
+
+    /// Another meka is refreshing the account's credential, which a rename would move from under
+    /// it. Nothing is wrong with what was asked; asked again shortly, it goes through.
+    #[error("account '{account}' is refreshing its credential in another meka; retry shortly")]
+    AccountRefreshing { account: String },
+
+    /// A profile a door would write, or a run would use, names no model. The display is the
+    /// shell's sentence; a door with a remedy of its own words it from the field.
+    #[error(
+        "profile '{profile}' names no model; set one with `meka profile set {profile} model <model>`"
+    )]
+    ProfileNamesNoModel { profile: String },
+
+    /// Sessions already record the name a profile would be renamed to, which the rename would
+    /// adopt. The display is the shell's sentence; a door with a remedy of its own words it from
+    /// the fields.
+    #[error(
+        "{sessions} session(s) already record the profile '{profile}'; move them first with `meka -r <id> --profile <name>`"
+    )]
+    ProfileRecordedBySessions { profile: String, sessions: u64 },
+
+    /// No profile is selected for a session that names none. The display is the shell's
+    /// sentence; a door with a remedy of its own words it from the refusal.
+    #[error("{0}")]
+    ProfileUnselected(ProfileRefusal),
+
+    /// Sub-agents under the sessions `under` are pinned to the name a profile would be renamed
+    /// to, which the rename would move them off. The display is the shell's sentence; a door with
+    /// a remedy of its own words it from the fields.
+    #[error("{}", profile_pinned_shell_sentence(.profile, .under))]
+    ProfilePinnedBySubagents {
+        profile: String,
+        under: Vec<uuid::Uuid>,
+    },
+
     /// MCP readiness gate rejected the turn: at least one server marked
     /// [`crate::config::McpServerConfig::required`] wasn't `Connected` within the configured
     /// grace period. Servers that aren't required never appear here. Turn contents haven't been
@@ -197,6 +286,189 @@ pub(crate) enum MekaError {
     /// propagates to a non-zero process exit.
     #[error("mcp: {} server(s) not ready: {}", .servers.len(), .servers.iter().map(|(n, s)| format!("{n} ({s})")).collect::<Vec<_>>().join(", "))]
     McpTurnGated { servers: Vec<(String, String)> },
+}
+
+/// [`MekaError::ProfilePinnedBySubagents`], with `remedy` as the door words removing a session.
+pub(crate) fn profile_pinned_sentence(profile: &str, under: &[uuid::Uuid], remedy: &str) -> String {
+    let under = under
+        .iter()
+        .map(uuid::Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "sub-agents under session(s) {under} are pinned to the profile '{profile}'; remove those \
+         sessions first with {remedy}"
+    )
+}
+
+/// [`MekaError::ProfilePinnedBySubagents`] with the shell's remedy.
+fn profile_pinned_shell_sentence(profile: &str, under: &[uuid::Uuid]) -> String {
+    profile_pinned_sentence(profile, under, "`meka session remove <id>`")
+}
+
+/// [`MekaError::AccountCredentialKind`] with the shell's remedy.
+fn account_credential_shell_sentence(account: &str, backend: &str, key_given: bool) -> String {
+    if key_given {
+        format!(
+            "'{account}' is on '{backend}', which logs in through the browser and takes no API \
+             key; drop `--api-key-stdin`"
+        )
+    } else {
+        format!("'{account}' is on '{backend}', which takes an API key")
+    }
+}
+
+/// What a credential stored for an MCP server stands in the way of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpCredentialObstacle {
+    /// A stored bearer would override the bundle a login is about to mint.
+    BearerOverridesLogin,
+    /// A credential is stored under a name no entry claims, which a new entry would adopt.
+    LeftFromRemovedServer,
+}
+
+impl McpCredentialObstacle {
+    /// The refusal, with `remedy` as the door words what clears the credential.
+    pub(crate) fn sentence(self, server_name: &str, remedy: &str) -> String {
+        match self {
+            Self::BearerOverridesLogin => format!(
+                "server '{server_name}' has a stored bearer, which would override the login; drop \
+                 it first with {remedy}"
+            ),
+            Self::LeftFromRemovedServer => format!(
+                "'{server_name}' has a stored credential left over from a removed server; clear it \
+                 first with {remedy}"
+            ),
+        }
+    }
+
+    /// The refusal with the shell's remedy.
+    pub(crate) fn shell_sentence(self, server_name: &str) -> String {
+        let remedy = match self {
+            Self::BearerOverridesLogin => format!("`meka mcp logout {server_name}`"),
+            Self::LeftFromRemovedServer => format!("`meka mcp remove {server_name}`"),
+        };
+        self.sentence(server_name, &remedy)
+    }
+}
+
+/// Why no profile is selected: the facts, for each host to word with its own remedy, since the
+/// shell's command is the wrong advice to a client that administers the installation over HTTP.
+/// `Display` is the shell's sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfileRefusal {
+    /// No profile is configured at all.
+    NoProfiles,
+    /// Several are, and `default_profile` names none of them.
+    NoDefault { configured: Vec<String> },
+    /// The one asked for, by `--profile` or by `default_profile`, is not configured; `configured`
+    /// is what is, possibly nothing.
+    Unknown {
+        requested: String,
+        source: ProfileRequest,
+        configured: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for ProfileRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProfiles => formatter.write_str(
+                "no profile configured; run `meka account add <name>`, then `meka profile add \
+                 <name>`",
+            ),
+            // Names `meka profile use`, which is what actually writes `default_profile`. Saying
+            // only "set `default_profile`" sends the reader to hand-edit a file for something a
+            // command does, and this state is most often reached by `meka profile remove`
+            // dropping a pointer to the profile it deleted.
+            Self::NoDefault { configured } => write!(
+                formatter,
+                "multiple profiles configured ({}) and no `default_profile`; pick one with `meka \
+                 profile use <name>`",
+                configured.join(", ")
+            ),
+            // The remedy differs by where the name came from. Telling someone who just typed
+            // `--profile typo` to "pass `--profile`" is advice they have already taken; telling
+            // someone whose `default_profile` names a deleted profile to run `meka profile list`
+            // is not enough.
+            Self::Unknown {
+                requested,
+                source,
+                configured,
+            } => write!(
+                formatter,
+                "{}; {}",
+                crate::text::unknown_name("profile", requested, configured),
+                match (source, configured.is_empty()) {
+                    (_, true) => "create one with `meka profile add <name>`",
+                    (ProfileRequest::Flag, false) => "pass a configured name to `--profile`",
+                    (ProfileRequest::DefaultProfile, false) =>
+                        "point `default_profile` at one with `meka profile use <name>`",
+                }
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProfileRefusal {}
+
+/// Which tier asked for the profile `config::select_profile` could not find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileRequest {
+    /// `--profile <name>` on this run.
+    Flag,
+    /// `default_profile` in `config.toml`, which is also what `meka profile use` writes.
+    DefaultProfile,
+}
+/// One of the two secrets a person stores for an MCP server by hand, which a refusal about it
+/// names with the way to store it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpSecretKind {
+    Bearer,
+    ClientSecret,
+}
+
+impl McpSecretKind {
+    /// What to call it when telling the user about it.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer token",
+            Self::ClientSecret => "client secret",
+        }
+    }
+
+    /// That the stored one is not presented, with `remedy` as the surface words storing another.
+    pub(crate) fn sentence(
+        self,
+        server_name: &str,
+        stored_for: Option<&str>,
+        remedy: &str,
+    ) -> String {
+        let label = self.label();
+        match stored_for {
+            Some(origin) => format!(
+                "MCP server '{server_name}' holds a {label} stored for {origin}, not its URL; \
+                 store one for it with {remedy}"
+            ),
+            None => format!(
+                "MCP server '{server_name}' holds a {label} stored for no configured server; \
+                 store one for its URL with {remedy}"
+            ),
+        }
+    }
+
+    /// The refusal with the shell's remedy.
+    pub(crate) fn shell_sentence(self, server_name: &str, stored_for: Option<&str>) -> String {
+        let flag = match self {
+            Self::Bearer => "--auth-token-stdin",
+            Self::ClientSecret => "--client-secret-stdin",
+        };
+        self.sentence(
+            server_name,
+            stored_for,
+            &format!("`meka mcp login {server_name} {flag}`"),
+        )
+    }
 }
 
 /// The catalog every surface reports a failure under: the `type` of an HTTP Problem Detail and
@@ -253,9 +525,18 @@ pub(crate) enum ErrorKind {
     /// Distinct from [`Self::InvalidBody`]: the request is well-formed and the remedy is to pick
     /// another name or edit that file directly, not to fix the payload.
     StoreReadOnly,
-    /// A session resident on this server runs on the account, whose credential refreshes under
-    /// its name: renamed under the session, the next refresh would write to a row that is gone.
+    /// `PUT /v1/instructions` would write `instructions.md`, which this server does not read:
+    /// `--instructions`, `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE` or the `instructions/`
+    /// directory stands above it. Not [`Self::StoreReadOnly`], whose remedy is another name: this
+    /// one's is unsetting the source in charge.
+    InstructionsOverridden,
+    /// The account's credential refreshes under its name while something holds it, a session
+    /// resident on this server or another meka refreshing it now: renamed under it, the next
+    /// refresh would write to a row that is gone.
     AccountInUse,
+    /// The server has begun shutting down and takes nothing on that would outlive it, such as a
+    /// browser login whose credential would be stored after the drain.
+    ShuttingDown,
     /// The id names a sub-agent's conversation, which only its parent can continue.
     ///
     /// Distinct from [`Self::InvalidBody`] for the reason [`Self::StoreReadOnly`] is: the request
@@ -362,7 +643,7 @@ pub(crate) enum ErrorKind {
 
 impl ErrorKind {
     /// Every entry of the catalog, for a reader that holds a `type` and wants the kind back.
-    pub(crate) const ALL: [Self; 30] = [
+    pub(crate) const ALL: [Self; 32] = [
         Self::Auth,
         Self::AuthScope,
         Self::SessionNotFound,
@@ -379,7 +660,9 @@ impl ErrorKind {
         Self::InboxAppended,
         Self::TurnMismatch,
         Self::StoreReadOnly,
+        Self::InstructionsOverridden,
         Self::AccountInUse,
+        Self::ShuttingDown,
         Self::SessionNotDrivable,
         Self::SubagentNotRunning,
         Self::InvalidBody,
@@ -420,7 +703,9 @@ impl ErrorKind {
             Self::InboxAppended => "inbox-appended",
             Self::TurnMismatch => "turn-mismatch",
             Self::StoreReadOnly => "store-read-only",
+            Self::InstructionsOverridden => "instructions-overridden",
             Self::AccountInUse => "account-in-use",
+            Self::ShuttingDown => "shutting-down",
             Self::SessionNotDrivable => "session-not-drivable",
             Self::SubagentNotRunning => "subagent-not-running",
             Self::InvalidBody => "invalid-body",
@@ -456,7 +741,9 @@ impl ErrorKind {
             Self::InboxAppended => "https://meka.run/errors/inbox-appended",
             Self::TurnMismatch => "https://meka.run/errors/turn-mismatch",
             Self::StoreReadOnly => "https://meka.run/errors/store-read-only",
+            Self::InstructionsOverridden => "https://meka.run/errors/instructions-overridden",
             Self::AccountInUse => "https://meka.run/errors/account-in-use",
+            Self::ShuttingDown => "https://meka.run/errors/shutting-down",
             Self::SessionNotDrivable => "https://meka.run/errors/session-not-drivable",
             Self::SubagentNotRunning => "https://meka.run/errors/subagent-not-running",
             Self::InvalidBody => "https://meka.run/errors/invalid-body",
@@ -492,7 +779,9 @@ impl ErrorKind {
             Self::InboxAppended => "Inbox item already appended",
             Self::TurnMismatch => "Turn is not the one in flight",
             Self::StoreReadOnly => "Skill is in a read-only directory",
-            Self::AccountInUse => "A resident session runs on the account",
+            Self::InstructionsOverridden => "Another source overrides instructions.md",
+            Self::AccountInUse => "The account's credential is in use",
+            Self::ShuttingDown => "The server is shutting down",
             Self::SessionNotDrivable => "Session is a sub-agent's conversation",
             Self::SubagentNotRunning => "Sub-agent is not running here",
             Self::InvalidBody => "Invalid request body",
@@ -532,7 +821,18 @@ impl MekaError {
             | Self::EmptyPrompt
             | Self::DisabledLevel { .. }
             | Self::ProfileNotConfigured { .. }
-            | Self::UnknownProject { .. } => ErrorKind::InvalidBody,
+            | Self::UnknownProject { .. }
+            | Self::ProfileDefaultStillNeeded { .. }
+            | Self::AccountCredentialKind { .. }
+            | Self::AccountCredentialLeftOver { .. }
+            | Self::ProfileNamesNoModel { .. }
+            | Self::ProfileRecordedBySessions { .. }
+            | Self::ProfilePinnedBySubagents { .. }
+            | Self::ProfileUnselected(_)
+            | Self::McpCredentialInTheWay { .. } => ErrorKind::InvalidBody,
+            // Its own type, as a resident session's use of the account is: the request is right
+            // and the remedy is to wait, not to change it.
+            Self::AccountRefreshing { .. } => ErrorKind::AccountInUse,
             // Same status as the three above, different `type`, because the remedies do not
             // overlap: meka's own ceiling, refused before anything was sent, and a permanent
             // property of the id itself.
@@ -557,7 +857,9 @@ impl MekaError {
             // A fully classified pre-flight refusal: answering "internal server error" would send
             // an operator looking for a bug in meka instead of at the subprocess that did not
             // start.
-            Self::McpTurnGated { .. } => ErrorKind::McpUnavailable,
+            Self::McpTurnGated { .. }
+            | Self::McpLoginRequired { .. }
+            | Self::McpSecretForAnotherUrl { .. } => ErrorKind::McpUnavailable,
             Self::Interrupted => ErrorKind::TurnCanceled,
             Self::SessionLocked(_) => ErrorKind::SessionLocked,
             Self::SessionNotFound(_) => ErrorKind::SessionNotFound,
@@ -593,6 +895,17 @@ impl MekaError {
             | Self::DisabledLevel { .. }
             | Self::ProfileNotConfigured { .. }
             | Self::UnknownProject { .. }
+            | Self::ProfileDefaultStillNeeded { .. }
+            | Self::AccountCredentialKind { .. }
+            | Self::AccountCredentialLeftOver { .. }
+            | Self::AccountRefreshing { .. }
+            | Self::ProfileNamesNoModel { .. }
+            | Self::ProfileRecordedBySessions { .. }
+            | Self::ProfilePinnedBySubagents { .. }
+            | Self::ProfileUnselected(_)
+            | Self::McpCredentialInTheWay { .. }
+            | Self::McpLoginRequired { .. }
+            | Self::McpSecretForAnotherUrl { .. }
             | Self::SessionNotFound(_)
             | Self::TurnInFlight { .. } => self.to_string(),
             Self::Provider(_) | Self::InvalidRequest(_) => {
@@ -1283,7 +1596,7 @@ mod tests {
         }
         assert_eq!(
             super::ErrorKind::AccountInUse.title(),
-            "A resident session runs on the account"
+            "The account's credential is in use"
         );
     }
     /// The store records a kind by its name and the HTTP host spells the same kind as a URI, so

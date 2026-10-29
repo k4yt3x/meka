@@ -20,49 +20,77 @@ use crate::{
     store::TokenStore,
 };
 
-/// The server URL a stored OAuth bundle was issued for, if it records one.
-///
-/// rmcp 3.5 writes `issuer`, the authorization server's issuer from its metadata, into the
-/// credential it hands the store, and leaves it out when discovery fell back to the origin's
-/// endpoints; a bundle an earlier rmcp wrote carries `server_url`. The row is keyed by
-/// `(server_name, kind)` and nothing else: point `[[mcp_servers]]` named `docs` at a different host
-/// and the token minted for the old one is presented to the new one, so `meka mcp get` shows the
-/// origin beside the URL for the two to be compared.
-///
-/// Best-effort by design, and `None` in three different ways that all mean the same thing to a
-/// caller: no bundle, a bundle that is not JSON, or one from a version of rmcp that recorded
-/// neither key. This decorates a listing; it must not fail one.
-pub(crate) async fn stored_credential_origin(
-    token_store: &TokenStore,
-    server_name: &str,
-) -> Option<String> {
-    let json = match token_store
-        .load_mcp_credentials(server_name, crate::store::McpCredentialKind::OAuth)
-        .await
-    {
-        Ok(json) => json?,
-        // A store meka cannot read is not the same fact as a server with no stored grant, and this
-        // function's `None` says the second. Logged rather than propagated: the caller is a display
-        // line, and losing one row of `mcp get` is not worth failing the command over, but a
-        // silent drop would present a locked store as "never logged in".
-        Err(error) => {
-            tracing::debug!(
-                "failed to read the stored OAuth credential for '{server_name}' to report its origin: {error}"
-            );
-            return None;
-        }
+/// The endpoint a stored MCP credential is bound to and a server is reached at: `url` in the
+/// canonical form RFC 8707 gives a resource, which the MCP authorization spec names a server by.
+/// Scheme and host lowercase and a default port dropped, as the URL parser leaves them, and no
+/// fragment or trailing slash. A string that is not a URL stands for itself.
+pub(crate) fn canonical_endpoint(url: &str) -> String {
+    let url = url.trim();
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return url.to_string();
     };
-    let parsed: serde_json::Value = serde_json::from_str(&json).ok()?;
-    origin_of(&parsed).map(str::to_string)
+    let mut canonical = parsed.origin().ascii_serialization();
+    canonical.push_str(parsed.path().trim_end_matches('/'));
+    if let Some(query) = parsed.query() {
+        canonical.push('?');
+        canonical.push_str(query);
+    }
+    canonical
 }
 
-/// Whether two URLs name the same server, for the purpose of "is this the grant for this host".
-///
-/// Scheme, host and port, which is the tuple that decides who receives the bearer token. Path is
-/// deliberately excluded: an MCP endpoint at `/mcp` and the issuer metadata at the site root are
-/// the same server, and comparing paths would report a mismatch on every correctly configured
-/// OAuth server. Both unparseable falls back to string equality, so a comparison meka cannot make
-/// says "the same" rather than crying wolf on a listing.
+/// Whether a credential of `kind` stored for `bound` may be presented to the server at `url`. An
+/// OAuth bundle at the resource it was issued for alone: a token is bound to its audience (RFC
+/// 8707, the MCP authorization spec). A bearer or a client secret anywhere on the origin it was
+/// given for, which is where a client sends a credential it holds (RFC 9110's protection space),
+/// and nowhere else: a credential never follows a server to another host.
+pub(crate) fn presentable(kind: crate::store::McpCredentialKind, bound: &str, url: &str) -> bool {
+    match kind {
+        crate::store::McpCredentialKind::OAuth => bound == canonical_endpoint(url),
+        crate::store::McpCredentialKind::Bearer | crate::store::McpCredentialKind::ClientSecret => {
+            !bound.is_empty() && same_origin(bound, url)
+        }
+    }
+}
+
+/// The origin of `endpoint`, the most of it a listing or a refusal shows: a path or a query may
+/// carry what the file keeps in an environment variable. `None` for a credential bound to no
+/// server.
+pub(crate) fn endpoint_origin(endpoint: &str) -> Option<String> {
+    if endpoint.is_empty() {
+        return None;
+    }
+    Some(match reqwest::Url::parse(endpoint) {
+        Ok(parsed) => parsed.origin().ascii_serialization(),
+        Err(_) => endpoint.to_string(),
+    })
+}
+
+/// The `secret` stored for `server_name`, when it may be presented to `url`; refused by name when
+/// it was stored for another endpoint, rather than sent there or silently left out.
+pub(crate) async fn presented_secret(
+    token_store: &TokenStore,
+    server_name: &str,
+    secret: crate::error::McpSecretKind,
+    url: &str,
+) -> Result<Option<String>> {
+    let kind = crate::store::McpCredentialKind::from(secret);
+    let Some(stored) = token_store.load_mcp_credentials(server_name, kind).await? else {
+        return Ok(None);
+    };
+    if presentable(kind, &stored.endpoint, url) {
+        return Ok(Some(stored.secret));
+    }
+    Err(MekaError::McpSecretForAnotherUrl {
+        server_name: server_name.to_string(),
+        secret,
+        stored_for: endpoint_origin(&stored.endpoint),
+    })
+}
+
+/// Whether two URLs name the same origin: scheme, host and port, the tuple that decides who
+/// receives a credential. Path is excluded: an MCP endpoint at `/mcp` and its authorization
+/// server's metadata at the site root are one origin. Two strings that are not URLs are the same
+/// only when equal, and one URL is never the same as a string that is not one.
 pub(crate) fn same_origin(left: &str, right: &str) -> bool {
     match (reqwest::Url::parse(left), reqwest::Url::parse(right)) {
         (Ok(left), Ok(right)) => {
@@ -70,135 +98,258 @@ pub(crate) fn same_origin(left: &str, right: &str) -> bool {
                 && left.host_str() == right.host_str()
                 && left.port_or_known_default() == right.port_or_known_default()
         }
-        _ => left == right,
+        (Err(_), Err(_)) => left == right,
+        _ => false,
     }
 }
 
-/// The issuer field out of a parsed bundle, in the order [`revoke_stored_token`] reads them.
-///
-/// Shared so the two cannot disagree about which key is authoritative: a bundle carrying both must
-/// revoke against the same host `mcp get` names, or the report is about a different endpoint than
-/// the one the token would be sent to.
-fn origin_of(parsed: &serde_json::Value) -> Option<&str> {
-    parsed
-        .get("server_url")
-        .and_then(|value| value.as_str())
-        .or_else(|| parsed.get("issuer").and_then(|value| value.as_str()))
+/// The revocation a door owes for the OAuth grant it cleared (RFC 7009), read before the clear and
+/// sent once it commits: the local clear is what a logout or a removal guarantees, and the
+/// authorization server answering slowly or not at all must hold up nothing behind it. Nothing is
+/// owed when no grant was stored or it held no token.
+#[must_use = "a cleared grant stays live at the provider until this is sent"]
+pub(crate) struct Revocation(Option<RevocationRequest>);
+
+/// One RFC 7009 request: the token, and the client that holds it.
+struct RevocationRequest {
+    server_name: String,
+    /// The authorization server's issuer, whose metadata names the revocation endpoint: the one
+    /// the grant records, else the origin it was stored for, whose endpoints a discovery that
+    /// found no metadata falls back to.
+    issuer: String,
+    /// The refresh token, which revokes the grant whole where the server supports it, else the
+    /// access token.
+    token: String,
+    token_type_hint: &'static str,
+    client_id: String,
+    /// The secret a confidential client authenticates with, which RFC 7009 asks of it.
+    client_secret: Option<String>,
 }
 
-/// Best-effort revoke of a stored OAuth access/refresh token for an MCP server. Looks up the stored
-/// credentials, discovers the provider's revocation endpoint via the OAuth authorization server
-/// metadata, and posts `token=…&token_type_hint=access_token` per RFC 7009. Errors are propagated
-/// so the caller can log them; local credential cleanup should run regardless.
-pub(crate) async fn revoke_stored_token(
+impl std::fmt::Debug for Revocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(request) => formatter
+                .debug_struct("Revocation")
+                .field("server_name", &request.server_name)
+                .field("issuer", &request.issuer)
+                .finish_non_exhaustive(),
+            None => formatter.write_str("Revocation(none)"),
+        }
+    }
+}
+
+impl Revocation {
+    /// Nothing owed.
+    pub(crate) const fn none() -> Self {
+        Self(None)
+    }
+
+    /// Whether a request is owed.
+    #[cfg(test)]
+    pub(crate) const fn is_owed(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The client secret the request authenticates with.
+    #[cfg(test)]
+    pub(crate) fn client_secret_for_test(&self) -> Option<&str> {
+        self.0.as_ref()?.client_secret.as_deref()
+    }
+
+    /// Send what is owed, best-effort: a failure is the log's to say, since the grant is already
+    /// cleared here and nothing a caller does changes the authorization server's answer.
+    pub(crate) async fn send(self) {
+        let Some(request) = self.0 else {
+            return;
+        };
+        let server_name = request.server_name.clone();
+        if let Err(error) = request.post().await {
+            tracing::warn!("failed to revoke the OAuth tokens at '{server_name}': {error}");
+        }
+    }
+}
+
+/// The revocation of the grant stored for `server_name`, owed once its clear commits. A grant that
+/// cannot be read is logged and revokes nothing: the clear goes on. The client secret goes along
+/// only when it was stored for the grant's own origin, which is where the flow that minted the
+/// grant presented it; one stored for another endpoint belongs to another client.
+pub(crate) async fn stored_revocation(
     token_store: &TokenStore,
     server_name: &str,
-) -> std::result::Result<(), String> {
-    let Some(json) = token_store
+) -> Result<Revocation> {
+    let Some(stored) = token_store
         .load_mcp_credentials(server_name, crate::store::McpCredentialKind::OAuth)
-        .await
-        .map_err(|error| format!("failed to load the stored credentials: {error}"))?
+        .await?
     else {
-        return Ok(());
+        return Ok(Revocation::none());
     };
-    let parsed: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|error| format!("stored credentials are not valid JSON: {error}"))?;
-    let issuer = origin_of(&parsed)
-        .ok_or_else(|| "the stored credentials record no server URL".to_string())?;
-    let access_token = parsed
-        .get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(|v| v.as_str());
-    let client_id = parsed
-        .get("client")
-        .and_then(|c| c.get("client_id"))
-        .and_then(|v| v.as_str());
-
-    let Some(access_token) = access_token else {
-        return Ok(());
+    let credentials: StoredCredentials = match serde_json::from_str(&stored.secret) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            tracing::warn!(
+                "failed to read the stored OAuth tokens for '{server_name}' to revoke them: {error}"
+            );
+            return Ok(Revocation::none());
+        }
     };
+    let Some(issuer) = credentials
+        .issuer
+        .clone()
+        .or_else(|| endpoint_origin(&stored.endpoint))
+    else {
+        tracing::warn!(
+            "the stored OAuth tokens for '{server_name}' name no issuer and no endpoint to revoke \
+             them at"
+        );
+        return Ok(Revocation::none());
+    };
+    // The token response as rmcp serializes it, the standard fields by their RFC 6749 names.
+    let tokens = serde_json::to_value(&credentials.token_response).unwrap_or_default();
+    let field = |name: &str| {
+        tokens
+            .get(name)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    let (token, token_type_hint) = match (field("refresh_token"), field("access_token")) {
+        (Some(refresh), _) => (refresh, "refresh_token"),
+        (None, Some(access)) => (access, "access_token"),
+        (None, None) => return Ok(Revocation::none()),
+    };
+    let client_secret = token_store
+        .load_mcp_credentials(server_name, crate::store::McpCredentialKind::ClientSecret)
+        .await?
+        .filter(|secret| {
+            presentable(
+                crate::store::McpCredentialKind::ClientSecret,
+                &secret.endpoint,
+                &stored.endpoint,
+            )
+        })
+        .map(|secret| secret.secret);
+    Ok(Revocation(Some(RevocationRequest {
+        server_name: server_name.to_string(),
+        issuer,
+        token,
+        token_type_hint,
+        client_id: credentials.client_id,
+        client_secret,
+    })))
+}
 
-    // RFC 8414 puts the metadata under `/.well-known/oauth-authorization-server`; many providers
-    // also expose it under `/.well-known/openid-configuration`, tried second.
-    //
-    // The `issuer` URL was stored during the original flow, so its origin is trusted; the network
-    // path and any redirect are not. reqwest follows redirects by default, which would let a MITM
-    // send the metadata fetch to an attacker host and the access token after it, so redirects are
-    // off, the body is size-capped, and `revocation_endpoint` is pinned to the issuer's origin.
-    const METADATA_BODY_CAP: usize = 256 * crate::text::KIB;
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| format!("failed to build the HTTP client: {error}"))?;
+/// `value` in the form encoding RFC 6749 Appendix B asks of a client's identity in HTTP Basic.
+fn form_encoded(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
 
-    let base = issuer.trim_end_matches('/');
-    let candidates = [
-        format!("{base}/.well-known/oauth-authorization-server"),
-        format!("{base}/.well-known/openid-configuration"),
+/// Where the authorization server `issuer` publishes its metadata, in the order the MCP
+/// authorization spec tries them: RFC 8414's path, then OpenID Connect Discovery's, each inserted
+/// ahead of the issuer's own path, and for an issuer with a path OpenID Connect Discovery's
+/// appended form last.
+fn metadata_candidates(issuer: &str) -> Vec<String> {
+    let Ok(parsed) = reqwest::Url::parse(issuer) else {
+        return Vec::new();
+    };
+    let origin = parsed.origin().ascii_serialization();
+    let path = parsed.path().trim_end_matches('/');
+    let mut candidates = vec![
+        format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        format!("{origin}/.well-known/openid-configuration{path}"),
     ];
-    let mut revocation_endpoint: Option<String> = None;
-    for url in &candidates {
-        let Ok(response) = http.get(url).send().await else {
-            continue;
-        };
-        if !response.status().is_success() {
-            continue;
-        }
-        // Bounded as it arrives rather than after: Content-Length is server-supplied, and a body
-        // read whole before the cap is checked is a body the cap did not bound.
-        let Some(bytes) = read_bounded(response, METADATA_BODY_CAP).await else {
-            continue;
-        };
-        if let Some(endpoint) = extract_revocation_endpoint(&bytes, METADATA_BODY_CAP) {
-            revocation_endpoint = Some(endpoint);
-            break;
-        }
+    if !path.is_empty() {
+        candidates.push(format!("{origin}{path}/.well-known/openid-configuration"));
     }
+    candidates
+}
 
-    let Some(endpoint) = revocation_endpoint else {
-        return Err(format!(
-            "server '{server_name}' does not advertise a revocation_endpoint"
-        ));
-    };
+impl RevocationRequest {
+    async fn post(self) -> std::result::Result<(), String> {
+        let Self {
+            server_name,
+            issuer,
+            token,
+            token_type_hint,
+            client_id,
+            client_secret,
+        } = self;
+        // The `issuer` URL was stored during the original flow, so its origin is trusted; the
+        // network path and any redirect are not. reqwest follows redirects by default,
+        // which would let a MITM send the metadata fetch to an attacker host and the access
+        // token after it, so redirects are off, the body is size-capped, and
+        // `revocation_endpoint` is pinned to the issuer's origin.
+        const METADATA_BODY_CAP: usize = 256 * crate::text::KIB;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| format!("failed to build the HTTP client: {error}"))?;
 
-    validate_revocation_endpoint_origin(issuer, &endpoint)?;
+        let mut revocation_endpoint: Option<String> = None;
+        for url in &metadata_candidates(&issuer) {
+            let Ok(response) = http.get(url).send().await else {
+                continue;
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            // Bounded as it arrives rather than after: Content-Length is server-supplied, and a
+            // body read whole before the cap is checked is a body the cap did not
+            // bound.
+            let Some(bytes) = read_bounded(response, METADATA_BODY_CAP).await else {
+                continue;
+            };
+            if let Some(endpoint) = extract_revocation_endpoint(&bytes, METADATA_BODY_CAP) {
+                revocation_endpoint = Some(endpoint);
+                break;
+            }
+        }
 
-    // The form body is built by hand rather than through another dependency;
-    // `percent_encoding::NON_ALPHANUMERIC` produces the same %-encoded UTF-8 `form_urlencoded`
-    // would.
-    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-    let enc = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
-    let mut body = format!("token={}&token_type_hint=access_token", enc(access_token));
-    if let Some(id) = client_id {
-        body.push_str("&client_id=");
-        body.push_str(&enc(id));
-    }
+        let Some(endpoint) = revocation_endpoint else {
+            return Err(format!(
+                "server '{server_name}' does not advertise a revocation_endpoint"
+            ));
+        };
 
-    let response = http
-        .post(&endpoint)
-        .header(
+        validate_revocation_endpoint_origin(&issuer, &endpoint)?;
+
+        let mut request = http.post(&endpoint).header(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
-        )
-        .body(body)
-        .send()
-        .await
-        .map_err(|error| {
+        );
+        let mut body = vec![
+            ("token", token.as_str()),
+            ("token_type_hint", token_type_hint),
+        ];
+        // A confidential client authenticates as RFC 6749 section 2.3.1 has it, by HTTP Basic over
+        // the pair encoded by its Appendix B, the form encoding; a public one names itself in the
+        // body.
+        match &client_secret {
+            Some(secret) => {
+                request = request.basic_auth(form_encoded(&client_id), Some(form_encoded(secret)));
+            }
+            None => body.push(("client_id", client_id.as_str())),
+        }
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(body)
+            .finish();
+
+        let response = request.body(body).send().await.map_err(|error| {
             format!(
                 "failed to POST the revocation: {}",
                 crate::error::format_reqwest_error(&error)
             )
         })?;
-    // RFC 7009: successful revocation is 200 OK with an empty body; unknown tokens also return 200
-    // OK. Non-2xx is a genuine failure.
-    if !response.status().is_success() {
-        return Err(format!(
-            "the revocation endpoint returned HTTP {}",
-            response.status().as_u16()
-        ));
+        // RFC 7009: successful revocation is 200 OK with an empty body; unknown tokens also return
+        // 200 OK. Non-2xx is a genuine failure.
+        if !response.status().is_success() {
+            return Err(format!(
+                "the revocation endpoint returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Classification of an unauthenticated probe to an HTTP MCP endpoint. The MCP authorization spec
@@ -319,7 +470,7 @@ async fn read_bounded(mut response: reqwest::Response, cap: usize) -> Option<Vec
 
 /// Parse an OAuth authorization-server metadata JSON document and return the `revocation_endpoint`
 /// string, if any. Rejects bodies larger than `max_bytes` and invalid JSON. Split from
-/// [`revoke_stored_token`] so the size-cap and extraction logic are testable without a live HTTP
+/// [`Revocation::send`] so the size-cap and extraction logic are testable without a live HTTP
 /// server.
 fn extract_revocation_endpoint(bytes: &[u8], max_bytes: usize) -> Option<String> {
     if bytes.len() > max_bytes {
@@ -363,49 +514,43 @@ pub(super) async fn connect_http_with_oauth(
     login_prompt: Option<std::sync::Arc<dyn LoginPrompt>>,
     handler: MekaClientHandler,
 ) -> Result<McpRunningService> {
-    // The client half of this server's identity, from the store. Loaded once here rather than in
-    // each arm: `client_credentials` requires one, `oauth` takes one only for a confidential
-    // client, and `client_credentials_jwt` signs instead of sharing a secret and wants none.
+    // The client half of this server's identity, from the store, for the flows that present one:
+    // `client_credentials` requires one and `oauth` takes one for a confidential client, while
+    // `client_credentials_jwt` signs instead of sharing a secret, so a secret it holds is never
+    // asked whether it may be presented.
+    let presents_a_secret = !matches!(auth_config, McpAuthConfig::ClientCredentialsJwt { .. });
     let client_secret = match token_store {
-        Some(store) => {
-            store
-                .load_mcp_credentials(server_name, crate::store::McpCredentialKind::ClientSecret)
-                .await?
+        Some(store) if presents_a_secret => {
+            presented_secret(
+                store,
+                server_name,
+                crate::error::McpSecretKind::ClientSecret,
+                url,
+            )
+            .await?
         }
-        None => None,
+        _ => None,
     };
 
     let auth_manager = match auth_config {
-        McpAuthConfig::ClientCredentials {
-            client_id,
-            scopes,
-            resource,
-        } => {
+        McpAuthConfig::ClientCredentials { client_id, scopes } => {
             // Required for this flow, and there is nothing to fall back to: without it meka cannot
             // prove which client it is and the token endpoint will refuse.
             let secret = client_secret.as_deref().ok_or_else(|| MekaError::McpAuth {
                 server_name: server_name.to_string(),
                 message: format!(
-                    "no client secret stored for '{server_name}'; run `meka mcp login {server_name} \
-                     --client-secret-stdin`"
+                    "no client secret stored for '{server_name}', which `client_credentials` \
+                     presents"
                 ),
             })?;
-            authenticate_client_credentials(
-                server_name,
-                url,
-                client_id,
-                secret,
-                scopes.as_deref(),
-                resource.as_deref(),
-            )
-            .await?
+            authenticate_client_credentials(server_name, url, client_id, secret, scopes.as_deref())
+                .await?
         }
         McpAuthConfig::ClientCredentialsJwt {
             client_id,
             signing_key_path,
             signing_algorithm,
             scopes,
-            resource,
         } => {
             authenticate_client_credentials_jwt(
                 server_name,
@@ -414,7 +559,6 @@ pub(super) async fn connect_http_with_oauth(
                 signing_key_path,
                 signing_algorithm.as_deref(),
                 scopes.as_deref(),
-                resource.as_deref(),
             )
             .await?
         }
@@ -460,13 +604,15 @@ async fn authenticate_client_credentials(
     client_id: &str,
     client_secret: &str,
     scopes: Option<&[String]>,
-    resource: Option<&str>,
 ) -> Result<AuthorizationManager> {
+    // The token is asked for the server it will be presented to, the resource the MCP
+    // authorization spec has every token request name (RFC 8707), which is a fact of the URL and
+    // not a setting.
     let config = ClientCredentialsConfig::ClientSecret {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
         scopes: scopes.map(|s| s.to_vec()).unwrap_or_default(),
-        resource: resource.map(|s| s.to_string()),
+        resource: Some(canonical_endpoint(url)),
     };
 
     let mut oauth_state = OAuthState::new(url, None)
@@ -499,7 +645,6 @@ async fn authenticate_client_credentials_jwt(
     signing_key_path: &str,
     signing_algorithm: Option<&str>,
     scopes: Option<&[String]>,
-    resource: Option<&str>,
 ) -> Result<AuthorizationManager> {
     // Open the key once and check permissions on the open fd to close the stat-then-read TOCTOU
     // window: a separate `metadata(path)` followed by `read(path)` could land on a different inode
@@ -528,7 +673,8 @@ async fn authenticate_client_credentials_jwt(
         signing_key,
         signing_algorithm: algorithm,
         scopes: scopes.map(|s| s.to_vec()).unwrap_or_default(),
-        resource: resource.map(|s| s.to_string()),
+        // As `authenticate_client_credentials` names it.
+        resource: Some(canonical_endpoint(url)),
         token_endpoint_audience: None,
     };
 
@@ -651,6 +797,7 @@ async fn authenticate_oauth_authorization_code(
         manager.set_credential_store(SqliteCredentialStore {
             token_store: store.clone(),
             server_name: server_name.to_string(),
+            endpoint: canonical_endpoint(url),
             last_read: std::sync::Arc::clone(&last_read),
         });
     }
@@ -671,11 +818,8 @@ async fn authenticate_oauth_authorization_code(
 
     // No stored credentials; run the interactive browser flow, if anyone is there to complete it.
     let Some(login_prompt) = login_prompt else {
-        return Err(MekaError::McpAuth {
+        return Err(MekaError::McpLoginRequired {
             server_name: server_name.to_string(),
-            message: format!(
-                "no stored OAuth credentials; run `meka mcp login {server_name}` to sign in"
-            ),
         });
     };
 
@@ -789,7 +933,7 @@ async fn authenticate_oauth_authorization_code(
     login_prompt.authorize_at(&auth_url);
 
     let expected_state = state_in_authorization_url(&auth_url);
-    let (code, state) = await_oauth_callback(
+    let callback = await_oauth_callback(
         callback_listener,
         login_prompt.as_ref(),
         expected_state.as_deref(),
@@ -800,8 +944,10 @@ async fn authenticate_oauth_authorization_code(
         message: format!("OAuth callback failed: {error}"),
     })?;
 
+    // The `iss` the authorization server answered with (RFC 9207), which rmcp checks against the
+    // issuer it discovered and requires where the server's metadata says it sends one.
     oauth_state
-        .handle_callback(&code, &state)
+        .handle_callback_with_issuer(&callback.code, &callback.state, callback.issuer.as_deref())
         .await
         .map_err(|error| MekaError::McpAuth {
             server_name: server_name.to_string(),
@@ -822,6 +968,15 @@ const CALLBACK_READ_CAP: usize = 64 * crate::text::KIB;
 /// End-of-headers marker for HTTP/1.x.
 const CRLF_CRLF: &[u8] = b"\r\n\r\n";
 
+/// What an authorization response carries back (RFC 6749 section 4.1.2, RFC 9207): the code, the
+/// `state` that ties it to this login, and the issuer that sent it, when it says.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OAuthCallback {
+    pub(crate) code: String,
+    pub(crate) state: String,
+    pub(crate) issuer: Option<String>,
+}
+
 /// Overall wall-clock budget for the OAuth callback wait, shared by both the TCP accept path and
 /// the paste-URL fallback.
 pub(crate) const OAUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -838,7 +993,7 @@ async fn await_oauth_callback(
     listener: tokio::net::TcpListener,
     prompt: &dyn LoginPrompt,
     expected_state: Option<&str>,
-) -> std::result::Result<(String, String), String> {
+) -> std::result::Result<OAuthCallback, String> {
     let deadline = tokio::time::Instant::now() + OAUTH_CALLBACK_TIMEOUT;
     let accepts_paste = prompt.accepts_paste();
     prompt.awaiting(Completion {
@@ -866,14 +1021,14 @@ fn state_in_authorization_url(auth_url: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
-/// Accept one HTTP request on the bound listener, validate it's the OAuth callback, extract `code`
-/// and `state`, and send back a success page. Loops past non-callback requests (favicons,
+/// Accept one HTTP request on the bound listener, validate it's the OAuth callback, extract what it
+/// carries, and send back a success page. Loops past non-callback requests (favicons,
 /// preflights) until the shared deadline elapses.
 async fn accept_http_callback(
     listener: tokio::net::TcpListener,
     expected_state: Option<&str>,
     overall_deadline: tokio::time::Instant,
-) -> std::result::Result<(String, String), String> {
+) -> std::result::Result<OAuthCallback, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     loop {
@@ -946,7 +1101,9 @@ async fn accept_http_callback(
 
         let request = String::from_utf8_lossy(&buffer);
         match parse_callback_query(&request) {
-            Ok((_, state)) if expected_state.is_some_and(|expected| expected != state.as_str()) => {
+            Ok(callback)
+                if expected_state.is_some_and(|expected| expected != callback.state.as_str()) =>
+            {
                 // A stale tab, or another login's browser: not this login's code, and refused
                 // ahead of the exchange so the one this login asked for is still waited on.
                 tracing::warn!("OAuth state mismatch; refusing the callback");
@@ -964,7 +1121,7 @@ async fn accept_http_callback(
                 }
                 continue;
             }
-            Ok((code, state)) => {
+            Ok(callback) => {
                 // No claim of success: the exchange comes after this page, and may still fail.
                 let response_body = "<!DOCTYPE html><html><body>\
                     <h1>Return to meka</h1>\
@@ -979,7 +1136,7 @@ async fn accept_http_callback(
                 if let Err(error) = stream.write_all(response.as_bytes()).await {
                     tracing::debug!("failed to send callback response: {error}");
                 }
-                return Ok((code, state));
+                return Ok(callback);
             }
             Err(CallbackParseError::NotCallbackPath) => {
                 // Almost certainly a browser preflight or favicon request. Respond 404 and keep
@@ -1015,7 +1172,7 @@ async fn read_pasted_callback(
     prompt: &dyn LoginPrompt,
     expected_state: Option<&str>,
     deadline: tokio::time::Instant,
-) -> std::result::Result<(String, String), String> {
+) -> std::result::Result<OAuthCallback, String> {
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -1036,10 +1193,11 @@ async fn read_pasted_callback(
             // Not fatal; the TCP branch of the `select!` keeps waiting.
             Ok(Ok(None)) => return std::future::pending().await,
             Ok(Ok(Some(line))) => match parse_pasted_callback(&line) {
-                Ok((code, state))
-                    if expected_state.is_none_or(|expected| expected == state.as_str()) =>
+                Ok(callback)
+                    if expected_state
+                        .is_none_or(|expected| expected == callback.state.as_str()) =>
                 {
-                    return Ok((code, state));
+                    return Ok(callback);
                 }
                 Ok(_) => prompt.paste_refused("OAuth state mismatch; refusing the callback"),
                 Err(reason) => prompt.paste_refused(&reason),
@@ -1048,10 +1206,10 @@ async fn read_pasted_callback(
     }
 }
 
-/// Extract `(code, state)` from a pasted callback URL. Accepts either the full URL or just the
+/// Extract what a pasted callback URL carries. Accepts either the full URL or just the
 /// query string, percent-decodes the values, and surfaces the `error=…` parameter (sanitized) when
 /// the authorization server declines.
-pub(crate) fn parse_pasted_callback(input: &str) -> std::result::Result<(String, String), String> {
+pub(crate) fn parse_pasted_callback(input: &str) -> std::result::Result<OAuthCallback, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("no callback URL pasted".to_string());
@@ -1064,6 +1222,7 @@ pub(crate) fn parse_pasted_callback(input: &str) -> std::result::Result<(String,
     };
     let mut code = None;
     let mut state = None;
+    let mut issuer = None;
     let mut error_param: Option<String> = None;
     // The same decoder as `parse_callback_query`: a redirect query is form-encoded, so `+` is a
     // space, which `percent_decode_str` would leave a literal `+` and the token exchange would
@@ -1081,6 +1240,7 @@ pub(crate) fn parse_pasted_callback(input: &str) -> std::result::Result<(String,
         match key.as_ref() {
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
+            "iss" => issuer = Some(decoded),
             "error" => error_param = Some(decoded),
             _ => {}
         }
@@ -1093,7 +1253,11 @@ pub(crate) fn parse_pasted_callback(input: &str) -> std::result::Result<(String,
     }
     let code = code.ok_or_else(|| "missing 'code' parameter in pasted URL".to_string())?;
     let state = state.ok_or_else(|| "missing 'state' parameter in pasted URL".to_string())?;
-    Ok((code, state))
+    Ok(OAuthCallback {
+        code,
+        state,
+        issuer,
+    })
 }
 
 #[derive(Debug)]
@@ -1104,9 +1268,7 @@ enum CallbackParseError {
     Malformed(String),
 }
 
-fn parse_callback_query(
-    request: &str,
-) -> std::result::Result<(String, String), CallbackParseError> {
+fn parse_callback_query(request: &str) -> std::result::Result<OAuthCallback, CallbackParseError> {
     let first_line = request
         .lines()
         .next()
@@ -1134,6 +1296,7 @@ fn parse_callback_query(
 
     let mut code = None;
     let mut state = None;
+    let mut issuer = None;
     let mut error_param: Option<String> = None;
 
     // `form_urlencoded`, not a hand-rolled `split('&')` + `percent_decode_str`. A redirect query is
@@ -1152,6 +1315,7 @@ fn parse_callback_query(
         match key.as_ref() {
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
+            "iss" => issuer = Some(decoded),
             "error" => error_param = Some(decoded),
             _ => {}
         }
@@ -1173,7 +1337,11 @@ fn parse_callback_query(
         CallbackParseError::Malformed("missing 'state' parameter in callback".into())
     })?;
 
-    Ok((code, state))
+    Ok(OAuthCallback {
+        code,
+        state,
+        issuer,
+    })
 }
 
 /// What this adapter knows about the row it writes to, which is what decides how it writes.
@@ -1203,6 +1371,9 @@ enum LastRead {
 struct SqliteCredentialStore {
     token_store: TokenStore,
     server_name: String,
+    /// The server's URL in [`canonical_endpoint`]'s form: the one endpoint a stored bundle is
+    /// presented to, and the one a bundle this adapter stores is bound to.
+    endpoint: String,
     /// What this adapter last saw in the row. See [`LastRead`].
     last_read: std::sync::Arc<std::sync::Mutex<LastRead>>,
 }
@@ -1239,14 +1410,31 @@ impl CredentialStore for SqliteCredentialStore {
             .load_mcp_credentials(&self.server_name, crate::store::McpCredentialKind::OAuth)
             .await
         {
-            Ok(Some(json)) => {
+            // Stored for another endpoint, so not this server's to present: as nothing stored,
+            // which a login replaces.
+            Ok(Some(stored))
+                if !presentable(
+                    crate::store::McpCredentialKind::OAuth,
+                    &stored.endpoint,
+                    &self.endpoint,
+                ) =>
+            {
+                tracing::debug!(
+                    "the stored OAuth tokens for MCP server '{server_name}' were issued for another \
+                     endpoint; not presenting them",
+                    server_name = self.server_name
+                );
+                self.remember(LastRead::Nothing);
+                Ok(None)
+            }
+            Ok(Some(stored)) => {
                 let credentials: StoredCredentials =
-                    serde_json::from_str(&json).map_err(|error| {
+                    serde_json::from_str(&stored.secret).map_err(|error| {
                         AuthError::InternalError(format!(
                             "failed to deserialize stored credentials: {error}"
                         ))
                     })?;
-                self.remember(LastRead::Json(json));
+                self.remember(LastRead::Json(stored.secret));
                 Ok(Some(credentials))
             }
             // Nothing stored means nothing to conflict with, and that has to be *recorded*: a
@@ -1283,6 +1471,7 @@ impl CredentialStore for SqliteCredentialStore {
                         &self.server_name,
                         crate::store::McpCredentialKind::OAuth,
                         &json,
+                        &self.endpoint,
                     )
                     .await
                     .map_err(|error| {
@@ -1350,70 +1539,148 @@ impl CredentialStore for SqliteCredentialStore {
 mod tests {
     use super::*;
 
-    /// The origin a stored bundle names, and what happens when it names none.
-    ///
-    /// rmcp has recorded `server_url` in the bundle since before meka stored it, so the fact was
-    /// always on disk; what was missing was any reader. `issuer` is the older key and still the
-    /// fallback, and the two must be read in the same order here as in `revoke_stored_token` --
-    /// otherwise `meka mcp get` reports one host while the revoke posts to another.
+    /// A server is named by its URL in one canonical form, whatever the spelling of its scheme,
+    /// host, default port or trailing slash, and a token is presented to that name alone; a
+    /// bearer and a client secret anywhere on their origin, and never across one.
+    #[test]
+    fn a_credential_is_presented_where_it_was_given_and_nowhere_else() {
+        use crate::store::McpCredentialKind::{Bearer, ClientSecret, OAuth};
+        assert_eq!(
+            canonical_endpoint(" HTTPS://Mcp.Example.com:443/mcp/#frag "),
+            "https://mcp.example.com/mcp"
+        );
+        assert_eq!(
+            canonical_endpoint("https://mcp.example.com/"),
+            "https://mcp.example.com"
+        );
+        assert_eq!(
+            canonical_endpoint("https://mcp.example.com/mcp?tenant=a"),
+            "https://mcp.example.com/mcp?tenant=a"
+        );
+        let bound = canonical_endpoint("https://a.example/mcp");
+        assert!(presentable(OAuth, &bound, "https://A.example/mcp/"));
+        assert!(
+            !presentable(OAuth, &bound, "https://a.example/other"),
+            "a token's audience is the resource it was issued for"
+        );
+        for kind in [Bearer, ClientSecret] {
+            assert!(presentable(kind, &bound, "https://a.example/other"));
+            assert!(
+                !presentable(kind, &bound, "https://b.example/mcp"),
+                "{kind}"
+            );
+            assert!(!presentable(kind, &bound, "http://a.example/mcp"), "{kind}");
+            assert!(
+                !presentable(kind, "", "https://a.example/mcp"),
+                "a credential bound to no server is presented to none"
+            );
+        }
+        assert!(!presentable(OAuth, "", "https://a.example/mcp"));
+    }
+
+    /// A revocation reads the grant as rmcp stores it: the refresh token where there is one, the
+    /// access token otherwise, the issuer the grant records or else the origin it was stored for,
+    /// and the client secret a confidential client authenticates with, when it was stored for the
+    /// grant's own origin and so belongs to the client the grant was minted for.
     #[tokio::test]
-    async fn a_stored_bundle_reports_the_host_it_was_issued_for() {
+    async fn a_revocation_reads_the_grant_as_rmcp_stores_it() {
+        use crate::store::McpCredentialKind;
         let manager = crate::store::Store::for_test().await;
         let token_store = manager.token_store();
-
-        assert_eq!(
-            stored_credential_origin(&token_store, "docs").await,
-            None,
-            "no bundle is not a mismatch; it is nothing to report"
+        let request = |revocation: Revocation| revocation.0;
+        assert!(
+            request(stored_revocation(&token_store, "docs").await.expect("read")).is_none(),
+            "no grant, nothing to revoke"
         );
 
         token_store
             .save_mcp_credentials(
                 "docs",
-                crate::store::McpCredentialKind::OAuth,
-                r#"{"server_url":"https://a.example/mcp","tokens":{"access_token":"x"}}"#,
+                McpCredentialKind::OAuth,
+                r#"{"client_id":"stub-client","token_response":{"access_token":"at","token_type":"bearer","refresh_token":"rt"},"issuer":"https://auth.example"}"#,
+                "https://docs.example/mcp",
             )
             .await
             .expect("seed");
-        assert_eq!(
-            stored_credential_origin(&token_store, "docs")
-                .await
-                .as_deref(),
-            Some("https://a.example/mcp")
-        );
+        token_store
+            .save_mcp_credentials(
+                "docs",
+                McpCredentialKind::ClientSecret,
+                "cs",
+                "https://docs.example/mcp",
+            )
+            .await
+            .expect("seed");
+        let revocation = request(stored_revocation(&token_store, "docs").await.expect("read"))
+            .expect("a grant to revoke");
+        assert_eq!(revocation.issuer, "https://auth.example");
+        assert_eq!(revocation.token, "rt");
+        assert_eq!(revocation.token_type_hint, "refresh_token");
+        assert_eq!(revocation.client_id, "stub-client");
+        assert_eq!(revocation.client_secret.as_deref(), Some("cs"));
 
         token_store
             .save_mcp_credentials(
-                "older",
-                crate::store::McpCredentialKind::OAuth,
-                r#"{"issuer":"https://b.example","tokens":{"access_token":"x"}}"#,
+                "fallback",
+                McpCredentialKind::OAuth,
+                r#"{"client_id":"c","token_response":{"access_token":"at","token_type":"bearer"}}"#,
+                "https://fallback.example/mcp",
             )
             .await
             .expect("seed");
-        assert_eq!(
-            stored_credential_origin(&token_store, "older")
-                .await
-                .as_deref(),
-            Some("https://b.example"),
-            "the older key is still read, or every pre-existing bundle reports nothing"
-        );
-
         token_store
             .save_mcp_credentials(
-                "broken",
-                crate::store::McpCredentialKind::OAuth,
-                "not json at all",
+                "fallback",
+                McpCredentialKind::ClientSecret,
+                "for-another-provider",
+                "https://other.example/mcp",
             )
             .await
             .expect("seed");
+        let revocation = request(
+            stored_revocation(&token_store, "fallback")
+                .await
+                .expect("read"),
+        )
+        .expect("a grant to revoke");
         assert_eq!(
-            stored_credential_origin(&token_store, "broken").await,
-            None,
-            "this decorates a listing and must never fail one"
+            revocation.issuer, "https://fallback.example",
+            "a discovery that found no metadata took the origin's endpoints"
+        );
+        assert_eq!(revocation.token, "at");
+        assert_eq!(revocation.token_type_hint, "access_token");
+        assert!(
+            revocation.client_secret.is_none(),
+            "a secret stored for another endpoint is another client's"
         );
     }
 
-    /// Two URLs are the same server when the bearer token would reach the same host.
+    /// An issuer's metadata is looked for where the MCP authorization spec says: RFC 8414's
+    /// well-known path and OpenID Connect Discovery's, inserted ahead of the issuer's own path, and
+    /// for an issuer with a path, OpenID Connect Discovery's appended to it.
+    #[test]
+    fn an_issuer_s_metadata_is_looked_for_where_the_specifications_put_it() {
+        assert_eq!(metadata_candidates("https://auth.example/"), [
+            "https://auth.example/.well-known/oauth-authorization-server",
+            "https://auth.example/.well-known/openid-configuration",
+        ]);
+        assert_eq!(metadata_candidates("https://auth.example/tenant/one"), [
+            "https://auth.example/.well-known/oauth-authorization-server/tenant/one",
+            "https://auth.example/.well-known/openid-configuration/tenant/one",
+            "https://auth.example/tenant/one/.well-known/openid-configuration",
+        ]);
+        assert!(metadata_candidates("not a url").is_empty());
+    }
+
+    /// A client's identity in HTTP Basic is encoded as RFC 6749 Appendix B has it, the form
+    /// encoding, which leaves `-`, `.`, `_` and `*` as they are and writes a space as `+`.
+    #[test]
+    fn basic_credentials_are_form_encoded() {
+        assert_eq!(form_encoded("a-b_c.d*e"), "a-b_c.d*e");
+        assert_eq!(form_encoded("a b:c%"), "a+b%3Ac%25");
+    }
+
+    /// Two URLs are one origin when a credential sent to either reaches the same host.
     #[test]
     fn same_origin_compares_who_receives_the_token() {
         assert!(
@@ -1437,9 +1704,10 @@ mod tests {
             !same_origin("https://a.example", "https://a.example:8443"),
             "a different port is a different server"
         );
+        assert!(same_origin("not a url", "not a url"));
         assert!(
-            same_origin("not a url", "not a url"),
-            "a comparison meka cannot make says `the same` rather than crying wolf"
+            !same_origin("not a url", "https://a.example"),
+            "a URL is never the same origin as a string that is not one"
         );
     }
 
@@ -1469,6 +1737,7 @@ mod tests {
                 "docs",
                 crate::store::McpCredentialKind::OAuth,
                 &json("original"),
+                "https://docs.example/mcp",
             )
             .await
             .expect("seed");
@@ -1476,6 +1745,7 @@ mod tests {
         let adapter = SqliteCredentialStore {
             token_store: token_store.clone(),
             server_name: "docs".to_string(),
+            endpoint: "https://docs.example/mcp".to_string(),
             last_read: std::sync::Arc::new(std::sync::Mutex::new(LastRead::Nothing)),
         };
         adapter.load().await.expect("load").expect("seeded");
@@ -1486,6 +1756,7 @@ mod tests {
                 "docs",
                 crate::store::McpCredentialKind::OAuth,
                 &json("theirs"),
+                "https://docs.example/mcp",
             )
             .await
             .expect("the other process writes");
@@ -1499,6 +1770,7 @@ mod tests {
                 .load_mcp_credentials("docs", crate::store::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some(json("theirs").as_str()),
             "the swap must lose"
@@ -1512,6 +1784,7 @@ mod tests {
                 .load_mcp_credentials("docs", crate::store::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some(json("theirs").as_str()),
             "and every write after it must lose too, rather than reverting to a blind upsert"
@@ -1537,7 +1810,7 @@ mod tests {
             (McpCredentialKind::OAuth, r#"{"client_id":"x"}"#),
         ] {
             token_store
-                .save_mcp_credentials("docs", kind, secret)
+                .save_mcp_credentials("docs", kind, secret, "https://docs.example/mcp")
                 .await
                 .expect("seed");
         }
@@ -1545,6 +1818,7 @@ mod tests {
         let adapter = SqliteCredentialStore {
             token_store: token_store.clone(),
             server_name: "docs".to_string(),
+            endpoint: "https://docs.example/mcp".to_string(),
             last_read: std::sync::Arc::new(std::sync::Mutex::new(LastRead::Nothing)),
         };
         adapter.clear().await.expect("clear");
@@ -1562,6 +1836,7 @@ mod tests {
                 .load_mcp_credentials("docs", McpCredentialKind::ClientSecret)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some("cs-not-a-real-secret"),
             "the client secret is not bound to an issuer and must survive"
@@ -1571,6 +1846,7 @@ mod tests {
                 .load_mcp_credentials("docs", McpCredentialKind::Bearer)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some("bearer-not-a-real-token"),
             "nor is a bearer this adapter never owned"
@@ -1598,11 +1874,13 @@ mod tests {
                 .load_mcp_credentials("docs", crate::store::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
         };
 
         let adapter = SqliteCredentialStore {
             token_store: token_store.clone(),
             server_name: "docs".to_string(),
+            endpoint: "https://docs.example/mcp".to_string(),
             last_read: std::sync::Arc::new(std::sync::Mutex::new(LastRead::Nothing)),
         };
 
@@ -1624,10 +1902,70 @@ mod tests {
         );
     }
 
+    /// A client secret is asked whether it may be presented only by a flow that presents one: a
+    /// `client_credentials_jwt` server holding a secret stored for another endpoint goes on to
+    /// its own signing, and refuses over that, never over the secret it does not send.
+    #[tokio::test]
+    async fn a_jwt_client_is_not_held_to_a_secret_it_never_sends() {
+        let store = crate::store::Store::for_test().await.token_store();
+        store
+            .save_mcp_credentials(
+                "jwt",
+                crate::store::McpCredentialKind::ClientSecret,
+                "cs",
+                "https://other.example/mcp",
+            )
+            .await
+            .expect("seed");
+        let auth = McpAuthConfig::ClientCredentialsJwt {
+            client_id: "c".to_string(),
+            signing_key_path: "/nonexistent/meka-test-signing-key.pem".to_string(),
+            signing_algorithm: None,
+            scopes: None,
+        };
+        let Err(error) = connect_http_with_oauth(
+            "jwt",
+            "https://a.example/mcp",
+            &auth,
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                "https://a.example/mcp",
+            ),
+            Some(&store),
+            None,
+            MekaClientHandler::new("jwt".to_string(), crate::mcp::McpClientContext::new()),
+        )
+        .await
+        else {
+            panic!("a key that is not there cannot sign");
+        };
+        assert!(
+            error.to_string().contains("signing key"),
+            "refused over its own key, not the secret: {error}"
+        );
+    }
+
+    /// The issuer an authorization response names (RFC 9207) is read off the callback whichever
+    /// way it arrives, for the exchange to check against the issuer it discovered, and its
+    /// absence is said as absence.
+    #[test]
+    fn a_callback_carries_the_issuer_it_names() {
+        let request = "GET /callback?code=c&state=s&iss=https%3A%2F%2Fauth.example HTTP/1.1\r\n";
+        let callback = parse_callback_query(request).expect("should parse");
+        assert_eq!(callback.issuer.as_deref(), Some("https://auth.example"));
+        let pasted = parse_pasted_callback(
+            "http://127.0.0.1:1/callback?code=c&state=s&iss=https%3A%2F%2Fauth.example",
+        )
+        .expect("should parse");
+        assert_eq!(pasted.issuer.as_deref(), Some("https://auth.example"));
+        let without = parse_pasted_callback("code=c&state=s").expect("should parse");
+        assert_eq!(without.issuer, None);
+    }
+
     #[test]
     fn parse_callback_query_valid() {
         let request = "GET /callback?code=abc123&state=xyz789 HTTP/1.1\r\nHost: localhost\r\n";
-        let (code, state) = parse_callback_query(request).expect("should parse");
+        let OAuthCallback { code, state, .. } =
+            parse_callback_query(request).expect("should parse");
         assert_eq!(code, "abc123");
         assert_eq!(state, "xyz789");
     }
@@ -1635,7 +1973,8 @@ mod tests {
     #[test]
     fn parse_callback_query_reversed_order() {
         let request = "GET /callback?state=xyz789&code=abc123 HTTP/1.1\r\n";
-        let (code, state) = parse_callback_query(request).expect("should parse");
+        let OAuthCallback { code, state, .. } =
+            parse_callback_query(request).expect("should parse");
         assert_eq!(code, "abc123");
         assert_eq!(state, "xyz789");
     }
@@ -1687,7 +2026,8 @@ mod tests {
     #[test]
     fn parse_callback_query_url_decodes_state() {
         let request = "GET /callback?code=abc&state=xyz%3D%3D HTTP/1.1\r\n";
-        let (code, state) = parse_callback_query(request).expect("should parse");
+        let OAuthCallback { code, state, .. } =
+            parse_callback_query(request).expect("should parse");
         assert_eq!(code, "abc");
         assert_eq!(state, "xyz==");
     }
@@ -2003,7 +2343,7 @@ mod tests {
     /// nothing local explains. `form_urlencoded::parse` is the decoder that matches the encoder.
     #[test]
     fn callback_query_decodes_form_encoding_not_just_percent_escapes() {
-        let (code, state) = parse_callback_query(
+        let OAuthCallback { code, state, .. } = parse_callback_query(
             "GET /callback?code=a+b&state=c%20d HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .expect("a well-formed callback");
@@ -2098,9 +2438,10 @@ mod tests {
             refusals: std::sync::Mutex::new(Vec::new()),
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        let (code, state) = read_pasted_callback(&prompt, Some("ours"), deadline)
-            .await
-            .expect("the third line is this login's");
+        let OAuthCallback { code, state, .. } =
+            read_pasted_callback(&prompt, Some("ours"), deadline)
+                .await
+                .expect("the third line is this login's");
         assert_eq!((code.as_str(), state.as_str()), ("b", "ours"));
         assert_eq!(*prompt.refusals.lock().unwrap(), [
             "missing 'code' parameter in pasted URL",
@@ -2125,7 +2466,7 @@ mod tests {
     fn parse_pasted_callback_accepts_full_url() {
         // Exact shape returned by Notion after the user authorizes.
         let input = "http://127.0.0.1:46437/callback?code=1d5d872b-594c-8153-a5e0-0002d8f4be0f%3AGEE3YdaPJhHZpMMa%3AjZ2YV0BC0TYheYBtoSB16LmRDTgIZ6zM&state=82Nw67m4su5AeMSfCFcXAw";
-        let (code, state) = parse_pasted_callback(input).expect("should parse");
+        let OAuthCallback { code, state, .. } = parse_pasted_callback(input).expect("should parse");
         // Percent-encoded colons in the code must be decoded.
         assert_eq!(
             code,
@@ -2139,7 +2480,7 @@ mod tests {
     /// right decoder all along.
     #[test]
     fn parse_pasted_callback_decodes_form_encoding_like_the_listener() {
-        let (code, state) =
+        let OAuthCallback { code, state, .. } =
             parse_pasted_callback("http://127.0.0.1:1/callback?code=a+b%2Bc&state=s+t")
                 .expect("should parse");
         assert_eq!(code, "a b+c");
@@ -2148,14 +2489,15 @@ mod tests {
 
     #[test]
     fn parse_pasted_callback_accepts_query_only() {
-        let (code, state) = parse_pasted_callback("code=abc&state=xyz").expect("should parse");
+        let OAuthCallback { code, state, .. } =
+            parse_pasted_callback("code=abc&state=xyz").expect("should parse");
         assert_eq!(code, "abc");
         assert_eq!(state, "xyz");
     }
 
     #[test]
     fn parse_pasted_callback_trims_whitespace_and_fragment() {
-        let (code, state) =
+        let OAuthCallback { code, state, .. } =
             parse_pasted_callback("   http://127.0.0.1:1/callback?code=a&state=b#fragment  \n")
                 .expect("should parse");
         assert_eq!(code, "a");

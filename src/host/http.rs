@@ -48,18 +48,32 @@ use crate::{
 /// Run meka as an HTTP server until the listener stops accepting (e.g. on SIGTERM after the
 /// graceful-shutdown drain completes). The signature mirrors [`crate::host::acp::run_acp`] for
 /// consistency with the existing dispatch in `main::async_main`.
+/// `[serve]` as `meka serve` runs it, or why it cannot start on it: the one check its startup asks
+/// and serving the file asks again, so a reload never accepts a file the next start refuses.
+pub(crate) fn resolve_serve(
+    raw: Option<crate::config::ServeConfig>,
+) -> std::result::Result<ResolvedServeConfig, String> {
+    let serve = ResolvedServeConfig::resolve(raw)
+        .map_err(|error| format!("invalid `[serve]` config: {error}"))?;
+    if serve.tokens.is_empty() {
+        return Err(
+            "`[serve]` has no tokens; add a `[[serve.tokens]]` entry with `scopes`".to_string(),
+        );
+    }
+    Ok(serve)
+}
+
 pub(crate) async fn run_serve(
     mut config: ResolvedConfig,
     store: Store,
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
 ) -> anyhow::Result<()> {
-    let mut serve = ResolvedServeConfig::resolve(config.serve.take())
-        .map_err(|error| anyhow::anyhow!("invalid `[serve]` config: {error}"))?;
+    let mut serve = resolve_serve(config.serve.take()).map_err(|error| anyhow::anyhow!(error))?;
     if let Some(bind_override) = config.request.serve_bind_override.take() {
         serve.bind = bind_override;
     }
-    if serve.tokens.is_empty() {
-        anyhow::bail!("`[serve]` has no tokens; add a `[[serve.tokens]]` entry with `scopes`");
+    for advisory in serve.advisories() {
+        tracing::warn!("{advisory}");
     }
     for token in &serve.tokens {
         if matches!(token.source, crate::host::http::config::TokenSource::Inline) {
@@ -295,12 +309,17 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         .route("/v1/memory/{name}", delete(handlers::stores::delete_memory))
         .route("/v1/instructions", get(handlers::stores::instructions))
         .route("/v1/instructions", put(handlers::stores::put_instructions))
+        .route("/v1/config", get(handlers::installation::config))
         .route(
             "/v1/config/reload",
             post(handlers::installation::reload_config),
         )
         .route("/v1/accounts", get(handlers::installation::accounts))
         .route("/v1/accounts", post(handlers::installation::create_account))
+        .route(
+            "/v1/accounts/{name}",
+            get(handlers::installation::get_account),
+        )
         .route(
             "/v1/accounts/{name}",
             patch(handlers::installation::rename_account),

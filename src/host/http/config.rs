@@ -41,6 +41,8 @@ const MAX_WEBHOOK_RETRIES: u32 = 10;
 pub(crate) struct ResolvedWebhook {
     pub(crate) url: String,
     pub(crate) secret: Option<String>,
+    /// The file `secret` was read from, for the startup advisory about who else can read it.
+    pub(crate) secret_file: Option<std::path::PathBuf>,
     pub(crate) events: Vec<String>,
     pub(crate) timeout: std::time::Duration,
     pub(crate) max_retries: u32,
@@ -74,6 +76,7 @@ impl ResolvedWebhook {
                 "[serve.webhooks] url '{url}' must start with https:// or http://"
             ));
         }
+        let secret_file = raw.secret_file.clone();
         let secret = match (raw.secret, raw.secret_file) {
             (Some(_), Some(_)) => {
                 return Err(
@@ -90,7 +93,6 @@ impl ResolvedWebhook {
                     .map_err(|error| {
                         format!("failed to read `secret_file` {}: {}", path.display(), error)
                     })?;
-                warn_if_world_readable(&path);
                 Some(resolved)
             }
             (None, None) => None,
@@ -144,6 +146,7 @@ impl ResolvedWebhook {
         Ok(Self {
             url,
             secret,
+            secret_file,
             events: raw.events,
             timeout: raw.timeout.unwrap_or(DEFAULT_WEBHOOK_TIMEOUT),
             // Clamped rather than trusted: each retry holds a task and sleeps, so a config typo of
@@ -307,7 +310,7 @@ pub(crate) enum TokenSource {
     /// `token = "${ENV_VAR}"` substituted at config-load time.
     EnvVar,
     /// `token_file = "/path/to/token"` read at config-load time.
-    File,
+    File(std::path::PathBuf),
 }
 impl ResolvedServeConfig {
     /// Resolve a [`ServeConfig`] (or its absence) into a [`ResolvedServeConfig`] with all
@@ -359,23 +362,6 @@ impl ResolvedServeConfig {
             .map(ResolvedWebhook::resolve)
             .collect::<Result<Vec<_>, _>>()?;
         let cors_allowed_origins = CorsOrigins::resolve(raw.cors_allowed_origins)?;
-        for webhook in &webhooks {
-            if webhook.secret.is_none() {
-                tracing::warn!(
-                    // Host only. `warn` is the default level, so this line lands in logs an
-                    // operator may well paste elsewhere, and for a Slack- or Discord-style
-                    // endpoint the URL path *is* the credential. The full URL is at `info`.
-                    endpoint = %webhook_host(&webhook.url),
-                    "webhook has no `secret`, so its deliveries are unsigned",
-                );
-            }
-            if webhook.url.starts_with("http://") {
-                tracing::warn!(
-                    endpoint = %webhook_host(&webhook.url),
-                    "webhook uses plaintext http; deliveries are signed but not encrypted",
-                );
-            }
-        }
         Ok(Self {
             bind: raw.bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
             cors_allowed_origins,
@@ -404,6 +390,65 @@ impl ResolvedServeConfig {
         })
     }
 }
+impl ResolvedServeConfig {
+    /// What resolving found worth saying and not refusing: a token or a webhook secret in a file
+    /// others can read, a scope that grants nothing, a webhook whose deliveries go unsigned or in
+    /// plaintext. Apart from [`Self::resolve`], which serving the file asks again on every write,
+    /// so `meka serve` says them once, at startup.
+    ///
+    /// A webhook is named by its host alone: these lines land in logs an operator may well paste
+    /// elsewhere, and for a Slack- or Discord-style endpoint the URL path *is* the credential.
+    pub(crate) fn advisories(&self) -> Vec<String> {
+        let mut advisories = Vec::new();
+        for token in &self.tokens {
+            if let TokenSource::File(path) = &token.source
+                && let Some(mode) = readable_by_others(path)
+            {
+                advisories.push(format!(
+                    "`[serve.tokens].token_file` '{path}' has mode {mode:04o}; run `chmod 0600` \
+                     on it",
+                    path = path.display()
+                ));
+            }
+            #[cfg(feature = "serve")]
+            for unknown in crate::host::http::scope::unknown_scopes(&token.scopes) {
+                advisories.push(match &token.description {
+                    Some(description) => format!(
+                        "serve token '{description}' declares a scope that grants nothing: \
+                         {unknown}"
+                    ),
+                    None => {
+                        format!("a serve token declares a scope that grants nothing: {unknown}")
+                    }
+                });
+            }
+        }
+        for webhook in &self.webhooks {
+            let endpoint = webhook_host(&webhook.url);
+            if let Some(path) = &webhook.secret_file
+                && let Some(mode) = readable_by_others(path)
+            {
+                advisories.push(format!(
+                    "`[serve.webhooks].secret_file` '{path}' has mode {mode:04o}; run `chmod \
+                     0600` on it",
+                    path = path.display()
+                ));
+            }
+            if webhook.secret.is_none() {
+                advisories.push(format!(
+                    "webhook {endpoint} has no `secret`, so its deliveries are unsigned"
+                ));
+            }
+            if webhook.url.starts_with("http://") {
+                advisories.push(format!(
+                    "webhook {endpoint} uses plaintext http; deliveries are signed but not \
+                     encrypted"
+                ));
+            }
+        }
+        advisories
+    }
+}
 impl ResolvedServeToken {
     fn resolve(raw: ServeTokenConfig) -> Result<Self, String> {
         let (token, source) = match (raw.token, raw.token_file) {
@@ -427,8 +472,7 @@ impl ResolvedServeToken {
                     .map_err(|error| {
                         format!("failed to read `token_file` {}: {}", path.display(), error)
                     })?;
-                warn_if_world_readable(&path);
-                (resolved, TokenSource::File)
+                (resolved, TokenSource::File(path))
             }
             (None, None) => {
                 return Err("[serve.tokens] entry must set either `token` or `token_file`".into());
@@ -437,8 +481,6 @@ impl ResolvedServeToken {
         if token.is_empty() {
             return Err("[serve.tokens] resolved token is empty".into());
         }
-        #[cfg(feature = "serve")]
-        crate::host::http::scope::warn_unknown(&raw.scopes, raw.description.as_deref());
         Ok(Self {
             token,
             description: raw.description,
@@ -447,32 +489,76 @@ impl ResolvedServeToken {
         })
     }
 }
-/// Warn when `path` is readable by group or others on Unix; a no-op elsewhere. A warning rather
-/// than a refusal, since the file has already been read.
-fn warn_if_world_readable(path: &std::path::Path) {
+/// The mode of `path` when group or others can read it, on Unix; `None` elsewhere, and when the
+/// file is private or cannot be read for its metadata.
+fn readable_by_others(path: &std::path::Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                tracing::warn!(
-                    "`[serve.tokens].token_file` '{path}' has mode {mode:04o}; run `chmod 0600` \
-                     on it",
-                    path = path.display(),
-                );
-            }
-        }
+        let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+        (mode & 0o077 != 0).then_some(mode)
     }
     #[cfg(not(unix))]
     {
         let _ = path;
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resolving `[serve]` says nothing, since serving the file asks it again on every write; what
+    /// it finds worth saying comes back as the advisories `meka serve` logs once at startup: a
+    /// token file others can read, a scope that grants nothing, a webhook unsigned and in
+    /// plaintext, named by its host alone.
+    #[test]
+    fn resolving_serve_says_nothing_and_answers_its_advisories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "tok-not-real").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+        }
+        let raw: ServeConfig = toml::from_str(&format!(
+            "[[tokens]]\ntoken_file = {path:?}\nscopes = [\"sessions:write\"]\n\n[[webhooks]]\nurl \
+             = \"http://hooks.example/services/SECRET\"\nevents = [\"turn.finished\"]\n",
+            path = token_file.to_string_lossy()
+        ))
+        .expect("a [serve] table");
+        let logs = crate::streams::capture::capture_logs(tracing::Level::WARN);
+        let resolved = ResolvedServeConfig::resolve(Some(raw)).expect("resolves");
+        assert_eq!(logs.logged(), "", "resolving logs nothing");
+        let advisories = resolved.advisories();
+        #[cfg(unix)]
+        assert!(
+            advisories
+                .iter()
+                .any(|line| line.contains("token_file") && line.contains("0644")),
+            "{advisories:?}"
+        );
+        assert!(
+            advisories
+                .iter()
+                .any(|line| line.contains("'sessions:write'")),
+            "{advisories:?}"
+        );
+        assert!(
+            advisories.iter().any(|line| line.contains("unsigned"))
+                && advisories
+                    .iter()
+                    .any(|line| line.contains("plaintext http")),
+            "{advisories:?}"
+        );
+        assert!(
+            advisories.iter().all(|line| !line.contains("SECRET")),
+            "a webhook is named by its host alone: {advisories:?}"
+        );
+    }
 
     /// Each configured origin ends up as the string a browser sends in `Origin`, so the exact
     /// match at the router compares like with like.

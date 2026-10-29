@@ -425,22 +425,22 @@ pub(crate) fn require_model<'a>(
 ) -> crate::error::Result<&'a str> {
     match model {
         Some(model) if !model.trim().is_empty() => Ok(model),
-        _ => Err(crate::error::MekaError::Config(format!(
-            "profile '{profile}' names no model; set one with `meka profile set {profile} model \
-             <model>`"
-        ))),
+        _ => Err(crate::error::MekaError::ProfileNamesNoModel {
+            profile: profile.to_string(),
+        }),
     }
 }
 /// `config.toml`'s `[accounts.*]` and `[profiles.*]` as a process knows them, and the default
 /// they pick: what a run resolves at startup and every session on a host resolves against.
 ///
-/// A snapshot, replaced whole and only by a write this process made through its own doors, after
-/// the document it wrote parsed. Never re-read per request: `config.toml` is hand-edited and has
-/// no change feed, so a half-written file could take a running server's sessions down, and which
-/// account a turn bills would depend on when the turn happened to run. A `meka profile add` in
-/// another process is therefore invisible to a running `meka serve` until restart, and
-/// `POST /v1/sessions` answers "not configured" about a profile `meka profile list` shows;
-/// documented for users at `docs/book/src/configuration/overview.md` § "When edits take effect".
+/// A snapshot, replaced whole and only when a host serves the file, after a write of its own or a
+/// reload ([`crate::host::SharedDeps::write_installation`]). Never re-read per request:
+/// `config.toml` is hand-edited and has no change feed, so a half-written file could take a
+/// running server's sessions down, and which account a turn bills would depend on when the turn
+/// happened to run. A `meka profile add` in another process is therefore invisible to a running
+/// `meka serve` until the file is next served, and `POST /v1/sessions` answers "not configured"
+/// about a profile `meka profile list` shows; documented for users at
+/// `docs/book/src/configuration/overview.md` § "When edits take effect".
 /// The credential behind an account is *not* snapshotted (see `CachedProvider` in the provider
 /// registry), because that one has a writer meka owns.
 #[derive(Debug, Clone)]
@@ -450,18 +450,36 @@ pub(crate) struct ProfileCatalog {
     /// The profile a session that names none runs on, or why there is none, as
     /// [`select_default`] decides it, for the host to word.
     pub(crate) default_profile: std::result::Result<String, ProfileRefusal>,
+    /// `[session].context_window`, which a profile's own value takes precedence over. In the
+    /// catalog with the profiles it completes, so serving the file serves it with them, and a
+    /// profile is never run on a window the file it was validated against does not state.
+    pub(crate) session_context_window: Option<u64>,
+    /// `[thinking].budget`, the seed a profile stating no `thinking_budget` of its own falls back
+    /// to, beside the profiles for the same reason. Held unresolved for the reason
+    /// [`Self::session_context_window`] is: resolving it through any one profile would make that
+    /// profile's budget everyone else's.
+    pub(crate) default_thinking_budget: Option<u64>,
 }
 
 impl ProfileCatalog {
     /// The catalog of a parsed `config.toml`: `requested` is `--profile`, else the file's
     /// `default_profile` decides.
     pub(crate) fn from_file(config_file: &ConfigFile, requested: Option<&str>) -> Self {
-        Self::select(
+        let mut catalog = Self::select(
             config_file.accounts.clone(),
             config_file.profiles.clone(),
             requested,
             config_file.default_profile.as_deref(),
-        )
+        );
+        catalog.session_context_window = config_file
+            .session
+            .as_ref()
+            .and_then(|session| session.context_window);
+        catalog.default_thinking_budget = config_file
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.budget);
+        catalog
     }
 
     /// The catalog over `accounts` and `profiles`, the default selected as a run selects it:
@@ -479,110 +497,31 @@ impl ProfileCatalog {
                 ProfileRequest::DefaultProfile,
             ),
         };
-        let default_profile = select_default(requested, source, &accounts, &profiles);
+        let default_profile = select_default(requested, source, &profiles);
         Self {
             accounts,
             profiles,
             default_profile,
+            session_context_window: None,
+            default_thinking_budget: None,
         }
     }
 }
 
 /// The profile a session that names none runs on, or why there is none: [`select_profile`]'s
-/// pick, followed through its account the way a run follows it, so a default on a missing account
-/// or an unknown backend is reported here rather than at the first session. The one definition,
+/// pick. Selection alone: whether a profile can run is [`refuse_an_unrunnable_profile`]'s to say,
+/// asked of every profile wherever a file is held to what startup refuses. The one definition,
 /// behind [`ProfileCatalog`]: a run at startup and a host after a write select the same way.
 fn select_default(
     requested: Option<String>,
     source: ProfileRequest,
-    accounts: &std::collections::BTreeMap<String, AccountConfig>,
     profiles: &std::collections::BTreeMap<String, ProfileConfig>,
 ) -> std::result::Result<String, ProfileRefusal> {
     let (selected, error) = select_profile(requested, source, profiles);
-    let Some(name) = selected else {
-        return Err(error.unwrap_or(ProfileRefusal::NoProfiles));
-    };
-    let profile = require_profile(&name, profiles)
-        .map_err(|error| ProfileRefusal::Unrunnable(error.to_string()))?;
-    let account = account_for(&name, profile, accounts).map_err(ProfileRefusal::Unrunnable)?;
-    // Resolved with no device id: this asks whether the account's backend parses, which is the
-    // one refusal `resolve_profile` makes, and a device id is a provider's business.
-    resolve_profile(profile, account, None, None, String::new())
-        .map_err(ProfileRefusal::Unrunnable)?;
-    Ok(name)
+    selected.ok_or_else(|| error.unwrap_or(ProfileRefusal::NoProfiles))
 }
-/// Why no profile is selected: the facts, for each host to word with its own remedy, since the
-/// shell's command is the wrong advice to a client that administers the installation over HTTP.
-/// `Display` is the shell's sentence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProfileRefusal {
-    /// No profile is configured at all.
-    NoProfiles,
-    /// Several are, and `default_profile` names none of them.
-    NoDefault { configured: Vec<String> },
-    /// The one asked for, by `--profile` or by `default_profile`, is not configured; `configured`
-    /// is what is, possibly nothing.
-    Unknown {
-        requested: String,
-        source: ProfileRequest,
-        configured: Vec<String>,
-    },
-    /// Selected, and then found unable to run: its account or its settings, in the sentence `meka
-    /// profile` prints, which names no host's door.
-    Unrunnable(String),
-}
+pub(crate) use crate::error::{ProfileRefusal, ProfileRequest};
 
-impl std::fmt::Display for ProfileRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoProfiles => formatter.write_str(
-                "no profile configured; run `meka account add <name>`, then `meka profile add \
-                 <name>`",
-            ),
-            // Names `meka profile use`, which is what actually writes `default_profile`. Saying
-            // only "set `default_profile`" sends the reader to hand-edit a file for something a
-            // command does, and this state is most often reached by `meka profile remove`
-            // dropping a pointer to the profile it deleted.
-            Self::NoDefault { configured } => write!(
-                formatter,
-                "multiple profiles configured ({}) and no `default_profile`; pick one with `meka \
-                 profile use <name>`",
-                configured.join(", ")
-            ),
-            // The remedy differs by where the name came from. Telling someone who just typed
-            // `--profile typo` to "pass `--profile`" is advice they have already taken; telling
-            // someone whose `default_profile` names a deleted profile to run `meka profile list`
-            // is not enough.
-            Self::Unknown {
-                requested,
-                source,
-                configured,
-            } => write!(
-                formatter,
-                "{}; {}",
-                crate::text::unknown_name("profile", requested, configured),
-                match (source, configured.is_empty()) {
-                    (_, true) => "create one with `meka profile add <name>`",
-                    (ProfileRequest::Flag, false) => "pass a configured name to `--profile`",
-                    (ProfileRequest::DefaultProfile, false) =>
-                        "point `default_profile` at one with `meka profile use <name>`",
-                }
-            ),
-            Self::Unrunnable(sentence) => formatter.write_str(sentence),
-        }
-    }
-}
-
-impl std::error::Error for ProfileRefusal {}
-
-/// Which tier asked for the profile [`select_profile`] could not find.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProfileRequest {
-    /// `--profile <name>` on this run.
-    Flag,
-    /// `default_profile` in `config.toml`, which is also what `meka profile use` writes.
-    DefaultProfile,
-}
 /// Resolve which profile is active given an explicit request (from `--profile` or
 /// `default_profile`) and the configured profiles. Returns `(default_profile, profile_error)`:
 /// exactly one is `Some`. A deferred refusal (rather than a hard failure) keeps
@@ -618,6 +557,48 @@ pub(crate) fn select_profile(
         },
     }
 }
+/// Refuse profile `name` when it cannot run: its account is not configured or names a backend
+/// meka does not have, it names no model, or its output cap does not exceed the thinking budget
+/// it reasons under. The one check every door that writes a profile, a run's startup and a host
+/// serving the file ask of each profile, so no surface serves one a turn would then refuse.
+pub(crate) fn refuse_an_unrunnable_profile(
+    name: &str,
+    profile: &ProfileConfig,
+    accounts: &std::collections::BTreeMap<String, AccountConfig>,
+    default_thinking_budget: Option<u64>,
+) -> crate::error::Result<()> {
+    let account = account_for(name, profile, accounts).map_err(crate::error::MekaError::Config)?;
+    let settings = resolve_profile(
+        profile,
+        account,
+        None,
+        default_thinking_budget,
+        String::new(),
+    )
+    .map_err(|error| crate::error::MekaError::Config(format!("profile '{name}': {error}")))?;
+    require_model(name, settings.model.as_deref())?;
+    validate_max_output_tokens(
+        name,
+        Some(settings.backend),
+        settings.max_output_tokens,
+        settings.thinking,
+        settings.thinking_budget,
+    )
+}
+
+/// Refuse the first profile in `profiles` that cannot run, by
+/// [`refuse_an_unrunnable_profile`].
+pub(crate) fn refuse_unrunnable_profiles(
+    accounts: &std::collections::BTreeMap<String, AccountConfig>,
+    profiles: &std::collections::BTreeMap<String, ProfileConfig>,
+    default_thinking_budget: Option<u64>,
+) -> crate::error::Result<()> {
+    for (name, profile) in profiles {
+        refuse_an_unrunnable_profile(name, profile, accounts, default_thinking_budget)?;
+    }
+    Ok(())
+}
+
 /// Refuse a `max_output_tokens` override that can't produce a valid Claude request: under
 /// [`crate::config::ThinkingMode::Budgeted`] the budget is drawn from `max_tokens`, so the cap
 /// must exceed it. Surfaced as a config error with clear guidance rather than a provider 400
@@ -626,9 +607,9 @@ pub(crate) fn select_profile(
 ///
 /// Asked once per *profile*, never once per process: the values it reads are stated per profile, so
 /// a run that resumes a session onto one profile must not be refused over another's settings, and
-/// that session's own pairing must still be checked. [`ResolvedConfig::validate_default_profile`]
-/// asks it of the process default; [`crate::provider::ProviderRegistry::resolve`] asks it of
-/// whichever profile a session actually names. Both arguments come from the same
+/// that session's own pairing must still be checked. [`refuse_an_unrunnable_profile`] asks it of
+/// every configured profile; [`crate::provider::ProviderRegistry::resolve`] asks it of whichever
+/// profile a session actually names. Both arguments come from the same
 /// [`ProfileSettings`], so a profile is never refused over a number stated nowhere in it.
 pub(crate) fn validate_max_output_tokens(
     profile: &str,

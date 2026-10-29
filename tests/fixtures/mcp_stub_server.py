@@ -24,7 +24,13 @@ request, so a test can change what the server does between two requests to it. T
       "elicit": {"message": "Name?", "schema": {"type": "object", "properties": {}}},
                                             tools/call asks this once, as input_required, then
                                             answers with what came back; with "repeat": true it
-                                            asks on every call and never answers
+                                            asks on every call and never answers; with "url" in
+                                            place of "schema" it asks the person to open that URL
+      "elicit_request": {"message": "Name?", "schema": {"type": "object", "properties": {}}},
+                                            tools/call asks this as an elicitation/create request
+                                            of its own, the legacy way, and answers the call with
+                                            what came back; the client cancelling the call cancels
+                                            the request too
       "progress": true,                     tools/call sends one notifications/progress first
       "prompts": ["p"],                     prompts advertised; each renders one user message
       "elicit_reads": true,                 resources/read asks `elicit` once, as tools/call does
@@ -98,6 +104,8 @@ class Server:
         self.streams = {}
         self.legacy_subscribed = set()
         self.notified_seq = 0
+        # The call each elicitation/create request of the server's own was sent for, by its id.
+        self.asking = {}
         self.lock = threading.Lock()
 
     def log(self, request):
@@ -124,6 +132,9 @@ class Server:
         current = state(self.path)
         self.log(request)
         if self.era == "silent" or current.get("mute"):
+            return
+        if method is None:
+            self.answered(request)
             return
 
         if self.era is None:
@@ -288,6 +299,18 @@ class Server:
         request_id = params.get("requestId")
         with self.lock:
             ended = self.streams.pop(request_id, None)
+            asked = [
+                elicitation for elicitation, call in self.asking.items() if call == request_id
+            ]
+            for elicitation in asked:
+                del self.asking[elicitation]
+        # The question a cancelled call raised is withdrawn with it, as a sender of a request
+        # whose answer no longer matters cancels it.
+        for elicitation in asked:
+            notify(
+                "notifications/cancelled",
+                {"requestId": elicitation, "reason": "the call that asked was cancelled"},
+            )
         # A listen stream the client cancelled ends with the final result the spec defines.
         if ended is not None:
             reply(request_id, self.result({"_meta": {META_SUBSCRIPTION_ID: request_id}}))
@@ -304,6 +327,24 @@ class Server:
                     "message": "halfway",
                 },
             )
+        asked = current.get("elicit_request")
+        if asked:
+            elicitation = f"elicit-{message_id}"
+            with self.lock:
+                self.asking[elicitation] = message_id
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": elicitation,
+                    "method": "elicitation/create",
+                    "params": {
+                        "mode": "form",
+                        "message": asked["message"],
+                        "requestedSchema": asked["schema"],
+                    },
+                }
+            )
+            return
         elicit = current.get("elicit")
         answers = params.get("inputResponses")
         if elicit and (answers is None or elicit.get("repeat")):
@@ -317,6 +358,15 @@ class Server:
             self.result({"content": [{"type": "text", "text": text}], "isError": False}),
         )
 
+    def answered(self, response):
+        """Answer the call an elicitation/create of the server's own was sent for."""
+        with self.lock:
+            call = self.asking.pop(response.get("id"), None)
+        if call is None:
+            return
+        text = f"asked and got {json.dumps(response.get('result'), sort_keys=True)}"
+        reply(call, self.result({"content": [{"type": "text", "text": text}], "isError": False}))
+
     def ask(self, message_id, elicit):
         """Answer a request with the one elicitation `elicit` describes, as input_required."""
         reply(
@@ -327,11 +377,20 @@ class Server:
                     "inputRequests": {
                         "answer": {
                             "method": "elicitation/create",
-                            "params": {
-                                "mode": "form",
-                                "message": elicit["message"],
-                                "requestedSchema": elicit["schema"],
-                            },
+                            "params": (
+                                {
+                                    "mode": "url",
+                                    "message": elicit["message"],
+                                    "url": elicit["url"],
+                                    "elicitationId": "e1",
+                                }
+                                if "url" in elicit
+                                else {
+                                    "mode": "form",
+                                    "message": elicit["message"],
+                                    "requestedSchema": elicit["schema"],
+                                }
+                            ),
                         }
                     },
                     "requestState": "round-1",

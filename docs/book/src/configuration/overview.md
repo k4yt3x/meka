@@ -135,7 +135,8 @@ Two consequences worth knowing:
   answer "not configured" until the server is restarted. The same applies to editing an existing
   profile or account. The one exception is a write `meka serve` made itself: an account or profile
   added, changed or removed through [its own API](../usage/http-api.md#managing-the-installation)
-  is served from the next session on, because the server reloads what it wrote.
+  is served from the next session on, because the server reads the whole file again after each
+  write of its own, which also serves an edit made in a shell before it.
 - **Editing your instructions files does not reach it either.** They are read once and go into the
   cached prompt prefix that every session shares. The same exception applies: `instructions.md`
   written through `PUT /v1/instructions` is read again by the server that wrote it, for the
@@ -143,10 +144,12 @@ Two consequences worth knowing:
 
 Restart the server to pick either up, or ask `meka serve` to read the file again with
 [`POST /v1/config/reload`](../usage/http-api.md#managing-the-installation), which applies the
-accounts, profiles, MCP server entries and `instructions.md` as they stand and nothing else: not
-the `[mcp]` table's own keys, nor any other section. Everything
-else follows a live source and needs no restart: skills are re-read per turn, memories per turn,
-and MCP tool lists follow the server.
+accounts, profiles, MCP server entries and `instructions.md` as they stand, with `[thinking]` and
+`[session].context_window`, which complete the profiles, and an MCP server's credentials a shell
+stored, and nothing else: not the `[mcp]` table's own keys, nor any other section. Its answer, and `GET /v1/config`, name in `restart_required` the sections the file has
+changed since the server started that only a restart applies, and a reload refuses a file the
+server could not start on, naming the setting. Everything else follows a live source and needs
+no restart: skills are re-read per turn, memories per turn, and MCP tool lists follow the server.
 
 A **rotated credential** sits between the two, and the distinction matters if you are rotating
 because a key leaked. `meka account login <name>` from a second process is picked up without a

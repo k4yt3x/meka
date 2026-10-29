@@ -1,7 +1,7 @@
 //! What a session is made of: the materials every agent and tool registry of the session is built
 //! from, and the live cells they all read through the same handles.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use uuid::Uuid;
 
@@ -71,7 +71,8 @@ impl CoreMaterials {
 /// lets a session record say a sub-agent is in a turn.
 #[derive(Clone)]
 pub(crate) struct RunningSubagents {
-    running: Arc<std::sync::Mutex<HashSet<Uuid>>>,
+    /// Each running sub-agent with the cell its profile is published in, which a rename reaches.
+    running: Arc<std::sync::Mutex<HashMap<Uuid, crate::provider::PublishedProfile>>>,
     /// Every start and end of a run, for a host that announces sub-agents it never sees a
     /// request for: a sub-agent is run by a tool, not by a handler.
     changes: tokio::sync::broadcast::Sender<SubagentChange>,
@@ -99,17 +100,22 @@ impl Default for RunningSubagents {
     fn default() -> Self {
         let (changes, _receiver) = tokio::sync::broadcast::channel(64);
         Self {
-            running: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            running: Arc::new(std::sync::Mutex::new(HashMap::new())),
             changes,
         }
     }
 }
 
 impl RunningSubagents {
-    /// Mark `child` as running for as long as the guard lives: the whole of a spawn or a
-    /// follow-up, whether or not the child's lock was taken.
-    pub(crate) fn run(&self, child: Uuid, start: SubagentRun) -> RunningGuard {
-        crate::sync::lock(&self.running).insert(child);
+    /// Mark `child` as running on `profile`, its cell, for as long as the guard lives: the whole
+    /// of a spawn or a follow-up, whether or not the child's lock was taken.
+    pub(crate) fn run(
+        &self,
+        child: Uuid,
+        start: SubagentRun,
+        profile: &crate::provider::PublishedProfile,
+    ) -> RunningGuard {
+        crate::sync::lock(&self.running).insert(child, profile.clone());
         self.announce(SubagentChange { child, run: start });
         RunningGuard {
             registry: self.clone(),
@@ -119,12 +125,21 @@ impl RunningSubagents {
 
     /// Whether this process is running `id` as a sub-agent right now.
     pub(crate) fn is_running(&self, id: Uuid) -> bool {
-        crate::sync::lock(&self.running).contains(&id)
+        crate::sync::lock(&self.running).contains_key(&id)
     }
 
     /// Every sub-agent running now, for a listener that missed some changes.
     pub(crate) fn running_ids(&self) -> Vec<Uuid> {
-        crate::sync::lock(&self.running).iter().copied().collect()
+        crate::sync::lock(&self.running).keys().copied().collect()
+    }
+
+    /// Call profile `from` by its new name `to` in every running sub-agent's cell, for a rename:
+    /// a worker it spawns, and the row its run records when it ends, name the profile the file
+    /// now calls it.
+    pub(crate) fn rename_profile(&self, from: &str, to: &str) {
+        for profile in crate::sync::lock(&self.running).values() {
+            profile.rename_profile(from, to);
+        }
     }
 
     /// Every change from now on. A receiver that falls behind is told how many it missed.
@@ -704,6 +719,28 @@ impl AgentOptions {
 mod tests {
     use super::*;
 
+    /// A rename reaches the cell of every sub-agent running now, so a worker it spawns and the row
+    /// its run records name the profile the file now calls it; one whose run ended is not held.
+    #[test]
+    fn a_rename_reaches_every_running_sub_agent_s_profile() {
+        let registry = RunningSubagents::default();
+        let resolved = crate::provider::ResolvedProfile {
+            provider: std::sync::Arc::new(crate::provider::mock::MockProvider::from_rounds(
+                Vec::new(),
+            )),
+            profile: "work".to_string(),
+            context_window: 0,
+            vision: true,
+        };
+        let running = crate::provider::PublishedProfile::detached(&resolved);
+        let ended = crate::provider::PublishedProfile::detached(&resolved);
+        let _guard = registry.run(Uuid::new_v4(), SubagentRun::Spawned, &running);
+        drop(registry.run(Uuid::new_v4(), SubagentRun::Spawned, &ended));
+        registry.rename_profile("work", "office");
+        assert_eq!(running.named().profile, "office");
+        assert_eq!(ended.named().profile, "work");
+    }
+
     /// A sub-agent is running for exactly the life of the guard its run holds, however the run
     /// ends, which is what makes the registry safe to read for a session record.
     #[test]
@@ -711,7 +748,11 @@ mod tests {
         let registry = RunningSubagents::default();
         let child = Uuid::new_v4();
         assert!(!registry.is_running(child));
-        let guard = registry.run(child, SubagentRun::Spawned);
+        let guard = registry.run(
+            child,
+            SubagentRun::Spawned,
+            &crate::provider::PublishedProfile::unbound(),
+        );
         assert!(registry.is_running(child));
         drop(guard);
         assert!(!registry.is_running(child));

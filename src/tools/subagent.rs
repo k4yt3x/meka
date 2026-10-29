@@ -920,7 +920,11 @@ impl Tool for AgentSpawnTool {
             .materials
             .core
             .running_subagents
-            .run(sub_session_id, crate::session::SubagentRun::Spawned);
+            .run(
+                sub_session_id,
+                crate::session::SubagentRun::Spawned,
+                &sub_agent.cells().profile,
+            );
 
         // Run the sub-agent's single turn via the shared `Agent::run_turn` path. Conversation
         // persistence (user message, assistant messages, tool results) happens inside `run_turn`
@@ -1717,7 +1721,11 @@ impl Tool for AgentFollowupTool {
             .materials
             .core
             .running_subagents
-            .run(agent_id, crate::session::SubagentRun::Resumed);
+            .run(
+                agent_id,
+                crate::session::SubagentRun::Resumed,
+                &sub_agent.cells().profile,
+            );
 
         // Rehydrate the worker's own conversation through the door every resume uses.
         // `from_events` arms the resume notice, and it is left armed deliberately: every

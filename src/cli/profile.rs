@@ -59,9 +59,10 @@ pub(crate) async fn run(
             unset,
         } => run_set(name, key, value.as_deref(), *unset),
         ProfileAction::Use { name } => run_use(name),
-        ProfileAction::Remove { name } => remove_profile(name, store).await,
+        ProfileAction::Remove { name } => Ok(remove_profile(name, store).await?),
         ProfileAction::Rename { name, new_name } => {
-            rename_profile(name, new_name, store).await.map(|_| ())
+            rename_profile(name, new_name, store).await?;
+            Ok(())
         }
     }
 }
@@ -72,9 +73,7 @@ fn run_add(
     model_flag: Option<String>,
     tuning_flags: ProfileTuning,
 ) -> anyhow::Result<()> {
-    if name.trim().is_empty() {
-        anyhow::bail!("profile name cannot be empty");
-    }
+    crate::installation::refuse_an_unusable_name("profile", name)?;
     // Hard-fails on an unparseable config rather than warning: this guard is the only thing
     // standing between `profile add <existing>` and `upsert_profile_document` replacing the
     // profile's table, and an empty parsed map defeats it.

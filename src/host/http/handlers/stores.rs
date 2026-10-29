@@ -882,31 +882,50 @@ pub(crate) async fn put_instructions(
     let body: WriteInstructionsRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("instructions", error))?;
     let path = instructions_target(&state.shared.config).map_err(|reason| {
-        ProblemDetail::new(ErrorKind::StoreReadOnly, StatusCode::CONFLICT, reason)
+        ProblemDetail::new(
+            ErrorKind::InstructionsOverridden,
+            StatusCode::CONFLICT,
+            reason,
+        )
     })?;
-    if body.content.trim().is_empty() {
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!("removed the standing instructions via HTTP"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ProblemDetail::internal_sanitized(
-                    "failed to remove the instructions file",
-                    error,
-                ));
+    state
+        .shared
+        .write_instructions(|| {
+            if body.content.trim().is_empty() {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => tracing::info!("removed the standing instructions via HTTP"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(ProblemDetail::internal_sanitized(
+                            "failed to remove the instructions file",
+                            error,
+                        ));
+                    }
+                }
+            } else {
+                crate::fs::write_file_atomic(&path, &body.content).map_err(|error| {
+                    ProblemDetail::internal_sanitized(
+                        "failed to write the instructions file",
+                        error,
+                    )
+                })?;
+                tracing::info!(
+                    "wrote the standing instructions via HTTP ({bytes} bytes)",
+                    bytes = body.content.len()
+                );
             }
-        }
-    } else {
-        crate::fs::write_file_atomic(&path, &body.content).map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to write the instructions file", error)
+            Ok(())
+        })
+        .await
+        .map_err(|failure| match failure {
+            crate::host::assembly::InstructionsFailure::Write(problem) => problem,
+            crate::host::assembly::InstructionsFailure::Reload(error) => {
+                ProblemDetail::internal_sanitized(
+                    "failed to reload the instructions after a write",
+                    error,
+                )
+            }
         })?;
-        tracing::info!(
-            "wrote the standing instructions via HTTP ({bytes} bytes)",
-            bytes = body.content.len()
-        );
-    }
-    state.shared.reload_instructions().map_err(|error| {
-        ProblemDetail::internal_sanitized("failed to reload the instructions after a write", error)
-    })?;
     Ok(Json(instructions_response(&state)))
 }
 

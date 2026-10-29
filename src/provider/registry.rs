@@ -321,12 +321,6 @@ pub(crate) struct ProviderRegistry {
     /// `--profile` on this run, which selects the default over `default_profile` each time the
     /// catalog is replaced, as it did at startup.
     pub(super) requested_profile: Option<String>,
-    /// `[session].context_window`, which a profile's own value takes precedence over.
-    pub(super) session_context_window: Option<u64>,
-    /// `[thinking].budget`, the seed a profile stating no `thinking_budget` of its own
-    /// falls back to. Held unresolved for the reason [`Self::session_context_window`] is:
-    /// resolving it through any one profile would make that profile's budget everyone else's.
-    pub(super) default_thinking_budget: Option<u64>,
     /// Device ids, resolved at most once per account.
     ///
     /// `claude-subscription` mints one and writes it into `config.toml` when the account states
@@ -360,8 +354,6 @@ impl ProviderRegistry {
         Self {
             catalog: std::sync::RwLock::new(Arc::clone(&config.catalog)),
             requested_profile: config.request.requested_profile.clone(),
-            session_context_window: config.session_context_window,
-            default_thinking_budget: config.default_thinking_budget,
             device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_store: Arc::new(token_store),
             built: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -391,8 +383,14 @@ impl ProviderRegistry {
             config_file,
             self.requested_profile.as_deref(),
         );
+        // An account the file no longer names takes its device id with it, so one added again
+        // under the name is given an id the file records, rather than one only this process holds.
+        crate::sync::lock(&self.device_ids).retain(|name, _| catalog.accounts.contains_key(name));
+        // Swapped under the cache's lock, which a resolution takes to read or fill the cache, so
+        // none finds the new catalog beside a provider built from the old one.
+        let mut built = crate::sync::lock(&self.built);
         *crate::sync::write(&self.catalog) = Arc::new(catalog);
-        crate::sync::lock(&self.built).clear();
+        built.clear();
     }
 
     /// Whether `name` is a configured profile, refused naming the configured ones otherwise.
@@ -436,8 +434,8 @@ impl ProviderRegistry {
     /// waits on whatever other meka holds it, then two fsyncs, all on whichever runtime thread
     /// happened to ask and while holding the registry's mutex. Done once here, every later ask
     /// is a map read. An account whose `backend` does not parse is skipped; `settings` reports
-    /// it.
-    pub(crate) async fn preload_device_ids(&self) {
+    /// it. Answers whether an account stated no id, so one was written into `config.toml`.
+    pub(crate) async fn preload_device_ids(&self) -> bool {
         let catalog = self.catalog();
         let pending: Vec<(String, crate::config::AccountConfig)> = {
             let cache = crate::sync::lock(&self.device_ids);
@@ -454,7 +452,12 @@ impl ProviderRegistry {
                 .map(|(name, account)| (name.clone(), account.clone()))
                 .collect()
         };
+        let mut wrote = false;
         for (name, account) in pending {
+            let stated = account
+                .device_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty());
             let resolved = tokio::task::spawn_blocking({
                 let name = name.clone();
                 move || {
@@ -472,6 +475,7 @@ impl ProviderRegistry {
             };
             match resolved {
                 Ok(device_id) => {
+                    wrote |= !stated;
                     crate::sync::lock(&self.device_ids)
                         .entry(name)
                         .or_insert(device_id);
@@ -483,6 +487,7 @@ impl ProviderRegistry {
                 }
             }
         }
+        wrote
     }
 
     /// Every configured profile's name, sorted, as the catalog stands: what `agent_spawn` offers
@@ -496,15 +501,23 @@ impl ProviderRegistry {
     /// because quietly running the conversation somewhere else is the failure this arrangement
     /// exists to prevent.
     pub(crate) fn settings(&self, profile: &str) -> Result<crate::config::ProfileSettings> {
-        let catalog = self.catalog();
+        self.settings_in(&self.catalog(), profile)
+    }
+
+    /// [`Self::settings`], as `catalog` states the profile.
+    fn settings_in(
+        &self,
+        catalog: &crate::config::ProfileCatalog,
+        profile: &str,
+    ) -> Result<crate::config::ProfileSettings> {
         let configured = crate::config::require_profile(profile, &catalog.profiles)?;
         let account = crate::config::account_for(profile, configured, &catalog.accounts)
             .map_err(MekaError::Config)?;
         crate::config::resolve_profile(
             configured,
             account,
-            self.session_context_window,
-            self.default_thinking_budget,
+            catalog.session_context_window,
+            catalog.default_thinking_budget,
             self.device_id_for(&configured.account, account)?,
         )
         .map_err(MekaError::Config)
@@ -541,15 +554,34 @@ impl ProviderRegistry {
         &self,
         profile: &str,
     ) -> Result<(Arc<dyn Provider>, crate::config::ProfileSettings)> {
-        let settings = self.settings(profile)?;
+        // Built from one catalog and cached only while it is still the one served: a write's
+        // `replace_catalog` landing during the awaits below clears the cache and would otherwise
+        // have this build fill it again with the settings it replaced, under a key that does not
+        // name them all. A build that spans a replacement is made again from the new catalog.
+        loop {
+            let catalog = self.catalog();
+            if let Some(resolved) = self.resolve_in(&catalog, profile).await? {
+                return Ok(resolved);
+            }
+        }
+    }
+
+    /// [`Self::resolve`] against `catalog`, or `None` when the catalog was replaced before the
+    /// provider could be cached.
+    async fn resolve_in(
+        &self,
+        catalog: &Arc<crate::config::ProfileCatalog>,
+        profile: &str,
+    ) -> Result<Option<(Arc<dyn Provider>, crate::config::ProfileSettings)>> {
+        let settings = self.settings_in(catalog, profile)?;
 
         #[cfg(test)]
         if let Some(scripted) = crate::sync::lock(&self.scripted_by_profile).get(profile) {
-            return Ok((Arc::clone(scripted), settings));
+            return Ok(Some((Arc::clone(scripted), settings)));
         }
         #[cfg(any(debug_assertions, feature = "mock-provider"))]
         if let Some(scripted) = crate::sync::lock(&self.scripted).as_ref() {
-            return Ok((Arc::clone(scripted), settings));
+            return Ok(Some((Arc::clone(scripted), settings)));
         }
 
         // Asked of the profile this session actually names, not of the process default. A pairing
@@ -578,10 +610,16 @@ impl ProviderRegistry {
             .token_store
             .account_credential_version(&settings.account)
             .await?;
-        if let Some(existing) = crate::sync::lock(&self.built).get(&key)
-            && existing.credential_version == credential_version
         {
-            return Ok((Arc::clone(&existing.provider), settings));
+            let built = crate::sync::lock(&self.built);
+            if !Arc::ptr_eq(catalog, &self.catalog()) {
+                return Ok(None);
+            }
+            if let Some(existing) = built.get(&key)
+                && existing.credential_version == credential_version
+            {
+                return Ok(Some((Arc::clone(&existing.provider), settings)));
+            }
         }
 
         let credential = self.credential_for(&settings.account).await?;
@@ -607,6 +645,9 @@ impl ProviderRegistry {
 
         let provider = {
             let mut built = crate::sync::lock(&self.built);
+            if !Arc::ptr_eq(catalog, &self.catalog()) {
+                return Ok(None);
+            }
             let cached = built.entry(key).or_insert_with(|| CachedProvider {
                 credential_version: credential_version.clone(),
                 provider: Arc::clone(&provider),
@@ -629,7 +670,7 @@ impl ProviderRegistry {
             drop(built);
             provider
         };
-        Ok((provider, settings))
+        Ok(Some((provider, settings)))
     }
 
     /// The account's own provider, for the read-only account views: built from the account's
@@ -724,12 +765,11 @@ impl ProviderRegistry {
         token_store: TokenStore,
     ) -> Self {
         Self {
-            catalog: std::sync::RwLock::new(Arc::new(crate::config::ProfileCatalog::select(
-                accounts, profiles, None, None,
-            ))),
+            catalog: std::sync::RwLock::new(Arc::new(crate::config::ProfileCatalog {
+                default_thinking_budget: Some(4_096),
+                ..crate::config::ProfileCatalog::select(accounts, profiles, None, None)
+            })),
             requested_profile: None,
-            session_context_window: None,
-            default_thinking_budget: Some(4_096),
             device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_store: Arc::new(token_store),
             built: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -987,6 +1027,21 @@ impl PublishedProfile {
         self.window.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Call `from` by its new name `to` wherever this cell holds it, the profile it names or the
+    /// fallback serving, for a rename: the provider is the one the profile was, since a rename
+    /// changes no setting, and a worker spawned or a row written from here on names the profile
+    /// the file now calls it.
+    pub(crate) fn rename_profile(&self, from: &str, to: &str) {
+        let mut guard = crate::sync::write(&self.published);
+        let published = &mut *guard;
+        for resolved in std::iter::once(&mut published.named).chain(published.serving.as_mut()) {
+            if resolved.profile == from {
+                resolved.profile = to.to_string();
+            }
+        }
+        drop(guard);
+    }
+
     /// Move the session onto `resolved`: a repin, which also ends a fallback serving in the old
     /// profile's place, so nothing later puts back the profile the user just left.
     pub(crate) fn store(&self, resolved: &ResolvedProfile) {
@@ -1098,6 +1153,27 @@ mod tests {
         assert_eq!(cell.context_window(), 3_000);
     }
 
+    /// A rename reaches the name a cell holds, the session's own and a fallback serving in its
+    /// place, and keeps the provider it was built with, since a rename changes no setting.
+    #[test]
+    fn a_rename_reaches_every_name_a_cell_holds_and_keeps_its_provider() {
+        let profile = |name: &str| crate::provider::ResolvedProfile {
+            provider: std::sync::Arc::new(super::Unbound),
+            profile: name.to_string(),
+            context_window: 1_000,
+            vision: true,
+        };
+        let cell = super::PublishedProfile::detached(&profile("main"));
+        let provider = std::sync::Arc::clone(&cell.named().provider);
+        cell.serve(&profile("backup"));
+        cell.rename_profile("main", "prime");
+        cell.rename_profile("backup", "reserve");
+        cell.rename_profile("elsewhere", "nowhere");
+        assert_eq!(cell.named().profile, "prime");
+        assert_eq!(cell.current().profile, "reserve");
+        assert!(std::sync::Arc::ptr_eq(&cell.named().provider, &provider));
+    }
+
     /// A session that does not exist yet is the only case the configured default answers.
     #[tokio::test]
     async fn a_session_that_does_not_exist_yet_takes_the_default() {
@@ -1191,5 +1267,71 @@ mod tests {
             message.contains("'nope'") && message.contains("work"),
             "the refusal names the accounts: {message}"
         );
+    }
+
+    /// A provider built from a catalog a write replaced while it was being built is not cached:
+    /// the write cleared the cache, and a build finishing after it must not fill it again with the
+    /// settings the write replaced, under a key that does not name them all. The next ask builds
+    /// from the catalog served.
+    #[tokio::test]
+    async fn a_build_that_spans_a_catalog_swap_is_not_cached() {
+        let store = crate::store::Store::for_test().await;
+        store
+            .token_store()
+            .save_account_credential(
+                "work",
+                &crate::store::AuthCredential::ApiKey("sk-test".to_string()),
+            )
+            .await
+            .expect("save");
+        let file = |effort: &str| -> crate::config::ConfigFile {
+            toml::from_str(&format!(
+                "[accounts.work]\nbackend = \"anthropic-messages\"\n\n[profiles.p]\naccount = \
+                 \"work\"\nmodel = \"m\"\neffort = \"{effort}\"\n"
+            ))
+            .expect("a config")
+        };
+        let registry = crate::provider::ProviderRegistry::for_test_over(
+            file("low").accounts,
+            file("low").profiles,
+            store.token_store(),
+        );
+        let stale = registry.catalog();
+        registry.replace_catalog(&file("high"));
+        assert!(
+            registry
+                .resolve_in(&stale, "p")
+                .await
+                .expect("resolved")
+                .is_none(),
+            "a build from the replaced catalog is not handed back as current"
+        );
+        assert!(crate::sync::lock(&registry.built).is_empty());
+        let (_, settings) = registry.resolve("p").await.expect("resolved");
+        assert_eq!(settings.effort.as_deref(), Some("high"));
+        assert_eq!(crate::sync::lock(&registry.built).len(), 1);
+    }
+
+    /// A served file's `[thinking].budget` and `[session].context_window` are the ones its
+    /// profiles resolve on: they complete the profiles, so the catalog carries them, and a
+    /// profile held to the file is never run on the values the process started with.
+    #[tokio::test]
+    async fn a_served_file_s_fallbacks_are_the_ones_its_profiles_resolve_on() {
+        let store = crate::store::Store::for_test().await;
+        let file: crate::config::ConfigFile = toml::from_str(
+            "[accounts.work]\nbackend = \"anthropic-messages\"\n\n[profiles.p]\naccount = \
+             \"work\"\nmodel = \"m\"\nthinking = \"budgeted\"\n\n[thinking]\nbudget = 4000\n\n\
+             [session]\ncontext_window = 123456\n",
+        )
+        .expect("a config");
+        let registry = crate::provider::ProviderRegistry::for_test_over(
+            file.accounts.clone(),
+            file.profiles.clone(),
+            store.token_store(),
+        );
+        registry.replace_catalog(&file);
+        let settings = registry.settings("p").expect("the profile resolves");
+        assert_eq!(settings.thinking_budget, 4_000);
+        assert_eq!(settings.context_window, Some(123_456));
     }
 }

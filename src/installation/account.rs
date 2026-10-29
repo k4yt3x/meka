@@ -44,7 +44,10 @@ pub(crate) struct OAuthSettings {
 
 /// Remove `[accounts.<name>]` and the credential stored under the name, either of which may be
 /// all there is: `meka account remove` and `DELETE /v1/accounts/{name}`.
-pub(crate) async fn remove_account(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
+pub(crate) async fn remove_account(
+    name: &str,
+    token_store: &TokenStore,
+) -> crate::error::Result<()> {
     // No configured account required: this is the only path that deletes a credential, so it has
     // to work on one whose `[accounts.<name>]` block was deleted by hand. Both sides are read
     // before either is touched, so a typo fails instead of reporting a removal that removed
@@ -80,26 +83,25 @@ pub(crate) async fn remove_account(name: &str, token_store: &TokenStore) -> anyh
             .into_iter()
             .filter(|account| !configured.contains(account))
             .collect();
-        anyhow::bail!(unknown_account(name, &configured, &orphaned));
+        return Err(super::refusal(unknown_account(
+            name,
+            &configured,
+            &orphaned,
+        )));
     }
 
-    // Delete the credential first; the config write can still fail, but the secret should go
-    // regardless so a `remove` that gets this far always logs you out. A config meka cannot *read*
-    // stops the command above instead, with nothing done: an error that leaves the secret deleted
-    // reads to the user as "nothing happened", which is the one thing it must not mean.
-    token_store.delete_account_credential(name).await?;
-    let removed_account = match remove_account_under_lock(name) {
-        Ok(removed) => removed,
-        Err(error) => {
-            // The credential is already gone, so a refusal here must not read as "nothing
-            // happened": that is the one thing this command's errors must never mean.
-            tracing::warn!(
-                "the stored credential for '{name}' is already cleared; log in again with `meka \
-                 account login {name}`"
-            );
-            return Err(error);
-        }
-    };
+    // The file first, refused under its lock while a profile names the account, and the
+    // credential after: a refusal then leaves both as they were, and a credential that fails to
+    // delete after the write is one no account names, which the listing shows and another
+    // removal clears.
+    let removed_account = remove_account_under_lock(name)?;
+    if let Err(error) = token_store.delete_account_credential(name).await {
+        tracing::warn!(
+            "removed '{name}' from config.toml, but failed to delete its stored credential: \
+             {error}; remove it again to clear the credential"
+        );
+        return Err(error);
+    }
 
     // What the write actually did, not what a probe predicted.
     if removed_account {
@@ -112,22 +114,23 @@ pub(crate) async fn remove_account(name: &str, token_store: &TokenStore) -> anyh
 
 /// Refuse to remove an account while a profile names it.
 ///
-/// Asked twice by `remove_account`, of the file as it stands each time: ahead of the credential
-/// deletion, and again under the lock the config write takes, because a `profile add` naming this
-/// account can land between the two and the first answer is stale by then.
+/// Asked twice by `remove_account`, of the file as it stands each time: ahead of the name check,
+/// so a refusal names the profiles in the way rather than calling the name unknown, and again
+/// under the lock the config write takes, because a `profile add` naming this account can land
+/// between the two and the first answer is stale by then.
 fn refuse_a_referenced_account(
     document: &toml_edit::DocumentMut,
     name: &str,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     let referenced_by = profiles_on_account(document, name);
     if referenced_by.is_empty() {
         return Ok(());
     }
-    anyhow::bail!(
+    Err(super::refusal(format!(
         "account '{}' is named by profile(s) {}; remove them first",
         name,
         referenced_by.join(", ")
-    )
+    )))
 }
 
 /// Remove `[accounts.<name>]` from the file, answering whether there was one to remove.
@@ -136,7 +139,7 @@ fn refuse_a_referenced_account(
 /// is read under it rather than carried over from `remove_account`'s probe, so the edit applies
 /// to the current file. No `await` inside, for the reason `remove_account` gives about
 /// `ConfigFileLock`.
-fn remove_account_under_lock(name: &str) -> anyhow::Result<bool> {
+fn remove_account_under_lock(name: &str) -> crate::error::Result<bool> {
     let (_lock, path, mut document) = open_document()?;
     refuse_a_referenced_account(&document, name)?;
     let removed = remove_account_document(&mut document, name);
@@ -172,10 +175,8 @@ pub(crate) async fn rename_account(
     name: &str,
     new_name: &str,
     token_store: &TokenStore,
-) -> anyhow::Result<()> {
-    if new_name.trim().is_empty() {
-        anyhow::bail!("account name cannot be empty");
-    }
+) -> crate::error::Result<()> {
+    super::refuse_an_unusable_name("account", new_name)?;
     // Probed under a short guard, dropped before the `await` below, for the reason
     // `remove_account` gives about `ConfigFileLock`; the write asks again under its own.
     {
@@ -184,23 +185,16 @@ pub(crate) async fn rename_account(
     }
     // A leftover credential under the new name would collide with the moved one, and it is a
     // secret nobody configured: refused by name rather than overwritten.
-    if token_store
-        .list_credential_accounts()
-        .await?
-        .iter()
-        .any(|account| account == new_name)
-    {
-        anyhow::bail!("a stored credential named '{new_name}' already exists; remove it first");
-    }
+    refuse_a_leftover_credential(token_store, new_name).await?;
 
     // Held until the row and the file both carry the new name. A refresh in flight in another meka
     // stores its result against the row it read, and with that row moved it finds nothing to
     // update and drops the rotated token, leaving the moved row holding a refresh token the issuer
     // has already spent.
     let Some(_refresh_guard) = token_store.try_lock_account_credential(name)? else {
-        anyhow::bail!(
-            "account '{name}' is refreshing its credential in another meka; retry shortly"
-        );
+        return Err(crate::error::MekaError::AccountRefreshing {
+            account: name.to_string(),
+        });
     };
 
     // The credential moves first, and moves back if the config write then fails, so the two never
@@ -230,13 +224,17 @@ fn refuse_an_unrenameable_account(
     document: &toml_edit::DocumentMut,
     name: &str,
     new_name: &str,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     let accounts = table_names(document, "accounts");
     if !accounts.iter().any(|account| account == name) {
-        anyhow::bail!(crate::text::unknown_name("account", name, &accounts));
+        return Err(super::refusal(crate::text::unknown_name(
+            "account", name, &accounts,
+        )));
     }
     if accounts.iter().any(|account| account == new_name) {
-        anyhow::bail!("an account named '{new_name}' already exists");
+        return Err(super::refusal(format!(
+            "an account named '{new_name}' already exists"
+        )));
     }
     Ok(())
 }
@@ -245,7 +243,7 @@ fn refuse_an_unrenameable_account(
 /// held to the end, and the document is read under it rather than carried over from
 /// `rename_account`'s probe. No `await` inside, for the reason `remove_account` gives about
 /// `ConfigFileLock`.
-fn rename_account_under_lock(name: &str, new_name: &str) -> anyhow::Result<()> {
+fn rename_account_under_lock(name: &str, new_name: &str) -> crate::error::Result<()> {
     let (_lock, path, mut document) = open_document()?;
     refuse_an_unrenameable_account(&document, name, new_name)?;
     rename_table_entry(&mut document, "accounts", name, new_name)?;
@@ -275,14 +273,14 @@ pub(super) fn rename_table_entry(
     section: &str,
     name: &str,
     new_name: &str,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     let table = document
         .get_mut(section)
         .and_then(|item| item.as_table_like_mut())
-        .ok_or_else(|| anyhow::anyhow!("no `[{section}]` table in config.toml"))?;
+        .ok_or_else(|| super::refusal(format!("no `[{section}]` table in config.toml")))?;
     let item = table
         .remove(name)
-        .ok_or_else(|| anyhow::anyhow!("no `[{section}.{name}]` table in config.toml"))?;
+        .ok_or_else(|| super::refusal(format!("no `[{section}.{name}]` table in config.toml")))?;
     table.insert(new_name, item);
     Ok(())
 }
@@ -301,7 +299,7 @@ pub(super) fn repoint_name(item: &mut toml_edit::Item, name: &str) {
 pub(crate) async fn account_views(
     token_store: &TokenStore,
     accounts: &std::collections::BTreeMap<String, config::AccountConfig>,
-) -> anyhow::Result<Vec<crate::view::AccountView>> {
+) -> crate::error::Result<Vec<crate::view::AccountView>> {
     let mut views: Vec<crate::view::AccountView> = Vec::with_capacity(accounts.len());
     for (name, account) in accounts {
         // The error arm is its own answer, not a "no". `load_account_credential` fails on a row it
@@ -348,7 +346,7 @@ pub(crate) fn unknown_account(name: &str, configured: &[String], orphaned: &[Str
 pub(crate) async fn orphaned_accounts(
     token_store: &TokenStore,
     accounts: &std::collections::BTreeMap<String, config::AccountConfig>,
-) -> anyhow::Result<Vec<String>> {
+) -> crate::error::Result<Vec<String>> {
     Ok(token_store
         .list_credential_accounts()
         .await?
@@ -357,10 +355,9 @@ pub(crate) async fn orphaned_accounts(
         .collect())
 }
 
-pub(crate) fn validate_backend(value: &str) -> anyhow::Result<config::Backend> {
-    value
-        .parse::<config::Backend>()
-        .map_err(|message| anyhow::anyhow!(message))
+/// The backend `value` names, or the refusal naming the ones meka has.
+pub(crate) fn validate_backend(value: &str) -> crate::error::Result<config::Backend> {
+    value.parse::<config::Backend>().map_err(super::refusal)
 }
 
 /// How a backend proves who it is: an interactive OAuth flow, or a key the user pastes.
@@ -444,7 +441,7 @@ pub(super) fn open_document() -> crate::error::Result<(
 pub(super) fn ensure_section_table<'a>(
     document: &'a mut toml_edit::DocumentMut,
     section: &str,
-) -> anyhow::Result<&'a mut toml_edit::Table> {
+) -> crate::error::Result<&'a mut toml_edit::Table> {
     if document.get(section).is_none() {
         let mut table = toml_edit::Table::new();
         // Implicit so the parent emits `[<section>.<name>]` headers rather than a bare
@@ -456,10 +453,10 @@ pub(super) fn ensure_section_table<'a>(
         .get_mut(section)
         .and_then(|item| item.as_table_mut())
         .ok_or_else(|| {
-            anyhow::anyhow!(
+            super::refusal(format!(
                 "`{section}` in config.toml is not a section; spell each entry as its own \
                  `[{section}.<name>]` section"
-            )
+            ))
         })
 }
 
@@ -484,14 +481,17 @@ pub(super) fn table_names(document: &toml_edit::DocumentMut, section: &str) -> V
 /// did; asking whether it already failed is the difference between naming the line the user must
 /// fix and blaming an edit that had nothing to do with it. It stays a refusal either way, because
 /// writing on top of a file meka cannot read would strand the rest of its contents.
-pub(super) fn reparse_after_edit(before: &str, after: &str) -> anyhow::Result<config::ConfigFile> {
+pub(super) fn reparse_after_edit(
+    before: &str,
+    after: &str,
+) -> crate::error::Result<config::ConfigFile> {
     toml::from_str(after).map_err(|error| {
         if toml::from_str::<config::ConfigFile>(before).is_err() {
-            anyhow::anyhow!(
+            super::refusal(format!(
                 "config.toml already fails to parse, so this is not what broke it: {error}"
-            )
+            ))
         } else {
-            anyhow::anyhow!("that change makes config.toml unreadable: {error}")
+            super::refusal(format!("that change makes config.toml unreadable: {error}"))
         }
     })
 }
@@ -500,37 +500,33 @@ pub(super) fn reparse_after_edit(before: &str, after: &str) -> anyhow::Result<co
 /// touching the filesystem.
 fn upsert_account_document(
     document: &mut toml_edit::DocumentMut,
-    name: &str,
-    backend: config::Backend,
-    base_url: Option<&str>,
-    settings: &OAuthSettings,
-    interleaved_thinking: Option<bool>,
-) -> anyhow::Result<()> {
-    let mut account = toml_edit::Table::new();
+    account: &NewAccount<'_>,
+) -> crate::error::Result<()> {
+    let mut table = toml_edit::Table::new();
     // Written in [`config::AccountConfig`]'s canonical order. An unset setting is left out rather
     // than written at its default, so the account records only what the user actually chose and a
     // later change to a default reaches existing accounts.
-    account.insert("backend", toml_edit::value(backend.name()));
-    if let Some(url) = base_url {
-        account.insert("base_url", toml_edit::value(url));
+    table.insert("backend", toml_edit::value(account.backend.name()));
+    if let Some(url) = account.base_url {
+        table.insert("base_url", toml_edit::value(url));
     }
-    if let Some(url) = settings.oauth_token_url.as_deref() {
-        account.insert("oauth_token_url", toml_edit::value(url));
+    if let Some(url) = account.settings.oauth_token_url.as_deref() {
+        table.insert("oauth_token_url", toml_edit::value(url));
     }
-    if let Some(client_id) = settings.client_id.as_deref() {
-        account.insert("client_id", toml_edit::value(client_id));
+    if let Some(client_id) = account.settings.client_id.as_deref() {
+        table.insert("client_id", toml_edit::value(client_id));
     }
-    if let Some(interleaved_thinking) = interleaved_thinking {
-        account.insert(
+    if let Some(interleaved_thinking) = account.interleaved_thinking {
+        table.insert(
             "interleaved_thinking",
             toml_edit::value(interleaved_thinking),
         );
     }
-    // Redundant here, since the inserts above already run in order, and deliberately kept: it is
-    // the one line that makes "every writer leaves the canonical order" true of this writer too.
-    let mut account = toml_edit::Item::Table(account);
-    config::sort_account_keys(&mut account);
-    ensure_section_table(document, "accounts")?.insert(name, account);
+    // The one line that makes "every writer leaves the canonical order" true of this writer
+    // whatever order the inserts above run in.
+    let mut table = toml_edit::Item::Table(table);
+    config::sort_account_keys(&mut table);
+    ensure_section_table(document, "accounts")?.insert(account.name, table);
     Ok(())
 }
 
@@ -543,41 +539,228 @@ fn remove_account_document(document: &mut toml_edit::DocumentMut, name: &str) ->
         .is_some()
 }
 
-/// Write `[accounts.<name>]`: `meka account add` once it holds the credential, and
-/// `POST /v1/accounts`.
-pub(crate) fn write_account(
-    name: &str,
-    backend: config::Backend,
-    base_url: Option<&str>,
-    settings: &OAuthSettings,
-    interleaved_thinking: Option<bool>,
-) -> anyhow::Result<()> {
-    // `_lock` is held to the end of the function, so the read above and the write below are one
-    // critical section.
-    let (_lock, path, mut document) = open_document()?;
-    // The same refusal `run_add` gave before its prompts, asked again now that the lock is held:
-    // the prompts and the OAuth flow between the two can take minutes, and an account written in
-    // that window by another `account add` or by hand was replaced wholesale.
-    if document
-        .get("accounts")
-        .and_then(|accounts| accounts.get(name))
-        .is_some()
-    {
-        anyhow::bail!("an account named '{name}' already exists");
+/// An account as a door adds it: the `[accounts.<name>]` settings a login is made against.
+pub(crate) struct NewAccount<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) backend: config::Backend,
+    pub(crate) base_url: Option<&'a str>,
+    pub(crate) settings: &'a OAuthSettings,
+    pub(crate) interleaved_thinking: Option<bool>,
+}
+
+/// Refuse a setting `backend` never reads: a body or a command states exactly what it means to
+/// write, and a setting written and never read reads as configured while doing nothing.
+pub(crate) fn refuse_inert_account_keys(account: &NewAccount<'_>) -> crate::error::Result<()> {
+    for (key, given) in [
+        (
+            "oauth_token_url",
+            account.settings.oauth_token_url.is_some(),
+        ),
+        ("client_id", account.settings.client_id.is_some()),
+        (
+            "interleaved_thinking",
+            account.interleaved_thinking.is_some(),
+        ),
+    ] {
+        if given && !account.backend.reads_account_key(key) {
+            return Err(super::refusal(format!(
+                "an account on '{backend}' never reads `{key}`; drop it",
+                backend = account.backend
+            )));
+        }
     }
-    let before = document.to_string();
-    upsert_account_document(
-        &mut document,
-        name,
-        backend,
-        base_url,
-        settings,
-        interleaved_thinking,
-    )?;
-    let after = document.to_string();
-    reparse_after_edit(&before, &after)?;
-    crate::fs::write_file_atomic(&path, &after)?;
     Ok(())
+}
+
+/// Refuse a credential of the wrong kind for `backend`: a key for one that logs in through the
+/// browser, or none for one that takes a key. `None` is allowed for a browser backend, whose
+/// account may be added ahead of its login.
+fn refuse_a_credential_of_the_wrong_kind(
+    account: &str,
+    backend: config::Backend,
+    credential: Option<&AuthCredential>,
+) -> crate::error::Result<()> {
+    let takes_key = matches!(credential_kind(backend), CredentialKind::ApiKey);
+    let key_given = matches!(credential, Some(AuthCredential::ApiKey(_)));
+    let fits = match credential {
+        Some(AuthCredential::ApiKey(_)) => takes_key,
+        Some(AuthCredential::OAuthToken { .. }) | None => !takes_key,
+    };
+    if fits {
+        return Ok(());
+    }
+    Err(crate::error::MekaError::AccountCredentialKind {
+        account: account.to_string(),
+        backend: backend.name().to_string(),
+        key_given,
+    })
+}
+
+/// Refuse a name a credential is stored under: on an add or a rename, the door has already found
+/// no account of that name, so the credential is one a removed account left behind. Adopted, it
+/// would be presented by an account whose backend or endpoint it was never minted for;
+/// overwritten, a secret would be destroyed unasked. `meka account remove` and `DELETE
+/// /v1/accounts/{name}` clear it.
+pub(crate) async fn refuse_a_leftover_credential(
+    token_store: &TokenStore,
+    name: &str,
+) -> crate::error::Result<()> {
+    if token_store
+        .list_credential_accounts()
+        .await?
+        .iter()
+        .any(|account| account == name)
+    {
+        return Err(crate::error::MekaError::AccountCredentialLeftOver {
+            account: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Add `[accounts.<name>]` and store its credential: `meka account add` once it holds one, and
+/// `POST /v1/accounts`, which may add a browser backend's account ahead of its login. Refused for
+/// an unusable name or one in use, a credential a removed account left under the name, a setting
+/// the backend never reads, a `base_url` the
+/// `chatgpt-subscription` paths cannot be appended to, and a credential of the wrong kind. The
+/// account lands before the secret, so a credential no account names is never left, and is taken
+/// back out when the secret fails to store, so a failed add leaves the file as it was.
+pub(crate) async fn add_account(
+    account: &NewAccount<'_>,
+    credential: Option<&AuthCredential>,
+    token_store: &TokenStore,
+) -> crate::error::Result<()> {
+    let name = account.name;
+    super::refuse_an_unusable_name("account", name)?;
+    refuse_inert_account_keys(account)?;
+    if account.backend == config::Backend::ChatGptSubscription
+        && let Some(url) = account.base_url
+    {
+        crate::provider::openai::subscription::chatgpt_base_url_shape(url)
+            .map_err(|error| super::refusal(error.to_string()))?;
+    }
+    refuse_a_credential_of_the_wrong_kind(name, account.backend, credential)?;
+    // Read ahead of the lock, which is never held across an await; acted on after the duplicate
+    // check below, so the refusal names what is in the way.
+    let leftover = refuse_a_leftover_credential(token_store, name).await;
+    {
+        // `_lock` is held to the end of this block, so the read and the write are one critical
+        // section, and released before the credential write awaits.
+        let (_lock, path, mut document) = open_document()?;
+        // Asked again now that the lock is held: the prompts and the browser login a terminal
+        // runs ahead of this can take minutes, and an account written in that window by another
+        // `account add` or by hand would be replaced wholesale.
+        if document
+            .get("accounts")
+            .and_then(|accounts| accounts.get(name))
+            .is_some()
+        {
+            return Err(super::refusal(format!(
+                "an account named '{name}' already exists"
+            )));
+        }
+        leftover?;
+        let before = document.to_string();
+        upsert_account_document(&mut document, account)?;
+        let after = document.to_string();
+        reparse_after_edit(&before, &after)?;
+        crate::fs::write_file_atomic(&path, &after)?;
+    }
+    if let Some(credential) = credential
+        && let Err(error) = token_store.save_account_credential(name, credential).await
+    {
+        if let Err(undo) = take_back_account(name) {
+            tracing::warn!(
+                "failed to take '{name}' back out of config.toml after its credential failed to \
+                 store: {undo}"
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Take back out the account an add wrote, after its credential failed to store; left in place
+/// once a profile names it, since that profile runs on it.
+fn take_back_account(name: &str) -> crate::error::Result<()> {
+    let (_lock, path, mut document) = open_document()?;
+    refuse_a_referenced_account(&document, name)?;
+    if remove_account_document(&mut document, name) {
+        crate::fs::write_file_atomic(&path, &document.to_string())?;
+    }
+    Ok(())
+}
+
+/// The account `name` in the parsed file, or the refusal naming the configured ones.
+pub(crate) fn require_account<'a>(
+    config_file: &'a config::ConfigFile,
+    name: &str,
+) -> crate::error::Result<&'a config::AccountConfig> {
+    config_file.accounts.get(name).ok_or_else(|| {
+        super::refusal(crate::text::unknown_name(
+            "account",
+            name,
+            config_file.accounts.keys(),
+        ))
+    })
+}
+
+/// Store `credential` for the account `name`, replacing the one it has: `POST
+/// /v1/accounts/{name}/login` with a key, and through [`commit_login`] every login. Refused for
+/// a name no account has and for a credential of the wrong kind for its backend.
+pub(crate) async fn store_credential(
+    config_file: &config::ConfigFile,
+    name: &str,
+    credential: &AuthCredential,
+    token_store: &TokenStore,
+) -> crate::error::Result<()> {
+    let account = require_account(config_file, name)?;
+    let backend = validate_backend(&account.backend)?;
+    refuse_a_credential_of_the_wrong_kind(name, backend, Some(credential))?;
+    token_store.save_account_credential(name, credential).await
+}
+
+/// What a login was begun against: the backend, and the client and token endpoint a grant is
+/// minted under, which every later refresh presents and posts to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoginTerms {
+    backend: String,
+    client_id: Option<String>,
+    oauth_token_url: Option<String>,
+}
+
+impl LoginTerms {
+    /// The terms `account` states now.
+    pub(crate) fn of(account: &config::AccountConfig) -> Self {
+        Self {
+            backend: account.backend.clone(),
+            client_id: account.client_id.clone(),
+            oauth_token_url: account.oauth_token_url.clone(),
+        }
+    }
+}
+
+/// Store the credential a login obtained for `name`, refused when the account no longer states
+/// the terms the login was begun under: renamed or removed while the person was in the browser,
+/// or moved to another backend, client or token endpoint, under which the grant would die at its
+/// first refresh. `meka account login` and both of `POST /v1/accounts/{name}/login`'s.
+pub(crate) async fn commit_login(
+    config_file: &config::ConfigFile,
+    name: &str,
+    began: &LoginTerms,
+    credential: &AuthCredential,
+    token_store: &TokenStore,
+) -> crate::error::Result<()> {
+    if config_file
+        .accounts
+        .get(name)
+        .is_none_or(|account| LoginTerms::of(account) != *began)
+    {
+        return Err(super::refusal(format!(
+            "account '{name}' changed while its login ran; log in again"
+        )));
+    }
+    store_credential(config_file, name, credential, token_store).await
 }
 
 fn build_authorize_url(
@@ -755,19 +938,33 @@ async fn bind_codex_listener() -> std::io::Result<tokio::net::TcpListener> {
 /// lifetime that ends it.
 const TOKEN_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A token exchange the authorization server refused, told apart from every other way a login
+/// A token exchange the authorization server rejected, told apart from every other way a login
 /// fails: what it says is the server's, which a surface decides whether to relay, where a timeout
 /// or a listener's failure is meka's own sentence.
 #[derive(Debug)]
-pub(crate) struct ExchangeRefused(anyhow::Error);
+pub(crate) struct ExchangeRejected(anyhow::Error);
 
-impl std::fmt::Display for ExchangeRefused {
+impl std::fmt::Display for ExchangeRejected {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
     }
 }
 
-impl std::error::Error for ExchangeRefused {}
+impl std::error::Error for ExchangeRejected {}
+
+/// A token exchange that got no answer meka can read: the endpoint unreachable, silent past its
+/// bound, or replying with something that is not a token. Told apart from [`ExchangeRejected`]
+/// because the remedy is the endpoint's, not the person's.
+#[derive(Debug)]
+pub(crate) struct ExchangeFailed(anyhow::Error);
+
+impl std::fmt::Display for ExchangeFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ExchangeFailed {}
 
 /// Log an account in through the browser, with `prompt` as the person's side of it: `meka account
 /// add` and `meka account login` at a terminal, and `POST /v1/accounts/{name}/login` on the API.
@@ -848,11 +1045,12 @@ pub(crate) async fn browser_login(
     )
     .await
     {
-        Ok(exchanged) => exchanged.map_err(|error| anyhow::Error::new(ExchangeRefused(error))),
-        Err(_elapsed) => anyhow::bail!(
+        Ok(exchanged) => exchanged,
+        Err(_elapsed) => Err(ExchangeFailed(anyhow::anyhow!(
             "the token exchange did not answer within {}s",
             TOKEN_EXCHANGE_TIMEOUT.as_secs()
-        ),
+        ))
+        .into()),
     }
 }
 
@@ -923,22 +1121,27 @@ async fn exchange_claude_code(
             "state": state,
         }))
         .send()
-        .await?;
+        .await
+        .map_err(|error| ExchangeFailed(error.into()))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = crate::error::read_whole_reply(response, None, &never)
             .await
             .unwrap_or_default();
-        anyhow::bail!(
+        return Err(ExchangeRejected(anyhow::anyhow!(
             "token exchange failed ({}): {}",
             status,
             crate::error::render_error_body(&body)
-        );
+        ))
+        .into());
     }
 
-    let body = crate::error::read_whole_reply(response, None, &never).await?;
-    let token: TokenResponse = serde_json::from_str(&body)?;
+    let body = crate::error::read_whole_reply(response, None, &never)
+        .await
+        .map_err(|error| ExchangeFailed(error.into()))?;
+    let token: TokenResponse =
+        serde_json::from_str(&body).map_err(|error| ExchangeFailed(error.into()))?;
     let expires_at = token.expires_in.map(|seconds| {
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -982,7 +1185,7 @@ fn build_codex_authorize_url(
 
 /// Wait on the loopback listener for the browser to be sent back under this login's
 /// `expected_state`, answering it a page, and give the code and state it carried; refuses after
-/// `timeout`, and on an authorization the server refused. A callback under another state, a stale
+/// `timeout`, and on an authorization the server rejected. A callback under another state, a stale
 /// tab or another login's browser, is answered a refusal and the wait goes on, ahead of the
 /// exchange, so the code this login asked for is still waited on. The page claims no success: the
 /// exchange comes after, and may still fail.
@@ -1202,18 +1405,20 @@ async fn exchange_codex_code(
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
-        .await?;
+        .await
+        .map_err(|error| ExchangeFailed(error.into()))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = crate::error::read_whole_reply(response, None, &never)
             .await
             .unwrap_or_default();
-        anyhow::bail!(
+        return Err(ExchangeRejected(anyhow::anyhow!(
             "Codex token exchange failed ({}): {}",
             status,
             crate::error::render_error_body(&body)
-        );
+        ))
+        .into());
     }
 
     #[derive(serde::Deserialize)]
@@ -1223,8 +1428,11 @@ async fn exchange_codex_code(
         refresh_token: Option<String>,
     }
 
-    let body = crate::error::read_whole_reply(response, None, &never).await?;
-    let token: CodexTokenResponse = serde_json::from_str(&body)?;
+    let body = crate::error::read_whole_reply(response, None, &never)
+        .await
+        .map_err(|error| ExchangeFailed(error.into()))?;
+    let token: CodexTokenResponse =
+        serde_json::from_str(&body).map_err(|error| ExchangeFailed(error.into()))?;
     let account_id = token.id_token.as_deref().and_then(extract_codex_account_id);
     let expires_at = extract_jwt_expiration_millis(&token.access_token);
 
@@ -1584,13 +1792,17 @@ mod tests {
         let leftover = rename_account("work", "stale", &store).await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
-        let message = |result: anyhow::Result<()>| match result {
+        let message = |result: crate::error::Result<()>| match result {
             Ok(()) => panic!("the rename must be refused"),
             Err(error) => error.to_string(),
         };
         assert!(message(unknown).contains("no account named 'nope'"));
         assert!(message(taken).contains("an account named 'other' already exists"));
-        assert!(message(leftover).contains("stored credential named 'stale'"));
+        assert_eq!(
+            message(leftover),
+            "'stale' has a stored credential left over from a removed account; clear it first \
+             with `meka account remove stale`"
+        );
         assert!(
             store
                 .load_account_credential("work")
@@ -1771,14 +1983,13 @@ mod tests {
     #[test]
     fn the_account_writer_records_what_was_chosen_and_nothing_else() {
         let mut bare = toml_edit::DocumentMut::new();
-        upsert_account_document(
-            &mut bare,
-            "work",
-            config::Backend::AnthropicMessages,
-            None,
-            &OAuthSettings::default(),
-            None,
-        )
+        upsert_account_document(&mut bare, &NewAccount {
+            name: "work",
+            backend: config::Backend::AnthropicMessages,
+            base_url: None,
+            settings: &OAuthSettings::default(),
+            interleaved_thinking: None,
+        })
         .expect("upsert");
         let rendered = bare.to_string();
         for key in ["base_url", "oauth_token_url", "client_id", "device_id"] {
@@ -1786,17 +1997,16 @@ mod tests {
         }
 
         let mut tuned = toml_edit::DocumentMut::new();
-        upsert_account_document(
-            &mut tuned,
-            "sub",
-            config::Backend::ClaudeSubscription,
-            Some("https://proxy.invalid/v1"),
-            &OAuthSettings {
+        upsert_account_document(&mut tuned, &NewAccount {
+            name: "sub",
+            backend: config::Backend::ClaudeSubscription,
+            base_url: Some("https://proxy.invalid/v1"),
+            settings: &OAuthSettings {
                 oauth_token_url: Some("https://auth.invalid/token".to_string()),
                 client_id: Some("my-client".to_string()),
             },
-            None,
-        )
+            interleaved_thinking: None,
+        })
         .expect("upsert");
         // Read back through the real parser, so a key written under the wrong name or type is
         // caught here rather than by `deny_unknown_fields` on the user's next run.
@@ -1821,14 +2031,13 @@ mod tests {
         let mut document = "accounts = { work = { backend = \"anthropic-messages\" } }\n"
             .parse::<toml_edit::DocumentMut>()
             .expect("parse");
-        let error = upsert_account_document(
-            &mut document,
-            "home",
-            config::Backend::OpenAiResponses,
-            None,
-            &OAuthSettings::default(),
-            None,
-        )
+        let error = upsert_account_document(&mut document, &NewAccount {
+            name: "home",
+            backend: config::Backend::OpenAiResponses,
+            base_url: None,
+            settings: &OAuthSettings::default(),
+            interleaved_thinking: None,
+        })
         .expect_err("an inline `accounts` must be refused, not overwritten");
         assert!(
             error.to_string().contains("is not a section"),

@@ -1,10 +1,14 @@
-//! The installation as `config.toml` holds it, managed over HTTP: the accounts and the profiles.
+//! The installation as `config.toml` and the store hold it, managed over HTTP: the accounts, the
+//! profiles and the MCP servers, the credentials stored for them, and their logins.
 //!
-//! Every write goes through the door `meka account` or `meka profile` uses, under the config file
-//! lock, keeping the file's comments and order, and refusing in the same words; what differs is
-//! the prompt, which a body answers up front. A write that landed replaces the catalog every
-//! session on this server resolves against ([`crate::config::ProfileCatalog`]), so the profile
-//! a client adds is the one its next `POST /v1/sessions` runs on, without a restart.
+//! Every write runs through the host's one write ([`crate::host::SharedDeps::write_installation`]):
+//! under one lock the file is parsed once and refused when it could not be served, the handler
+//! decides on that parse and calls the door `meka account`, `meka profile` or `meka mcp` uses,
+//! keeping the file's comments and order and refusing in the same words, and the file is then
+//! served whole, so the profile a client adds is the one its next `POST /v1/sessions` runs on,
+//! without a restart. A browser login is a write whose input arrives late: it begins against the
+//! file as written and commits through the same write, refused when what it began against has
+//! changed meanwhile.
 //!
 //! Under `config:r` and `config:w`, the installation's own pair: a token that runs turns has no
 //! business rebinding which account they bill.
@@ -31,27 +35,20 @@ use crate::{
     view::{AccountView, ProfileDetailView, ProfileView},
 };
 
-/// What a configuration door's refusal is on the wire. A fault of the file or the store is the
-/// sanitized 500 with the text in the log, where the operator reads it; everything else is the
-/// door's own sentence about what was sent, as the 422 every refusal of a body is. An unknown
-/// name on the path is a 404 ahead of the door, from the handler holding the catalog.
-fn door_refusal(context: &str, error: anyhow::Error) -> ProblemDetail {
-    if error.downcast_ref::<std::io::Error>().is_some() {
+/// What a door's error is on the wire, for every door: a refusal of what was sent is the 422
+/// every refusal of a body is, worded by [`ProblemDetail::for_error`] with this API's remedy
+/// where the shell's sentence names a command; a fault of the file or the store is the sanitized
+/// 500 with the text in the log under `context`, where the operator reads it. An unknown name on
+/// the path is a 404 ahead of the door, from the handler holding the parse.
+fn door_problem(
+    state: &ServerState,
+    context: &str,
+    error: crate::error::MekaError,
+) -> ProblemDetail {
+    if error.kind() == ErrorKind::Internal {
         return ProblemDetail::internal_sanitized(context, error);
     }
-    let sentence = match error.downcast_ref::<crate::error::MekaError>() {
-        Some(crate::error::MekaError::Io(_) | crate::error::MekaError::Database(_)) => {
-            return ProblemDetail::internal_sanitized(context, error);
-        }
-        // The sentence rather than the display, which prefixes its class.
-        Some(refusal) => refusal.sentence(),
-        None => error.to_string(),
-    };
-    ProblemDetail::new(
-        ErrorKind::InvalidBody,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        sentence,
-    )
+    ProblemDetail::for_error(&error, state.config.relay_provider_errors)
 }
 
 /// The 422 for a body the door would not be asked about.
@@ -63,7 +60,22 @@ fn refused(sentence: impl Into<String>) -> ProblemDetail {
     )
 }
 
-/// The 404 for a name no account or profile has, in the words every door refuses one with.
+/// The 502 for a login the other side did not see through.
+fn upstream(sentence: impl Into<String>) -> ProblemDetail {
+    ProblemDetail::new(ErrorKind::Provider, StatusCode::BAD_GATEWAY, sentence)
+}
+
+/// The 503 for a login begun or committing after the server began shutting down.
+fn shutting_down() -> ProblemDetail {
+    ProblemDetail::new(
+        ErrorKind::ShuttingDown,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the server is shutting down",
+    )
+}
+
+/// The 404 for a name no account, profile or server has, in the words every door refuses one
+/// with.
 fn not_found(
     noun: &str,
     name: &str,
@@ -76,59 +88,137 @@ fn not_found(
     )
 }
 
-/// The catalog's reload after a write to `config.toml`, begun ahead of the write. The rename and
-/// remove doors work on the raw document, so a file with a defect elsewhere can be repaired at a
-/// terminal; here the catalog is rebuilt from what a write leaves, so a file that already fails to
-/// parse is refused before it is written, naming the line, rather than written and then reported as
-/// a fault.
-#[must_use]
-struct Reload<'a>(&'a ServerState);
-
-impl<'a> Reload<'a> {
-    fn ahead_of_write(state: &'a ServerState) -> Result<Self, ProblemDetail> {
-        crate::config::load_config_file_or_err().map_err(|error| {
-            refused(format!(
-                "config.toml already fails to parse; repair it first: {sentence}",
-                sentence = error.sentence()
-            ))
-        })?;
-        Ok(Self(state))
+/// Write the installation over HTTP: the host's one write
+/// ([`crate::host::SharedDeps::write_installation`]), with `edit` deciding on the parse it is
+/// handed and answering in this API's terms, and every login pending on an account or a server
+/// the served file no longer names ended after it, since its commit would be refused.
+async fn write_installation<T>(
+    state: &ServerState,
+    edit: impl AsyncFnOnce(&crate::config::ConfigFile) -> Result<T, ProblemDetail>,
+) -> Result<(T, crate::host::assembly::ServedServers), ProblemDetail> {
+    use crate::host::assembly::{InstallationFailure, ServeFailure};
+    match state.shared.write_installation(edit).await {
+        Ok(written) => {
+            end_logins_on_subjects_gone(state).await;
+            Ok(written)
+        }
+        Err(InstallationFailure::Unservable(unservable)) => Err(refused(
+            unservable.worded(crate::host::http::errors::api_wording),
+        )),
+        Err(InstallationFailure::Edit(problem)) => Err(problem),
+        Err(InstallationFailure::Unserved(ServeFailure::Unservable(unservable))) => Err(refused(
+            unservable.after_the_write(crate::host::http::errors::api_wording),
+        )),
+        Err(InstallationFailure::Unserved(ServeFailure::Fault(error))) => Err(
+            ProblemDetail::internal_sanitized("failed to serve config.toml after the write", error),
+        ),
     }
+}
 
-    /// Bring the catalog up to the file the write produced, or say that it could not be read.
-    fn after_write(self) -> Result<(), ProblemDetail> {
-        self.0.shared.reload_profiles().map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to reload the profiles after a write", error)
-        })
-    }
+/// The file as written, for a door that begins something it commits through
+/// [`write_installation`] later: refused as that write would refuse it.
+fn installation_as_written(
+    state: &ServerState,
+) -> Result<crate::config::ConfigFile, ProblemDetail> {
+    state
+        .shared
+        .installation_as_written()
+        .map_err(|unservable| refused(unservable.worded(crate::host::http::errors::api_wording)))
+}
+
+/// Where the installation is and how what this server serves stands against `config.toml`, as
+/// `GET /v1/config` answers.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ConfigResponse {
+    /// `config.toml`'s path; absent when no config directory can be determined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) config_path: Option<String>,
+    /// The data directory, where the store lives; absent when none can be determined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) data_dir: Option<String>,
+    /// When this process last read `config.toml` whole, RFC 3339: its start, the last
+    /// `POST /v1/config/reload`, or its own last write, each of which reads the whole file.
+    pub(crate) config_loaded_at: String,
+    /// When `config.toml` was last written, RFC 3339; absent when there is no file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) config_modified_at: Option<String>,
+    /// Whether `config.toml` has changed since this process last read it whole: an edit made in a
+    /// shell, which `POST /v1/config/reload` applies. A write of the server's own reads the file
+    /// again, so it leaves this `false`. Compared on the file's modification time, so it holds
+    /// where the two instants above, spelled to the second, read equal.
+    pub(crate) config_changed: bool,
+    /// The sections of `config.toml` that state something else than the file this server
+    /// started on and are read at startup alone, so neither a reload nor a write applies them and
+    /// only a restart does: `permissions`, `shell`, `[mcp]`'s own keys as `mcp`, and the rest.
+    pub(crate) restart_required: Vec<&'static str>,
+}
+
+/// `GET /v1/config`: where the installation is, when `config.toml` was last read whole and
+/// written, whether an edit awaits `POST /v1/config/reload`, and what only a restart applies.
+#[utoipa::path(
+    get,
+    path = "/v1/config",
+    tag = "installation",
+    responses(
+        (status = 200, description = "Where the installation is and how this server stands against it", body = ConfigResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["config:r"]))
+)]
+pub(crate) async fn config(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::ConfigRead>,
+) -> Json<ConfigResponse> {
+    // The record ahead of the file: a serving that lands between the two then reads as a change
+    // the record predates, where the other order would call a file just read whole changed.
+    let read = state.shared.whole_read();
+    let modified = crate::config::config_file_modified();
+    Json(ConfigResponse {
+        config_path: crate::paths::config_file_path().map(|path| path.display().to_string()),
+        data_dir: crate::paths::meka_data_dir().map(|path| path.display().to_string()),
+        config_loaded_at: super::info::rfc3339(read.at),
+        config_modified_at: modified
+            .map(|modified| super::info::rfc3339(chrono::DateTime::<chrono::Utc>::from(modified))),
+        config_changed: modified != read.modified,
+        restart_required: state.shared.sections_awaiting_restart(),
+    })
 }
 
 /// What `POST /v1/config/reload` applied.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ReloadResponse {
-    /// RFC 3339, when this read of `config.toml` was made; `GET /v1/info` reports the same instant
-    /// from now on.
+    /// RFC 3339, when this read of `config.toml` was made; `GET /v1/config` reports the same
+    /// instant from now on.
     pub(crate) config_loaded_at: String,
     /// MCP servers the file names that were not running, started.
     pub(crate) servers_added: Vec<String>,
-    /// MCP servers whose entry changed, restarted on the file's.
+    /// MCP servers whose connection or credential changed, restarted on the file's entry.
     pub(crate) servers_restarted: Vec<String>,
+    /// MCP servers whose tool policy alone changed, given it on the connection they hold.
+    pub(crate) servers_reconfigured: Vec<String>,
     /// MCP servers the file no longer names, taken out of the running manager.
     pub(crate) servers_removed: Vec<String>,
+    /// Sections of `config.toml` that state something else than the file this server started
+    /// on and are read at startup alone, so only a restart applies them; as `GET /v1/config`
+    /// reports.
+    pub(crate) restart_required: Vec<&'static str>,
 }
 
 /// `POST /v1/config/reload`: read `config.toml` again and serve what a write over HTTP would
 /// have: the accounts and profiles, the MCP servers brought to the file's entries, and the standing
-/// instructions. Every other section is read at startup alone.
+/// instructions. Every other section is read at startup alone, and the answer names those that
+/// changed.
 #[utoipa::path(
     post,
     path = "/v1/config/reload",
     tag = "installation",
     responses(
-        (status = 200, description = "What the reload applied", body = ReloadResponse),
+        (status = 200, description = "What the reload applied, and what waits for a restart", body = ReloadResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 422, description = "`config.toml` fails to parse, or holds an MCP server entry startup would refuse; nothing was applied", body = ProblemDetail),
+        (status = 422, description = "`config.toml` fails to parse, or holds anything startup would refuse; nothing was applied", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -137,122 +227,25 @@ pub(crate) async fn reload_config(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::ConfigWrite>,
 ) -> Result<Json<ReloadResponse>, ProblemDetail> {
-    // Taken ahead of the read: a write holds it across its edit of the file and its change to the
-    // manager, so the file read under it is the file as every write left it, and no write lands
-    // between this read and what it brings the manager to.
-    let _doors = state.mcp_doors.lock().await;
-    let wanted = {
-        let _reads = state.shared.hold_config_reads();
-        let config_file = crate::config::load_config_file_or_err().map_err(|error| {
-            refused(format!(
-                "config.toml fails to parse; repair it first: {sentence}",
-                sentence = error.sentence()
-            ))
-        })?;
-        let wanted = config_file
-            .mcp
-            .as_ref()
-            .and_then(|mcp| mcp.servers.clone())
-            .unwrap_or_default();
-        refuse_mcp_entries(&wanted)?;
-        // The accounts and profiles, as a write of theirs replaces them.
-        state.shared.providers.replace_catalog(&config_file);
-        wanted
-    };
-    let servers = reconcile_servers(&state, &wanted).await?;
-    // The file is read and served; the standing instructions are another file's, read next.
-    let loaded_at = chrono::Utc::now();
-    *crate::sync::lock(&state.config_loaded_at) = loaded_at;
-    state.shared.reload_instructions().map_err(|error| {
-        ProblemDetail::internal_sanitized("failed to reload the standing instructions", error)
-    })?;
+    let ((), servers) = write_installation(&state, async |_| Ok(())).await?;
     tracing::info!(
         "reloaded config.toml via HTTP: {added} MCP server(s) added, {restarted} restarted, \
-         {removed} removed",
+         {reconfigured} reconfigured, {removed} removed",
         added = servers.added.len(),
         restarted = servers.restarted.len(),
+        reconfigured = servers.reconfigured.len(),
         removed = servers.removed.len()
     );
+    let read_at = state.shared.whole_read().at;
     Ok(Json(ReloadResponse {
-        // As `GET /v1/info` spells it, so the two instants compare equal.
-        config_loaded_at: super::info::rfc3339(loaded_at),
+        // As `GET /v1/config` spells it, so the two instants compare equal.
+        config_loaded_at: super::info::rfc3339(read_at),
         servers_added: servers.added,
         servers_restarted: servers.restarted,
+        servers_reconfigured: servers.reconfigured,
         servers_removed: servers.removed,
+        restart_required: state.shared.sections_awaiting_restart(),
     }))
-}
-
-/// What the file's MCP entries are refused for ahead of any change, by the predicate startup asks
-/// of them. Refused here, nothing is served; refused by the manager, the entries before it would
-/// be.
-fn refuse_mcp_entries(wanted: &[crate::config::McpServerConfig]) -> Result<(), ProblemDetail> {
-    crate::mcp::sanitize::validate_server_entries(wanted).map_err(|message| {
-        refused(format!(
-            "config.toml holds an MCP server entry meka refuses; repair it first: {message}"
-        ))
-    })
-}
-
-/// The MCP servers a reload changed, by name.
-#[derive(Default)]
-struct ReconciledServers {
-    added: Vec<String>,
-    restarted: Vec<String>,
-    removed: Vec<String>,
-}
-
-/// Bring the running manager to `wanted`, the file's entries: a server the file names and the
-/// manager does not run is started, one whose entry differs is restarted on the file's, one the
-/// file no longer names is taken out. A server whose entry is unchanged is left as it is,
-/// connected or not, so a reload is not a reconnect. A server without a manager (MCP disabled at
-/// startup) has nothing to bring anywhere.
-async fn reconcile_servers(
-    state: &ServerState,
-    wanted: &[crate::config::McpServerConfig],
-) -> Result<ReconciledServers, ProblemDetail> {
-    let Some(manager) = state.shared.mcp_manager.clone() else {
-        return Ok(ReconciledServers::default());
-    };
-    let running: std::collections::BTreeMap<String, crate::config::McpServerConfig> = manager
-        .server_configs()
-        .into_iter()
-        .map(|config| (config.name.clone(), config))
-        .collect();
-    let mut changed = ReconciledServers::default();
-    for config in wanted {
-        match running.get(&config.name) {
-            Some(current) if crate::installation::mcp::same_entry(current, config) => {}
-            Some(_) => {
-                // A login in flight was made against the entry the file no longer states. Under
-                // the lock, unlike at the write doors, since which entries changed is known only
-                // under it: a login whose flow has ended waits here for the lock and is cut at the
-                // grace, its restart left to this reload. What its flow wrote after this read, the
-                // `auth` block, shows as a modification later than the read, like any shell's.
-                forget_pending_logins(state, &config.name, false).await;
-                manager.replace_server(config).await.map_err(|error| {
-                    ProblemDetail::internal_sanitized("failed to restart the server", error)
-                })?;
-                changed.restarted.push(config.name.clone());
-            }
-            None => {
-                manager.add_server(config).map_err(|error| {
-                    ProblemDetail::internal_sanitized("failed to start the server", error)
-                })?;
-                changed.added.push(config.name.clone());
-            }
-        }
-    }
-    for name in running.keys() {
-        if wanted.iter().any(|config| &config.name == name) {
-            continue;
-        }
-        forget_pending_logins(state, name, false).await;
-        manager.remove_server(name).await.map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to remove the server", error)
-        })?;
-        changed.removed.push(name.to_string());
-    }
-    Ok(changed)
 }
 
 // ----- Accounts ----------------------------------------------------------------------------------
@@ -289,13 +282,45 @@ pub(crate) async fn accounts(
     let accounts = account::account_views(&token_store, &catalog.accounts)
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to list accounts", error))?;
-    let orphaned_credentials = account::orphaned_accounts(&token_store, &catalog.accounts)
+    // Claimed by the file as well as by the served catalog: an account added in a shell and not
+    // yet served is a configured account, which `DELETE` would remove whole, not a stray secret.
+    let mut claimed = catalog.accounts.clone();
+    if let Ok(config_file) = crate::config::load_config_file_or_err() {
+        claimed.extend(config_file.accounts);
+    }
+    let orphaned_credentials = account::orphaned_accounts(&token_store, &claimed)
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to list credentials", error))?;
     Ok(Json(AccountsResponse {
         accounts,
         orphaned_credentials,
     }))
+}
+
+/// `GET /v1/accounts/{name}`: one account as the server serves it, with whether a credential is
+/// stored under it.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{name}",
+    tag = "installation",
+    params(("name" = String, Path, description = "Account name")),
+    responses(
+        (status = 200, description = "The account", body = AccountView),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "No such account", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["config:r"]))
+)]
+pub(crate) async fn get_account(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::ConfigRead>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<AccountView>, ProblemDetail> {
+    let catalog = state.shared.providers.catalog();
+    let token_store = state.shared.store.token_store();
+    Ok(Json(account_view(&catalog, &token_store, &name).await?))
 }
 
 /// The body of `POST /v1/accounts`: the `[accounts.<name>]` settings, and the key for a backend
@@ -337,7 +362,7 @@ pub(crate) struct CreateAccountRequest {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body: a name in use, an unknown backend, a setting the backend never reads, or a key where none is taken or none where one is", body = ProblemDetail),
+        (status = 422, description = "Invalid body: a name in use, an unknown backend, a setting the backend never reads, or a key where none is taken or none where one is; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -349,92 +374,45 @@ pub(crate) async fn create_account(
 ) -> Result<(StatusCode, Json<AccountView>), ProblemDetail> {
     let body: CreateAccountRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("account", error))?;
-    let name = body.name.trim();
-    if name.is_empty() {
-        return Err(refused("account name cannot be empty"));
-    }
+    let name = body.name.as_str();
     let backend =
-        account::validate_backend(&body.backend).map_err(|error| refused(error.to_string()))?;
-    // Refused rather than dropped, as `meka profile set` refuses a key the backend never reads: a
-    // body states exactly what it means to write, and reporting success for a setting that was
-    // not written would be reporting nothing.
-    for (key, given) in [
-        ("client_id", body.client_id.is_some()),
-        ("oauth_token_url", body.oauth_token_url.is_some()),
-        ("interleaved_thinking", body.interleaved_thinking.is_some()),
-    ] {
-        if given && !backend.reads_account_key(key) {
-            return Err(refused(format!(
-                "an account on '{backend}' never reads `{key}`; drop it"
-            )));
-        }
-    }
-    if backend == crate::config::Backend::ChatGptSubscription
-        && let Some(url) = body.base_url.as_deref()
-    {
-        crate::provider::openai::subscription::chatgpt_base_url_shape(url)
-            .map_err(|error| refused(error.to_string()))?;
-    }
-    let credential = match (account::credential_kind(backend), body.api_key) {
-        (account::CredentialKind::ApiKey, Some(key)) => {
-            Some(crate::store::AuthCredential::ApiKey(key))
-        }
-        (account::CredentialKind::ApiKey, None) => {
-            return Err(refused(format!(
-                "an account on '{backend}' needs `api_key`"
-            )));
-        }
-        (_, Some(_)) => {
-            return Err(refused(format!(
-                "'{backend}' logs in through the browser and takes no API key; add the account \
-                 without one and log in at `POST /v1/accounts/{name}/login`"
-            )));
-        }
-        (_, None) => None,
-    };
+        account::validate_backend(&body.backend).map_err(|error| refused(error.sentence()))?;
     let settings = account::OAuthSettings {
         oauth_token_url: body.oauth_token_url,
         client_id: body.client_id,
     };
-    let reload = Reload::ahead_of_write(&state)?;
-    // The account before the secret, as `meka account add` orders them: a failed credential write
-    // then leaves an account with no credential, which the listing shows and the login repairs,
-    // rather than a credential no account names.
-    account::write_account(
-        name,
-        backend,
-        body.base_url.as_deref(),
-        &settings,
-        body.interleaved_thinking,
-    )
-    .map_err(|error| door_refusal("failed to write the account", error))?;
+    let credential = body.api_key.map(crate::store::AuthCredential::ApiKey);
     let token_store = state.shared.store.token_store();
-    if let Some(credential) = &credential {
-        token_store
-            .save_account_credential(name, credential)
-            .await
-            .map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to store the account credential", error)
-            })?;
-    }
-    reload.after_write()?;
+    write_installation(&state, async |_| {
+        account::add_account(
+            &account::NewAccount {
+                name,
+                backend,
+                base_url: body.base_url.as_deref(),
+                settings: &settings,
+                interleaved_thinking: body.interleaved_thinking,
+            },
+            credential.as_ref(),
+            &token_store,
+        )
+        .await
+        .map_err(|error| door_problem(&state, "failed to add the account", error))
+    })
+    .await?;
     tracing::info!("added account '{name}' via HTTP");
     let catalog = state.shared.providers.catalog();
     let view = account_view(&catalog, &token_store, name).await?;
     Ok((StatusCode::CREATED, Json(view)))
 }
 
-/// One account's view from the catalog a write just produced.
+/// One account's view from the served catalog, or the 404 naming the accounts it holds.
 async fn account_view(
     catalog: &crate::config::ProfileCatalog,
     token_store: &crate::store::TokenStore,
     name: &str,
 ) -> Result<AccountView, ProblemDetail> {
     let Some(config) = catalog.accounts.get(name) else {
-        return Err(ProblemDetail::internal_sanitized(
-            "the account written is not in the reloaded catalog",
-            name,
-        ));
+        return Err(not_found("account", name, catalog.accounts.keys()));
     };
     let mut views = account::account_views(
         token_store,
@@ -447,7 +425,7 @@ async fn account_view(
         .ok_or_else(|| ProblemDetail::internal_sanitized("the account view came back empty", name))
 }
 
-/// The body of `PATCH /v1/accounts/{name}` and of a `PATCH /v1/profiles/{name}` that renames.
+/// The body of `PATCH /v1/accounts/{name}`.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RenameRequest {
@@ -470,9 +448,9 @@ pub(crate) struct RenameRequest {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such account", body = ProblemDetail),
-        (status = 409, description = "A session resident on this server runs on the account, whose credential refreshes under its name", body = ProblemDetail),
+        (status = 409, description = "A session or sub-agent running on this server may run on the account, or another meka is refreshing its credential, which refreshes under its name", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid new name, or one in use", body = ProblemDetail),
+        (status = 422, description = "Invalid new name, or one in use; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -485,64 +463,17 @@ pub(crate) async fn rename_account(
 ) -> Result<Json<AccountView>, ProblemDetail> {
     let body: RenameRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("account patch", error))?;
-    let catalog = state.shared.providers.catalog();
-    let Some(config) = catalog.accounts.get(&name) else {
-        return Err(not_found("account", &name, catalog.accounts.keys()));
-    };
-    // A session resident here keeps the provider it was built with, and a subscription's
-    // credential refreshes under the account's name: renamed under the session, the next refresh
-    // would write to a row that is gone and lose the token the issuer just rotated. Refused while
-    // such a session is up; an API key is held by its provider whole and has no row to refresh.
-    let refreshes = account::validate_backend(&config.backend).is_ok_and(|backend| {
-        !matches!(
-            account::credential_kind(backend),
-            account::CredentialKind::ApiKey
-        )
-    });
-    if refreshes {
-        let resident: Vec<uuid::Uuid> = state.sessions.read().await.keys().copied().collect();
-        let mut running = 0;
-        for id in resident {
-            let recorded = state
-                .shared
-                .store
-                .recorded_profile(id)
-                .await
-                .map_err(|error| {
-                    ProblemDetail::internal_sanitized("failed to read a session's profile", error)
-                })?;
-            // A session on a profile since removed still runs on the provider it was built
-            // with, which may be this account's; counted, since it cannot be shown not to be.
-            if recorded.is_some_and(|profile| {
-                catalog
-                    .profiles
-                    .get(&profile)
-                    .is_none_or(|profile| profile.account == name)
-            }) {
-                running += 1;
-            }
-        }
-        if running > 0 {
-            return Err(ProblemDetail::new(
-                ErrorKind::AccountInUse,
-                StatusCode::CONFLICT,
-                format!(
-                    "{running} session(s) resident on this server may run on '{name}', whose \
-                     credential refreshes under its name; delete them or wait for them to be \
-                     evicted"
-                ),
-            ));
-        }
-    }
-    let reload = Reload::ahead_of_write(&state)?;
-    // A login begun under the old name would store its credential there, beside the one the
-    // rename moves.
-    forget_pending_logins(&state, &name, true).await;
     let token_store = state.shared.store.token_store();
-    account::rename_account(&name, &body.name, &token_store)
-        .await
-        .map_err(|error| door_refusal("failed to rename the account", error))?;
-    reload.after_write()?;
+    write_installation(&state, async |config_file| {
+        let Some(config) = config_file.accounts.get(&name) else {
+            return Err(not_found("account", &name, config_file.accounts.keys()));
+        };
+        refuse_renaming_under_a_session(&state, &name, config).await?;
+        account::rename_account(&name, &body.name, &token_store)
+            .await
+            .map_err(|error| door_problem(&state, "failed to rename the account", error))
+    })
+    .await?;
     tracing::info!(
         "renamed account '{name}' to '{new}' via HTTP",
         new = body.name
@@ -550,6 +481,91 @@ pub(crate) async fn rename_account(
     let catalog = state.shared.providers.catalog();
     let view = account_view(&catalog, &token_store, &body.name).await?;
     Ok(Json(view))
+}
+
+/// Refuse renaming `name` while a session resident here, or a sub-agent running here, may run on
+/// it and its credential refreshes. A session keeps the provider it was built with, and a
+/// subscription's credential refreshes under the account's name: renamed under the session, the
+/// next refresh would write to a row that is gone and lose the token the issuer just rotated. A
+/// session runs on its profile and on any profile that profile falls back to, so the whole chain
+/// counts. An API key is held by its provider whole and has no row to refresh, and an account
+/// with no credential stored has none either.
+async fn refuse_renaming_under_a_session(
+    state: &ServerState,
+    name: &str,
+    config: &crate::config::AccountConfig,
+) -> Result<(), ProblemDetail> {
+    let refreshes = account::validate_backend(&config.backend).is_ok_and(|backend| {
+        !matches!(
+            account::credential_kind(backend),
+            account::CredentialKind::ApiKey
+        )
+    });
+    if !refreshes {
+        return Ok(());
+    }
+    let stored = state
+        .shared
+        .store
+        .token_store()
+        .list_credential_accounts()
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to read the stored credentials", error)
+        })?;
+    if !stored.iter().any(|account| account == name) {
+        return Ok(());
+    }
+    // The served catalog, since it is what a running provider was built from.
+    let catalog = state.shared.providers.catalog();
+    let mut running: Vec<uuid::Uuid> = state.sessions.read().await.keys().copied().collect();
+    running.extend(state.shared.running_subagents.running_ids());
+    let mut on_the_account = 0;
+    for id in running {
+        let recorded = state
+            .shared
+            .store
+            .recorded_profile(id)
+            .await
+            .map_err(|error| {
+                ProblemDetail::internal_sanitized("failed to read a session's profile", error)
+            })?;
+        if recorded.is_some_and(|profile| chain_may_bill(&catalog, &profile, name)) {
+            on_the_account += 1;
+        }
+    }
+    if on_the_account == 0 {
+        return Ok(());
+    }
+    Err(ProblemDetail::new(
+        ErrorKind::AccountInUse,
+        StatusCode::CONFLICT,
+        format!(
+            "{on_the_account} session(s) open on this server may run on '{name}'; rename it once \
+             they have closed"
+        ),
+    ))
+}
+
+/// Whether a session on `profile` may run on `account`: the profile or one it falls back to bills
+/// it, or one of them is no longer configured, since a session on a profile since removed still
+/// runs on the provider it was built with and cannot be shown not to bill it.
+fn chain_may_bill(catalog: &crate::config::ProfileCatalog, profile: &str, account: &str) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pending = vec![profile.to_string()];
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        let Some(config) = catalog.profiles.get(&current) else {
+            return true;
+        };
+        if config.account == account {
+            return true;
+        }
+        pending.extend(config.fallbacks.iter().cloned());
+    }
+    false
 }
 
 /// `DELETE /v1/accounts/{name}`: remove an account and the credential stored under its name,
@@ -564,7 +580,7 @@ pub(crate) async fn rename_account(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such account, and no credential under the name", body = ProblemDetail),
-        (status = 422, description = "A profile names the account", body = ProblemDetail),
+        (status = 422, description = "A profile names the account; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -574,32 +590,30 @@ pub(crate) async fn delete_account(
     _scoped: scope::Scoped<scope::ConfigWrite>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<StatusCode, ProblemDetail> {
-    let catalog = state.shared.providers.catalog();
     let token_store = state.shared.store.token_store();
-    if !catalog.accounts.contains_key(&name) {
-        // A credential no account claims is this door's to clear too, as it is `meka account
-        // remove`'s, so the name is unknown only when neither side has it.
-        let orphaned = account::orphaned_accounts(&token_store, &catalog.accounts)
-            .await
-            .map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to list credentials", error)
-            })?;
-        if !orphaned.contains(&name) {
-            let configured: Vec<String> = catalog.accounts.keys().cloned().collect();
-            return Err(ProblemDetail::new(
-                ErrorKind::NotFound,
-                StatusCode::NOT_FOUND,
-                account::unknown_account(&name, &configured, &orphaned),
-            ));
+    write_installation(&state, async |config_file| {
+        if !config_file.accounts.contains_key(&name) {
+            // A credential no account claims is this door's to clear too, as it is `meka
+            // account remove`'s, so the name is unknown only when neither side has it.
+            let orphaned = account::orphaned_accounts(&token_store, &config_file.accounts)
+                .await
+                .map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to list credentials", error)
+                })?;
+            if !orphaned.contains(&name) {
+                let configured: Vec<String> = config_file.accounts.keys().cloned().collect();
+                return Err(ProblemDetail::new(
+                    ErrorKind::NotFound,
+                    StatusCode::NOT_FOUND,
+                    account::unknown_account(&name, &configured, &orphaned),
+                ));
+            }
         }
-    }
-    let reload = Reload::ahead_of_write(&state)?;
-    // A login still pending would store a credential under a name no account claims.
-    forget_pending_logins(&state, &name, true).await;
-    account::remove_account(&name, &token_store)
-        .await
-        .map_err(|error| door_refusal("failed to remove the account", error))?;
-    reload.after_write()?;
+        account::remove_account(&name, &token_store)
+            .await
+            .map_err(|error| door_problem(&state, "failed to remove the account", error))
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -622,39 +636,12 @@ const BROWSER_LOGIN_LIFETIME: std::time::Duration = std::time::Duration::from_se
 const LOGIN_URL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a login being ended may take to end on its own before it is aborted: enough for a
-/// flow at an await to see the cancel and put back what it set aside.
+/// flow at an await to see the cancel and close the probe connection it opened.
 const LOGIN_END_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Why a browser login failed: what was asked could not be done as asked, the other side did not
-/// answer, or meka's own store failed, which a caller is told as a 422, a 502 and a 500.
-#[derive(Debug, Clone)]
-enum LoginFailure {
-    Refused(String),
-    Upstream(String),
-    /// The sentence is sanitized; the fault is in the log.
-    Internal(String),
-}
-
-impl LoginFailure {
-    /// The problem a caller is answered with.
-    fn problem(self) -> ProblemDetail {
-        match self {
-            Self::Refused(sentence) => refused(sentence),
-            Self::Upstream(sentence) => {
-                ProblemDetail::new(ErrorKind::Provider, StatusCode::BAD_GATEWAY, sentence)
-            }
-            Self::Internal(sentence) => ProblemDetail::new(
-                ErrorKind::Internal,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                sentence,
-            ),
-        }
-    }
-}
-
-/// What finished a browser login: `Ok` once the credential is stored, `Err` with why it failed;
-/// `None` while it waits.
-type LoginOutcome = Arc<std::sync::Mutex<Option<Result<(), LoginFailure>>>>;
+/// What finished a browser login: `Ok` once the credential is stored and served, `Err` with what
+/// the request completing it is answered with; `None` while it waits.
+type LoginOutcome = Arc<std::sync::Mutex<Option<Result<(), ProblemDetail>>>>;
 
 /// The person's side of a browser login run over HTTP, an account's or an MCP server's: the URL
 /// and what completes the login are kept for the request that began it to answer with, and the
@@ -672,6 +659,9 @@ struct HttpLoginPrompt {
     pasted: std::sync::Mutex<Option<String>>,
     paste_ready: tokio::sync::Notify,
     cancel: tokio_util::sync::CancellationToken,
+    /// Set once the flow holds its credential and its commit has begun: from then on the commit
+    /// decides how the login ends, so nothing that ends logins settles this one for it.
+    committing: std::sync::atomic::AtomicBool,
 }
 
 impl HttpLoginPrompt {
@@ -752,15 +742,22 @@ fn login_status_of(outcome: &LoginOutcome) -> LoginStatus {
             status: "completed",
             error: None,
         },
-        Some(Err(
-            LoginFailure::Refused(error)
-            | LoginFailure::Upstream(error)
-            | LoginFailure::Internal(error),
-        )) => LoginStatus {
+        Some(Err(problem)) => LoginStatus {
             status: "failed",
-            error: Some(error),
+            error: Some(problem.detail.unwrap_or(problem.title)),
         },
     }
+}
+
+/// Whether `login`'s commit has begun and not yet settled it, which every path that ends logins
+/// leaves to the commit: settled for it, the login would read as failed while its credential is
+/// stored.
+fn is_committing(login: &PendingLogin) -> bool {
+    login
+        .prompt
+        .committing
+        .load(std::sync::atomic::Ordering::Acquire)
+        && crate::sync::lock(&login.outcome).is_none()
 }
 
 /// Settle a login that will not complete, so a request waiting on it is answered with `reason`
@@ -768,7 +765,7 @@ fn login_status_of(outcome: &LoginOutcome) -> LoginStatus {
 fn settle_login(login: &PendingLogin, reason: &str) {
     let mut outcome = crate::sync::lock(&login.outcome);
     if outcome.is_none() {
-        *outcome = Some(Err(LoginFailure::Refused(reason.to_string())));
+        *outcome = Some(Err(refused(reason)));
     }
     drop(outcome);
     login.prompt.wake();
@@ -776,8 +773,7 @@ fn settle_login(login: &PendingLogin, reason: &str) {
 
 /// End a login: its flow is told to stop, which it does at its next cancel-aware await and within
 /// its own bounds either way, and a request waiting on it is answered with `reason`. Not aborted:
-/// an abort skips what the flow puts back on its way out, as an MCP login restores the bundle it
-/// cleared.
+/// an abort skips the close of the probe connection an MCP login opened.
 fn end_login(login: &PendingLogin, reason: &str) {
     login.cancel.cancel();
     settle_login(login, reason);
@@ -787,9 +783,9 @@ fn end_login(login: &PendingLogin, reason: &str) {
 pub(crate) type PendingLogins =
     Arc<std::sync::Mutex<std::collections::HashMap<String, PendingLogin>>>;
 
-/// What a caller is told of an exchange the authorization server refused: its own body, which
+/// What a caller is told of an exchange the authorization server rejected: its own body, which
 /// `[serve] relay_provider_errors` decides whether a caller sees, with the whole in the log.
-fn exchange_refusal(relay: bool, account: &str, error: &anyhow::Error) -> String {
+fn exchange_rejection(relay: bool, account: &str, error: &anyhow::Error) -> String {
     tracing::warn!("the browser login for '{account}' failed: {error}");
     if relay {
         error.to_string()
@@ -802,7 +798,7 @@ fn exchange_refusal(relay: bool, account: &str, error: &anyhow::Error) -> String
 fn sweep_expired_logins(pending: &mut std::collections::HashMap<String, PendingLogin>) {
     let now = std::time::Instant::now();
     pending.retain(|_, login| {
-        if login.expires_at > now {
+        if login.expires_at > now || is_committing(login) {
             return true;
         }
         end_login(login, "the login lapsed");
@@ -811,16 +807,16 @@ fn sweep_expired_logins(pending: &mut std::collections::HashMap<String, PendingL
 }
 
 /// Drop the pending login on `subject`, an account's when `account` and an MCP server's
-/// otherwise, and wait its task out: for the login replacing it, which binds the same port, and
-/// for a rename or a removal of the subject, after which a credential the login stored would sit
-/// under a name nothing claims.
+/// otherwise, and wait its task out, for the login replacing it, which binds the same port.
 async fn forget_pending_logins(state: &ServerState, subject: &str, account: bool) {
     let removed: Vec<PendingLogin> = {
         let mut pending = crate::sync::lock(&state.pending_logins);
         sweep_expired_logins(&mut pending);
         let gone: Vec<String> = pending
             .iter()
-            .filter(|(_, login)| login.subject == subject && login.account == account)
+            .filter(|(_, login)| {
+                login.subject == subject && login.account == account && !is_committing(login)
+            })
             .map(|(login_id, _)| login_id.clone())
             .collect();
         let removed = gone
@@ -830,7 +826,40 @@ async fn forget_pending_logins(state: &ServerState, subject: &str, account: bool
         drop(pending);
         removed
     };
-    end_logins(removed, "the login was replaced, or its subject removed").await;
+    end_logins(removed, "the login was replaced").await;
+}
+
+/// End every pending login on an account or an MCP server the file no longer names, after a
+/// write: its commit would be refused, so it holds a listener for nothing. Read off the file,
+/// which a write replaces whole, rather than off the running manager, which another write may be
+/// in the middle of restarting a server on. A file that does not parse ends nothing.
+async fn end_logins_on_subjects_gone(state: &ServerState) {
+    let Ok(config_file) = crate::config::load_config_file_or_err() else {
+        return;
+    };
+    let servers = config_file.mcp_servers();
+    let removed: Vec<PendingLogin> = {
+        let mut pending = crate::sync::lock(&state.pending_logins);
+        let gone: Vec<String> = pending
+            .iter()
+            .filter(|(_, login)| !is_committing(login))
+            .filter(|(_, login)| {
+                if login.account {
+                    !config_file.accounts.contains_key(&login.subject)
+                } else {
+                    !servers.iter().any(|server| server.name == login.subject)
+                }
+            })
+            .map(|(login_id, _)| login_id.clone())
+            .collect();
+        let removed = gone
+            .into_iter()
+            .filter_map(|login_id| pending.remove(&login_id))
+            .collect();
+        drop(pending);
+        removed
+    };
+    end_logins(removed, "the login's account or server was removed").await;
 }
 
 /// Drop every pending login and wait its task out, for a server shutting down: a completion
@@ -844,12 +873,18 @@ pub(crate) async fn forget_every_pending_login(state: &ServerState) {
     end_logins(removed, "the server is shutting down").await;
 }
 
-/// End each of `removed` with `reason` and wait its task out.
+/// End each of `removed` with `reason` and wait its task out, leaving one whose commit has begun
+/// to that commit.
 async fn end_logins(removed: Vec<PendingLogin>, reason: &str) {
     for login in removed {
+        // Its commit ends it, and quickly: settled here, it would read as failed while the
+        // credential is stored.
+        if is_committing(&login) {
+            continue;
+        }
         // Canceled first and aborted only after a grace: a flow at an await that sees the cancel
-        // ends on its own and puts back what it set aside, as an MCP login restores the bundle it
-        // cleared, where an abort leaves that undone.
+        // ends on its own and closes the probe connection an MCP login opened, where an abort
+        // drops it mid-step.
         login.cancel.cancel();
         settle_login(&login, reason);
         let mut task = login.task;
@@ -917,7 +952,9 @@ pub(crate) struct LoginStatus {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such account", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "No key for a backend that takes one, or one for a backend that logs in through the browser", body = ProblemDetail),
+        (status = 422, description = "No key for a backend that takes one, or one for a backend that logs in through the browser; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
+        (status = 502, description = "The login produced no authorization URL in time; the reason is in the meka log", body = ProblemDetail),
+        (status = 503, description = "The server is shutting down", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -934,55 +971,70 @@ pub(crate) async fn login_account(
         serde_json::from_slice(&raw_body)
             .map_err(|error| ProblemDetail::invalid_body("login", error))?
     };
-    let catalog = state.shared.providers.catalog();
-    let Some(config) = catalog.accounts.get(&name) else {
-        return Err(not_found("account", &name, catalog.accounts.keys()));
-    };
-    let backend =
-        account::validate_backend(&config.backend).map_err(|error| refused(error.to_string()))?;
-    let credential = match (account::credential_kind(backend), body.api_key) {
-        (account::CredentialKind::ApiKey, Some(key)) => crate::store::AuthCredential::ApiKey(key),
-        (account::CredentialKind::ApiKey, None) => {
-            return Err(refused(format!(
-                "'{name}' is on '{backend}', which logs in with `api_key`"
-            )));
-        }
-        (_, Some(_)) => {
-            return Err(refused(format!(
-                "'{name}' is on '{backend}', which logs in through the browser and takes no API \
-                 key"
-            )));
-        }
-        (_, None) => {
-            let started = begin_browser_login(&state, &name, backend, config).await?;
-            return Ok((StatusCode::ACCEPTED, Json(started)).into_response());
-        }
-    };
     let token_store = state.shared.store.token_store();
-    token_store
-        .save_account_credential(&name, &credential)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to store the account credential", error)
-        })?;
-    tracing::info!("re-authenticated account '{name}' via HTTP");
-    let view = account_view(&catalog, &token_store, &name).await?;
-    Ok(Json(view).into_response())
+    if let Some(key) = body.api_key {
+        let credential = crate::store::AuthCredential::ApiKey(key);
+        write_installation(&state, async |config_file| {
+            if !config_file.accounts.contains_key(&name) {
+                return Err(not_found("account", &name, config_file.accounts.keys()));
+            }
+            account::store_credential(config_file, &name, &credential, &token_store)
+                .await
+                .map_err(|error| {
+                    door_problem(&state, "failed to store the account credential", error)
+                })
+        })
+        .await?;
+        tracing::info!("re-authenticated account '{name}' via HTTP");
+        let catalog = state.shared.providers.catalog();
+        let view = account_view(&catalog, &token_store, &name).await?;
+        return Ok(Json(view).into_response());
+    }
+    // The login begins against the account as the file states it, which its commit holds it to.
+    let config_file = installation_as_written(&state)?;
+    let Some(config) = config_file.accounts.get(&name) else {
+        return Err(not_found("account", &name, config_file.accounts.keys()));
+    };
+    let backend = account::validate_backend(&config.backend)
+        .map_err(|error| door_problem(&state, "failed to read the account", error))?;
+    if matches!(
+        account::credential_kind(backend),
+        account::CredentialKind::ApiKey
+    ) {
+        return Err(door_problem(
+            &state,
+            "failed to begin the login",
+            crate::error::MekaError::AccountCredentialKind {
+                account: name.clone(),
+                backend: backend.name().to_string(),
+                key_given: false,
+            },
+        ));
+    }
+    match begin_browser_login(&state, &name, backend, config).await? {
+        Begun::Browser(started) => Ok((StatusCode::ACCEPTED, Json(started)).into_response()),
+        Begun::Completed => {
+            let catalog = state.shared.providers.catalog();
+            Ok(Json(account_view(&catalog, &token_store, &name).await?).into_response())
+        }
+    }
 }
 
 /// Begin a browser login for `name`, replacing one pending: the flow `meka account login` runs
-/// at a terminal, with the request's side as the person's.
+/// at a terminal, with the request's side as the person's, its credential committed through
+/// [`write_installation`] against the terms the account stated as it began.
 async fn begin_browser_login(
     state: &ServerState,
     name: &str,
     backend: crate::config::Backend,
     config: &crate::config::AccountConfig,
-) -> Result<LoginStarted, ProblemDetail> {
+) -> Result<Begun, ProblemDetail> {
+    let began = account::LoginTerms::of(config);
     let client_id = config.client_id.clone();
     let oauth_token_url = config.oauth_token_url.clone();
-    let token_store = state.shared.store.token_store();
     let account = name.to_string();
     let relay = state.config.relay_provider_errors;
+    let state_for_flow = state.clone();
     begin_login(
         state,
         name,
@@ -999,25 +1051,42 @@ async fn begin_browser_login(
             .await
             .map_err(|error| {
                 // The authorization server's own words are relayed as `[serve]
-                // relay_provider_errors` decides; every other failure is meka's own sentence.
-                LoginFailure::Refused(
-                    if error.downcast_ref::<account::ExchangeRefused>().is_some() {
-                        exchange_refusal(relay, &account, &error)
-                    } else {
-                        tracing::warn!("the browser login for '{account}' ended: {error}");
-                        error.to_string()
-                    },
-                )
+                // relay_provider_errors` decides; an exchange that got no answer meka can read is
+                // the endpoint's failure, with the reason in the log; every other failure is
+                // meka's own sentence about what the person did.
+                if error.downcast_ref::<account::ExchangeRejected>().is_some() {
+                    refused(exchange_rejection(relay, &account, &error))
+                } else if error.downcast_ref::<account::ExchangeFailed>().is_some() {
+                    tracing::warn!("the token exchange for '{account}' failed: {error}");
+                    upstream("the token exchange got no answer; the reason is in the meka log")
+                } else {
+                    tracing::warn!("the browser login for '{account}' ended: {error}");
+                    refused(error.to_string())
+                }
             })?;
-            token_store
-                .save_account_credential(&account, &credential)
-                .await
-                .map_err(|error| {
-                    tracing::error!("failed to store the credential for '{account}': {error}");
-                    LoginFailure::Internal(
-                        "the credential could not be stored; see the server log".to_string(),
-                    )
-                })?;
+            commit_on_its_own_task(&state_for_flow, &prompt, {
+                let state = state_for_flow.clone();
+                let account = account.clone();
+                async move {
+                    let token_store = state.shared.store.token_store();
+                    write_installation(&state, async |config_file| {
+                        account::commit_login(
+                            config_file,
+                            &account,
+                            &began,
+                            &credential,
+                            &token_store,
+                        )
+                        .await
+                        .map_err(|error| {
+                            door_problem(&state, "failed to store the account credential", error)
+                        })
+                    })
+                    .await
+                    .map(|_| ())
+                }
+            })
+            .await?;
             tracing::info!("logged in account '{account}' from the browser");
             Ok(())
         },
@@ -1025,21 +1094,61 @@ async fn begin_browser_login(
     .await
 }
 
-/// Begin a browser login on `subject` over HTTP: the earlier one on it goes first, `flow` runs
-/// as a task with an [`HttpLoginPrompt`] as the person's side, and the answer is the URL and
-/// what the flow said completes it, once both are out. A flow that ends first is answered with
-/// why, and one that produces no URL in time is given up.
+/// Run a login's commit on a task of its own and answer how it went, marking the login as
+/// committing first so nothing that ends logins settles it for the commit: the login's task can be
+/// aborted at its grace, and an abort landing inside a write's serving, between a server's
+/// removal and its re-adding, would leave the manager without a server the file names. A spawned
+/// task runs on when the one awaiting it is aborted. Refused once the server is shutting down,
+/// whose drain would not wait for it.
+async fn commit_on_its_own_task(
+    state: &ServerState,
+    prompt: &HttpLoginPrompt,
+    commit: impl std::future::Future<Output = Result<(), ProblemDetail>> + Send + 'static,
+) -> Result<(), ProblemDetail> {
+    if state.shutdown.is_cancelled() {
+        return Err(shutting_down());
+    }
+    prompt
+        .committing
+        .store(true, std::sync::atomic::Ordering::Release);
+    match tokio::spawn(commit).await {
+        Ok(committed) => committed,
+        Err(error) => Err(ProblemDetail::internal_sanitized(
+            "a login's commit ended abnormally",
+            error,
+        )),
+    }
+}
+
+/// How a login begun over HTTP stands when its request is answered.
+enum Begun {
+    /// Waiting for the person: the URL to open and what completes the login.
+    Browser(LoginStarted),
+    /// Committed already, by a flow that needed no browser: a `client_credentials` server proves
+    /// its client with the secret alone.
+    Completed,
+}
+
+/// Begin a login on `subject` over HTTP: the earlier one on it goes first, `flow` runs as a task
+/// with an [`HttpLoginPrompt`] as the person's side, and the answer is the URL and what the flow
+/// said completes it, once both are out. A flow that ends first is answered with how it ended,
+/// committed or refused, and one that produces no URL in time is given up.
 async fn begin_login<F>(
     state: &ServerState,
     subject: &str,
     account: bool,
     lifetime: std::time::Duration,
     flow: impl FnOnce(Arc<HttpLoginPrompt>) -> F,
-) -> Result<LoginStarted, ProblemDetail>
+) -> Result<Begun, ProblemDetail>
 where
-    F: std::future::Future<Output = Result<(), LoginFailure>> + Send + 'static,
+    F: std::future::Future<Output = Result<(), ProblemDetail>> + Send + 'static,
 {
     let noun = if account { "account" } else { "MCP server" };
+    // The shutdown ends every pending login once; one begun after would store its credential
+    // past the drain.
+    if state.shutdown.is_cancelled() {
+        return Err(shutting_down());
+    }
     // The earlier login goes first, listener included: its task is waited out, since a
     // cancellation alone leaves a port held until that task is next polled, and the flow below
     // would find it taken.
@@ -1053,6 +1162,7 @@ where
         pasted: std::sync::Mutex::new(None),
         paste_ready: tokio::sync::Notify::new(),
         cancel: cancel.clone(),
+        committing: std::sync::atomic::AtomicBool::new(false),
     });
     let outcome: LoginOutcome = Arc::new(std::sync::Mutex::new(None));
     let task = tokio::spawn({
@@ -1077,15 +1187,33 @@ where
     let expires_at = (chrono::Utc::now()
         + chrono::Duration::from_std(lifetime).unwrap_or_default())
     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    crate::sync::lock(&state.pending_logins).insert(login_id.clone(), PendingLogin {
-        subject: subject.to_string(),
-        account,
-        prompt: Arc::clone(&prompt),
-        expires_at: std::time::Instant::now() + lifetime,
-        outcome: Arc::clone(&outcome),
-        cancel,
-        task,
-    });
+    // One login per subject, asked again under the map's lock: another begun on the subject since
+    // the forget above is replaced by this one, as an earlier one was.
+    let replaced: Vec<PendingLogin> = {
+        let mut pending = crate::sync::lock(&state.pending_logins);
+        let others: Vec<String> = pending
+            .iter()
+            .filter(|(_, login)| {
+                login.subject == subject && login.account == account && !is_committing(login)
+            })
+            .map(|(login_id, _)| login_id.clone())
+            .collect();
+        let replaced = others
+            .into_iter()
+            .filter_map(|login_id| pending.remove(&login_id))
+            .collect();
+        pending.insert(login_id.clone(), PendingLogin {
+            subject: subject.to_string(),
+            account,
+            prompt: Arc::clone(&prompt),
+            expires_at: std::time::Instant::now() + lifetime,
+            outcome: Arc::clone(&outcome),
+            cancel,
+            task,
+        });
+        replaced
+    };
+    end_logins(replaced, "the login was replaced").await;
     // The URL and what completes the login arrive once the flow has bound what it binds, or the
     // flow ends without them.
     let deadline = tokio::time::Instant::now() + LOGIN_URL_WAIT;
@@ -1097,12 +1225,7 @@ where
         }
         if let Some(settled) = crate::sync::lock(&outcome).clone() {
             crate::sync::lock(&state.pending_logins).remove(&login_id);
-            return Err(match settled {
-                Ok(()) => {
-                    ProblemDetail::internal_sanitized("the login ended before it began", subject)
-                }
-                Err(failure) => failure.problem(),
-            });
+            return settled.map(|()| Begun::Completed);
         }
         tokio::select! {
             () = prompt.changed.notified() => {}
@@ -1110,15 +1233,11 @@ where
                 if let Some(login) = crate::sync::lock(&state.pending_logins).remove(&login_id) {
                     end_login(&login, "the login produced no authorization URL in time");
                 }
-                return Err(ProblemDetail::new(
-                    ErrorKind::Provider,
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "the login for {noun} '{subject}' produced no authorization URL within \
-                         {}s; the reason is in the meka log",
-                        LOGIN_URL_WAIT.as_secs()
-                    ),
-                ));
+                return Err(upstream(format!(
+                    "the login for {noun} '{subject}' produced no authorization URL within {}s; \
+                     the reason is in the meka log",
+                    LOGIN_URL_WAIT.as_secs()
+                )));
             }
         }
     };
@@ -1133,7 +1252,7 @@ where
         expires_at,
     };
     tracing::info!("began a browser login for {noun} '{subject}' via HTTP");
-    Ok(started)
+    Ok(Begun::Browser(started))
 }
 
 /// Complete a pending browser login with what the browser gave: the line goes to the flow as a
@@ -1162,7 +1281,7 @@ async fn complete_pending_login(
     }
     loop {
         if let Some(settled) = crate::sync::lock(&outcome).clone() {
-            return settled.map_err(LoginFailure::problem);
+            return settled;
         }
         if let Some(reason) = crate::sync::lock(&prompt.paste_refusal).take() {
             return Err(refused(reason));
@@ -1170,11 +1289,14 @@ async fn complete_pending_login(
         tokio::select! {
             () = prompt.changed.notified() => {}
             () = tokio::time::sleep_until(expires_at.into()) => {
-                return Err(ProblemDetail::new(
-                    ErrorKind::Provider,
-                    StatusCode::BAD_GATEWAY,
-                    format!("the login for {noun} '{subject}' did not complete in time"),
-                ));
+                // A commit under way decides the answer; its end wakes this wait.
+                if prompt.committing.load(std::sync::atomic::Ordering::Acquire) {
+                    prompt.changed.notified().await;
+                    continue;
+                }
+                return Err(upstream(format!(
+                    "the login for {noun} '{subject}' did not complete in time"
+                )));
             }
         }
     }
@@ -1246,7 +1368,7 @@ pub(crate) struct CompleteLoginRequest {
 /// gave, storing the credential.
 ///
 /// A login the loopback listener has already completed answers 200 as well; one it has already
-/// failed answers 422 with why. A code the authorization server refuses ends the login, since the
+/// failed answers 422 with why. A code the authorization server rejects ends the login, since the
 /// code is spent; a paste that carries no code leaves it pending for another try.
 #[utoipa::path(
     post,
@@ -1263,7 +1385,9 @@ pub(crate) struct CompleteLoginRequest {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such login pending on the account, or one that lapsed", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "No code in what was pasted, another login's state, or an exchange the authorization server refused", body = ProblemDetail),
+        (status = 422, description = "No code in what was pasted, another login's state, or an exchange the authorization server rejected; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
+        (status = 502, description = "The token exchange got no answer meka can read, or the login lapsed; the reason is in the meka log", body = ProblemDetail),
+        (status = 503, description = "The server is shutting down", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -1403,31 +1527,6 @@ pub(crate) struct CreateProfileRequest {
     pub(crate) default: bool,
 }
 
-/// Refuse a setting on a profile whose account's backend never sends it, as `meka profile set`
-/// does: a body states exactly what it means to write. An account the catalog lacks or whose
-/// backend does not parse is left to the write door, which refuses the account by name.
-fn refuse_inert_keys(
-    catalog: &crate::config::ProfileCatalog,
-    account: &str,
-    keys: impl IntoIterator<Item = &'static str>,
-) -> Result<(), ProblemDetail> {
-    let Some(backend) = catalog
-        .accounts
-        .get(account)
-        .and_then(|config| config.backend.parse::<crate::config::Backend>().ok())
-    else {
-        return Ok(());
-    };
-    for key in keys {
-        if !backend.reads_profile_key(key) {
-            return Err(refused(format!(
-                "a profile on '{account}', a '{backend}' account, never sends `{key}`; drop it"
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// `POST /v1/profiles`: add a profile on a configured account.
 #[utoipa::path(
     post,
@@ -1439,7 +1538,7 @@ fn refuse_inert_keys(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body: a name in use, an account not configured, a setting the backend never sends, or a profile that could not run", body = ProblemDetail),
+        (status = 422, description = "Invalid body: a name in use, an account not configured, a setting the backend never sends, a profile that could not run, or `default: true` on a server started with `--profile`; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -1451,29 +1550,7 @@ pub(crate) async fn create_profile(
 ) -> Result<(StatusCode, Json<ProfileDetailView>), ProblemDetail> {
     let body: CreateProfileRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("profile", error))?;
-    let name = body.name.trim();
-    if name.is_empty() {
-        return Err(refused("profile name cannot be empty"));
-    }
-    let model = crate::config::require_model(name, Some(&body.model))
-        .map_err(|error| refused(error.sentence()))?;
-    let catalog = state.shared.providers.catalog();
-    let stated: Vec<&'static str> = [
-        ("context_window", body.context_window.is_some()),
-        ("max_output_tokens", body.max_output_tokens.is_some()),
-        ("max_request_bytes", body.max_request_bytes.is_some()),
-        ("effort", body.effort.is_some()),
-        ("vision", body.vision.is_some()),
-        ("deferred_tools", body.deferred_tools.is_some()),
-        ("thinking", body.thinking.is_some()),
-        ("thinking_budget", body.thinking_budget.is_some()),
-        ("cache_control", body.cache_control.is_some()),
-        ("thinking_display", body.thinking_display.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(key, given)| given.then_some(key))
-    .collect();
-    refuse_inert_keys(&catalog, &body.account, stated)?;
+    let name = body.name.as_str();
     let tuning = profile::ProfileTuning {
         fallbacks: body.fallbacks,
         context_window: body.context_window,
@@ -1487,10 +1564,12 @@ pub(crate) async fn create_profile(
         cache_control: body.cache_control,
         thinking_display: body.thinking_display,
     };
-    let reload = Reload::ahead_of_write(&state)?;
-    profile::write_profile(name, &body.account, model, &tuning, body.default)
-        .map_err(|error| door_refusal("failed to write the profile", error))?;
-    reload.after_write()?;
+    refuse_a_default_under_the_started_profile(&state, body.default)?;
+    write_installation(&state, async |_| {
+        profile::write_profile(name, &body.account, &body.model, &tuning, body.default)
+            .map_err(|error| door_problem(&state, "failed to write the profile", error))
+    })
+    .await?;
     tracing::info!(
         "added profile '{name}' on account '{account}' via HTTP",
         account = body.account
@@ -1553,17 +1632,9 @@ pub(crate) struct PatchProfileRequest {
 
 impl PatchProfileRequest {
     /// The changes the body asks for, as the edit door takes them. The door reads each value and
-    /// refuses one no profile may carry, in the words `meka profile set` would; the one refusal
-    /// made here is the one whose remedy is this surface's.
-    fn into_changes(self) -> Result<profile::ProfileChanges, ProblemDetail> {
-        if let Patch::Set(names) = &self.fallbacks
-            && names.iter().all(|name| name.trim().is_empty())
-        {
-            return Err(refused(
-                "fallbacks must name at least one profile; send null to remove the setting",
-            ));
-        }
-        Ok(profile::ProfileChanges {
+    /// refuses one no profile may carry, in the words `meka profile set` would.
+    fn into_changes(self) -> profile::ProfileChanges {
+        profile::ProfileChanges {
             model: self.model,
             fallbacks: self.fallbacks,
             context_window: self.context_window,
@@ -1576,7 +1647,7 @@ impl PatchProfileRequest {
             thinking_budget: self.thinking_budget,
             cache_control: self.cache_control,
             thinking_display: self.thinking_display,
-        })
+        }
     }
 }
 
@@ -1593,7 +1664,7 @@ impl PatchProfileRequest {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such profile", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body: a value the key refuses, a setting the backend never sends, a profile that could not run on the result, `default: false`, or a `name` sent beside other changes", body = ProblemDetail),
+        (status = 422, description = "Invalid body: a value the key refuses, a setting the backend never sends, a profile that could not run on the result, `default: false`, `default: true` on a server started with `--profile`, a `name` sent beside other changes, or a rename of the profile the server was started with `--profile` naming; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -1606,58 +1677,97 @@ pub(crate) async fn patch_profile(
 ) -> Result<Json<ProfileDetailView>, ProblemDetail> {
     let body: PatchProfileRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("profile patch", error))?;
-    let catalog = state.shared.providers.catalog();
-    let Some(profile) = catalog.profiles.get(&name) else {
-        return Err(not_found("profile", &name, catalog.profiles.keys()));
-    };
     if body.default == Some(false) {
         return Err(refused(
             "`default: false` unsets nothing; remove the profile or make another the default",
         ));
     }
     let make_default = body.default == Some(true);
+    refuse_a_default_under_the_started_profile(&state, make_default)?;
     let new_name = body.name.clone();
-    let account = profile.account.clone();
-    let changes = body.into_changes()?;
-    let reload = Reload::ahead_of_write(&state)?;
-    let mut moved = Vec::new();
-    let final_name = match new_name {
-        Some(new_name) => {
-            if make_default || !changes.is_empty() {
-                return Err(refused(
-                    "`name` renames the profile and is sent on its own; change its settings in \
-                     another request",
-                ));
-            }
-            moved = profile::rename_profile(&name, &new_name, &state.shared.store)
+    let changes = body.into_changes();
+    if new_name.is_some() && (make_default || !changes.is_empty()) {
+        return Err(refused(
+            "`name` renames the profile and is sent on its own; change its settings in another \
+             request",
+        ));
+    }
+    let (moved, _) = write_installation(&state, async |config_file| {
+        if !config_file.profiles.contains_key(&name) {
+            return Err(not_found("profile", &name, config_file.profiles.keys()));
+        }
+        if let Some(new_name) = &new_name {
+            refuse_losing_the_started_profile(&state, &name)?;
+            let moved = profile::rename_profile(&name, new_name, &state.shared.store)
                 .await
-                .map_err(|error| door_refusal("failed to rename the profile", error))?;
+                .map_err(|error| door_problem(&state, "failed to rename the profile", error))?;
+            // The name is also held live, by every resident session and running sub-agent, and a
+            // worker spawned or a row written from those cells must name the profile as the file
+            // now does: a rename moves the name everywhere it is recorded.
+            for entry in state.sessions.read().await.values() {
+                entry
+                    .resident
+                    .cells()
+                    .profile
+                    .rename_profile(&name, new_name);
+            }
+            state
+                .shared
+                .running_subagents
+                .rename_profile(&name, new_name);
             tracing::info!("renamed profile '{name}' to '{new_name}' via HTTP");
-            new_name
+            return Ok(moved);
         }
-        None => {
-            refuse_inert_keys(&catalog, &account, changes.set_keys())?;
-            let keys = changes.keys();
-            profile::edit_profile(&name, &changes, make_default)
-                .map_err(|error| door_refusal("failed to write the profile", error))?;
-            if make_default {
-                tracing::info!("default profile set to '{name}' via HTTP");
-            }
-            if !keys.is_empty() {
-                tracing::info!(
-                    "changed profile '{name}' via HTTP: {keys}",
-                    keys = keys.join(", ")
-                );
-            }
-            name
+        let keys = changes.keys();
+        profile::edit_profile(&name, &changes, make_default)
+            .map_err(|error| door_problem(&state, "failed to write the profile", error))?;
+        if make_default {
+            tracing::info!("default profile set to '{name}' via HTTP");
         }
-    };
-    reload.after_write()?;
+        if !keys.is_empty() {
+            tracing::info!(
+                "changed profile '{name}' via HTTP: {keys}",
+                keys = keys.join(", ")
+            );
+        }
+        Ok(Vec::new())
+    })
+    .await?;
     // After the catalog knows the new name, so a client that refetches on the announcement
     // finds the profile the record names.
     super::sessions::announce_sessions_moved(&state, &moved).await;
     let catalog = state.shared.providers.catalog();
+    let final_name = new_name.unwrap_or(name);
     Ok(Json(profile_detail(&catalog, &final_name)?))
+}
+
+/// Refuse renaming or removing the profile `--profile` named when this server started: the
+/// server selects it as the default for as long as it runs, so a session naming none would be
+/// refused, and the file would no longer be one the server could start on.
+fn refuse_losing_the_started_profile(state: &ServerState, name: &str) -> Result<(), ProblemDetail> {
+    if state.shared.requested_profile() == Some(name) {
+        return Err(refused(format!(
+            "this server was started with `--profile {name}`, which selects it as the default; \
+             restart the server without `--profile` first"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse `"default": true` on a server `--profile` started: the flag selects the default for as
+/// long as the server runs, so the file's `default_profile` would move and nothing a session
+/// gets would.
+fn refuse_a_default_under_the_started_profile(
+    state: &ServerState,
+    asked: bool,
+) -> Result<(), ProblemDetail> {
+    if asked && let Some(started) = state.shared.requested_profile() {
+        return Err(refused(format!(
+            "this server was started with `--profile {started}`, which selects the default; \
+             restart the server without `--profile` first"
+        )));
+    }
+    Ok(())
 }
 
 /// `DELETE /v1/profiles/{name}`: remove a profile. The sessions recorded on it keep the name and
@@ -1672,7 +1782,7 @@ pub(crate) async fn patch_profile(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such profile", body = ProblemDetail),
-        (status = 422, description = "Another profile names it in `fallbacks`", body = ProblemDetail),
+        (status = 422, description = "Another profile names it in `fallbacks`; it is the default while two or more profiles would remain; or the server was started with `--profile` naming it; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -1682,15 +1792,16 @@ pub(crate) async fn delete_profile(
     _scoped: scope::Scoped<scope::ConfigWrite>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<StatusCode, ProblemDetail> {
-    let catalog = state.shared.providers.catalog();
-    if !catalog.profiles.contains_key(&name) {
-        return Err(not_found("profile", &name, catalog.profiles.keys()));
-    }
-    let reload = Reload::ahead_of_write(&state)?;
-    profile::remove_profile(&name, &state.shared.store)
-        .await
-        .map_err(|error| door_refusal("failed to remove the profile", error))?;
-    reload.after_write()?;
+    write_installation(&state, async |config_file| {
+        if !config_file.profiles.contains_key(&name) {
+            return Err(not_found("profile", &name, config_file.profiles.keys()));
+        }
+        refuse_losing_the_started_profile(&state, &name)?;
+        profile::remove_profile(&name, &state.shared.store)
+            .await
+            .map_err(|error| door_problem(&state, "failed to remove the profile", error))
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1722,13 +1833,6 @@ fn configured_server(
         })
 }
 
-/// What an MCP door's refusal is on the wire: the door's own sentence for what was sent, the
-/// sanitized 500 for a fault of the file or the store, through the one classification every
-/// error has.
-fn mcp_refusal(state: &ServerState, error: crate::error::MekaError) -> ProblemDetail {
-    ProblemDetail::for_error(&error, state.config.relay_provider_errors)
-}
-
 /// A configured server's entry and where its connection stands: `GET /v1/mcp/{name}`, and what
 /// every write answers with.
 #[derive(Debug, Serialize, ToSchema)]
@@ -1748,21 +1852,20 @@ async fn server_status(
     manager: &crate::mcp::McpClientManager,
     name: &str,
 ) -> Result<McpServerStatus, ProblemDetail> {
-    // What the server runs under: the entry as the file states it, with what it leaves unsaid
-    // filled in, as the manager fills its running copy.
-    let config = manager
-        .overlay()
-        .settled(&configured_server(manager, name)?);
-    let detail =
-        crate::installation::mcp::server_detail(&config, &state.shared.store.token_store())
-            .await
-            .map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to read the server", error)
-            })?;
+    let detail = crate::installation::mcp::server_detail(
+        &configured_server(manager, name)?,
+        manager.overlay(),
+        &state.shared.store.token_store(),
+    )
+    .await
+    .map_err(|error| ProblemDetail::internal_sanitized("failed to read the server", error))?;
     let (connection, error) = match manager.server_entry(name) {
         Some(entry) => {
             let state = entry.state().await;
             let error = match &state {
+                crate::mcp::ServerState::Failed {
+                    needs: Some(need), ..
+                } => Some(crate::host::http::errors::api_wording(&need.refusal(name))),
                 crate::mcp::ServerState::Failed { error, .. } => Some(error.clone()),
                 _ => None,
             };
@@ -1891,7 +1994,7 @@ impl McpServerRequest {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body: a name in use or reserved, keys that do not fit the transport, or a secret the entry cannot present", body = ProblemDetail),
+        (status = 422, description = "Invalid body: a name in use or reserved, keys that do not fit the transport, or a secret the entry cannot present; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -1908,14 +2011,14 @@ pub(crate) async fn create_mcp_server(
         auth_token: body.auth_token,
         client_secret: body.client_secret,
     };
-    let _doors = state.mcp_doors.lock().await;
-    crate::installation::mcp::add_server(&body.server, &secrets, &state.shared.store.token_store())
-        .await
-        .map_err(|error| mcp_refusal(&state, error))?;
+    let token_store = state.shared.store.token_store();
+    write_installation(&state, async |_| {
+        crate::installation::mcp::add_server(&body.server, &secrets, &token_store)
+            .await
+            .map_err(|error| door_problem(&state, "failed to add the MCP server", error))
+    })
+    .await?;
     let name = body.server.name.clone();
-    manager
-        .add_server(&body.server)
-        .map_err(|error| ProblemDetail::internal_sanitized("failed to start the server", error))?;
     tracing::info!("added MCP server '{name}' via HTTP");
     Ok((
         StatusCode::CREATED,
@@ -1924,9 +2027,9 @@ pub(crate) async fn create_mcp_server(
 }
 
 /// The body of `PATCH /v1/mcp/{name}`: any of the entry's keys, each left out to keep, `null` to
-/// remove, or a value to set, and the two secrets, each `null` to clear the kind. A string key
-/// reads `""` as `null`. `name` and `transport` are not changed: another transport is another
-/// server.
+/// remove, or a value to set, `env`, `headers` and `tool_permissions` merging key by key, and the
+/// two secrets, each `null` to clear the kind. A string key reads `""` as `null`. `name` and
+/// `transport` are not changed: another transport is another server.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PatchMcpServerRequest {
@@ -1936,15 +2039,17 @@ pub(crate) struct PatchMcpServerRequest {
     #[serde(default)]
     #[schema(value_type = Option<Vec<String>>)]
     pub(crate) args: Patch<Vec<String>>,
+    /// Merged into the entry's: a key set to a string is set, one set to `null` removed.
     #[serde(default)]
-    #[schema(value_type = Option<std::collections::HashMap<String, String>>)]
-    pub(crate) env: Patch<std::collections::HashMap<String, String>>,
+    #[schema(value_type = Option<std::collections::HashMap<String, Option<String>>>)]
+    pub(crate) env: Patch<std::collections::HashMap<String, Option<String>>>,
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub(crate) url: Patch<String>,
+    /// Merged into the entry's, as `env` is.
     #[serde(default)]
-    #[schema(value_type = Option<std::collections::HashMap<String, String>>)]
-    pub(crate) headers: Patch<std::collections::HashMap<String, String>>,
+    #[schema(value_type = Option<std::collections::HashMap<String, Option<String>>>)]
+    pub(crate) headers: Patch<std::collections::HashMap<String, Option<String>>>,
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub(crate) headers_helper: Patch<String>,
@@ -1966,10 +2071,11 @@ pub(crate) struct PatchMcpServerRequest {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub(crate) deferral: Patch<crate::config::Deferral>,
+    /// Merged into the entry's, as `env` is.
     #[serde(default)]
-    #[schema(value_type = Option<std::collections::HashMap<String, String>>)]
+    #[schema(value_type = Option<std::collections::HashMap<String, Option<String>>>)]
     pub(crate) tool_permissions:
-        Patch<std::collections::HashMap<String, crate::permission::Permission>>,
+        Patch<std::collections::HashMap<String, Option<crate::permission::Permission>>>,
     #[serde(default)]
     #[schema(value_type = Option<bool>)]
     pub(crate) trust_read_only_hint: Patch<bool>,
@@ -1987,8 +2093,9 @@ pub(crate) struct PatchMcpServerRequest {
     pub(crate) client_secret: Patch<String>,
 }
 
-/// `PATCH /v1/mcp/{name}`: change a server's entry in place and put the changed server in place
-/// of the running one, which reconnects it; a `disabled: true` stops it, `false` starts it.
+/// `PATCH /v1/mcp/{name}`: change a server's entry in place. A change to what its connection is
+/// made from, or to a credential it stores, restarts it; a change to its tool policy alone applies
+/// on the connection it holds; `disabled: true` stops it and `false` starts it.
 #[utoipa::path(
     patch,
     path = "/v1/mcp/{name}",
@@ -2001,7 +2108,7 @@ pub(crate) struct PatchMcpServerRequest {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such server", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body: keys that do not fit the transport, an `auth` block beside a stored bearer, or a secret the entry cannot present", body = ProblemDetail),
+        (status = 422, description = "Invalid body: keys that do not fit the transport, an `auth` block beside a stored bearer, or a secret the entry cannot present; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -2015,7 +2122,6 @@ pub(crate) async fn patch_mcp_server(
     let body: PatchMcpServerRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("MCP server patch", error))?;
     let manager = mcp_manager(&state)?;
-    configured_server(&manager, &name)?;
     let changes = crate::installation::mcp::ServerChanges {
         command: body.command,
         args: body.args,
@@ -2036,25 +2142,24 @@ pub(crate) async fn patch_mcp_server(
         auth_token: body.auth_token,
         client_secret: body.client_secret,
     };
-    // A login still pending was begun for the entry as it was: a bundle it minted would be for an
-    // endpoint or an `auth` the entry no longer states.
-    forget_pending_logins(&state, &name, false).await;
-    let _doors = state.mcp_doors.lock().await;
-    let config =
-        crate::installation::mcp::edit_server(&name, &changes, &state.shared.store.token_store())
+    let token_store = state.shared.store.token_store();
+    let ((_, revocation), _) = write_installation(&state, async |config_file| {
+        require_file_server(config_file, &name)?;
+        crate::installation::mcp::edit_server(&name, &changes, &token_store)
             .await
-            .map_err(|error| mcp_refusal(&state, error))?;
-    manager.replace_server(&config).await.map_err(|error| {
-        ProblemDetail::internal_sanitized("failed to restart the server", error)
-    })?;
+            .map_err(|error| door_problem(&state, "failed to change the MCP server", error))
+    })
+    .await?;
+    // Outside the write, once it has committed: the authorization server holds up nothing.
+    revocation.send().await;
     tracing::info!("changed MCP server '{name}' via HTTP");
     Ok(Json(server_status(&state, &manager, &name).await?))
 }
 
 /// `DELETE /v1/mcp/{name}`: remove a server from `config.toml` and from the running manager,
 /// closing its connection and dropping its tools from every session, and clear the credentials
-/// stored under its name, the OAuth grant revoked at the provider first where it can be. A name
-/// with credentials and no entry is cleared the same way.
+/// stored under its name, the OAuth grant revoked at the provider once the removal is served,
+/// where it can be. A name with credentials and no entry is cleared the same way.
 #[utoipa::path(
     delete,
     path = "/v1/mcp/{name}",
@@ -2065,6 +2170,7 @@ pub(crate) async fn patch_mcp_server(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such server, and no credentials under the name", body = ProblemDetail),
+        (status = 422, description = "`config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -2074,33 +2180,59 @@ pub(crate) async fn delete_mcp_server(
     _scoped: scope::Scoped<scope::ConfigWrite>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<StatusCode, ProblemDetail> {
-    let manager = mcp_manager(&state)?;
+    mcp_manager(&state)?;
     let token_store = state.shared.store.token_store();
-    let configured = configured_server(&manager, &name).is_ok();
-    if !configured {
-        let has_credentials = token_store
-            .has_mcp_credentials(&name)
+    let (revocation, _) = write_installation(&state, async |config_file| {
+        refuse_a_name_nothing_holds(config_file, &name, &token_store).await?;
+        crate::installation::mcp::remove_server(&name, &token_store)
             .await
-            .map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to read the credentials", error)
-            })?;
-        if !has_credentials {
-            return Err(not_found("MCP server", &name, manager.server_names()));
-        }
-    }
-    // A login still pending would store a credential under a name no entry claims.
-    forget_pending_logins(&state, &name, false).await;
-    let _doors = state.mcp_doors.lock().await;
-    crate::installation::mcp::remove_server(&name, &token_store)
-        .await
-        .map_err(|error| mcp_refusal(&state, error))?;
-    if configured && let Err(error) = manager.remove_server(&name).await {
-        tracing::warn!(
-            "MCP server '{name}' was removed from config.toml but not from the running manager: {error}"
-        );
-    }
+            .map_err(|error| door_problem(&state, "failed to remove the MCP server", error))
+    })
+    .await?;
+    revocation.send().await;
     tracing::info!("removed MCP server '{name}' via HTTP");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The entry `name` in the parsed file, or the 404 naming the configured ones.
+fn require_file_server(
+    config_file: &crate::config::ConfigFile,
+    name: &str,
+) -> Result<crate::config::McpServerConfig, ProblemDetail> {
+    let entries = config_file.mcp_servers();
+    entries
+        .iter()
+        .find(|entry| entry.name == name)
+        .cloned()
+        .ok_or_else(|| {
+            not_found(
+                "MCP server",
+                name,
+                entries.iter().map(|entry| entry.name.as_str()),
+            )
+        })
+}
+
+/// The 404 for a name neither the file's entries nor the stored credentials hold, from the two
+/// doors that take either: a removal and a logout.
+async fn refuse_a_name_nothing_holds(
+    config_file: &crate::config::ConfigFile,
+    name: &str,
+    token_store: &crate::store::TokenStore,
+) -> Result<(), ProblemDetail> {
+    let Err(missing) = require_file_server(config_file, name) else {
+        return Ok(());
+    };
+    let has_credentials = token_store
+        .has_mcp_credentials(name)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to read the credentials", error)
+        })?;
+    if has_credentials {
+        return Ok(());
+    }
+    Err(missing)
 }
 
 /// The body of `POST /v1/mcp/{name}/login`: a secret to store, or none to begin the OAuth login
@@ -2116,25 +2248,6 @@ pub(crate) struct McpLoginRequest {
     pub(crate) client_secret: Option<String>,
 }
 
-/// Put `name` back on the running manager from the entry as the file now states it, once a
-/// credential is stored: an `auth` block the login wrote is in force, and the login shows as a
-/// connection without the client reaching for the reconnect route.
-async fn restart_after_login(state: &ServerState, name: &str) {
-    let Ok(manager) = mcp_manager(state) else {
-        return;
-    };
-    let _doors = state.mcp_doors.lock().await;
-    match crate::installation::mcp::restart_from_file(&manager, name).await {
-        Ok(true) => tracing::info!("restarted MCP server '{name}' after its login"),
-        Ok(false) => {
-            tracing::debug!("MCP server '{name}' is no longer configured after its login");
-        }
-        Err(error) => {
-            tracing::warn!("failed to restart MCP server '{name}' after its login: {error}");
-        }
-    }
-}
-
 /// `POST /v1/mcp/{name}/login`: store a credential for a server, or begin its OAuth login in the
 /// browser.
 ///
@@ -2144,7 +2257,9 @@ async fn restart_after_login(state: &ServerState, name: &str) {
 /// login` runs at a terminal begins: the answer is 202 with the URL to open and a `login_id`,
 /// the server holds the loopback listener the browser is sent back to, and a browser elsewhere
 /// is answered by posting the callback URL to `POST /v1/mcp/{name}/login/{login_id}`. The server
-/// is restarted from the entry as the file then states it once the login completes.
+/// is restarted from the entry as the file then states it once the login completes. A
+/// `client_credentials` server needs no browser: its login connects with the stored secret and is
+/// answered 200 with the server, as a stored secret is.
 #[utoipa::path(
     post,
     path = "/v1/mcp/{name}/login",
@@ -2152,14 +2267,15 @@ async fn restart_after_login(state: &ServerState, name: &str) {
     params(("name" = String, Path, description = "MCP server name")),
     request_body = McpLoginRequest,
     responses(
-        (status = 200, description = "The secret stored; the server as it stands", body = McpServerStatus),
+        (status = 200, description = "The secret stored, or a login that needed no browser completed: a `client_credentials` server's; the server as it stands", body = McpServerStatus),
         (status = 202, description = "A browser login begun; open the URL, then complete the login", body = LoginStarted),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such server", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "A secret the entry cannot present, both secrets at once, or a login the entry cannot run: a stdio server, or one holding a bearer", body = ProblemDetail),
+        (status = 422, description = "A secret the entry cannot present, both secrets at once, or a login the entry cannot run: a stdio server, or one holding a bearer; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 502, description = "The login did not begin: the server or its authorization server did not answer; the reason is in the meka log", body = ProblemDetail),
+        (status = 503, description = "The server is shutting down", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -2180,9 +2296,6 @@ pub(crate) async fn login_mcp_server(
             .map_err(|error| ProblemDetail::invalid_body("MCP login", error))?
     };
     let manager = mcp_manager(&state)?;
-    configured_server(&manager, &name)?;
-    let configs = manager.server_configs();
-    let overlay = manager.overlay().clone();
     let token_store = state.shared.store.token_store();
     let secret = match (body.auth_token, body.client_secret) {
         (Some(_), Some(_)) => {
@@ -2195,18 +2308,32 @@ pub(crate) async fn login_mcp_server(
         (None, None) => None,
     };
     if let Some((kind, secret)) = secret {
-        crate::installation::mcp::store_server_secret(&configs, &token_store, &name, kind, &secret)
+        // Served after, so the server restarts on the secret.
+        write_installation(&state, async |config_file| {
+            require_file_server(config_file, &name)?;
+            crate::installation::mcp::store_server_secret(
+                &config_file.mcp_servers(),
+                &token_store,
+                &name,
+                kind,
+                &secret,
+            )
             .await
-            .map_err(|error| mcp_refusal(&state, error))?;
+            .map_err(|error| door_problem(&state, "failed to store the credential", error))
+        })
+        .await?;
         tracing::info!("stored a credential for MCP server '{name}' via HTTP");
-        // In the request, so the answer carries the restarted server's state.
-        restart_after_login(&state, &name).await;
         return Ok(Json(server_status(&state, &manager, &name).await?).into_response());
     }
 
+    // The login begins against the entry as the file states it, which its commit holds it to.
+    let config_file = installation_as_written(&state)?;
+    require_file_server(&config_file, &name)?;
+    let servers = config_file.mcp_servers();
+    let overlay = manager.overlay().clone();
     let server = name.clone();
     let state_for_flow = state.clone();
-    let started = begin_login(
+    let begun = begin_login(
         &state,
         &name,
         false,
@@ -2214,47 +2341,67 @@ pub(crate) async fn login_mcp_server(
         // both, so the login outlives neither.
         crate::mcp::auth::OAUTH_CALLBACK_TIMEOUT + crate::installation::mcp::PROBE_CONNECT_TIMEOUT,
         move |prompt| async move {
-            let login_prompt: Arc<dyn crate::oauth::LoginPrompt> = prompt;
-            let result = crate::installation::mcp::login_server(
-                &configs,
+            let login_prompt: Arc<dyn crate::oauth::LoginPrompt> = Arc::clone(&prompt) as _;
+            let grant = crate::installation::mcp::obtain_login(
+                &servers,
                 &overlay,
                 &token_store,
                 &server,
                 login_prompt,
             )
-            .await;
-            match result {
-                Ok(()) => {
-                    tracing::info!("logged in MCP server '{server}' from the browser");
-                    restart_after_login(&state_for_flow, &server).await;
-                    Ok(())
-                }
-                Err(error) => {
-                    tracing::warn!("the browser login for MCP server '{server}' failed: {error}");
-                    // An auth failure carries the reason the flow recorded, a URL in which may
-                    // name a key, as a connector's reason may; its kind's sentence names nothing,
-                    // and the client managing servers over HTTP has no log to read one from.
-                    Err(match (&error, error.kind()) {
-                        // What was asked cannot be done as asked, in the door's own words.
-                        (_, ErrorKind::InvalidBody) => {
-                            LoginFailure::Refused(crate::text::redact_urls(&error.sentence()))
-                        }
-                        (crate::error::MekaError::McpAuth { message, .. }, _) => {
-                            LoginFailure::Upstream(format!(
-                                "the login did not complete: {}",
-                                crate::text::redact_urls(message)
-                            ))
-                        }
-                        _ => LoginFailure::Upstream(
-                            "the login did not complete; the reason is in the meka log".to_string(),
-                        ),
+            .await
+            .map_err(|error| mcp_login_problem(&state_for_flow, &server, error))?;
+            commit_on_its_own_task(&state_for_flow, &prompt, {
+                let state = state_for_flow.clone();
+                let server = server.clone();
+                async move {
+                    write_installation(&state, async |config_file| {
+                        crate::installation::mcp::commit_login(config_file, grant, &token_store)
+                            .await
+                            .map_err(|error| mcp_login_problem(&state, &server, error))
                     })
+                    .await
+                    .map(|_| ())
                 }
-            }
+            })
+            .await?;
+            tracing::info!("logged in MCP server '{server}' from the browser");
+            Ok(())
         },
     )
     .await?;
-    Ok((StatusCode::ACCEPTED, Json(started)).into_response())
+    match begun {
+        Begun::Browser(started) => Ok((StatusCode::ACCEPTED, Json(started)).into_response()),
+        Begun::Completed => Ok(Json(server_status(&state, &manager, &name).await?).into_response()),
+    }
+}
+
+/// What an MCP login's failure is on the wire. An auth failure carries the reason the flow
+/// recorded, with URLs redacted, since a URL may name a key, as a connector's reason may; its
+/// kind's sentence names nothing, and the client managing servers over HTTP has no log to read
+/// one from. A refusal is the door's own words, the rest the log's to say.
+fn mcp_login_problem(
+    state: &ServerState,
+    server: &str,
+    error: crate::error::MekaError,
+) -> ProblemDetail {
+    tracing::warn!("the browser login for MCP server '{server}' failed: {error}");
+    match &error {
+        crate::error::MekaError::McpCredentialInTheWay { .. } => {
+            door_problem(state, "the MCP login failed", error)
+        }
+        _ if error.kind() == ErrorKind::InvalidBody => {
+            refused(crate::text::redact_urls(&error.sentence()))
+        }
+        crate::error::MekaError::McpAuth { message, .. } => upstream(format!(
+            "the login did not complete: {}",
+            crate::text::redact_urls(message)
+        )),
+        crate::error::MekaError::Database(_) | crate::error::MekaError::Io(_) => {
+            ProblemDetail::internal_sanitized("the MCP login failed", error)
+        }
+        _ => upstream("the login did not complete; the reason is in the meka log"),
+    }
 }
 
 /// `GET /v1/mcp/{name}/login/{login_id}`: where a browser login stands.
@@ -2288,8 +2435,8 @@ pub(crate) async fn mcp_login_status(
 /// browser was sent to, when it could not reach the listener itself.
 ///
 /// A URL with no code in it is refused and leaves the login pending, as an account's is. The
-/// answer waits for the exchange and the restart, so the server it carries is the one the
-/// credential connected.
+/// answer waits for the exchange and the commit; the restart connects in the background, so the
+/// server it carries is `pending` until it has.
 #[utoipa::path(
     post,
     path = "/v1/mcp/{name}/login/{login_id}",
@@ -2305,8 +2452,9 @@ pub(crate) async fn mcp_login_status(
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such login pending on the server, or one that lapsed", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "No code in what was posted, another login's state, or a login that had already ended", body = ProblemDetail),
+        (status = 422, description = "No code in what was posted, another login's state, or a login that had already ended; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 502, description = "The exchange at the authorization server failed; the reason is in the meka log", body = ProblemDetail),
+        (status = 503, description = "The server is shutting down", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -2327,9 +2475,9 @@ pub(crate) async fn complete_mcp_login(
     Ok(Json(server_status(&state, &manager, &name).await?))
 }
 
-/// `POST /v1/mcp/{name}/logout`: clear every credential stored for a server, the OAuth grant
-/// revoked at the provider first where it can be. A connection already open stays until the
-/// server is reconnected.
+/// `POST /v1/mcp/{name}/logout`: clear every credential stored for a server and restart it
+/// without them, the OAuth grant revoked at the provider once that is served, where it can be. A
+/// server holding none is left as it is.
 #[utoipa::path(
     post,
     path = "/v1/mcp/{name}/logout",
@@ -2340,6 +2488,7 @@ pub(crate) async fn complete_mcp_login(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such server, and no credentials under the name", body = ProblemDetail),
+        (status = 422, description = "`config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["config:w"]))
@@ -2349,24 +2498,17 @@ pub(crate) async fn logout_mcp_server(
     _scoped: scope::Scoped<scope::ConfigWrite>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<StatusCode, ProblemDetail> {
-    let manager = mcp_manager(&state)?;
+    mcp_manager(&state)?;
     let token_store = state.shared.store.token_store();
-    if configured_server(&manager, &name).is_err() {
-        let has_credentials = token_store
-            .has_mcp_credentials(&name)
+    // Served after, so the server restarts without the credentials it held.
+    let (revocation, _) = write_installation(&state, async |config_file| {
+        refuse_a_name_nothing_holds(config_file, &name, &token_store).await?;
+        crate::installation::mcp::logout_server(&config_file.mcp_servers(), &token_store, &name)
             .await
-            .map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to read the credentials", error)
-            })?;
-        if !has_credentials {
-            return Err(not_found("MCP server", &name, manager.server_names()));
-        }
-    }
-    // A login still pending would store the credential this clears.
-    forget_pending_logins(&state, &name, false).await;
-    crate::installation::mcp::logout_server(&manager.server_configs(), &token_store, &name)
-        .await
-        .map_err(|error| mcp_refusal(&state, error))?;
+            .map_err(|error| door_problem(&state, "failed to clear the credentials", error))
+    })
+    .await?;
+    revocation.send().await;
     tracing::info!("logged out MCP server '{name}' via HTTP");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2383,7 +2525,7 @@ mod tests {
             r#"{"context_window": null, "effort": "", "model": "m", "vision": false}"#,
         )
         .expect("parse");
-        let changes = body.into_changes().expect("changes");
+        let changes = body.into_changes();
         assert_eq!(changes.model, Patch::Set("m".to_string()));
         assert_eq!(changes.fallbacks, Patch::Keep);
         assert_eq!(changes.context_window, Patch::Remove);
@@ -2400,7 +2542,7 @@ mod tests {
             serde_json::from_str(r#"{"name": "primary"}"#).expect("parse");
         assert_eq!(rename.name.as_deref(), Some("primary"));
         assert_eq!(rename.default, None);
-        assert!(rename.into_changes().expect("changes").is_empty());
+        assert!(rename.into_changes().is_empty());
     }
 
     /// The secrets ride beside the entry and are taken out of it: the entry keeps refusing a key

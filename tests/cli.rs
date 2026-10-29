@@ -3326,6 +3326,12 @@ fn mcp_views_report_the_file_s_defaults_for_what_an_entry_leaves_unsaid() {
         "mcp", "get", "stub", "--format", "json",
     ]));
     assert_eq!(shown["required"], true, "{shown}");
+    assert_eq!(shown["deferral"], "eager", "{shown}");
+    assert_eq!(
+        shown["inherited"],
+        serde_json::json!(["required", "deferral"]),
+        "what the entry leaves to `[mcp]`: {shown}"
+    );
     let tools = json_stdout(run_isolated(&install, &[
         "mcp", "tools", "stub", "--format", "json",
     ]));
@@ -4691,5 +4697,109 @@ fn memory_export_imports_into_another_installation() {
         forced.status.success(),
         "{}",
         String::from_utf8_lossy(&forced.stderr)
+    );
+}
+
+/// `meka profile remove` refuses the default while two or more profiles would remain, naming
+/// `meka profile use`; with one left it removes the profile and drops the key, since the one left
+/// is the default by the selection rule.
+#[test]
+fn profile_remove_refuses_the_default_while_others_would_remain() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"a\"\n\n[accounts.x]\nbackend = \"anthropic-messages\"\n\n\
+         [profiles.a]\naccount = \"x\"\nmodel = \"m\"\n\n[profiles.b]\naccount = \"x\"\nmodel = \
+         \"m\"\n\n[profiles.c]\naccount = \"x\"\nmodel = \"m\"\n",
+    );
+    let refused = run_isolated(&install, &["profile", "remove", "a"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("'a' is the default profile")
+            && stderr.contains("`meka profile use <name>`"),
+        "{stderr}"
+    );
+    let config_path = install.config_dir().join("config.toml");
+    let config = std::fs::read_to_string(&config_path).expect("read config");
+    assert!(config.contains("[profiles.a]"), "nothing removed: {config}");
+
+    let removed = run_isolated(&install, &["profile", "remove", "b"]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let removed = run_isolated(&install, &["profile", "remove", "a"]);
+    assert!(
+        removed.status.success(),
+        "the default with one other left: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let config = std::fs::read_to_string(&config_path).expect("read config");
+    assert!(!config.contains("default_profile"), "{config}");
+    assert!(config.contains("[profiles.c]"), "{config}");
+}
+
+/// A credential a removed account left behind is not adopted or overwritten by an account added
+/// under its name: refused before any prompt, naming the command that clears it.
+#[test]
+fn account_add_refuses_a_name_holding_a_removed_account_s_credential() {
+    let install = Install::new();
+    let add = |name: &str| {
+        let mut add = install
+            .meka(&[
+                "account",
+                "add",
+                name,
+                "--backend",
+                "anthropic-messages",
+                "--api-key-stdin",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn add");
+        {
+            use std::io::Write;
+            add.stdin
+                .take()
+                .expect("stdin")
+                .write_all(b"sk-test\n")
+                .expect("write the key");
+        }
+        add.wait_with_output().expect("add")
+    };
+    let first = add("work");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    // Taken out of the file by hand; the credential stays.
+    install.write_config("");
+    let again = add("work");
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        !again.status.success()
+            && stderr.contains(
+                "'work' has a stored credential left over from a removed account; clear it first \
+                 with `meka account remove work`"
+            ),
+        "{stderr}"
+    );
+}
+
+/// A logout of a name no server is configured under and no credential is stored for is refused,
+/// as the HTTP route refuses it, rather than reporting a clear of nothing.
+#[test]
+fn mcp_logout_refuses_a_name_nothing_holds() {
+    let install = Install::new();
+    install.write_config("");
+    let output = run_isolated(&install, &["mcp", "logout", "nosuchserver"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("no MCP server named 'nosuchserver'"),
+        "{stderr}"
     );
 }

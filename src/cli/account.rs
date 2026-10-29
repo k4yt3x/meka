@@ -7,8 +7,9 @@ use crate::{
     cli::AccountAction,
     config,
     installation::account::{
-        CredentialKind, OAuthSettings, account_views, browser_login, credential_kind,
-        orphaned_accounts, remove_account, rename_account, validate_backend, write_account,
+        CredentialKind, LoginTerms, NewAccount, OAuthSettings, account_views, add_account,
+        browser_login, commit_login, credential_kind, orphaned_accounts, remove_account,
+        rename_account, validate_backend,
     },
     store::{AuthCredential, TokenStore},
 };
@@ -49,9 +50,9 @@ pub(crate) async fn run(
             .await
         }
         AccountAction::List { format } => run_list(token_store, *format).await,
-        AccountAction::Remove { name } => remove_account(name, token_store).await,
+        AccountAction::Remove { name } => Ok(remove_account(name, token_store).await?),
         AccountAction::Rename { name, new_name } => {
-            rename_account(name, new_name, token_store).await
+            Ok(rename_account(name, new_name, token_store).await?)
         }
         AccountAction::Login {
             name,
@@ -72,9 +73,7 @@ async fn run_add(
     api_key_stdin: bool,
     token_store: &TokenStore,
 ) -> anyhow::Result<()> {
-    if name.trim().is_empty() {
-        anyhow::bail!("account name cannot be empty");
-    }
+    crate::installation::refuse_an_unusable_name("account", name)?;
     // Every prompt below reads the stdin the key is piped on, so under `--api-key-stdin` a prompt
     // would eat the secret, or write a second piped line to `config.toml` as `base_url`. The
     // backend is required up front and the base URL takes the backend default.
@@ -87,10 +86,12 @@ async fn run_add(
         // a backend that logs in through the browser, so a script piping a key would hang on a
         // flow it cannot see while the key it piped went unread.
         if !matches!(credential_kind(backend), CredentialKind::ApiKey) {
-            anyhow::bail!(
-                "'{backend}' logs in through the browser and takes no API key; drop \
-                 `--api-key-stdin`"
-            );
+            return Err(crate::error::MekaError::AccountCredentialKind {
+                account: name.to_string(),
+                backend: backend.name().to_string(),
+                key_given: true,
+            }
+            .into());
         }
     }
     // Hard-fails on an unparseable config rather than warning: this guard is the only thing
@@ -103,16 +104,21 @@ async fn run_add(
              {name}`"
         );
     }
+    // Ahead of the prompts and the login, which the door's own refusal would come after.
+    crate::installation::account::refuse_a_leftover_credential(token_store, name).await?;
 
     let backend = match backend_flag {
         Some(value) => validate_backend(value)?,
         None => prompt_backend()?,
     };
-    // Refused rather than written and ignored, the way a key the backend never reads is warned
-    // about when hand-written: a flag that does nothing on this backend is a mistake to name.
-    if interleaved_thinking.is_some() && !backend.reads_account_key("interleaved_thinking") {
-        anyhow::bail!("`--interleaved-thinking` is read by `anthropic-messages` alone; drop it");
-    }
+    // The door's own rule, asked ahead of the prompts and the login it would otherwise follow.
+    crate::installation::account::refuse_inert_account_keys(&NewAccount {
+        name,
+        backend,
+        base_url: None,
+        settings: &settings_flags,
+        interleaved_thinking,
+    })?;
 
     let base_url = match base_url_flag {
         Some(url) => Some(url),
@@ -141,7 +147,7 @@ async fn run_add(
         crate::provider::openai::subscription::chatgpt_base_url_shape(url)?;
     }
 
-    let settings = drop_inert_settings(settings_flags, backend);
+    let settings = settings_flags;
 
     // Last, after every prompt: the Codex login races a pasted-callback reader against the loopback
     // callback, and a callback win can leave a stdin read parked, so nothing may read stdin after.
@@ -157,44 +163,21 @@ async fn run_add(
     )
     .await?;
 
-    // The account before the secret, so the half that lands first is the visible half: a failed
-    // config write then leaves an account with no credential, which the next run refuses by name,
-    // rather than a credential no account names, which only `account list` reports.
-    write_account(
-        name,
-        backend,
-        base_url.as_deref(),
-        &settings,
-        interleaved_thinking,
-    )?;
-    token_store
-        .save_account_credential(name, &credential)
-        .await?;
+    add_account(
+        &NewAccount {
+            name,
+            backend,
+            base_url: base_url.as_deref(),
+            settings: &settings,
+            interleaved_thinking,
+        },
+        Some(&credential),
+        token_store,
+    )
+    .await?;
 
     tracing::info!("added account '{name}'");
     Ok(())
-}
-
-/// Drop an OAuth override aimed at a backend that never reads it, saying so.
-///
-/// Through [`config::Backend::reads_account_key`], the one place that knows which backend reads
-/// what. Writing the key anyway would produce a setting that reads plausibly and does nothing,
-/// which the load-time warning would then report on every start.
-fn drop_inert_settings(mut settings: OAuthSettings, backend: config::Backend) -> OAuthSettings {
-    let mut dropped: Vec<&str> = Vec::new();
-    if !backend.reads_account_key("client_id") && settings.client_id.take().is_some() {
-        dropped.push("--client-id");
-    }
-    if !backend.reads_account_key("oauth_token_url") && settings.oauth_token_url.take().is_some() {
-        dropped.push("--oauth-token-url");
-    }
-    if !dropped.is_empty() {
-        tracing::warn!(
-            "ignoring {dropped}: an account on '{backend}' never reads it",
-            dropped = dropped.join(", "),
-        );
-    }
-    settings
 }
 
 async fn run_login(
@@ -203,13 +186,7 @@ async fn run_login(
     token_store: &TokenStore,
 ) -> anyhow::Result<()> {
     let config_file = config::load_config_file_or_err()?;
-    let Some(account) = config_file.accounts.get(name) else {
-        anyhow::bail!(crate::text::unknown_name(
-            "account",
-            name,
-            config_file.accounts.keys()
-        ));
-    };
+    let account = crate::installation::account::require_account(&config_file, name)?;
     // Before the guard below, which asks `credential_kind` a question it answers `None` to for a
     // backend it does not recognize. Otherwise a typo'd `backend` is diagnosed as a browser login
     // and the user is sent to run the command again without the flag, only to meet the real error
@@ -219,11 +196,14 @@ async fn run_login(
     // script piping a key to one would hang on an OAuth flow it cannot see. The account names its
     // backend, so this is answerable before anything opens.
     if api_key_stdin && !matches!(credential_kind(backend), CredentialKind::ApiKey) {
-        anyhow::bail!(
-            "'{name}' is a '{backend}' account, which logs in through the browser and takes no API \
-             key; drop `--api-key-stdin`"
-        );
+        return Err(crate::error::MekaError::AccountCredentialKind {
+            account: name.to_string(),
+            backend: backend.name().to_string(),
+            key_given: true,
+        }
+        .into());
     }
+    let began = LoginTerms::of(account);
     let credential = acquire_credential(
         backend,
         api_key_stdin,
@@ -231,9 +211,16 @@ async fn run_login(
         account.oauth_token_url.as_deref(),
     )
     .await?;
-    token_store
-        .save_account_credential(name, &credential)
-        .await?;
+    // Against the file as it stands once the person is done, which the browser step may have
+    // given minutes to change.
+    commit_login(
+        &config::load_config_file_or_err()?,
+        name,
+        &began,
+        &credential,
+        token_store,
+    )
+    .await?;
     tracing::info!("re-authenticated account '{name}'");
     Ok(())
 }
@@ -1014,10 +1001,12 @@ mod tests {
         assert_eq!(status.expires_at, None);
     }
 
-    /// `--interleaved-thinking` is `anthropic-messages`'s key; on any other backend it would be
-    /// written and never read, so the door refuses it in the words the hand-written warning uses.
+    /// A setting the backend never reads, `--interleaved-thinking` on any backend but
+    /// `anthropic-messages` and an OAuth override on an API-key backend, would be written and
+    /// never read, so `add` refuses it ahead of the key prompt, in the words the door refuses it
+    /// with over HTTP.
     #[tokio::test]
-    async fn add_refuses_the_interleaved_thinking_flag_on_a_backend_that_never_reads_it() {
+    async fn add_refuses_a_setting_the_backend_never_reads_ahead_of_the_prompts() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("config.toml"), "").expect("write config");
         let store = crate::store::Store::for_test().await.token_store();
@@ -1025,7 +1014,7 @@ mod tests {
         // SAFETY: as in the sibling tests.
         let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
-        let result = run_add(
+        let thinking = run_add(
             "home",
             Some("openai-responses"),
             None,
@@ -1035,12 +1024,29 @@ mod tests {
             &store,
         )
         .await;
+        let client = run_add(
+            "home",
+            Some("openai-responses"),
+            None,
+            OAuthSettings {
+                oauth_token_url: None,
+                client_id: Some("mine".to_string()),
+            },
+            None,
+            true,
+            &store,
+        )
+        .await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
-        let error = result
-            .expect_err("refused ahead of the key prompt")
-            .to_string();
-        assert!(error.contains("`--interleaved-thinking`"), "{error}");
-        assert!(error.contains("anthropic-messages"), "{error}");
+        for (result, key) in [(thinking, "interleaved_thinking"), (client, "client_id")] {
+            let error = result
+                .expect_err("refused ahead of the key prompt")
+                .to_string();
+            assert_eq!(
+                error,
+                format!("an account on 'openai-responses' never reads `{key}`; drop it")
+            );
+        }
     }
 
     /// The sibling of `login_refuses_a_piped_key_for_a_browser_backend`, and asserted together
@@ -1169,24 +1175,6 @@ mod tests {
         assert!(
             !error.contains("meka account add"),
             "an unreadable file is not a missing profile: {error}"
-        );
-    }
-
-    /// An OAuth override aimed at an API-key backend is dropped with a warning rather than written
-    /// where nothing reads it; the subscription backends keep it.
-    #[test]
-    fn an_oauth_override_aimed_at_a_key_backend_is_dropped() {
-        let flags = || OAuthSettings {
-            oauth_token_url: Some("https://auth.invalid/token".to_string()),
-            client_id: Some("my-client".to_string()),
-        };
-        let key = drop_inert_settings(flags(), config::Backend::OpenAiResponses);
-        assert!(key.client_id.is_none() && key.oauth_token_url.is_none());
-        let subscription = drop_inert_settings(flags(), config::Backend::ChatGptSubscription);
-        assert_eq!(subscription.client_id.as_deref(), Some("my-client"));
-        assert_eq!(
-            subscription.oauth_token_url.as_deref(),
-            Some("https://auth.invalid/token")
         );
     }
 

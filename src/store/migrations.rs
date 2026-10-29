@@ -110,6 +110,11 @@ pub(crate) struct Context {
     /// the scheduler, which is the safe direction, and the interactive hosts fall back to their
     /// own default when they read one.
     pub(crate) default_permission: String,
+    /// Each http MCP server `config.toml` configures, by name, with the endpoint its stored
+    /// credentials are presented to: its `url` with every `${VAR}` expanded, in the canonical
+    /// form a stored credential records, or what this process's environment leaves unresolved
+    /// in the `url`. Empty when the caller read no file.
+    pub(crate) mcp_endpoints: Vec<(String, std::result::Result<String, String>)>,
 }
 
 impl Context {
@@ -119,12 +124,22 @@ impl Context {
             default_provider: profile.unwrap_or_default().to_string(),
             config_unreadable: false,
             default_permission: String::new(),
+            mcp_endpoints: Vec::new(),
         }
     }
 
     /// The same, with the level a session that never recorded one adopts.
     pub(crate) fn starting_at(mut self, permission: &str) -> Self {
         self.default_permission = permission.to_string();
+        self
+    }
+
+    /// The same, with the endpoint each configured MCP server's credentials are bound to.
+    pub(crate) fn binding_mcp_credentials_to(
+        mut self,
+        endpoints: Vec<(String, std::result::Result<String, String>)>,
+    ) -> Self {
+        self.mcp_endpoints = endpoints;
         self
     }
 
@@ -140,6 +155,7 @@ impl Context {
             default_provider: String::new(),
             config_unreadable: true,
             default_permission: String::new(),
+            mcp_endpoints: Vec::new(),
         }
     }
 }
@@ -426,6 +442,25 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "compact_boundaries_record_their_compaction",
         step: Step::Rust(compact_boundaries_record_their_compaction),
+    },
+    // 0.85 counts every write of an MCP server's credentials but a token refresh, per server and
+    // past a clear, so a host serving the installation can tell a server whose credential changed
+    // under it, whichever process wrote it. A server written before the table counts from zero.
+    Migration {
+        name: "mcp_credentials_count_their_writes",
+        step: Step::Sql(
+            "CREATE TABLE IF NOT EXISTS mcp_credential_generations (
+                 server     TEXT PRIMARY KEY,
+                 generation INTEGER NOT NULL
+             )",
+        ),
+    },
+    // 0.85 binds every MCP credential to the endpoint it was stored for, which a connect presents
+    // it to alone. A credential stored before the column is bound to the URL its server is
+    // configured with now, the one it has been presented to; one no server claims to none.
+    Migration {
+        name: "mcp_credentials_name_their_endpoint",
+        step: Step::Contextual(mcp_credentials_name_their_endpoint),
     },
 ];
 
@@ -840,6 +875,7 @@ const HEAD_TABLES: &[&str] = &[
     "background_tasks",
     "blobs",
     "inbox_items",
+    "mcp_credential_generations",
     "mcp_credentials",
     "memories",
     "message_blobs",
@@ -854,7 +890,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 13_810_882_772_540_558_385;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 7_151_354_190_224_943_844;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -4378,6 +4414,70 @@ fn root_rows_take_the_default_level_once_the_config_reads(
     Ok(())
 }
 
+/// Bind each MCP credential to the endpoint it is presented to: the column, then every row, to
+/// the URL `context` says its server is configured with. A row no configured server claims stays
+/// bound to none and is never presented. Refused, aborting the transaction, while a row is to be
+/// bound and the caller could not read `config.toml`, or could not resolve its server's `url`, so
+/// the binding is made on a later run that can rather than to nothing or to the literal. Safe to
+/// replay: a store that has the column has been through this step, and is left alone.
+fn mcp_credentials_name_their_endpoint(
+    transaction: &rusqlite::Transaction<'_>,
+    context: &Context,
+) -> rusqlite::Result<()> {
+    let columns = {
+        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = statement.query_map(["mcp_credentials"], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    // Bound in the run that adds the column and in no other: a replay finds every row through this
+    // step already, and an empty endpoint then is a credential deliberately bound to no server,
+    // which a server of the same name added since must not adopt.
+    if columns.iter().any(|column| column == "endpoint") {
+        return Ok(());
+    }
+    transaction.execute_batch(
+        "ALTER TABLE mcp_credentials ADD COLUMN endpoint TEXT NOT NULL DEFAULT ''",
+    )?;
+    let unbound: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM mcp_credentials", [], |row| row.get(0))?;
+    if unbound == 0 {
+        return Ok(());
+    }
+    if context.config_unreadable {
+        // `InvalidParameterName` for the reason the 0.44 step gives.
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "cannot bind {unbound} MCP credential(s) to their servers while config.toml cannot be \
+             read; fix the file and start meka again"
+        )));
+    }
+    for (server, endpoint) in &context.mcp_endpoints {
+        match endpoint {
+            Ok(endpoint) => {
+                transaction.execute(
+                    "UPDATE mcp_credentials SET endpoint = ?2 WHERE server = ?1",
+                    rusqlite::params![server, endpoint],
+                )?;
+            }
+            Err(why) => {
+                let held: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM mcp_credentials WHERE server = ?1",
+                    [server],
+                    |row| row.get(0),
+                )?;
+                // Refused rather than bound to the literal, which would hold the credential for a
+                // URL no connect reaches, for good.
+                if held > 0 {
+                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                        "cannot bind {held} MCP credential(s) to '{server}' while its `url` does \
+                         not resolve: {why}; start meka again where it does"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The profile named by the only stored credential, when there is exactly one.
 ///
 /// Ambiguity is not resolved by picking: with two credentials there is no evidence here about which
@@ -4935,6 +5035,14 @@ mod tests {
             (
                 "compact_boundaries_record_their_compaction",
                 8832125766036357788_u64,
+            ),
+            (
+                "mcp_credentials_count_their_writes",
+                5989719722207488857_u64,
+            ),
+            (
+                "mcp_credentials_name_their_endpoint",
+                16595899173170091335_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
@@ -6683,6 +6791,111 @@ mod tests {
             )
             .expect("query");
         assert_eq!(old, 0, "the table named for one kind is gone");
+    }
+
+    /// Every MCP credential is bound once to the URL its server is configured with, a row no
+    /// server claims to none; a replay rebinds nothing, not even a row bound to none whose name a
+    /// server has taken since; and while a row is to be bound, an unreadable config, or a `url`
+    /// the environment leaves unresolved, refuses the migration whole rather than binding it to
+    /// nothing or to the literal.
+    #[test]
+    fn every_mcp_credential_is_bound_once_to_its_server_s_url() {
+        let mut connection = store_as_0_42_left_it();
+        let from = stopped_before(&mut connection, "mcp_credentials_name_their_endpoint");
+        connection
+            .execute_batch(
+                "INSERT INTO mcp_credentials (server, kind, secret, updated_at) VALUES \
+                 ('docs', 'oauth', '{}', '2026-01-01T00:00:00Z'), \
+                 ('docs', 'client_secret', 'cs', '2026-01-01T00:00:00Z'), \
+                 ('gone', 'bearer', 'b', '2026-01-01T00:00:00Z')",
+            )
+            .expect("three stored credentials");
+        let endpoints = |connection: &rusqlite::Connection| -> Vec<(String, String, String)> {
+            let mut statement = connection
+                .prepare("SELECT server, kind, endpoint FROM mcp_credentials ORDER BY 1, 2")
+                .expect("the column exists");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+
+        let pending = plan(&connection).expect("classified");
+        let error = apply(&mut connection, pending, &Context::on_unreadable_config())
+            .expect_err("a row to bind refuses an unreadable config");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot bind 3 MCP credential(s)"),
+            "{error}"
+        );
+        assert_eq!(user_version(&connection).expect("version"), from);
+
+        let pending = plan(&connection).expect("classified");
+        let error = apply(
+            &mut connection,
+            pending,
+            &Context::adopting(Some("p")).binding_mcp_credentials_to(vec![(
+                "docs".to_string(),
+                Err("environment variable(s) [\"HOST\"] are unset".to_string()),
+            )]),
+        )
+        .expect_err("a row to bind refuses a url the environment leaves unresolved");
+        assert!(
+            error.to_string().contains(
+                "cannot bind 2 MCP credential(s) to 'docs' while its `url` does not resolve: \
+                 environment variable(s) [\"HOST\"] are unset"
+            ),
+            "{error}"
+        );
+        assert_eq!(user_version(&connection).expect("version"), from);
+
+        let pending = plan(&connection).expect("classified");
+        apply(
+            &mut connection,
+            pending,
+            &Context::adopting(Some("p")).binding_mcp_credentials_to(vec![(
+                "docs".to_string(),
+                Ok("https://docs.example/mcp".to_string()),
+            )]),
+        )
+        .expect("migrated");
+        let bound = vec![
+            (
+                "docs".to_string(),
+                "client_secret".to_string(),
+                "https://docs.example/mcp".to_string(),
+            ),
+            (
+                "docs".to_string(),
+                "oauth".to_string(),
+                "https://docs.example/mcp".to_string(),
+            ),
+            ("gone".to_string(), "bearer".to_string(), String::new()),
+        ];
+        assert_eq!(endpoints(&connection), bound);
+
+        connection
+            .execute_batch("PRAGMA user_version = 0;")
+            .expect("the round trip that drops the version");
+        let replayed = plan(&connection).expect("classified by shape");
+        apply(
+            &mut connection,
+            replayed,
+            &Context::adopting(Some("p")).binding_mcp_credentials_to(vec![
+                (
+                    "docs".to_string(),
+                    Ok("https://elsewhere.example/mcp".to_string()),
+                ),
+                (
+                    "gone".to_string(),
+                    Ok("https://new.example/mcp".to_string()),
+                ),
+            ]),
+        )
+        .expect("the replay must not fail");
+        assert_eq!(endpoints(&connection), bound, "a replay rebinds nothing");
     }
 
     /// Rule 3, for the step that rebuilds a table rather than altering one. A bare `CREATE TABLE`

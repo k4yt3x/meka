@@ -230,7 +230,10 @@ One word per concept, everywhere it is written or read:
   server); *deny* is the OS, a permission, or the user's answer; *decline* is a gate or the model.
 - Quoting in a message: backticks for keys, commands and code (`` `[permissions].default` ``,
   `` `meka profile use` ``); single quotes for values and names (`'work'`). An unknown name is
-  reported through `text::unknown_name`, never a per-door sentence.
+  reported through `text::unknown_name`, never a per-door sentence. A refusal whose remedy is a
+  command is a typed `MekaError` variant (`ProfileDefaultStillNeeded`, `McpCredentialInTheWay`):
+  its `Display` is the shell's sentence, and `ProblemDetail::for_error` words the route from its
+  fields, the one place every HTTP route takes it from.
 - An empty list says "No <nouns>." on stderr. Every line meka says in its own voice, a status
   line, a notice, a stage direction, a turn's end row, a note printed on the way out, starts
   with a capital letter whatever its shape ("Background task 7f3a1c22 finished after 6s",
@@ -298,9 +301,10 @@ output; don't demote it to `info!`.
   > the sole profile; a sub-agent's row records the profile its `agent_spawn` call named, else its
   parent's live profile, which it keeps following. Accounts are managed by `meka account` (`add`/`login`/`list`/`rename`/`remove`) and
   profiles by `meka profile` (`add`/`set`/`use`/`list`/`rename`/`remove`), mirroring `meka mcp`: `use` is the
-  command that points `default_profile` at a profile (`profile remove` unsets it when it named the
-  removed profile; `profile add` names the profile that was alone when a second joins it, so the
-  default stays put), `account login` rotates a credential without touching the account or its profiles,
+  command that points `default_profile` at a profile (`profile remove` refuses the default while
+  two or more profiles would remain and drops the key when one would; `profile add` names the
+  profile that was alone when a second joins it, so the default stays put), `account login`
+  rotates a credential without touching the account or its profiles,
   `account remove` refuses while a profile names the account, and a `rename` moves the name
   everywhere it is recorded (the credential row and every profile's `account`; `default_profile`,
   every session row and each pinned sub-agent spec) and changes no setting.
@@ -471,12 +475,13 @@ entry to add.
 The tree reads top-down. `src/main.rs` dispatches to `host/` and `cli/`; the screen's slash commands
 run the `cli` handlers, so `host` sits above `cli`. Both edit the installation (`config.toml`'s
 accounts, profiles and MCP servers, and the credential rows) through `installation`, below them and
-above `mcp`: a prompt belongs to `cli`, a request body to `host`, the door to neither. Both call
-`agent`, which calls `tools`, which
-calls `provider` and `mcp`, which call `store`. `mcp` publishes its tools and never names a registry;
-`tools/mcp_adapter.rs` is where they become `Tool`s. `render` is reached only from `host`, `cli`
-and the frontend implementations; `streams` is the leaf that writes stderr for
-everyone. `tests/layering.rs` ranks every top-level module and lets a `crate::<module>` edge point
+above `mcp`: a prompt belongs to `cli`, a request body to `host`, the door to neither. On a host
+that serves the file, every write of the installation runs through `SharedDeps::write_installation`,
+the door deciding on the parse it hands over, and a browser login commits through it. `host` and
+`cli` both call `agent`, which calls `tools`, which calls `provider` and `mcp`, which call `store`.
+`mcp` publishes its tools and never names a registry; `tools/mcp_adapter.rs` is where they become
+`Tool`s. `render` is reached only from `host`, `cli` and the frontend implementations; `streams` is
+the leaf that writes stderr for everyone. `tests/layering.rs` ranks every top-level module and lets a `crate::<module>` edge point
 only at a strictly lower rank, so siblings cannot name each other. Its tolerated list is empty; one
 edge is by design, `tools/subagent` reaching up to `agent`, because a sub-agent is an agent. A new
 module fails the test until it is placed. Put new code where its callers already are: a type

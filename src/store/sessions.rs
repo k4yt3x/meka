@@ -167,6 +167,43 @@ impl SpawnTerms {
 /// Interpolated rather than parameterized because it names columns, not values, and takes the
 /// alias as an argument rather than being a `const` so a joined query cannot silently pick the
 /// wrong table's columns.
+/// What a profile rename moved, from [`Store::rename_profile`], for [`Store::undo_profile_move`]
+/// to put back.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileMove {
+    /// The rows that recorded the old name.
+    pub(crate) sessions: Vec<Uuid>,
+    /// The sub-agents whose pinned spawn terms named it.
+    pub(crate) pins: Vec<Uuid>,
+    /// The name they were moved to.
+    pub(crate) to: String,
+}
+
+/// What runs on one profile name, from [`Store::sessions_run_on_profile_name`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RunOnName {
+    /// Root sessions recording it.
+    pub(crate) roots: u64,
+    /// The roots of the trees holding a sub-agent pinned to it.
+    pub(crate) pinned_under: Vec<Uuid>,
+}
+
+/// The ids an `UPDATE … RETURNING id` answers, each refused unless it is one meka wrote.
+fn ids_returned(
+    transaction: &rusqlite::Transaction<'_>,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<Uuid>> {
+    transaction
+        .prepare(sql)?
+        .query_map(params, |row| {
+            let id: String = row.get(0)?;
+            Uuid::parse_str(&id)
+                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))
+        })?
+        .collect()
+}
+
 pub(crate) fn spawned_session_sql(qualifier: &str) -> String {
     format!(
         "({qualifier}parent_session_id IS NOT NULL OR {qualifier}subagent_spec_json IS NOT NULL)"
@@ -1143,8 +1180,8 @@ impl Store {
     }
 
     /// Move every session on `profile` to `new_profile`, the pinned spawn terms of a sub-agent
-    /// included, and answer the ids of the rows that moved, so a host can announce each as its
-    /// row now reads.
+    /// included, and answer what moved: the ids of the rows, so a host can announce each as its
+    /// row now reads, and of the pinned terms, so an undo puts back exactly these.
     ///
     /// One transaction, because a follow-up runs a pinned worker on its row while `session show`
     /// and an export read the spec: rows moved without specs would show a worker pinned to a
@@ -1153,65 +1190,122 @@ impl Store {
         &self,
         profile: &str,
         new_profile: &str,
-    ) -> Result<Vec<Uuid>> {
+    ) -> Result<ProfileMove> {
         let profile = profile.to_string();
         let new_profile = new_profile.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection.transaction()?;
-                let moved: Vec<Uuid> = transaction
-                    .prepare("UPDATE sessions SET profile = ?2 WHERE profile = ?1 RETURNING id")?
-                    .query_map(rusqlite::params![profile, new_profile], |row| {
-                        let id: String = row.get(0)?;
-                        Uuid::parse_str(&id).map_err(|error| {
-                            rusqlite::Error::InvalidParameterName(error.to_string())
-                        })
-                    })?
-                    .collect::<rusqlite::Result<_>>()?;
+                let sessions = ids_returned(
+                    &transaction,
+                    "UPDATE sessions SET profile = ?2 WHERE profile = ?1 RETURNING id",
+                    rusqlite::params![profile, new_profile],
+                )?;
                 // `json_valid` first: `json_extract` raises on a spec that is not JSON, which an
                 // import writes verbatim from its archive, and one such row must not block every
                 // rename. It is left as it is, like any spec the rename has no name to move.
-                transaction.execute(
+                let pins = ids_returned(
+                    &transaction,
                     &format!(
                         "UPDATE sessions
                          SET subagent_spec_json = json_set(subagent_spec_json, '$.{key}', ?2)
                          WHERE json_valid(subagent_spec_json)
-                           AND json_extract(subagent_spec_json, '$.{key}') = ?1",
+                           AND json_extract(subagent_spec_json, '$.{key}') = ?1
+                         RETURNING id",
                         key = Self::SUBAGENT_SPEC_PROFILE_KEY
                     ),
                     rusqlite::params![profile, new_profile],
                 )?;
                 transaction.commit()?;
-                Ok(moved)
+                Ok(ProfileMove {
+                    sessions,
+                    pins,
+                    to: new_profile,
+                })
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to rename a profile: {error}")))
     }
 
-    /// How many rows record `profile` anywhere: on the row, root or sub-agent, or in pinned spawn
-    /// terms. What a rename onto this name would otherwise adopt, and what its undo would then
-    /// carry away with the rows it meant to put back.
-    pub(crate) async fn count_sessions_recording_profile(&self, profile: &str) -> Result<u64> {
+    /// Put what `moved` moved back onto `profile`, and nothing else: a row or a pin that recorded
+    /// the name the rename moved them to before it ran stays as it was, and so does one moved
+    /// again since, by a `PATCH` between the rename and its undo, which is the later act.
+    pub(crate) async fn undo_profile_move(&self, moved: ProfileMove, profile: &str) -> Result<()> {
         let profile = profile.to_string();
         self.connection
-            .call(move |connection| {
-                connection.query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM sessions
-                         WHERE profile = ?1
-                            OR (json_valid(subagent_spec_json)
-                                AND json_extract(subagent_spec_json, '$.{key}') = ?1)",
-                        key = Self::SUBAGENT_SPEC_PROFILE_KEY
-                    ),
-                    rusqlite::params![profile],
-                    |row| row.get::<_, i64>(0),
-                )
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                for id in &moved.sessions {
+                    transaction.execute(
+                        "UPDATE sessions SET profile = ?2 WHERE id = ?1 AND profile = ?3",
+                        rusqlite::params![id.to_string(), profile, moved.to],
+                    )?;
+                }
+                for id in &moved.pins {
+                    transaction.execute(
+                        &format!(
+                            "UPDATE sessions
+                             SET subagent_spec_json = json_set(subagent_spec_json, '$.{key}', ?2)
+                             WHERE id = ?1 AND json_valid(subagent_spec_json)
+                               AND json_extract(subagent_spec_json, '$.{key}') = ?3",
+                            key = Self::SUBAGENT_SPEC_PROFILE_KEY
+                        ),
+                        rusqlite::params![id.to_string(), profile, moved.to],
+                    )?;
+                }
+                transaction.commit()
             })
             .await
-            .map(|count| count.max(0) as u64)
+            .map_err(|error| {
+                MekaError::Database(format!("failed to put a renamed profile back: {error}"))
+            })
+    }
+
+    /// What runs on the name `profile`, which a rename onto it would move to another profile: the
+    /// root sessions that record it, each running on its row, and the roots of the trees holding
+    /// a sub-agent pinned to it. A sub-agent that follows its parent runs on the parent's profile
+    /// whatever its row records, so its row is not counted.
+    pub(crate) async fn sessions_run_on_profile_name(&self, profile: &str) -> Result<RunOnName> {
+        let profile = profile.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let roots: i64 = connection.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions WHERE profile = ?1 AND NOT {}",
+                        spawned_session_sql("")
+                    ),
+                    rusqlite::params![profile],
+                    |row| row.get(0),
+                )?;
+                let mut statement = connection.prepare(&format!(
+                    "WITH RECURSIVE up(id, parent) AS (
+                         SELECT id, parent_session_id FROM sessions
+                         WHERE json_valid(subagent_spec_json)
+                           AND json_extract(subagent_spec_json, '$.{key}') = ?1
+                         UNION
+                         SELECT sessions.id, sessions.parent_session_id
+                         FROM sessions JOIN up ON sessions.id = up.parent
+                     )
+                     SELECT DISTINCT id FROM up WHERE parent IS NULL ORDER BY id",
+                    key = Self::SUBAGENT_SPEC_PROFILE_KEY
+                ))?;
+                let pinned_under = statement
+                    .query_map(rusqlite::params![profile], |row| {
+                        let id: String = row.get(0)?;
+                        Uuid::parse_str(&id).map_err(|error| {
+                            rusqlite::Error::InvalidParameterName(error.to_string())
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<Uuid>>>()?;
+                Ok(RunOnName {
+                    roots: roots.max(0) as u64,
+                    pinned_under,
+                })
+            })
+            .await
             .map_err(|error| {
                 MekaError::Database(format!(
-                    "failed to count sessions recording a profile: {error}"
+                    "failed to read the sessions run on a profile: {error}"
                 ))
             })
     }
@@ -5728,13 +5822,14 @@ mod tests {
             .await
             .expect("malformed");
 
-        let moved = store
-            .rename_profile("old", "new")
-            .await
-            .expect("rename")
-            .len();
+        let moved = store.rename_profile("old", "new").await.expect("rename");
 
-        assert_eq!(moved, 4, "the root and all three children moved");
+        assert_eq!(
+            moved.sessions.len(),
+            4,
+            "the root and all three children moved"
+        );
+        assert_eq!(moved.pins, [pinned], "the one pinned spec moved");
         assert_eq!(
             store
                 .load_subagent_spec(malformed)
@@ -9728,12 +9823,131 @@ mod tests {
             .expect_err("the row cannot be announced");
         assert!(error.to_string().contains("failed to rename"), "{error}");
         assert_eq!(
-            store
-                .count_sessions_recording_profile("old")
-                .await
-                .expect("count"),
+            store.count_sessions_on_profile("old").await.expect("count"),
             1,
             "nothing moved"
+        );
+    }
+
+    /// What a rename onto a name would move off it: a root session recording it, and a sub-agent
+    /// pinned to it, named by the root of its tree; never a sub-agent that follows its parent,
+    /// which runs on the parent's profile whatever its row records. And an undo puts back what the
+    /// rename moved and nothing that recorded the name before it ran.
+    #[tokio::test]
+    async fn a_rename_counts_what_runs_on_the_name_and_its_undo_puts_back_what_it_moved() {
+        let store = Store::for_test().await;
+        let follower_root = store
+            .create_session(None, "other".to_string())
+            .await
+            .expect("root");
+        let (follower, _lock) = store
+            .create_child_session_for_test(
+                follower_root,
+                None,
+                Vec::new(),
+                Some("{}".to_string()),
+                "read".to_string(),
+                "new".to_string(),
+            )
+            .await
+            .expect("a worker following its parent");
+        assert_eq!(
+            store
+                .sessions_run_on_profile_name("new")
+                .await
+                .expect("read"),
+            RunOnName::default(),
+            "a follower runs on its parent's profile"
+        );
+
+        let pinned_root = store
+            .create_session(None, "other".to_string())
+            .await
+            .expect("root");
+        let (pinned, _lock) = store
+            .create_child_session_for_test(
+                pinned_root,
+                None,
+                Vec::new(),
+                Some(r#"{"profile":"new"}"#.to_string()),
+                "read".to_string(),
+                "new".to_string(),
+            )
+            .await
+            .expect("a pinned worker");
+        let (_, _lock) = store
+            .create_child_session_for_test(
+                pinned,
+                None,
+                Vec::new(),
+                Some(r#"{"profile":"new"}"#.to_string()),
+                "read".to_string(),
+                "new".to_string(),
+            )
+            .await
+            .expect("a pinned worker under it");
+        assert_eq!(
+            store
+                .sessions_run_on_profile_name("new")
+                .await
+                .expect("read"),
+            RunOnName {
+                roots: 0,
+                pinned_under: vec![pinned_root],
+            }
+        );
+        store
+            .create_session(None, "new".to_string())
+            .await
+            .expect("a root on the name");
+        assert_eq!(
+            store
+                .sessions_run_on_profile_name("new")
+                .await
+                .expect("read")
+                .roots,
+            1
+        );
+
+        let old = store
+            .create_session(None, "old".to_string())
+            .await
+            .expect("a root on the old name");
+        let moved_since = store
+            .create_session(None, "old".to_string())
+            .await
+            .expect("a root a PATCH moves after the rename");
+        let moved = store.rename_profile("old", "new").await.expect("rename");
+        assert_eq!(moved.sessions.len(), 2);
+        store
+            .update_session(moved_since, SessionPatch {
+                profile: Some("elsewhere".to_string()),
+                ..SessionPatch::default()
+            })
+            .await
+            .expect("a PATCH between the rename and its undo");
+        store.undo_profile_move(moved, "old").await.expect("undo");
+        assert_eq!(
+            store.recorded_profile(old).await.expect("read").as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            store
+                .recorded_profile(follower)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("new"),
+            "a row that recorded the new name before the rename is not carried onto the old one"
+        );
+        assert_eq!(
+            store
+                .recorded_profile(moved_since)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("elsewhere"),
+            "a move made after the rename is the later act, and stands"
         );
     }
 }

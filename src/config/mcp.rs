@@ -352,26 +352,30 @@ impl From<McpTransport> for String {
 /// `deny_unknown_fields` so a key this does not model is refused rather than silently dropped,
 /// which is the same strictness [`McpServerConfig`] already has. A secret quietly ignored is worse
 /// than one refused: the connect fails later, somewhere else, for a reason that names nothing.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum McpAuthConfig {
     ClientCredentials {
         client_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         scopes: Option<Vec<String>>,
-        resource: Option<String>,
     },
     ClientCredentialsJwt {
         client_id: String,
         signing_key_path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         signing_algorithm: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         scopes: Option<Vec<String>>,
-        resource: Option<String>,
     },
     #[serde(rename = "oauth")]
     OAuth {
+        #[serde(skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         scopes: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         redirect_port: Option<u16>,
     },
 }

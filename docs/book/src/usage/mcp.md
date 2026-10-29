@@ -21,19 +21,19 @@ Manage configured servers without editing `config.toml` by hand:
 | Command | Action |
 |---|---|
 | `meka mcp list [--format json]` | Print all configured servers, plus any stored OAuth credential that no server claims (see [Leftover credentials](../configuration/config-file.md#leftover-credentials)). Under `json`, `{"servers": [...]}` with each server's `name`, `transport`, `required`, `disabled`, and its `permission`, `command`, `args` or `url` where set. |
-| `meka mcp get <name> [--format json]` | Print full details for one server: the listing's fields plus `env_keys`, `header_keys`, the kinds of `credentials` stored (never their values), `credential_origin`, `auth`, `allowed_tools`, `disabled_tools` and `tool_permissions`. |
+| `meka mcp get <name> [--format json]` | Print full details for one server: the listing's fields, `deferral`, `inherited` (which of `required` and `deferral` the entry leaves to `[mcp]`), `env_keys`, `header_keys`, the kinds of `credentials` stored and presented to its `url` (never their values), `credentials_for_another_endpoint` (each kind stored for another endpoint, with the origin it was stored for), and every other key as written: `headers_helper`, the `auth` block, `allowed_tools`, `disabled_tools`, `eager_load_tools`, `trust_read_only_hint` and `tool_permissions`. |
 | `meka mcp add <name> <url-or-command> [args...] [flags]` | Persist a server. Transport is auto-detected: a URL starting with `http[s]://` means HTTP, anything else means stdio. Preserves existing formatting/comments via `toml_edit`. |
-| `meka mcp remove <name>` | Best-effort revoke stored OAuth tokens (RFC 7009) at the provider, then delete the server entry, clear stored credentials, and drop any resource-update ledger entries. A name with stored credentials but no config entry is cleaned rather than refused. |
+| `meka mcp remove <name>` | Clear stored credentials, delete the server entry and drop any resource-update ledger entries, then revoke the stored OAuth tokens (RFC 7009) at the provider, best-effort. A name with stored credentials but no config entry is cleaned rather than refused. |
 | `meka mcp disable <name>` | Set `disabled = true` on the server entry. The next `meka` start skips it entirely. |
 | `meka mcp enable <name>` | Clear the `disabled` flag, so the server connects on the next start. |
 | `meka mcp reconnect <name>` | Smoke-test a connect; exits non-zero with the error when it fails. |
 | `meka mcp tools <name> [--format json]` | Connect and list every advertised tool with its resolved permission, the chain step that decided it, and whether the current config allows it. Useful for populating `--allow-tool`, `--disable-tool`, or `--tool-permission` overrides without leaving the CLI. Under `json`, the object `GET /v1/mcp/{name}/tools` answers with (`server`, `tools[]` of `raw_name`, `description`, `required_permission`, `permission_source`, `allowed`, `loading`) plus `read_only_hint_declined`. |
 | `meka mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. With `--auth-token-stdin` or `--client-secret-stdin`, stores that secret and exits instead, which is also how you rotate one. A pasted callback the flow cannot read, or one carrying another login's state, is refused and asked for again. |
-| `meka mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear every stored credential for the server. |
+| `meka mcp logout <name>` | Clear every stored credential for the server, then call the provider's `revocation_endpoint` (RFC 7009) for the OAuth tokens it held, best-effort. |
 
 ### Credentials
 
-An MCP server's bearer token, OAuth client secret and OAuth token bundle are kept in the store (`mcp_credentials`, keyed by server name and kind), never in `config.toml`. This is the same rule accounts follow, and for the same reason: `config.toml` is a plaintext file people commit, sync and share.
+An MCP server's bearer token, OAuth client secret and OAuth token bundle are kept in the store (`mcp_credentials`, keyed by server name and kind, each bound to the endpoint it was stored for), never in `config.toml`. This is the same rule accounts follow, and for the same reason: `config.toml` is a plaintext file people commit, sync and share.
 
 Each is read from stdin so it never reaches `ps` output or your shell history. One command reads one secret, so `--auth-token-stdin` and `--client-secret-stdin` cannot be combined:
 
@@ -44,7 +44,7 @@ $ pass show acme-secret | meka mcp login acme --client-secret-stdin
 
 A confidential OAuth client holds two at once: the long-lived client secret it authenticates with, and the refreshable bundle it obtained. Store the secret first, then run `meka mcp login <name>` to complete the flow. Refreshing the bundle leaves the client secret alone.
 
-`meka mcp get <name>` lists which kinds a server has, without printing any of them, and shows the origin an OAuth bundle was issued for as `issued for: <scheme>://<host>[:port]`. That flags the case a rotated `url` leaves behind: a bundle minted against the old host is still stored and still sent, so the line names a mismatch rather than letting the next call fail as a bare `401`. `meka mcp list` names servers that have a stored credential but no `[[mcp.servers]]` entry, which is what a hand-edited config strands.
+A credential is presented only where it was given: the OAuth tokens a login obtained to the exact `url` they were issued for, which is their audience, and a bearer or a client secret anywhere on the scheme, host and port of the `url` it was stored with. A `url` moved to another host takes nothing along, so a credential is never sent to a server it was not meant for. The server then fails to connect, saying what it holds and for where, until a login, or the secret stored again, gives it one for the new `url`; a bearer beside an `[auth]` block, or a client secret beside a `client_credentials_jwt` block, is never sent and never stops a connect. A credential is bound to the `url` as this process's environment expands it, so a `${VAR}` in the `url` that the environment leaves unset refuses storing a secret for it. `meka mcp get <name>` lists which kinds a server has, without printing any of them, and names under `not presented` each kind it holds for another endpoint with the origin it was stored for. `meka mcp list` names servers that have a stored credential but no `[[mcp.servers]]` entry, which is what a hand-edited config strands.
 
 ### `meka mcp add` flags
 
@@ -102,7 +102,7 @@ authorized 'notion'
 
 The probe and the auto-login only run for HTTP servers, and only when the user didn't provide `--auth-token-stdin` (static bearer) or `--auth` (other than `oauth`). Stdio servers skip both.
 
-Only `meka mcp login` runs the browser flow. A host that connects a server and finds no stored credential (the screen at startup, `meka serve`, `meka acp`, `/mcp reconnect`) marks it failed and names `meka mcp login <name>` as the remedy, rather than printing a URL to a terminal nobody may be watching.
+Only `meka mcp login` runs the browser flow. A host that connects a server and finds no stored credential (the screen at startup, `meka serve`, `meka acp`, `/mcp reconnect`) marks it failed for want of OAuth credentials for its URL, which each surface words with its own login: `meka mcp login <name>` in a shell, `/mcp login <name>` on the screen, `POST /v1/mcp/{name}/login` over HTTP, rather than printing a URL to a terminal nobody may be watching.
 
 ### Remote hosts / SSH sessions
 
@@ -131,10 +131,13 @@ authorized 'notion'
 On the screen:
 - `/mcp list` (or a bare `/mcp`): a picker of the configured servers with their state; Enter offers reconnect, login and logout for the picked one.
 - `/mcp reconnect <server>`: reconnect smoke-test.
-- `/mcp login <server>` / `/mcp logout <server>`: run the auth flow or revoke; a login that stores
-  its credential restarts the screen's connection to the server with it. On the screen the
-  URL and the paste field above are one question in the composer's place; Esc on it ends the login,
-  and a paste the flow cannot read, or one carrying another login's state, is refused and asked again.
+- `/mcp login <server>` / `/mcp logout <server>`: run the auth flow or revoke. Either ends by
+  reading `config.toml` whole and serving it to the screen, as a write over HTTP does: the server
+  restarts on the credential, or without it, and an account, a profile or a server edited in a
+  shell since the screen opened is served with it. A file the screen could not start on refuses
+  both until it is repaired. On the screen the URL and the paste field above are one question in
+  the composer's place; Esc on it ends the login, and a paste the flow cannot read, or one carrying
+  another login's state, is refused and asked again.
 - `/mcp <server>:<prompt> [args...]`: render a server-defined prompt as the next user turn.
 
 ## Resources and prompts

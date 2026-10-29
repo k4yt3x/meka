@@ -112,8 +112,8 @@ once, in either mode.
 
 Top-level field naming the profile to use when `--profile` isn't passed. Set it with
 `meka profile use <name>`. A sole profile is the default by the selection rule, so the first
-`meka profile add` leaves the key unset; the second names the profile that was alone, unless it
-takes `--default` itself, so the default stays where it was.
+`meka profile add` leaves the key unset; the second names the profile that was alone, so the
+default stays where it was.
 
 ## Account fields
 
@@ -216,7 +216,7 @@ interleaved_thinking = false
 
 `claude-subscription` only. Stable per-device identifier embedded in `metadata.user_id` to mirror Claude Code's `~/.claude.json` device id (`getOrCreateUserID` in `utils/config.ts`).
 
-If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way, the resolved value is persisted back to the account under `[accounts.<name>].device_id`. This file write only happens for the `claude-subscription` backend; other backends don't need a device id.
+If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way, the resolved value is persisted back to the account under `[accounts.<name>].device_id`, the first time a process reads the account: at startup, or when `meka serve` serves the file after a write or a reload. This file write only happens for the `claude-subscription` backend; other backends don't need a device id.
 
 You can supply your own value if you want to control attribution explicitly:
 
@@ -462,11 +462,11 @@ store, never the config file.
 
 | Command | Action |
 |---|---|
-| `meka account add <name> [--backend B] [--base-url U] [--client-id ID] [--oauth-token-url U] [--interleaved-thinking BOOL] [--api-key-stdin]` | Add an account. Prompts for the backend and base URL when not flagged, then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--backend` as a flag too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. `--client-id` and `--oauth-token-url` are dropped with a warning on an API-key backend, which never reads them. `device_id` has no flag, because meka resolves and persists it itself. |
+| `meka account add <name> [--backend B] [--base-url U] [--client-id ID] [--oauth-token-url U] [--interleaved-thinking BOOL] [--api-key-stdin]` | Add an account. Prompts for the backend and base URL when not flagged, then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--backend` as a flag too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. `--client-id` and `--oauth-token-url` are refused on an API-key backend, which never reads them. `device_id` has no flag, because meka resolves and persists it itself. |
 | `meka account list` | List configured accounts with backend, base URL, and whether each has a stored credential; `--format json` prints the same as one document. Also names any stored credential that no account claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka account login <name> [--api-key-stdin]` | Re-acquire the secret for an existing account (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). `--api-key-stdin` reads the key from stdin for scripted rotation, and is refused on the subscription backends, which have no key to read. Every setting on the account is kept. |
-| `meka account remove <name>` | Delete the stored credential from the store and remove the `[accounts.<name>]` entry from the config file. Refused while any profile names the account, naming the profiles: remove or repoint those first. Works on a name with only one of the two halves, so it can clean up after a hand-edit. |
-| `meka account rename <name> <new-name>` | Rename the account in place. The `[accounts.<name>]` table keeps its position and comments, every profile naming it follows, and its stored credential moves with it, so no login is needed. Refused when the new name is taken, a leftover credential is stored under it, or another meka is refreshing the account's token at that moment. Stop running hosts first: one keeps the names it started with until restarted, and a token it refreshes afterwards is dropped rather than saved. |
+| `meka account remove <name>` | Remove the `[accounts.<name>]` entry from the config file, then delete the stored credential from the store. Refused while any profile names the account, naming the profiles: remove or repoint those first. Works on a name with only one of the two halves, so it can clean up after a hand-edit, or after a removal whose credential failed to delete. |
+| `meka account rename <name> <new-name>` | Rename the account in place. The `[accounts.<name>]` table keeps its position and comments, every profile naming it follows, and its stored credential moves with it, so no login is needed. Refused when the new name is taken, a leftover credential is stored under it, or another meka is refreshing the account's token at that moment. Stop running hosts first: a session a host already runs on the account refreshes its token under the old name, and that token is dropped rather than saved. `meka serve` refuses the rename itself while one may. |
 | `meka account usage` / `whoami` / `stats` | The read-only account views; see [Account info](../usage/account.md). |
 
 `--api-key-stdin` reads the key from standard input instead of prompting, for scripted setup:
@@ -493,8 +493,8 @@ login.
 | `meka profile list` | List configured profiles with account, backend, model and the default marker; `--format json` prints the same as one document. Names any profile whose account is not configured. |
 | `meka profile set <name> <key> <value>` | Change one setting on an existing profile, in place. `--unset` in place of the value removes the key instead. See [Changing one setting](#changing-one-setting). |
 | `meka profile use <name>` | Set `default_profile` to this profile. |
-| `meka profile remove <name>` | Remove the `[profiles.<name>]` entry from the config file. Warns if it clears a `default_profile` that other profiles are still competing for, and if any sessions are pinned to the profile it deleted (those refuse to resume until it is configured again, or moved with `meka -r <id> --profile <name>`). The account and its credential stay. |
-| `meka profile rename <name> <new-name>` | Rename the profile in place. The `[profiles.<name>]` table keeps its position and comments, `default_profile` follows when it named the profile, and every session recorded on it moves, sub-agent sessions and their pinned spawn terms included. Refused when the new name is taken, or when any session already records it. Stop running hosts first: one keeps the names it started with until restarted, and its sessions on the renamed profile are refused their next turn. |
+| `meka profile remove <name>` | Remove the `[profiles.<name>]` entry from the config file. Refuses the default while two or more profiles would remain, so point `default_profile` elsewhere first with `meka profile use`; with one profile left the key is dropped, since that profile is the default by the rule. Warns if any sessions are pinned to the profile it deleted (those refuse to resume until it is configured again, or moved with `meka -r <id> --profile <name>`). The account and its credential stay. |
+| `meka profile rename <name> <new-name>` | Rename the profile in place. The `[profiles.<name>]` table keeps its position and comments, `default_profile` follows when it named the profile, and every session recorded on it moves, sub-agent sessions and their pinned spawn terms included. Refused when the new name is taken, when a root session already records it, or when a sub-agent is pinned to it; a sub-agent that follows its parent runs on the parent's profile whatever its row records, and is not counted. Stop running hosts first, or have `meka serve` read the file again with `POST /v1/config/reload`: a host keeps the names it last read, and its sessions on the renamed profile are refused their next turn until it reads the new one. |
 
 A running `meka serve` offers the same verbs over HTTP, on `/v1/profiles` under the `config:w`
 scope, and serves what it wrote without a restart; see
@@ -855,9 +855,11 @@ headers = { X-Api-Key = "${GITHUB_MCP_TOKEN}" }
 
 A bearer token and an OAuth client secret are unambiguously secrets, so they are not config at all. They live in the store and are set with `meka mcp add --auth-token-stdin` / `--client-secret-stdin`, or afterwards with `meka mcp login`. See [Credentials](../usage/mcp.md#credentials).
 
+A stored credential is bound to the `url` it was stored for, `${VAR}` expanded, and presented there alone: an OAuth login's tokens to that exact URL, the resource they were issued for, and a bearer or a client secret anywhere on its scheme, host and port. Point `url` at another host and the server stops presenting what it holds, and fails to connect saying so, until it is logged in or given its secret again; `meka mcp get` lists what it holds for another endpoint. A `${VAR}` in `url` that the environment leaves unset binds nothing: storing a secret for the server is refused where it is unset.
+
 ### `[mcp.servers.auth]`
 
-OAuth authentication for HTTP MCP servers. Set `type` to choose the authentication method. This is mutually exclusive with a stored bearer token.
+OAuth authentication for HTTP MCP servers. Set `type` to choose the authentication method. This is mutually exclusive with a stored bearer token. Every token request names the server's own `url` as its resource ([RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)), as the MCP authorization spec requires, so no key states it.
 
 The client secret is not a field here. It is a secret, so it lives in the store: set it with `meka mcp add --client-secret-stdin` or `meka mcp login <name> --client-secret-stdin`. See [Credentials](../usage/mcp.md#credentials).
 
@@ -866,7 +868,6 @@ The client secret is not a field here. It is a secret, so it lives in the store:
 | `type` | Yes | Auth method: `"client_credentials"`, `"client_credentials_jwt"`, or `"oauth"` |
 | `client_id` | Varies | OAuth client id (required for client_credentials/jwt, optional for oauth with dynamic registration) |
 | `scopes` | No | OAuth scopes to request |
-| `resource` | No | Resource parameter ([RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)), `client_credentials` and `client_credentials_jwt` only |
 | `signing_key_path` | JWT only | Path to PEM private key file |
 | `signing_algorithm` | No | JWT signing algorithm: `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384` |
 | `redirect_port` | No | Local port for OAuth authorization code callback. When omitted, meka binds to a random ephemeral port (recommended). `oauth` only. |
@@ -1738,7 +1739,7 @@ An array of bearer tokens for API authentication. At least one token is required
 | `token` | Yes* | The bearer token value. Supports `${ENV_VAR}` substitution. Mutually exclusive with `token_file`. |
 | `token_file` | Yes* | Path to a file containing the token (one line, trimmed). Mutually exclusive with `token`. A startup warning is logged if the file is world-readable. |
 | `description` | No | Human-readable label for this token (appears in logs). |
-| `scopes` | Yes | Array of scope strings. One `:r` and one `:w` per subsystem: `sessions`, `skills`, `memory`, `schedule`, `mcp`. |
+| `scopes` | Yes | Array of scope strings. One `:r` and one `:w` per subsystem: `sessions`, `skills`, `memory`, `schedule`, `mcp`, `config`. |
 
 \* Exactly one of `token` or `token_file` must be set.
 
@@ -1784,6 +1785,7 @@ scopes = [
     "memory:r", "memory:w",
     "schedule:r", "schedule:w",
     "mcp:r", "mcp:w",
+    "config:r", "config:w",
 ]
 ```
 

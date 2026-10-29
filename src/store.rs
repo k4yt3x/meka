@@ -53,7 +53,8 @@ use self::locks::*;
 pub(crate) use self::{
     blobs::content_hash,
     credentials::{
-        AuthCredential, CredentialWrite, McpCredentialKind, StoredCredential, TokenStore,
+        AuthCredential, CredentialWrite, McpCredential, McpCredentialKind, StoredCredential,
+        TokenStore,
     },
     locks::SessionLockSlot,
     scratchpad::{RenameOutcome, ScratchpadEntry},
@@ -136,9 +137,9 @@ impl Store {
             None => default_database_path()?,
         };
 
-        // In-memory SQLite databases (used by tests) have no on-disk parent; give each `open()`
-        // call its own ephemeral lock dir under the system temp directory so concurrent tests don't
-        // share lock files.
+        // In-memory SQLite databases (a login's staging store, and tests) have no on-disk parent;
+        // give each `open()` call its own ephemeral lock dir under the system temp directory so two
+        // of them never share lock files.
         let is_in_memory = database_path == Path::new(":memory:");
         let lock_dir = if is_in_memory {
             std::env::temp_dir().join(format!("meka-test-locks-{}", Uuid::new_v4()))
@@ -472,6 +473,14 @@ impl Store {
     }
 }
 
+impl Store {
+    /// A store in memory alone, through the same ledger as one on disk: a login's staging store,
+    /// which holds what the flow mints until the door that commits it, and every test's.
+    pub(crate) async fn in_memory() -> Result<Self> {
+        Self::open(Some(Path::new(":memory:")), &Default::default()).await
+    }
+}
+
 #[cfg(test)]
 impl Store {
     /// An in-memory store at the current schema.
@@ -480,9 +489,7 @@ impl Store {
     /// passed it created sessions in the developer's own `meka.db` on every `cargo test`, and
     /// migrated and backed it up on the way in.
     pub(crate) async fn for_test() -> Self {
-        Self::open(Some(Path::new(":memory:")), &Default::default())
-            .await
-            .expect("an in-memory store opens")
+        Self::in_memory().await.expect("an in-memory store opens")
     }
 }
 

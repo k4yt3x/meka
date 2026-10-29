@@ -12,21 +12,66 @@ and `-shm` companions with the file.
 
 ## 0.84 to 0.85
 
-Nothing is renamed and the store is unchanged; the HTTP API grows a surface and two of its shapes
-change, and an ACP client sees two things differently.
+One config key is retired, and the store gains a table and a column, which the first run adds on
+its own; the HTTP API grows a surface and four of its shapes change, a start refuses a profile
+that cannot run, two shell commands refuse where they warned, and an ACP client sees two things
+differently.
 
 **The installation is managed over HTTP, under two new scopes.** `/v1/accounts`, `/v1/profiles`,
 `/v1/mcp` and `PUT /v1/instructions` do what `meka account`, `meka profile`, `meka mcp` and the
-instructions file do in a shell, and a change made through them is served at once, where an edit
-made in a shell still needs a restart. They sit behind `config:r` and `config:w`, which no existing
-token holds: grant them to the token that administers the installation and to no other, since
-`config:w` is shell on the host. `GET /v1/info` names where the installation is (`config_path`,
-`data_dir`) and when `config.toml` was last read and written, and `POST /v1/config/reload` reads
-the file again for an edit made in a shell. The server now starts with no profile configured, so
-an installation can be set up over the API; the refusal moved to the session that names none, and
-over HTTP it names `POST /v1/accounts` and `POST /v1/profiles` rather than the shell's commands.
+instructions file do in a shell, and a change made through them is served at once; an edit made
+in a shell is served by the next of them, or by `POST /v1/config/reload`. They sit behind
+`config:r` and `config:w`, which no existing token holds: grant them to the token that administers
+the installation and to no other, since `config:w` is shell on the host. `GET /v1/config` names
+where the installation is (`config_path`, `data_dir`), when `config.toml` was last read and
+written, and `config_changed`, whether an edit made in a shell awaits `POST /v1/config/reload`,
+which reads the file again; every write of the server's own ends with the same whole read. The
+server now starts with no profile configured, so an installation can be set up over the API; the
+refusal moved to the session that names none, and over HTTP it names `POST /v1/accounts` and
+`POST /v1/profiles` rather than the shell's commands.
 Adding a second profile names the one that was alone as `default_profile`, in a shell as over
-HTTP, where it used to leave the installation with no default.
+HTTP, where it used to leave the installation with no default; and removing the default while two
+or more profiles would remain is refused, in a shell as over HTTP, where `meka profile remove`
+used to warn and unset it. Point `default_profile` elsewhere first, with `meka profile use` or
+`PATCH /v1/profiles/{name}` and `"default": true`. `meka account add` refuses `--client-id` and
+`--oauth-token-url` on a backend that never reads them, where it dropped them with a warning, as
+it already refused `--interleaved-thinking`.
+
+**Every profile must be able to run.** A start, a reload and every write of the installation
+refuse a `config.toml` holding a profile whose account is not configured, that names no model, or
+whose `max_output_tokens` does not exceed its thinking budget, where only the default was held to
+it. The refusal names the profile; repair it with `meka profile set` or remove it.
+
+**An MCP credential is bound to the endpoint it was stored for.** A connect presents OAuth tokens
+to the exact `url` they were issued for alone, and a bearer or a client secret to the scheme, host
+and port of the `url` it was stored with, so a credential never follows a server to another host.
+The first run binds every credential already stored to its server's `url` as `config.toml` states
+it then, which is where it has been presented all along, so nothing changes for a server that
+stays put; it stops, naming the file, while a credential is stored and `config.toml` cannot be
+read, and naming the server while a credential is stored for one whose `url` holds a `${VAR}` the
+environment leaves unset, since a binding made from the literal would hold the credential for a
+URL nothing reaches. The binding is made from that first command's environment: a variable it
+holds differently from the server's own runs, or a `${VAR:-default}` it leaves to its default,
+binds the credential where its expansion points, and the server's connect then refuses it, naming
+the origin it was stored for. Run the first command after the upgrade with the environment the
+server runs under. Storing a secret for such a server, with `meka mcp add`, `meka mcp login
+--auth-token-stdin` or `--client-secret-stdin`, or over the API, is refused the same way where
+the variable is unset. A server whose `url` moves to another host afterwards fails to connect,
+saying so, until it is logged in again or its secret stored again. `meka mcp get` and `GET /v1/mcp/{name}` list as `credentials` the kinds presented to the
+`url`, and the kinds held for another endpoint under `credentials_for_another_endpoint`, with the
+origin each was stored for; `credential_origin` and `credential_origin_matches_url` are gone.
+
+**`resource` is retired from `[mcp.servers.auth]`.** A `client_credentials` or
+`client_credentials_jwt` token request names the server's own `url` as its resource, as the MCP
+authorization spec requires, so the key would only restate it or contradict it; a file that still
+carries it is refused at startup, naming the key and its line. Delete the line.
+
+**`GET /v1/mcp` is an object, and a server's `auth` is the block.** `GET /v1/mcp` answers
+`{"servers": [...]}`, with `orphaned_credentials` beside it when a credential is stored under a
+name no entry claims; a client that read the bare list reads `servers`. `GET /v1/mcp/{name}` and
+`meka mcp get --format json` carry every key the entry states, and `auth` is the block as written,
+`{"type": "oauth", ...}`, where it was the `type` string alone; `required` and `deferral` are what
+the server runs under, and `inherited` names those the entry leaves to `[mcp]`.
 
 **OpenAPI: the responses body's `outcome` schema is `ResponseOutcome`.** It takes the three
 answers an elicitation takes (`accept`, `decline`, `cancel`) beside the four an approval takes. A

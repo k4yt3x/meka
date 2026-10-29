@@ -9818,6 +9818,7 @@ mod tests {
             state: crate::mcp::ServerState::Failed {
                 error: "boom".to_string(),
                 at: std::time::Instant::now(),
+                needs: None,
             },
         }
     }

@@ -42,14 +42,41 @@ pub(crate) struct ProfileTuning {
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
 }
 
+impl ProfileTuning {
+    /// The keys this states a value for, which the account's backend must read.
+    fn stated_keys(&self) -> Vec<&'static str> {
+        [
+            ("fallbacks", !self.fallbacks.is_empty()),
+            ("context_window", self.context_window.is_some()),
+            ("max_output_tokens", self.max_output_tokens.is_some()),
+            ("max_request_bytes", self.max_request_bytes.is_some()),
+            ("effort", self.effort.is_some()),
+            ("vision", self.vision.is_some()),
+            ("deferred_tools", self.deferred_tools.is_some()),
+            ("thinking", self.thinking.is_some()),
+            ("thinking_budget", self.thinking_budget.is_some()),
+            ("cache_control", self.cache_control.is_some()),
+            ("thinking_display", self.thinking_display.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(key, stated)| stated.then_some(key))
+        .collect()
+    }
+}
+
 /// Remove `[profiles.<name>]`, or a dangling `default_profile` naming it: `meka profile remove`
-/// and `DELETE /v1/profiles/{name}`.
-pub(crate) async fn remove_profile(name: &str, store: &crate::store::Store) -> anyhow::Result<()> {
+/// and `DELETE /v1/profiles/{name}`. The default is not removed while two or more profiles would
+/// remain, since nothing would pick one; with one left, the key is dropped and the sole profile
+/// is the default by the selection rule.
+pub(crate) async fn remove_profile(
+    name: &str,
+    store: &crate::store::Store,
+) -> crate::error::Result<()> {
     // `open_document` rather than the parsed config on purpose: `remove` must still run on a
     // config.toml that meka can't deserialize, since it is one of the ways such a file gets
     // repaired. The guard is dropped before the `await` below, for the reason `account remove`
     // gives about `ConfigFileLock`'s thread-local depth counter.
-    let (was_default, removed, remaining) = {
+    let (was_default, removed) = {
         let (_lock, path, mut document) = open_document()?;
         let was_default = document
             .get("default_profile")
@@ -60,10 +87,24 @@ pub(crate) async fn remove_profile(name: &str, store: &crate::store::Store) -> a
         // of the user, as `account remove` refuses an account a profile names.
         let naming = profiles_naming_as_fallback(&document, name);
         if !naming.is_empty() {
-            anyhow::bail!(
+            return Err(super::refusal(format!(
                 "profile(s) {} name '{name}' in `fallbacks`; remove it from them first",
                 naming.join(", ")
-            );
+            )));
+        }
+        // A dangling `default_profile`, one naming no profile, is cleanup rather than a choice
+        // lost, so only a default that exists is held back.
+        let profiles = table_names(&document, "profiles");
+        let exists = profiles.iter().any(|profile| profile == name);
+        let others: Vec<String> = profiles
+            .into_iter()
+            .filter(|profile| profile != name)
+            .collect();
+        if was_default && exists && others.len() > 1 {
+            return Err(crate::error::MekaError::ProfileDefaultStillNeeded {
+                name: name.to_string(),
+                remaining: others,
+            });
         }
         // Written even with no profile to remove: `default_profile` can still point at the name,
         // and dropping that dangling pointer is exactly the cleanup this case is for.
@@ -71,26 +112,17 @@ pub(crate) async fn remove_profile(name: &str, store: &crate::store::Store) -> a
         if !removed && !was_default {
             // The document's own table names rather than `require_profile`: this command edits
             // through `toml_edit` so it works on a file the typed config no longer parses.
-            anyhow::bail!(crate::text::unknown_name(
+            return Err(super::refusal(crate::text::unknown_name(
                 "profile",
                 name,
-                table_names(&document, "profiles")
-            ));
+                table_names(&document, "profiles"),
+            )));
         }
         crate::fs::write_file_atomic(&path, &document.to_string())?;
-        (was_default, removed, table_names(&document, "profiles"))
+        (was_default, removed)
     };
-
-    // Losing the default is not a detail: with two or more profiles left, nothing picks one, and
-    // the next `meka` with no `--profile` stops with an error about a setting the user did not
-    // knowingly change. Said at `warn!` rather than `info!` because it needs a follow-up action
-    // and is visible at the default verbosity.
-    if was_default && remaining.len() > 1 {
-        tracing::warn!(
-            "'{name}' was the default profile, so `default_profile` is now unset; pick one of \
-             {remaining} with `meka profile use <name>`",
-            remaining = remaining.join(", ")
-        );
+    if was_default {
+        tracing::info!("'{name}' was the default profile; `default_profile` is unset");
     }
 
     // Sessions pinned to the profile are what makes a removal consequential, and they are silent
@@ -122,10 +154,8 @@ pub(crate) async fn rename_profile(
     name: &str,
     new_name: &str,
     store: &crate::store::Store,
-) -> anyhow::Result<Vec<uuid::Uuid>> {
-    if new_name.trim().is_empty() {
-        anyhow::bail!("profile name cannot be empty");
-    }
+) -> crate::error::Result<Vec<uuid::Uuid>> {
+    super::refuse_an_unusable_name("profile", new_name)?;
     // Probed under a short guard, dropped before the `await` below, for the reason `account
     // remove` gives about `ConfigFileLock`; the write asks again under its own.
     {
@@ -133,36 +163,46 @@ pub(crate) async fn rename_profile(
         refuse_an_unrenameable_profile(&document, name, new_name)?;
     }
 
-    // Rows already recording the new name, which `profile remove` leaves behind, would be adopted
-    // by the rename and then carried onto the old name by its undo: refused by name, since only an
-    // explicit act may move a session between profiles.
-    let recorded = store.count_sessions_recording_profile(new_name).await?;
-    if recorded > 0 {
-        anyhow::bail!(
-            "{recorded} session(s) already record the profile '{new_name}'; move them first with \
-             `meka -r <id> --profile <name>`"
-        );
+    // What runs on the new name already, which `profile remove` leaves behind, would run on the
+    // renamed profile instead: refused by name, since only an explicit act may move a session
+    // between profiles. A root session first, which a move takes off the name, then a sub-agent
+    // pinned to it, which only removing its session does.
+    let run_on = store.sessions_run_on_profile_name(new_name).await?;
+    if run_on.roots > 0 {
+        return Err(crate::error::MekaError::ProfileRecordedBySessions {
+            profile: new_name.to_string(),
+            sessions: run_on.roots,
+        });
+    }
+    if !run_on.pinned_under.is_empty() {
+        return Err(crate::error::MekaError::ProfilePinnedBySubagents {
+            profile: new_name.to_string(),
+            under: run_on.pinned_under,
+        });
     }
 
     // The rows move first, and move back if the config write then fails, so a session never names
     // a profile the file does not have for longer than this function runs. The other order has no
-    // undo: a config already renamed makes the second half unrepeatable.
+    // undo: a config already renamed makes the second half unrepeatable. The undo puts back what
+    // moved and nothing else, so a sub-agent row that followed its parent onto the new name before
+    // is not carried onto the old one.
     let moved = store.rename_profile(name, new_name).await?;
+    let sessions = moved.sessions.clone();
     if let Err(error) = rename_profile_under_lock(name, new_name) {
-        if let Err(undo) = store.rename_profile(new_name, name).await {
+        if let Err(undo) = store.undo_profile_move(moved, name).await {
             tracing::warn!(
                 "failed to move {count} session(s) back to '{name}': {undo}; they now run on \
                  '{new_name}'",
-                count = moved.len()
+                count = sessions.len()
             );
         }
         return Err(error);
     }
     tracing::info!(
         "renamed profile '{name}' to '{new_name}'; {count} session(s) follow",
-        count = moved.len()
+        count = sessions.len()
     );
-    Ok(moved)
+    Ok(sessions)
 }
 
 /// Refuse a rename that names no profile or takes a name in use.
@@ -173,13 +213,17 @@ fn refuse_an_unrenameable_profile(
     document: &toml_edit::DocumentMut,
     name: &str,
     new_name: &str,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     let profiles = table_names(document, "profiles");
     if !profiles.iter().any(|profile| profile == name) {
-        anyhow::bail!(crate::text::unknown_name("profile", name, &profiles));
+        return Err(super::refusal(crate::text::unknown_name(
+            "profile", name, &profiles,
+        )));
     }
     if profiles.iter().any(|profile| profile == new_name) {
-        anyhow::bail!("a profile named '{new_name}' already exists");
+        return Err(super::refusal(format!(
+            "a profile named '{new_name}' already exists"
+        )));
     }
     Ok(())
 }
@@ -187,7 +231,7 @@ fn refuse_an_unrenameable_profile(
 /// Rename `[profiles.<name>]` and repoint `default_profile` if it named it, as one critical
 /// section under the config lock. No `await` inside, for the reason `account remove` gives about
 /// `ConfigFileLock`.
-fn rename_profile_under_lock(name: &str, new_name: &str) -> anyhow::Result<()> {
+fn rename_profile_under_lock(name: &str, new_name: &str) -> crate::error::Result<()> {
     let (_lock, path, mut document) = open_document()?;
     refuse_an_unrenameable_profile(&document, name, new_name)?;
     rename_table_entry(&mut document, "profiles", name, new_name)?;
@@ -278,7 +322,7 @@ fn refuse_an_inert_key(
     document: &toml_edit::DocumentMut,
     name: &str,
     key: &str,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     let account = document
         .get("profiles")
         .and_then(|item| item.as_table_like())
@@ -304,10 +348,10 @@ fn refuse_an_inert_key(
     if backend.reads_profile_key(key) {
         return Ok(());
     }
-    anyhow::bail!(
+    Err(super::refusal(format!(
         "profile '{name}' bills '{account}', a '{backend}' account, which never sends `{key}`; \
          nothing was written"
-    )
+    )))
 }
 
 /// What an edit of `[profiles.<name>]` changes: each key `meka profile set` writes, kept, removed
@@ -358,16 +402,6 @@ impl ProfileChanges {
             .collect()
     }
 
-    /// The keys set to a value, which the profile's backend has to read for the write to mean
-    /// anything.
-    pub(crate) fn set_keys(&self) -> Vec<&'static str> {
-        self.states()
-            .into_iter()
-            .filter(|(_, state)| *state == PatchState::Set)
-            .map(|(key, _)| key)
-            .collect()
-    }
-
     /// Whether nothing is changed.
     pub(crate) fn is_empty(&self) -> bool {
         self.keys().is_empty()
@@ -380,9 +414,9 @@ impl ProfileChanges {
     fn to_document(
         &self,
         name: &str,
-    ) -> anyhow::Result<Vec<(&'static str, Option<toml_edit::Value>)>> {
+    ) -> crate::error::Result<Vec<(&'static str, Option<toml_edit::Value>)>> {
         let mut changes: Vec<(&'static str, Option<toml_edit::Value>)> = Vec::new();
-        let integer = |key: &'static str, patch: &Patch<u64>| -> anyhow::Result<_> {
+        let integer = |key: &'static str, patch: &Patch<u64>| -> crate::error::Result<_> {
             Ok(match patch {
                 Patch::Keep => None,
                 Patch::Remove => Some((key, None)),
@@ -421,14 +455,7 @@ impl ProfileChanges {
             Patch::Keep => {}
             Patch::Remove => changes.push(("fallbacks", None)),
             Patch::Set(names) => {
-                let names: Vec<String> = names
-                    .iter()
-                    .map(|name| name.trim().to_string())
-                    .filter(|name| !name.is_empty())
-                    .collect();
-                if names.is_empty() {
-                    anyhow::bail!("fallbacks must name at least one profile");
-                }
+                let names = fallback_names(names)?;
                 changes.push((
                     "fallbacks",
                     Some(toml_edit::Value::Array(fallbacks_array(&names))),
@@ -483,7 +510,7 @@ pub(crate) fn edit_profile(
     name: &str,
     changes: &ProfileChanges,
     make_default: bool,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     let changes = changes.to_document(name)?;
     // `_lock` is held to the end of the function, so the read, the validation and the write are one
     // critical section.
@@ -494,11 +521,11 @@ pub(crate) fn edit_profile(
         .iter()
         .any(|profile| profile == name)
     {
-        anyhow::bail!(crate::text::unknown_name(
+        return Err(super::refusal(crate::text::unknown_name(
             "profile",
             name,
-            table_names(&document, "profiles")
-        ));
+            table_names(&document, "profiles"),
+        )));
     }
     for (key, value) in &changes {
         set_profile_field(&mut document, name, key, value.clone());
@@ -531,14 +558,14 @@ pub(crate) fn edit_profile(
 /// TOML has one integer type and it is signed 64-bit, so a `u64` past `i64::MAX` has no
 /// representation at all; `as i64` would wrap it silently into a file every later command refuses,
 /// the `profile set` that would repair it included.
-pub(crate) fn toml_integer(field: &str, value: u64) -> anyhow::Result<i64> {
+pub(crate) fn toml_integer(field: &str, value: u64) -> crate::error::Result<i64> {
     i64::try_from(value).map_err(|_| {
-        anyhow::anyhow!(
+        super::refusal(format!(
             "{} must be at most {} (the largest TOML integer), got {}",
             field,
             i64::MAX,
             value
-        )
+        ))
     })
 }
 
@@ -550,7 +577,7 @@ fn upsert_profile_document(
     account: &str,
     model: &str,
     tuning: &ProfileTuning,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     let mut profile = toml_edit::Table::new();
     // Written in [`config::ProfileConfig`]'s canonical order, so a profile meka authors reads the
     // way the reference documents it.
@@ -562,7 +589,7 @@ fn upsert_profile_document(
     if !tuning.fallbacks.is_empty() {
         profile.insert(
             "fallbacks",
-            toml_edit::value(fallbacks_array(&tuning.fallbacks)),
+            toml_edit::value(fallbacks_array(&fallback_names(&tuning.fallbacks)?)),
         );
     }
     if let Some(window) = tuning.context_window {
@@ -654,7 +681,8 @@ pub(crate) fn write_profile(
     model: &str,
     tuning: &ProfileTuning,
     make_default: bool,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
+    super::refuse_an_unusable_name("profile", name)?;
     // `_lock` is held to the end of the function, so the read above and the write below are one
     // critical section.
     let (_lock, path, mut document) = open_document()?;
@@ -666,7 +694,9 @@ pub(crate) fn write_profile(
         .and_then(|profiles| profiles.get(name))
         .is_some()
     {
-        anyhow::bail!("a profile named '{name}' already exists");
+        return Err(super::refusal(format!(
+            "a profile named '{name}' already exists"
+        )));
     }
     // The account too, for the same reason: `account remove` re-asks its own side under this lock,
     // and the pair only holds if this side asks as well. Read off the document rather than the
@@ -675,15 +705,18 @@ pub(crate) fn write_profile(
         .iter()
         .any(|configured| configured == account)
     {
-        anyhow::bail!(crate::text::unknown_name(
+        return Err(super::refusal(crate::text::unknown_name(
             "account",
             account,
-            table_names(&document, "accounts")
-        ));
+            table_names(&document, "accounts"),
+        )));
     }
     let alone = table_names(&document, "profiles");
     let before = document.to_string();
     upsert_profile_document(&mut document, name, account, model, tuning)?;
+    for key in tuning.stated_keys() {
+        refuse_an_inert_key(&document, name, key)?;
+    }
     let after = document.to_string();
     refuse_a_profile_that_cannot_run(&before, &after, name)?;
     if make_default {
@@ -702,6 +735,22 @@ pub(crate) fn write_profile(
     }
     crate::fs::write_file_atomic(&path, &document.to_string())?;
     Ok(())
+}
+
+/// A `fallbacks` list as a door writes it, whichever door: each name trimmed and a blank one
+/// dropped, and a list that names nothing then refused, since a list stated is a list meant.
+fn fallback_names(names: &[String]) -> crate::error::Result<Vec<String>> {
+    let names: Vec<String> = names
+        .iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Err(super::refusal(
+            "fallbacks must name at least one profile; remove the setting for none",
+        ));
+    }
+    Ok(names)
 }
 
 /// The TOML array a `fallbacks` list is written as.
@@ -770,24 +819,19 @@ pub(crate) fn refuse_a_profile_that_cannot_run(
     before: &str,
     after: &str,
     name: &str,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     let candidate = reparse_after_edit(before, after)?;
     if let Some(profile) = candidate.profiles.get(name) {
         // `--unset model` and `--model ""` both arrive here as a profile a run would refuse by
         // name; the predicate the run applies refuses the write first.
-        config::require_model(name, profile.model.as_deref())?;
-        config::validate_max_output_tokens(
+        config::refuse_an_unrunnable_profile(
             name,
+            profile,
+            &candidate.accounts,
             candidate
-                .accounts
-                .get(&profile.account)
-                .and_then(|account| account.backend.parse::<config::Backend>().ok()),
-            profile.max_output_tokens,
-            profile.thinking.unwrap_or_default(),
-            profile
-                .thinking_budget
-                .or(candidate.thinking.as_ref().and_then(|it| it.budget))
-                .unwrap_or(config::DEFAULT_THINKING_BUDGET_TOKENS),
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.budget),
         )?;
     }
     // The chains, over the whole file rather than `name` alone: an edit to one profile's window or
@@ -798,7 +842,7 @@ pub(crate) fn refuse_a_profile_that_cannot_run(
         && toml::from_str::<config::ConfigFile>(before)
             .is_ok_and(|previous| fallback_chains_of(&previous).is_ok())
     {
-        anyhow::bail!(reason);
+        return Err(super::refusal(reason));
     }
     Ok(())
 }
@@ -831,7 +875,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(changes.keys(), ["context_window", "effort", "vision"]);
-        assert_eq!(changes.set_keys(), ["context_window", "effort"]);
         let described: Vec<(&str, Option<String>)> = changes
             .to_document("work")
             .expect("document")
@@ -1163,7 +1206,7 @@ mod tests {
         let taken = rename_profile("work", "personal", &store).await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
-        let message = |result: anyhow::Result<Vec<uuid::Uuid>>| match result {
+        let message = |result: crate::error::Result<Vec<uuid::Uuid>>| match result {
             Ok(_) => panic!("the rename must be refused"),
             Err(error) => error.to_string(),
         };

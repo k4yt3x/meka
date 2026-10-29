@@ -72,7 +72,7 @@ pub(super) async fn run_connector(
 
     let (stdio_entries, http_entries): (Vec<_>, Vec<_>) = pending
         .into_iter()
-        .partition(|entry| matches!(entry.config.transport, McpTransport::Stdio));
+        .partition(|entry| matches!(entry.config().transport, McpTransport::Stdio));
 
     let stdio_limit = runtime.stdio_concurrency.max(1);
     let http_limit = runtime.http_concurrency.max(1);
@@ -211,6 +211,24 @@ fn is_repeat_failure(state: &ServerState, cause: &str) -> bool {
     matches!(state, ServerState::Failed { error, .. } if error == cause)
 }
 
+/// What a failed connect is recorded as: the bare cause, and the credential the server lacks when
+/// that is why. `MekaError::McpConnection` and `McpAuth` render as `MCP <class> error: <server>:
+/// <message>`, and every consumer of the cause (`meka mcp list`, the turn-gate summary, the
+/// agent-facing tool error, a login's reason) already names the server, so keeping the prefix
+/// would say it twice. The remedy for a missing credential is each surface's own to word, so the
+/// cause leaves it unsaid.
+pub(super) fn failure_cause(error: &MekaError) -> (String, Option<super::CredentialNeed>) {
+    match error {
+        MekaError::McpConnection { message, .. } | MekaError::McpAuth { message, .. } => {
+            (message.clone(), None)
+        }
+        other => match super::CredentialNeed::of(other) {
+            Some(need) => (need.cause(), Some(need)),
+            None => (other.to_string(), None),
+        },
+    }
+}
+
 /// Record a failed connect on `entry`, announcing it only when it tells the user something new.
 /// The one door a failure is recorded by: the connector's, and the give-up of
 /// `ServerEntry::reconnect`.
@@ -223,6 +241,7 @@ pub(super) async fn record_connect_failure(
     entry: &Arc<ServerEntry>,
     server_name: &str,
     cause: String,
+    needs: Option<super::CredentialNeed>,
 ) {
     // The cause reaches the log at the default level, the model as the reason the server is
     // unavailable, and every session's history through the tool results that quote it.
@@ -239,6 +258,7 @@ pub(super) async fn record_connect_failure(
     *entry.state.write().await = ServerState::Failed {
         error: cause,
         at: std::time::Instant::now(),
+        needs,
     };
 }
 
@@ -295,23 +315,14 @@ pub(crate) async fn connect_one(
     let landing = entry.connects.connecting();
     let connected = match connect_task.await {
         Ok(Some(Ok(Ok(service)))) => service,
-        // Store the bare cause. `MekaError::McpConnection` and `McpAuth` render as
-        // "MCP <class> error: <server>: <message>", and every consumer of this string
-        // (`meka mcp list`, the turn-gate summary, the agent-facing tool error, a login's reason)
-        // already names the server, so keeping the prefix would say it twice.
         Ok(Some(Ok(Err(error)))) => {
-            let cause = match &error {
-                MekaError::McpConnection { message, .. } | MekaError::McpAuth { message, .. } => {
-                    message.clone()
-                }
-                other => other.to_string(),
-            };
-            record_connect_failure(&entry, &server_name, cause).await;
+            let (cause, needs) = failure_cause(&error);
+            record_connect_failure(&entry, &server_name, cause, needs).await;
             return;
         }
         Ok(Some(Err(_elapsed))) => {
             let cause = format!("connect timed out after {connect_timeout:?}");
-            record_connect_failure(&entry, &server_name, cause).await;
+            record_connect_failure(&entry, &server_name, cause, None).await;
             return;
         }
         // Ended by a shutdown or a removal: the entry is closed or out, and a failure recorded now
@@ -319,7 +330,7 @@ pub(crate) async fn connect_one(
         Ok(None) => return,
         Err(join_error) => {
             let cause = format!("connect task join error: {join_error}");
-            record_connect_failure(&entry, &server_name, cause).await;
+            record_connect_failure(&entry, &server_name, cause, None).await;
             return;
         }
     };
@@ -390,14 +401,14 @@ async fn discover_and_register_tools(
     mcp_default_permission: Option<Permission>,
     manager: &Arc<McpClientManager>,
 ) -> Result<usize> {
-    let adapters = build_mcp_tools(
+    let (adapters, policy) = build_mcp_tools(
         entry,
         mcp_default_permission,
         super::DEFAULT_MCP_REQUEST_TIMEOUT,
     )
     .await?;
     let registered_count = adapters.len();
-    manager.register_server_tools(entry, adapters).await;
+    manager.register_server_tools(entry, adapters, policy).await;
     Ok(registered_count)
 }
 
@@ -428,9 +439,10 @@ pub(super) async fn build_mcp_tools(
     entry: &Arc<ServerEntry>,
     mcp_default_permission: Option<Permission>,
     timeout: std::time::Duration,
-) -> Result<Vec<McpTool>> {
+) -> Result<(Vec<McpTool>, Arc<crate::config::McpServerConfig>)> {
     let server_name = entry.server_name.clone();
-    let server_config = &entry.config;
+    let policy = entry.config();
+    let server_config = &*policy;
     // Bounded like every other `tools/list`. This one already sat inside the connect timeout, but
     // the tool *count* is unbounded there too, and the cap belongs to meka rather than to the
     // server's pagination.
@@ -528,7 +540,7 @@ pub(super) async fn build_mcp_tools(
         });
     }
 
-    Ok(adapters)
+    Ok((adapters, policy))
 }
 
 /// Drain a stdio MCP child's stderr line by line into meka's tracing stream. Many MCP servers log
@@ -620,6 +632,25 @@ fn bearer_for_transport(
     }
 }
 
+/// Whether a handshake failed on the server's 401 challenge (RFC 6750): rmcp reports it as an
+/// `AuthRequiredError` down the chain of the transport error the handshake wraps it in.
+fn challenged(error: &rmcp::service::ClientInitializeError) -> bool {
+    let rmcp::service::ClientInitializeError::TransportError { error, .. } = error else {
+        return false;
+    };
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error.error.as_ref());
+    while let Some(cause) = current {
+        if cause
+            .downcast_ref::<rmcp::transport::streamable_http_client::AuthRequiredError>()
+            .is_some()
+        {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
+}
+
 /// Connect to an MCP server, dispatching to the auth or no-auth path.
 ///
 /// The returned future is `!Send` when the server config uses OAuth, because rmcp's auth module
@@ -631,7 +662,7 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
     use super::handler::{http_lifecycle, stdio_probe};
 
     let server_name = entry.server_name.as_str();
-    let config = &entry.config;
+    let config = &*entry.config();
     let token_store = entry.token_store.as_ref();
     let client_context = &entry.client_context;
     let handler = MekaClientHandler::new(server_name.to_string(), Arc::clone(client_context));
@@ -752,11 +783,21 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
             // The server's static bearer, if it has one. Absent for a server that authenticates
             // through a flow instead, and absent when this host has no store at all (the mock
             // harness); either way no Authorization header is sent.
+            // Asked whether it may be presented only where it would be: beside an `[auth]`
+            // block it is dropped below, wherever it was stored for.
             let bearer = match token_store {
+                Some(store) if config.auth.is_some() => store
+                    .load_mcp_credentials(server_name, crate::store::McpCredentialKind::Bearer)
+                    .await?
+                    .map(|stored| stored.secret),
                 Some(store) => {
-                    store
-                        .load_mcp_credentials(server_name, crate::store::McpCredentialKind::Bearer)
-                        .await?
+                    super::auth::presented_secret(
+                        store,
+                        server_name,
+                        crate::error::McpSecretKind::Bearer,
+                        url,
+                    )
+                    .await?
                 }
                 None => None,
             };
@@ -780,12 +821,24 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
                 let transport =
                     rmcp::transport::StreamableHttpClientTransport::from_config(transport_config);
 
+                let presented_a_bearer = bearer.is_some();
                 handler
                     .serve_with_lifecycle(transport, http_lifecycle())
                     .await
-                    .map_err(|error| MekaError::McpConnection {
-                        server_name: server_name.to_string(),
-                        message: format!("HTTP connection failed: {error}"),
+                    .map_err(|error| {
+                        // A server that asks for a login before an `[auth]` block says so is one
+                        // a login, which assumes `oauth`, connects; one that refuses a stored
+                        // bearer wants another bearer, which is a connection failure as written.
+                        if !presented_a_bearer && challenged(&error) {
+                            MekaError::McpLoginRequired {
+                                server_name: server_name.to_string(),
+                            }
+                        } else {
+                            MekaError::McpConnection {
+                                server_name: server_name.to_string(),
+                                message: format!("HTTP connection failed: {error}"),
+                            }
+                        }
                     })
             }
         }
@@ -863,6 +916,7 @@ mod tests {
         let same = ServerState::Failed {
             error: "'ida-mcp' not found".to_string(),
             at: std::time::Instant::now(),
+            needs: None,
         };
         assert!(is_repeat_failure(&same, "'ida-mcp' not found"));
         assert!(
@@ -887,6 +941,7 @@ mod tests {
             "api",
             "error sending request for url (https://api.example.test/mcp?apiKey=SECRET)"
                 .to_string(),
+            None,
         )
         .await;
         match &*entry.state.read().await {
@@ -920,13 +975,13 @@ mod tests {
     #[tokio::test]
     async fn record_connect_failure_stores_the_bare_cause() {
         let entry = bare_entry("ida");
-        record_connect_failure(&entry, "ida", "'ida-mcp' not found".to_string()).await;
+        record_connect_failure(&entry, "ida", "'ida-mcp' not found".to_string(), None).await;
         match &*entry.state.read().await {
             ServerState::Failed { error, .. } => assert_eq!(error, "'ida-mcp' not found"),
             other => panic!("expected Failed, got {}", other.label()),
         }
         // A second identical failure keeps the state and stays quiet.
-        record_connect_failure(&entry, "ida", "'ida-mcp' not found".to_string()).await;
+        record_connect_failure(&entry, "ida", "'ida-mcp' not found".to_string(), None).await;
         assert!(matches!(
             &*entry.state.read().await,
             ServerState::Failed { .. }
@@ -936,8 +991,8 @@ mod tests {
     fn bare_entry(name: &str) -> Arc<ServerEntry> {
         Arc::new(ServerEntry {
             server_name: name.to_string(),
-            configured: McpServerConfig::for_test(name),
-            config: McpServerConfig::for_test(name),
+            configs: crate::mcp::EntryConfigs::lock_for_test(McpServerConfig::for_test(name)),
+            credential_generation: 0,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
@@ -971,8 +1026,8 @@ mod tests {
 
         let entry = Arc::new(ServerEntry {
             server_name: "ida".to_string(),
-            configured: config.clone(),
-            config,
+            configs: crate::mcp::EntryConfigs::lock_for_test(config),
+            credential_generation: 0,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
@@ -1039,13 +1094,14 @@ mod tests {
             "environment variable(s) [\"TOKEN\"] are unset and named in `headers` or `env`";
         let entry = Arc::new(ServerEntry {
             server_name: "tenant".to_string(),
-            configured: config.clone(),
-            config,
+            configs: crate::mcp::EntryConfigs::lock_for_test(config),
+            credential_generation: 0,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Failed {
                 error: reason.to_string(),
                 at: std::time::Instant::now(),
+                needs: None,
             }),
             reconnect_lock: Mutex::new(()),
             removed: tokio_util::sync::CancellationToken::new(),
@@ -1102,8 +1158,8 @@ mod tests {
 
         let entry = Arc::new(ServerEntry {
             server_name: "hung".to_string(),
-            configured: config.clone(),
-            config,
+            configs: crate::mcp::EntryConfigs::lock_for_test(config),
+            credential_generation: 0,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
@@ -1174,6 +1230,7 @@ mod tests {
         *entry.state.write().await = ServerState::Failed {
             error: "initial connect failed".to_string(),
             at: std::time::Instant::now(),
+            needs: None,
         };
         (entry, manager)
     }
@@ -1269,6 +1326,7 @@ mod tests {
         *entry.state.write().await = ServerState::Failed {
             error: "still failing".to_string(),
             at: std::time::Instant::now(),
+            needs: None,
         };
         let handle = tokio::spawn(retry_until_connected(
             Arc::clone(&entry),

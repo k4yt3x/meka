@@ -174,6 +174,21 @@ async fn close_service(server_name: &str, mut service: McpRunningService) {
     }
 }
 
+/// An entry as it runs: every `${VAR}` expanded once, up front, so the rest of the pipeline sees
+/// only resolved values, and what the entry leaves unsaid settled under the `[mcp]` defaults, so
+/// no reader downstream has to remember that `None` means "inherit" or that the CLI asked for a
+/// tool to load eagerly. The entry as it was handed in stays beside it, for the doors that show,
+/// edit or compare it.
+fn settle_entry(
+    original_config: &McpServerConfig,
+    overlay: &crate::config::McpOverlay,
+) -> (McpServerConfig, crate::mcp::expand::Unresolved) {
+    let mut config = original_config.clone();
+    let unresolved = crate::mcp::expand::expand_server_config(&mut config);
+    overlay.settle(&mut config);
+    (config, unresolved)
+}
+
 /// One server's entry, validated: the name is one a tool prefix can carry and meka does not
 /// reserve, `${VAR}` is expanded once, and a secret the environment did not supply fails the
 /// entry closed. The one builder, so a server added while the process runs is held to what
@@ -182,19 +197,12 @@ fn build_entry(
     original_config: &McpServerConfig,
     overlay: &crate::config::McpOverlay,
     token_store: Option<TokenStore>,
+    credential_generation: u64,
     client_context: Arc<McpClientContext>,
     tool_call_timeout: std::time::Duration,
     connects: Arc<Connects>,
 ) -> Result<Arc<ServerEntry>> {
-    // Apply env-var substitution (`${VAR}` / `${VAR:-default}`) once, up-front, so the rest of
-    // the pipeline sees only resolved values.
-    let mut config = original_config.clone();
-    let unresolved = crate::mcp::expand::expand_server_config(&mut config);
-    // Settled here, the one place every entry is made, so no reader downstream has to remember
-    // that `None` means "inherit the `[mcp]` default" or that the CLI asked for a tool to load
-    // eagerly: the runtime copy reads the whole word, while `configured` stays the entry as it
-    // was handed in, for the doors that show, edit or compare it.
-    overlay.settle(&mut config);
+    let (config, unresolved) = settle_entry(original_config, overlay);
     if !unresolved.names.is_empty() {
         tracing::warn!(
             "MCP server '{name}': unresolved env vars {names:?} left literal in config",
@@ -231,6 +239,7 @@ fn build_entry(
         ServerState::Failed {
             error: error.clone(),
             at: std::time::Instant::now(),
+            needs: None,
         }
     } else {
         ServerState::Pending
@@ -238,8 +247,11 @@ fn build_entry(
 
     Ok(Arc::new(ServerEntry {
         server_name: config.name.clone(),
-        configured: original_config.clone(),
-        config,
+        configs: std::sync::RwLock::new(EntryConfigs {
+            settled: Arc::new(config),
+            configured: Arc::new(original_config.clone()),
+        }),
+        credential_generation,
         token_store,
         client_context,
         state: RwLock::new(initial_state),
@@ -326,7 +338,7 @@ impl ServerTools {
         let mut kept = Vec::with_capacity(tools.len());
         let mut deferred = Vec::new();
         for tool in tools {
-            match tool_exposure(tool.server_config(), tool.raw_name()) {
+            match tool_exposure(&tool.server_config(), tool.raw_name()) {
                 crate::config::Deferral::Hidden => continue,
                 crate::config::Deferral::Deferred => deferred.push(tool.namespaced_name.clone()),
                 crate::config::Deferral::Eager => {}
@@ -371,7 +383,73 @@ pub(crate) enum ServerState {
             reason = "when the failure happened; recorded so the state carries it, read by nothing yet"
         )]
         at: std::time::Instant,
+        /// The credential the server lacks, when that is why: each surface words the remedy
+        /// with its own command, which `error` leaves unsaid.
+        needs: Option<CredentialNeed>,
     },
+}
+
+/// What a server that failed for want of a credential it could present needs from the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialNeed {
+    /// No OAuth credentials for its URL, and nobody was there to log it in.
+    Login,
+    /// The stored `secret` was given for another endpoint.
+    SecretForItsUrl {
+        secret: crate::error::McpSecretKind,
+        stored_for: Option<String>,
+    },
+}
+
+impl CredentialNeed {
+    /// The need `error` reports, when it reports one.
+    pub(crate) fn of(error: &MekaError) -> Option<Self> {
+        match error {
+            MekaError::McpLoginRequired { .. } => Some(Self::Login),
+            MekaError::McpSecretForAnotherUrl {
+                secret, stored_for, ..
+            } => Some(Self::SecretForItsUrl {
+                secret: *secret,
+                stored_for: stored_for.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The refusal that says it about `server_name`, for a surface to word with its remedy.
+    pub(crate) fn refusal(&self, server_name: &str) -> MekaError {
+        match self {
+            Self::Login => MekaError::McpLoginRequired {
+                server_name: server_name.to_string(),
+            },
+            Self::SecretForItsUrl { secret, stored_for } => MekaError::McpSecretForAnotherUrl {
+                server_name: server_name.to_string(),
+                secret: *secret,
+                stored_for: stored_for.clone(),
+            },
+        }
+    }
+
+    /// The bare cause, with no remedy, for the state a failed server records.
+    fn cause(&self) -> String {
+        match self {
+            Self::Login => "no OAuth credentials for its URL".to_string(),
+            Self::SecretForItsUrl {
+                secret,
+                stored_for: Some(origin),
+            } => format!(
+                "the stored {label} was given for {origin}, not its URL",
+                label = secret.label()
+            ),
+            Self::SecretForItsUrl {
+                secret,
+                stored_for: None,
+            } => format!(
+                "the stored {label} was given for no configured server",
+                label = secret.label()
+            ),
+        }
+    }
 }
 
 impl ServerState {
@@ -445,13 +523,16 @@ fn redact_mcp_error(error: MekaError) -> MekaError {
 /// [`Self::require_connected`].
 pub(crate) struct ServerEntry {
     pub(crate) server_name: String,
-    pub(crate) config: McpServerConfig,
-    /// The entry as it was handed in, from `config.toml` or a door's body, every `${VAR}` a
-    /// reference still and a `required` or `deferral` it leaves out left out: what the doors that
-    /// show, edit or compare the entry read, since what a reference expands to in [`Self::config`]
-    /// may be the secret it keeps out of the file, and a default settled there is not the file's
-    /// word. A reload compares it with the file as the file would be written from each.
-    pub(crate) configured: McpServerConfig,
+    /// The entry as it runs and as it was handed in; see [`Self::config`] and
+    /// [`Self::configured`]. Behind a lock because a change to the policy keys alone replaces both
+    /// in place ([`McpClientManager::reconfigure_server`]); the keys the connection is made from
+    /// never change for the life of an entry, so a reader may hold a snapshot across a connect.
+    configs: std::sync::RwLock<EntryConfigs>,
+    /// The server's credential generation when this entry was built, from
+    /// [`TokenStore::mcp_credential_generations`]: a host serving the installation restarts an
+    /// entry whose server's credentials have been written since, the one change the file cannot
+    /// show.
+    pub(crate) credential_generation: u64,
     pub(crate) token_store: Option<TokenStore>,
     pub(crate) client_context: Arc<McpClientContext>,
     pub(crate) state: RwLock<ServerState>,
@@ -510,11 +591,46 @@ pub(crate) struct ServerEntry {
     pub(crate) connects: Arc<Connects>,
 }
 
+/// One entry's two configurations, replaced together.
+struct EntryConfigs {
+    /// The entry as it runs, from [`settle_entry`].
+    settled: Arc<McpServerConfig>,
+    /// The entry as it was handed in.
+    configured: Arc<McpServerConfig>,
+}
+
+#[cfg(test)]
+impl EntryConfigs {
+    /// `config` as both of an entry's configurations, for a test building a [`ServerEntry`] by
+    /// hand.
+    pub(crate) fn lock_for_test(config: McpServerConfig) -> std::sync::RwLock<Self> {
+        std::sync::RwLock::new(Self {
+            settled: Arc::new(config.clone()),
+            configured: Arc::new(config),
+        })
+    }
+}
+
 impl ServerEntry {
+    /// The entry as it runs: every `${VAR}` expanded and what it leaves unsaid settled under the
+    /// `[mcp]` defaults.
+    pub(crate) fn config(&self) -> Arc<McpServerConfig> {
+        Arc::clone(&crate::sync::read(&self.configs).settled)
+    }
+
+    /// The entry as it was handed in, from `config.toml` or a door's body, every `${VAR}` a
+    /// reference still and a `required` or `deferral` it leaves out left out: what the doors that
+    /// show, edit or compare the entry read, since what a reference expands to in [`Self::config`]
+    /// may be the secret it keeps out of the file, and a default settled there is not the file's
+    /// word.
+    pub(crate) fn configured(&self) -> Arc<McpServerConfig> {
+        Arc::clone(&crate::sync::read(&self.configs).configured)
+    }
+
     /// Whether this entry is one a connector connects: enabled, and not refused for a secret the
     /// environment did not supply, which is failed for good.
     fn wants_connecting(&self) -> bool {
-        !self.config.disabled.unwrap_or(false) && self.refused.is_none()
+        !self.config().disabled.unwrap_or(false) && self.refused.is_none()
     }
 
     /// The configured per-request bound, or [`DEFAULT_MCP_REQUEST_TIMEOUT`] before the connector
@@ -734,7 +850,7 @@ impl ServerEntry {
         self: &Arc<Self>,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
-        let max_attempts: u32 = match self.config.transport {
+        let max_attempts: u32 = match self.config().transport {
             McpTransport::Stdio => 1,
             McpTransport::Http => 5,
         };
@@ -827,13 +943,8 @@ impl ServerEntry {
             server_name: self.server_name.clone(),
             message: "reconnect made no attempt".to_string(),
         });
-        let cause = match &error {
-            MekaError::McpConnection { message, .. } | MekaError::McpAuth { message, .. } => {
-                message.clone()
-            }
-            other => other.to_string(),
-        };
-        connector::record_connect_failure(self, &self.server_name, cause).await;
+        let (cause, needs) = connector::failure_cause(&error);
+        connector::record_connect_failure(self, &self.server_name, cause, needs).await;
         if let Some(retry) = self.background_retry.get() {
             tokio::spawn(connector::retry_until_connected(
                 Arc::clone(self),
@@ -947,10 +1058,6 @@ impl McpClientManager {
     /// no process or network work; [`Self::start_connector`] does, once the registries have
     /// subscribed, so the connector can register tools into them as each server comes up without
     /// any registry having to exist before config validation.
-    #[allow(
-        clippy::unused_async,
-        reason = "the signature is the boundary every host and test calls, and the credential check it is likely to grow will await the store"
-    )]
     pub(crate) async fn prepare_with_overlay(
         configs: &[McpServerConfig],
         overlay: crate::config::McpOverlay,
@@ -964,11 +1071,16 @@ impl McpClientManager {
         let connects = Connects::new();
 
         sanitize::validate_server_entries(configs).map_err(MekaError::Config)?;
+        let generations = match &token_store {
+            Some(store) => store.mcp_credential_generations().await?,
+            None => HashMap::new(),
+        };
         for original_config in configs {
             let entry = build_entry(
                 original_config,
                 &overlay,
                 token_store.clone(),
+                generations.get(&original_config.name).copied().unwrap_or(0),
                 Arc::clone(&client_context),
                 tool_call_timeout,
                 Arc::clone(&connects),
@@ -1038,11 +1150,36 @@ impl McpClientManager {
     /// The one door for all three discovery paths (the connector's first `tools/list`, the refresh
     /// a `tools/list_changed` notification triggers, and the re-list [`Self::refresh_server_tools`]
     /// runs after a reconnect), so none of them can classify a tool differently from the others.
+    ///
+    /// `listed_under` is the policy the listing was built under. One the entry no longer holds, a
+    /// permission or a tool list changed while the server listed, is listed under again first, so
+    /// tools built under the policy it replaced never reach a session; a listing that fails then
+    /// registers nothing.
     pub(super) async fn register_server_tools(
         &self,
         entry: &Arc<ServerEntry>,
         tools: Vec<McpTool>,
+        listed_under: Arc<McpServerConfig>,
     ) {
+        let (mut tools, mut listed_under) = (tools, listed_under);
+        while !Arc::ptr_eq(&listed_under, &entry.config()) {
+            match connector::build_mcp_tools(
+                entry,
+                self.mcp_default_permission,
+                self.request_timeout(),
+            )
+            .await
+            {
+                Ok((fresh, policy)) => (tools, listed_under) = (fresh, policy),
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to list MCP server '{name}' under its new policy: {error}",
+                        name = entry.server_name
+                    );
+                    return;
+                }
+            }
+        }
         self.update_server_tools(entry, ServerTools::from_tools(tools))
             .await;
     }
@@ -1157,7 +1294,7 @@ impl McpClientManager {
                     name: name.clone(),
                     // Settled when the entry was made, so `None` is unreachable; read as optional,
                     // the default, rather than panicked on.
-                    required: entry.config.required.unwrap_or(false),
+                    required: entry.config().required.unwrap_or(false),
                     state: other,
                 }),
             }
@@ -1228,7 +1365,7 @@ impl McpClientManager {
     pub(crate) fn server_configs(&self) -> Vec<McpServerConfig> {
         self.entries()
             .into_iter()
-            .map(|(_, entry)| entry.configured.clone())
+            .map(|(_, entry)| McpServerConfig::clone(&entry.configured()))
             .collect()
     }
 
@@ -1260,19 +1397,22 @@ impl McpClientManager {
         }
     }
 
-    /// Add a server to a running manager, as `POST /v1/mcp` does once the entry is in
-    /// `config.toml`, and connect it in the background: the entry is answered at once, `pending`
-    /// (or `disabled`, or `failed` for a secret the environment did not supply), and the connect
-    /// runs as the startup connector's would, retried on a cold-start failure. A name in use, or
-    /// one meka reserves, is refused.
+    /// Add a server to a running manager, as serving the installation does for an entry the file
+    /// names and the manager does not run, and connect it in the background: the entry is
+    /// answered at once, `pending` (or `disabled`, or `failed` for a secret the environment did
+    /// not supply), and the connect runs as the startup connector's would, retried on a
+    /// cold-start failure. `credential_generation` is the server's, read before this is asked. A
+    /// name in use, or one meka reserves, is refused.
     pub(crate) fn add_server(
         self: &Arc<Self>,
         config: &McpServerConfig,
+        credential_generation: u64,
     ) -> Result<Arc<ServerEntry>> {
         let entry = build_entry(
             config,
             self.overlay(),
             self.token_store.clone(),
+            credential_generation,
             Arc::clone(&self.client_context),
             self.tool_call_timeout,
             Arc::clone(&self.connects),
@@ -1372,15 +1512,55 @@ impl McpClientManager {
         Ok(())
     }
 
-    /// Put `config` in place of the server of the same name: the one door for a change to a
-    /// configured server, which is a removal and an add, so a changed `url`, a flipped
-    /// `disabled` and a narrowed tool list all take effect the same way.
+    /// Put `config` in place of the server of the same name, as a removal and an add: the door
+    /// for a change to what the connection is made from, a changed `url` or a flipped `disabled`,
+    /// and for a credential written under the running entry.
     pub(crate) async fn replace_server(
         self: &Arc<Self>,
         config: &McpServerConfig,
+        credential_generation: u64,
     ) -> Result<Arc<ServerEntry>> {
         self.remove_server(&config.name).await?;
-        self.add_server(config)
+        self.add_server(config, credential_generation)
+    }
+
+    /// Put `config`'s policy keys in place on the running server of the same name, keeping its
+    /// connection: the door for a change the connection is not made from, a permission or a tool
+    /// list, which [`crate::installation::mcp::same_connection`] tells apart. A connected server
+    /// lists its tools again under the new policy, and every session's registry takes the new
+    /// set. A listing that fails restarts the server instead, so a narrowed policy is never left
+    /// standing on tools built under the wider one. Answers whether the connection was kept.
+    pub(crate) async fn reconfigure_server(
+        self: &Arc<Self>,
+        config: &McpServerConfig,
+    ) -> Result<bool> {
+        let Some(entry) = self.entry(&config.name) else {
+            return Err(MekaError::McpConnection {
+                server_name: config.name.clone(),
+                message: self.unknown_server(&config.name),
+            });
+        };
+        let (settled, _) = settle_entry(config, self.overlay());
+        *crate::sync::write(&entry.configs) = EntryConfigs {
+            settled: Arc::new(settled),
+            configured: Arc::new(config.clone()),
+        };
+        if !matches!(entry.state().await, ServerState::Connected { .. }) {
+            // Its next connect lists under the entry as it now stands.
+            return Ok(true);
+        }
+        match self.refresh_server_tools(&entry).await {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                tracing::warn!(
+                    "failed to list MCP server '{name}' under its new policy: {error}; restarting it",
+                    name = config.name
+                );
+                self.replace_server(config, entry.credential_generation)
+                    .await?;
+                Ok(false)
+            }
+        }
     }
 
     /// Whether the server owning a namespaced tool name has yet to finish its first connection.
@@ -1459,11 +1639,11 @@ impl McpClientManager {
     /// list means meka does not know what the server has, which is not the same as knowing it has
     /// nothing.
     pub(crate) async fn refresh_server_tools(&self, entry: &Arc<ServerEntry>) -> Result<usize> {
-        let adapters =
+        let (adapters, policy) =
             connector::build_mcp_tools(entry, self.mcp_default_permission, self.request_timeout())
                 .await?;
         let count = adapters.len();
-        self.register_server_tools(entry, adapters).await;
+        self.register_server_tools(entry, adapters, policy).await;
         Ok(count)
     }
 
@@ -1478,6 +1658,7 @@ impl McpClientManager {
         };
         connector::build_mcp_tools(&entry, self.mcp_default_permission, self.request_timeout())
             .await
+            .map(|(tools, _)| tools)
     }
 
     /// [`Self::discover_tools_for_server`], classified the way the connector classifies a listing.
@@ -1595,7 +1776,7 @@ impl McpClientManager {
             });
         };
 
-        let server_config = &entry.config;
+        let server_config = &*entry.config();
         let tools = entry.list_tools_bounded(self.request_timeout()).await?;
 
         let mut out = Vec::with_capacity(tools.len());
@@ -2580,12 +2761,12 @@ mod tests {
         let settled = |name: &str| {
             let entry = manager.entry(name).expect("entry");
             (
-                entry.config.required,
-                entry.config.deferral,
-                entry.config.eager_load_tools.clone(),
-                entry.configured.required,
-                entry.configured.deferral,
-                entry.configured.eager_load_tools.clone(),
+                entry.config().required,
+                entry.config().deferral,
+                entry.config().eager_load_tools.clone(),
+                entry.configured().required,
+                entry.configured().deferral,
+                entry.configured().eager_load_tools.clone(),
             )
         };
         let eager = Some(vec!["search".to_string()]);
@@ -2615,7 +2796,7 @@ mod tests {
         );
 
         manager
-            .add_server(&McpServerConfig::for_test("later"))
+            .add_server(&McpServerConfig::for_test("later"), 0)
             .expect("add");
         assert_eq!(
             settled("later"),
@@ -2630,7 +2811,7 @@ mod tests {
             "one added later inherits the same"
         );
         manager
-            .replace_server(&McpServerConfig::for_test("follows"))
+            .replace_server(&McpServerConfig::for_test("follows"), 0)
             .await
             .expect("replace");
         assert_eq!(
@@ -2660,8 +2841,8 @@ mod tests {
     fn pending_entry_for(config: McpServerConfig) -> Arc<ServerEntry> {
         Arc::new(ServerEntry {
             server_name: config.name.clone(),
-            configured: config.clone(),
-            config,
+            configs: EntryConfigs::lock_for_test(config),
+            credential_generation: 0,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
@@ -2893,7 +3074,7 @@ mod tests {
         .expect("prepare");
         let entry = manager.entry("vault").expect("the configured entry");
         assert_eq!(
-            entry.config.url.as_deref(),
+            entry.config().url.as_deref(),
             Some("https://example.test/expanded"),
             "the connect reads the expanded value"
         );
@@ -3102,6 +3283,7 @@ mod tests {
             .await = ServerState::Failed {
             error: "'ida-mcp' not found".to_string(),
             at: std::time::Instant::now(),
+            needs: None,
         };
         let reason = manager
             .unavailable_tool_reason("mcp__ida__decompile")
@@ -3320,8 +3502,8 @@ mod tests {
         config.args = Some(vec!["3".to_string()]);
         Arc::new(ServerEntry {
             server_name: name.to_string(),
-            configured: config.clone(),
-            config,
+            configs: EntryConfigs::lock_for_test(config),
+            credential_generation: 0,
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
@@ -3420,6 +3602,7 @@ mod tests {
         *entry.state.write().await = ServerState::Failed {
             error: "boom".to_string(),
             at: std::time::Instant::now(),
+            needs: None,
         };
         let err = entry.require_connected().await.unwrap_err();
         assert!(matches!(err, MekaError::McpConnection { .. }));
@@ -3443,7 +3626,8 @@ mod tests {
         assert_eq!(
             ServerState::Failed {
                 error: "x".into(),
-                at: std::time::Instant::now()
+                at: std::time::Instant::now(),
+                needs: None,
             }
             .label(),
             "failed"

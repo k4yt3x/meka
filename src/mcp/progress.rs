@@ -42,6 +42,8 @@ struct Entry {
     /// site (e.g. an MCP connection probe). When `None`, `dispatch` falls back to a tracing log
     /// and the user sees nothing.
     frontend: Option<Arc<dyn Frontend>>,
+    /// When the call is cut at its own bound, which an elicitation it raises cannot outlive.
+    deadline: tokio::time::Instant,
 }
 
 impl ProgressRegistry {
@@ -57,6 +59,7 @@ impl ProgressRegistry {
         tool_name: String,
         tool_use_id: Option<String>,
         frontend: Option<Arc<dyn Frontend>>,
+        deadline: tokio::time::Instant,
     ) -> ProgressGuard {
         let key = Key {
             server_name,
@@ -66,6 +69,7 @@ impl ProgressRegistry {
             tool_name,
             tool_use_id,
             frontend,
+            deadline,
         });
         ProgressGuard {
             entries: Arc::clone(&self.entries),
@@ -138,20 +142,34 @@ impl ProgressRegistry {
     /// in-flight calls are all there is to go on. One session with parallel calls to the server is
     /// unambiguous; two sessions on the same server are not, and picking one would surface the
     /// prompt in the wrong editor and answer the other session's call with what this one typed.
+    ///
+    /// The route's deadline is the latest of those calls' own: whichever of them asked, the prompt
+    /// is answerable for no longer than that call waits, and a call that ends sooner is canceled
+    /// with its question by the server.
     pub(crate) fn elicitation_route(&self, server_name: &str) -> ElicitationRoute {
-        let frontends: Vec<Arc<dyn Frontend>> = crate::sync::lock(&self.entries)
-            .iter()
-            .filter(|(key, _entry)| key.server_name == server_name)
-            .filter_map(|(_key, entry)| entry.frontend.clone())
-            .collect();
+        let calls: Vec<(Arc<dyn Frontend>, tokio::time::Instant)> =
+            crate::sync::lock(&self.entries)
+                .iter()
+                .filter(|(key, _entry)| key.server_name == server_name)
+                .filter_map(|(_key, entry)| {
+                    entry
+                        .frontend
+                        .clone()
+                        .map(|frontend| (frontend, entry.deadline))
+                })
+                .collect();
         let mut route = ElicitationRoute::Nobody;
-        for frontend in frontends {
+        for (frontend, deadline) in calls {
             route = match route {
-                ElicitationRoute::Nobody => ElicitationRoute::To(frontend),
-                ElicitationRoute::To(known)
-                    if std::ptr::addr_eq(Arc::as_ptr(&known), Arc::as_ptr(&frontend)) =>
-                {
-                    ElicitationRoute::To(known)
+                ElicitationRoute::Nobody => ElicitationRoute::To { frontend, deadline },
+                ElicitationRoute::To {
+                    frontend: known,
+                    deadline: latest,
+                } if std::ptr::addr_eq(Arc::as_ptr(&known), Arc::as_ptr(&frontend)) => {
+                    ElicitationRoute::To {
+                        frontend: known,
+                        deadline: latest.max(deadline),
+                    }
                 }
                 _ => return ElicitationRoute::Ambiguous,
             };
@@ -180,8 +198,11 @@ fn token_key(token: &ProgressToken) -> String {
 
 /// Where an elicitation goes, from [`ProgressRegistry::elicitation_route`].
 pub(crate) enum ElicitationRoute {
-    /// The one frontend with calls in flight on the server.
-    To(Arc<dyn Frontend>),
+    /// The one frontend with calls in flight on the server, and the latest of their deadlines.
+    To {
+        frontend: Arc<dyn Frontend>,
+        deadline: tokio::time::Instant,
+    },
     /// No call on the server is in flight: it elicited outside a tool call, or the call's guard
     /// is already gone.
     Nobody,
@@ -211,6 +232,11 @@ mod tests {
     use crate::frontend::{Frontend, FrontendEvent, testing::RecordingFrontend};
 
     /// A token as rmcp mints it for a request: a number.
+    /// A call bound no test reaches.
+    fn far() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
     fn minted(number: i64) -> ProgressToken {
         ProgressToken(NumberOrString::Number(number))
     }
@@ -234,7 +260,7 @@ mod tests {
         let registry = ProgressRegistry::default();
         let token = minted(1);
         {
-            let _guard = registry.register(&token, "srv".into(), "tool".into(), None, None);
+            let _guard = registry.register(&token, "srv".into(), "tool".into(), None, None, far());
             assert!(
                 registry.is_registered("srv", &token),
                 "token missing from registry while guard is still alive"
@@ -276,6 +302,7 @@ mod tests {
             "tool".into(),
             Some("tu-1".into()),
             Some(frontend),
+            far(),
         );
 
         // The token as a server echoes it: the number rmcp minted, unchanged.
@@ -319,6 +346,7 @@ mod tests {
             "tool-a".into(),
             Some("ta".into()),
             Some(frontend_a),
+            far(),
         );
         let _guard_b = registry.register(
             &minted(2),
@@ -326,6 +354,7 @@ mod tests {
             "tool-b".into(),
             Some("tb".into()),
             Some(frontend_b),
+            far(),
         );
 
         registry
@@ -376,6 +405,7 @@ mod tests {
             "tool-a".into(),
             Some("ta".into()),
             Some(Arc::clone(&frontend_a)),
+            far(),
         );
         let _guard_b = registry.register(
             &minted(1),
@@ -383,6 +413,7 @@ mod tests {
             "tool-b".into(),
             Some("tb".into()),
             Some(frontend_b),
+            far(),
         );
 
         registry
@@ -403,7 +434,7 @@ mod tests {
         assert!(
             matches!(
                 registry.elicitation_route("srv-a"),
-                ElicitationRoute::To(ref found)
+                ElicitationRoute::To { frontend: ref found, .. }
                     if std::ptr::addr_eq(Arc::as_ptr(found), Arc::as_ptr(&frontend_a))
             ),
             "server A's elicitation goes to the frontend of A's call"
@@ -430,8 +461,12 @@ mod tests {
             "tool".into(),
             None,
             Some(frontend),
+            far(),
         );
-        let ElicitationRoute::To(found) = registry.elicitation_route("unique-srv-for-test") else {
+        let ElicitationRoute::To {
+            frontend: found, ..
+        } = registry.elicitation_route("unique-srv-for-test")
+        else {
             panic!("one frontend with a call in flight is the route");
         };
         found
@@ -446,6 +481,36 @@ mod tests {
                 .any(|e| matches!(e, FrontendEvent::Notice(n) if n.text == "probe")),
             "the found frontend must be the one originally registered",
         );
+    }
+
+    /// The route carries the latest deadline among its frontend's calls on the server, which is
+    /// as long as whichever of them asked can still be waiting.
+    #[test]
+    fn an_elicitation_route_ends_with_the_last_call_that_could_have_asked() {
+        let frontend: Arc<dyn Frontend> = Arc::new(RecordingFrontend::new());
+        let registry = ProgressRegistry::default();
+        let sooner = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let later = sooner + std::time::Duration::from_secs(10);
+        let _first = registry.register(
+            &minted(8),
+            "srv".into(),
+            "tool".into(),
+            None,
+            Some(Arc::clone(&frontend)),
+            later,
+        );
+        let _second = registry.register(
+            &minted(9),
+            "srv".into(),
+            "tool".into(),
+            None,
+            Some(Arc::clone(&frontend)),
+            sooner,
+        );
+        assert!(matches!(
+            registry.elicitation_route("srv"),
+            ElicitationRoute::To { deadline, .. } if deadline == later
+        ));
     }
 
     /// Routed only when every call in flight on the server belongs to one frontend: parallel
@@ -467,6 +532,7 @@ mod tests {
             "tool".into(),
             Some("ta".into()),
             Some(Arc::clone(&frontend_a)),
+            far(),
         );
         let _guard_a2 = registry.register(
             &minted(5),
@@ -474,11 +540,12 @@ mod tests {
             "tool".into(),
             Some("ta2".into()),
             Some(Arc::clone(&frontend_a)),
+            far(),
         );
         assert!(
             matches!(
                 registry.elicitation_route("srv"),
-                ElicitationRoute::To(ref found)
+                ElicitationRoute::To { frontend: ref found, .. }
                     if std::ptr::addr_eq(Arc::as_ptr(found), Arc::as_ptr(&frontend_a))
             ),
             "parallel calls from one frontend route to it"
@@ -490,6 +557,7 @@ mod tests {
             "tool".into(),
             Some("tb".into()),
             Some(Arc::clone(&frontend_b)),
+            far(),
         );
         assert!(matches!(
             registry.elicitation_route("srv"),

@@ -59,3 +59,24 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for Patch<T> {
         })
     }
 }
+
+/// A door's refusal of what it was asked, in words meant for whoever asked: the class every
+/// surface answers as a refusal of the request rather than as a fault, a 422 on HTTP.
+pub(crate) fn refusal(message: impl Into<String>) -> crate::error::MekaError {
+    crate::error::MekaError::Usage(message.into())
+}
+
+/// Refuse an account or profile name nothing could name back: empty, or with whitespace at
+/// either end, which a flag, a path segment and a TOML key each read differently. Asked by every
+/// door that adds or renames one, so a name means the same wherever it was typed.
+pub(crate) fn refuse_an_unusable_name(noun: &str, name: &str) -> crate::error::Result<()> {
+    if name.trim().is_empty() {
+        return Err(refusal(format!("{noun} name cannot be empty")));
+    }
+    if name.trim() != name {
+        return Err(refusal(format!(
+            "{noun} name '{name}' has whitespace at either end; drop it"
+        )));
+    }
+    Ok(())
+}

@@ -298,16 +298,22 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         // A picker rather than a table: each server with its state, and the pick offers the
         // three verbs below for it. The credential orphans `meka mcp list` reports are the CLI's.
         SlashCommand::McpList => {
-            if config.mcp_servers.is_empty() {
+            let served = served_servers(config, mcp_manager.as_deref());
+            if served.is_empty() {
                 ui.reply("No MCP servers.");
             } else {
-                let mut servers = Vec::with_capacity(config.mcp_servers.len());
-                for server in &config.mcp_servers {
+                let mut servers = Vec::with_capacity(served.len());
+                for server in &served {
                     let entry = mcp_manager
                         .as_ref()
                         .and_then(|manager| manager.server_entry(&server.name));
                     let state = match entry {
                         Some(entry) => match entry.state().await {
+                            crate::mcp::ServerState::Failed {
+                                needs: Some(need), ..
+                            } => {
+                                format!("failed: {}", screen_sentence(&need.refusal(&server.name)))
+                            }
                             crate::mcp::ServerState::Failed { error, .. } => format!(
                                 "failed: {}",
                                 crate::text::sanitize_to_line(&error, usize::MAX)
@@ -335,7 +341,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         // command never having run.
         SlashCommand::McpReconnect { server } => {
             let (outcome, printed) = capture(crate::cli::mcp::run_reconnect(
-                &config.mcp_servers,
+                &served_servers(config, mcp_manager.as_deref()),
                 &config.mcp_overlay,
                 token_store,
                 &server,
@@ -348,12 +354,12 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 // "Connected", not "Reconnected": this is a smoke test on a throwaway client, and
                 // the session's own connection to that server is untouched.
                 Ok(()) => ui.note(format!("Connected to '{server}'.")),
-                Err(error) => ui.reply(error.to_string()),
+                Err(error) => ui.reply(screen_sentence(&error)),
             }
         }
         SlashCommand::McpLogin { server } => {
-            let (outcome, printed) = capture(crate::installation::mcp::login_server(
-                &config.mcp_servers,
+            let (outcome, printed) = capture(log_in_and_serve(
+                shared,
                 &config.mcp_overlay,
                 token_store,
                 &server,
@@ -364,32 +370,33 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 ui.reply(printed);
             }
             match outcome {
-                Ok(()) => {
-                    ui.note(format!("Authorized '{server}'."));
-                    // The session's entry predates the `auth` block the login wrote: restarted
-                    // from the file, it connects with the credential, as an HTTP login's does.
-                    if let Some(manager) = mcp_manager.as_ref()
-                        && let Err(error) =
-                            crate::installation::mcp::restart_from_file(manager, &server).await
-                    {
-                        ui.reply(format!("failed to restart '{server}': {error}"));
-                    }
-                }
+                Ok(()) => ui.note(format!("Authorized '{server}'.")),
                 Err(error) => ui.reply(error.to_string()),
             }
         }
         SlashCommand::McpLogout { server } => {
-            let (outcome, printed) = capture(crate::installation::mcp::logout_server(
-                &config.mcp_servers,
-                token_store,
-                &server,
-            ))
+            // Served after, so the server restarts without the credentials it held.
+            let (outcome, printed) = capture(async {
+                let (revocation, served) = shared
+                    .write_installation(async |config_file| {
+                        crate::installation::mcp::logout_server(
+                            &config_file.mcp_servers(),
+                            token_store,
+                            &server,
+                        )
+                        .await
+                    })
+                    .await
+                    .map_err(crate::error::MekaError::from)?;
+                revocation.send().await;
+                Ok::<_, crate::error::MekaError>(served)
+            })
             .await;
             if !printed.trim().is_empty() {
                 ui.reply(printed);
             }
             match outcome {
-                Ok(()) => ui.note(format!("Cleared credentials for '{server}'.")),
+                Ok(_) => ui.note(format!("Cleared credentials for '{server}'.")),
                 Err(error) => ui.reply(error.to_string()),
             }
         }
@@ -1147,6 +1154,57 @@ pub(crate) fn help_text() -> String {
     out.push_str("  Ctrl+L         Redraw the screen\n");
     out.push_str("  Ctrl+D         Leave\n");
     out
+}
+
+/// What the screen says about `error`: a server with no stored OAuth credential names the
+/// screen's own login, every other error as it reads anywhere, a secret stored for another
+/// endpoint included, since the screen has no command that takes a secret.
+fn screen_sentence(error: &crate::error::MekaError) -> String {
+    match error {
+        crate::error::MekaError::McpLoginRequired { server_name } => format!(
+            "MCP server '{server_name}' has no OAuth credentials for its URL; log in with `/mcp login \
+             {server_name}`"
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// The MCP servers as this host serves them: the running manager's entries, which serving the
+/// file after a login or a logout brings to the file's, else the entries it started on.
+fn served_servers(
+    config: &crate::config::ResolvedConfig,
+    manager: Option<&mcp::McpClientManager>,
+) -> Vec<crate::config::McpServerConfig> {
+    match manager {
+        Some(manager) => manager.server_configs(),
+        None => config.mcp_servers.clone(),
+    }
+}
+
+/// `/mcp login`: the flow against the entry as the file states it, its credential committed
+/// through the installation's one write, which then serves the file, so the server restarts on
+/// the credential and on the `auth` block the login wrote.
+async fn log_in_and_serve(
+    shared: &crate::host::SharedDeps,
+    overlay: &crate::config::McpOverlay,
+    token_store: &crate::store::TokenStore,
+    server: &str,
+    prompt: Arc<dyn crate::oauth::LoginPrompt>,
+) -> crate::error::Result<()> {
+    // Refused as the commit would refuse it, before the person spends a browser login on it.
+    let servers = shared
+        .installation_as_written()
+        .map_err(|unservable| crate::installation::refusal(unservable.to_string()))?
+        .mcp_servers();
+    let grant =
+        crate::installation::mcp::obtain_login(&servers, overlay, token_store, server, prompt)
+            .await?;
+    shared
+        .write_installation(async |config_file| {
+            crate::installation::mcp::commit_login(config_file, grant, token_store).await
+        })
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

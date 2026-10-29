@@ -201,7 +201,7 @@ impl ClientHandler for MekaClientHandler {
     fn create_elicitation(
         &self,
         request: ElicitRequestParams,
-        _context: RequestContext<RoleClient>,
+        request_context: RequestContext<RoleClient>,
     ) -> impl Future<Output = std::result::Result<ElicitResult, McpError>> + Send + '_ {
         let server = Arc::clone(&self.server_name);
         let context = Arc::clone(&self.context);
@@ -211,8 +211,10 @@ impl ClientHandler for MekaClientHandler {
             // progress guard already dropped) there is no human to ask, and with calls from two
             // sessions in flight there is no telling which human, so declining is the answer in
             // both cases rather than a guess that lands the prompt in the wrong session.
-            let frontend = match context.progress.elicitation_route(server.as_ref()) {
-                crate::mcp::progress::ElicitationRoute::To(frontend) => frontend,
+            let (frontend, deadline) = match context.progress.elicitation_route(server.as_ref()) {
+                crate::mcp::progress::ElicitationRoute::To { frontend, deadline } => {
+                    (frontend, deadline)
+                }
                 crate::mcp::progress::ElicitationRoute::Nobody => {
                     tracing::warn!(
                         "MCP server '{server}' requested elicitation with no tool call in flight; \
@@ -228,8 +230,18 @@ impl ClientHandler for MekaClientHandler {
                     return Ok(ElicitationResponse::Decline.into_result());
                 }
             };
-            // A request of the server's own carries no call to bound it by.
-            Ok(elicit(server.as_ref(), frontend.as_ref(), request, None).await)
+            // Bounded by the calls it was routed by, and withdrawn when the server cancels its
+            // request (`notifications/cancelled`), as it does once the call that asked is cut: a
+            // prompt left standing would take an answer nothing reads.
+            tokio::select! {
+                result = elicit(server.as_ref(), frontend.as_ref(), request, Some(deadline)) => {
+                    Ok(result)
+                }
+                () = request_context.ct.cancelled() => {
+                    tracing::info!("MCP server '{server}' canceled its elicitation");
+                    Ok(ElicitationResponse::Cancel.into_result())
+                }
+            }
         }
     }
 }
@@ -315,6 +327,7 @@ pub(super) async fn elicit(
     // cut.
     // Never past the call that asked: the call is cut at its own bound and the prompt canceled
     // with it, so a longer wait would be advertised and not kept.
+    let opens_a_url = matches!(kind, ElicitationKind::Url { .. });
     let asked_at = tokio::time::Instant::now();
     let patience = asked_at + frontend.elicitation_timeout();
     let deadline = call_deadline.map_or(patience, |call| call.min(patience));
@@ -336,6 +349,14 @@ pub(super) async fn elicit(
                 ElicitationResponse::Decline
             }
         };
+    // A URL prompt's acceptance carries no content (MCP elicitation, URL mode): what the person
+    // gives goes to the server's page, never through its client, whatever a frontend sent back.
+    let response = match response {
+        ElicitationResponse::Accept { .. } if opens_a_url => {
+            ElicitationResponse::Accept { content: None }
+        }
+        response => response,
+    };
 
     response.into_result()
 }
@@ -497,8 +518,8 @@ impl McpTool {
 
     /// The server config that produced this adapter. Used to read per-server policy (eager-load,
     /// permission overrides, …) without rediscovering the manager.
-    pub(crate) fn server_config(&self) -> &crate::config::McpServerConfig {
-        &self.entry.config
+    pub(crate) fn server_config(&self) -> Arc<crate::config::McpServerConfig> {
+        self.entry.config()
     }
 
     pub(crate) fn server_name(&self) -> &str {
@@ -596,6 +617,7 @@ impl McpTool {
             self.remote_tool_name.clone(),
             context.tool_call_id.clone(),
             Some(Arc::clone(&context.frontend)),
+            deadline,
         );
 
         // Cap how long we wait on the best-effort cancellation notification so a hung transport
@@ -1336,5 +1358,50 @@ mod tests {
             "{:?}",
             prompt.kind
         );
+    }
+
+    /// A URL prompt's acceptance reaches the server with no content, whatever the frontend sent
+    /// back with it, and a form's keeps what the person filled in.
+    #[tokio::test]
+    async fn a_url_acceptance_carries_no_content_to_the_server() {
+        struct Filling;
+
+        #[async_trait::async_trait]
+        impl Frontend for Filling {
+            async fn emit(&self, _event: crate::frontend::FrontendEvent) {}
+
+            async fn request_permission(
+                &self,
+                _request: crate::frontend::PermissionRequest,
+            ) -> crate::frontend::PermissionOutcome {
+                crate::frontend::PermissionOutcome::Allow
+            }
+
+            async fn handle_elicitation(
+                &self,
+                _prompt: crate::frontend::ElicitationPrompt,
+            ) -> ElicitationResponse {
+                ElicitationResponse::Accept {
+                    content: Some(serde_json::json!({"name": "Ada"})),
+                }
+            }
+        }
+
+        let url: ElicitRequestParams = serde_json::from_value(serde_json::json!({
+            "mode": "url", "message": "Sign in", "url": "https://example.test/login",
+            "elicitationId": "e1"
+        }))
+        .expect("a url request");
+        let result = elicit("srv", &Filling, url, None).await;
+        assert!(matches!(result.action, ElicitationAction::Accept));
+        assert!(result.content.is_none(), "{:?}", result.content);
+
+        let form: ElicitRequestParams = serde_json::from_value(serde_json::json!({
+            "mode": "form", "message": "Name?",
+            "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
+        }))
+        .expect("a form request");
+        let result = elicit("srv", &Filling, form, None).await;
+        assert!(result.content.is_some());
     }
 }

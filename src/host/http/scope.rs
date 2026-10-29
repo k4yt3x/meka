@@ -198,27 +198,17 @@ fn admitted(principal: &Principal, scopes: &[&str]) -> Result<(), ProblemDetail>
     }
 }
 
-/// Warn about a configured scope no handler will ever demand.
+/// The configured scopes no handler will ever demand, each said with the scopes there are.
 ///
-/// A warning rather than a hard error, in both directions: rejecting would mean a config written
-/// for a newer meka cannot start an older binary, and staying silent would mean a plausible typo
-/// like `sessions:write` grants nothing at all while looking like it grants everything. Called once
-/// per token at config-resolve time.
-pub(crate) fn warn_unknown(scopes: &[String], token_description: Option<&str>) {
-    for scope in scopes {
-        if KNOWN_SCOPES.contains(&scope.as_str()) {
-            continue;
-        }
-        let unknown = crate::text::unknown_name("scope", scope, KNOWN_SCOPES);
-        match token_description {
-            Some(description) => tracing::warn!(
-                "serve token '{description}' declares a scope that grants nothing: {unknown}"
-            ),
-            None => {
-                tracing::warn!("a serve token declares a scope that grants nothing: {unknown}")
-            }
-        }
-    }
+/// Said rather than refused, in both directions: refusing would mean a config written for a newer
+/// meka cannot start an older binary, and staying silent would mean a plausible typo like
+/// `sessions:write` grants nothing at all while looking like it grants everything.
+pub(crate) fn unknown_scopes(scopes: &[String]) -> Vec<String> {
+    scopes
+        .iter()
+        .filter(|scope| !KNOWN_SCOPES.contains(&scope.as_str()))
+        .map(|scope| crate::text::unknown_name("scope", scope, KNOWN_SCOPES))
+        .collect()
 }
 
 #[cfg(test)]
@@ -293,8 +283,8 @@ mod tests {
         assert_eq!(sorted.as_slice(), KNOWN_SCOPES);
     }
 
-    /// `warn_unknown` has no return value; this pins the classification it warns on so a rename of
-    /// a real scope cannot silently start warning about every token that uses it.
+    /// Pins the classification `unknown_scopes` says so a rename of a real scope cannot silently
+    /// start flagging every token that uses it.
     #[test]
     fn typo_scopes_are_not_in_the_catalog() {
         for typo in ["sessions:write", "session:r", "skills", "memory:rw", ""] {

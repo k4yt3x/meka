@@ -32,7 +32,7 @@ pub(crate) async fn list_servers(
 ) -> Result<()> {
     // Computed before the early return below: "every server is gone but the OAuth bundles are still
     // here" is precisely the state worth reporting, and it is the one that return would hide.
-    let orphans = orphaned_credentials(servers, token_store).await?;
+    let orphans = crate::installation::mcp::orphaned_credentials(servers, token_store).await?;
 
     if format == crate::cli::OutputFormat::Json {
         let views: Vec<McpServerView> = servers.iter().map(McpServerView::from).collect();
@@ -142,27 +142,6 @@ pub(crate) async fn list_servers(
     Ok(())
 }
 
-/// Server names holding stored OAuth credentials that no configured server claims.
-///
-/// Credentials are keyed by server name and nothing deletes them when the `[[mcp.servers]]` entry
-/// goes away by hand, so an OAuth bundle can outlive its server indefinitely. This diff is the only
-/// thing that can name one, and `meka mcp remove <name>` then clears it.
-///
-/// Safe to compute here only because every caller of `list_servers` has already failed on an
-/// unreadable config. An empty server list that came from a config meka could not parse would
-/// report every credential in the database as an orphan.
-async fn orphaned_credentials(
-    servers: &[McpServerConfig],
-    token_store: &TokenStore,
-) -> Result<Vec<String>> {
-    Ok(token_store
-        .list_mcp_credential_servers()
-        .await?
-        .into_iter()
-        .filter(|name| !servers.iter().any(|config| &config.name == name))
-        .collect())
-}
-
 /// Print the orphan block, if there is one. The names go to stderr with a hint: the listing is the
 /// requested data and this is a diagnostic about the store, so `meka mcp list 2>/dev/null | awk`
 /// must not see it as rows.
@@ -183,12 +162,13 @@ fn report_orphaned_credentials(orphans: &[String]) -> Result<()> {
 
 pub(crate) async fn run_get(
     servers: &[McpServerConfig],
+    overlay: &crate::config::McpOverlay,
     name: &str,
     token_store: &TokenStore,
     format: crate::cli::OutputFormat,
 ) -> Result<()> {
     let config = require_server(servers, name)?;
-    let detail = server_detail(config, token_store).await?;
+    let detail = server_detail(config, overlay, token_store).await?;
     if format == crate::cli::OutputFormat::Json {
         crate::cli::write_json(&detail)?;
         return Ok(());
@@ -208,14 +188,21 @@ pub(crate) async fn run_get(
     } else {
         fields.push((
             "required",
-            if server.required {
-                "yes (gates the turn)"
-            } else {
-                "no"
-            }
-            .to_string(),
+            format!(
+                "{}{}",
+                if server.required {
+                    "yes (gates the turn)"
+                } else {
+                    "no"
+                },
+                inherited_note(&detail, "required")
+            ),
         ));
     }
+    fields.push((
+        "deferral",
+        format!("{}{}", detail.deferral, inherited_note(&detail, "deferral")),
+    ));
     fields.push((
         "permission",
         server
@@ -238,28 +225,37 @@ pub(crate) async fn run_get(
     if !detail.header_keys.is_empty() {
         fields.push(("headers", detail.header_keys.join(", ")));
     }
+    if let Some(helper) = &detail.headers_helper {
+        fields.push(("headers_helper", helper.clone()));
+    }
     if !detail.credentials.is_empty() {
         fields.push(("credentials", detail.credentials.join(", ")));
     }
-    if let Some(origin) = &detail.credential_origin {
-        fields.push((
-            "issued for",
-            match (detail.credential_origin_matches_url, &server.url) {
-                (Some(false), Some(configured)) => {
-                    format!("{origin} (does not match url: {configured})")
-                }
-                _ => origin.clone(),
-            },
-        ));
+    if !detail.credentials_for_another_endpoint.is_empty() {
+        let elsewhere: Vec<String> = detail
+            .credentials_for_another_endpoint
+            .iter()
+            .map(|stray| match &stray.stored_for {
+                Some(origin) => format!("{} (stored for {origin})", stray.kind),
+                None => format!("{} (stored for no server)", stray.kind),
+            })
+            .collect();
+        fields.push(("not presented", elsewhere.join(", ")));
     }
-    if let Some(auth) = detail.auth {
-        fields.push(("auth", auth.to_string()));
+    if let Some(auth) = &detail.auth {
+        fields.push(("auth", auth_summary(auth)));
     }
     if let Some(allowed) = &detail.allowed_tools {
         fields.push(("allowed_tools", allowed.join(", ")));
     }
     if let Some(disabled) = &detail.disabled_tools {
         fields.push(("disabled_tools", disabled.join(", ")));
+    }
+    if let Some(eager) = &detail.eager_load_tools {
+        fields.push(("eager_load_tools", eager.join(", ")));
+    }
+    if let Some(trust) = detail.trust_read_only_hint {
+        fields.push(("trust_read_only_hint", trust.to_string()));
     }
     if let Some(permissions) = &detail.tool_permissions {
         fields.push((
@@ -273,6 +269,59 @@ pub(crate) async fn run_get(
     }
     crate::render::write_stdout(crate::text::format_fields(&fields))?;
     Ok(())
+}
+
+/// ` (from [mcp])` after a value the entry leaves unsaid, or nothing.
+fn inherited_note(detail: &crate::view::McpServerDetail, key: &str) -> &'static str {
+    if detail.inherited.contains(&key) {
+        " (from [mcp])"
+    } else {
+        ""
+    }
+}
+
+/// An `auth` block on one line: its `type`, then each key it states.
+fn auth_summary(auth: &McpAuthConfig) -> String {
+    let mut keys: Vec<String> = Vec::new();
+    let mut push = |key: &str, value: Option<String>| {
+        if let Some(value) = value {
+            keys.push(format!("{key} = {value}"));
+        }
+    };
+    let kind = match auth {
+        McpAuthConfig::ClientCredentials { client_id, scopes } => {
+            push("client_id", Some(client_id.clone()));
+            push("scopes", scopes.as_ref().map(|scopes| scopes.join(" ")));
+            "client_credentials"
+        }
+        McpAuthConfig::ClientCredentialsJwt {
+            client_id,
+            signing_key_path,
+            signing_algorithm,
+            scopes,
+        } => {
+            push("client_id", Some(client_id.clone()));
+            push("signing_key_path", Some(signing_key_path.clone()));
+            push("signing_algorithm", signing_algorithm.clone());
+            push("scopes", scopes.as_ref().map(|scopes| scopes.join(" ")));
+            "client_credentials_jwt"
+        }
+        McpAuthConfig::OAuth {
+            client_id,
+            scopes,
+            redirect_port,
+        } => {
+            push("client_id", client_id.clone());
+            push("scopes", scopes.as_ref().map(|scopes| scopes.join(" ")));
+            push("redirect_port", redirect_port.map(|port| port.to_string()));
+            "oauth"
+        }
+    };
+    if keys.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind} ({})", keys.join(", "))
+    }
 }
 
 /// Run `meka mcp tools <name>`: connect to the server, list every advertised tool, resolve
@@ -300,10 +349,7 @@ pub(crate) async fn run_tools(
     )
     .await?;
     if !connected {
-        return Err(MekaError::McpConnection {
-            server_name: config.name.clone(),
-            message: "failed to connect; see logs above".to_string(),
-        });
+        return Err(crate::installation::mcp::probe_failure(&manager, &config.name).await);
     }
 
     let tools = manager.list_advertised_tools(&config.name).await?;
@@ -425,10 +471,7 @@ pub(crate) async fn run_reconnect(
         manager.shutdown_arc().await;
         Ok(())
     } else {
-        Err(MekaError::McpConnection {
-            server_name: config.name.clone(),
-            message: "failed to connect; see logs above".to_string(),
-        })
+        Err(crate::installation::mcp::probe_failure(&manager, &config.name).await)
     }
 }
 
@@ -933,7 +976,6 @@ fn resolve_auth_config(
             Ok(Some(McpAuthConfig::ClientCredentials {
                 client_id,
                 scopes: if scope.is_empty() { None } else { Some(scope) },
-                resource: None,
             }))
         }
         Some(McpAuthKind::ClientCredentialsJwt) => {
@@ -955,7 +997,6 @@ fn resolve_auth_config(
                 signing_key_path,
                 signing_algorithm,
                 scopes: if scope.is_empty() { None } else { Some(scope) },
-                resource: None,
             }))
         }
     }
@@ -1025,7 +1066,7 @@ fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
 
 /// Run `meka mcp disable <name>`. Sets `disabled = true` on the server entry in config.toml.
 pub(crate) async fn run_disable(name: &str, token_store: &TokenStore) -> Result<()> {
-    edit_server(
+    let (_, revocation) = edit_server(
         name,
         &ServerChanges {
             disabled: Patch::Set(true),
@@ -1034,13 +1075,14 @@ pub(crate) async fn run_disable(name: &str, token_store: &TokenStore) -> Result<
         token_store,
     )
     .await?;
+    revocation.send().await;
     tracing::info!("disabled '{name}'");
     Ok(())
 }
 
 /// Run `meka mcp enable <name>`. Clears `disabled` from the server entry in config.toml.
 pub(crate) async fn run_enable(name: &str, token_store: &TokenStore) -> Result<()> {
-    edit_server(
+    let (_, revocation) = edit_server(
         name,
         &ServerChanges {
             disabled: Patch::Set(false),
@@ -1049,6 +1091,7 @@ pub(crate) async fn run_enable(name: &str, token_store: &TokenStore) -> Result<(
         token_store,
     )
     .await?;
+    revocation.send().await;
     tracing::info!("enabled '{name}'");
     Ok(())
 }
@@ -1089,8 +1132,14 @@ pub(crate) async fn run_mcp_subcommand(
             .await?
         }
         crate::cli::McpAction::Get { name, format } => {
-            crate::cli::mcp::run_get(&config.mcp_servers_as_served(), name, &token_store, *format)
-                .await?
+            crate::cli::mcp::run_get(
+                &config.mcp_servers,
+                &config.mcp_overlay,
+                name,
+                &token_store,
+                *format,
+            )
+            .await?
         }
         crate::cli::McpAction::Reconnect { name } => {
             crate::cli::mcp::run_reconnect(
@@ -1153,7 +1202,9 @@ pub(crate) async fn run_mcp_subcommand(
             }
         }
         crate::cli::McpAction::Logout { name } => {
-            crate::cli::mcp::logout_server(&config.mcp_servers, &token_store, name).await?
+            let revocation =
+                crate::cli::mcp::logout_server(&config.mcp_servers, &token_store, name).await?;
+            revocation.send().await;
         }
         crate::cli::McpAction::Add {
             name,
@@ -1221,7 +1272,10 @@ pub(crate) async fn run_mcp_subcommand(
             .await?
         }
         crate::cli::McpAction::Remove { name } => {
-            crate::cli::mcp::remove_server(name, &token_store).await?
+            crate::cli::mcp::remove_server(name, &token_store)
+                .await?
+                .send()
+                .await;
         }
         crate::cli::McpAction::Disable { name } => {
             crate::cli::mcp::run_disable(name, &token_store).await?
@@ -1583,7 +1637,7 @@ mod tests {
         args.client_secret = Some("cs-not-a-real-secret".to_string());
         let resolved = resolve_add_args(args).expect("resolve");
         store_secrets(
-            &resolved.name,
+            &resolved_to_server_config(&resolved),
             &ServerSecrets {
                 auth_token: resolved.auth_token.clone(),
                 client_secret: resolved.client_secret.clone(),
@@ -1598,6 +1652,7 @@ mod tests {
                 .load_mcp_credentials("api", McpCredentialKind::ClientSecret)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some("cs-not-a-real-secret")
         );
@@ -1606,7 +1661,7 @@ mod tests {
         args.auth_token = Some("bearer-not-a-real-token".to_string());
         let resolved = resolve_add_args(args).expect("resolve");
         store_secrets(
-            &resolved.name,
+            &resolved_to_server_config(&resolved),
             &ServerSecrets {
                 auth_token: resolved.auth_token.clone(),
                 client_secret: resolved.client_secret.clone(),
@@ -1621,6 +1676,7 @@ mod tests {
                 .load_mcp_credentials("bear", McpCredentialKind::Bearer)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some("bearer-not-a-real-token")
         );
@@ -1657,6 +1713,7 @@ mod tests {
                     "api",
                     crate::store::McpCredentialKind::Bearer,
                     "bearer-not-a-real-token",
+                    "https://example.test/mcp",
                 )
                 .await
                 .expect("save");
@@ -1683,6 +1740,7 @@ mod tests {
                     .load_mcp_credentials("api", crate::store::McpCredentialKind::Bearer)
                     .await
                     .expect("load")
+                    .map(|stored| stored.secret)
                     .as_deref(),
                 Some("bearer-not-a-real-token"),
                 "and it must not have cleared the bearer it refused over (auth block: {had_auth})"
@@ -1701,7 +1759,8 @@ mod tests {
                 .save_mcp_credentials(
                     name,
                     crate::store::McpCredentialKind::OAuth,
-                    r#"{"tokens":{"access_token":"at"}}"#,
+                    r#"{"client_id":"c","token_response":{"access_token":"at","token_type":"bearer"}}"#,
+                    "",
                 )
                 .await
                 .expect("save");
@@ -1710,7 +1769,7 @@ mod tests {
         // `notion` is configured but never logged in to, which is not an orphan: the diff runs in
         // one direction only.
         let servers = vec![server_named("linear"), server_named("notion")];
-        let orphans = orphaned_credentials(&servers, &store)
+        let orphans = crate::installation::mcp::orphaned_credentials(&servers, &store)
             .await
             .expect("diff credentials against servers");
         assert_eq!(orphans, vec!["retired".to_string()]);
@@ -1733,6 +1792,7 @@ mod tests {
                 "api",
                 crate::store::McpCredentialKind::Bearer,
                 "bearer-not-a-real-token",
+                "",
             )
             .await
             .expect("save the credential the deleted server left behind");
@@ -1767,6 +1827,7 @@ mod tests {
                 .load_mcp_credentials("api", crate::store::McpCredentialKind::Bearer)
                 .await
                 .expect("load")
+                .map(|stored| stored.secret)
                 .as_deref(),
             Some("bearer-not-a-real-token"),
             "and it must not have destroyed the credential it refused over"
