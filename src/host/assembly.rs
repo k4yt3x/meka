@@ -711,7 +711,6 @@ pub(crate) async fn build_shared_deps(
     // file's, and a run that cannot load the guidance the user named must not start.
     let instructions = crate::instructions::resolve(&config.standing_instructions)?;
     if let Some(found) = &instructions {
-        crate::instructions::warn_if_large(found);
         tracing::info!("instructions loaded from {source}", source = found.source);
     }
     let user_instructions_count = instructions.as_ref().map_or(0, |found| found.count());
@@ -879,7 +878,7 @@ pub(crate) async fn build_session_agent(
     if let Some(name) = &project {
         shared.store.require_project(name).await?;
     }
-    let agent_options = session_agent_options(shared, &cwd.get());
+    let agent_options = session_agent_options(shared, &cwd.get(), &resolved);
     let mut cells = SessionCells::new(
         shared_permission,
         cwd,
@@ -909,26 +908,37 @@ pub(crate) async fn build_session_agent(
     assemble_agent(shared.materials(session_stats), cells, agent_options).await
 }
 /// This session's copy of the process-wide options: the standing text, with the files
-/// `[instructions].files` names read against `directory` and appended.
+/// `[instructions].files` names read against `directory` and appended, the whole of it measured
+/// against the window of `profile`, which the session runs on.
 ///
 /// Read here rather than beside the standing text at startup because a relative entry means the
 /// session's directory, which `serve` and ACP take from the client per session and a resume from
-/// the row, so the process has no one answer to give.
-fn session_agent_options(shared: &SharedDeps, directory: &std::path::Path) -> AgentOptions {
+/// the row, so the process has no one answer to give; and a set is large or not by the window it
+/// rides in, which is the session's.
+fn session_agent_options(
+    shared: &SharedDeps,
+    directory: &std::path::Path,
+    profile: &crate::provider::ResolvedProfile,
+) -> AgentOptions {
     let mut options = shared.agent_options.clone();
     // The standing text as it stands now, not as the process started: a `PUT /v1/instructions`
     // between the two is for the sessions that open after it.
     let standing = crate::sync::read(&shared.instructions).clone();
-    options.user_instructions_count = standing.as_ref().map_or(0, |found| found.count());
-    options.user_instructions = standing.map(|found| found.text);
-    if shared.config.instruction_files.is_empty() {
-        return options;
-    }
-    let listed = crate::instructions::read_files(&shared.config.instruction_files, directory);
+    let listed = if shared.config.instruction_files.is_empty() {
+        None
+    } else {
+        crate::instructions::read_files(&shared.config.instruction_files, directory)
+    };
     if let Some(found) = &listed {
-        crate::instructions::warn_if_large(found);
         tracing::info!("instructions loaded from {source}", source = found.source);
     }
+    crate::instructions::warn_if_large(
+        &standing.iter().chain(listed.iter()).collect::<Vec<_>>(),
+        &profile.profile,
+        profile.context_window,
+    );
+    options.user_instructions_count = standing.as_ref().map_or(0, |found| found.count());
+    options.user_instructions = standing.map(|found| found.text);
     options.user_instructions_count += listed.as_ref().map_or(0, |found| found.count());
     options.user_instructions = crate::instructions::join(options.user_instructions.take(), listed);
     options
@@ -1454,9 +1464,6 @@ impl SharedDeps {
     /// a write this process made to the conventional file, for the sessions that open after it.
     pub(crate) fn reload_instructions(&self) -> crate::error::Result<()> {
         let found = crate::instructions::resolve(&self.config.standing_instructions)?;
-        if let Some(found) = &found {
-            crate::instructions::warn_if_large(found);
-        }
         *crate::sync::write(&self.instructions) = found;
         Ok(())
     }

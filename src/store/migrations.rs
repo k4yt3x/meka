@@ -5308,46 +5308,45 @@ mod tests {
         /// paste the new vector out of the failure, which re-freezes the edit alongside whatever
         /// was legitimately added and launders exactly what this guards.
         ///
-        /// Re-pinned once, on 2026-09-06, when the digest began covering a Rust or Contextual
-        /// step's body and its helpers; until then such an entry carried only its name, so its
-        /// body was frozen by convention alone. The SQL entries kept their values, which is the
-        /// check that nothing else moved.
+        /// The values move together only when the digest itself changes, and then only once the
+        /// last release's file is shown to digest the new way to the new values; the SQL entries
+        /// keep theirs.
         const SHIPPED: &[(&str, u64)] = &[
             ("baseline_0_42", 9890918125805624612_u64),
-            ("gates_become_kind_and_spec", 14871176051668618256_u64),
-            ("sessions_name_their_provider", 2839145663817881110_u64),
+            ("gates_become_kind_and_spec", 10824300382461519644_u64),
+            ("sessions_name_their_provider", 10660157190827296968_u64),
             (
                 "sessions_record_their_model_overrides",
-                16650669434822866619_u64,
+                16447649218508969861_u64,
             ),
-            ("mcp_credentials_hold_every_kind", 5768695620423760250_u64),
-            ("scheduled_jobs_forget_isolation", 17602669801808082090_u64),
+            ("mcp_credentials_hold_every_kind", 15819882144504089346_u64),
+            ("scheduled_jobs_forget_isolation", 2924328199513258016_u64),
             (
                 "sessions_forget_their_model_overrides",
-                6081320598876219933_u64,
+                11650393866885008471_u64,
             ),
             (
                 "mcp_credentials_exist_on_every_store",
-                10674060935313009008_u64,
+                1218548169117643806_u64,
             ),
             (
                 "background_tasks_announce_before_they_deliver",
-                12218580709004178328_u64,
+                13677593927469062408_u64,
             ),
             ("prompt_history_is_in_the_ledger", 7340959758223132754_u64),
-            ("sessions_record_their_profile", 7263607531702221278_u64),
-            ("credentials_belong_to_accounts", 10445015279463977740_u64),
-            ("sessions_carry_approvals", 11421791245895291692_u64),
+            ("sessions_record_their_profile", 4452082150572100278_u64),
+            ("credentials_belong_to_accounts", 4645333150285749858_u64),
+            ("sessions_carry_approvals", 9305602474708262108_u64),
             (
                 "user_turns_carry_their_context_as_a_block",
-                10528060927322803169_u64,
+                753895093100704199_u64,
             ),
-            ("images_live_in_blobs", 12946522340706447291_u64),
-            ("columns_follow_one_naming_rule", 12052506080733391844_u64),
-            ("repair_rows_retag_their_thinking", 10024761171275002141_u64),
+            ("images_live_in_blobs", 5999372279988225783_u64),
+            ("columns_follow_one_naming_rule", 6989040896223063432_u64),
+            ("repair_rows_retag_their_thinking", 3721487409980884821_u64),
             (
                 "root_rows_take_the_default_level_once_the_config_reads",
-                12427590907437771145_u64,
+                7649120122176690823_u64,
             ),
             (
                 "background_tasks_spell_canceled_with_one_l",
@@ -5355,88 +5354,88 @@ mod tests {
             ),
             (
                 "sessions_record_their_context_tokens",
-                878754235509908731_u64,
+                6060548574527943491_u64,
             ),
-            ("names_follow_the_vocabulary", 13015232274362220399_u64),
+            ("names_follow_the_vocabulary", 7810525614731406363_u64),
             ("sessions_have_an_inbox", 5664388226393763354_u64),
             ("messages_are_indexed_by_kind", 3120448634739482323_u64),
-            ("tool_use_blocks_call_tool_load", 12114945205812471246_u64),
+            ("tool_use_blocks_call_tool_load", 1564862944052864466_u64),
             (
                 "tool_calls_take_their_class_first_names",
-                15307148509222958465_u64,
+                6168942621003956629_u64,
             ),
             (
                 "gate_tools_take_their_class_first_names",
-                1618890790364633461_u64,
+                4959369985507603683_u64,
             ),
             (
                 "sessions_take_a_title_a_pin_and_a_search_index",
-                13895030768240920509_u64,
+                4553256674406173219_u64,
             ),
             (
                 "search_indexes_fold_every_diacritic",
                 7730251297735454426_u64,
             ),
-            ("sessions_number_their_turns", 14854401362647262172_u64),
-            ("turns_are_rows", 463447860238898326_u64),
+            ("sessions_number_their_turns", 5808736416454632722_u64),
+            ("turns_are_rows", 15575599497470500669_u64),
             (
                 "background_tasks_name_their_subagent",
-                17443559184355884232_u64,
+                6141819771244746906_u64,
             ),
             (
                 "boundaries_carry_a_checklist_snapshot",
-                12503180714611675843_u64,
+                13167535928224751627_u64,
             ),
             (
                 "tool_calls_take_their_checklist_names",
-                17876045330514229377_u64,
+                6221659085346372509_u64,
             ),
-            ("nudges_are_blocks", 3286139522237048285_u64),
+            ("nudges_are_blocks", 8905212851839945928_u64),
             (
                 "sessions_name_their_working_directory",
-                6525172221673504139_u64,
+                16218093789996852617_u64,
             ),
-            ("subagent_specs_name_their_network", 6204434571494268024_u64),
+            ("subagent_specs_name_their_network", 3915572646307258472_u64),
             (
                 "inbox_items_fires_and_reports_are_blocks",
-                16587665193673430809_u64,
+                5171122152059920151_u64,
             ),
-            ("repairs_take_the_relayed_blocks", 9883890175305426370_u64),
+            ("repairs_take_the_relayed_blocks", 8975702034087659152_u64),
             (
                 "background_reports_name_only_their_tasks",
-                14970459526399045671_u64,
+                13535459457406678923_u64,
             ),
             (
                 "turns_record_why_they_were_canceled",
-                8514104273109450752_u64,
+                12927975797737627528_u64,
             ),
             (
                 "turns_record_the_profile_that_served_them",
-                16857558564953777198_u64,
+                6987396903242226646_u64,
             ),
             (
                 "inbox_items_remember_why_their_last_turn_failed",
-                14439600663556915070_u64,
+                9697083894545299276_u64,
             ),
             (
                 "inbox_items_record_errors_as_objects",
-                1342041145199385063_u64,
+                9199573064185723127_u64,
             ),
             (
                 "subagent_specs_name_their_allow_lists",
-                7456634420440402148_u64,
+                7164776193585964014_u64,
             ),
             (
                 "memories_carry_load_references_source_verification_and_expiry",
-                11700233977647167775_u64,
+                7000727370084981065_u64,
             ),
             (
                 "projects_are_rows_named_by_sessions_and_memories",
-                4611095635135850049_u64,
+                17160008959945555_u64,
             ),
             (
                 "compact_boundaries_record_their_compaction",
-                8832125766036357788_u64,
+                14985646600417395900_u64,
             ),
             (
                 "mcp_credentials_count_their_writes",
@@ -5444,13 +5443,13 @@ mod tests {
             ),
             (
                 "mcp_credentials_name_their_endpoint",
-                16595899173170091335_u64,
+                400404944289461485_u64,
             ),
             ("messages_record_unsigned_thinking", 5083750834782537321_u64),
-            ("scheduled_jobs_name_their_zone", 5013015663447183594_u64),
+            ("scheduled_jobs_name_their_zone", 11818223669390445530_u64),
             (
                 "sealed_reasoning_names_its_endpoint",
-                3354420230335719451_u64,
+                12275967669795080019_u64,
             ),
             (
                 "messages_hold_invocations_and_resources",
@@ -5458,62 +5457,107 @@ mod tests {
             ),
             (
                 "messages_mark_the_copies_compactions_kept",
-                6026873272331046982_u64,
+                2056776001206291594_u64,
             ),
-            ("sessions_mark_an_unfinished_copy", 8572168703950525872_u64),
+            ("sessions_mark_an_unfinished_copy", 8368756446981473698_u64),
         ];
-        /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
-        /// every column-zero function it calls, recursively. What a Rust step does is its body and
-        /// its helpers', so both are what freezing it means; a shared helper that changes changes
-        /// every step that calls it, which is the signal.
-        fn source_of(production: &str, name: &str) -> String {
-            // A generic helper's header goes on with `<`, and a helper that escaped the search
-            // would be one a step could change without its digest moving.
-            fn header_of(production: &str, name: &str) -> Option<usize> {
-                production
-                    .find(&format!("\nfn {name}("))
-                    .or_else(|| production.find(&format!("\nfn {name}<")))
+        /// Every column-zero item of `production` that a step can name, by a call, as a value or
+        /// as a constant it reads, whatever its visibility, with its text: an item the digest
+        /// missed would be one a step could change without its digest moving.
+        fn items_of(production: &str) -> std::collections::HashMap<&str, &str> {
+            const OPENINGS: &[&str] = &[
+                "fn ", "pub", "const ", "static ", "//", "#[", "struct ", "enum ", "impl ",
+                "type ", "use ", "mod ", "}",
+            ];
+            let lines: Vec<(usize, &str)> = production
+                .split_inclusive('\n')
+                .scan(0, |offset, line| {
+                    let start = *offset;
+                    *offset += line.len();
+                    Some((start, line))
+                })
+                .collect();
+            let mut items = std::collections::HashMap::new();
+            for (index, (start, line)) in lines.iter().enumerate() {
+                let declared = ["pub(crate) ", "pub(super) ", ""]
+                    .iter()
+                    .find_map(|visibility| line.strip_prefix(visibility))
+                    .and_then(|rest| {
+                        ["fn ", "const ", "static "].iter().find_map(|keyword| {
+                            rest.strip_prefix(keyword).map(|name| (*keyword, name))
+                        })
+                    });
+                let Some((keyword, rest)) = declared else {
+                    continue;
+                };
+                let name: &str = &rest[..rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len())];
+                // A function runs to its column-zero brace, a constant to the next column-zero
+                // line that opens an item or its comment.
+                let end = lines
+                    .iter()
+                    .skip(index + 1)
+                    .find(|(_, next)| {
+                        if keyword == "fn " {
+                            next.starts_with("}\n") || *next == "}"
+                        } else {
+                            OPENINGS.iter().any(|opening| next.starts_with(opening))
+                        }
+                    })
+                    .map_or(production.len(), |(next_start, next)| {
+                        if keyword == "fn " {
+                            next_start + next.len()
+                        } else {
+                            *next_start
+                        }
+                    });
+                items.entry(name).or_insert(&production[*start..end]);
             }
-            fn body_of<'a>(production: &'a str, name: &str) -> &'a str {
-                let start = header_of(production, name)
-                    .unwrap_or_else(|| panic!("no column-zero `fn {name}` in migrations.rs"));
-                let rest = &production[start + 1..];
-                let end = rest
-                    .find("\n}\n")
-                    .expect("a column-zero function ends with a column-zero brace");
-                &rest[..end + 2]
+            // The ledger is digested entry by entry, and a step that reads it reads positions,
+            // which an append does not move. The shape classifier and its table run once per store
+            // ahead of the ledger and are edited by design when a step renames (AGENTS.md), so a
+            // local that shares one of their names must not draw them into a step's digest.
+            for machinery in ["MIGRATIONS", "classify_by_shape", "BASELINE_OBJECTS"] {
+                items.remove(machinery);
             }
-            let mut wanted = vec![name.to_string()];
-            let mut seen: Vec<String> = Vec::new();
+            items
+        }
+        /// The text of item `name` and, in name order, of every item its code names, recursively.
+        /// What a Rust step does is its body and what it reaches, so both are what freezing it
+        /// means; a shared helper that changes changes every step that reaches it, which is the
+        /// signal. A name on a comment line is not followed: a step's comment may point at the
+        /// shape classifier, whose rename edits AGENTS.md asks for.
+        fn source_of(items: &std::collections::HashMap<&str, &str>, name: &str) -> String {
+            let mut wanted = vec![name];
+            let mut seen: Vec<&str> = Vec::new();
             while let Some(current) = wanted.pop() {
                 if seen.contains(&current) {
                     continue;
                 }
-                let body = body_of(production, &current);
-                let mut rest = body;
-                while let Some(open) = rest.find('(') {
-                    let ident: String = rest[..open]
-                        .chars()
-                        .rev()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                    if !ident.is_empty()
-                        && ident != current
+                let body = items
+                    .get(current)
+                    .unwrap_or_else(|| panic!("no column-zero `{current}` in migrations.rs"));
+                // Only a line that is all comment is passed over: cutting a line at `//` would
+                // also cut it inside a string, `"http://"`, and drop the names after it.
+                let code = body
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"));
+                for ident in code
+                    .flat_map(|line| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+                {
+                    if ident != current
                         && !seen.contains(&ident)
-                        && header_of(production, &ident).is_some()
+                        && let Some((known, _)) = items.get_key_value(ident)
                     {
-                        wanted.push(ident);
+                        wanted.push(known);
                     }
-                    rest = &rest[open + 1..];
                 }
                 seen.push(current);
             }
-            seen.sort();
+            seen.sort_unstable();
             seen.iter()
-                .map(|name| body_of(production, name))
+                .filter_map(|name| items.get(name).copied())
                 .collect::<Vec<_>>()
                 .join("\n")
         }
@@ -5524,13 +5568,14 @@ mod tests {
             .split("\nmod tests {")
             .next()
             .expect("splitting always yields a first part");
+        let items = items_of(production);
         let current: Vec<(&str, u64)> = MIGRATIONS
             .iter()
             .map(|migration| {
                 let body = match &migration.step {
                     Step::Sql(sql) => digest(sql),
                     Step::Rust(_) | Step::Contextual(_) => {
-                        digest(&source_of(production, migration.name))
+                        digest(&source_of(&items, migration.name))
                     }
                 };
                 (migration.name, digest(migration.name) ^ body)

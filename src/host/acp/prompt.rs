@@ -125,16 +125,23 @@ pub(super) async fn try_local_command(
     permission: &crate::permission::SharedPermission,
     shared: &crate::host::SharedDeps,
 ) -> Option<String> {
-    let (name, extra) = split_acp_slash(prompt_text)?;
-    if !crate::text::is_blank(&extra) {
-        return None;
-    }
-    match name.as_str() {
+    match local_command(prompt_text)? {
         "status" => Some(build_status_text(agent, conversation_len, permission, shared).await),
         "mcp" => Some(build_mcp_list_text(shared).await),
         "usage" => Some(build_usage_text(agent, shared.relay_provider_errors()).await),
         _ => None,
     }
+}
+/// The local command `prompt_text` is, alone on its line, if it is one.
+pub(super) fn local_command(prompt_text: &str) -> Option<&'static str> {
+    let (name, extra) = split_acp_slash(prompt_text)?;
+    if !crate::text::is_blank(&extra) {
+        return None;
+    }
+    crate::host::COMMANDS
+        .iter()
+        .find(|command| command.editor_help.is_some() && command.name == name)
+        .map(|command| command.name)
 }
 /// Plain-text `/usage` output for ACP clients, reusing the shared `render::format_account_usage`.
 /// A failure is worded by `acp_error_for`, the one mapping for what this wire may carry.
@@ -448,6 +455,13 @@ pub(super) async fn run_prompt_turn(
     // produce nothing, and a client that dropped its content on the floor should hear about it.
     // The words are expanded below once a slash command has been resolved.
     let prompt_text = sent_text(&parts);
+    // A local command answers with text and sends nothing on, so an image beside it would go
+    // nowhere.
+    if has_images && let Some(command) = local_command(&prompt_text) {
+        return responder.respond_with_error(invalid_params_error(format!(
+            "`/{command}` takes no image; send it without one"
+        )));
+    }
     let input = match crate::agent::TurnInput::sent(parts.clone(), images) {
         Ok(input) => input,
         Err(error) => return responder.respond_with_error(acp_error_for(&error, false)),

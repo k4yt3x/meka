@@ -341,7 +341,23 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             // to replace it, which is what runs a `headers_helper` again. With no manager there
             // is no connection to replace, and a connect on a throwaway client says whether one
             // would succeed.
-            let Some(manager) = mcp_manager.as_ref() else {
+            if let Some(manager) = mcp_manager.as_ref() {
+                match manager
+                    .reconnect_server(&server, config.mcp_connect_timeout)
+                    .await
+                {
+                    Ok(mcp::ServerState::Connected { .. }) => {
+                        ui.note(format!("Connected to '{server}'."));
+                    }
+                    Ok(state) => ui.reply(format!(
+                        "MCP server '{server}' {}.",
+                        state
+                            .unavailable_reason()
+                            .unwrap_or_else(|| "is unavailable".to_string())
+                    )),
+                    Err(error) => ui.reply(screen_sentence(&error)),
+                }
+            } else {
                 let (outcome, printed) = capture(crate::cli::mcp::run_reconnect(
                     &served_servers(config, None),
                     &config.mcp_overlay,
@@ -356,22 +372,6 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                     Ok(()) => ui.note(format!("Connected to '{server}'.")),
                     Err(error) => ui.reply(screen_sentence(&error)),
                 }
-                return;
-            };
-            match manager
-                .reconnect_server(&server, config.mcp_connect_timeout)
-                .await
-            {
-                Ok(mcp::ServerState::Connected { .. }) => {
-                    ui.note(format!("Connected to '{server}'."));
-                }
-                Ok(state) => ui.reply(format!(
-                    "MCP server '{server}' {}.",
-                    state
-                        .unavailable_reason()
-                        .unwrap_or_else(|| "is unavailable".to_string())
-                )),
-                Err(error) => ui.reply(screen_sentence(&error)),
             }
         }
         SlashCommand::McpLogin { server } => {
@@ -1068,12 +1068,12 @@ fn parse_skill_slash(rest: &str) -> SlashCommand {
 }
 
 /// What a command line typed with images attached does: an invocation, a skill or an MCP prompt,
-/// takes them, as an editor's and the API's do; another command takes none, and a line that is no
-/// command at all is words for the model beside the images.
+/// takes them, as an editor's and the API's do; another command takes none, and a line that names
+/// no command is refused as it is without them.
 pub(crate) enum WithImages {
     Invocation(SlashCommand),
     TakesNone,
-    Words,
+    Unknown,
 }
 
 /// [`WithImages`] for `line` and `images`.
@@ -1098,7 +1098,7 @@ pub(crate) fn with_images(line: &str, images: Vec<crate::image::ImageSource>) ->
             images,
         }),
         Some(_) => WithImages::TakesNone,
-        None => WithImages::Words,
+        None => WithImages::Unknown,
     }
 }
 
@@ -1278,7 +1278,7 @@ mod tests {
     use super::*;
 
     /// A skill or an MCP prompt invoked with an image attached takes the image; another command
-    /// takes none, and a line that is no command is words.
+    /// takes none, and a line that names no command is unknown, as it is without an image.
     #[test]
     fn an_invocation_line_takes_the_images_attached_to_it() {
         let image = crate::image::ImageSource::Blob {
@@ -1302,7 +1302,7 @@ mod tests {
         ));
         assert!(matches!(
             with_images("/home/me/shot.png what is this", vec![image]),
-            WithImages::Words
+            WithImages::Unknown
         ));
     }
 

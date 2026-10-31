@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::{
     Tool, ToolOutput,
-    util::{optional_str, require_str, resolve_session_id},
+    util::{optional_object, optional_str, require_str, resolve_session_id},
 };
 use crate::{
     config::ResolvedScheduleConfig,
@@ -233,7 +233,7 @@ impl Tool for ScheduleCreateTool {
 
 impl ScheduleCreateTool {
     fn parse_gate(&self, input: &serde_json::Value, tool_name: &str) -> Result<Option<Gate>> {
-        let Some(raw) = input.get("gate").filter(|value| !value.is_null()) else {
+        let Some(raw) = optional_object(input, "gate", tool_name)? else {
             return Ok(None);
         };
         let refuse = |message: String| MekaError::ToolExecution {
@@ -590,6 +590,27 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("an ungated reminder is allowed at {level}: {error}"));
+    }
+
+    /// A gate spelled as a JSON string is refused naming `gate`, not read as one with no `check`.
+    #[tokio::test]
+    async fn a_gate_that_is_not_an_object_is_refused_by_name() {
+        let (tool, _session_id, _manager) = harness().await;
+        let refused = tool
+            .execute(
+                serde_json::json!({
+                    "prompt": "x",
+                    "every": "1h",
+                    "gate": "{\"check\": {\"command\": \"true\"}}"
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a string is not a gate");
+        assert!(
+            refused.to_string().contains("'gate' must be an object"),
+            "{refused}"
+        );
     }
 
     #[tokio::test]

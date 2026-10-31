@@ -141,13 +141,14 @@ answer is not on the transcript at all; see [Slash commands](#slash-commands).
 ## Images
 
 An image goes with the next prompt. Paste or drag a path to an image file (`png`, `jpg`, `gif`,
-`webp` or `bmp`) onto the composer and the file is attached, or press **Ctrl+V** to attach the
-image on the clipboard. meka reads that from the operating system, since a terminal pastes text
-alone, so it needs a display on the machine meka runs on and does not work over SSH; a path does.
-Each attachment is a chip above the text, **Backspace** on an empty composer drops the last one,
-and **Enter** sends them with the words, shown as `• image` rows on the transcript. The profile has
-to accept images (`[profiles.<name>].vision`), the limits are the HTTP API's, and an image waits
-for the turn to end rather than riding on a steer.
+`webp` or `bmp`) onto the composer and the file is attached, or press **Ctrl+V** to attach the image
+on the clipboard. meka reads that from the operating system, since a terminal pastes text alone, so
+it needs a display on the machine meka runs on and does not work over SSH; a path does. Each
+attachment is a chip above the text, **Backspace** on an empty composer drops the last one, and
+**Enter** sends them with the words, shown as `• image` rows on the transcript. A skill or an MCP
+prompt typed with them takes them, and gives them back when it cannot run; any other command is
+refused while they are attached. The profile has to accept images (`[profiles.<name>].vision`), the
+limits are the HTTP API's, and an image waits for the turn to end rather than riding on a steer.
 
 ## Scrolling and the mouse
 

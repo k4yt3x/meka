@@ -195,6 +195,15 @@ pub(crate) async fn run_serve(
     inbox_handle.abort();
     announcer_handle.abort();
     pruner_handle.abort();
+    // After the sweepers, so none makes a session resident behind this, and ahead of the MCP
+    // servers, whose registries the sessions are detached from as they go.
+    let released = state
+        .sessions
+        .release_every(state.shared.mcp_manager.as_ref())
+        .await;
+    if released > 0 {
+        tracing::info!("released {released} session(s) on shutdown");
+    }
     // Close the MCP servers before the exit paths below: the drain-timeout arm of the match ends
     // in `std::process::exit(1)`, so anything after it is skipped exactly when a hung shutdown
     // makes closing them matter most. `serve` runs for days and respawns nothing, so its stdio

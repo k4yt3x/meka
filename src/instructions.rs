@@ -22,10 +22,10 @@
 
 use std::path::{Path, PathBuf};
 
-/// Ceiling above which an instruction set is reported as suspiciously large. Not enforced: a big
-/// preamble can be exactly what the user wants, and it is cached, so this warns rather than
-/// truncates.
-const LARGE_INSTRUCTIONS_TOKENS: u64 = 8_000;
+/// The share of a profile's context window, in percent, past which a session's instructions are
+/// reported as large. Not enforced: a big preamble can be exactly what the user wants, and it is
+/// cached, so this warns rather than truncates.
+const LARGE_INSTRUCTIONS_PERCENT: u64 = 5;
 
 /// Cap on how many `*.md` files one `instructions/` directory contributes, mirroring
 /// [`crate::memory`]'s bound on an unpruned store. A directory past this is far more likely to be
@@ -315,17 +315,37 @@ fn read_file(path: &Path) -> Option<String> {
     }
 }
 
-/// Report an instruction set large enough that the user should know it is there. Silent otherwise.
+/// Report the instructions a session carries, every set of them, when together they take more
+/// than [`LARGE_INSTRUCTIONS_PERCENT`] of `context_window`, the window of `profile`, which the
+/// session runs on. Silent otherwise.
 ///
-/// It rides the cached prefix so the ongoing cost is small, but it still occupies window the
-/// conversation cannot use, and a set this size is usually a directory pointed somewhere
-/// unintended rather than a decision.
-pub(crate) fn warn_if_large(instructions: &Instructions) {
-    let estimate = crate::tokens::estimate_text(&instructions.text);
-    if estimate > LARGE_INSTRUCTIONS_TOKENS {
-        let source = &instructions.source;
-        tracing::warn!("instructions from {source} are large (~{estimate} tokens)");
+/// They ride the cached prefix so the ongoing cost is small, but every request carries them, and
+/// what they cost is their share of the window: a set that is nothing on one profile crowds a
+/// smaller one. A share that large is usually a directory pointed somewhere unintended rather than
+/// a decision.
+pub(crate) fn warn_if_large(sets: &[&Instructions], profile: &str, context_window: u64) {
+    let estimate: u64 = sets
+        .iter()
+        .map(|set| crate::tokens::estimate_text(&set.text))
+        .sum();
+    if let Some(percent) = large_share(estimate, context_window) {
+        let sources = sets
+            .iter()
+            .map(|set| set.source.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            "instructions from {sources} take ~{estimate} tokens, {percent}% of the context \
+             window of profile '{profile}'"
+        );
     }
+}
+
+/// The percent of `context_window` that `estimate` tokens take, when it is past
+/// [`LARGE_INSTRUCTIONS_PERCENT`].
+fn large_share(estimate: u64, context_window: u64) -> Option<u64> {
+    (estimate.saturating_mul(100) > context_window.saturating_mul(LARGE_INSTRUCTIONS_PERCENT))
+        .then(|| estimate.saturating_mul(100) / context_window.max(1))
 }
 
 /// [`resolve`] over the persistent tiers only, for `meka instructions show`: a per-run
@@ -362,6 +382,22 @@ pub(crate) fn resolve(
 }
 #[cfg(test)]
 mod tests {
+
+    /// A set is large by its share of the window it rides in: what is nothing on a 1M-token
+    /// profile is a twentieth of a 128k one.
+    #[test]
+    fn a_set_is_large_by_its_share_of_the_window() {
+        assert_eq!(large_share(8_449, 1_000_000), None);
+        assert_eq!(large_share(8_449, 128_000), Some(6));
+        assert_eq!(
+            large_share(50_000, 1_000_000),
+            None,
+            "exactly the share is not past it"
+        );
+        assert_eq!(large_share(50_001, 1_000_000), Some(5));
+        assert_eq!(large_share(1, 0), Some(100), "a window of nothing");
+    }
+
     use super::*;
 
     fn write(dir: &Path, name: &str, body: &str) {

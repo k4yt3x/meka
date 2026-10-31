@@ -39,6 +39,10 @@ struct TaskHandle {
     /// `None` between reserving the slot and spawning the work. Canceling in that window still
     /// works, because the token exists from the start; only joining has to wait.
     join: Option<tokio::task::JoinHandle<()>>,
+    /// The status a [`BackgroundTasks::cancel_all`] signaled this task with, which its outcome
+    /// reports in place of the failure its interruption reads as: the stop's own record may have
+    /// come before the task's row existed.
+    stopped_as: Option<crate::store::background::TaskStatus>,
 }
 
 impl BackgroundTasks {
@@ -67,8 +71,28 @@ impl BackgroundTasks {
             session_id,
             cancellation,
             join: None,
+            stopped_as: None,
         });
         true
+    }
+
+    /// The status task `id`'s work records: `completed` when it succeeded, else the status a stop
+    /// signaled it with, else `failed`. A task stopped while it was starting has no row for the
+    /// stop to record on, so its own outcome is the one place that can say why it ended.
+    pub(crate) async fn outcome_status(
+        &self,
+        id: &str,
+        is_error: bool,
+    ) -> crate::store::background::TaskStatus {
+        if !is_error {
+            return crate::store::background::TaskStatus::Completed;
+        }
+        self.inner
+            .lock()
+            .await
+            .get(id)
+            .and_then(|handle| handle.stopped_as)
+            .unwrap_or(crate::store::background::TaskStatus::Failed)
     }
 
     /// Attach the spawned work to a slot already reserved by [`Self::try_reserve`].
@@ -113,45 +137,35 @@ impl BackgroundTasks {
         }
     }
 
-    /// Every task id this process is running, without touching them.
-    ///
-    /// Callers canceling in bulk need this *before* signaling: a `canceled` row has to be
-    /// written first, because `finish_background_task` only overwrites a `running` row and the
-    /// work reacting to its token would otherwise land `failed` there first. "Your build
-    /// failed" and "you stopped your build" are exactly the distinction the four terminal
-    /// states exist to keep.
-    pub(crate) async fn task_ids(&self) -> Vec<String> {
-        self.inner.lock().await.keys().cloned().collect()
-    }
-
     /// Stop every task this process runs, recording each still running as stopped with `status`
     /// first, so what the agent hears says why rather than the `failed` its own interruption would
     /// write; how many were signaled. Every one is signaled, a task still starting whose row has
-    /// not landed included, since nothing else would stop it, and one whose outcome landed first
-    /// keeps it. A record that cannot be made stops them all the same: stopping is what was asked,
-    /// and only the word the agent hears is lost.
+    /// not landed included, since nothing else would stop it, and its outcome reports `status`
+    /// ([`Self::outcome_status`]). One whose outcome landed first keeps it. A record that cannot be
+    /// made stops them all the same: stopping is what was asked, and only the word the agent hears
+    /// is lost.
     pub(crate) async fn stop_all(
         &self,
         store: &crate::store::background::BackgroundStore,
         status: crate::store::background::TaskStatus,
     ) -> usize {
-        if let Err(error) = store
-            .stop_background_tasks(self.task_ids().await, status)
-            .await
-        {
+        let ids: Vec<String> = self.inner.lock().await.keys().cloned().collect();
+        if let Err(error) = store.stop_background_tasks(ids, status).await {
             tracing::warn!(
                 "failed to record background tasks as {status}; stopping them anyway: {error}",
                 status = status.name()
             );
         }
-        self.cancel_all().await
+        self.cancel_all(status).await
     }
 
-    /// Signal every task this process is running, returning how many were signaled: the signal
-    /// [`Self::stop_all`] sends once it has recorded why.
-    pub(crate) async fn cancel_all(&self) -> usize {
-        let guard = self.inner.lock().await;
-        for handle in guard.values() {
+    /// Signal every task this process is running, each left `status` for its outcome to report,
+    /// returning how many were signaled: the signal [`Self::stop_all`] sends once it has recorded
+    /// why.
+    pub(crate) async fn cancel_all(&self, status: crate::store::background::TaskStatus) -> usize {
+        let mut guard = self.inner.lock().await;
+        for handle in guard.values_mut() {
+            handle.stopped_as.get_or_insert(status);
             handle.cancellation.cancel();
         }
         guard.len()
@@ -262,8 +276,9 @@ pub(crate) fn only_what_was_won(
 ///
 /// For a caller that puts the batch into the conversation at once: a turn at its round boundary,
 /// a host folding it into the prompt it is about to run, the one-shot's post-turn report. The
-/// stamp is one-way, so a caller that might not run a turn after all asks the host layer's gated
-/// form, which first asks whether one can start.
+/// stamp is undone only by the turn that carries the batch, when it is refused before it opens or
+/// cannot store the message that carries it, so a caller that might not run a turn after all asks
+/// the host layer's gated form, which first asks whether one can start.
 pub(crate) async fn claim_outcomes_now(
     store: &crate::store::Store,
     session_id: Uuid,
@@ -616,7 +631,7 @@ mod tests {
         });
         tasks.attach("a", join).await;
 
-        assert_eq!(tasks.cancel_all().await, 1);
+        assert_eq!(tasks.cancel_all(TaskStatus::Interrupted).await, 1);
         tasks.wait_all().await;
 
         assert!(
@@ -695,6 +710,58 @@ mod tests {
             .await
             .expect("tasks");
         assert_eq!(recorded[0].status, TaskStatus::Interrupted);
+    }
+
+    /// A stop that lands while a task's row is still being written records nothing for it, so the
+    /// task's own outcome reports the stop: the failure its interruption reads as is recorded as
+    /// the stop's status, where a task no stop signaled still fails and one that succeeded keeps
+    /// its outcome.
+    #[tokio::test]
+    async fn a_task_stopped_before_its_row_landed_reports_the_stop() {
+        let store = crate::store::Store::for_test().await;
+        let session_id = store
+            .create_session(None, "p".to_string())
+            .await
+            .expect("session");
+        let tasks = BackgroundTasks::default();
+        let row = BackgroundTask {
+            session_id,
+            status: TaskStatus::Running,
+            finished_at: None,
+            ..task(TaskStatus::Running, None)
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve(row.id.clone(), session_id, token.clone(), 4)
+                .await
+        );
+        let background = store.background_store();
+        assert_eq!(
+            tasks.stop_all(&background, TaskStatus::Interrupted).await,
+            1
+        );
+        assert!(token.is_cancelled());
+
+        background.start_background_task(&row).await.expect("start");
+        let status = tasks.outcome_status(&row.id, true).await;
+        background
+            .finish_background_task(&row.id, status, Some("interrupted".to_string()), None)
+            .await
+            .expect("finish");
+        let recorded = background
+            .list_background_tasks(session_id)
+            .await
+            .expect("tasks");
+        assert_eq!(recorded[0].status, TaskStatus::Interrupted);
+        assert_eq!(
+            tasks.outcome_status(&row.id, false).await,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            tasks.outcome_status("unstopped", true).await,
+            TaskStatus::Failed
+        );
     }
 
     /// The ceiling is per session, so one session filling it must not starve another.

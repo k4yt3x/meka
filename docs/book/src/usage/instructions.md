@@ -81,7 +81,7 @@ What to expect:
 - `--instructions` and `MEKA_INSTRUCTIONS` replace the standing text only; the listed files still apply. Setting `MEKA_INSTRUCTIONS=` to the empty string blanks the standing text and nothing else. To stop reading a file, remove it from the list.
 - Sub-agents receive them together with the standing text under `instructions: "inherit"`, and nothing otherwise.
 - `GET /v1/instructions` on the HTTP API returns the standing text alone, since what a session read depends on its directory.
-- The size warning below applies to the listed files as well.
+- The size warning below counts the listed files together with the standing text.
 
 `meka instructions show` and `meka instructions path` read the list against the directory they run in, so `cd` into a project and run them to see what a session opened there is told.
 
@@ -100,6 +100,6 @@ This is the opposite of [skills](./skills.md) and [memory](./memory.md), which d
 - Empty or whitespace-only instructions are treated as unset.
 - Sub-agents do **not** receive them by default. Instructions describe the root agent, and a sub-agent handed one task by one of its turns is not that agent; inheriting the persona is how a sub-agent ends up addressing the user as though it were the one they are talking to. The agent can pass `instructions: "inherit"` to [`agent_spawn`](../tools/overview.md#agent_spawn) when a task genuinely needs the project's standing rules, or pass a [skill](./skills.md) when the direction is reusable.
 - They apply at every permission level, including `none`, because you wrote them.
-- A set larger than roughly 8k tokens logs a warning at startup, or when a session opens for the files `[instructions] files` names. It still works, and it is cached, but it occupies that much of every request's window and is usually a surprise rather than a decision.
+- Instructions that take more than 5% of the context window of the profile a session runs on (roughly 50k tokens on a 1M window, 6k on 128k) log a warning when the session opens. They still work, and they are cached, but every request carries them, and a share that large is usually a surprise rather than a decision.
 - An unreadable file in a directory is skipped with a warning rather than hiding the rest of it. A path you named explicitly via `MEKA_INSTRUCTIONS_FILE` is an error instead, since running without guidance you believe you supplied is worse than not starting.
 - A directory contributes at most 100 files; past that it is far more likely pointed somewhere unintended than intentional, so the rest are skipped with a warning.

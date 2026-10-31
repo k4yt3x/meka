@@ -1125,17 +1125,7 @@ fn shift_enter_is_a_newline_under_the_kitty_keyboard_protocol() {
 #[test]
 fn a_pasted_image_path_is_attached_and_sent() {
     let install = screen_install("read", "", "");
-    let path = install.work_dir().join("dot.png");
-    let mut png = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-        2,
-        2,
-        image::Rgba([255, 0, 0, 255]),
-    ))
-    .write_to(&mut png, image::ImageFormat::Png)
-    .expect("a png");
-    std::fs::write(&path, png.into_inner()).expect("write the png");
-    let paste = format!("\x1b[200~{}\x1b[201~", path.display());
+    let paste = pasted_png(&install);
     let screens = run_screen(&install, TWO_TURNS, &[&paste, "/exit"]);
     let rows = final_screen(&screens);
     assert!(
@@ -1149,6 +1139,142 @@ fn a_pasted_image_path_is_attached_and_sent() {
     assert!(
         !rows.iter().any(|row| row.contains("dot.png")),
         "the path was attached, not typed: {rows:#?}"
+    );
+}
+
+/// A pasted path to a small PNG in the install's working directory, as the bracketed paste that
+/// attaches it.
+fn pasted_png(install: &Install) -> String {
+    let path = install.work_dir().join("dot.png");
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        2,
+        image::Rgba([255, 0, 0, 255]),
+    ))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .expect("a png");
+    std::fs::write(&path, png.into_inner()).expect("write the png");
+    format!("\x1b[200~{}\x1b[201~", path.display())
+}
+
+/// A line that names no command is refused with an image attached as it is without one, and the
+/// line and the image stay in the composer, where they would otherwise reach the model.
+#[test]
+fn an_unknown_command_typed_with_an_image_is_refused() {
+    let install = screen_install("read", "", "");
+    let typed = format!("{}/nosuch x", pasted_png(&install));
+    let screens = run_screen(&install, TWO_TURNS, &[&typed, "\x1b", "/exit"]);
+    assert!(
+        screens[1]
+            .iter()
+            .any(|row| row.contains("Unknown command: /nosuch.")),
+        "refused as unknown: {:#?}",
+        screens[1]
+    );
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter().any(|row| row.contains("dot.png")),
+        "the image is still attached: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row == "  First answer."),
+        "nothing went to the model: {rows:#?}"
+    );
+}
+
+/// A shell command typed with an image attached runs and takes no image: the image waits in the
+/// composer for the next prompt rather than going to the model with the command line.
+#[test]
+fn a_shell_command_typed_with_an_image_runs_and_leaves_it_attached() {
+    let install = screen_install("read", "", "");
+    let armed = format!("{}!", pasted_png(&install));
+    let screens = run_screen(&install, TWO_TURNS, &[
+        &armed,
+        "echo shell-with-image",
+        "/exit",
+    ]);
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter().any(|row| row == "  shell-with-image"),
+        "the command ran: {rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("dot.png")),
+        "the image is still attached: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row == "  First answer."),
+        "nothing went to the model: {rows:#?}"
+    );
+}
+
+/// The same while a turn runs: the shell command is not refused for the image a busy turn cannot
+/// take, since it takes none.
+#[test]
+fn a_shell_command_typed_with_an_image_runs_while_a_turn_does() {
+    const LONG_ANSWER: &str = r#"[
+ [{"type":"sleep","ms":15000},
+  {"type":"text","text":"done at last"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = screen_install("read", "", "");
+    let armed = format!("{}!", pasted_png(&install));
+    let screens = run_screen(&install, LONG_ANSWER, &[
+        "hi",
+        &armed,
+        "echo busy-shell",
+        "/exit",
+    ]);
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter().any(|row| row == "  busy-shell"),
+        "the command ran: {rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("dot.png")),
+        "the image is still attached: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row == "  done at last"),
+        "the turn was still running: {rows:#?}"
+    );
+}
+
+/// An invocation the host refuses, here a skill that is not installed, hands the image it took
+/// back to the composer.
+#[test]
+fn a_refused_invocation_gives_its_image_back() {
+    let install = screen_install("read", "", "");
+    let typed = format!("{}/skill nosuch", pasted_png(&install));
+    let screens = run_screen(&install, TWO_TURNS, &[&typed, "\x1b", "/exit"]);
+    assert!(
+        screens[1].iter().any(|row| row.contains("nosuch")),
+        "the skill is refused: {:#?}",
+        screens[1]
+    );
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter().any(|row| row.contains("dot.png")),
+        "the image is back in the composer: {rows:#?}"
+    );
+}
+
+/// `/mcp reconnect` with no MCP server running answers and leaves the screen ready, so the next
+/// prompt runs rather than waiting on a command that never said it was done.
+#[test]
+fn a_reconnect_with_no_mcp_server_leaves_the_screen_ready() {
+    let install = screen_install("read", "", "");
+    let screens = run_screen(&install, TWO_TURNS, &[
+        "/mcp reconnect nosuch",
+        "\x1b",
+        "hi",
+        "/exit",
+    ]);
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter().any(|row| row == "  First answer."),
+        "the prompt after the reconnect ran: {rows:#?}"
     );
 }
 

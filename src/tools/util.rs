@@ -230,6 +230,24 @@ pub(super) fn optional_count(
         .map(|value| usize::try_from(value).unwrap_or(usize::MAX)))
 }
 
+/// An optional object parameter: `None` when absent or `null`, refused naming the field when it
+/// holds anything else. Read as absent, `headers` sent as a JSON-encoded string would have the
+/// request go out without the headers it asked for.
+pub(super) fn optional_object<'a>(
+    input: &'a serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<Option<&'a serde_json::Map<String, serde_json::Value>>> {
+    match input.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Object(fields)) => Ok(Some(fields)),
+        Some(value) => Err(MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("'{field}' must be an object, got {value}"),
+        }),
+    }
+}
+
 /// A field declared as a list of strings, read as the list, as one bare string (a mistake models
 /// make constantly, and the recovery is free), or as nothing: absent, `null` and a blank string
 /// are `None`. A blank entry is no entry, as a blank string is no value. An entry that is not a

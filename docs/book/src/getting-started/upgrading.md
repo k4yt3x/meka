@@ -30,8 +30,8 @@ Session archives are `format_version` 18. A 0.86 archive imports as it is: its k
 linked the same way, and its sealed reasoning names no endpoint, since the archive does not say
 which.
 
-Two environment values, a handful of flags, two OpenAI request shapes and two HTTP shapes are
-refused or read differently.
+Two environment values, a handful of flags, two OpenAI request shapes, two HTTP shapes, an ACP
+field and a tool's argument types are refused or read differently.
 
 **`openai-responses` asks for encrypted reasoning, a reasoning summary and a cache key.** Every
 request carries `include: ["reasoning.encrypted_content"]`, `reasoning.summary` and a
@@ -71,11 +71,13 @@ to know where the file is.
 session's running total. An editor that showed it as the session's cost should sum it across
 turns.
 
-**A tool's boolean and number arguments are read strictly.** A boolean is `true` or `false`, a
-number an integer (`2.0` counts as 2, as JSON Schema has it), or the field is left out. Anything
-else, a string such as `"true"` or `"3"`, a fraction, or a negative where a count is asked for, is
-refused naming the field, so a model corrects the call rather than having it read as `false` or as
-the default. `memory_search` read a quoted `limit` as the number it spelled, and now refuses it.
+**A tool's boolean, number and object arguments are read strictly.** A boolean is `true` or
+`false`, a number an integer (`2.0` counts as 2, as JSON Schema has it), an object an object
+(`web_fetch`'s `headers` an object of strings), or the field is left out. Anything else, a string
+such as `"true"` or `"3"`, a fraction, a negative where a count is asked for, or an object spelled
+as a JSON string, is refused naming the field, so a model corrects the call rather than having it
+read as `false`, as the default or as absent. `memory_search` read a quoted `limit` as the number
+it spelled, and now refuses it.
 
 ## 0.85 to 0.86
 

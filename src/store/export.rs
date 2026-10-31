@@ -505,21 +505,38 @@ pub(crate) fn plan_import(
                 })?),
                 None => None,
             };
-            // A link hides the copy from every history, so it is taken only between two messages,
-            // the one shape a compaction writes: on anything else it would hide what it names.
+            // A link hides the copy from every history, so it is taken only in the one shape a
+            // compaction writes: a message repeating an earlier one, word for word, below a
+            // boundary the original is above. On anything else it would hide what it names.
             if let Some(original) = event.copy_of {
-                let copies_a_message = matches!(event.event, crate::conversation::Event::Append(_))
-                    && matches!(
-                        events.get(original),
-                        Some(crate::store::ImportedEvent {
-                            event: crate::conversation::Event::Append(_),
-                            ..
-                        })
-                    );
+                let repeats = |earlier: &crate::conversation::Event| {
+                    matches!(
+                        (earlier, &event.event),
+                        (
+                            crate::conversation::Event::Append(_),
+                            crate::conversation::Event::Append(_)
+                        )
+                    ) && matches!(
+                        (
+                            super::sessions::encode_event_for_db(earlier),
+                            super::sessions::encode_event_for_db(&event.event),
+                        ),
+                        (Ok(earlier), Ok(copy)) if earlier == copy
+                    )
+                };
+                let copies_a_message = events
+                    .get(original)
+                    .is_some_and(|earlier: &crate::store::ImportedEvent| repeats(&earlier.event))
+                    && events.iter().skip(original + 1).any(|between| {
+                        matches!(
+                            between.event,
+                            crate::conversation::Event::CompactBoundary { .. }
+                        )
+                    });
                 if !copies_a_message {
                     return Err(crate::error::MekaError::Usage(format!(
                         "session {} in the archive has event {position} copying event {original}, \
-                         which is not an earlier message or is not one itself",
+                         which is not an earlier message it repeats from before a compaction",
                         session.id,
                         position = events.len()
                     )));
@@ -805,9 +822,10 @@ mod tests {
     }
 
     /// A link hides the copy from every history, so an archive may draw one only from a message to
-    /// an earlier message: one onto a repair, or forward, is refused.
+    /// an earlier message it repeats word for word, across a compaction: one onto a repair,
+    /// forward, onto other words, or with no boundary between, is refused.
     #[test]
-    fn an_archive_link_is_refused_unless_it_joins_two_messages_in_order() {
+    fn an_archive_link_is_refused_unless_it_repeats_an_earlier_message_across_a_compaction() {
         let profiles = configured(&["work"]);
         let plan = |events: serde_json::Value| {
             let mut archive = archive_on("work");
@@ -824,23 +842,59 @@ mod tests {
                 Some(crate::permission::Permission::Read),
             )
         };
-        let message = |copy_of: Option<usize>| {
+        let saying = |text: &str, copy_of: Option<usize>| {
             serde_json::json!({
                 "at": "2020-01-01T00:00:00Z",
-                "event": {"Append": {"role": "user", "content": [{"type": "text", "text": "hi"}]}},
+                "event": {"Append": {"role": "user", "content": [{"type": "text", "text": text}]}},
                 "turn_id": null,
                 "copy_of": copy_of,
             })
         };
+        let message = |copy_of: Option<usize>| saying("hi", copy_of);
         let repair = serde_json::json!({
             "at": "2020-01-01T00:00:00Z",
             "event": {"Repair": {"replaced_count": 1, "messages": []}},
             "turn_id": null,
             "copy_of": null,
         });
-        assert!(plan(serde_json::json!([message(None), message(Some(0))])).is_ok());
-        assert!(plan(serde_json::json!([repair, message(Some(0))])).is_err());
-        assert!(plan(serde_json::json!([message(Some(1)), message(None)])).is_err());
+        let boundary = serde_json::json!({
+            "at": "2020-01-01T00:00:00Z",
+            "event": crate::conversation::Event::CompactBoundary {
+                summary: crate::conversation::Message::user("the summary"),
+                replaced_count: 1,
+                record: crate::conversation::CompactionRecord::for_test(),
+                loaded_tools_snapshot: Default::default(),
+                checklist_snapshot: Default::default(),
+            },
+            "turn_id": null,
+            "copy_of": null,
+        });
+        assert!(
+            plan(serde_json::json!([
+                message(None),
+                boundary,
+                message(Some(0))
+            ]))
+            .is_ok()
+        );
+        assert!(plan(serde_json::json!([message(None), message(Some(0))])).is_err());
+        assert!(
+            plan(serde_json::json!([
+                message(None),
+                boundary,
+                saying("bye", Some(0))
+            ]))
+            .is_err()
+        );
+        assert!(plan(serde_json::json!([repair, boundary, message(Some(0))])).is_err());
+        assert!(
+            plan(serde_json::json!([
+                message(Some(2)),
+                boundary,
+                message(None)
+            ]))
+            .is_err()
+        );
     }
 
     /// A blob is served back under the label it carries, so an archive whose blob claims to be a

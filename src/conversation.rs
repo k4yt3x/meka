@@ -2115,7 +2115,8 @@ impl Message {
 pub(crate) enum PromptRetention {
     /// Keep it. A human typed it and can see the error, or it carries something that exists nowhere
     /// else: a background-task outcome, whose row is stamped `delivered` before the turn starts
-    /// and is never handed out again, or a one-shot job's fire, whose row is retired with the turn.
+    /// and handed out again only if the turn is refused before it opens or cannot store it, or a
+    /// one-shot job's fire, whose row is retired with the turn.
     #[default]
     Keep,
     /// Withdraw it, because whoever produced it will produce it again: a recurring job on its next

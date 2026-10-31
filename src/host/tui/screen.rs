@@ -375,6 +375,9 @@ struct Screen {
     next_shell_run: u64,
     /// Followups typed during a turn, each with the id of the prompt item it is shown as.
     followups: std::collections::VecDeque<(u64, String)>,
+    /// The images an invocation took from the composer, until its turn starts: a host that refuses
+    /// the invocation first hands them back to the composer.
+    invoked_with: Vec<super::input::Attachment>,
     hint: Option<(String, Instant)>,
     /// When the open question was asked, for the grace it takes no answer in.
     question_opened: Option<Instant>,
@@ -428,6 +431,7 @@ impl Screen {
             shell: None,
             next_shell_run: 0,
             followups: std::collections::VecDeque::new(),
+            invoked_with: Vec::new(),
             hint: None,
             question_opened: None,
             history_generation: 0,
@@ -945,6 +949,9 @@ impl Screen {
                     | crate::frontend::FrontendEvent::CompactionFailed { .. } => {
                         self.compacting = false;
                     }
+                    crate::frontend::FrontendEvent::TurnStarted { .. } => {
+                        self.invoked_with.clear();
+                    }
                     _ => {}
                 }
                 self.activity.note(&event);
@@ -977,6 +984,11 @@ impl Screen {
             }
             UiEvent::Panel(body) => self.open_panel(Panel::with_text(&body), PanelKind::Info),
             UiEvent::Done => {
+                // An invocation the host refused ahead of its turn hands its images back.
+                let refused = std::mem::take(&mut self.invoked_with);
+                if !refused.is_empty() {
+                    self.composer.give_back(refused);
+                }
                 self.launch.transcript.flush_turn_end();
                 self.busy = None;
                 self.activity = view::Activity::Working;
@@ -1724,9 +1736,13 @@ impl Screen {
         if trimmed == "!" {
             return;
         }
+        // Leaving and a shell command take no image: the one leaves, and the other runs with the
+        // images left for the next prompt.
+        let leaves = trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit");
+        let shell = trimmed.strip_prefix('!').map(str::to_string);
         // An image rides on a prompt that opens a turn; the inbox a busy turn reads carries
         // words alone.
-        if self.is_busy() && self.composer.has_attachments() {
+        if self.is_busy() && self.composer.has_attachments() && !leaves && shell.is_none() {
             self.reply("An image goes with the next prompt; wait for the turn to end.");
             return;
         }
@@ -1747,8 +1763,11 @@ impl Screen {
                     );
                     return;
                 }
+                super::commands::WithImages::Unknown => {
+                    self.reply(unknown_command_message(&trimmed));
+                    return;
+                }
                 super::commands::WithImages::Invocation(command) => Some(command),
-                super::commands::WithImages::Words => None,
             }
         } else {
             None
@@ -1761,7 +1780,19 @@ impl Screen {
         self.back_to_bottom();
         // Not echoed here, as no command line is: the appended message says it.
         if let Some(command) = routed {
+            self.invoked_with = attachments;
             self.ask_host(HostEvent::Command(command));
+            return;
+        }
+        if leaves {
+            self.leave();
+            return;
+        }
+        if let Some(command) = shell {
+            self.composer.give_back(attachments);
+            if !command.trim().is_empty() {
+                self.run_shell(&command);
+            }
             return;
         }
         if !attachments.is_empty() {
@@ -1792,16 +1823,6 @@ impl Screen {
 
         if trimmed.starts_with('/') {
             self.run_command_line(trimmed).await;
-            return;
-        }
-        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-            self.leave();
-            return;
-        }
-        if let Some(command) = trimmed.strip_prefix('!') {
-            if !command.trim().is_empty() {
-                self.run_shell(command);
-            }
             return;
         }
         if self.is_busy() {

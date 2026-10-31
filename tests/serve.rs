@@ -6990,6 +6990,53 @@ fn a_shutdown_with_a_feed_reader_attached_exits_clean() {
     reader.join().expect("the reader's stream ended");
 }
 
+/// A shutdown lets every resident session go, so a background task still running when the
+/// server stops is recorded as interrupted on the way out, not left reading `running` for the next
+/// process to open the session to sweep.
+#[cfg(unix)]
+#[test]
+fn a_shutdown_records_a_running_background_task_as_interrupted() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": {"command": "sleep 30", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = ServeTestHarness::spawn("\n[background]\nenabled = true\n", script);
+    let id = create_session_id(&harness);
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "run it", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        response.status(),
+        200,
+        "{}",
+        response.text().unwrap_or_default()
+    );
+
+    let kill_status = Command::new("kill")
+        .arg("-TERM")
+        .arg(harness.child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill_status.success(), "kill should succeed");
+    let status = harness.child.wait().expect("wait for exit");
+    assert!(status.success(), "{status:?}");
+    let connection =
+        rusqlite::Connection::open(harness.install.database()).expect("open the store");
+    let recorded: String = connection
+        .query_row("SELECT status FROM background_tasks", [], |row| row.get(0))
+        .expect("the task's row");
+    assert_eq!(recorded, "interrupted");
+}
+
 /// A cursor this server did not issue is the caller's to fix, answered as such rather than as a
 /// fault in the server.
 #[test]

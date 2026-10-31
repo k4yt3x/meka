@@ -815,8 +815,12 @@ pub(super) fn insert_event(
 /// the session's latest boundary: the alignment that pairs the most copies with rows holding what
 /// they hold, in order, each with the latest row it can take. Called ahead of the batch's own
 /// boundary. A copy no row holds names none and is a row of its own, so history keeps what it says
-/// (a prompt whose own save failed, or a message the view rewrote on its way to the model), and it
-/// cannot draw the copies before it off their rows by taking an older row that happens to match.
+/// (a prompt whose own save failed, or a message the view rewrote on its way to the model). Rows
+/// are told apart by what they hold alone, so where the same words were said earlier, a copy
+/// without a row of its own can pair with the older row and draw the copies before it onto older
+/// rows too. History then shows each row once, so words said again and never saved show only where
+/// they were first said, and a turn sweep that takes the older rows and leaves the newer shows a
+/// kept message twice.
 fn link_kept_copies(
     transaction: &rusqlite::Transaction<'_>,
     session_id: &str,

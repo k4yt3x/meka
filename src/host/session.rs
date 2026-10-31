@@ -520,6 +520,24 @@ where
     K: Eq + std::hash::Hash + Clone,
     E: std::ops::Deref<Target = ResidentSession> + Clone,
 {
+    /// Let every resident session go, for a host on its way out, once its turns have unwound: each
+    /// is released as [`ResidentSession::release`] releases one, so the background work it started
+    /// is recorded as interrupted and stopped rather than left reading `running`, and its lock and
+    /// registry go with it. How many sessions were released.
+    ///
+    /// Nothing here waits on a conversation: a turn that outlived the drain still holds one, and
+    /// blocking would trade a stale row for a hung shutdown.
+    pub(crate) async fn release_every(
+        &self,
+        mcp_manager: Option<&Arc<crate::mcp::McpClientManager>>,
+    ) -> usize {
+        let resident = std::mem::take(&mut *self.0.write().await);
+        for entry in resident.values() {
+            entry.release(mcp_manager).await;
+        }
+        resident.len()
+    }
+
     /// Cancel every session's in-flight turn, for a host that is shutting down.
     ///
     /// Through the cell, not the live token alone: a turn admitted but not yet published has no

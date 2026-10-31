@@ -9,7 +9,9 @@ use html2md::rewrite_html_custom_with_url;
 
 use super::{
     Tool, ToolOutput,
-    util::{compile_user_regex, optional_str, redirects_to_scratchpad, require_str},
+    util::{
+        compile_user_regex, optional_object, optional_str, redirects_to_scratchpad, require_str,
+    },
 };
 use crate::{
     config::{MinTlsVersion, WebClientConfig},
@@ -399,18 +401,25 @@ fn html_to_markdown(html: &str, base_url: &Option<url::Url>) -> String {
 /// parameter unwrap and the description shown to the agent. Pass `0` to disable the cap.
 const DEFAULT_LIMIT_CHARS: usize = 30_000;
 
+/// `builder` with the call's `headers`, refused naming the field when they are not an object of
+/// strings: a header dropped would send the request without what it asked for.
 fn apply_headers(
     mut builder: reqwest::RequestBuilder,
     input: &serde_json::Value,
-) -> reqwest::RequestBuilder {
-    if let Some(headers) = input.get("headers").and_then(|h| h.as_object()) {
-        for (key, value) in headers {
-            if let Some(value_str) = value.as_str() {
-                builder = builder.header(key.as_str(), value_str);
-            }
-        }
+) -> Result<reqwest::RequestBuilder> {
+    let Some(headers) = optional_object(input, "headers", "web_fetch")? else {
+        return Ok(builder);
+    };
+    for (name, value) in headers {
+        let Some(value) = value.as_str() else {
+            return Err(MekaError::ToolExecution {
+                tool_name: "web_fetch".to_string(),
+                message: "every value in 'headers' must be a string".to_string(),
+            });
+        };
+        builder = builder.header(name.as_str(), value);
     }
-    builder
+    Ok(builder)
 }
 
 pub(super) struct FetchUrlTool {
@@ -496,7 +505,22 @@ impl Tool for FetchUrlTool {
         // finishes on its own and is discarded.
         let cancellation = context.cancellation;
 
-        let request = apply_headers(self.client.get(&url), &input);
+        // Every argument is read ahead of the request, so a call refused for one sends nothing.
+        let raw = super::util::optional_bool(&input, "raw", "web_fetch")?.unwrap_or(false);
+        // When the caller redirects to the scratchpad we produce full content regardless of
+        // `limit`, the scratchpad being the overflow buffer, though a `limit` sent is read all the
+        // same, so one of the wrong type is refused either way.
+        let limit = super::util::optional_count(&input, "limit", "web_fetch")?
+            .unwrap_or(DEFAULT_LIMIT_CHARS);
+        let limit = if redirects_to_scratchpad(&input) {
+            0
+        } else {
+            limit
+        };
+        let pattern = optional_str(&input, "regex", "web_fetch")?
+            .map(|pattern| compile_user_regex(pattern, "web_fetch"))
+            .transpose()?;
+        let request = apply_headers(self.client.get(&url), &input)?;
         let response = unless_canceled(&cancellation, request.send())
             .await?
             .map_err(|error| MekaError::ToolExecution {
@@ -559,7 +583,6 @@ impl Tool for FetchUrlTool {
 
         let html = String::from_utf8_lossy(&body_bytes).into_owned();
 
-        let raw = super::util::optional_bool(&input, "raw", "web_fetch")?.unwrap_or(false);
         // Parsing and converting up to ten megabytes of HTML is pure CPU, and on the runtime it
         // blocks every other task on that worker.
         let body = if raw {
@@ -577,21 +600,11 @@ impl Tool for FetchUrlTool {
             })?
         };
 
-        // When the caller redirects to the scratchpad we produce full content regardless of
-        // `limit`; the scratchpad is the overflow buffer.
-        let limit = if redirects_to_scratchpad(&input) {
-            0
-        } else {
-            super::util::optional_count(&input, "limit", "web_fetch")?
-                .unwrap_or(DEFAULT_LIMIT_CHARS)
-        };
-
         // The regex runs against the whole document, before any truncation: run after, `limit`
         // would decide which matches existed, and "No matches found" would read as a fact about
         // the page. The cap then applies to the match list.
-        let matched = match optional_str(&input, "regex", "web_fetch")? {
-            Some(pattern) => {
-                let re = compile_user_regex(pattern, "web_fetch")?;
+        let matched = match pattern {
+            Some(re) => {
                 let mut matches = re.find_iter(&body).map(|found| found.as_str());
                 let Some(first) = matches.next() else {
                     return Ok(ToolOutput::text(
@@ -960,6 +973,7 @@ mod tests {
             }
         });
         let request = apply_headers(client.get("https://example.com"), &input)
+            .unwrap()
             .build()
             .unwrap();
         assert_eq!(request.headers().get("X-Custom").unwrap(), "test-value");
@@ -976,6 +990,7 @@ mod tests {
             "headers": { "User-Agent": "custom-agent" }
         });
         let request = apply_headers(client.get("https://example.com"), &input)
+            .unwrap()
             .build()
             .unwrap();
         assert_eq!(request.headers().get("User-Agent").unwrap(), "custom-agent");
@@ -986,25 +1001,26 @@ mod tests {
         let client = reqwest::Client::new();
         let input = serde_json::json!({"url": "https://example.com"});
         let request = apply_headers(client.get("https://example.com"), &input)
+            .unwrap()
             .build()
             .unwrap();
         assert!(request.headers().get("X-Custom").is_none());
     }
 
+    /// Headers of another shape, or a value that is not a string, are refused rather than left
+    /// off the request.
     #[test]
-    fn apply_headers_skips_non_string_values() {
+    fn headers_that_are_not_an_object_of_strings_are_refused() {
         let client = reqwest::Client::new();
-        let input = serde_json::json!({
-            "headers": {
-                "X-Valid": "good",
-                "X-Invalid": 123
-            }
-        });
-        let request = apply_headers(client.get("https://example.com"), &input)
-            .build()
-            .unwrap();
-        assert_eq!(request.headers().get("X-Valid").unwrap(), "good");
-        assert!(request.headers().get("X-Invalid").is_none());
+        for headers in [
+            serde_json::json!({ "X-Valid": "good", "X-Invalid": 123 }),
+            serde_json::json!("{\"Authorization\": \"Bearer x\"}"),
+        ] {
+            let input = serde_json::json!({ "headers": headers });
+            let refused =
+                apply_headers(client.get("https://example.com"), &input).expect_err("refused");
+            assert!(refused.to_string().contains("headers"), "{refused}");
+        }
     }
 
     #[test]

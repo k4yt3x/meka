@@ -506,6 +506,11 @@ impl Composer {
         std::mem::take(&mut self.attachments)
     }
 
+    /// Attachments taken for a prompt that was not sent after all, ahead of any attached since.
+    pub(crate) fn give_back(&mut self, attachments: Vec<Attachment>) {
+        self.attachments.splice(0..0, attachments);
+    }
+
     /// The row the chips take above the text, when there are any.
     pub(crate) fn attachment_rows(&self) -> u16 {
         u16::from(self.has_attachments())

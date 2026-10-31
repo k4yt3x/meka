@@ -193,24 +193,16 @@ pub(super) async fn acp_run_until_disconnect(
     //
     // `session/close` is an *optional* capability, so a client that simply exits leaves each entry
     // resident: an `Agent`, a `ToolRegistry` the MCP manager holds a strong clone of, and an open
-    // file lock. Dropping the map here releases the flock -- which is what lets the same session be
-    // reopened by the next `meka` without a `SessionLocked` error -- and lets the registry go, so
+    // file lock. Releasing them here lets the flock go -- which is what lets the same session be
+    // reopened by the next `meka` without a `SessionLocked` error -- and the registry, so
     // `tools/list_changed` stops fanning out to sessions that no longer exist.
-    let abandoned = {
-        let mut sessions = state.sessions.write().await;
-        std::mem::take(&mut *sessions)
-    };
-    if !abandoned.is_empty() {
-        for entry in abandoned.values() {
-            // Nothing here waits on the conversation: an in-flight turn that outlived the drain
-            // timeout still holds it, and blocking would trade a leaked registry for a hung
-            // shutdown.
-            entry.release(state.shared.mcp_manager.as_ref()).await;
-        }
-        let released = abandoned.len();
+    let released = state
+        .sessions
+        .release_every(state.shared.mcp_manager.as_ref())
+        .await;
+    if released > 0 {
         tracing::info!("released {released} session(s) the client did not close");
     }
-    drop(abandoned);
 
     Ok(())
 }

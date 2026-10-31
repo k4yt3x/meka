@@ -181,7 +181,8 @@ impl TurnInput {
     }
 
     /// A batch of outcomes that earned a turn of its own. Always kept: the rows are stamped
-    /// delivered before the turn starts and are never handed out again.
+    /// delivered before the turn starts, and handed out again only if the turn is refused before
+    /// it opens or cannot store them.
     pub(crate) fn outcomes(outcomes: Vec<crate::store::background::BackgroundTask>) -> Self {
         Self {
             prompt: Prompt::Outcomes(outcomes),
@@ -609,7 +610,10 @@ impl Agent {
     /// session; never by a fallback, since a chain's profiles share their `vision`
     /// (`config::validate_fallback_chains`). Asked ahead of the session row and `TurnStarted`, as
     /// the MCP gate is, so the refusal leaves no trace.
-    fn refuse_images_the_profile_cannot_read(&self, messages: &Conversation) -> Result<()> {
+    pub(crate) fn refuse_images_the_profile_cannot_read(
+        &self,
+        messages: &Conversation,
+    ) -> Result<()> {
         let serving = self.cells.profile.current();
         if serving.vision {
             return Ok(());
@@ -706,29 +710,25 @@ impl Agent {
             )
             .await;
         if saved.is_err() {
-            self.put_back(arrivals).await;
+            self.put_back(arrivals.outcomes()).await;
         }
         saved
     }
 
-    /// Put the outcomes `arrivals` claimed back in the undelivered pool, for a round that will not
-    /// carry them after all: a later turn then reads them, where otherwise nothing would.
-    pub(super) async fn put_back(&self, arrivals: &Arrivals) {
-        if arrivals.outcomes().is_empty() {
+    /// Put `outcomes`, claimed for a message that will not carry them after all, back in the
+    /// undelivered pool: a later turn then reads them, where otherwise nothing would.
+    pub(super) async fn put_back(&self, outcomes: &[crate::store::background::BackgroundTask]) {
+        if outcomes.is_empty() {
             return;
         }
-        let ids: Vec<String> = arrivals
-            .outcomes()
-            .iter()
-            .map(|task| task.id.clone())
-            .collect();
+        let ids: Vec<String> = outcomes.iter().map(|task| task.id.clone()).collect();
         if let Err(error) = self
             .store
             .background_store()
             .release_background_tasks(&ids)
             .await
         {
-            tracing::warn!("failed to put background outcomes back after a failed save: {error}");
+            tracing::warn!("failed to put background outcomes back: {error}");
         }
     }
 }
@@ -808,6 +808,10 @@ impl Arrivals {
 struct TurnOpening {
     user_message: Message,
     inbox_ids: Vec<Uuid>,
+    /// The outcomes the message carries, claimed already, which a message that fails to save puts
+    /// back, as a round's failed save does ([`Agent::save_carrying`]), on the same terms: a
+    /// session that stays loaded may read them twice.
+    outcomes: Vec<crate::store::background::BackgroundTask>,
     /// The world snapshot the model had seen before this turn rendered its own, for a turn that
     /// is withdrawn.
     world_state_rollback: Option<prompt::WorldSnapshot>,
@@ -1027,13 +1031,12 @@ impl Agent {
         })
     }
 
-    /// Whether a turn could start right now, asked before anything irreversible is done for it.
+    /// Whether a turn could start right now as far as its MCP servers go, asked before anything is
+    /// done for it.
     ///
     /// [`Self::run_turn`] gates on this itself, deliberately before it touches the conversation, so
-    /// a refused turn leaves no trace. That ordering is what makes it unsafe to *claim* a
-    /// background outcome first: the claim stamps a row that is never handed out again, and a turn
-    /// refused here would carry it nowhere. `background::claim_undelivered_outcomes` asks this
-    /// before stamping anything, which is why the answer is public.
+    /// a refused turn leaves no trace and puts back the outcomes it was to carry. A claimer asks it
+    /// first so as not to claim a batch only for it to go back, which is why the answer is public.
     pub(crate) async fn ensure_ready_for_turn(&self) -> Result<()> {
         self.await_mcp_ready().await
     }
@@ -1169,9 +1172,16 @@ impl Agent {
         *crate::sync::lock(&self.current_turn) = Some(turn_id);
         let _turn_scope = TurnScope { agent: self };
         // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
-        // leaves no trace in the conversation.
-        self.await_mcp_ready().await?;
-        self.refuse_images_the_profile_cannot_read(messages)?;
+        // leaves no trace in the conversation, and the outcomes it was to carry go back for a turn
+        // that can.
+        let ready = match self.await_mcp_ready().await {
+            Ok(()) => self.refuse_images_the_profile_cannot_read(messages),
+            Err(error) => Err(error),
+        };
+        if let Err(refused) = ready {
+            self.put_back(&outcomes).await;
+            return Err(refused);
+        }
 
         let session_id = match self.cells.session_id.get() {
             Some(session_id) => session_id,
@@ -1553,13 +1563,14 @@ impl Agent {
             .frontend
             .emit(FrontendEvent::MessageAppended {
                 message: user_message.clone(),
-                outcomes,
+                outcomes: outcomes.clone(),
                 late,
             })
             .await;
         Ok(TurnOpening {
             user_message,
             inbox_ids,
+            outcomes,
             world_state_rollback,
             resumed,
             suspect_floor,
@@ -2636,6 +2647,7 @@ impl Agent {
                     .await
                 {
                     tracing::warn!("failed to save user message on interruption: {error}");
+                    self.put_back(&opening.outcomes).await;
                 }
             }
             // Saved rather than popped, because `Keep` means the prompt carries something that
@@ -2656,6 +2668,7 @@ impl Agent {
                     .await
                 {
                     tracing::warn!("failed to save user message after a failed turn: {error}");
+                    self.put_back(&opening.outcomes).await;
                 }
             }
             Err(error) if !matches!(error, MekaError::Interrupted) && !recovery.user_saved => {
@@ -2816,7 +2829,7 @@ impl Agent {
             return Ok(());
         }
         if let Err(error) = recovery.ensure_prompt_saved(self, session_id, prompt).await {
-            self.put_back(&arrivals).await;
+            self.put_back(arrivals.outcomes()).await;
             return Err(error);
         }
         let ids = arrivals.item_ids();
@@ -4569,6 +4582,123 @@ mod tests {
             .await;
         assert!(outcome.is_err(), "the prompt cannot be saved: {outcome:?}");
         let undelivered = background
+            .list_undelivered_background_tasks(session_id)
+            .await
+            .expect("tasks");
+        assert_eq!(undelivered.len(), 1, "the outcome is offered again");
+    }
+
+    /// A finished task's row, claimed for a turn to carry, as a host claims one.
+    async fn claimed_outcome(
+        store: &Store,
+        session_id: Uuid,
+    ) -> Vec<crate::store::background::BackgroundTask> {
+        let task = crate::store::background::BackgroundTask {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            tool: "shell_execute".to_string(),
+            label: "cargo test".to_string(),
+            status: crate::store::background::TaskStatus::Running,
+            outcome: None,
+            scratchpad_entry: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            announced_at: None,
+            delivered_at: None,
+            subagent_id: None,
+        };
+        let background = store.background_store();
+        background
+            .start_background_task(&task)
+            .await
+            .expect("start");
+        background
+            .finish_background_task(
+                &task.id,
+                crate::store::background::TaskStatus::Completed,
+                Some("42 passed".to_string()),
+                None,
+            )
+            .await
+            .expect("finish");
+        let claimed = crate::background::claim_outcomes_now(store, session_id).await;
+        assert_eq!(claimed.len(), 1, "claimed");
+        claimed
+    }
+
+    /// A turn refused before it opens, here for a history holding an image on a profile without
+    /// vision, puts back the outcomes it was to carry, so a turn that can carry them reads them.
+    #[tokio::test]
+    async fn a_turn_refused_before_it_opens_puts_its_outcomes_back() {
+        let (mut agent, provider, store, session_id, _frontend) =
+            agent_with_session(vec![text_round("seen")]).await;
+        agent.enable_background_for_test(2);
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("look at this".to_string(), vec![
+                    image_source(),
+                ])
+                .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("a profile that reads images runs the turn");
+        agent.set_provider(crate::provider::ResolvedProfile {
+            provider: provider.clone(),
+            profile: "text-only".to_string(),
+            context_window: 200_000,
+            vision: false,
+        });
+        let claimed = claimed_outcome(&store, session_id).await;
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::outcomes(claimed),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("refused for the history's image");
+        let undelivered = store
+            .background_store()
+            .list_undelivered_background_tasks(session_id)
+            .await
+            .expect("tasks");
+        assert_eq!(undelivered.len(), 1, "the outcome is offered again");
+    }
+
+    /// A turn that fails with its prompt unsaved, and cannot save it on the way out either, puts
+    /// back the outcomes the prompt carries: no stored message holds them.
+    #[tokio::test]
+    async fn a_failed_turn_whose_prompt_cannot_be_saved_puts_its_outcomes_back() {
+        let (mut agent, _provider, store, session_id, _frontend) =
+            agent_with_session(vec![vec![MockEvent::Fail {
+                message: "the provider broke".to_string(),
+            }]])
+            .await;
+        agent.enable_background_for_test(2);
+        let claimed = claimed_outcome(&store, session_id).await;
+        store
+            .run_sql_for_test(
+                "CREATE TRIGGER refuse_the_prompt BEFORE INSERT ON messages \
+                 WHEN NEW.content LIKE '%unsavable prompt%' \
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("unsavable prompt".to_string(), Vec::new())
+                    .expect("a prompt")
+                    .riding(claimed),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("the provider fails");
+        let undelivered = store
+            .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("tasks");
@@ -9938,7 +10068,54 @@ mod tests {
         assert_eq!(running[0].label, "sleep 600");
 
         // Leave nothing behind for the next test's runtime to trip over.
-        agent.background_tasks().cancel_all().await;
+        agent
+            .background_tasks()
+            .cancel_all(crate::store::background::TaskStatus::Interrupted)
+            .await;
+    }
+
+    /// A task a stop signaled reports the stop from its own outcome, which is what records it when
+    /// the stop could not: here the signal comes with no record ahead of it, as it does for a task
+    /// whose row had not landed when the stop recorded the rest.
+    #[tokio::test]
+    async fn a_signaled_task_records_the_stop_from_its_own_outcome() {
+        use crate::provider::mock::MockProvider;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("sleep 600"),
+            text_round("started it"),
+        ]));
+        let (agent, store) = background_agent(provider, Arc::new(SlowFixture)).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("run the suite".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn must not block on the task");
+
+        agent
+            .background_tasks()
+            .cancel_all(crate::store::background::TaskStatus::Interrupted)
+            .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.background_tasks().wait_all(),
+        )
+        .await
+        .expect("the task ends on its signal");
+        let tasks = store
+            .background_store()
+            .list_background_tasks(agent.session_id().expect("session"))
+            .await
+            .expect("tasks");
+        assert_eq!(
+            tasks[0].status,
+            crate::store::background::TaskStatus::Interrupted
+        );
     }
 
     /// With `[background] enabled = false` the parameter is never offered, so a model asking for it
@@ -10173,7 +10350,10 @@ mod tests {
         assert!(results.contains("which is the limit"), "{results}");
         assert!(results.contains("without `background`"), "{results}");
 
-        agent.background_tasks().cancel_all().await;
+        agent
+            .background_tasks()
+            .cancel_all(crate::store::background::TaskStatus::Interrupted)
+            .await;
     }
 
     /// `background` is meka's own. A tool must never see it, least of all a remote MCP server that

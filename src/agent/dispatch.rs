@@ -530,7 +530,6 @@ impl Agent {
                 true,
             );
         }
-
         let requested_entry = crate::tools::scratchpad::requested_entry(input).map(str::to_string);
         let join = tokio::spawn({
             let tool = Arc::clone(tool);
@@ -577,11 +576,7 @@ impl Agent {
 
                 let text =
                     crate::conversation::ContentBlock::tool_result_text_content(&output.content);
-                let status = if output.is_error {
-                    crate::store::background::TaskStatus::Failed
-                } else {
-                    crate::store::background::TaskStatus::Completed
-                };
+                let status = tasks.outcome_status(&task_id, output.is_error).await;
                 // The entry the call named takes the whole output and the report says where, as
                 // an inline call's result does; a word about the call rather than its output is
                 // the report itself, as it stays inline there.

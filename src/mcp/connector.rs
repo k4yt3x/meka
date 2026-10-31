@@ -246,11 +246,12 @@ pub(super) async fn record_connect_failure(
     } else {
         tracing::warn!("failed to connect to MCP server '{server_name}': {cause}");
     }
-    *entry.state.write().await = ServerState::Failed {
+    let previous = std::mem::replace(&mut *entry.state.write().await, ServerState::Failed {
         error: cause,
         at: std::time::Instant::now(),
         needs,
-    };
+    });
+    entry.retire(previous);
 }
 
 /// Connect a single `Pending` server: wrap the existing `connect_server` in a per-server timeout,
@@ -986,7 +987,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
-            renewal_refused: std::sync::atomic::AtomicU64::new(0),
+            renewal_tried_at: std::sync::Mutex::new(None),
             removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
@@ -1024,7 +1025,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
-            renewal_refused: std::sync::atomic::AtomicU64::new(0),
+            renewal_tried_at: std::sync::Mutex::new(None),
             removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
@@ -1098,7 +1099,7 @@ mod tests {
                 needs: None,
             }),
             reconnect_lock: Mutex::new(()),
-            renewal_refused: std::sync::atomic::AtomicU64::new(0),
+            renewal_tried_at: std::sync::Mutex::new(None),
             removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: Some(reason.to_string()),
@@ -1160,7 +1161,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
-            renewal_refused: std::sync::atomic::AtomicU64::new(0),
+            renewal_tried_at: std::sync::Mutex::new(None),
             removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,

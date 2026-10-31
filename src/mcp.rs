@@ -86,6 +86,9 @@ fn cap_advertised_tools<T>(listed: Vec<T>, server_name: &str) -> Vec<T> {
 pub(crate) const DEFAULT_MCP_REQUEST_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+/// How long a connection whose renewal was tried waits before a rejection on it is renewed again.
+const RENEWAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Allow-list of image MIME types passed straight through to the provider. Anything else (notably
 /// `image/svg+xml`, which can embed script/link elements) is converted to a text placeholder.
 pub(crate) const ALLOWED_IMAGE_MIME_TYPES: &[&str] =
@@ -117,7 +120,14 @@ const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) struct Connects {
     stopping: CancellationToken,
     in_flight: tokio::sync::watch::Sender<usize>,
+    /// The connections an entry let go of while a request still held them, so a shutdown closes
+    /// them with the rest: no entry's state names them any longer. `None` once a shutdown has
+    /// taken them.
+    retired: std::sync::Mutex<Option<Vec<Retired>>>,
 }
+
+/// A connection an entry let go of, by its server's name, held weakly.
+type Retired = (String, std::sync::Weak<McpRunningService>);
 
 /// One connect in flight; dropping it is the connect ending, however it ended.
 pub(crate) struct Connecting(Arc<Connects>);
@@ -127,7 +137,36 @@ impl Connects {
         Arc::new(Self {
             stopping: CancellationToken::new(),
             in_flight: tokio::sync::watch::Sender::new(0),
+            retired: std::sync::Mutex::new(Some(Vec::new())),
         })
+    }
+
+    /// Let go of `server_name`'s connection `service`: dropped here when nothing else holds it,
+    /// which closes it, and otherwise remembered until the last request on it lets go. Once a
+    /// shutdown has taken the ones remembered, a connection still held is ended at once instead,
+    /// since nothing would come back for it.
+    pub(crate) fn retire(&self, server_name: &str, service: Arc<McpRunningService>) {
+        if Arc::strong_count(&service) == 1 {
+            return;
+        }
+        match crate::sync::lock(&self.retired).as_mut() {
+            Some(retired) => {
+                retired.retain(|(_, held)| held.strong_count() > 0);
+                retired.push((server_name.to_string(), Arc::downgrade(&service)));
+            }
+            None => service.cancellation_token().cancel(),
+        }
+    }
+
+    /// The retired connections a request still holds, for the shutdown to close; a connection
+    /// retired after this is ended by [`Self::retire`].
+    fn still_held(&self) -> Vec<(String, Arc<McpRunningService>)> {
+        crate::sync::lock(&self.retired)
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(server_name, held)| held.upgrade().map(|service| (server_name, service)))
+            .collect()
     }
 
     /// The token a connect in flight ends on.
@@ -256,7 +295,7 @@ fn build_entry(
         client_context,
         state: RwLock::new(initial_state),
         reconnect_lock: Mutex::new(()),
-        renewal_refused: std::sync::atomic::AtomicU64::new(0),
+        renewal_tried_at: std::sync::Mutex::new(None),
         removed: CancellationToken::new(),
         tool_call_timeout,
         refused,
@@ -495,14 +534,14 @@ pub(crate) struct NotConnected {
 pub(crate) struct LiveConnection {
     /// The connection's peer, which the request is sent through.
     pub(crate) peer: Peer<RoleClient>,
-    /// Which of the entry's connections this is, for [`ServerEntry::reconnect_replacing`].
+    /// Which of the entry's connections this is, for [`ServerEntry::renew_rejected`].
     pub(crate) generation: u64,
     _service: Arc<McpRunningService>,
 }
 
 /// How hard a reconnect tries before it gives up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Persistence {
+enum Persistence {
     /// The transport's schedule: five attempts over HTTP with a backoff between, one for stdio.
     Backoff,
     /// One attempt, for a connection the server rejected as unauthorized: a fresh `headers_helper`
@@ -612,10 +651,9 @@ pub(crate) struct ServerEntry {
     pub(crate) client_context: Arc<McpClientContext>,
     pub(crate) state: RwLock<ServerState>,
     pub(crate) reconnect_lock: Mutex<()>,
-    /// One past the generation of the connection whose renewal after a rejection as unauthorized
-    /// failed, or zero: that connection is not renewed again, so a server that keeps rejecting
-    /// what the helper gives it costs each request its own answer rather than another reconnect.
-    pub(crate) renewal_refused: std::sync::atomic::AtomicU64,
+    /// When a renewal after a rejection as unauthorized was last tried; see
+    /// [`Self::renew_rejected`].
+    pub(crate) renewal_tried_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Cancelled when the manager takes the entry out, so a connect or a retry in flight on it
     /// ends at once rather than at its bound, child and all; a shutdown ends every entry's through
     /// `connects` instead.
@@ -838,10 +876,11 @@ impl ServerEntry {
     /// reconnect. The attempt holds its connection, so a replacement another request makes does
     /// not cut it short.
     ///
-    /// The one door every request to the server takes but two: a tool listing, whose reconnect
+    /// The one door every request to the server takes but these: a tool listing, whose reconnect
     /// would re-list inside the listing it came from, so a listing that fails keeps the tools it
-    /// had and the next request mends the connection; and the notification stream, which every
-    /// connection opens for itself when it is adopted.
+    /// had and the next request mends the connection; and what a connection carries over for
+    /// itself when it is adopted (its notification stream, or a legacy server's subscriptions),
+    /// which a mend would only carry over again.
     pub(crate) async fn on_a_connection<T, F, Fut>(
         self: &Arc<Self>,
         cancellation: &CancellationToken,
@@ -869,15 +908,12 @@ impl ServerEntry {
     }
 
     /// Replace connection `seen` with a fresh one, whether or not its transport has closed: what a
-    /// server rejecting the headers it was opened with, or a person asking for a reconnect, needs.
-    /// Serialized on `reconnect_lock` like [`Self::reconnect`]; a caller that finds `seen`
-    /// replaced already returns at once. A connection still open is replaced only by one that
-    /// opened: giving up leaves it serving, where a closed one is recorded as failed.
+    /// person asking for a reconnect needs. Serialized on `reconnect_lock` like
+    /// [`Self::reconnect`]; a caller that finds `seen` replaced already returns at once.
     pub(crate) async fn reconnect_replacing(
         self: &Arc<Self>,
         seen: u64,
         cancellation: &CancellationToken,
-        persistence: Persistence,
     ) -> Result<()> {
         let _guard = tokio::select! {
             guard = self.reconnect_lock.lock() => guard,
@@ -886,6 +922,18 @@ impl ServerEntry {
         if self.connection.load(std::sync::atomic::Ordering::SeqCst) != seen {
             return Ok(());
         }
+        self.replace_connection(cancellation, Persistence::Backoff)
+            .await
+    }
+
+    /// Replace the live connection under `reconnect_lock`, which the caller holds. A connection
+    /// still open is replaced only by one that opened: giving up leaves it serving, where a closed
+    /// one is recorded as failed.
+    async fn replace_connection(
+        self: &Arc<Self>,
+        cancellation: &CancellationToken,
+        persistence: Persistence,
+    ) -> Result<()> {
         if let Some(reason) = &self.refused {
             return Err(MekaError::McpConnection {
                 server_name: self.server_name.clone(),
@@ -902,38 +950,51 @@ impl ServerEntry {
     }
 
     /// Replace connection `seen`, which the server rejected as unauthorized, with one that runs
-    /// `headers_helper` again; whether a new connection is there to retry on. Once per connection:
-    /// one that failed to renew is not tried again, and its requests get their own rejection
-    /// back, so a server that keeps rejecting the helper's token costs no request a reconnect.
+    /// `headers_helper` again; whether a new connection is there to retry on. Once per
+    /// [`RENEWAL_INTERVAL`], however the try ended: the requests that meet a rejection in the
+    /// meantime get their own back at once, so a server that keeps rejecting the helper's token,
+    /// at the handshake or after it, costs no request a reconnect, and a helper that failed for a
+    /// moment is tried again once the interval has passed.
     pub(crate) async fn renew_rejected(
         self: &Arc<Self>,
         seen: u64,
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        if self
-            .renewal_refused
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == seen + 1
-        {
-            return Ok(false);
+        let _guard = tokio::select! {
+            guard = self.reconnect_lock.lock() => guard,
+            _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+        };
+        if self.connection.load(std::sync::atomic::Ordering::SeqCst) != seen {
+            return Ok(true);
         }
+        // Stamped ahead of the try, so one cut short by its request's bound counts as well, and
+        // whatever connection it was for: one that opened and is rejected all the same is not
+        // renewed again on the next. A stop by the person asking puts the last stamp back.
+        let previous = {
+            let mut tried = crate::sync::lock(&self.renewal_tried_at);
+            if tried.is_some_and(|at| at.elapsed() < RENEWAL_INTERVAL) {
+                return Ok(false);
+            }
+            tried.replace(std::time::Instant::now())
+        };
         tracing::info!(
             "MCP server '{name}' rejected a request as unauthorized; reconnecting once to run \
              `headers_helper` again",
             name = self.server_name
         );
         match self
-            .reconnect_replacing(seen, cancellation, Persistence::Once)
+            .replace_connection(cancellation, Persistence::Once)
             .await
         {
             Ok(()) => Ok(true),
-            Err(MekaError::Interrupted) => Err(MekaError::Interrupted),
+            Err(MekaError::Interrupted) => {
+                *crate::sync::lock(&self.renewal_tried_at) = previous;
+                Err(MekaError::Interrupted)
+            }
             Err(error) => {
-                self.renewal_refused
-                    .store(seen + 1, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(
                     "failed to renew MCP server '{name}' after it rejected a request as \
-                     unauthorized; not trying again on this connection: {error}",
+                     unauthorized; not trying again for {RENEWAL_INTERVAL:?}: {error}",
                     name = self.server_name
                 );
                 Ok(false)
@@ -1001,14 +1062,23 @@ impl ServerEntry {
                 .peer_info()
                 .and_then(|info| info.instructions.clone()),
         );
-        *state = ServerState::Connected {
+        let previous = std::mem::replace(&mut *state, ServerState::Connected {
             service: Arc::new(service),
-        };
+        });
         self.connection
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(state);
+        self.retire(previous);
         tokio::spawn(subscriptions::resumption(Arc::clone(self)));
         Ok(())
+    }
+
+    /// Let go of the connection in `previous`, the state this entry has just left, if it held one;
+    /// see [`Connects::retire`].
+    pub(crate) fn retire(&self, previous: ServerState) {
+        if let ServerState::Connected { service } = previous {
+            self.connects.retire(&self.server_name, service);
+        }
     }
 
     /// Transport-close check used by [`Self::reconnect`]. Returns false if the server isn't
@@ -1714,10 +1784,14 @@ impl McpClientManager {
             match Arc::try_unwrap(service) {
                 Ok(owned) => close_service(name, owned).await,
                 // Closed by its drop guard as the last of them lets go, which a process that goes
-                // on serving runs.
-                Err(_held) => tracing::debug!(
-                    "MCP server '{name}' still had in-flight calls on removal; closed once they end"
-                ),
+                // on serving runs, or by a shutdown that comes first.
+                Err(held) => {
+                    tracing::debug!(
+                        "MCP server '{name}' still had in-flight calls on removal; closed once \
+                         they end"
+                    );
+                    entry.retire(ServerState::Connected { service: held });
+                }
             }
         }
         self.tools_snapshot.write().await.remove(name);
@@ -1976,7 +2050,6 @@ impl McpClientManager {
                     entry.reconnect_replacing(
                         entry.connection.load(std::sync::atomic::Ordering::SeqCst),
                         &tokio_util::sync::CancellationToken::new(),
-                        Persistence::Backoff,
                     ),
                 )
                 .await
@@ -2127,6 +2200,7 @@ impl McpClientManager {
             drop(state);
             services.push((server_name, service));
         }
+        services.extend(self.connects.still_held());
 
         // One grace for every server, so calls in flight on several finish together. A request
         // holds its connection's service for as long as it runs; one still holding it after the
@@ -3072,7 +3146,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
-            renewal_refused: std::sync::atomic::AtomicU64::new(0),
+            renewal_tried_at: std::sync::Mutex::new(None),
             removed: CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
@@ -3387,6 +3461,9 @@ mod tests {
     struct TokenServer {
         token: std::sync::Mutex<String>,
         handshakes: std::sync::atomic::AtomicUsize,
+        /// Whether `prompts/list` is rejected as unauthorized whatever token it carries, as a
+        /// server does that accepts the handshake and checks its calls.
+        prompts_unauthorized: std::sync::atomic::AtomicBool,
     }
 
     #[cfg(all(unix, feature = "serve"))]
@@ -3400,7 +3477,12 @@ mod tests {
         let sent = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
-        if sent != Some(expected.as_str()) {
+        if sent != Some(expected.as_str())
+            || (message["method"] == "prompts/list"
+                && server
+                    .prompts_unauthorized
+                    .load(std::sync::atomic::Ordering::SeqCst))
+        {
             return axum::http::StatusCode::UNAUTHORIZED.into_response();
         }
         let Some(id) = message.get("id").cloned() else {
@@ -3456,6 +3538,7 @@ mod tests {
         let server = Arc::new(TokenServer {
             token: std::sync::Mutex::new("first".to_string()),
             handshakes: std::sync::atomic::AtomicUsize::new(0),
+            prompts_unauthorized: std::sync::atomic::AtomicBool::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3508,11 +3591,12 @@ mod tests {
     }
 
     /// A server that rejects the token the helper keeps giving is renewed once, with one attempt,
-    /// and not again on the same connection: every request after that gets its own rejection back
-    /// at once, where it would otherwise wait out a reconnect's backoff each time.
+    /// for the requests that meet the rejection together, and not again on the same connection
+    /// until the interval has passed: every request in between gets its own rejection back at
+    /// once, where it would otherwise wait out a reconnect each time.
     #[cfg(all(unix, feature = "serve"))]
     #[tokio::test]
-    async fn a_token_the_server_keeps_rejecting_is_renewed_once() {
+    async fn a_token_the_server_keeps_rejecting_is_renewed_once_per_interval() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3537,6 +3621,7 @@ mod tests {
         let server = Arc::new(TokenServer {
             token: std::sync::Mutex::new("first".to_string()),
             handshakes: std::sync::atomic::AtomicUsize::new(0),
+            prompts_unauthorized: std::sync::atomic::AtomicBool::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3573,18 +3658,60 @@ mod tests {
         *server.token.lock().expect("token") = "second".to_string();
         let cancellation = CancellationToken::new();
         let started = std::time::Instant::now();
-        assert!(list_prompts(&entry, &cancellation).await.is_err());
-        assert_eq!(helper_runs(), connected + 1, "one renewal, one attempt");
+        let requests = (0..3).map(|_| list_prompts(&entry, &cancellation));
+        for listed in futures::future::join_all(requests).await {
+            assert!(listed.is_err());
+        }
+        assert_eq!(
+            helper_runs(),
+            connected + 1,
+            "three rejections together, one renewal of one attempt"
+        );
         assert!(list_prompts(&entry, &cancellation).await.is_err());
         assert_eq!(
             helper_runs(),
             connected + 1,
-            "not renewed again on this connection"
+            "not renewed again within the interval"
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "no backoff: {:?}",
             started.elapsed()
+        );
+
+        let age_the_stamp = || {
+            if let Some(tried_at) = crate::sync::lock(&entry.renewal_tried_at).as_mut() {
+                *tried_at = std::time::Instant::now()
+                    .checked_sub(RENEWAL_INTERVAL)
+                    .expect("the host has been up longer than the interval");
+            }
+        };
+        age_the_stamp();
+        assert!(list_prompts(&entry, &cancellation).await.is_err());
+        assert_eq!(
+            helper_runs(),
+            connected + 2,
+            "renewed again once the interval has passed"
+        );
+
+        // A server that takes the handshake and rejects the call: the renewal opens a connection,
+        // the call is rejected on it all the same, and the next rejection is not renewed again.
+        *server.token.lock().expect("token") = "first".to_string();
+        server
+            .prompts_unauthorized
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        age_the_stamp();
+        assert!(list_prompts(&entry, &cancellation).await.is_err());
+        assert_eq!(
+            helper_runs(),
+            connected + 3,
+            "renewed onto a connection that opened"
+        );
+        assert!(list_prompts(&entry, &cancellation).await.is_err());
+        assert_eq!(
+            helper_runs(),
+            connected + 3,
+            "not renewed again on the new connection within the interval"
         );
     }
 
@@ -3832,6 +3959,59 @@ mod tests {
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        manager.shutdown_within(SHUTDOWN_BUDGET).await;
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), call).await;
+        assert!(ended.is_ok(), "the call ended with the shutdown");
+    }
+
+    /// A connection let go of after a shutdown has taken the ones it remembers is ended at once:
+    /// the shutdown will not come back for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_connection_retired_behind_a_shutdown_is_ended_at_once() {
+        let (_temp, _state, _log, _manager, entry) = connected_stub(serde_json::json!({
+            "tools": ["search"],
+            "legacy_only": true,
+        }))
+        .await;
+        let service = match &*entry.state.read().await {
+            ServerState::Connected { service } => Arc::clone(service),
+            _ => panic!("connected"),
+        };
+        let held = Arc::clone(&service);
+        assert!(entry.connects.still_held().is_empty());
+        entry.connects.retire("stub", service);
+        assert!(held.is_closed(), "ended rather than left to its holder");
+    }
+
+    /// A shutdown ends a call still running on a connection a reconnect replaced, which no entry's
+    /// state names any longer, as it ends one on a live connection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shutdown_ends_a_call_on_a_connection_a_reconnect_replaced() {
+        let (_temp, _state, _log, manager, entry) = connected_stub(serde_json::json!({
+            "tools": ["search"],
+            "call_delay_ms": 30_000,
+            "legacy_only": true,
+        }))
+        .await;
+        let call = tokio::spawn({
+            let entry = Arc::clone(&entry);
+            async move {
+                entry
+                    .on_a_connection(&CancellationToken::new(), |peer| async move {
+                        peer.call_tool(rmcp::model::CallToolRequestParams::new("search"))
+                            .await
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let replaced = manager
+            .reconnect_server("stub", std::time::Duration::from_secs(20))
+            .await
+            .expect("replaced");
+        assert!(matches!(replaced, ServerState::Connected { .. }));
         manager.shutdown_within(SHUTDOWN_BUDGET).await;
         let ended = tokio::time::timeout(std::time::Duration::from_secs(2), call).await;
         assert!(ended.is_ok(), "the call ended with the shutdown");
@@ -4259,7 +4439,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
-            renewal_refused: std::sync::atomic::AtomicU64::new(0),
+            renewal_tried_at: std::sync::Mutex::new(None),
             removed: CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
@@ -5452,6 +5632,38 @@ mod tests {
             stub.logged_methods()
         );
         assert_eq!(stub.sent("resources/subscribe"), 0);
+    }
+
+    /// A modern subscription that meets a connection whose transport has closed reconnects, as any
+    /// request does, and asks for its stream on the new connection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_modern_subscription_reconnects_a_closed_transport() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": [], "resources": ["file:///a"], "exit_after": 1
+        }))
+        .await;
+        stub.connect().await;
+        assert!(
+            eventually(std::time::Duration::from_secs(10), async || stub
+                .entry
+                .live_connection()
+                .await
+                .is_ok_and(|connection| connection.peer.is_transport_closed()))
+            .await,
+            "the stub exits after its first listing: {:?}",
+            stub.logged_methods()
+        );
+        stub.write_state(serde_json::json!({"tools": [], "resources": ["file:///a"]}));
+
+        subscriptions::subscribe(
+            &stub.entry,
+            "file:///a".to_string(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("subscribed on a new connection");
+        assert_eq!(stub.entry.subscriptions.uris(), vec!["file:///a"]);
     }
 
     /// A legacy subscription is a request the server forgets with the connection, so the set is

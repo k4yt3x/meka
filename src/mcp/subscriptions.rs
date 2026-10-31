@@ -218,46 +218,31 @@ async fn reopen_stream(
     Ok(accepted)
 }
 
-/// `subscriptions/listen` for the set as it stands, acknowledged. A rejection as unauthorized on a
-/// server whose headers come from `headers_helper` renews the connection, when `mending` allows,
-/// and the stream is asked for once more on the new one. The adoption carries the set over too,
-/// and the later of the two streams is the one the entry keeps.
+/// `subscriptions/listen` for the set as it stands, acknowledged. When `mending` allows, a
+/// connection that closed or was rejected as unauthorized is mended as any request's is, and the
+/// stream is asked for once more on the new one. The adoption carries the set over too, and the
+/// later of the two streams is the one the entry keeps.
 async fn open_stream(
     entry: &Arc<ServerEntry>,
     cancellation: &CancellationToken,
     mending: Mending,
 ) -> Result<Subscription> {
-    let failed = |error: rmcp::ServiceError| MekaError::McpConnection {
-        server_name: entry.server_name.clone(),
-        message: format!("failed to open the notification stream: {error}"),
-    };
     bounded(entry, "subscriptions/listen", cancellation, async {
-        let connection = entry.live_connection().await?;
-        let error = match connection
-            .peer
-            .listen(listen_filter(&entry.subscriptions.uris()))
-            .await
-        {
-            Ok(subscription) => return Ok(subscription),
-            Err(error) => error,
+        let listen = |peer: rmcp::Peer<rmcp::RoleClient>| async move {
+            peer.listen(listen_filter(&entry.subscriptions.uris()))
+                .await
         };
-        let renewable = mending == Mending::Reconnect
-            && entry.config().headers_helper.is_some()
-            && crate::mcp::rejected_as_unauthorized(&error);
-        if !renewable
-            || !entry
-                .renew_rejected(connection.generation, cancellation)
-                .await?
-        {
-            return Err(failed(error));
-        }
-        drop(connection);
-        let renewed = entry.live_connection().await?;
-        renewed
-            .peer
-            .listen(listen_filter(&entry.subscriptions.uris()))
-            .await
-            .map_err(failed)
+        let opened = match mending {
+            Mending::Reconnect => entry.on_a_connection(cancellation, listen).await?,
+            Mending::Never => {
+                let connection = entry.live_connection().await?;
+                listen(connection.peer.clone()).await
+            }
+        };
+        opened.map_err(|error| MekaError::McpConnection {
+            server_name: entry.server_name.clone(),
+            message: format!("failed to open the notification stream: {error}"),
+        })
     })
     .await
 }

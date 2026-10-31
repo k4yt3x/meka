@@ -567,6 +567,15 @@ where
             );
             continue;
         }
+        // Asked of the profile just resolved: the turn would refuse it and put the batch back,
+        // and the next tick would claim it again.
+        if let Err(error) = entry
+            .agent
+            .refuse_images_the_profile_cannot_read(&conversation)
+        {
+            tracing::warn!("holding a background outcome report for session {session_id}: {error}");
+            continue;
+        }
         // A turn that ran between the read and the lock may have folded the batch in already;
         // the stamp below then wins nothing, and the tick moves on.
         if !hooks.announce(&ready).await {
@@ -932,13 +941,13 @@ async fn give_up_inbox_item<H: HostHooks>(
 /// Whether the turn that would carry these outcomes can start at all.
 ///
 /// `Agent::run_turn` gates on MCP readiness as its first statement, before it touches the
-/// conversation, so a required server that is down refuses every turn -- and a batch stamped ahead
-/// of one is a batch nobody is ever told about, because the stamp is one-way. Every claimer asks
-/// this first: [`claim_undelivered_outcomes`] for the hosts that fold a batch into somebody's
-/// prompt, and the two pollers directly, since they stamp with
+/// conversation, so a required server that is down refuses every turn, and puts back the batch it
+/// was to carry. Every claimer asks this first, so a batch is not claimed only to go back:
+/// [`claim_undelivered_outcomes`] for the hosts that fold a batch into somebody's prompt, and the
+/// two pollers directly, since they stamp with
 /// [`crate::store::background::BackgroundStore::mark_background_tasks_delivered`] to render the
-/// batch as a turn of its own. A turn's own round boundary claims without asking: it is running,
-/// so it can carry them.
+/// batch as a turn of its own and would otherwise claim it again on every tick. A turn's own round
+/// boundary claims without asking: it is running, so it can carry them.
 pub(crate) async fn a_turn_can_carry_them(agent: &crate::agent::Agent) -> bool {
     if !agent.background_enabled() {
         return false;

@@ -6930,6 +6930,33 @@ model = "model-from-alpha"
     );
 }
 
+/// A local command answers with text and sends nothing on, so one sent with an image is refused
+/// rather than run with the image dropped.
+#[test]
+fn a_local_command_sent_with_an_image_is_refused() {
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
+    let session_id = harness.new_session();
+    let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let id = harness.send_request(
+        "session/prompt",
+        serde_json::json!({
+            "sessionId": session_id,
+            "prompt": [
+                { "type": "text", "text": "/status" },
+                { "type": "image", "data": png_b64, "mimeType": "image/png" }
+            ]
+        }),
+    );
+    let response = harness.await_response(id);
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert!(
+        response["error"]["data"]
+            .as_str()
+            .is_some_and(|data| data.contains("`/status` takes no image")),
+        "{response}"
+    );
+}
+
 /// Every `agent_message_chunk` in `updates`, concatenated.
 fn agent_text(updates: &[serde_json::Value]) -> String {
     updates

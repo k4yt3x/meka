@@ -712,7 +712,7 @@ impl McpTool {
                     if self.entry.config().headers_helper.is_some() {
                         tracing::warn!(
                             "MCP server '{server_name}' rejected the call as unauthorized with the \
-                             headers `headers_helper` printed, run again on a new connection"
+                             headers `headers_helper` printed"
                         );
                     } else {
                         tracing::warn!(

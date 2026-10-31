@@ -111,7 +111,12 @@ fn strip_test_code(source: &str) -> String {
     while let Some(at) = rest.find("#[cfg(test)]") {
         kept.push_str(&rest[..at]);
         let after_attribute = &rest[at + "#[cfg(test)]".len()..];
-        rest = skip_item(after_attribute);
+        let after_item = skip_item(after_attribute);
+        // The item's lines stay as blank lines, so a line counted in what is kept is the line
+        // in the file.
+        let skipped = &rest[at..rest.len() - after_item.len()];
+        kept.push_str(&"\n".repeat(skipped.matches('\n').count()));
+        rest = after_item;
     }
     kept.push_str(rest);
     kept
@@ -546,13 +551,11 @@ const RAW_ARGUMENT_READERS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// A string or list argument is read through `require_str`, `optional_str`, their
-/// `_allowing_empty` forms or `string_or_list` everywhere but inside the functions
-/// [`RAW_ARGUMENT_READERS`] names, so blank means "left out" and a wrong type is refused by one
-/// definition rather than one per tool. Matched on the spellings a raw read takes: `.get(...)` of
-/// a field name or a constant chained into `as_str`, a `match` on `input.get(...)` with a
-/// `Value::String` or `Value::Bool` arm, an `input.get(...)` read into an array, a field read as
-/// a number or a boolean, or `input["field"]` read as any of those.
+/// An argument is read through the readers in `src/tools/util.rs` everywhere but inside the
+/// functions [`RAW_ARGUMENT_READERS`] names, so blank means "left out" and a wrong type is refused
+/// by one definition rather than one per tool. Matched on the spellings a raw read takes: any
+/// `.get(...)` or `["field"]` on a value named `input`, ending in `input`, or `arguments`, and
+/// `.get(...)` on any value chained into `as_str` or read as a number or a boolean.
 #[test]
 fn tool_arguments_are_read_through_the_shared_readers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -561,7 +564,7 @@ fn tool_arguments_are_read_through_the_shared_readers() {
     files.sort();
 
     let raw_read = regex::Regex::new(
-        r#"\.get\((?:"[a-z_]+"|[A-Za-z_:]+)\)\)?\s*\.and_then\((?:serde_json::Value::as_str|\|[a-z_]+\|\s*[a-z_]+\.as_str\(\))\)|match\s+input\s*\.get\("[a-z_]+"\)\s*\{[^}]*Value::(?:String|Bool)\(|input\s*\[\s*"[a-z_]+"\s*\]\s*\.\s*as_(?:str|u64|i64|f64|bool|array)\b|input\s*\.get\((?:"[a-z_]+"|[a-z_]+)\)(?s:.){0,160}?(?:as_array\(\)|Value::Array\()|\.get\((?:"[a-z_]+"|[A-Za-z_:]+)\)(?s:.){0,240}?(?:as_u64|as_i64|as_f64|as_bool)\b"#,
+        r#"\b(?:[a-z_]*input|arguments)\s*(?:\.\s*get\s*\(|\[\s*")|\.get\((?:"[a-z_]+"|[A-Za-z_:]+)\)\)?\s*\.and_then\((?:serde_json::Value::as_str|\|[a-z_]+\|\s*[a-z_]+\.as_str\(\))\)|\.get\((?:"[a-z_]+"|[A-Za-z_:]+)\)(?s:.){0,240}?(?:as_u64|as_i64|as_f64|as_bool)\b"#,
     )
     .expect("a valid pattern");
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
@@ -577,9 +580,16 @@ fn tool_arguments_are_read_through_the_shared_readers() {
             continue;
         }
         let source = fs::read_to_string(path).expect("read a source file");
+        // A comment line is kept blank, so a line counted in the code is the line in the file.
         let code = strip_test_code(&source)
             .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    line
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         // A function's body runs from its `fn name(` to the first line that is a lone `}`.
@@ -604,8 +614,13 @@ fn tool_arguments_are_read_through_the_shared_readers() {
                 }
                 None => {
                     let line = code[..found.start()].matches('\n').count() + 1;
+                    let read = found
+                        .as_str()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     violations.push(format!(
-                        "{relative}:{line} reads an argument without the shared readers"
+                        "{relative}:{line} reads an argument without the shared readers: `{read}`"
                     ));
                 }
             }

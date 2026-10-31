@@ -458,7 +458,7 @@ change meaning with `action` is a family that wants splitting.
 
 ## Tool arguments
 
-Every tool reads its arguments by four rules, through the readers in `src/tools/util.rs`, never a
+Every tool reads its arguments by five rules, through the readers in `src/tools/util.rs`, never a
 raw `input.get(...)`. A model that fills every field it was shown sends `""` where it has nothing
 to say, which a strict schema spells `null`; both mean the field was left out, and no standard
 defines a blank, so meka does, once.
@@ -483,6 +483,9 @@ defines a blank, so meka does, once.
   since read as absent it hands the call the default it did not ask for. A serde struct reads a
   number through `text::whole_number` in a deserializer of the field's own, which names the field.
   A limit past the schema's range is clamped to it; a line or message number below 1 is refused.
+- **An object.** `optional_object`: an object, or nothing; anything else, the object spelled as a
+  JSON string included, is refused naming the field, since read as absent it sends the call
+  without what it asked for (a fetch without its `headers`).
 
 A tool that parses through a serde struct carries the string rule with
 `#[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]` on each optional

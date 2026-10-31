@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use super::{
     Tool, ToolOutput, ToolScope,
-    util::{optional_str, require_str},
+    util::{optional_object, optional_str, require_str},
 };
 use crate::{
     error::{MekaError, Result},
@@ -458,7 +458,7 @@ impl Tool for GetMcpPromptTool {
         let server = require_str(&input, "server", "mcp_prompt_get")?;
         let name = require_str(&input, "name", "mcp_prompt_get")?;
 
-        let arguments = input.get("arguments").and_then(|v| v.as_object()).cloned();
+        let arguments = optional_object(&input, "arguments", "mcp_prompt_get")?.cloned();
 
         let entry =
             visible_server_entry("mcp_prompt_get", &self.manager, &self.tool_scope, &server)?;

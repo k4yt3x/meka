@@ -336,7 +336,7 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
 /// definition for both atomic writers, so neither is the one that forgets.
 pub(crate) fn sync_parent_directory(path: &Path) {
     #[cfg(unix)]
-    if let Some(parent) = path.parent()
+    if let Some(parent) = directory_of(path)
         && let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all())
     {
         let path = path.display();
@@ -346,6 +346,18 @@ pub(crate) fn sync_parent_directory(path: &Path) {
     {
         let _ = path;
     }
+}
+/// The directory that names `path`. A bare file name's parent is the empty path, which names the
+/// current directory but cannot be opened as one.
+#[cfg(unix)]
+fn directory_of(path: &Path) -> Option<&Path> {
+    path.parent().map(|parent| {
+        if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        }
+    })
 }
 /// Create a directory (and any missing parents) born at mode 0700 on Unix. Avoids the umask window
 /// that `create_dir_all` + later `set_permissions` would open: between `mkdir(2)` and `chmod(2)`,
@@ -545,6 +557,23 @@ pub(super) fn try_lock_file(path: &std::path::Path) -> Result<Option<FileLock>> 
 
 #[cfg(test)]
 mod tests {
+
+    /// A file named bare, as `meka session export` names its archive in the current directory, is
+    /// synced through the current directory rather than through an empty path no open accepts.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_file_name_is_named_by_the_current_directory() {
+        assert_eq!(
+            directory_of(Path::new("session-1.json")),
+            Some(Path::new("."))
+        );
+        assert_eq!(
+            directory_of(Path::new("/data/meka/session-1.json")),
+            Some(Path::new("/data/meka"))
+        );
+        assert_eq!(directory_of(Path::new("/")), None);
+    }
+
     use super::*;
 
     /// A mode that could not be tightened is warned about: the file stays at the umask's mode,
