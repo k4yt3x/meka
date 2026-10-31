@@ -78,7 +78,7 @@ Each request:
 
 ### Reasoning across turns
 
-Requests are stateless (`store: false`), so the reasoning a model produced is only available to the next request if meka sends it back. It does: each reasoning item is recorded with its `rs_…` id and its `encrypted_content`, and replayed verbatim as a `reasoning` input item immediately before the output it produced. This is what lets a multi-step tool-calling turn keep one chain of thought instead of restarting it at every call, and it mirrors what the first-party Codex client does.
+Requests are stateless (`store: false`), so the reasoning a model produced is only available to the next request if meka sends it back. It does: each reasoning item is recorded with its `rs_…` id, its `encrypted_content` and the origin of the endpoint that sealed it, and replayed verbatim, to that endpoint alone, as a `reasoning` input item immediately before the output it produced. This is what lets a multi-step tool-calling turn keep one chain of thought instead of restarting it at every call, and it mirrors what the first-party Codex client does.
 
 The encrypted content is opaque: meka cannot read it, only replay it. It is stored under a shape that records which provider it came from, so a session recorded here and resumed against Claude does not hand Claude an OpenAI blob (nor the reverse); a block from the wrong provider is simply not replayed. The summary is the readable part, and what the screen shows as a thinking block.
 

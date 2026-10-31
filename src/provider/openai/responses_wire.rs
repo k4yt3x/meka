@@ -39,9 +39,10 @@ use crate::{
 ///
 /// The request body for one completion, for a backend that may declare its deferred tools.
 ///
-/// The result carries only what every Responses implementation understands. A backend that knows
-/// more about its own endpoint adds to it afterwards; see [`include_encrypted_reasoning`], which
-/// only `chatgpt-subscription` applies.
+/// The result carries only what every Responses implementation understands, and replays sealed
+/// reasoning sealed at `replays_reasoning_from` alone: reasoning from another endpoint is a blob
+/// this one cannot open. A backend that knows more about its own endpoint adds OpenAI's own fields
+/// afterwards; see [`include_encrypted_reasoning`].
 ///
 /// Under [`DeferredToolDelivery::Searched`] the endpoint's own `tool_search` is declared with
 /// client execution in place of meka's two discovery tools, `deferred_tools` ride with
@@ -63,6 +64,7 @@ pub(super) fn build_request_body_for(
     reasoning_effort: Option<&str>,
     max_output_tokens: Option<u64>,
     stream: bool,
+    replays_reasoning_from: Option<&str>,
 ) -> serde_json::Value {
     let searched = searched_call_ids(delivery, messages);
     let mut input = Vec::with_capacity(messages.len());
@@ -72,7 +74,9 @@ pub(super) fn build_request_body_for(
             Role::User => {
                 encode_user_message(message, &mut input, &searched, tools, deferred_tools)
             }
-            Role::Assistant => encode_assistant_message(message, &mut input, &searched),
+            Role::Assistant => {
+                encode_assistant_message(message, &mut input, &searched, replays_reasoning_from)
+            }
         }
     }
 
@@ -109,37 +113,12 @@ pub(super) fn build_request_body_for(
 
 /// Ask the server to round-trip its reasoning as `reasoning.encrypted_content`.
 ///
-/// A no-op unless the request already asks for reasoning, since there would be nothing to encrypt.
-/// The one caller settles that with [`request_reasoning_summary`] first, so the guard is really a
-/// refusal to be used out of order rather than a live branch; the ordering is asserted by
-/// `an_unconfigured_profile_still_asks_for_a_summary_and_encrypted_reasoning`.
-///
-/// This is *not* in [`build_request_body_for`] because it is a fact about one endpoint rather than
-/// about the protocol. `include` is an OpenAI extension; `chatgpt-subscription` sends it because
-/// its endpoint is always ChatGPT and the first-party Codex client sends it, while
-/// `openai-responses` reaches Ollama, vLLM, LM Studio and OpenRouter, where meka has no basis for
-/// assuming it is understood and a rejected request is the cost of guessing wrong.
+/// Not in [`build_request_body_for`] because it is OpenAI's field rather than the protocol's:
+/// `chatgpt-subscription` always sends it, as the first-party Codex client does, and
+/// `openai-responses` sends it unless the profile's `encrypted_reasoning` is off. A model reasons
+/// whether or not the request carries a `reasoning` object, so this asks regardless of one.
 pub(super) fn include_encrypted_reasoning(body: &mut serde_json::Value) {
-    if body.get("reasoning").is_some() {
-        body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
-    }
-}
-
-/// Drop every replayed `reasoning` item from a built body.
-///
-/// The encoder is protocol-level and replays sealed reasoning for any backend, which is right for
-/// the protocol and wrong for one endpoint: `openai-responses` never asks for encrypted reasoning,
-/// so the only way its history holds any is a session recorded under `chatgpt-subscription` and
-/// resumed against a `base_url` (Ollama, vLLM, LM Studio, OpenRouter). Replaying it there ships
-/// ChatGPT's sealed blob and `rs_...` id to a third party that cannot decrypt it and may reject the
-/// item shape outright.
-///
-/// The same refusal the Claude encoder makes by matching only [`OpaqueReasoning::Signed`], one
-/// level up: an endpoint drops what it could not have produced.
-pub(super) fn drop_replayed_reasoning(body: &mut serde_json::Value) {
-    if let Some(input) = body.get_mut("input").and_then(|input| input.as_array_mut()) {
-        input.retain(|item| item.get("type").and_then(|kind| kind.as_str()) != Some("reasoning"));
-    }
+    body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
 }
 
 /// Ask the server for a reasoning summary, the only part of its reasoning it will show a person.
@@ -149,12 +128,12 @@ pub(super) fn drop_replayed_reasoning(body: &mut serde_json::Value) {
 /// (`ReasoningSummary::Auto`, and its `supports_reasoning_summary_parameter` defaults to true), so
 /// this is what the first-party client's own users see.
 ///
-/// Establishes the `reasoning` object when the profile configured no effort, which is deliberate:
-/// it is also what makes [`include_encrypted_reasoning`] apply to a default profile. Codex likewise
+/// Establishes the `reasoning` object when the profile configured no effort, as Codex does: it
 /// sends `reasoning` on every request and omits only the fields it has no value for.
 ///
-/// Endpoint-specific for the same reason as [`include_encrypted_reasoning`]: `summary` is an
-/// OpenAI parameter, and only `chatgpt-subscription` knows it is talking to OpenAI.
+/// Not in [`build_request_body_for`] for the reason [`include_encrypted_reasoning`] is not:
+/// `summary` is an OpenAI parameter, which `chatgpt-subscription` always sends and
+/// `openai-responses` sends unless the profile's `reasoning_summary` is off.
 ///
 /// Takes the body [`build_request_body_for`] returns, where `reasoning` is either an object or
 /// absent; an absent one is created here, which is how the no-effort case gets its `reasoning`
@@ -289,7 +268,9 @@ fn encode_user_message(
             | ContentBlock::Nudge { text, .. }
             | ContentBlock::Inbox { text, .. }
             | ContentBlock::Scheduled { text, .. }
-            | ContentBlock::BackgroundReport { text, .. } => text_parts.push(text),
+            | ContentBlock::BackgroundReport { text, .. }
+            | ContentBlock::Invocation { text, .. }
+            | ContentBlock::Resource { text, .. } => text_parts.push(text),
             // Responses takes `input_image` content parts on the user message. No model gate;
             // non-vision models return a clear error.
             ContentBlock::Image { source } => image_parts.push(input_image_part(source)),
@@ -366,6 +347,7 @@ fn encode_assistant_message(
     message: &Message,
     input: &mut Vec<serde_json::Value>,
     searched: &std::collections::HashSet<String>,
+    replays_reasoning_from: Option<&str>,
 ) {
     let mut pending_text = String::new();
 
@@ -373,17 +355,21 @@ fn encode_assistant_message(
         match block {
             ContentBlock::Text { text } => pending_text.push_str(text),
             // Replayed only when it carries `encrypted_content`, which is the reasoning itself and
-            // the only part the model can resume from. A summary without it is a digest written
-            // for a human, so sending one back buys nothing and would put an item shape on the wire
-            // for endpoints that were never asked for reasoning in the first place.
+            // the only part the model can resume from, and only to the endpoint that sealed it. A
+            // summary without it is a digest written for a human, so sending one back buys
+            // nothing and would put an item shape on the wire for endpoints that were never asked
+            // for reasoning in the first place.
             ContentBlock::Thinking {
                 thinking,
                 opaque:
                     Some(OpaqueReasoning::Sealed {
                         encrypted_content,
                         id,
+                        origin: Some(origin),
                     }),
-            } if an_emitted_item_follows(&message.content, index) => {
+            } if replays_reasoning_from == Some(origin.as_str())
+                && an_emitted_item_follows(&message.content, index) =>
+            {
                 flush_assistant_text(&mut pending_text, input);
                 input.push(reasoning_input_item(
                     id.as_deref(),
@@ -530,6 +516,8 @@ pub(super) struct SseState {
     /// Once `response.completed` (or `response.failed` / `response.incomplete`) has been
     /// processed, the driver should stop pulling new events.
     pub(super) finished: bool,
+    /// The origin of the endpoint answering, which every sealed reasoning block records.
+    pub(super) origin: Option<String>,
 }
 
 struct ActiveToolCall {
@@ -705,6 +693,7 @@ pub(super) fn process_event(
                             OpaqueReasoning::Sealed {
                                 encrypted_content,
                                 id,
+                                origin: state.origin.clone(),
                             }
                         }),
                     });
@@ -821,7 +810,10 @@ fn usage_from(usage: &serde_json::Value) -> TokenUsage {
             .filter(|(key, _)| *key != "attribution")
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        tracing::debug!("responses usage: {}", serde_json::Value::Object(totals));
+        tracing::debug!(
+            "responses usage: {totals}",
+            totals = serde_json::Value::Object(totals)
+        );
     }
     super::parse_usage(
         usage,
@@ -852,6 +844,11 @@ pub(super) trait ResponsesBackend: crate::oauth::RefreshesCredential + Send + Sy
     fn client(&self) -> &reqwest::Client;
     /// The URL a completion is posted to.
     fn endpoint(&self) -> String;
+    /// The origin of [`Self::endpoint`], which the reasoning it seals records; see
+    /// [`OpaqueReasoning::Sealed`].
+    fn origin(&self) -> Option<String> {
+        crate::provider::endpoint_origin(&self.endpoint())
+    }
     /// The request body for one completion, before serialization.
     fn request_body(
         &self,
@@ -939,7 +936,7 @@ pub(super) async fn stream<B: ResponsesBackend>(
         &cancellation,
     )
     .await?;
-    drive_responses_sse_stream(response, event_sender, cancellation).await
+    drive_responses_sse_stream(response, backend.origin(), event_sender, cancellation).await
 }
 
 /// The serialized request, within the profile's ceiling when it states one.
@@ -952,8 +949,11 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
     attribution: &crate::provider::Attribution,
 ) -> Result<(String, Option<crate::frontend::Notice>)> {
     match backend.max_request_bytes() {
-        Some(max_request_bytes) => {
-            crate::provider::budget::fit_body_to_budget(messages, max_request_bytes, |messages| {
+        Some(max_request_bytes) => crate::provider::budget::fit_body_to_budget(
+            messages,
+            max_request_bytes,
+            None,
+            |messages| {
                 crate::provider::budget::serialize_body(&backend.request_body(
                     system_prompt,
                     messages,
@@ -961,8 +961,8 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
                     deferred_tools,
                     attribution,
                 ))
-            })
-        }
+            },
+        ),
         None => Ok((
             crate::provider::budget::serialize_body(&backend.request_body(
                 system_prompt,
@@ -980,11 +980,15 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
 /// [`process_event`], and forwards the resulting [`StreamEvent`]s to the agent.
 pub(super) async fn drive_responses_sse_stream(
     response: reqwest::Response,
+    origin: Option<String>,
     event_sender: mpsc::Sender<StreamEvent>,
     cancellation: CancellationToken,
 ) -> Result<()> {
     let mut protocol = ResponsesStream {
-        state: SseState::default(),
+        state: SseState {
+            origin,
+            ..SseState::default()
+        },
     };
     match crate::provider::sse::drive(
         response,
@@ -1044,6 +1048,9 @@ mod tests {
     use super::*;
     use crate::conversation::ToolResultContent;
 
+    /// The origin every sealed block these tests write records, as ChatGPT's would.
+    const CHATGPT_ORIGIN: &str = "https://chatgpt.com";
+
     /// An appending request with nothing deferred, which is what most of these tests build.
     fn build_request_body(
         model: &str,
@@ -1064,7 +1071,31 @@ mod tests {
             reasoning_effort,
             max_output_tokens,
             stream,
+            Some(CHATGPT_ORIGIN),
         )
+    }
+
+    /// An invocation and an attached resource are text on this wire, in the order the message
+    /// holds them, so the model reads the skill's body and the file among the words.
+    #[test]
+    fn an_invocation_and_a_resource_are_read_in_place() {
+        let body = build_request_body(
+            "gpt-5",
+            "",
+            &[Message::invoked_with_a_resource_for_test()],
+            &[],
+            None,
+            None,
+            true,
+        );
+        let sent = body["input"].to_string();
+        let at = |needle: &str| {
+            sent.find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not sent: {sent}"))
+        };
+        assert!(at("the skill's body") < at("compare "), "{sent}");
+        assert!(at("compare ") < at("fn a() {}"), "{sent}");
+        assert!(at("fn a() {}") < at(" with the old one"), "{sent}");
     }
 
     #[test]
@@ -1286,15 +1317,6 @@ mod tests {
                 .iter()
                 .any(|value| value == "reasoning.encrypted_content")
         );
-    }
-
-    /// Nothing to encrypt means nothing to ask for.
-    #[test]
-    fn the_encrypted_reasoning_include_is_a_no_op_without_reasoning() {
-        let mut body =
-            build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, None, true);
-        include_encrypted_reasoning(&mut body);
-        assert!(body.get("include").is_none(), "{body}");
     }
 
     #[test]
@@ -1621,7 +1643,13 @@ mod tests {
             .expect("build response")
             .into();
         let (sender, mut receiver) = mpsc::channel(64);
-        let outcome = drive_responses_sse_stream(response, sender, CancellationToken::new()).await;
+        let outcome = drive_responses_sse_stream(
+            response,
+            Some(CHATGPT_ORIGIN.to_string()),
+            sender,
+            CancellationToken::new(),
+        )
+        .await;
         let mut events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             events.push(event);
@@ -1929,7 +1957,7 @@ mod tests {
     fn a_stated_ceiling_redacts_old_images_on_responses() {
         let with_ceiling = |max_request_bytes: Option<usize>| {
             let api_key: String = "test-key".to_string();
-            crate::provider::openai::responses::OpenAiResponsesProvider::new(
+            crate::provider::openai::responses::OpenAiResponsesProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiResponses,
@@ -2095,6 +2123,7 @@ mod tests {
                     Some(OpaqueReasoning::Sealed {
                         encrypted_content,
                         id,
+                        ..
                     }),
             } => {
                 assert_eq!(encrypted_content, "OPAQUE");
@@ -2131,6 +2160,7 @@ mod tests {
                     opaque: Some(OpaqueReasoning::Sealed {
                         encrypted_content,
                         id,
+                        ..
                     }),
                 }] if id.as_deref() == Some("rs_silent") && encrypted_content == "OPAQUE"
             ),
@@ -2276,6 +2306,7 @@ mod tests {
             opaque: encrypted.map(|encrypted_content| OpaqueReasoning::Sealed {
                 encrypted_content: encrypted_content.to_string(),
                 id: id.map(str::to_string),
+                origin: Some("https://chatgpt.com".to_string()),
             }),
         }
     }
@@ -2319,6 +2350,7 @@ mod tests {
                 None,
                 None,
                 true,
+                Some(CHATGPT_ORIGIN),
             );
             body["tools"].as_array().cloned().unwrap_or_default()
         };
@@ -2408,6 +2440,7 @@ mod tests {
             None,
             None,
             true,
+            Some(CHATGPT_ORIGIN),
         );
         let tools = body["tools"].as_array().cloned().unwrap_or_default();
         assert_eq!(tools[0]["type"], "tool_search", "{tools:?}");
@@ -2459,6 +2492,7 @@ mod tests {
                 None,
                 None,
                 true,
+                Some(CHATGPT_ORIGIN),
             )["input"]
                 .as_array()
                 .cloned()

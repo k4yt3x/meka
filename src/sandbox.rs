@@ -2123,6 +2123,154 @@ mod tests {
         );
     }
 
+    /// Another terminal's pty is refused in every confinement, after the read allows it has to
+    /// beat, while the ptys a command opens itself keep the sandbox's extension and stay usable.
+    #[test]
+    fn every_profile_refuses_another_terminal_after_its_read_allows() {
+        let root = std::path::PathBuf::from("/Users/someone/work");
+        for (label, writable, readable) in [
+            ("read level", Vec::new(), None),
+            ("workspace", vec![root.clone()], None),
+            (
+                "confined reads",
+                vec![root.clone()],
+                Some(vec![root.clone()]),
+            ),
+        ] {
+            let (profile, _) = sandbox_profile_for(
+                &writable,
+                readable.as_deref(),
+                &[],
+                crate::config::Network::Host,
+            );
+            let deny = profile
+                .rfind("(require-not (extension \"com.apple.sandbox.pty\"))")
+                .unwrap_or_else(|| panic!("no terminal rule under {label}:\n{profile}"));
+            let last_read_allow = profile.rfind("(allow file-read").expect("a read allow");
+            assert!(
+                deny > last_read_allow,
+                "the terminal rule must follow the read allows under {label}:\n{profile}"
+            );
+        }
+    }
+
+    /// End to end through `sandbox-exec`: a confined command cannot open a pty the test opened,
+    /// as it could not open another terminal's.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_seatbelted_shell_cannot_read_another_terminal() {
+        // SAFETY: `posix_openpt`, `grantpt`, `unlockpt` and `ptsname` on a descriptor this test
+        // owns, closed at the end; `ptsname`'s buffer is read before any other call.
+        let (master, slave) = unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0, "a pty opens");
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let name = libc::ptsname(master);
+            assert!(!name.is_null(), "the pty has a name");
+            let slave = std::ffi::CStr::from_ptr(name)
+                .to_string_lossy()
+                .into_owned();
+            (master, slave)
+        };
+        let (profile, params) = sandbox_profile_for(&[], None, &[], crate::config::Network::Host);
+        let status = std::process::Command::new(SANDBOX_EXEC_PATH)
+            .arg("-p")
+            .arg(&profile)
+            .args(&params)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("if (exec 3< \"$0\") 2>/dev/null; then exit 4; fi; exit 0")
+            .arg(&slave)
+            .status()
+            .expect("spawn sandbox-exec");
+        // SAFETY: the descriptor `posix_openpt` returned above.
+        unsafe { libc::close(master) };
+        assert_eq!(status.code(), Some(0), "{slave} opened under the sandbox");
+    }
+
+    /// Every directory between a writable root and meka's store is denied a write as itself,
+    /// which is what a rename of it is, after the write allow it has to beat. The directories
+    /// inside stay writable: the deny is a literal, not a subpath.
+    #[test]
+    fn the_profile_holds_the_directories_above_meka_s_store_in_place() {
+        let root = std::path::PathBuf::from("/Users/someone");
+        let store = root.join("Library/Application Support/meka");
+        let (profile, params) = sandbox_profile_for(
+            std::slice::from_ref(&root),
+            None,
+            std::slice::from_ref(&store),
+            crate::config::Network::Host,
+        );
+        let allow = profile
+            .find("(allow file-write* (subpath (param \"MEKA_WRITABLE_0\")))")
+            .expect("the root is allowed");
+        for (index, directory) in ["Library", "Library/Application Support"]
+            .iter()
+            .enumerate()
+        {
+            let rule = format!("(deny file-write* (literal (param \"MEKA_PINNED_{index}\")))");
+            let deny = profile.find(&rule).expect("the ancestor is held");
+            assert!(deny > allow, "the deny must follow the allow:\n{profile}");
+            let mut expected = std::ffi::OsString::from(format!("MEKA_PINNED_{index}="));
+            expected.push(root.join(directory).as_os_str());
+            assert!(
+                params
+                    .windows(2)
+                    .any(|window| window[0] == "-D" && window[1] == expected),
+                "the ancestor's path travels as a parameter: {params:?}"
+            );
+        }
+        assert!(
+            !profile.contains("MEKA_PINNED_2"),
+            "neither the root nor the store itself is pinned:\n{profile}"
+        );
+    }
+
+    /// End to end through `sandbox-exec`: a confined command cannot rename a directory on the way
+    /// from its writable root down to meka's store, and still writes inside it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_seatbelted_shell_cannot_move_meka_s_store_from_under_its_deny() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = crate::workspace::canonical_for_test(temp.path());
+        let store = home
+            .join("Library")
+            .join("Application Support")
+            .join("meka");
+        std::fs::create_dir_all(&store).expect("store");
+        std::fs::write(store.join("meka.db"), "secret\n").expect("write");
+        let (profile, params) = sandbox_profile_for(
+            std::slice::from_ref(&home),
+            None,
+            std::slice::from_ref(&store),
+            crate::config::Network::Host,
+        );
+        let status = std::process::Command::new(SANDBOX_EXEC_PATH)
+            .arg("-p")
+            .arg(&profile)
+            .args(&params)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(
+                "cd \"$0\" && mv Library Library.moved 2>/dev/null; \
+                 mv 'Library/Application Support' Library/moved 2>/dev/null; \
+                 touch Library/written; exit 0",
+            )
+            .arg(&home)
+            .status()
+            .expect("spawn sandbox-exec");
+        assert!(status.success(), "sandbox-exec did not run: {status:?}");
+        assert!(
+            store.join("meka.db").exists(),
+            "the store moved out from under its deny"
+        );
+        assert!(
+            home.join("Library").join("written").exists(),
+            "a write inside the root was refused"
+        );
+    }
+
     #[test]
     fn the_seatbelt_profile_passes_roots_as_parameters_not_profile_text() {
         let roots = vec![

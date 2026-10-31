@@ -112,17 +112,31 @@ async fn drive_within<P: Protocol>(
         cancellation,
     )
     .await?;
-    let mut event_stream = bounded_events(response.bytes_stream(), max_event_bytes).eventsource();
+    // Any byte restarts the idle clock, a comment line included: an endpoint keeping a silent
+    // think alive sends `: PROCESSING` comments, which the decoder never hands up as an event.
+    let last_byte = std::sync::Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+    let body = response.bytes_stream().inspect({
+        let last_byte = std::sync::Arc::clone(&last_byte);
+        move |_| *crate::sync::lock(&last_byte) = tokio::time::Instant::now()
+    });
+    let mut event_stream = bounded_events(body, max_event_bytes).eventsource();
     loop {
+        let quiet_until = *crate::sync::lock(&last_byte) + STREAM_IDLE_TIMEOUT;
         tokio::select! {
             _ = cancellation.cancelled() => {
                 return Err(MekaError::Interrupted);
             }
-            event = tokio::time::timeout(STREAM_IDLE_TIMEOUT, event_stream.next()) => {
+            event = tokio::time::timeout_at(quiet_until, event_stream.next()) => {
                 // Bounds silence, not the turn: a model still emitting deltas resets this on every
                 // one. Without it a connection that dies without an RST leaves the turn parked on
                 // a socket that will never speak again, for as long as the process runs.
                 let Ok(event) = event else {
+                    // Bytes that came in under an event still being assembled, or a comment,
+                    // moved the clock: the wait goes on from them. `next` is cancel-safe, so the
+                    // event in progress is not lost.
+                    if *crate::sync::lock(&last_byte) + STREAM_IDLE_TIMEOUT > tokio::time::Instant::now() {
+                        continue;
+                    }
                     let message = format!(
                         "idle timeout waiting for a {what} SSE event after {}s",
                         STREAM_IDLE_TIMEOUT.as_secs()
@@ -294,6 +308,64 @@ mod tests {
             _event_sender: &mpsc::Sender<StreamEvent>,
         ) -> Result<Step> {
             Ok(Step::Continue)
+        }
+    }
+
+    /// A stream whose endpoint says only that it is still there, in comment lines, for longer than
+    /// the idle bound is not cut: any byte restarts the clock, and the event that follows lands.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_comments_hold_a_quiet_stream_open() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("the request arrives");
+                assert!(read > 0, "the client closed the connection");
+                head.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      transfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("head");
+            let keepalive = b"a\r\n: waiting\n\r\n";
+            for _ in 0..3 {
+                tokio::time::sleep(STREAM_IDLE_TIMEOUT * 2 / 3).await;
+                socket.write_all(keepalive).await.expect("keepalive");
+            }
+            socket
+                .write_all(b"a\r\ndata: {}\n\n\r\n0\r\n\r\n")
+                .await
+                .expect("event");
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("the head arrives");
+        let (event_sender, _events) = mpsc::channel(8);
+        let outcome = drive_within(
+            response,
+            "test",
+            &event_sender,
+            &CancellationToken::new(),
+            &mut Discard,
+            1024,
+        )
+        .await;
+        peer.await.expect("the peer finished");
+        if let Err(error) = outcome {
+            panic!("the quiet stream was cut: {error}");
         }
     }
 

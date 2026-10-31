@@ -24,7 +24,8 @@ pub(crate) struct TurnStore {
 pub(crate) struct TurnRecord {
     pub(crate) id: Uuid,
     /// Who opened it: `client`, `inbox`, `schedule`, `background`, or `parent` for a sub-agent's.
-    pub(crate) source: String,
+    #[cfg_attr(feature = "serve", schema(value_type = String))]
+    pub(crate) source: TurnSource,
     /// RFC 3339, when the turn began.
     pub(crate) started_at: String,
     /// RFC 3339, when the turn ended.
@@ -118,6 +119,80 @@ impl From<&crate::stats::TokenUsage> for TurnUsage {
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
             cache_read_input_tokens: usage.cache_read_input_tokens,
         }
+    }
+}
+
+/// Who opened a turn: the one vocabulary the row, an archive, `turn.started` and every host share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum TurnSource {
+    /// A person, or a client acting for one, whichever host it arrived through.
+    Client,
+    /// The inbox driver, on items another session, agent or client left.
+    Inbox,
+    /// A scheduled job firing.
+    Schedule,
+    /// Finished background work delivered as a turn of its own.
+    Background,
+    /// The checkpoint turn `POST /compact` runs. Announced on the feed alone: a compaction
+    /// records its boundary, never a turn row.
+    Compaction,
+    /// A sub-agent's turn, opened by its parent's spawn or follow-up.
+    Parent,
+}
+
+impl TurnSource {
+    const ALL: [Self; 6] = [
+        Self::Client,
+        Self::Inbox,
+        Self::Schedule,
+        Self::Background,
+        Self::Compaction,
+        Self::Parent,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Inbox => "inbox",
+            Self::Schedule => "schedule",
+            Self::Background => "background",
+            Self::Compaction => "compaction",
+            Self::Parent => "parent",
+        }
+    }
+}
+
+impl std::fmt::Display for TurnSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for TurnSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|source| source.name() == value)
+            .ok_or_else(|| {
+                crate::text::unknown_name("turn source", value, Self::ALL.map(Self::name))
+            })
+    }
+}
+
+impl TryFrom<String> for TurnSource {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<TurnSource> for String {
+    fn from(source: TurnSource) -> Self {
+        source.name().to_string()
     }
 }
 
@@ -357,7 +432,16 @@ pub(super) fn turn_from_row(
     };
     Ok(Some(TurnRecord {
         id,
-        source: row.get(offset + 1)?,
+        source: row
+            .get::<_, String>(offset + 1)?
+            .parse()
+            .map_err(|error: String| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    offset + 1,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?,
         started_at: row.get(offset + 2)?,
         ended_at: row.get(offset + 3)?,
         status,
@@ -386,10 +470,10 @@ impl TurnStore {
         &self,
         session_id: Uuid,
         turn_id: Uuid,
-        source: &str,
+        source: TurnSource,
         started_at: &str,
     ) -> Result<()> {
-        let source = source.to_string();
+        let source = source.name();
         let started_at = started_at.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {

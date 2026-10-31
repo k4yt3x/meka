@@ -93,8 +93,19 @@ pub(super) fn reader_hung_up(error: io::Error) -> io::Error {
     }
     error
 }
+/// `text` in `color` where stderr is a terminal, and as it is otherwise: a log file or the next
+/// tool in a pipeline would keep the escapes as bytes.
+pub(crate) fn colored_for_stderr(text: impl std::fmt::Display, color: Color) -> String {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        crossterm::style::style(text).with(color).to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 pub(crate) fn render_hint(message: &str) {
-    write_stderr_line(rows_of(message).with(Color::DarkGrey));
+    write_stderr_line(colored_for_stderr(rows_of(message), Color::DarkGrey));
 }
 
 /// A message's text, ending where its last row does: a trailing newline would print an empty row of
@@ -104,7 +115,11 @@ fn rows_of(message: &str) -> &str {
 }
 /// Print a single-line CLI error to stderr in the project's standard format.
 pub(crate) fn render_error(error: &dyn std::fmt::Display) {
-    write_stderr_line(format!("{} {}", "Error:".with(Color::Red), error));
+    write_stderr_line(format!(
+        "{} {}",
+        colored_for_stderr("Error:", Color::Red),
+        error
+    ));
 }
 /// A stage direction about the output rather than output of its own: `(interrupted)`.
 ///
@@ -122,149 +137,8 @@ pub(crate) fn render_error(error: &dyn std::fmt::Display) {
 ///
 /// Every caller passes one of meka's own strings, so there is nothing here to sanitize.
 pub(crate) fn render_annotation(note: &str) {
-    write_stderr_line(format!("({})", rows_of(note)).with(Color::Yellow));
-}
-
-/// Capturing this process's `tracing` output for the current thread, for tests that assert on a
-/// log line.
-///
-/// Here rather than in either module that needs it, because there can only be one of these. The
-/// subscriber has to be installed **globally**: `tracing` caches a callsite's interest process-wide
-/// the first time it is evaluated, so a thread-local subscriber loses a race it cannot see -- a
-/// sibling test reaching the same `warn!` first, with no subscriber installed, registers the
-/// callsite as never-enabled, and every later capture of it comes back empty. That is a flake of
-/// roughly 2 runs in 10, which is worse than a loud failure because it reads as a CI hiccup.
-///
-/// Only one global can be installed, so a second copy of this helper does not merely duplicate
-/// code: the loser's `set_global_default` fails, its buffer is never written to, and its tests
-/// break. The buffer stays thread-local, which is what keeps concurrent tests out of each other's
-/// output.
-#[cfg(test)]
-pub(crate) mod log_capture {
-    use std::{cell::RefCell, io, sync::OnceLock};
-
-    thread_local! {
-        static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    }
-
-    struct ThreadLocalWriter;
-
-    impl io::Write for ThreadLocalWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            BUFFER.with(|buffer| buffer.borrow_mut().extend_from_slice(bytes));
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalWriter {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            ThreadLocalWriter
-        }
-    }
-
-    /// Begin capturing on this thread, discarding anything already buffered.
-    ///
-    /// Safe to call from any number of threads and any number of times; the subscriber is installed
-    /// once and the buffer it writes to is whichever thread is logging.
-    ///
-    /// Installed at `INFO` rather than `WARN` because one caller needs to assert an `info!`: the
-    /// line that says a sweep was bounded, which exists so a capped run does not read as a complete
-    /// one. Only one global subscriber can exist, so the level has to satisfy every caller and each
-    /// one filters what it wants -- see [`warnings`] and [`infos`]. Capturing more than is asserted
-    /// is the safe direction; a caller that asserts *silence* must filter, or an unrelated `info!`
-    /// will fail it.
-    pub(crate) fn start() {
-        static INSTALLED: OnceLock<()> = OnceLock::new();
-        INSTALLED.get_or_init(|| {
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(ThreadLocalWriter)
-                .with_max_level(tracing::Level::INFO)
-                .with_ansi(false)
-                .without_time()
-                .finish();
-            // An already-installed global is not worth failing a test over: what this needs is for
-            // the callsites it asserts on to be *enabled*. Reported rather than discarded, since a
-            // future change that breaks capture would otherwise do it silently and every assertion
-            // built on this would start passing vacuously.
-            if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
-                eprintln!("log capture: a global subscriber was already installed: {error}");
-            }
-        });
-        BUFFER.with(|buffer| buffer.borrow_mut().clear());
-    }
-
-    /// What this thread has logged since [`start`], every level together.
-    pub(crate) fn captured() -> String {
-        BUFFER.with(|buffer| String::from_utf8_lossy(&buffer.borrow()).into_owned())
-    }
-
-    /// Only the `WARN` lines. What a caller asserting "this warned once, not once per tick" wants,
-    /// and what a caller asserting silence *must* use.
-    pub(crate) fn warnings() -> String {
-        at_level("WARN")
-    }
-
-    /// Only the `INFO` lines.
-    pub(crate) fn infos() -> String {
-        at_level("INFO")
-    }
-
-    /// The subscriber writes the level as the first token of each event, so selecting one is a
-    /// filter over the text. A multi-line event keeps its continuation lines with the line that
-    /// names the level.
-    ///
-    /// Matched as that leading token and not with `contains`, which finds a level name anywhere in
-    /// the line, including inside the *message*: a `WARN` about a gate watching a log (`grep ERROR
-    /// ...`) would be filed as ERROR and dropped, and an assertion counting warnings would silently
-    /// undercount.
-    fn at_level(level: &str) -> String {
-        let mut kept = String::new();
-        let mut keeping = false;
-        for line in captured().lines() {
-            let leading = line.split_whitespace().next().unwrap_or_default();
-            if ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"].contains(&leading) {
-                keeping = leading == level;
-            }
-            if keeping {
-                kept.push_str(line);
-                kept.push('\n');
-            }
-        }
-        kept
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A level name inside a *message* must not be mistaken for the line's level: a gate watching
-    /// a log (`grep ERROR ...`) puts exactly that into a warning, and every assertion built on
-    /// `warnings()` would undercount in silence.
-    #[test]
-    fn log_capture_files_a_line_by_its_level_not_by_its_message() {
-        log_capture::start();
-        tracing::warn!("gate for job abc failed: grep ERROR /var/log/app returned nothing");
-        tracing::info!("held over 3 due job(s)");
-
-        let warnings = log_capture::warnings();
-        assert!(
-            warnings.contains("grep ERROR"),
-            "a warning whose message names another level is still a warning: {warnings:?}"
-        );
-        assert!(
-            !warnings.contains("held over"),
-            "and an info line is not one: {warnings:?}"
-        );
-        assert!(
-            log_capture::infos().contains("held over"),
-            "which is where it does belong"
-        );
-    }
+    write_stderr_line(colored_for_stderr(
+        format!("({})", rows_of(note)),
+        Color::Yellow,
+    ));
 }

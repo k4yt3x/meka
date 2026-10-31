@@ -56,7 +56,14 @@ pub(crate) fn rfc3339(when: chrono::DateTime<chrono::Utc>) -> String {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r", "config:r"]))
+    security(
+        ("bearerAuth" = ["sessions:r"]),
+        ("bearerAuth" = ["mcp:r"]),
+        ("bearerAuth" = ["skills:r"]),
+        ("bearerAuth" = ["memory:r"]),
+        ("bearerAuth" = ["schedule:r"]),
+        ("bearerAuth" = ["config:r"])
+    )
 )]
 pub(crate) async fn info(
     State(state): State<ServerState>,
@@ -89,7 +96,14 @@ pub(crate) async fn info(
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r", "config:r"]))
+    security(
+        ("bearerAuth" = ["sessions:r"]),
+        ("bearerAuth" = ["mcp:r"]),
+        ("bearerAuth" = ["skills:r"]),
+        ("bearerAuth" = ["memory:r"]),
+        ("bearerAuth" = ["schedule:r"]),
+        ("bearerAuth" = ["config:r"])
+    )
 )]
 pub(crate) async fn skills(
     State(state): State<ServerState>,
@@ -135,7 +149,14 @@ pub(crate) struct McpServersResponse {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r", "config:r"]))
+    security(
+        ("bearerAuth" = ["sessions:r"]),
+        ("bearerAuth" = ["mcp:r"]),
+        ("bearerAuth" = ["skills:r"]),
+        ("bearerAuth" = ["memory:r"]),
+        ("bearerAuth" = ["schedule:r"]),
+        ("bearerAuth" = ["config:r"])
+    )
 )]
 pub(crate) async fn mcp(
     State(state): State<ServerState>,
@@ -217,9 +238,9 @@ pub(crate) async fn mcp_tools(
         .shared
         .mcp_manager
         .as_ref()
-        .ok_or_else(|| no_such_server(&name))?;
+        .ok_or_else(|| no_such_server(&state, &name))?;
     if manager.server_entry(&name).is_none() {
-        return Err(no_such_server(&name));
+        return Err(no_such_server(&state, &name));
     }
     let tools = manager
         .list_advertised_tools(&name)
@@ -245,11 +266,17 @@ pub(crate) async fn mcp_tools(
     }))
 }
 
-fn no_such_server(name: &str) -> ProblemDetail {
+fn no_such_server(state: &ServerState, name: &str) -> ProblemDetail {
+    let known = state
+        .shared
+        .mcp_manager
+        .as_ref()
+        .map(|manager| manager.server_names())
+        .unwrap_or_default();
     ProblemDetail::new(
         ErrorKind::NotFound,
         StatusCode::NOT_FOUND,
-        format!("no MCP server named '{name}'"),
+        crate::text::unknown_name("MCP server", name, known),
     )
     .with("server", name.to_string())
 }
@@ -295,10 +322,10 @@ pub(crate) async fn mcp_reconnect(
         .shared
         .mcp_manager
         .as_ref()
-        .ok_or_else(|| no_such_server(&name))?;
+        .ok_or_else(|| no_such_server(&state, &name))?;
     let entry = manager
         .server_entry(&name)
-        .ok_or_else(|| no_such_server(&name))?;
+        .ok_or_else(|| no_such_server(&state, &name))?;
 
     // Read once, before the attempt, and classify the outcome against it rather than against the
     // wording of the error. `reconnect_server` refuses two states outright, and telling them apart

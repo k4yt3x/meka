@@ -619,10 +619,6 @@ impl Registered {
             .iter()
             .map(|entry| entry.definition.name.as_str())
     }
-
-    pub(super) fn tools(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
-        self.entries.iter().map(|entry| &entry.tool)
-    }
 }
 
 /// The tools a request carries, and what their schemas cost the window.

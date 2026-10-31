@@ -45,7 +45,7 @@ These are returned in `InitializeResponse.agentCapabilities`:
 
 The client advertises these in `InitializeRequest.clientCapabilities`; meka stashes them and lets the built-in tools route accordingly:
 
-- **`fs.readTextFile: true`**: `file_read` issues `fs/read_text_file { sessionId, path, line?, limit? }` so the client serves the *in-buffer* view of the file. Image and regex `file_read` modes have no `fs/*` analog and stay local.
+- **`fs.readTextFile: true`**: `file_read` issues `fs/read_text_file { sessionId, path, line?, limit? }` so the client serves the *in-buffer* view of the file, when the client also takes writes. A regex read fetches the file the same way and filters it; an image read has no `fs/*` analog and stays local.
 - **`fs.writeTextFile: true`**: `file_write` and `file_edit`'s apply step issue `fs/write_text_file { sessionId, path, content }`. meka still attaches diff metadata to the `tool_call_update` so clients with an apply-diff UI can render it, as it does for `skill_write`, whose file is in meka's store; a memory write, which has no file, and a delete, which leaves no text after, carry their change as a unified diff in a `diff` code block instead.
 - **`terminal`**: not consumed. It means "I implement `terminal/*`", i.e. the agent may run commands *in the client*, which meka never does. See [Shell commands stay inside meka](#shell-commands-stay-inside-meka).
 - **`_meta.terminal_output: true`**: the client renders agent-owned terminals, so `shell_execute` output is streamed into a real terminal instead of a code block. A *rendering* choice only: meka still spawns and sandboxes the process either way. Advertised by Zed; independent of the `terminal` capability above.
@@ -84,7 +84,7 @@ Editors differ in which paths they will serve: Zed answers only for the project 
 
 The route is chosen once per tool call by the read, not per request: `file_edit` and `file_write` write back through whichever filesystem they read from, so a diff taken from the editor's buffer isn't applied to disk while the buffer keeps the old content. The read is also the more reliable signal: Zed reports an out-of-project path as `ResourceNotFound` on `fs/read_text_file` but as a generic error on `fs/write_text_file`, so a route chosen from the write's own error would never recognize it.
 
-One case can't honor that: a client advertising `fs.readTextFile` but not `fs.writeTextFile` reads for meka and expects meka to do the write, so the edit lands on disk while the client still holds a buffer for the file. The tool result discloses that too, with its own note.
+A client advertising `fs.readTextFile` but not `fs.writeTextFile` leaves the write to meka, so `file_read`, `file_edit` and `file_write` read the file from disk as well: what the model reads is what its edit is computed from, and the edit lands where it was computed. The client still holds a buffer for the file, which the write diverges from; the tool result discloses that with its own note.
 
 ## Session lifecycle
 
@@ -99,7 +99,7 @@ What an `InternalError`'s `data` carries follows the same policy the HTTP API ap
 - A store or filesystem failure, and a `[web]`/`base_url` misconfiguration, never travel: they name meka's own directories or the operator's config. `data` says where the detail went.
 
 - **`session/new { cwd, mcpServers }`**: mints a fresh persisted session, captures the cwd, takes the on-disk session lock, returns the session id and the current `SessionMode` state. `mcpServers` is ignored, with a warning naming how many entries were dropped; meka's servers come from `config.toml`. On this and every other door, `cwd` must be an existing directory and is recorded in its canonical spelling (symlinks resolved), the rule the screen's `/cd` and the HTTP API apply too; anything else is `InvalidParams`.
-- **`session/load { sessionId, cwd, mcpServers }`**: replays the persisted conversation as a stream of `session/update` notifications (`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`) before the response. A background report replays as the stage direction the live run said, a parenthesized `agent_message_chunk`, never as the words the model read. Orphan tool calls (the persisted log stopped mid-tool) are closed out with a `failed` status so the client's UI doesn't render a stuck spinner. If the client's `cwd` differs from the persisted one, meka updates the persisted row to match; the client wins, but only once the session has actually opened, so a load meka refuses (a sub-agent's id, a profile that has left `config.toml`, an account with no stored credential) leaves the session's recorded directory and roots exactly as they were. `mcpServers` is ignored silently here and on `session/resume`. A sub-agent's id is refused with `InvalidParams` before the session is locked; continue that conversation with `agent_followup` from the parent instead.
+- **`session/load { sessionId, cwd, mcpServers }`**: replays the session's log, its newest 2,000 rows without what a rewind took back, as a stream of `session/update` notifications (`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`) before the response. The turns before a compaction are replayed too, and the compaction is said where it happened, as the live run said it: a completed `compaction_update` to a client that advertised `session.compaction`, else the note; never the summary as a user turn. The recent turns a compaction kept are replayed once. A background report replays as the stage direction the live run said, a parenthesized `agent_message_chunk`, never as the words the model read. A skill invoked by name replays as `/<skill-name>` and the words typed with it, never as its body; an MCP prompt invoked on the screen, which an editor has no command for, as the stage direction the screen says and then those words. Orphan tool calls (the persisted log stopped mid-tool) are closed out with a `failed` status so the client's UI doesn't render a stuck spinner. If the client's `cwd` differs from the persisted one, meka updates the persisted row to match; the client wins, but only once the session has actually opened, so a load meka refuses (a sub-agent's id, a profile that has left `config.toml`, an account with no stored credential) leaves the session's recorded directory and roots exactly as they were. `mcpServers` is ignored silently here and on `session/resume`. A sub-agent's id is refused with `InvalidParams` before the session is locked; continue that conversation with `agent_followup` from the parent instead.
 - **`session/list { cwd?, cursor? }`**: paginated index. Filtered to the requested cwd when present, compared in the canonical spelling every session records; sub-agent sessions are always hidden. `nextCursor` is opaque; round-trip it back to keep paging.
 - **`session/resume { sessionId, cwd, mcpServers }`**: adopts the session id without replaying. Use this when the client already has the history rendered. Same cwd-update behavior as `session/load`, including that a refused resume writes nothing. A sub-agent's id is refused on the same terms as `session/load`.
 - **`session/fork { sessionId, cwd, additionalDirectories, mcpServers }`**: copies the session's conversation into a new persisted session, adopts the copy as active, and returns its id. The source is left open and untouched. See [Forking](#forking).
@@ -113,10 +113,11 @@ What an `InternalError`'s `data` carries follows the same policy the HTTP API ap
 ### Idle sessions are released
 
 A session untouched for 24 hours is dropped from the map by a sweep that runs every 5 minutes,
-releasing its lock and detaching its MCP registry. Only the in-memory entry goes: `session/load`
-reopens the conversation exactly as it does one from a previous run, so a client that keeps an id
-around needs no special handling. Sticky approval answers go with the entry, so they reset here as they
-do on `session/close`.
+releasing its lock and detaching its MCP registry. Only the in-memory entry goes, and the next
+`session/prompt`, `session/set_mode` or `session/set_config_option` naming it reopens it, in the
+directory and with the roots its row records, so a client that keeps a thread open needs no special
+handling; `session/load` reopens it with its history, as it does one from a previous run. Sticky
+approval answers go with the entry, so they reset here as they do on `session/close`.
 
 `session/close` is optional in the protocol and several editors never send one, which is what this
 answers. Each open session holds an `Agent`, a tool registry the MCP manager keeps a clone of, and
@@ -129,8 +130,10 @@ defaults for the same mechanism.
 A `session/prompt` carries a `prompt` array of `ContentBlock`s. meka accepts:
 
 - **`text`**: the baseline.
-- **`resource_link`**: flattened into a `<resource_link name="…" uri="…">description</resource_link>` tag inside the prompt text so the model sees the reference; meka does not fetch the resource server-side. A block that declares a MIME type adds ` mime="…"` to the tag, here and on `resource` below.
-- **`resource`** (embedded @-mention contents): a text resource is inlined as a `<resource uri="…">…contents…</resource>` tag; a binary (blob) resource becomes a self-closing `<resource uri="…" encoding="base64"/>` marker (the payload is not inlined).
+- **`resource_link`**: the model reads it as a `<resource_link name="…" uri="…">description</resource_link>` tag where the link sits among the words; meka does not fetch the resource server-side. A block that declares a MIME type adds ` mime="…"` to the tag, here and on `resource` below.
+- **`resource`** (embedded @-mention contents): a text resource is read as a `<resource uri="…">…contents…</resource>` tag where it sits; a binary (blob) resource becomes a self-closing `<resource uri="…" encoding="base64"/>` marker (the payload is not inlined).
+
+Each resource is stored in its place among the words, so a session's title reads the words around it, and `session/load` replays it as a `resource_link` named as the editor named it (an embedded resource by the last segment of its URI) rather than as its contents. A prompt that opens with `/<skill-name>` is the skill's invocation, whole: the model reads the words and the files sent with them, then the skill's body, and `session/load` replays it as the command and those words, each file as its `@name`.
 - **`image`**: accepted only when the profile has vision on. The payload is normalized through meka's image pipeline (size cap, format conversion) and forwarded to the model as native vision input (Claude `image`, OpenAI chat `image_url`, Codex `input_image`).
 
 `audio` blocks (and `image` when `vision = false`) produce `InvalidParams`.
@@ -152,7 +155,7 @@ While the turn runs, meka streams `session/update` notifications:
 - `notice` again for finished [background work](background.md) the model was shown, in the screen's words: `title` is the stage direction (`Background task 7f3a1c22 finished after 12m 4s`), `description` the task's label (one line per task when several report at once), and `_meta.background.tasks` the tasks as `GET /v1/sessions/{id}/tasks` lists them, outcome included, so a client that wants the result has it without the transcript carrying it. A client without `session.notices` gets the direction as a parenthesized `agent_message_chunk`, as a replay says it. The report the model read is shown to no client.
 - A `user_message_chunk` carrying a scheduled job's prompt, pushed by meka itself before the turn it fires runs, so the transcript shows what triggered it.
 - `usage_update` after every provider round, carrying `used` (tokens currently in context: all input tiers plus output) and `size` (the model's context window), so clients with a context gauge (e.g. Zed) show how full the window is while a long tool loop runs rather than once it ends; a turn that fails or is canceled reports its rounds too, and a compaction reports the estimate it leaves. One more on `session/new`, `session/load`, `session/resume` and `session/fork`, with what the row recorded, so a reopened session's gauge is not empty until its first reply. Emitted only once the window is known.
-- The `session/prompt` *response* additionally carries `usage`: session-cumulative `totalTokens` / `inputTokens` / `outputTokens` / `cachedReadTokens` / `cachedWriteTokens`. This is the running total for the session, not the gauge: `usage_update` answers "how full is the window", `usage` answers "what has this session cost". `thoughtTokens` is omitted because meka doesn't meter reasoning separately from output.
+- The `session/prompt` *response* additionally carries `usage`: what that turn spent, as the protocol defines it, in `totalTokens` / `inputTokens` / `outputTokens` / `cachedReadTokens` / `cachedWriteTokens`, a sub-agent's and a compaction's spend inside the turn included. This is the turn's cost, not the gauge: `usage_update` answers "how full is the window", `usage` answers "what did this turn cost". A local command such as `/status` spends nothing and says so. `thoughtTokens` is omitted because meka doesn't meter reasoning separately from output.
 
 The response carries a final `stopReason`:
 
@@ -244,7 +247,7 @@ it. It stays on the profile.
 
 Two kinds of slash command are advertised through `session/update: available_commands_update` (after `session/new` / `session/load` / `session/resume` / `session/fork`, and refreshed at the top of every `session/prompt` so a skill installed mid-session shows up without a reconnect):
 
-- **Built-in local commands**: `/status` (the permission level, then the screen's block: profile, model, context usage, effort, thinking, compaction count, cumulative tokens), `/mcp` (configured MCP servers and their connection status) and `/usage` (the account's rate-limit windows, subscription backends only). They render text back as an `agent_message_chunk` and end the turn immediately, with no model call.
+- **Built-in local commands**: `/status` (the permission level, then the screen's block: profile, model, context usage, effort, thinking, compaction count, cumulative tokens), `/mcp` (configured MCP servers and their connection status) and `/usage` (the account's rate-limit windows, subscription backends only). They render text back as an `agent_message_chunk` and end the turn immediately, with no model call. They take no argument, so a command followed by words, `/usage looks wrong, why?`, goes to the model as typed.
 - **Skills** (see [Skills](./skills.md)): each installed skill is a top-level command carrying a free-form input hint (`"additional context (optional)"`).
 
 When the user picks one from the palette, the client typically inserts `/<name> ` and lets the user type extra context. meka parses the prompt as follows:
@@ -301,6 +304,6 @@ This method is marked **unstable** in the protocol: it is not part of the spec y
 
 - **Tool-call diff metadata isn't persisted.** A session reopened with `session/load` replays `tool_call_update`s as plain text rather than diffs. The on-disk content is unaffected.
 - **`terminal/*` is never used**: meka owns every process it spawns, so no command runs in the client's terminal. Output streams into the tool call instead, as an agent-owned terminal where the client advertises `_meta.terminal_output` and a `console` block otherwise. See [Shell commands stay inside meka](#shell-commands-stay-inside-meka).
-- **Image and regex `file_read`**: stay local. The `fs/read_text_file` request carries only text, so there's no protocol surface to delegate either case.
+- **Image `file_read`**: stays local. The `fs/read_text_file` request carries only text, so there's no protocol surface to delegate it. A regex `file_read` fetches the whole document through the delegate and filters it locally.
 - **`audio` prompts**: not supported; `audio` content blocks produce `InvalidParams`.
 - **No client-side model gate for images**: when `vision` is on, meka forwards images to whatever model the profile names; a non-vision model returns a provider error rather than meka refusing up front. Set `vision = false` for text-only endpoints.

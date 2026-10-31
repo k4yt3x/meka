@@ -101,8 +101,12 @@ impl Tool for ScheduleCreateTool {
                     },
                     "cron": {
                         "type": "string",
-                        "description": "Recurring 5-field cron expression in local time \
+                        "description": "Recurring 5-field cron expression, read in `timezone` \
                                         ('0 9 * * 1-5' = 09:00 on weekdays). No seconds field."
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": timezone_description()
                     },
                     "gate": {
                         "type": "object",
@@ -269,54 +273,34 @@ impl ScheduleCreateTool {
     }
 }
 
-/// Pull exactly one of `at` / `every` / `cron` out of the tool input.
+/// The schedule the tool input names, read by the one rule every door that creates a job uses.
 fn parse_schedule(
     input: &serde_json::Value,
     now: chrono::DateTime<Utc>,
     tool_name: &str,
 ) -> Result<Schedule> {
-    let mut given: Vec<(&str, &str)> = Vec::new();
-    for key in ["at", "every", "cron"] {
-        if let Some(value) = optional_str(input, key, tool_name)? {
-            given.push((key, value.trim()));
-        }
-    }
-
-    let (kind, value) = match given.as_slice() {
-        [single] => *single,
-        [] => {
-            return Err(MekaError::ToolExecution {
-                tool_name: tool_name.to_string(),
-                message: "give one of 'at' (once), 'every' (interval), or 'cron' (expression)"
-                    .to_string(),
-            });
-        }
-        // Ambiguity is refused rather than resolved by precedence: silently honoring one and
-        // dropping the other would produce a job that fires on a schedule nobody asked for.
-        several => {
-            return Err(MekaError::ToolExecution {
-                tool_name: tool_name.to_string(),
-                message: format!(
-                    "give exactly one schedule, got {}",
-                    several
-                        .iter()
-                        .map(|(key, _)| *key)
-                        .collect::<Vec<_>>()
-                        .join(" and ")
-                ),
-            });
-        }
-    };
-
-    let parsed = match kind {
-        "at" => Schedule::parse_at(value, now),
-        "every" => Schedule::parse_every(value),
-        _ => Schedule::parse_cron(value),
-    };
-    parsed.map_err(|message| MekaError::ToolExecution {
+    Schedule::parse_request(
+        optional_str(input, "at", tool_name)?,
+        optional_str(input, "every", tool_name)?,
+        optional_str(input, "cron", tool_name)?,
+        optional_str(input, "timezone", tool_name)?,
+        now,
+    )
+    .map_err(|message| MekaError::ToolExecution {
         tool_name: tool_name.to_string(),
         message,
     })
+}
+
+/// What `timezone` says, naming the machine's zone so the model knows what a pattern without one
+/// is read in.
+fn timezone_description() -> String {
+    match crate::schedule::machine_zone_name() {
+        Some(name) => {
+            format!("IANA time zone a `cron` pattern is read in. Default: the machine's, {name}.")
+        }
+        None => "IANA time zone a `cron` pattern is read in. Default: the machine's.".to_string(),
+    }
 }
 
 pub(super) struct ScheduleListTool {

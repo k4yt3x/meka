@@ -40,6 +40,7 @@ use crate::{
 
 mod registry;
 mod types;
+pub(crate) mod wire_names;
 
 pub(crate) use self::{registry::*, types::*};
 use crate::{
@@ -82,19 +83,47 @@ pub(crate) fn default_base_url(backend: Backend) -> &'static str {
     }
 }
 
+/// The origin of the endpoint `url` names, `scheme://host[:port]`, which the reasoning an endpoint
+/// seals records; `None` for a URL that does not parse.
+pub(crate) fn endpoint_origin(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+}
+
+/// Each profile on a `chatgpt-subscription` account with the origin of the endpoint its requests
+/// go to, which the migration that records where sealed reasoning was sealed takes from its
+/// caller.
+pub(crate) fn chatgpt_reasoning_origins(
+    accounts: &std::collections::BTreeMap<String, crate::config::AccountConfig>,
+    profiles: &std::collections::BTreeMap<String, crate::config::ProfileConfig>,
+) -> Vec<(String, String)> {
+    profiles
+        .iter()
+        .filter_map(|(name, profile)| {
+            let account = accounts.get(&profile.account)?;
+            if account.backend.parse::<Backend>().ok()? != Backend::ChatGptSubscription {
+                return None;
+            }
+            let base_url = account
+                .base_url
+                .as_deref()
+                .unwrap_or(DEFAULT_CHATGPT_BASE_URL);
+            Some((name.clone(), endpoint_origin(base_url)?))
+        })
+        .collect()
+}
+
 /// How long a provider stream may go without producing anything before it is treated as dead.
 ///
 /// This bounds *silence*, never a turn. A model thinking hard, or a request queued behind a busy
 /// endpoint, keeps sending: reasoning deltas, text deltas, ping events. Nothing here caps how long
 /// a turn may legitimately run, how many tool calls it may make, or how many tokens it may spend.
 ///
-/// Measured in decodable SSE *events*, not bytes. All three drivers wrap `event_stream.next()`, and
-/// `eventsource-stream` discards comment lines and refuses to dispatch a data-empty event, so a
-/// keepalive that is only `: ping` does not reset this clock: an endpoint sending nothing else for
-/// five minutes is treated as silent, which is the intended reading of it but not what "without a
-/// byte" would mean. Bounding actual bytes would mean timing the response body underneath the SSE
-/// decoder in all three drivers, for a shape no provider meka targets produces. Every provider in
-/// use sends `ping` / `keep-alive` events with a data field, which do reset it.
+/// Measured in bytes, under the SSE decoder in [`sse::drive`], which every streaming backend reads
+/// through: a keepalive comment such as OpenRouter's `: OPENROUTER PROCESSING` resets it as a
+/// `ping` event does, so a model thinking in silence behind a gateway that says it is still there
+/// is not cut and asked again.
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long to wait for the TCP + TLS handshake before giving up on a provider endpoint.
@@ -190,12 +219,13 @@ impl TurnOrigin {
 
     /// The same fact in meka's own words, as a turn's row and the HTTP API's `turn.started`
     /// name who opened a turn.
-    pub(crate) const fn source(self) -> &'static str {
+    pub(crate) const fn source(self) -> crate::store::turns::TurnSource {
+        use crate::store::turns::TurnSource;
         match self {
-            Self::Human => "client",
-            Self::Scheduled => "schedule",
-            Self::Peer => "inbox",
-            Self::TaskNotification => "background",
+            Self::Human => TurnSource::Client,
+            Self::Scheduled => TurnSource::Schedule,
+            Self::Peer => TurnSource::Inbox,
+            Self::TaskNotification => TurnSource::Background,
         }
     }
 }
@@ -1620,10 +1650,19 @@ mod tests {
                 },
             ),
             (
-                r#"{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E"}}"#,
+                r#"{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E","origin":"https://chatgpt.com"}}"#,
                 OpaqueReasoning::Sealed {
                     encrypted_content: "E".to_string(),
                     id: None,
+                    origin: Some("https://chatgpt.com".to_string()),
+                },
+            ),
+            (
+                r#"{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E","origin":null}}"#,
+                OpaqueReasoning::Sealed {
+                    encrypted_content: "E".to_string(),
+                    id: None,
+                    origin: None,
                 },
             ),
             (
@@ -1643,6 +1682,15 @@ mod tests {
                 "an absent id must not be written back as null"
             );
         }
+    }
+
+    /// A sealed block that does not say which endpoint sealed it is a shape only an older build
+    /// wrote, which the migration converts; read as an unknown origin here it would be a second
+    /// place that knows the old shape.
+    #[test]
+    fn a_sealed_block_without_its_origin_does_not_load() {
+        let stored = r#"{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E"}}"#;
+        assert!(serde_json::from_str::<ContentBlock>(stored).is_err());
     }
 
     #[test]

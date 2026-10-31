@@ -559,10 +559,7 @@ impl Tool for FetchUrlTool {
 
         let html = String::from_utf8_lossy(&body_bytes).into_owned();
 
-        let raw = input
-            .get("raw")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let raw = super::util::optional_bool(&input, "raw", "web_fetch")?.unwrap_or(false);
         // Parsing and converting up to ten megabytes of HTML is pure CPU, and on the runtime it
         // blocks every other task on that worker.
         let body = if raw {
@@ -585,10 +582,7 @@ impl Tool for FetchUrlTool {
         let limit = if redirects_to_scratchpad(&input) {
             0
         } else {
-            input
-                .get("limit")
-                .and_then(serde_json::Value::as_u64)
-                .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+            super::util::optional_count(&input, "limit", "web_fetch")?
                 .unwrap_or(DEFAULT_LIMIT_CHARS)
         };
 
@@ -598,14 +592,26 @@ impl Tool for FetchUrlTool {
         let matched = match optional_str(&input, "regex", "web_fetch")? {
             Some(pattern) => {
                 let re = compile_user_regex(pattern, "web_fetch")?;
-                let matches: Vec<&str> = re.find_iter(&body).map(|found| found.as_str()).collect();
-                if matches.is_empty() {
+                let mut matches = re.find_iter(&body).map(|found| found.as_str());
+                let Some(first) = matches.next() else {
                     return Ok(ToolOutput::text(
                         "No matches found for the given regex pattern.".to_string(),
                         false,
                     ));
+                };
+                let mut joined = first.to_string();
+                let mut joined_chars = first.chars().count();
+                // Past `limit` the rest is cut anyway, and a pattern that matches every character
+                // of a large page would otherwise build a list as long as the page first.
+                for found in matches {
+                    if limit > 0 && joined_chars > limit {
+                        break;
+                    }
+                    joined.push('\n');
+                    joined.push_str(found);
+                    joined_chars += 1 + found.chars().count();
                 }
-                Some(matches.join("\n"))
+                Some(joined)
             }
             None => None,
         };

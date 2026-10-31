@@ -181,7 +181,7 @@ pub(crate) async fn compact(
     // name the turn, and a terminal closes it. Unattended, like a scheduled fire.
     let (_feed, _ids) = entry.frontend.begin_turn(
         turn_id,
-        crate::host::scheduler::TurnSource::Compaction,
+        crate::host::scheduler::TurnStarter::Compaction,
         crate::host::http::feed::Opener::DRIVER,
         state.config.stream_reattach_grace,
         state.config.stream_replay_events,
@@ -952,7 +952,7 @@ pub(crate) async fn export(
     let manager = &state.shared.store;
     match query.format.as_deref().unwrap_or("markdown") {
         "markdown" => {
-            let events = manager.load_events(id).await.map_err(|error| {
+            let events = manager.load_history(id).await.map_err(|error| {
                 ProblemDetail::internal_sanitized("failed to load session events", error)
                     .with("session_id", id.to_string())
             })?;

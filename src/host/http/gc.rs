@@ -47,7 +47,9 @@ pub(crate) fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
 async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle: bool) {
     let evicted = state
         .sessions
-        .sweep_idle(idle_timeout, |entry| entry.frontend.subscriber_count() > 0)
+        .sweep_idle(idle_timeout, |entry| {
+            entry.frontend.readers_keeping_loaded() > 0
+        })
         .await;
     if evicted.is_empty() {
         return;
@@ -72,14 +74,16 @@ async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle:
         entry.frontend.close_feed();
     }
 
+    // By the retention sweep's rule: a pin or a scheduled job anywhere in the tree keeps it.
     if delete_on_idle {
         for (id, _entry) in &evicted {
             let tree =
                 crate::host::http::handlers::sessions::ids_a_deletion_removes(state, *id).await;
-            match state.shared.store.delete_session(*id).await {
-                Ok(_) => {
+            match state.shared.store.delete_session_if_expirable(*id).await {
+                Ok(true) => {
                     crate::host::http::handlers::sessions::announce_deletion(state, &tree);
                 }
+                Ok(false) => {}
                 Err(error) => {
                     tracing::warn!("session GC: failed to delete row for {id}: {error}");
                 }

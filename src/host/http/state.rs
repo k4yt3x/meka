@@ -18,6 +18,9 @@ use crate::host::{ResidentSession, Sessions, SharedDeps};
 #[derive(Clone)]
 pub(crate) struct ServerState {
     pub(crate) shared: Arc<SharedDeps>,
+    /// The tokens every request is checked against, replaced when the server serves
+    /// `config.toml`.
+    pub(crate) auth: super::auth::AuthRegistry,
     pub(crate) sessions: Sessions<Uuid, SessionEntry>,
     /// Configured serve settings, post-resolve (defaults filled, env vars substituted).
     pub(crate) config: Arc<crate::host::http::config::ResolvedServeConfig>,
@@ -89,6 +92,7 @@ impl ServerState {
         let config_webhooks = config.webhooks.clone();
         let stream_replay_events = config.stream_replay_events;
         Self {
+            auth: super::auth::AuthRegistry::new(config.tokens.clone()),
             shared,
             sessions: Sessions::new(),
             config,
@@ -115,6 +119,7 @@ impl ServerState {
             replay_capacity: self.config.stream_replay_events,
             reattach_grace: self.config.stream_reattach_grace,
             webhooks: Some(self.webhooks.clone()),
+            background: Some(self.shared.store.background_store()),
             server: Some(Arc::clone(&self.server_feed)),
             children: Some(Arc::clone(&self.child_feeds)),
         }

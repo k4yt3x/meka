@@ -23,7 +23,7 @@ meka account whoami [NAME] [--format <FORMAT>]   # plan, tier, org, role and loc
 meka account stats [NAME] [--format <FORMAT>]    # lifetime tokens, streaks, per-day counts
 ```
 
-See the [`meka account` CLI reference](./config-file.md#meka-account-cli) for the full flag list.
+See the [`meka account` CLI reference](../usage/accounts-and-profiles.md#meka-account-cli) for the full flag list.
 
 ### `profile`
 
@@ -40,7 +40,7 @@ meka profile remove work
 meka profile rename work daily
 ```
 
-See the [`meka profile` CLI reference](./config-file.md#meka-profile-cli) for the full flag list.
+See the [`meka profile` CLI reference](../usage/accounts-and-profiles.md#meka-profile-cli) for the full flag list.
 
 ### `project`
 
@@ -290,7 +290,7 @@ rewritten and it keeps that profile from then on. See
 > **There is no `--model`, `--base-url`, `--thinking` or `--thinking-budget`.** A profile is an
 > indivisible bundle of an account, a model and every model-tied setting, and a session records
 > which one it runs on rather than a rewritten copy. To change a setting, edit the profile with
-> [`meka profile set`](./config-file.md#meka-profile-cli); to run something different, make a second
+> [`meka profile set`](../usage/accounts-and-profiles.md#meka-profile-cli); to run something different, make a second
 > profile and select it with `--profile`.
 
 ### `--project <NAME>`

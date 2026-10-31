@@ -71,6 +71,13 @@ impl WebhookEvent {
     }
 }
 
+/// When a claimed outcome's announcement is tried: at once, then twice more as a busy store clears.
+const ANNOUNCE_RETRY_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::ZERO,
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_secs(1),
+];
+
 /// Whether subscribers were told, so a caller knows if it may go on to deliver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Announced {
@@ -204,6 +211,32 @@ impl WebhookDispatcher {
             );
         }
         Announced::Told
+    }
+
+    /// [`Self::announce_finished_tasks`] for outcomes a turn has claimed, tried again past a stamp
+    /// that fails. The claim stamped them delivered, which takes them out of the pool the poller
+    /// announces from, so nothing else would announce them: one `SQLITE_BUSY` from another
+    /// process's write would cost the webhook for good.
+    pub(crate) async fn announce_claimed_tasks(
+        &self,
+        store: &crate::store::background::BackgroundStore,
+        tasks: &[crate::store::background::BackgroundTask],
+    ) {
+        for delay in ANNOUNCE_RETRY_DELAYS {
+            tokio::time::sleep(delay).await;
+            if self
+                .announce_finished_tasks(store, tasks)
+                .await
+                .may_deliver()
+            {
+                return;
+            }
+        }
+        tracing::warn!(
+            "failed to announce {count} claimed background outcome(s); their `task.finished` \
+             webhooks are not sent",
+            count = tasks.len()
+        );
     }
 
     /// Queue `event` for delivery to every endpoint subscribed to it.
@@ -522,6 +555,80 @@ mod tests {
             Announced::Told.may_deliver() && Announced::Nothing.may_deliver(),
             "the other two answers let the caller carry on"
         );
+    }
+
+    /// An outcome a turn claimed is announced past a stamp that fails once, since the claim took
+    /// it out of the pool any later sweep would announce it from.
+    #[tokio::test]
+    async fn a_claimed_outcome_is_announced_past_a_failed_stamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let store = crate::store::Store::open(Some(&path), &Default::default())
+            .await
+            .expect("open");
+        let session_id = store
+            .create_session(None, "p".to_string())
+            .await
+            .expect("session");
+        let task = crate::store::background::BackgroundTask {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            tool: "shell_execute".to_string(),
+            label: "cargo test".to_string(),
+            status: crate::store::background::TaskStatus::Completed,
+            outcome: Some("ok".to_string()),
+            scratchpad_entry: None,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            announced_at: None,
+            delivered_at: None,
+            subagent_id: None,
+        };
+        store
+            .background_store()
+            .start_background_task(&task)
+            .await
+            .expect("start");
+        rusqlite::Connection::open(&path)
+            .expect("second connection")
+            .execute_batch(
+                "CREATE TABLE injected_failures (remaining INTEGER NOT NULL); \
+                 INSERT INTO injected_failures VALUES (1); \
+                 CREATE TRIGGER injected_failure BEFORE UPDATE ON background_tasks \
+                 WHEN NEW.announced_at IS NOT NULL \
+                   AND (SELECT remaining FROM injected_failures) > 0 \
+                 BEGIN \
+                   SELECT RAISE(FAIL, 'injected store failure'); \
+                 END;",
+            )
+            .expect("install the trigger");
+        // Lifted from outside: the stamp's own transaction would roll back a count kept inside it.
+        // Well before the first retry, well after the first try.
+        let lift = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                rusqlite::Connection::open(&path)
+                    .expect("third connection")
+                    .execute_batch("UPDATE injected_failures SET remaining = 0;")
+                    .expect("lift the failure");
+            }
+        });
+
+        WebhookDispatcher::new(Vec::new())
+            .announce_claimed_tasks(&store.background_store(), std::slice::from_ref(&task))
+            .await;
+        lift.join().expect("the lift ran");
+
+        let announced: Option<String> = rusqlite::Connection::open(&path)
+            .expect("read back")
+            .query_row(
+                "SELECT announced_at FROM background_tasks WHERE id = ?1",
+                [&task.id],
+                |row| row.get(0),
+            )
+            .expect("the row");
+        assert!(announced.is_some(), "announced on the retry");
     }
 
     /// `max_retries` is operator-supplied, so the backoff arithmetic has to survive a large one.

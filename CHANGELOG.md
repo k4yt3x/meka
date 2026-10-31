@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `meka instructions show` and `meka instructions path` take `--format json`.
+- A cron job takes an IANA `timezone`; without one it runs in the machine's zone.
+- Profile keys `encrypted_reasoning` and `reasoning_summary` on `openai-responses`.
+- Account keys `prompt_cache_key` (Responses) and `stream_usage` (Chat Completions).
+- HTTP: messages carry `invocation` and `resource` blocks for invoked prompts and attached files.
+- Account key `max_tool_name_bytes` holds tool names to an endpoint's lower limit.
+
+### Changed
+
+- **Breaking:** A relative `MEKA_CONFIG_DIR` or `MEKA_DATA_DIR` is refused at startup.
+- **Breaking:** `meka serve` and `meka acp` refuse the flags that belong to a run, as `--prompt`.
+- **Breaking:** `meka profile add` and `set` refuse a flag the account's backend never sends.
+- **Breaking:** HTTP: feed event ids start from the clock, so an id from before a restart is a gap.
+- **Breaking:** HTTP: `GET /v1/instructions` shows `path` and `source` to `config:r` tokens alone.
+- **Breaking:** `openai-responses` asks for encrypted reasoning, a summary of it and a cache key.
+- **Breaking:** `openai-chat-completions` asks for usage on every streamed request.
+- Reasoning an endpoint sealed is sent back to that endpoint alone.
+- A steer or a background outcome that arrives while the reply is written continues the turn.
+- `/mcp reconnect` and `POST /v1/mcp/{name}/reconnect` replace a server's connection, or keep it.
+- HTTP: a feed reader without `sessions:w` no longer keeps its session loaded.
+- Session archives are `format_version` 18; a kept copy names the event it copies (`copy_of`).
+- An upgrade that migrates the store refuses while another meka process has the store open.
+- A tool's boolean or number argument of another type, as `"true"` or `"3"`, is refused.
+- HTTP: the feed's replay ring holds at most 16 MiB of events.
+- On exit, MCP calls in flight get two seconds to finish before their servers are closed.
+- On an editor that serves reads but takes no writes, `file_read` reads the file from disk.
+- Session import refuses a blob not labeled as an image; blobs are served with `nosniff`.
+- ACP: `/mcp` says what it lists, and a local command followed by words goes to the model.
+- ACP errors and refused HTTP logins and imports name where to look and the route that fixes them.
+- Unknown MCP servers, skills and memories are reported in one wording; durations read alike.
+
+### Fixed
+
+- A confined shell can no longer move meka's own directories out from under the sandbox's mask.
+- A scheduled job's gate reaches no further than its session's network and read confinement.
+- A browser login waits past a connection that sends nothing, or a callback that is not its own.
+- A one-shot answer printed to a terminal drops escape sequences; a pipe still gets it verbatim.
+- A turn that falls back to another profile sends the tools that profile's backend carries.
+- A context overflow the ChatGPT backend reports mid-stream compacts and retries the turn.
+- A photo downscaled for Claude stays a JPEG within the per-image limit instead of failing.
+- BMP images are converted to PNG; no provider accepts them as sent.
+- Whitespace-only text, as a reply cut after a newline, no longer fails every later Claude request.
+- A tool result with nothing in it says so instead of leaving the model an empty result.
+- Claude requests carry at most 100 images, the API's limit; the oldest are redacted past it.
+- A stream an endpoint keeps alive with comment lines is no longer cut after five quiet minutes.
+- Parallel tool calls an endpoint streams without an `index` stay separate calls.
+- Two processes refreshing one MCP server's OAuth token no longer spend the same refresh token.
+- A `headers_helper` that writes a lot of output no longer stalls until its timeout.
+- A failed sub-agent turn still gives the parent its id; a cut-short report says so.
+- Sub-agent turns no longer count toward the session's turn total.
+- A failed compaction at a turn's start is not retried at once by the next check.
+- An interrupt that lands right after a compaction keeps the checklist and the compaction marker.
+- A blank scratchpad entry name or `file_read` path is refused naming the field.
+- A schedule request field left blank reads as not given; one of the wrong type is refused.
+- A checklist sent as a bare string, or with a blank status, is read as the model meant it.
+- Session import no longer applies an older archive format's conversions to a current archive.
+- Session import stores times in UTC and refuses an unknown turn source, status or reason.
+- Removing a project clears it from the sub-agents that named it.
+- Memory search no longer merges two projects' memories that share a name.
+- `meka serve`'s idle sweep no longer deletes a pinned session.
+- HTTP: OpenAPI lists each read scope a route accepts as an alternative rather than all together.
+- ACP: loading a session replays the whole conversation and says each compaction once.
+- ACP: session notifications follow the `session/new` and fork responses instead of preceding them.
+- ACP: an approval prompt names its tool call, so the editor's card resolves.
+- ACP: a session the idle sweep released reopens on its next prompt instead of failing.
+- ACP: a prompt response's `usage` is the turn's, as the protocol defines it, not the session's.
+- The screen and ACP follow a profile or project another client recorded on the session.
+- A one-shot run stopped by SIGTERM or SIGHUP stops its background tasks before it exits.
+- A reply cut at the output limit says so on the screen and in a one-shot run.
+- Log lines held while the screen was up print on exit only at the level asked for.
+- Piped stderr carries no color codes; the profile setup hint shows only when the profile is gone.
+- A paste reaches a picker's filter while it is being typed.
+- An MCP tool name longer than the backend allows is sent shortened instead of failing the request.
+- An MCP server with `headers_helper` reconnects once when it rejects a request as unauthorized.
+- A burst of MCP list-change notices lists the server once or twice rather than once per notice.
+- A confined command can no longer read another terminal or the machine's input devices.
+- The screen's input history is deleted with what the retention windows expire.
+- A skill, an MCP prompt or an attached file no longer titles, replays or exports as its body.
+- A compaction's kept turns show once in history, search and exports.
+- A fork or an import of a long session no longer holds up other processes' writes.
+- HTTP: a token removed from `[[serve.tokens]]` stops working on reload, its open streams too.
+- HTTP: `task.finished` is sent for an outcome a running turn reads, not only one the poller sends.
+- An MCP call in flight when a reconnect replaces its connection finishes there, not sent twice.
+- A background outcome is not lost when the turn that read it fails to save.
+- A background call that names a `scratchpad` entry has its output saved there.
+- Canceling every background task signals and counts only the tasks still running.
+- `file_edit` on an editor that serves reads but not writes no longer undoes an earlier edit.
+- Two `scratchpad_edit` calls on one entry in one reply both apply.
+- `tool_load` no longer suggests a tool the profile's backend does not carry.
+- A `web_fetch` regex that matches most of a page no longer holds every match in memory.
+- On Windows, a memory dated before 1601 is refused instead of crashing meka.
+- An `unverified` window too large for a date no longer crashes a memory listing.
+- A background task stopped by an exit, a signal or a closed session reports `interrupted`.
+- A skill invoked on the screen with an image attached takes the image.
+
 ## [0.86.0] - 2026-10-29
 
 ### Changed

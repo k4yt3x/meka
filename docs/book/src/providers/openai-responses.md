@@ -79,18 +79,19 @@ Request body fields meka sets: `model`, `input`, `instructions` (the system prom
 `tools`, `tool_choice: auto`, `store: false`, `stream: true`, `reasoning.effort` (only when `effort`
 is set), and `max_output_tokens` (only when `max_output_tokens` is set).
 
-What it deliberately does **not** send is `include: ["reasoning.encrypted_content"]` or
-`reasoning.summary`. Both are OpenAI extensions: the first round-trips reasoning across stateless
-turns, the second asks for the human-readable digest meka renders as a thinking block.
-`chatgpt-subscription` sends both because its endpoint is always ChatGPT; here the endpoint is
-whatever `base_url` names, meka has no way to know whether either is understood, and an unrecognized
-field is a rejected request rather than a degraded one.
+OpenAI's own fields go out too, as `chatgpt-subscription` sends them, each with a switch for an
+endpoint or a model that refuses it:
 
-The trade-off, stated plainly: against OpenAI itself this backend shows no thinking and carries no
-reasoning between a turn's own tool calls. Use `chatgpt-subscription` if you want either. Endpoints
-that stream reasoning unprompted (vLLM and Ollama emit `response.reasoning_text.delta` without
-being asked) still render their thinking here.
+| Field | What it does | Switch |
+|---|---|---|
+| `include: ["reasoning.encrypted_content"]` | Returns the model's reasoning sealed, which meka sends back on the turn's later requests so the model reasons on between its own tool calls | the profile's [`encrypted_reasoning`](../configuration/config-file.md#encrypted_reasoning) |
+| `reasoning.summary: "auto"` | Asks for the digest meka shows as the model's thinking | the profile's [`reasoning_summary`](../configuration/config-file.md#reasoning_summary) |
+| `prompt_cache_key` | Routes one conversation's requests to the cache holding its prefix; meka sends the session's id | the account's [`prompt_cache_key`](../configuration/config-file.md#prompt_cache_key) |
 
-The same rule keeps `prompt_cache_key` off the wire here: it is OpenAI's own routing hint, and
-`chatgpt-subscription` is where meka sends it. The `cached_tokens` an endpoint reports inside
-`input_tokens` are counted as cache reads, so `/status` shows a hit rate on this backend too.
+Most servers ignore a field they do not know, and one that refuses names the field in its error,
+which is the switch to turn off. Sealed reasoning goes back only to the endpoint that sealed it, so
+a session that ran on ChatGPT or another endpoint does not send that endpoint's reasoning here.
+Endpoints that stream reasoning unprompted (vLLM and Ollama emit `response.reasoning_text.delta`
+without being asked) render their thinking either way. The `cached_tokens` an endpoint reports
+inside `input_tokens` are counted as cache reads, so `/status` shows a hit rate on this backend
+too.

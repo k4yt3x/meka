@@ -191,7 +191,7 @@ fn carries_the_request(message: &Message, words: &str) -> bool {
     if message.role != Role::User {
         return false;
     }
-    let text = message.text_content();
+    let text = message.text_paragraphs();
     text == words || text.contains(&request_section(words))
 }
 
@@ -345,9 +345,10 @@ fn received_blocks(message: &Message) -> Vec<&str> {
             {
                 Some(text.as_str())
             }
-            ContentBlock::Inbox { text, .. } | ContentBlock::Scheduled { text, .. } => {
-                Some(text.as_str())
-            }
+            ContentBlock::Inbox { text, .. }
+            | ContentBlock::Scheduled { text, .. }
+            | ContentBlock::Invocation { text, .. }
+            | ContentBlock::Resource { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect()
@@ -763,14 +764,11 @@ impl Agent {
         // a tail write that then fails leaves the database holding a valid boundary with a
         // truncated tail, which puts those messages permanently outside the materialized view of
         // every future load.
-        let mut compaction_events = Vec::with_capacity(to_keep.len() + 1);
-        compaction_events.push(boundary_event);
-        compaction_events.extend(
-            to_keep
-                .iter()
-                .map(|message| crate::conversation::Event::Append(message.clone())),
-        );
-        if let Err(error) = self.save_events_atomic(session_id, compaction_events).await {
+        if let Err(error) = self
+            .store
+            .save_compaction(session_id, &boundary_event, &to_keep, self.current_turn())
+            .await
+        {
             // Put the conversation back: the rewrite above already happened in memory, so without
             // this the caller is told the compaction failed while the model goes on reasoning from
             // a summary the database has never heard of. `POST /rewind` guards the same hazard
@@ -916,13 +914,7 @@ impl Agent {
         // The request carries what the turn's own builder sends from the same loaded set, so its
         // prefix is the turn's and the prompt cache holds. The checkpoint's allow-list is narrower
         // and is enforced at dispatch, through `admitted`.
-        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
-            messages.events(),
-            self.tool_registry.deferred_tool_delivery(),
-        );
-        let active = self.tool_registry.active_tools(&loaded);
-        let definitions: Vec<ToolDefinition> = active.definitions;
-        let deferred_definitions: Vec<ToolDefinition> = active.deferred_definitions;
+        let rebuild = || self.request_tools(messages.events()).1;
         let admitted: std::collections::HashMap<String, Arc<dyn crate::tools::Tool>> = self
             .tool_registry
             .checkpoint_tools(
@@ -969,13 +961,20 @@ impl Agent {
                 tracing::warn!("checkpoint turn interrupted; summarizing instead");
                 return Ok(None);
             }
+            // Read per round, so a round after a fallback carries what the serving wire does.
+            let (loaded, active) = self.request_tools(messages.events());
             let completed = loop {
                 match self
                     .complete_with_retry(
                         "the checkpoint's provider call",
-                        CompletionRequest::new(&system_prompt, &checkpoint_messages, &definitions)
-                            .declaring(&deferred_definitions)
-                            .attributed(attribution.clone()),
+                        CompletionRequest::new(
+                            &system_prompt,
+                            &checkpoint_messages,
+                            &active.definitions,
+                        )
+                        .declaring(&active.deferred_definitions)
+                        .attributed(attribution.clone()),
+                        Some(&rebuild),
                         &cancellation,
                         &cancellation,
                     )
@@ -1012,11 +1011,12 @@ impl Agent {
                 ..
             } = completed;
             tracing::debug!(
-                "checkpoint round usage: input={} cache_creation={} cache_read={} output={}",
-                usage.input_tokens,
-                usage.cache_creation_input_tokens,
-                usage.cache_read_input_tokens,
-                usage.output_tokens
+                "checkpoint round usage: input={input} cache_creation={cache_creation} \
+                 cache_read={cache_read} output={output}",
+                input = usage.input_tokens,
+                cache_creation = usage.cache_creation_input_tokens,
+                cache_read = usage.cache_read_input_tokens,
+                output = usage.output_tokens
             );
             self.session_stats.record_untracked_tokens(&usage);
             for notice in notices {
@@ -1177,6 +1177,7 @@ impl Agent {
                     CompletionRequest::new(&system_prompt, &compact_messages, &[])
                         .attributed(self.compaction_attribution(request))
                         .without_thinking(),
+                    None,
                     cancellation,
                     &unfired,
                 )
@@ -1208,11 +1209,12 @@ impl Agent {
             ..
         } = completed?;
         tracing::debug!(
-            "summary usage: input={} cache_creation={} cache_read={} output={}",
-            usage.input_tokens,
-            usage.cache_creation_input_tokens,
-            usage.cache_read_input_tokens,
-            usage.output_tokens
+            "summary usage: input={input} cache_creation={cache_creation} cache_read={cache_read} \
+             output={output}",
+            input = usage.input_tokens,
+            cache_creation = usage.cache_creation_input_tokens,
+            cache_read = usage.cache_read_input_tokens,
+            output = usage.output_tokens
         );
         self.session_stats.record_untracked_tokens(&usage);
         // Provider notices from the summary call (image redaction on a very large window), emitted
@@ -1341,6 +1343,7 @@ mod tests {
             .complete_with_retry(
                 "a test call",
                 CompletionRequest::new("system", &[], &[]),
+                None,
                 &CancellationToken::new(),
                 &CancellationToken::new(),
             )
@@ -1402,6 +1405,7 @@ mod tests {
             .complete_with_retry(
                 "a test call",
                 CompletionRequest::new("system", &[], &[]),
+                None,
                 &cancellation,
                 &cancellation,
             )
@@ -2576,6 +2580,19 @@ mod tests {
         assert!(
             messages.len() > 1,
             "a tail should survive when keep_recent is left unset"
+        );
+        // The tail is written as copies the model reads after the boundary. This conversation
+        // was never saved, so no row holds what they hold, and history says them as the only
+        // record there is.
+        let session = agent.cells().session_id.get().expect("a session");
+        assert_eq!(
+            store.load_view_events(session).await.expect("view").len(),
+            messages.len()
+        );
+        assert_eq!(
+            store.load_history(session).await.expect("history").len(),
+            messages.len(),
+            "the boundary and the copies"
         );
         assert!(
             messages.as_slice()[0]

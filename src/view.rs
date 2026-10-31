@@ -58,7 +58,7 @@ pub(crate) struct SessionView {
     /// The project the session is on; empty for none.
     pub(crate) project: String,
     /// The title a user set, else the first user message's words, whitespace collapsed and cut to
-    /// 80 characters. Empty until either has happened.
+    /// 200 characters. Empty until either has happened.
     pub(crate) title: String,
     /// The session this one was spawned from, for a sub-agent; omitted for a root session.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,6 +216,15 @@ pub(crate) struct AccountView {
     /// Whether the interleaved-thinking beta is sent, when the account states it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) interleaved_thinking: Option<bool>,
+    /// Whether `prompt_cache_key` is sent, when the account states it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_key: Option<bool>,
+    /// Whether a streamed request asks for its usage, when the account states it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stream_usage: Option<bool>,
+    /// The longest tool name the endpoint takes, when the account states it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_tool_name_bytes: Option<usize>,
     /// `yes`, `no`, or `unreadable`: the same three answers as the plain column, because a row
     /// meka cannot deserialize is neither logged in nor logged out.
     pub(crate) authenticated: &'static str,
@@ -232,6 +241,9 @@ impl AccountView {
             oauth_token_url: account.oauth_token_url.clone(),
             client_id: account.client_id.clone(),
             interleaved_thinking: account.interleaved_thinking,
+            prompt_cache_key: account.prompt_cache_key,
+            stream_usage: account.stream_usage,
+            max_tool_name_bytes: account.max_tool_name_bytes,
             authenticated,
         }
     }
@@ -274,6 +286,10 @@ pub(crate) struct ProfileDetailView {
     pub(crate) cache_control: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) thinking_display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) encrypted_reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_summary: Option<bool>,
 }
 
 impl ProfileDetailView {
@@ -308,6 +324,8 @@ impl ProfileDetailView {
             thinking_display: profile
                 .thinking_display
                 .map(|display| display.name().to_string()),
+            encrypted_reasoning: profile.encrypted_reasoning,
+            reasoning_summary: profile.reasoning_summary,
         }
     }
 }
@@ -462,9 +480,13 @@ pub(crate) struct McpToolsResponse {
 pub(crate) struct ScheduledJobView {
     pub(crate) id: String,
     pub(crate) session_id: Uuid,
-    /// Human-readable rendering of the schedule, e.g. `every 30m`, `cron 0 9 * * 1-5`, or an RFC
-    /// 3339 instant for a one-shot.
+    /// Human-readable rendering of the schedule, e.g. `every 30m`, `0 9 * * 1-5 in Asia/Tokyo`,
+    /// or the instant a one-shot fires.
     pub(crate) schedule: String,
+    /// The IANA zone a cron job's pattern is read in; absent for one read in the host machine's
+    /// zone, and for every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) timezone: Option<String>,
     pub(crate) prompt: String,
     /// Present when the job is gated, on a shell command or a tool call.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -518,6 +540,7 @@ impl ScheduledJobView {
             id: job.id.clone(),
             session_id: job.session_id,
             schedule: job.schedule.describe(),
+            timezone: job.schedule.timezone().map(str::to_string),
             prompt: job.prompt.clone(),
             gate: job.gate.as_ref().map(|gate| GateView {
                 check: reveal_command.then(|| gate.probe.summary()),

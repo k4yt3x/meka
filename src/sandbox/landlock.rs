@@ -99,6 +99,34 @@ pub(crate) struct LandlockGrant {
     pub(crate) path: std::ffi::CString,
     pub(crate) allowed: u64,
 }
+/// Where the host's input arrives, which no confined command may read: the pseudo-terminals, the
+/// input devices a keyboard is read from, raw or through the input layer, and the virtual
+/// consoles, their terminals (`/dev/tty0` and on, not the serial ports or `/dev/tty`) and the
+/// screens they echo to (`/dev/vcs*`). Each as it resolves, and only what exists.
+fn host_input() -> Vec<PathBuf> {
+    let mut input: Vec<PathBuf> = ["/dev/pts", "/dev/input"]
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect();
+    let numbered = |name: &str, prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        input.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    (name.len() > "tty".len() && numbered(name, "tty"))
+                        || (name.len() > "hidraw".len() && numbered(name, "hidraw"))
+                        || ["vcs", "vcsa", "vcsu"]
+                            .iter()
+                            .any(|prefix| numbered(name, prefix))
+                })
+        }));
+    }
+    input
+}
 /// The rights a rule on anything but a directory may carry. The kernel answers a rule whose parent
 /// is a regular file and whose rights include a directory-class one with `EINVAL`, and a failed
 /// `add_rule` takes the whole spawn down.
@@ -163,11 +191,17 @@ pub(crate) fn landlock_grants(
         &std::fs::canonicalize(dev_null).unwrap_or_else(|_| dev_null.to_path_buf()),
         LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE,
     );
+    // The host's input is hidden from reads as meka's own directories are: opening another
+    // terminal's pty, or the keyboard's device, takes what is typed there, a password at a prompt
+    // included, from the program it was typed to. A command meka runs has no terminal of its own
+    // (it is started in a session of its own with stdin closed), so nothing it needs is there.
+    let mut hidden_from_reads = private.to_vec();
+    hidden_from_reads.extend(host_input());
     match readable {
-        None => read_grants(&mut grants, Path::new("/"), private),
+        None => read_grants(&mut grants, Path::new("/"), &hidden_from_reads),
         Some(paths) => {
             for path in paths {
-                read_grants(&mut grants, path, private);
+                read_grants(&mut grants, path, &hidden_from_reads);
             }
         }
     }
@@ -739,6 +773,60 @@ mod tests {
         );
     }
 
+    /// A confined command cannot open another terminal's pty, which would take what is typed
+    /// there, at the `read` level or with a workspace, while the rest of `/dev` stays as it was.
+    /// The pty is a real one the test opens, so the kernel is what refuses it.
+    #[test]
+    fn a_confined_command_cannot_read_another_terminal() {
+        let Some(abi) = usable_abi() else {
+            return;
+        };
+        // SAFETY: `posix_openpt`, `grantpt`, `unlockpt` and `ptsname_r` on a descriptor this test
+        // owns, closed at the end.
+        let (master, slave) = unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0, "a pty opens");
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let mut name = [0 as libc::c_char; 128];
+            assert_eq!(libc::ptsname_r(master, name.as_mut_ptr(), name.len()), 0);
+            let slave = std::ffi::CStr::from_ptr(name.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+            (master, slave)
+        };
+        // In a subshell: a failed redirection on `exec` ends the shell that runs it.
+        let open_it = format!("if (exec 3< {slave}) 2>/dev/null; then exit 4; fi; exit 0");
+        assert_eq!(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&open_it)
+                .status()
+                .expect("spawn")
+                .code(),
+            Some(4),
+            "unconfined, the test's own pty opens"
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = crate::workspace::canonical_for_test(temp.path());
+        for (label, writable) in [("read level", vec![]), ("workspace", vec![root])] {
+            let grants = super::landlock_grants(abi, &writable, None, &[], &[]);
+            assert_eq!(
+                confined_exit(abi, grants.clone(), &open_it),
+                Some(0),
+                "{slave} must not open under {label}"
+            );
+            assert_eq!(
+                confined_exit(abi, grants, "head -c 1 /dev/urandom > /dev/null"),
+                Some(0),
+                "the rest of /dev still reads under {label}"
+            );
+        }
+        // SAFETY: the descriptor `posix_openpt` returned above.
+        unsafe { libc::close(master) };
+    }
+
     /// `2>/dev/null` works under Landlock, as it does under Bubblewrap and Seatbelt: discarding
     /// output is not a write to the machine.
     #[test]
@@ -831,7 +919,9 @@ mod tests {
         assert_eq!(grants[&base.join("a/b/other")], handled);
         assert_eq!(grants[&base.join("a/file")], handled & super::ACCESS_FILE);
 
-        // Nothing to hide: one rule on `/` that reads files, one on the root.
+        // Nothing private to hide, and the host's input still is: `/` lists and runs, and every
+        // entry off the way to `/dev/pts`, `/dev/input`, the raw keyboards and the virtual
+        // consoles reads files.
         let plain = by_path(&super::landlock_grants(
             9,
             std::slice::from_ref(&base.join("a")),
@@ -839,12 +929,33 @@ mod tests {
             &[],
             &[],
         ));
+        assert_eq!(plain[&PathBuf::from("/")], read);
+        for on_the_way in [
+            "/dev",
+            "/dev/pts",
+            "/dev/input",
+            "/dev/tty0",
+            "/dev/tty1",
+            "/dev/hidraw0",
+            "/dev/vcs",
+            "/dev/vcsa1",
+        ] {
+            assert!(
+                !plain.contains_key(&PathBuf::from(on_the_way)),
+                "{on_the_way}: {plain:?}"
+            );
+        }
+        if std::path::Path::new("/dev/tty").exists() {
+            assert!(
+                plain.contains_key(&PathBuf::from("/dev/tty")),
+                "the controlling terminal is not another's: {plain:?}"
+            );
+        }
         assert_eq!(
-            plain[&PathBuf::from("/")],
-            read | super::LANDLOCK_ACCESS_FS_READ_FILE
+            plain[&PathBuf::from("/etc")],
+            super::LANDLOCK_ACCESS_FS_READ_FILE
         );
         assert_eq!(plain[&base.join("a")], handled);
-        assert_eq!(plain.len(), 3, "`/dev/null`, `/` and the root: {plain:?}");
 
         // Scratch space: everything but socket resolution.
         let scratch = by_path(&super::landlock_grants(

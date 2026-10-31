@@ -112,6 +112,16 @@ pub(crate) trait Frontend: Send + Sync {
         Delegation::Local
     }
 
+    /// Whether [`Self::delegate_fs_write`] hands a write to the client rather than answering
+    /// [`Delegation::Local`].
+    ///
+    /// Asked before an edit reads, because an edit has to be computed from the file its write
+    /// lands on: a client that serves reads but takes no writes leaves the write on disk, and a
+    /// second edit computed from its buffer would undo the first.
+    fn accepts_fs_writes(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if the frontend has observed that its client is no longer reachable (e.g. an
     /// ACP client has closed its stdio connection, so every `session/update` notification returns
     /// an error). The agent loop checks this at every loop iteration and short-circuits with
@@ -497,9 +507,8 @@ pub(crate) enum FrontendEvent {
         display_summary: Option<String>,
     },
     /// A previously-announced tool call has finished. Emitted once per tool in source order after
-    /// the parallel dispatch settles. The screen impl ignores this today (tool results render
-    /// through the model's next assistant message); the ACP impl translates it to
-    /// `session/update: tool_call_update` with `status: completed | failed`.
+    /// the parallel dispatch settles. The screen closes the call's row with it; the ACP impl
+    /// translates it to `session/update: tool_call_update` with `status: completed | failed`.
     ToolCallCompleted {
         id: String,
         /// Tool name (matches the [`Self::ToolCallStarted`] `name`). Lets a frontend format the
@@ -549,18 +558,16 @@ pub(crate) enum FrontendEvent {
     ContextMeasured { used: u64, window: u64 },
     /// User-visible advisory raised by meka itself or by the provider layer (e.g. image redaction
     /// when the request body would exceed the API limit). The terminal frontends render it in the
-    /// color its [`NoticeLevel`] asks for; `AcpFrontend` forwards it as an `AgentMessageChunk`
-    /// with a `[meka] ` or `[meka warn] ` prefix so the editor's transcript records the
-    /// side-effect; the HTTP and one-shot JSON surfaces carry it as a [`NoticeView`].
-    /// `SilentFrontend` drops it.
+    /// color its [`NoticeLevel`] asks for; `AcpFrontend` sends it as a `notice` to a client that
+    /// advertised `session.notices`, and otherwise as an `AgentMessageChunk` with a `[meka] ` or
+    /// `[meka warn] ` prefix so the editor's transcript records the side-effect; the HTTP and
+    /// one-shot JSON surfaces carry it as a [`NoticeView`]. `SilentFrontend` drops it.
     Notice(crate::frontend::Notice),
     /// Incremental progress from an in-flight MCP tool (`notifications/progress`). Routed
     /// per-session via the frontend the MCP call registered with its progress token. See
     /// [`crate::mcp::progress::ProgressRegistry`]. The screen shows it under the running call's
-    /// row and the one-shot as an inline status line; `HttpFrontend` streams it as a `progress`
-    /// SSE event;
-    /// `AcpFrontend` logs at `info!` today (no protocol primitive yet). `SilentFrontend` drops
-    /// them.
+    /// row; `HttpFrontend` streams it as a `progress` SSE event; `AcpFrontend` logs it at `info!`,
+    /// having no protocol primitive for it; the one-shot and `SilentFrontend` drop it.
     McpProgress(crate::frontend::ProgressUpdate),
     /// A compaction began: the checkpoint turn or the summarizer is about to run, which can take
     /// a while, and the event that next names `id` says how it ended. Emitted for every
@@ -652,6 +659,11 @@ pub(crate) struct PermissionRequest {
     /// round-trip against this so a `session/cancel` during an approval prompt resolves promptly
     /// instead of hanging until the client replies.
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
+    /// The tool call the prompt is about, as this frontend announced it: the call's own id for
+    /// the session's call, and for a sub-agent's, the parent's `agent_spawn` call it runs under,
+    /// which is the one the parent's client has shown. Each forwarding adapter sets its own, so
+    /// the outermost, the one the client knows, is what arrives. `None` where no call is in scope.
+    pub(crate) tool_call_id: Option<String>,
     /// The sub-agent whose call this is, when the request reaches a frontend through its
     /// parent's. `None` for the session's own call. Set by the innermost forwarding adapter, so a
     /// grandchild's prompt names the grandchild.
@@ -802,6 +814,9 @@ impl Frontend for PermissionForwardingFrontend {
         if request.subagent_id.is_none() {
             request.subagent_id = self.subagent_id;
         }
+        if let Some(spawn_call) = &self.tool_call_id {
+            request.tool_call_id = Some(spawn_call.clone());
+        }
         self.delegate.request_permission(request).await
     }
 
@@ -816,6 +831,10 @@ impl Frontend for PermissionForwardingFrontend {
 
     async fn delegate_fs_write(&self, path: &Path, content: &str) -> Delegation<()> {
         self.delegate.delegate_fs_write(path, content).await
+    }
+
+    fn accepts_fs_writes(&self) -> bool {
+        self.delegate.accepts_fs_writes()
     }
 
     /// Forwarded for the same reason as [`Self::request_permission`]: an MCP server called from a
@@ -840,7 +859,7 @@ impl Frontend for PermissionForwardingFrontend {
 
 /// Fully-silent frontend: drops every emit and denies every permission request. Used by tests and
 /// `meka tool list`'s reference registry. Both want a frontend that never reaches out to a user.
-/// Sub-agents use [`PermissionForwardingFrontend`] instead so their permission prompts surface in
+/// Sub-agents use [`PermissionForwardingFrontend`] instead so their approval prompts surface in
 /// the parent's UI.
 pub(crate) struct SilentFrontend;
 
@@ -1170,6 +1189,7 @@ mod tests {
                 primary_param: Some("/tmp/foo".to_string()),
                 input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                tool_call_id: None,
                 subagent_id: None,
             })
             .await;
@@ -1307,6 +1327,7 @@ mod tests {
                 primary_param: Some("rm -rf /".to_string()),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                tool_call_id: None,
                 subagent_id: None,
             })
             .await;
@@ -1629,6 +1650,7 @@ mod tests {
                 primary_param: Some("/tmp/foo".into()),
                 input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                tool_call_id: None,
                 subagent_id: None,
             })
             .await;
@@ -1704,6 +1726,10 @@ mod tests {
                 .take()
                 .unwrap_or(Delegation::Local)
         }
+
+        fn accepts_fs_writes(&self) -> bool {
+            true
+        }
     }
 
     #[tokio::test]
@@ -1737,5 +1763,9 @@ mod tests {
             PathBuf::from("/tmp/sub.txt"),
             "hi from sub-agent".to_string()
         )]);
+        assert!(
+            forwarder.accepts_fs_writes(),
+            "a sub-agent's edits read from where its writes land, as the parent's do"
+        );
     }
 }

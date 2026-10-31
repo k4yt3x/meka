@@ -151,8 +151,8 @@ impl Agent {
         }
         if chain.len() > 1 {
             tracing::warn!(
-                "every profile in the chain ({}) refused this turn; it fails on '{failed}'",
-                chain.join(", ")
+                "every profile in the chain ({chain}) refused this turn; it fails on '{failed}'",
+                chain = chain.join(", ")
             );
         }
         false
@@ -194,15 +194,27 @@ impl Agent {
         &self,
         what: &str,
         request: CompletionRequest<'_>,
+        // The tools to send once a fallback binds another profile, whose wire may carry another
+        // set, or carry its deferred tools another way; `None` for a request that carries none.
+        rebuild: Option<&(dyn Fn() -> crate::tools::ActiveTools + Sync)>,
         cancellation: &CancellationToken,
         attempt_cancellation: &CancellationToken,
     ) -> Result<crate::provider::Completion> {
         let mut started = std::time::Instant::now();
         let mut retries = 0_u32;
+        let mut rebuilt: Option<crate::tools::ActiveTools> = None;
         loop {
             let provider: Arc<dyn crate::provider::Provider> = self.provider();
+            let attempt = match &rebuilt {
+                Some(active) => CompletionRequest {
+                    tools: &active.definitions,
+                    deferred_tools: &active.deferred_definitions,
+                    ..request.clone()
+                },
+                None => request.clone(),
+            };
             match provider
-                .complete(request.clone(), attempt_cancellation.clone())
+                .complete(attempt, attempt_cancellation.clone())
                 .await
             {
                 Ok(completed) => {
@@ -218,15 +230,16 @@ impl Agent {
                         if self.fall_back(&error, false).await {
                             started = std::time::Instant::now();
                             retries = 0;
+                            rebuilt = rebuild.map(|rebuild| rebuild());
                             continue;
                         }
                         return Err(error);
                     };
                     let ceiling = crate::provider::retry::MAX_PROVIDER_RETRIES;
                     tracing::warn!(
-                        "{what} failed transiently (attempt {}/{ceiling}), retrying in {delay:?}: \
+                        "{what} failed transiently (attempt {attempt}/{ceiling}), retrying in {delay:?}: \
                          {error}",
-                        retries + 1
+                        attempt = retries + 1
                     );
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
@@ -271,6 +284,14 @@ mod tests {
         main_rounds: Vec<Vec<MockEvent>>,
         backup_rounds: Vec<Vec<MockEvent>>,
     ) -> Family {
+        family_over(
+            MockProvider::from_rounds(main_rounds),
+            MockProvider::from_rounds(backup_rounds),
+        )
+        .await
+    }
+
+    async fn family_over(main: MockProvider, backup: MockProvider) -> Family {
         let store = Store::for_test().await;
         let account = |name: &str| {
             (name.to_string(), crate::config::AccountConfig {
@@ -293,8 +314,8 @@ mod tests {
                 .collect(),
             store.token_store(),
         ));
-        let main = Arc::new(MockProvider::from_rounds(main_rounds));
-        let backup = Arc::new(MockProvider::from_rounds(backup_rounds));
+        let main = Arc::new(main);
+        let backup = Arc::new(backup);
         providers.install_scripted_for(
             "main",
             Arc::clone(&main) as Arc<dyn crate::provider::Provider>,
@@ -422,6 +443,70 @@ mod tests {
                 .any(|text| text == "Profile 'main' is unavailable; this turn runs on 'backup'."),
             "{:?}",
             notices(&family)
+        );
+    }
+
+    /// A tool that exists to be carried or not.
+    struct Probe;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for Probe {
+        fn definition(&self) -> crate::provider::ToolDefinition {
+            crate::provider::ToolDefinition {
+                name: "probe_inspect".to_string(),
+                description: "probe".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                title: None,
+                annotations: None,
+                meta: None,
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolOutput> {
+            Ok(crate::tools::ToolOutput::text("probed".to_string(), false))
+        }
+    }
+
+    /// A fallback onto a wire that refuses a tool the failed profile's wire carried sends what the
+    /// serving wire carries, not the request built for the profile that failed.
+    #[tokio::test]
+    async fn a_fallback_sends_the_tools_the_serving_wire_carries() {
+        let family = family_over(
+            MockProvider::from_rounds(vec![exhausted()]),
+            MockProvider::from_rounds(vec![answer("from backup")]).refusing("probe_inspect"),
+        )
+        .await;
+        family
+            .agent
+            .tool_registry
+            .register(Arc::new(Probe))
+            .expect("register");
+        family
+            .agent
+            .tool_registry
+            .publish_profile(&family.agent.cells().profile);
+        run(&family).await.expect("the fallback answers");
+        let carried = |streams: Vec<crate::provider::mock::StreamRequest>| -> Vec<String> {
+            streams
+                .last()
+                .expect("a request")
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect()
+        };
+        assert!(carried(family.main.streams()).contains(&"probe_inspect".to_string()));
+        assert!(
+            !carried(family.backup.streams()).contains(&"probe_inspect".to_string()),
+            "the fallback was sent a tool its wire refuses"
         );
     }
 
@@ -627,7 +712,7 @@ mod tests {
         let request = CompletionRequest::new("system", &[], &[]);
         family
             .agent
-            .complete_with_retry("a test call", request.clone(), &token, &token)
+            .complete_with_retry("a test call", request.clone(), None, &token, &token)
             .await
             .expect("the fallback completes");
         assert_eq!(family.agent.serving_fallback().as_deref(), Some("backup"));
@@ -662,6 +747,7 @@ mod tests {
             .complete_with_retry(
                 "a test call",
                 CompletionRequest::new("system", &[], &[]),
+                None,
                 &token,
                 &token,
             )

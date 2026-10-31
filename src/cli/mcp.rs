@@ -156,7 +156,7 @@ fn report_orphaned_credentials(orphans: &[String]) -> Result<()> {
     ));
     // The action only: deleting the entry by hand is the usual cause, but a rollback that itself
     // failed leaves the same trace, so a hint naming one cause would mislead the other.
-    crate::render::render_hint("delete one with `meka mcp remove <name>`");
+    crate::render::render_hint("Delete one with `meka mcp remove <name>`.");
     Ok(())
 }
 
@@ -635,9 +635,10 @@ async fn probe_then_login(
         probe_and_announce(&resolved.name, &expansion.text).await
     } else {
         tracing::warn!(
-            "skipping the auth probe of '{}': its URL names {:?}, which this shell does not supply",
-            resolved.name,
-            [expansion.missing, expansion.malformed].concat()
+            "skipping the auth probe of '{name}': its URL names {variables:?}, which this shell does not \
+             supply",
+            name = resolved.name,
+            variables = [expansion.missing, expansion.malformed].concat()
         );
         ProbeOutcome::Inconclusive
     };

@@ -6,7 +6,7 @@ use super::*;
 /// `[serve]` table: HTTP server config for `meka serve`. All fields optional with sensible
 /// defaults, but at least one `[[serve.tokens]]` entry is required; the server refuses to start
 /// without one.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServeConfig {
     /// Listen address. Default `127.0.0.1:8080`: bind to loopback so a fresh deploy isn't
@@ -34,9 +34,9 @@ pub(crate) struct ServeConfig {
     /// carries.
     ///
     /// **What it can expose.** Usually the upstream's response body, which can name the
-    /// *operator's* provider account and its rate-limit posture. Not always, though: the member
-    /// carries the failing call's error message, and for some failures that is meka's own sentence
-    /// about the call rather than anything the provider sent.
+    /// *operator's* account with the provider and its rate-limit posture. Not always, though: the
+    /// member carries the failing call's error message, and for some failures that is meka's own
+    /// sentence about the call rather than anything the provider sent.
     ///
     /// **Who can read it.** `sessions:r`, not just `sessions:w`. Submitting a turn takes the write
     /// scope, but the failure also rides the terminal `turn.failed` event, and `GET
@@ -57,11 +57,12 @@ pub(crate) struct ServeConfig {
     /// Process-wide cap on concurrent in-flight turns across all sessions. None = unbounded
     /// (default). Returns 429 with `concurrency-limit` when exceeded.
     pub(crate) max_concurrent_turns: Option<usize>,
-    /// How many SSE events per turn to retain so a client reconnecting with `Last-Event-ID` can
-    /// replay what it missed. Default 256, matching the live broadcast channel's capacity.
+    /// How many of a session feed's latest SSE events to retain so a client reconnecting with
+    /// `Last-Event-ID` can replay what it missed. Default 256, matching the live broadcast
+    /// channel's capacity.
     ///
-    /// Raising it buys a longer reconnect window at the cost of holding more per-session memory
-    /// during a turn; `0` switches replay off, so a reconnect gets only what happens from then on.
+    /// Raising it buys a longer reconnect window at the cost of more memory per resident session;
+    /// `0` switches replay off, so a reconnect gets only what happens from then on.
     pub(crate) stream_replay_events: Option<usize>,
     /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
     /// reconnect. Accepts humantime strings like `"30s"`. Default `"30s"`.

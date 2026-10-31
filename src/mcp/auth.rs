@@ -278,7 +278,7 @@ impl RevocationRequest {
         // which would let a MITM send the metadata fetch to an attacker host and the access
         // token after it, so redirects are off, the body is size-capped, and
         // `revocation_endpoint` is pinned to the issuer's origin.
-        const METADATA_BODY_CAP: usize = 256 * crate::text::KIB;
+        const MAX_METADATA_BODY_BYTES: usize = 256 * crate::text::KIB;
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -296,10 +296,10 @@ impl RevocationRequest {
             // Bounded as it arrives rather than after: Content-Length is server-supplied, and a
             // body read whole before the cap is checked is a body the cap did not
             // bound.
-            let Some(bytes) = read_bounded(response, METADATA_BODY_CAP).await else {
+            let Some(bytes) = read_bounded(response, MAX_METADATA_BODY_BYTES).await else {
                 continue;
             };
-            if let Some(endpoint) = extract_revocation_endpoint(&bytes, METADATA_BODY_CAP) {
+            if let Some(endpoint) = extract_revocation_endpoint(&bytes, MAX_METADATA_BODY_BYTES) {
                 revocation_endpoint = Some(endpoint);
                 break;
             }
@@ -962,12 +962,6 @@ async fn authenticate_oauth_authorization_code(
         })
 }
 
-/// The most of one HTTP callback request that is read before it is dropped. Large enough for big
-/// `Cookie:` headers (which can exceed 4 KiB), small enough to cap a resource-exhaustion attempt.
-const CALLBACK_READ_CAP: usize = 64 * crate::text::KIB;
-/// End-of-headers marker for HTTP/1.x.
-const CRLF_CRLF: &[u8] = b"\r\n\r\n";
-
 /// What an authorization response carries back (RFC 6749 section 4.1.2, RFC 9207): the code, the
 /// `state` that ties it to this login, and the issuer that sent it, when it says.
 #[derive(Debug, PartialEq, Eq)]
@@ -1029,7 +1023,7 @@ async fn accept_http_callback(
     expected_state: Option<&str>,
     overall_deadline: tokio::time::Instant,
 ) -> std::result::Result<OAuthCallback, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     loop {
         let remaining = overall_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1052,52 +1046,28 @@ async fn accept_http_callback(
             Ok(Ok(pair)) => pair,
         };
 
-        // Read to the end of the request headers or to the byte cap. A browser may send favicon
-        // or preflight requests to the callback origin; a path other than `/callback?...` gets a
-        // 404 so it stops retrying, and the wait continues.
-        let mut buffer = Vec::with_capacity(4096);
-        let mut temp = [0u8; 4096];
-        let headers_complete = loop {
-            if buffer.windows(CRLF_CRLF.len()).any(|w| w == CRLF_CRLF) {
-                break true;
-            }
-            if buffer.len() >= CALLBACK_READ_CAP {
-                break false;
-            }
-            let read_remaining =
-                overall_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if read_remaining.is_zero() {
+        // A browser may send favicon or preflight requests to the callback origin; a path other
+        // than `/callback?...` gets a 404 so it stops retrying, and the wait continues.
+        let buffer = match crate::oauth::read_callback_request(&mut stream, overall_deadline).await
+        {
+            None => {
                 return Err(format!(
                     "authorization timed out after {}s",
                     OAUTH_CALLBACK_TIMEOUT.as_secs()
                 ));
             }
-            match tokio::time::timeout(read_remaining, stream.read(&mut temp)).await {
-                Err(_) => {
-                    return Err(format!(
-                        "authorization timed out after {}s",
-                        OAUTH_CALLBACK_TIMEOUT.as_secs()
-                    ));
+            Some(crate::oauth::CallbackRequest::Abandoned) => continue,
+            Some(crate::oauth::CallbackRequest::Oversized) => {
+                tracing::debug!("OAuth callback: dropped a request with oversized headers");
+                if let Err(error) = stream
+                    .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await {
+                    tracing::debug!("failed to answer the callback client: {error}");
                 }
-                Ok(Err(error)) => return Err(format!("failed to read request: {error}")),
-                Ok(Ok(0)) => break buffer.windows(CRLF_CRLF.len()).any(|w| w == CRLF_CRLF),
-                Ok(Ok(n)) => buffer.extend(temp.iter().take(n)),
+                continue;
             }
+            Some(crate::oauth::CallbackRequest::Head(buffer)) => buffer,
         };
-
-        if !headers_complete {
-            tracing::debug!(
-                "OAuth callback: dropped request with incomplete/oversized headers \
-                 ({buffer} bytes)",
-                buffer = buffer.len()
-            );
-            if let Err(error) = stream
-                .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await {
-                tracing::debug!("failed to answer the callback client: {error}");
-            }
-            continue;
-        }
 
         let request = String::from_utf8_lossy(&buffer);
         match parse_callback_query(&request) {
@@ -1157,6 +1127,14 @@ async fn accept_http_callback(
                     .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                     .await {
                     tracing::debug!("failed to answer the callback client: {error}");
+                }
+                // Ends the login only when it is this login's answer: an error or a missing code
+                // under another state, or none, is anyone's to send.
+                if expected_state.is_some_and(|expected| {
+                    crate::oauth::callback_state(&request).as_deref() != Some(expected)
+                }) {
+                    tracing::warn!("OAuth callback without this login's state; still waiting");
+                    continue;
                 }
                 return Err(message);
             }
@@ -1404,6 +1382,19 @@ impl SqliteCredentialStore {
 
 #[async_trait]
 impl CredentialStore for SqliteCredentialStore {
+    /// Held across rmcp's load, token request and save, so two meka processes on one server do not
+    /// both spend its refresh token, which an issuer that rotates them refuses as reuse: the second
+    /// loads what the first stored and refreshes from that.
+    async fn acquire_refresh_guard(
+        &self,
+    ) -> std::result::Result<Option<rmcp::transport::auth::CredentialRefreshGuard>, AuthError> {
+        Ok(
+            crate::oauth::await_mcp_credential_lock(&self.token_store, &self.server_name)
+                .await
+                .map(rmcp::transport::auth::CredentialRefreshGuard::new),
+        )
+    }
+
     async fn load(&self) -> std::result::Result<Option<StoredCredentials>, AuthError> {
         match self
             .token_store
@@ -1708,6 +1699,46 @@ mod tests {
         assert!(
             !same_origin("not a url", "https://a.example"),
             "a URL is never the same origin as a string that is not one"
+        );
+    }
+
+    /// A refresh holds the server's credential lock from rmcp's load to its save, so another
+    /// process's refresh of the same server waits rather than spending the same refresh token; a
+    /// different server's is not held up.
+    #[tokio::test]
+    async fn a_refresh_holds_the_server_s_credential_lock() {
+        let store = crate::store::Store::for_test().await;
+        let token_store = store.token_store();
+        let adapter = SqliteCredentialStore {
+            token_store: token_store.clone(),
+            server_name: "docs".to_string(),
+            endpoint: "https://docs.example/mcp".to_string(),
+            last_read: std::sync::Arc::new(std::sync::Mutex::new(LastRead::Nothing)),
+        };
+        let guard = adapter
+            .acquire_refresh_guard()
+            .await
+            .expect("guard")
+            .expect("the lock is free");
+        assert!(
+            token_store
+                .try_lock_mcp_credential("docs")
+                .expect("ask")
+                .is_none(),
+            "another refresh of the server got in"
+        );
+        assert!(
+            token_store
+                .try_lock_mcp_credential("other")
+                .expect("ask")
+                .is_some()
+        );
+        drop(guard);
+        assert!(
+            token_store
+                .try_lock_mcp_credential("docs")
+                .expect("ask")
+                .is_some()
         );
     }
 

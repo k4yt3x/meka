@@ -28,8 +28,8 @@ model   = "claude-opus-5-5"
 ```
 
 See [Config file](./config-file.md) for the full reference and the
-[`meka account`](./config-file.md#meka-account-cli) and
-[`meka profile`](./config-file.md#meka-profile-cli) command suites.
+[`meka account`](../usage/accounts-and-profiles.md#meka-account-cli) and
+[`meka profile`](../usage/accounts-and-profiles.md#meka-profile-cli) command suites.
 
 ## Required settings
 
@@ -107,7 +107,7 @@ subscriptions) keep independent credentials, and every profile on one account sh
 Deleting an `[accounts.<name>]` block by hand removes the settings but not the secret, which stays in
 the store under that name. `meka account list` names any credential left that way, and `meka
 account remove <name>` deletes it; see [Leftover
-credentials](./config-file.md#leftover-credentials).
+credentials](../usage/accounts-and-profiles.md#leftover-credentials).
 
 ## Why some settings have no config key
 
@@ -145,8 +145,10 @@ Two consequences worth knowing:
 Restart the server to pick either up, or ask `meka serve` to read the file again with
 [`POST /v1/config/reload`](../usage/http-api.md#managing-the-installation), which applies the
 accounts, profiles, MCP server entries and `instructions.md` as they stand, with `[thinking]` and
-`[session].context_window`, which complete the profiles, and an MCP server's credentials a shell
-stored, and nothing else: not the `[mcp]` table's own keys, nor any other section. Its answer, and `GET /v1/config`, name in `restart_required` the sections the file has
+`[session].context_window`, which complete the profiles, an MCP server's credentials a shell
+stored, and `[[serve.tokens]]`, and nothing else: not the `[mcp]` table's own keys, nor any other
+section. A token removed or rescoped there applies to the next request, and a stream it holds
+open ends once the token no longer grants what the stream reads. Its answer, and `GET /v1/config`, name in `restart_required` the sections the file has
 changed since the server started that only a restart applies, and a reload refuses a file the
 server could not start on, naming the setting. Everything else follows a live source and needs
 no restart: skills are re-read per turn, memories per turn, and MCP tool lists follow the server.

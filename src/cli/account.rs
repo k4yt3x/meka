@@ -7,9 +7,9 @@ use crate::{
     cli::AccountAction,
     config,
     installation::account::{
-        CredentialKind, LoginTerms, NewAccount, OAuthSettings, account_views, add_account,
-        browser_login, commit_login, credential_kind, orphaned_accounts, remove_account,
-        rename_account, validate_backend,
+        CredentialKind, EndpointSettings, LoginTerms, NewAccount, OAuthSettings, account_views,
+        add_account, browser_login, commit_login, credential_kind, orphaned_accounts,
+        remove_account, rename_account, validate_backend,
     },
     store::{AuthCredential, TokenStore},
 };
@@ -33,6 +33,9 @@ pub(crate) async fn run(
             oauth_token_url,
             client_id,
             interleaved_thinking,
+            prompt_cache_key,
+            stream_usage,
+            max_tool_name_bytes,
             api_key_stdin,
         } => {
             run_add(
@@ -43,7 +46,12 @@ pub(crate) async fn run(
                     oauth_token_url: oauth_token_url.clone(),
                     client_id: client_id.clone(),
                 },
-                *interleaved_thinking,
+                EndpointSettings {
+                    interleaved_thinking: *interleaved_thinking,
+                    prompt_cache_key: *prompt_cache_key,
+                    stream_usage: *stream_usage,
+                    max_tool_name_bytes: *max_tool_name_bytes,
+                },
                 *api_key_stdin,
                 token_store,
             )
@@ -69,7 +77,7 @@ async fn run_add(
     backend_flag: Option<&str>,
     base_url_flag: Option<String>,
     settings_flags: OAuthSettings,
-    interleaved_thinking: Option<bool>,
+    endpoint: EndpointSettings,
     api_key_stdin: bool,
     token_store: &TokenStore,
 ) -> anyhow::Result<()> {
@@ -117,7 +125,7 @@ async fn run_add(
         backend,
         base_url: None,
         settings: &settings_flags,
-        interleaved_thinking,
+        endpoint,
     })?;
 
     let base_url = match base_url_flag {
@@ -169,7 +177,7 @@ async fn run_add(
             backend,
             base_url: base_url.as_deref(),
             settings: &settings,
-            interleaved_thinking,
+            endpoint,
         },
         Some(&credential),
         token_store,
@@ -311,7 +319,7 @@ pub(super) fn report_unknown_backends(config_file: &config::ConfigFile) {
         crate::streams::write_stderr_line("");
         crate::streams::write_stderr_line(format!("Account '{name}': {error}"));
         crate::render::render_hint(&format!(
-            "set `backend` under `[accounts.{name}]` to one of those"
+            "Set `backend` under `[accounts.{name}]` to one of those."
         ));
     }
 }
@@ -331,7 +339,7 @@ fn report_orphaned_accounts(orphans: &[String]) -> anyhow::Result<()> {
     // The action only. Deleting the block by hand is the usual cause, but an `add` that stored the
     // secret and then failed to write the account leaves the same trace, so a hint that named one
     // cause would send that user looking for an edit they never made.
-    crate::render::render_hint("delete one with `meka account remove <name>`");
+    crate::render::render_hint("Delete one with `meka account remove <name>`.");
     Ok(())
 }
 
@@ -1019,7 +1027,10 @@ mod tests {
             Some("openai-responses"),
             None,
             OAuthSettings::default(),
-            Some(false),
+            EndpointSettings {
+                interleaved_thinking: Some(false),
+                ..EndpointSettings::default()
+            },
             true,
             &store,
         )
@@ -1032,7 +1043,7 @@ mod tests {
                 oauth_token_url: None,
                 client_id: Some("mine".to_string()),
             },
-            None,
+            EndpointSettings::default(),
             true,
             &store,
         )
@@ -1067,7 +1078,7 @@ mod tests {
             Some("claude-subscription"),
             None,
             OAuthSettings::default(),
-            None,
+            EndpointSettings::default(),
             true,
             &store,
         )
@@ -1101,7 +1112,7 @@ mod tests {
             Some("chatgpt-subscription"),
             Some("https://chatgpt.com/backend-api".to_string()),
             OAuthSettings::default(),
-            None,
+            EndpointSettings::default(),
             false,
             &store,
         )

@@ -33,10 +33,10 @@ Fetch a web page and return its content as markdown text.
 If the response `Content-Type` is a supported raster image format, `web_fetch` returns a multimodal `Image` content block instead of markdown. No disk is touched; bytes are base64-encoded in memory.
 
 **Provider-native formats** (passed through unchanged):
-- `image/png`, `image/jpeg` (and `image/jpg`), `image/gif`, `image/webp`, `image/bmp` (and `image/x-ms-bmp`)
+- `image/png`, `image/jpeg` (and `image/jpg`), `image/gif`, `image/webp`
 
 **Convertible formats** (decoded and re-encoded as PNG transparently):
-- `image/tiff`, `image/vnd.microsoft.icon` / `image/x-icon`, `image/vnd.radiance` (HDR), `image/x-exr`, `image/x-targa`, `image/x-portable-*` (PNM), `image/qoi`, `image/vnd.ms-dds`, `image/x-farbfeld`
+- `image/bmp` (and `image/x-ms-bmp`), `image/tiff`, `image/vnd.microsoft.icon` / `image/x-icon`, `image/vnd.radiance` (HDR), `image/x-exr`, `image/x-targa`, `image/x-portable-*` (PNM), `image/qoi`, `image/vnd.ms-dds`, `image/x-farbfeld`
 
 **Unsupported formats** (fall through to the text branch): `image/svg+xml`, `image/jxl`, `image/heic`, `image/avif`.
 

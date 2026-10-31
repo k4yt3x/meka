@@ -189,6 +189,13 @@ const PROFILE_BODY: &str = r#"
 (allow sysctl-read
   (sysctl-name-regex #"^net.routetable"))
 "#;
+/// The host's terminals, refused to every confinement but the ptys a command opened itself.
+const HOST_TERMINALS_RULE: &str = r#"
+(deny file-read* file-write*
+  (require-all
+    (regex #"^/dev/ttys[0-9]+$")
+    (require-not (extension "com.apple.sandbox.pty"))))
+"#;
 /// Build the SBPL profile and the `-D` parameter arguments for one confinement.
 ///
 /// The read-only profile is used verbatim when `writable` is empty and reads are unconfined. With
@@ -257,6 +264,27 @@ pub(crate) fn sandbox_profile_for(
         let key = format!("MEKA_PRIVATE_{index}");
         profile.push_str(&format!(
             "\n(deny file-read* file-write* file-test-existence (subpath (param \"{key}\")))\n"
+        ));
+        let mut param = std::ffi::OsString::from(&key);
+        param.push("=");
+        param.push(directory.as_os_str());
+        params.push(std::ffi::OsString::from("-D"));
+        params.push(param);
+    }
+    // Another terminal's pty, after the global read allow it would otherwise fall under: reading
+    // it takes what is typed there, a password at a prompt included. A pty the command opened
+    // itself carries the sandbox's extension and stays its own.
+    profile.push_str(HOST_TERMINALS_RULE);
+    // The directories between a writable root and a private directory under it, each as itself
+    // and not what it holds: the denies above name paths, so a command that renamed `~/Library`
+    // would carry the store out from under them for every command after it.
+    for (index, directory) in crate::workspace::pinned_ancestors(writable, private)
+        .iter()
+        .enumerate()
+    {
+        let key = format!("MEKA_PINNED_{index}");
+        profile.push_str(&format!(
+            "\n(deny file-write* (literal (param \"{key}\")))\n"
         ));
         let mut param = std::ffi::OsString::from(&key);
         param.push("=");

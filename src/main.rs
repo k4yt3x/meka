@@ -111,6 +111,8 @@ fn main() -> anyhow::Result<()> {
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_writer(relay::RELAY.clone())
+                    // Colored for a terminal alone: a redirected stderr would keep the escapes.
+                    .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
                     .with_filter(build_log_filter(rust_log.as_deref(), log_level)),
             )
             .with(
@@ -119,6 +121,10 @@ fn main() -> anyhow::Result<()> {
             )
             .init();
     }
+
+    // Before anything reads either directory: a relative override would otherwise be dropped for
+    // the real one, its store and its credentials.
+    crate::paths::refuse_relative_overrides().map_err(anyhow::Error::msg)?;
 
     // Multi-threaded, and one caller depends on that rather than merely preferring it:
     // `GateToolset::resolve` answers a scheduled gate's authority question synchronously and blocks
@@ -237,6 +243,10 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                             .starting_at(&permission.to_string())
                             .binding_mcp_credentials_to(installation::mcp::endpoints_of(
                                 &file.mcp_servers(),
+                            ))
+                            .sealing_chatgpt_reasoning_at(provider::chatgpt_reasoning_origins(
+                                &file.accounts,
+                                &file.profiles,
                             ));
                         (
                             Some((adopted, file.profiles)),
@@ -345,6 +355,19 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
             (cli.continue_last, "--continue"),
             (cli.resume.is_some(), "--resume"),
             (cli.project.is_some(), "--project"),
+            (cli.prompt.is_some(), "--prompt"),
+            (cli.skill.is_some(), "--skill"),
+            (cli.oneshot, "--oneshot"),
+            // ACP applies the directory flags to every session it opens; an HTTP session is
+            // confined to its own `working_directory` and would never read them.
+            (
+                serve_mode && !cli.additional_workspace_directory.is_empty(),
+                "--additional-workspace-directory",
+            ),
+            (
+                serve_mode && !cli.additional_readable_directory.is_empty(),
+                "--additional-readable-directory",
+            ),
         ]
         .into_iter()
         .filter_map(|(given, flag)| given.then_some(flag))
@@ -354,6 +377,20 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
             // `session/load` and picks a project through a config option, where an HTTP client
             // names the session in the path and the project on the create.
             let remedies = [
+                (
+                    cli.prompt.is_some() || cli.skill.is_some() || cli.oneshot,
+                    if acp_mode {
+                        "a turn is the editor's `session/prompt`"
+                    } else {
+                        "a turn is `POST /v1/sessions/{id}/turn`"
+                    },
+                ),
+                (
+                    serve_mode
+                        && (!cli.additional_workspace_directory.is_empty()
+                            || !cli.additional_readable_directory.is_empty()),
+                    "a session's directory is `working_directory` on `POST /v1/sessions`",
+                ),
                 (
                     cli.continue_last || cli.resume.is_some(),
                     if acp_mode {
@@ -385,19 +422,14 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     let mut config = ResolvedConfig::resolve(cli.overrides());
 
     // If --skill is set, validate and render the body upfront so an invalid name fails fast
-    // before any session/MCP setup. The combined string (extra + body, mirroring the screen's
-    // `/skill <name> [extra...]`) then takes the place of cli.prompt as the first-turn input.
-    // Resolved config comes first because `[skills] additional_directories` decides which roots the
-    // lookup sees.
-    let skill_prompt = runtime.block_on(host::build_skill_prompt(
+    // before any session/MCP setup. The invocation, `--prompt` as its directive, then takes the
+    // place of the prompt as the first turn's input. Resolved config comes first because
+    // `[skills] additional_directories` decides which roots the lookup sees.
+    let skill_invocation = runtime.block_on(host::build_skill_invocation(
         cli.skill.as_deref(),
         cli.prompt.as_deref(),
         &config.skill_roots(),
     ))?;
-
-    if let Some(prompt) = skill_prompt {
-        config.request.prompt = Some(prompt);
-    }
     // `--bind` on `meka serve` overrides the config-file `[serve].bind`. Apply here so
     // `async_main` sees a single resolved binding without re-parsing the CLI.
     if let Some(cli::Command::Serve { bind: Some(bind) }) = cli.command.as_ref() {
@@ -407,7 +439,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     // the one-shot's approval refusal sits several call sites below `run_oneshot`, which takes flat
     // scalars; the functions that compose a line still take an explicit width, so tests never
     // touch it.
-    runtime.block_on(async_main(config, acp_mode, serve_mode))
+    runtime.block_on(async_main(config, skill_invocation, acp_mode, serve_mode))
 }
 
 /// Build the `tracing` filter for meka.
@@ -483,6 +515,7 @@ fn build_screen_log_filter(
 
 async fn async_main(
     config: ResolvedConfig,
+    skill_invocation: Option<conversation::ContentBlock>,
     acp_mode: bool,
     serve_mode: bool,
 ) -> anyhow::Result<()> {
@@ -497,7 +530,11 @@ async fn async_main(
         None,
         &store::migrations::Context::adopting(config.configured_default_profile.as_deref())
             .starting_at(&config::default_permission_on_disk()?.to_string())
-            .binding_mcp_credentials_to(installation::mcp::endpoints_of(&config.mcp_servers)),
+            .binding_mcp_credentials_to(installation::mcp::endpoints_of(&config.mcp_servers))
+            .sealing_chatgpt_reasoning_at(provider::chatgpt_reasoning_origins(
+                &config.accounts,
+                &config.profiles,
+            )),
     )
     .await?;
     let token_store = store.token_store();
@@ -544,17 +581,24 @@ async fn async_main(
         return host::acp::run_acp(config, store, mcp_manager).await;
     }
 
+    // What the run opens with: the invocation `--skill` named, else the words `--prompt` gave.
+    let opening = skill_invocation.or_else(|| {
+        config
+            .request
+            .prompt
+            .clone()
+            .map(|text| conversation::ContentBlock::Text { text })
+    });
     if config.request.oneshot {
         // Startup already refused `--oneshot` without a prompt or `--skill`; this is the same
         // refusal for a request that arrived by another route, in place of a panic.
-        let Some(prompt) = config.request.prompt.clone() else {
+        let Some(opening) = opening else {
             anyhow::bail!("`--oneshot` requires `--prompt` or `--skill`");
         };
-        return host::oneshot::run_oneshot(config, store, prompt, mcp_manager).await;
+        return host::oneshot::run_oneshot(config, store, opening, mcp_manager).await;
     }
 
-    let initial_prompt = config.request.prompt.clone();
-    host::tui::run_interactive(config, store, token_store, initial_prompt, mcp_manager).await
+    host::tui::run_interactive(config, store, token_store, opening, mcp_manager).await
 }
 
 #[cfg(test)]

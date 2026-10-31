@@ -23,7 +23,7 @@ axum = { version = "0.8", optional = true }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "wrap_help"] }
-croner = "4"
+croner = { version = "4", features = ["jiff"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 dirs = "7"
 eventsource-stream = "0.2"
@@ -37,6 +37,7 @@ hmac = "0.13.0"
 humantime-serde = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 infer = { version = "0.22", default-features = false }
+jiff = "0.2"
 open = "5"
 percent-encoding = "2"
 pulldown-cmark = { version = "0.13.5", default-features = false }

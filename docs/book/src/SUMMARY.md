@@ -31,6 +31,7 @@
 - [Projects](./usage/projects.md)
 - [Scheduling](./usage/scheduling.md)
 - [Background tasks](./usage/background.md)
+- [Accounts and profiles](./usage/accounts-and-profiles.md)
 - [Account info](./usage/account.md)
 
 # Providers

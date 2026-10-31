@@ -1057,7 +1057,7 @@ pub(crate) async fn run_shell_probe(
                 if read == 0 {
                     break;
                 }
-                let room = GATE_OUTPUT_LIMIT.saturating_sub(kept.len());
+                let room = GATE_OUTPUT_BYTES.saturating_sub(kept.len());
                 kept.extend(chunk.iter().take(read.min(room)));
             }
         }
@@ -1065,14 +1065,14 @@ pub(crate) async fn run_shell_probe(
     };
     let collected = async {
         let (stdout, stderr) = tokio::join!(
-            read_bounded(stdout_pipe, GATE_PARSE_LIMIT),
+            read_bounded(stdout_pipe, GATE_PARSE_BYTES),
             read_stderr_bounded(stderr_pipe)
         );
         let mut stdout = stdout?;
         let stderr = stderr?;
-        let cut_off = stdout.len() > GATE_PARSE_LIMIT;
+        let cut_off = stdout.len() > GATE_PARSE_BYTES;
         if cut_off {
-            stdout.truncate(GATE_PARSE_LIMIT);
+            stdout.truncate(GATE_PARSE_BYTES);
             // The producer is still running with nobody reading; waiting for it to finish on its
             // own would be waiting for the timeout.
             if let Err(error) = child.kill().await {
@@ -1095,7 +1095,7 @@ pub(crate) async fn run_shell_probe(
         };
     if cut_off {
         tracing::debug!(
-            "gate output exceeded {GATE_PARSE_LIMIT} bytes and was cut off; the command was stopped"
+            "gate output exceeded {GATE_PARSE_BYTES} bytes and was cut off; the command was stopped"
         );
     }
 

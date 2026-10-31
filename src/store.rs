@@ -60,7 +60,7 @@ pub(crate) use self::{
     scratchpad::{RenameOutcome, ScratchpadEntry},
     search::SessionMatch,
     sessions::{
-        ForkOverrides, ImportSessionRecord, LogPage, LogRow, Rewound, SessionFilter,
+        ForkOverrides, ImportSessionRecord, ImportedEvent, LogPage, LogRow, Rewound, SessionFilter,
         SessionMetaRow, SessionPatch, SessionReach, SessionSummary, SessionSweep, SourceLock,
         SpawnTerms, normalize_title,
     },
@@ -91,7 +91,16 @@ pub(crate) struct Store {
     /// mid-copy from another process mid-turn, and the two deserve opposite answers: a copy is
     /// one short transaction to wait behind, a turn is not.
     probed_forks: Arc<tokio::sync::Mutex<()>>,
+    /// This process's shared hold on the store, taken once the schema is current and kept while
+    /// any clone lives; see [`STORE_IN_USE_STEM`].
+    in_use: Arc<std::sync::OnceLock<std::fs::File>>,
 }
+
+/// File stem of the lock every process holds shared for as long as it has the store open. A
+/// migration takes it exclusive, under the schema lock, and refuses when it cannot: an older
+/// process still running on the store would go on writing the shape the migration replaced, and
+/// the next build to read those rows would drop them.
+const STORE_IN_USE_STEM: &str = "store";
 
 /// How long to keep trying to convert a rollback-journal database to WAL before giving up.
 ///
@@ -251,6 +260,7 @@ impl Store {
             database_path,
             scheduler_memory: Arc::default(),
             warned_rows: Arc::default(),
+            in_use: Arc::default(),
         };
         store.initialize_schema(context).await?;
         store.prune_orphan_lock_files().await;
@@ -325,12 +335,46 @@ impl Store {
         // with `failed to initialize schema in '<path>': database is locked`, and
         // `meka session list` (a pure read) dies the same way. A rare, loud, retryable startup
         // error is the accepted half of that trade.
+        let in_use_path = self.lock_dir.join(format!("{STORE_IN_USE_STEM}.lock"));
+        let in_use = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&in_use_path)
+            .map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to open the store's in-use lock '{}': {}",
+                    in_use_path.display(),
+                    error
+                ))
+            })?;
+
         let database_path = self.database_path.clone();
         let context = context.clone();
-        let (plan, backup) = self
+        let (plan, backup, in_use) = self
             .connection
             .call(move |connection| -> std::result::Result<_, MekaError> {
                 let plan = migrations::plan(connection)?;
+                // Carrying an existing store forward, and only then: a process still running on it
+                // holds the in-use lock shared, and would keep writing what this replaces.
+                let migrating = plan.from > 0 && plan.migrates();
+                if migrating {
+                    match in_use.try_lock() {
+                        Ok(()) => {}
+                        Err(std::fs::TryLockError::WouldBlock) => {
+                            return Err(MekaError::Database(
+                                "another meka process is using the store; stop it, then run \
+                                 this again to upgrade the store"
+                                    .to_string(),
+                            ));
+                        }
+                        Err(std::fs::TryLockError::Error(error)) => {
+                            return Err(MekaError::Database(format!(
+                                "failed to take the store's in-use lock: {error}"
+                            )));
+                        }
+                    }
+                }
                 // Before anything is written, and only when there is something to lose. `from > 0`
                 // is what distinguishes carrying an existing store forward from building a new one:
                 // a fresh store has no data to preserve, and copying the empty file it does not yet
@@ -369,7 +413,16 @@ impl Store {
                         "failed to reconcile the session search index: {error}"
                     ))
                 })?;
-                Ok((plan, backup))
+                // Held shared from here on, under the schema lock still, so no migration can come
+                // between this process reading the current schema and saying it is on it. An
+                // exclusive holder exists only under the schema lock, so this does not wait.
+                if migrating && let Err(error) = in_use.unlock() {
+                    tracing::warn!("failed to release the store's in-use lock: {error}");
+                }
+                if let Err(error) = in_use.try_lock_shared() {
+                    tracing::warn!("failed to hold the store's in-use lock: {error}");
+                }
+                Ok((plan, backup, in_use))
             })
             .await
             .map_err(|error| match error {
@@ -380,6 +433,10 @@ impl Store {
                     other
                 )),
             })?;
+
+        if self.in_use.set(in_use).is_err() {
+            tracing::debug!("the store's in-use lock was already held by this handle");
+        }
 
         if plan.migrates() {
             match backup {
@@ -498,13 +555,11 @@ mod tests {
     use super::*;
 
     /// `MEKA_DATA_DIR` has to be absolute, for a sharper version of the reason `MEKA_CONFIG_DIR`
-    /// does: `meka.db` holds every provider credential, so a relative value gives one credential
-    /// store per directory meka is launched from, none of them the one the user set up.
-    ///
-    /// The comment justifying the config-directory hardening asserted this sibling "already refuses
-    /// both". It refused only the empty value.
+    /// does: `meka.db` holds every provider credential, so a relative value would give one store
+    /// per directory meka is launched from, and falling back to the platform's would act on the
+    /// real one the user asked to be kept out of. It resolves no store at all.
     #[tokio::test]
-    async fn a_relative_data_dir_is_refused_rather_than_joined_to_the_cwd() {
+    async fn a_relative_data_dir_resolves_no_store() {
         let _env = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
         let previous = std::env::var_os("MEKA_DATA_DIR");
         // SAFETY: `MEKA_DATA_DIR` is process-global; the lock above serializes every test that
@@ -523,11 +578,10 @@ mod tests {
             }
         }
 
-        let relative = relative.expect("a rejected override still resolves a platform default");
         assert!(
-            !relative.starts_with("relative"),
-            "a relative override must not be joined to the cwd; got {}",
-            relative.display(),
+            relative.is_err(),
+            "a relative override resolves no store, neither one under the cwd nor the platform's \
+             real one: {relative:?}",
         );
         assert_eq!(
             absolute.expect("an absolute override is honored"),
@@ -648,6 +702,49 @@ mod tests {
 
     // MCP TokenStore tests. Exercise the methods backing `meka mcp login/logout`. In-memory DB
     // keeps each case hermetic.
+
+    /// A store an older build is still running on is not migrated under it: the open that would
+    /// carry it forward refuses while another holder has it, and goes ahead once it is gone.
+    #[tokio::test]
+    async fn a_store_another_process_holds_is_not_migrated_under_it() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        let holder = Store::open(Some(&database_path), &Default::default())
+            .await
+            .expect("the first open builds the store");
+        let head: i64 = holder
+            .connection
+            .call(|connection| {
+                connection.query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
+            })
+            .await
+            .expect("a version");
+        rusqlite::Connection::open(&database_path)
+            .expect("open")
+            .execute_batch(&format!("PRAGMA user_version = {}", head - 1))
+            .expect("step the store back by its last, empty step");
+
+        let Err(refused) = Store::open(Some(&database_path), &Default::default()).await else {
+            panic!("a store another holder has open was migrated under it");
+        };
+        assert!(
+            refused.to_string().contains("another meka process"),
+            "{refused}"
+        );
+
+        drop(holder);
+        let reopened = Store::open(Some(&database_path), &Default::default())
+            .await
+            .expect("with nobody else on it, the store is carried forward");
+        let version: i64 = reopened
+            .connection
+            .call(|connection| {
+                connection.query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
+            })
+            .await
+            .expect("a version");
+        assert_eq!(version, head);
+    }
 
     /// Two hosts starting together against one unmigrated store. The schema lock is what makes the
     /// loser re-read the winner's answer instead of acting on its own stale one, and a migration

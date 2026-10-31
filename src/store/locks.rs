@@ -49,6 +49,9 @@ pub(super) const SCHEMA_LOCK_STEM: &str = "schema";
 /// not parse as a UUID, and relying on that accident is how the next lock shaped like one inherits
 /// the hazard.
 pub(super) const ACCOUNT_LOCK_PREFIX: &str = "account-";
+/// File-stem prefix of the per-server MCP credential locks, kept out of the prune for the reason
+/// [`ACCOUNT_LOCK_PREFIX`] is.
+pub(super) const MCP_LOCK_PREFIX: &str = "mcp-";
 
 impl Store {
     /// Acquire an exclusive OS file lock on the session. Returns a [`FileLock`] handle whose
@@ -142,7 +145,11 @@ impl Store {
             // from a `sqlite_master` read the other is free to invalidate before the decision is
             // acted on. Named explicitly so a future lock called anything UUID-shaped does not
             // quietly inherit the hazard.
-            if stem == SCHEMA_LOCK_STEM || stem.starts_with(ACCOUNT_LOCK_PREFIX) {
+            if stem == SCHEMA_LOCK_STEM
+                || stem == super::STORE_IN_USE_STEM
+                || stem.starts_with(ACCOUNT_LOCK_PREFIX)
+                || stem.starts_with(MCP_LOCK_PREFIX)
+            {
                 continue;
             }
             let Ok(id) = Uuid::parse_str(stem) else {

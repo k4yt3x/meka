@@ -431,12 +431,9 @@ pub(crate) async fn rewind_session_command(
     };
     store.save_rewind(session_id, &event).await?;
 
-    crate::streams::write_stderr_line(format!(
-        "Rewound {} turn(s); {} message(s) remain, and `meka session export` still shows the \
-         dropped ones.",
-        turns,
-        conversation.len(),
-    ));
+    let rewound = crate::text::counted(turns as u64, "turn", "turns");
+    let remain = crate::text::counted(conversation.len() as u64, "message", "messages");
+    tracing::info!("rewound {rewound} of session {session_id}; {remain} remain");
     Ok(())
 }
 
@@ -538,10 +535,10 @@ pub(crate) async fn export_session(
 
     let (body, default_ext) = match format {
         cli::SessionExportFormat::Markdown => {
-            // Export the full event log so pre-compaction turns are included. Compaction only hides
+            // Export the log as history so pre-compaction turns are included. Compaction only hides
             // older turns from the model (it appends a boundary, never deletes), so the export
-            // walks the raw log and renders every turn plus a marker at each compaction point.
-            let events = store.load_events(session_id).await?;
+            // walks the log and renders every turn once plus a marker at each compaction point.
+            let events = store.load_history(session_id).await?;
             let scratchpad_entries: std::collections::HashMap<String, String> = store
                 .load_all_scratchpad_entries(session_id)
                 .await?

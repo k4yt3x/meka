@@ -97,7 +97,8 @@ When the turn ends, a row closes it, in the same dim register as the other stage
 • Finished at 19:28 after 19m 19s
 ```
 
-The first word says how the turn ended (`Finished`, `Interrupted`, `Failed`), and
+The opening words say how the turn ended (`Finished`, `Interrupted`, `Failed`, or `Hit the output
+limit` and `Declined by the model` for an answer that stopped short of being one), and
 [`display.turn_end_summary`](../configuration/config-file.md#displayturn_end_summary) picks the
 facts after it: the time, the duration, the tokens used. A resumed session closes every recorded
 turn the same way, so the scrollback says when each one ended.
@@ -259,7 +260,7 @@ with their state, and **Enter** offers reconnect, login and logout for the picke
 | `/task [show\|cancel <id>]` | Pick a background task to show; show or cancel one by id, or all |
 | `/mcp <subcommand>` | Manage MCP servers and prompts |
 | `/mcp list` | Pick a server to reconnect, log in or log out |
-| `/mcp reconnect <server>` | Reconnect smoke-test for one server |
+| `/mcp reconnect <server>` | Open a new connection to a server |
 | `/mcp login <server>` | Run the OAuth flow for a server |
 | `/mcp logout <server>` | Clear stored credentials for a server |
 | `/mcp <server>:<prompt> [args]` | Render an MCP prompt as the next turn |
@@ -271,7 +272,9 @@ Some of the grammar the table compresses: a bare `/mcp` is `/mcp list`, and the 
 server's live state (`pending` / `connected` / `failed` / `disabled`); `/task cancel all` is
 accepted for `--all`; `/schedule cancel`, `/task cancel` and the two `show`s take an id or any
 unique prefix; `/cd ~` still goes home; `/export` writes `session-<id>.md` in the working directory
-and prints where it landed; `/skill <name>` prepends anything typed after the name to the skill body;
+and prints where it landed; `/skill <name>` prepends anything typed after the name to the skill body,
+and the transcript shows `Running skill '<name>'.` with those words under it, live and on a resume,
+as it does `Running prompt '<server>:<prompt>'.` for an MCP prompt;
 `/memory` lists memories most important first; `/mcp login <server>` puts the authorization URL
 as a question in the composer's place, with one field for the callback URL pasted from the
 browser's address bar when the browser cannot reach meka, and Esc on it ends the login.

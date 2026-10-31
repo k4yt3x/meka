@@ -169,22 +169,26 @@ impl Tool for TaskCancelTool {
     ) -> Result<ToolOutput> {
         let session_id = resolve_session_id(&self.context.site.session_id, "task_cancel")?;
 
-        if input
-            .get("all")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
+        if super::util::optional_bool(&input, "all", "task_cancel")?.unwrap_or(false) {
             // Recorded before signaling, exactly as the single-id path below does and for the same
             // reason: the work reacting to its token reports an interruption, which would otherwise
             // land as `failed` and tell the agent its build broke rather than that it was stopped.
-            let ids = self.context.tasks.session_task_ids(session_id).await;
+            // Read from the store, so a row whose process is gone is retired as the single-id path
+            // retires it, and only what was recorded is signaled.
             let store = self.context.store.background_store();
-            for id in &ids {
-                store
-                    .finish_background_task(id, TaskStatus::Canceled, None, None)
-                    .await?;
+            let running = store
+                .list_running_background_tasks(session_id)
+                .await?
+                .into_iter()
+                .map(|task| task.id)
+                .collect();
+            let canceled = store
+                .stop_background_tasks(running, TaskStatus::Canceled)
+                .await?;
+            for id in &canceled {
+                self.context.tasks.cancel(id).await;
             }
-            let signaled = self.context.tasks.cancel_session(session_id).await;
+            let signaled = canceled.len();
             return Ok(ToolOutput::text(
                 if signaled == 0 {
                     "No running background tasks to cancel.".to_string()
@@ -225,15 +229,24 @@ impl Tool for TaskCancelTool {
             ));
         }
 
-        // Record the cancellation before signaling. `finish_background_task` only writes over a
-        // `running` row, so whichever of the two lands first wins, and doing it in this order means
-        // a task that happens to finish in the same instant cannot report success after the agent
-        // was told it was stopped.
-        self.context
+        // Record the cancellation before signaling: the record writes only over a `running` row, so
+        // a task that finishes in the same instant keeps its outcome and is not signaled, and one
+        // stopped is never told it succeeded.
+        let stopped = self
+            .context
             .store
             .background_store()
-            .finish_background_task(&task.id, TaskStatus::Canceled, None, None)
+            .stop_background_tasks(vec![task.id.clone()], TaskStatus::Canceled)
             .await?;
+        if stopped.is_empty() {
+            return Ok(ToolOutput::text(
+                format!(
+                    "Task {} already finished and is not running.",
+                    task.short_id()
+                ),
+                false,
+            ));
+        }
         let signaled = self.context.tasks.cancel(&task.id).await;
         if !signaled {
             // The row was ours to retire but the handle was not: the task belonged to a process
@@ -516,6 +529,54 @@ mod tests {
             .expect("list");
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0].status, TaskStatus::Canceled);
+    }
+
+    /// Only the tasks recorded as canceled are signaled and counted: one whose own outcome landed
+    /// first keeps it and is left alone, though its handle is still held.
+    #[tokio::test]
+    async fn task_cancel_all_signals_only_what_it_recorded() {
+        let (context, session_id) = context().await;
+        let running = seed(&context, session_id, "sleep 600").await;
+        let finishing = seed(&context, session_id, "cargo test").await;
+        let running_token = CancellationToken::new();
+        let finishing_token = CancellationToken::new();
+        for (task, token) in [(&running, &running_token), (&finishing, &finishing_token)] {
+            context
+                .tasks
+                .try_reserve(task.id.clone(), session_id, token.clone(), 10)
+                .await;
+        }
+        context
+            .store
+            .background_store()
+            .finish_background_task(
+                &finishing.id,
+                TaskStatus::Completed,
+                Some("42 passed".to_string()),
+                None,
+            )
+            .await
+            .expect("finish");
+        let tool = TaskCancelTool { context };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"all": true}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("ok");
+
+        assert!(
+            result.text_content().contains("Asked 1 "),
+            "{}",
+            result.text_content()
+        );
+        assert!(running_token.is_cancelled());
+        assert!(
+            !finishing_token.is_cancelled(),
+            "a finished task is not signaled"
+        );
     }
 
     #[tokio::test]

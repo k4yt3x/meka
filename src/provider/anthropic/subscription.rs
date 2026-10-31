@@ -108,7 +108,7 @@ pub(crate) struct ClaudeSubscriptionProvider {
 
 impl ClaudeSubscriptionProvider {
     /// Build from a profile's settings, whose credential the builder has checked is an OAuth one.
-    pub(crate) fn new(settings: crate::provider::ProviderBuilder) -> Result<Self> {
+    pub(crate) fn from_settings(settings: crate::provider::ProviderBuilder) -> Result<Self> {
         let credential_key = settings.resolve_credential_key()?;
         let crate::provider::ProviderBuilder {
             credential,
@@ -784,12 +784,14 @@ impl Provider for ClaudeSubscriptionProvider {
                 None,
             );
             match request.send().await {
-                Ok(response) if response.status().is_success() => response
-                    .text()
-                    .await
-                    .ok()
-                    .and_then(|text| serde_json::from_str::<OAuthRolesResponse>(&text).ok())
-                    .and_then(|roles| roles.organization_role),
+                Ok(response) if response.status().is_success() => {
+                    let cancellation = tokio_util::sync::CancellationToken::new();
+                    crate::error::read_whole_reply(response, None, &cancellation)
+                        .await
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<OAuthRolesResponse>(&text).ok())
+                        .and_then(|roles| roles.organization_role)
+                }
                 _ => None,
             }
         };
@@ -1005,7 +1007,7 @@ mod tests {
     }
 
     fn provider_with_base(base_url: Option<&str>) -> ClaudeSubscriptionProvider {
-        ClaudeSubscriptionProvider::new(
+        ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
                 AuthCredential::ApiKey("test-key".to_string()),
@@ -1103,7 +1105,7 @@ mod tests {
         let port = listener.local_addr().expect("the bound address").port();
         drop(listener);
 
-        ClaudeSubscriptionProvider::new(
+        ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
                 AuthCredential::OAuthToken {
@@ -1610,7 +1612,7 @@ mod tests {
 
     #[test]
     fn a_claude_subscription_base_url_keeps_the_root_the_oauth_endpoints_hang_off() {
-        let provider = ClaudeSubscriptionProvider::new(
+        let provider = ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
                 AuthCredential::OAuthToken {
@@ -1643,7 +1645,7 @@ mod tests {
 
     #[test]
     fn account_uuid_sourced_from_oauth_credential() {
-        let provider = ClaudeSubscriptionProvider::new(
+        let provider = ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
                 AuthCredential::OAuthToken {
@@ -1707,7 +1709,7 @@ mod tests {
     }
 
     fn provider_effort(model: &str, effort: Option<&str>) -> ClaudeSubscriptionProvider {
-        ClaudeSubscriptionProvider::new(
+        ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
                 AuthCredential::ApiKey("test-key".to_string()),
@@ -1736,7 +1738,7 @@ mod tests {
         effort: &str,
         thinking_display: crate::config::ThinkingDisplay,
     ) -> ClaudeSubscriptionProvider {
-        ClaudeSubscriptionProvider::new(
+        ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
                 AuthCredential::ApiKey("test-key".to_string()),
@@ -2546,7 +2548,7 @@ mod tests {
     async fn a_request_that_only_declares_deferred_tools_still_sends_the_beta() {
         // An OAuth token rather than the API key the other tests use: this backend refuses an API
         // key before it builds a request. Its expiry is a day out so no refresh is attempted.
-        let provider = ClaudeSubscriptionProvider::new(
+        let provider = ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
                 AuthCredential::OAuthToken {
@@ -2683,7 +2685,7 @@ mod tests {
     #[test]
     fn the_1m_context_beta_follows_the_profiles_window() {
         let with_window = |window: Option<u64>| {
-            ClaudeSubscriptionProvider::new(
+            ClaudeSubscriptionProvider::from_settings(
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::ClaudeSubscription,
                     AuthCredential::ApiKey("test-key".to_string()),
@@ -4484,7 +4486,7 @@ mod tests {
                 expires_at: Some(crate::oauth::now_epoch_millis()),
                 account_id: None,
             };
-            let provider = ClaudeSubscriptionProvider::new(
+            let provider = ClaudeSubscriptionProvider::from_settings(
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::ClaudeSubscription,
                     credential,
@@ -4573,7 +4575,7 @@ mod tests {
         };
 
         let provider = Arc::new(
-            ClaudeSubscriptionProvider::new(
+            ClaudeSubscriptionProvider::from_settings(
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::ClaudeSubscription,
                     credential,
@@ -4652,7 +4654,7 @@ mod tests {
             expires_at: Some(crate::oauth::now_epoch_millis()),
             account_id: None,
         };
-        let provider = ClaudeSubscriptionProvider::new(
+        let provider = ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
                 credential,
@@ -4791,7 +4793,7 @@ mod tests {
     /// A provider against the listener at `local`, holding a token the store believes is good for
     /// another hour. Only the backend's word says otherwise.
     fn provider_against(local: std::net::SocketAddr) -> ClaudeSubscriptionProvider {
-        ClaudeSubscriptionProvider::new(
+        ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
                 AuthCredential::OAuthToken {

@@ -1081,6 +1081,11 @@ enabled = ["read", "unrestricted"]
                     tool_call["rawInput"]["content"], "hello",
                     "rawInput carries the call's arguments: {value}"
                 );
+                assert_eq!(
+                    tool_call["toolCallId"], "call_write",
+                    "the prompt names the call the editor already shows, not a card of its own: \
+                     {value}"
+                );
                 let content_text = tool_call["content"][0]["content"]["text"]
                     .as_str()
                     .unwrap_or_default();
@@ -2027,16 +2032,16 @@ enabled = ["read", "unrestricted"]
         })
         .build();
 
-    // session/new fires before any session/update notifications, so we can't filter notifications
-    // by session_id up front. Send the request manually, then walk the stream picking up the
-    // intermediate `available_commands_update` notification(s) and the eventual response
-    // together.
+    // The palette follows the response: a client registers the session only once the response
+    // names its id, and drops a notification for an id it does not know yet. Send the request
+    // manually, then walk the stream for the response and the `available_commands_update` after it.
     let cwd = harness.config_dir();
     let id = harness.send_request(
         "session/new",
         serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
     );
     let needle = format!("\"id\":{id}");
+    let mut saw_skill_before_response = false;
     let mut saw_skill = false;
     let mut new_response: Option<serde_json::Value> = None;
     let mut transcript = String::new();
@@ -2058,17 +2063,23 @@ enabled = ["read", "unrestricted"]
                 && let Some(cmds) = update["availableCommands"].as_array()
                 && cmds.iter().any(|c| c["name"] == "demo-skill")
             {
+                if new_response.is_none() {
+                    saw_skill_before_response = true;
+                }
                 saw_skill = true;
             }
         }
         if line.contains(&needle) && response_matches(&line, &needle) {
             new_response = Some(value);
+        }
+        if saw_skill && new_response.is_some() {
             break;
         }
     }
     assert!(
-        saw_skill,
-        "expected available_commands_update with demo-skill; transcript:\n{transcript}",
+        saw_skill && !saw_skill_before_response,
+        "expected available_commands_update with demo-skill after the response; \
+         transcript:\n{transcript}",
     );
     let response = new_response.unwrap_or_else(|| {
         panic!("no session/new response; transcript:\n{transcript}");
@@ -2120,6 +2131,139 @@ model = "claude-sonnet-4-5"
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
         "skill invocation should run a normal turn: {response}",
+    );
+}
+
+/// An editor's prompt keeps the files attached among its words in place: the model reads each
+/// where it sat, and a reload says the words with each file as the link it was sent as. One that
+/// invokes a skill is the invocation of all of it, the request read ahead of the skill's body, and
+/// a reload says the command and the words, each file as its mention, never the body or a file's
+/// contents.
+#[test]
+fn an_editor_prompt_keeps_its_files_in_place_and_an_invocation_takes_them() {
+    let config_toml = r#"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+"#;
+    let reply = serde_json::json!([
+        { "type": "text", "text": "ok" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]);
+    let mut harness = AcpTestHarness::builder()
+        .config(config_toml)
+        .pre_spawn(move |config_dir| {
+            let skill_dir = config_dir.join("skills").join("hello");
+            std::fs::create_dir_all(&skill_dir).expect("mkdir");
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\ndescription: say hi\n---\nrespond with a greeting\n",
+            )
+            .expect("write SKILL.md");
+            serde_json::json!([reply.clone(), reply])
+        })
+        .build();
+    let session_id = harness.new_session();
+    let attached = serde_json::json!({
+        "type": "resource",
+        "resource": { "uri": "file:///proj/src/a.rs", "text": "fn a() {}" }
+    });
+    for opening in ["compare ", "/hello compare "] {
+        let id = harness.send_request(
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [
+                    { "type": "text", "text": opening },
+                    attached,
+                    { "type": "text", "text": " with the old one" }
+                ],
+            }),
+        );
+        let (_updates, response) = harness.collect_updates(&session_id, id);
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    }
+
+    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let openings: Vec<Vec<serde_json::Value>> = connection
+        .prepare(
+            "SELECT content FROM messages WHERE session_id = ?1 AND kind = 'user_blocks' \
+             ORDER BY id",
+        )
+        .expect("prepare")
+        .query_map([&session_id], |row| row.get::<_, String>(0))
+        .expect("query")
+        .map(|content| serde_json::from_str(&content.expect("row")).expect("json"))
+        .collect();
+    drop(connection);
+    let kinds = |blocks: &[serde_json::Value]| -> Vec<String> {
+        blocks
+            .iter()
+            .filter_map(|block| block["type"].as_str().map(str::to_string))
+            .collect()
+    };
+    assert_eq!(kinds(&openings[0]), [
+        "turn_context",
+        "text",
+        "resource",
+        "text"
+    ]);
+    assert_eq!(openings[0][2]["name"], "a.rs");
+    assert!(
+        openings[0][2]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("fn a() {}")),
+        "the model reads the file: {:?}",
+        openings[0]
+    );
+    assert_eq!(kinds(&openings[1]), ["turn_context", "invocation"]);
+    let invocation = &openings[1][1];
+    assert_eq!(invocation["name"], "hello");
+    assert_eq!(invocation["directive"], "compare @a.rs with the old one");
+    let read = invocation["text"].as_str().unwrap_or_default();
+    let request = read.find("with the old one").expect("the request");
+    assert!(
+        read.find("fn a() {}").expect("the file") < request,
+        "{read}"
+    );
+    assert!(
+        request < read.find("respond with a greeting").expect("the body"),
+        "{read}"
+    );
+
+    harness.close_session(&session_id);
+    let cwd = harness.work_dir();
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(response["result"].is_object(), "{response}");
+    let said: Vec<serde_json::Value> = updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "user_message_chunk")
+        .map(|update| update["content"].clone())
+        .collect();
+    assert_eq!(
+        said,
+        [
+            serde_json::json!({ "type": "text", "text": "compare " }),
+            serde_json::json!({
+                "type": "resource_link",
+                "name": "a.rs",
+                "uri": "file:///proj/src/a.rs"
+            }),
+            serde_json::json!({ "type": "text", "text": " with the old one" }),
+            serde_json::json!({
+                "type": "text",
+                "text": "/hello compare @a.rs with the old one"
+            }),
+        ],
+        "updates:\n{updates:#?}"
     );
 }
 
@@ -2273,9 +2417,9 @@ enabled = ["read", "workspace"]
     );
 }
 
-/// when the client advertises `fs.read_text_file`, a `file_read` tool call delegates to
-/// `fs/read_text_file` rather than touching the disk. The mock provider scripts the tool use; the
-/// test harness intercepts the outgoing fs request and answers with canned content.
+/// when the client advertises `fs.read_text_file` and takes writes, a `file_read` tool call
+/// delegates to `fs/read_text_file` rather than touching the disk. The mock provider scripts the
+/// tool use; the test harness intercepts the outgoing fs request and answers with canned content.
 #[test]
 fn acp_fs_read_text_file_is_delegated_when_capability_offered() {
     let config_toml = r#"
@@ -2289,7 +2433,7 @@ model = "claude-sonnet-4-5"
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .capabilities(serde_json::json!({
-            "fs": { "readTextFile": true, "writeTextFile": false },
+            "fs": { "readTextFile": true, "writeTextFile": true },
             "terminal": false
         }))
         .pre_spawn(|config_dir| {
@@ -3319,7 +3463,7 @@ enabled = ["read", "unrestricted"]
     );
 }
 
-/// a sub-agent's permission prompt must forward through `PermissionForwardingFrontend` to the
+/// a sub-agent's approval prompt must forward through `PermissionForwardingFrontend` to the
 /// parent's ACP connection. The parent triggers `agent_spawn`; the sub-agent runs in `ask` mode
 /// (inherited) and attempts `file_write`, which fires a `session/request_permission` on the
 /// *parent's* connection. Test answers `allow_once` and asserts the request was observed.
@@ -4976,7 +5120,7 @@ fn acp_fs_read_text_file_fetches_the_whole_document_and_windows_locally() {
     let mut harness = AcpTestHarness::builder()
         .config(ACP_INVALID_PARAMS_CONFIG)
         .capabilities(serde_json::json!({
-            "fs": { "readTextFile": true, "writeTextFile": false }
+            "fs": { "readTextFile": true, "writeTextFile": true }
         }))
         .pre_spawn(move |config_dir| {
             let target = fixture_beside(config_dir, "delegated-line-limit.txt");
@@ -6755,6 +6899,34 @@ model = "model-from-beta"
     assert!(
         !text.contains("model-from-alpha"),
         "and must not still be reporting the old one: {updates:?}"
+    );
+}
+
+/// A blank text block ahead of a local command is nothing typed: the command runs, as it does
+/// when the editor sends it alone.
+#[test]
+fn a_blank_block_ahead_of_a_local_command_does_not_hide_it() {
+    let config_toml = r#"
+[accounts.alpha]
+backend = "anthropic-messages"
+
+[profiles.alpha]
+account = "alpha"
+model = "model-from-alpha"
+"#;
+    let mut harness = AcpTestHarness::spawn(config_toml, None);
+    let session_id = harness.new_session();
+    let id = harness.send_request(
+        "session/prompt",
+        serde_json::json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "" }, { "type": "text", "text": "/status" }],
+        }),
+    );
+    let (updates, _response) = harness.collect_updates(&session_id, id);
+    assert!(
+        agent_text(&updates).contains("model-from-alpha"),
+        "the command ran: {updates:?}"
     );
 }
 

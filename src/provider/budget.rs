@@ -17,6 +17,27 @@ use crate::{
     image::RedactedImage,
 };
 
+/// The most images the Messages API takes in one request. Fails toward sending less: a backend
+/// behind a `base_url` that takes more loses its oldest images early, and one that takes fewer
+/// refuses the request as it would without this.
+pub(super) const ANTHROPIC_MAX_REQUEST_IMAGES: usize = 100;
+
+/// The images `messages` carries, as attachments and in tool results.
+fn image_count(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .map(|block| match block {
+            ContentBlock::Image { .. } => 1,
+            ContentBlock::ToolResult { content, .. } => content
+                .iter()
+                .filter(|item| matches!(item, ToolResultContent::Image { .. }))
+                .count(),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// How far below the ceiling a redaction stops, so the next several turns do not re-trigger it.
 /// Mirrors Claude Code's `apiMicrocompact` watermark (180k → 140k = ~78% of trigger): a stable
 /// cache prefix between redactions matters more than minimum-impact redaction per event. For the
@@ -62,7 +83,29 @@ pub(super) fn redact_oldest_images(
     messages: &[Message],
     bytes_to_drop: usize,
 ) -> (Cow<'_, [Message]>, RedactionStats) {
-    if bytes_to_drop == 0 || messages.len() <= 1 {
+    if bytes_to_drop == 0 {
+        return (Cow::Borrowed(messages), RedactionStats::default());
+    }
+    redact_oldest_images_until(messages, |stats| stats.bytes_freed >= bytes_to_drop)
+}
+
+/// [`redact_oldest_images`] by count: the oldest images until `images_to_drop` are gone.
+fn redact_oldest_image_count(
+    messages: &[Message],
+    images_to_drop: usize,
+) -> (Cow<'_, [Message]>, RedactionStats) {
+    if images_to_drop == 0 {
+        return (Cow::Borrowed(messages), RedactionStats::default());
+    }
+    redact_oldest_images_until(messages, |stats| stats.images_redacted >= images_to_drop)
+}
+
+/// The walk under both: oldest first, the last message untouched, stopping once `done` says so.
+fn redact_oldest_images_until(
+    messages: &[Message],
+    done: impl Fn(&RedactionStats) -> bool,
+) -> (Cow<'_, [Message]>, RedactionStats) {
+    if messages.len() <= 1 {
         return (Cow::Borrowed(messages), RedactionStats::default());
     }
 
@@ -90,7 +133,7 @@ pub(super) fn redact_oldest_images(
                             *item = ToolResultContent::Text {
                                 text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
                             };
-                            if stats.bytes_freed >= bytes_to_drop {
+                            if done(&stats) {
                                 break 'outer;
                             }
                         }
@@ -110,7 +153,7 @@ pub(super) fn redact_oldest_images(
                     *block = ContentBlock::Text {
                         text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
                     };
-                    if stats.bytes_freed >= bytes_to_drop {
+                    if done(&stats) {
                         break 'outer;
                     }
                 }
@@ -135,20 +178,31 @@ pub(super) fn redact_oldest_images(
 pub(super) fn fit_body_to_budget<F>(
     messages: &[Message],
     max_request_bytes: usize,
+    // The most images a request may carry, on a wire whose API counts them.
+    max_images: Option<usize>,
     mut build: F,
 ) -> Result<(String, Option<crate::frontend::Notice>)>
 where
     F: FnMut(&[Message]) -> Result<String>,
 {
-    let body_json = build(messages)?;
+    let images_to_drop = max_images.map_or(0, |max| image_count(messages).saturating_sub(max));
+    let (counted, mut stats) = redact_oldest_image_count(messages, images_to_drop);
+    let body_json = build(counted.as_ref())?;
 
-    if body_json.len() <= max_request_bytes {
+    if body_json.len() <= max_request_bytes && stats.images_redacted == 0 {
         return Ok((body_json, None));
     }
 
-    let bytes_to_drop = body_json.len() - redaction_target(max_request_bytes);
-    let (redacted, stats) = redact_oldest_images(messages, bytes_to_drop);
-    let body_json = build(redacted.as_ref())?;
+    let body_json = if body_json.len() <= max_request_bytes {
+        body_json
+    } else {
+        let bytes_to_drop = body_json.len() - redaction_target(max_request_bytes);
+        let (redacted, by_size) = redact_oldest_images(counted.as_ref(), bytes_to_drop);
+        stats.images_redacted += by_size.images_redacted;
+        stats.bytes_freed += by_size.bytes_freed;
+        stats.positions.extend(by_size.positions);
+        build(redacted.as_ref())?
+    };
 
     // `RequestTooLarge`, meka's own refusal: the request never left the process, so publishing it
     // as a provider failure would tell a caller to look in the server log for a provider response
@@ -212,7 +266,7 @@ mod tests {
     #[test]
     fn a_body_over_the_ceiling_is_refused_as_meka_s_own() {
         let messages = vec![message("first"), message(&"x".repeat(4096))];
-        let error = fit_body_to_budget(&messages, 64, |messages| {
+        let error = fit_body_to_budget(&messages, 64, None, |messages| {
             Ok(serde_json::to_string(&serde_json::json!(
                 messages.iter().map(|_| "x".repeat(64)).collect::<Vec<_>>()
             ))
@@ -235,8 +289,49 @@ mod tests {
     fn a_body_that_fits_is_returned_unchanged() {
         let messages = vec![message("first")];
         let (body, notice) =
-            fit_body_to_budget(&messages, 4096, |_| Ok("{}".to_string())).expect("fits");
+            fit_body_to_budget(&messages, 4096, None, |_| Ok("{}".to_string())).expect("fits");
         assert_eq!(body, "{}");
         assert!(notice.is_none(), "nothing was redacted");
+    }
+
+    /// A request over the API's image count loses its oldest images until it is at the count,
+    /// however small its body, and says so; the message being answered keeps its own.
+    #[test]
+    fn a_request_over_the_image_count_loses_its_oldest_images() {
+        let image = || ContentBlock::Image {
+            source: crate::image::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "aGk=".to_string(),
+            },
+        };
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![image(), image()],
+            },
+            message("between"),
+            Message {
+                role: Role::User,
+                content: vec![image()],
+            },
+        ];
+        let mut sent = Vec::new();
+        let (_, notice) = fit_body_to_budget(&messages, 1 << 20, Some(2), |messages| {
+            sent = messages.to_vec();
+            Ok("{}".to_string())
+        })
+        .expect("fits");
+        assert_eq!(image_count(&sent), 2, "{sent:?}");
+        assert!(
+            matches!(sent[0].content[0], ContentBlock::Text { .. }),
+            "the oldest image goes first: {sent:?}"
+        );
+        assert!(matches!(sent[2].content[0], ContentBlock::Image { .. }));
+        let notice = notice.expect("a redaction is reported");
+        assert!(
+            notice.text.starts_with("Redacted 1 old image "),
+            "{}",
+            notice.text
+        );
     }
 }

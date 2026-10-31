@@ -167,28 +167,41 @@ fn assemble_report(
 /// a full disk reports success over an empty file. A reader that hung up is excluded: it stopped
 /// reading on purpose, and every tool in a pipeline is entitled to do that.
 fn print_answer(answer: &str) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
     let answer = answer.trim_end_matches('\n');
     if answer.trim().is_empty() {
         return Ok(());
     }
-    match crate::render::write_stdout_line(answer) {
+    let answer = answer_for_stdout(answer, std::io::stdout().is_terminal());
+    match crate::render::write_stdout_line(&answer) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Err(error) => Err(anyhow::Error::new(error).context("the answer did not reach stdout")),
     }
 }
 
+/// The answer as it goes to stdout. A terminal executes what a model may have copied from what it
+/// read, an escape that clears the screen or sets the clipboard, so it gets the text with every
+/// control but a newline and a tab taken out, as the screen draws it; a pipe gets the bytes.
+fn answer_for_stdout(answer: &str, terminal: bool) -> std::borrow::Cow<'_, str> {
+    if terminal {
+        std::borrow::Cow::Owned(crate::text::sanitize_stream_text(answer))
+    } else {
+        std::borrow::Cow::Borrowed(answer)
+    }
+}
+
 pub(crate) async fn run_oneshot(
     config: ResolvedConfig,
     store: Store,
-    prompt: String,
+    opening: crate::conversation::ContentBlock,
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
 ) -> anyhow::Result<()> {
     let config = Arc::new(config);
     // Ahead of everything with a side effect: a run refused for an empty prompt must not have
     // created a session row, taken a lock or swept anything on the way to saying so. The outcomes
     // it carries ride on it once the session is known.
-    let input = crate::agent::TurnInput::from_parts(prompt, Vec::new())?;
+    let input = crate::agent::TurnInput::sent(vec![opening], Vec::new())?;
     // `--format json` records the turn instead of rendering it: stdout carries one object at the
     // end and nothing before it, so `meka -p … --format json | jq` sees only the object.
     let json_frontend = matches!(
@@ -306,7 +319,7 @@ pub(crate) async fn run_oneshot(
         cancel.clone(),
         &agent,
         // The note is said in the screen's voice; here it is a log line, and reads as one.
-        |note: &str| tracing::warn!("{}", crate::text::as_log_line(note)),
+        |note: &str| tracing::warn!("{line}", line = crate::text::as_log_line(note)),
         || {
             // Exits from inside the listener's task, so it never reaches the funnel in `main`
             // and has to release the grants itself.
@@ -343,6 +356,7 @@ pub(crate) async fn run_oneshot(
     // child process group ran on with nothing tracking it and its row stayed `running` until a
     // later open swept it to `interrupted`.
     let (turn_error, outcome) = match run_turn_interruptible(
+        &shared,
         &cancel,
         admission,
         &agent,
@@ -366,8 +380,26 @@ pub(crate) async fn run_oneshot(
     // model had written by then is still its answer, and the exit code says the rest. A failed
     // turn is reported on stderr and by the exit code alone, because an answer beside it would
     // read as one.
+    // A stdout that would not take the answer is reported at the end, with the turn's own error,
+    // so the teardown below still runs: returning here would leave background process groups
+    // running untracked and the MCP servers unstopped.
+    let mut write_error: Option<anyhow::Error> = None;
     if json_frontend.is_none() && (turn_error.is_none() || interrupted) {
-        print_answer(&plain_frontend.answer())?;
+        if let Err(error) = print_answer(&plain_frontend.answer()) {
+            write_error = Some(error);
+        }
+        // The JSON report carries the stop reason; the plain answer alone would read as complete.
+        match &outcome {
+            Some(crate::agent::TurnOutcome::MaxTokens) => {
+                tracing::warn!(
+                    "the answer stopped at the model's output limit and may be cut short"
+                );
+            }
+            Some(crate::agent::TurnOutcome::Refusal(_)) => {
+                tracing::warn!("the model declined to answer");
+            }
+            _ => {}
+        }
     }
     // The report goes out for a turn that ended, whichever way, an interrupt included: its
     // `stop_reason` says so, and the exit code says so again. A failed turn is reported on stderr
@@ -377,7 +409,14 @@ pub(crate) async fn run_oneshot(
     {
         let events = std::mem::take(&mut *crate::sync::lock(&frontend.events));
         let report = assemble_report(events, outcome, session_id, agent.profile());
-        crate::render::write_stdout_line(&serde_json::to_string(&report)?)?;
+        match crate::render::write_stdout_line(&serde_json::to_string(&report)?) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => {
+                write_error =
+                    Some(anyhow::Error::new(error).context("the report did not reach stdout"));
+            }
+        }
     }
 
     // A one-shot run exits with the turn, so there is no later turn to deliver an outcome into.
@@ -437,8 +476,8 @@ pub(crate) async fn run_oneshot(
     if stopped > 0 {
         // A warning, not a signpost: the tasks were stopped short and their results are not coming.
         tracing::warn!(
-            "stopping {stopped} background task{}",
-            if stopped == 1 { "" } else { "s" }
+            "stopping {tasks}",
+            tasks = crate::text::counted(stopped as u64, "background task", "background tasks")
         );
         // Waited for, not just signaled, for the reason the screen gives: the process leaves
         // through `exit` right after this, which polls no task again, so a cancel alone would
@@ -465,6 +504,9 @@ pub(crate) async fn run_oneshot(
     if let Some(error) = turn_error {
         return Err(error.into());
     }
+    if let Some(error) = write_error {
+        return Err(error);
+    }
 
     Ok(())
 }
@@ -472,6 +514,18 @@ pub(crate) async fn run_oneshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal gets the answer without the escapes a model may have copied from what it read,
+    /// and a pipe gets it byte for byte.
+    #[test]
+    fn a_terminal_gets_the_answer_without_its_escapes_and_a_pipe_gets_the_bytes() {
+        let answer = "hello \u{1b}]52;c;aGk=\u{7} \u{1b}[2J world\n\tdone";
+        assert_eq!(
+            answer_for_stdout(answer, true),
+            "hello ]52;c;aGk=  world\n\tdone"
+        );
+        assert_eq!(answer_for_stdout(answer, false), answer);
+    }
 
     /// The reply a nudge answered and the reply after it are two paragraphs of the report, as the
     /// text on either side of a tool call is; glued, "I have planned it.Done." reads as one

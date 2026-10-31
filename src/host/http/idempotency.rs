@@ -1,6 +1,7 @@
 //! Stripe-style `Idempotency-Key` cache for blocking `POST /turn` responses.
 //!
-//! Key scope: `(token_id, key)`. Tokens get independent dedup namespaces. Body mismatch on
+//! Key scope: `(token_id, scope, key)`, `scope` being what the request acts on. Tokens get
+//! independent dedup namespaces. Body mismatch on
 //! replay returns 409. Entries expire after 24 h and are pruned in the background.
 //!
 //! Concurrency: a per-key slot state machine (`Pending` → `Completed`) ensures only one
@@ -50,7 +51,7 @@ impl CachedResponse {
     }
 }
 
-/// Slot state for a single `(token_id, key)` entry. Distinguishes "first request is running"
+/// Slot state for a single `(token_id, scope, key)` entry. Distinguishes "first request is running"
 /// from "first request finished" so concurrent same-key requests can be rejected cleanly.
 #[derive(Debug, Clone)]
 enum Slot {
@@ -143,7 +144,7 @@ impl IdempotencyCache {
         Self::new(STANDARD_TTL)
     }
 
-    /// Atomically look up the slot for `(token_id, key)` and, if absent, reserve it by
+    /// Atomically look up the slot for `(token_id, scope, key)` and, if absent, reserve it by
     /// inserting a `Pending` marker. The returned `LookupOutcome` reflects what the caller
     /// should do:
     ///
@@ -332,7 +333,7 @@ impl IdempotencyCache {
     }
 }
 
-/// RAII guard handed to the first caller that observes a miss for a given `(token_id, key)`.
+/// RAII guard handed to the first caller that observes a miss for a given `(token_id, scope, key)`.
 /// The slot is held in `Pending` state for as long as the ticket is alive; calling
 /// `commit(status, body)` upgrades to `Cached`. Dropping without committing removes the
 /// `Pending` entry so retries are unblocked.

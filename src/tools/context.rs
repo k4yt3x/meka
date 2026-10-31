@@ -324,7 +324,7 @@ impl Tool for ContextCheckTool {
             report.push_str(&match generation {
                 0 => "Compactions so far: none, so nothing has been summarized away yet.\n".into(),
                 1 => "Compactions so far: 1. Detail from before it survives only as a summary; \
-                      The original turns remain stored.\n"
+                      the original turns remain stored.\n"
                     .to_string(),
                 count => format!(
                     "Compactions so far: {count}. Each one summarizes the previous summary, so \
@@ -396,9 +396,7 @@ impl Tool for ContextCompactTool {
             trigger: crate::conversation::CompactionTrigger::Requested,
             instructions: optional_str(&input, "instructions", "context_compact")?
                 .map(|instructions| instructions.trim().to_string()),
-            keep_recent: input
-                .get("keep_recent")
-                .and_then(serde_json::Value::as_bool),
+            keep_recent: super::util::optional_bool(&input, "keep_recent", "context_compact")?,
             request_in_flight: None,
         };
         let mut pending = crate::sync::lock(&self.pending);
@@ -500,9 +498,7 @@ impl Tool for ContextReplaceTool {
         }
         let recorded = self.slot.submit(Submission {
             summary: summary.to_string(),
-            keep_recent: input
-                .get("keep_recent")
-                .and_then(serde_json::Value::as_bool),
+            keep_recent: super::util::optional_bool(&input, "keep_recent", "context_replace")?,
         });
         // Disarmed between the check above and here: the checkpoint ended, and a summary it will
         // never read is refused rather than reported accepted.

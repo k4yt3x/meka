@@ -337,20 +337,40 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         // (the exit code carries it) and wrong here, where silence is indistinguishable from the
         // command never having run.
         SlashCommand::McpReconnect { server } => {
-            let (outcome, printed) = capture(crate::cli::mcp::run_reconnect(
-                &served_servers(config, mcp_manager.as_deref()),
-                &config.mcp_overlay,
-                token_store,
-                &server,
-            ))
-            .await;
-            if !printed.trim().is_empty() {
-                ui.reply(printed);
-            }
-            match outcome {
-                // "Connected", not "Reconnected": this is a smoke test on a throwaway client, and
-                // the session's own connection to that server is untouched.
-                Ok(()) => ui.note(format!("Connected to '{server}'.")),
+            // The session's own connection when this process runs one: a reconnect is asked for
+            // to replace it, which is what runs a `headers_helper` again. With no manager there
+            // is no connection to replace, and a connect on a throwaway client says whether one
+            // would succeed.
+            let Some(manager) = mcp_manager.as_ref() else {
+                let (outcome, printed) = capture(crate::cli::mcp::run_reconnect(
+                    &served_servers(config, None),
+                    &config.mcp_overlay,
+                    token_store,
+                    &server,
+                ))
+                .await;
+                if !printed.trim().is_empty() {
+                    ui.reply(printed);
+                }
+                match outcome {
+                    Ok(()) => ui.note(format!("Connected to '{server}'.")),
+                    Err(error) => ui.reply(screen_sentence(&error)),
+                }
+                return;
+            };
+            match manager
+                .reconnect_server(&server, config.mcp_connect_timeout)
+                .await
+            {
+                Ok(mcp::ServerState::Connected { .. }) => {
+                    ui.note(format!("Connected to '{server}'."));
+                }
+                Ok(state) => ui.reply(format!(
+                    "MCP server '{server}' {}.",
+                    state
+                        .unavailable_reason()
+                        .unwrap_or_else(|| "is unavailable".to_string())
+                )),
                 Err(error) => ui.reply(screen_sentence(&error)),
             }
         }
@@ -410,6 +430,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             server,
             prompt: prompt_name,
             args,
+            images,
         } => 'prompt: {
             let Some(manager) = mcp_manager.as_ref() else {
                 ui.reply("No MCP servers.");
@@ -482,13 +503,19 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                             "'{server}:{prompt_name}' rendered an empty prompt."
                         ));
                     } else {
-                        let Ok(input) = crate::agent::TurnInput::from_parts(user_input, Vec::new())
+                        let invocation = crate::conversation::ContentBlock::Invocation {
+                            kind: crate::conversation::InvocationKind::McpPrompt,
+                            name: format!("{server}:{prompt_name}"),
+                            directive: args.join(" "),
+                            text: user_input,
+                        };
+                        let Ok(input) = crate::agent::TurnInput::sent(vec![invocation], images)
                         else {
                             ui.reply("Nothing to send.");
                             break 'prompt;
                         };
-                        ui.note(format!("Running prompt '{server}:{prompt_name}'."));
                         match crate::host::terminal::run_turn_interruptible(
+                            shared,
                             cancel,
                             cancel.admit(),
                             agent,
@@ -577,7 +604,11 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 ui.reply(error.to_string());
             }
         }
-        SlashCommand::SkillInvoke { name, extra } => 'invoke: {
+        SlashCommand::SkillInvoke {
+            name,
+            extra,
+            images,
+        } => 'invoke: {
             let installed = agent.skills().current().await;
             let Some(skill) = installed.find(&name) else {
                 let message = match installed.skip_reason(&name) {
@@ -595,23 +626,19 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             let body = match skills::load_skill_body(skill).await {
                 Ok(body) => body,
                 Err(error) => {
-                    ui.reply(format!("failed to load skill '{name}': {error}"));
+                    ui.reply(format!("Failed to load skill '{name}': {error}"));
                     break 'invoke;
                 }
             };
-            // The user's directive first, then the skill's body as the method.
-            let body = if extra.is_empty() {
-                body
-            } else {
-                format!("{extra}\n\n{body}")
-            };
-            let Ok(input) = crate::agent::TurnInput::from_parts(body, Vec::new()) else {
+            // The body is the model's to read; the screen says what the person did when the
+            // message is appended, as a replay does.
+            let invocation = skills::invocation(&name, extra, body);
+            let Ok(input) = crate::agent::TurnInput::sent(vec![invocation], images) else {
                 ui.reply("Nothing to send.");
                 break 'invoke;
             };
-            // The body is the model's to read; the row says what the person did.
-            ui.note(format!("Running skill '{name}'."));
             match crate::host::terminal::run_turn_interruptible(
+                shared,
                 cancel,
                 cancel.admit(),
                 agent,
@@ -792,11 +819,12 @@ pub(crate) enum SlashCommand {
     Fork,
     Cd(Option<String>),
     /// `/mcp <server>:<prompt> [args...]`: render an MCP prompt and send its messages as the next
-    /// user turn.
+    /// user turn, with the images attached to the line.
     McpPrompt {
         server: String,
         prompt: String,
         args: Vec<String>,
+        images: Vec<crate::image::ImageSource>,
     },
     McpList,
     McpReconnect {
@@ -837,10 +865,11 @@ pub(crate) enum SlashCommand {
     },
     SkillList,
     /// `/skill <name> [extra...]`: invoke a skill, with anything after the name prepended to its
-    /// body so the model reads the user's directive first.
+    /// body so the model reads the user's directive first, and the images attached to the line.
     SkillInvoke {
         name: String,
         extra: String,
+        images: Vec<crate::image::ImageSource>,
     },
     Status,
     Usage,
@@ -1031,7 +1060,46 @@ fn parse_skill_slash(rest: &str) -> SlashCommand {
         Some((name, extra)) => (name.to_string(), extra.trim().to_string()),
         None => (rest.to_string(), String::new()),
     };
-    SlashCommand::SkillInvoke { name, extra }
+    SlashCommand::SkillInvoke {
+        name,
+        extra,
+        images: Vec::new(),
+    }
+}
+
+/// What a command line typed with images attached does: an invocation, a skill or an MCP prompt,
+/// takes them, as an editor's and the API's do; another command takes none, and a line that is no
+/// command at all is words for the model beside the images.
+pub(crate) enum WithImages {
+    Invocation(SlashCommand),
+    TakesNone,
+    Words,
+}
+
+/// [`WithImages`] for `line` and `images`.
+pub(crate) fn with_images(line: &str, images: Vec<crate::image::ImageSource>) -> WithImages {
+    match parse_slash_command(line) {
+        Some(SlashCommand::SkillInvoke { name, extra, .. }) => {
+            WithImages::Invocation(SlashCommand::SkillInvoke {
+                name,
+                extra,
+                images,
+            })
+        }
+        Some(SlashCommand::McpPrompt {
+            server,
+            prompt,
+            args,
+            ..
+        }) => WithImages::Invocation(SlashCommand::McpPrompt {
+            server,
+            prompt,
+            args,
+            images,
+        }),
+        Some(_) => WithImages::TakesNone,
+        None => WithImages::Words,
+    }
 }
 
 /// `/mcp`: every shape parses to a command, so nothing falls through to "Unknown command".
@@ -1066,6 +1134,7 @@ fn parse_mcp_slash(rest: &str) -> SlashCommand {
             server: server.to_string(),
             prompt: prompt.to_string(),
             args: argument.split_whitespace().map(str::to_string).collect(),
+            images: Vec::new(),
         };
     }
     SlashCommand::McpUnknownVerb {
@@ -1086,7 +1155,7 @@ const MCP_HELP_ROWS: [(&str, &str); 5] = [
     ("/mcp list", "Pick a server to reconnect, log in or log out"),
     (
         "/mcp reconnect <server>",
-        "Reconnect smoke-test for one server",
+        "Open a new connection to a server",
     ),
     ("/mcp login <server>", "Run the OAuth flow for a server"),
     (
@@ -1208,6 +1277,35 @@ async fn log_in_and_serve(
 mod tests {
     use super::*;
 
+    /// A skill or an MCP prompt invoked with an image attached takes the image; another command
+    /// takes none, and a line that is no command is words.
+    #[test]
+    fn an_invocation_line_takes_the_images_attached_to_it() {
+        let image = crate::image::ImageSource::Blob {
+            hash: "0".repeat(64),
+            media_type: "image/png".into(),
+            size: 3,
+        };
+        assert!(matches!(
+            with_images("/skill review the parser", vec![image.clone()]),
+            WithImages::Invocation(SlashCommand::SkillInvoke { name, extra, images })
+                if name == "review" && extra == "the parser" && images == vec![image.clone()]
+        ));
+        assert!(matches!(
+            with_images("/mcp exa:search pelicans", vec![image.clone()]),
+            WithImages::Invocation(SlashCommand::McpPrompt { images, .. })
+                if images == vec![image.clone()]
+        ));
+        assert!(matches!(
+            with_images("/status", vec![image.clone()]),
+            WithImages::TakesNone
+        ));
+        assert!(matches!(
+            with_images("/home/me/shot.png what is this", vec![image]),
+            WithImages::Words
+        ));
+    }
+
     #[test]
     fn every_help_description_starts_in_the_same_column() {
         let text = help_command_rows();
@@ -1232,7 +1330,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_slash_command("/mcp exa:search a b"),
-            Some(SlashCommand::McpPrompt { server, prompt, args }) if server == "exa" && prompt == "search" && args.len() == 2
+            Some(SlashCommand::McpPrompt { server, prompt, args, .. }) if server == "exa" && prompt == "search" && args.len() == 2
         ));
         assert!(matches!(
             parse_slash_command("/mcp frob"),

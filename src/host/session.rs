@@ -205,7 +205,7 @@ mod tests {
         let token = crate::agent::TurnCancellation::new();
         let _published = cell.publish(token.clone(), admission);
         assert!(
-            token.is_cancelled(),
+            token.is_canceled(),
             "a cancel the caller was told succeeded left the turn running"
         );
     }
@@ -216,7 +216,7 @@ mod tests {
         let admission = cell.admit();
         let token = crate::agent::TurnCancellation::new();
         let _published = cell.publish(token.clone(), admission);
-        assert!(!token.is_cancelled());
+        assert!(!token.is_canceled());
     }
 
     #[test]
@@ -227,7 +227,7 @@ mod tests {
         let token = crate::agent::TurnCancellation::new();
         let _published = cell.publish(token.clone(), admission);
         assert!(
-            !token.is_cancelled(),
+            !token.is_canceled(),
             "a stale cancel aborted a turn submitted after it"
         );
     }
@@ -275,7 +275,7 @@ mod tests {
             cell.cancel(crate::store::turns::CancelReason::Client),
             "the live turn is what a cancel stops"
         );
-        assert!(token.is_cancelled());
+        assert!(token.is_canceled());
         drop(published);
         assert!(cell.live().is_none(), "the cell empties when the turn ends");
         assert!(

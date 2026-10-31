@@ -357,6 +357,23 @@ pub(crate) enum AccountAction {
             value_name = "BOOL"
         )]
         interleaved_thinking: Option<bool>,
+        /// Send `prompt_cache_key` (default: true)
+        #[arg(
+            long = "prompt-cache-key",
+            hide_possible_values = true,
+            value_name = "BOOL"
+        )]
+        prompt_cache_key: Option<bool>,
+        /// Ask for streamed usage (default: true)
+        #[arg(
+            long = "stream-usage",
+            hide_possible_values = true,
+            value_name = "BOOL"
+        )]
+        stream_usage: Option<bool>,
+        /// The longest tool name the endpoint takes (default: the wire's)
+        #[arg(long = "max-tool-name-bytes", value_name = "BYTES")]
+        max_tool_name_bytes: Option<usize>,
         /// Read the API key from stdin
         #[arg(long = "api-key-stdin")]
         api_key_stdin: bool,
@@ -502,6 +519,20 @@ pub(crate) enum ProfileAction {
             )
         )]
         thinking_display: Option<crate::config::ThinkingDisplay>,
+        /// Ask for sealed reasoning and send it back (default: true)
+        #[arg(
+            long = "encrypted-reasoning",
+            hide_possible_values = true,
+            value_name = "BOOL"
+        )]
+        encrypted_reasoning: Option<bool>,
+        /// Ask for a reasoning summary (default: true)
+        #[arg(
+            long = "reasoning-summary",
+            hide_possible_values = true,
+            value_name = "BOOL"
+        )]
+        reasoning_summary: Option<bool>,
     },
     /// List configured profiles
     List {
@@ -667,12 +698,18 @@ pub(crate) enum InstructionsAction {
     /// (or `instructions/`) in the config directory; `--instructions` belongs to a run and is not
     /// consulted. The files `[instructions].files` names are read against the current directory
     /// and follow. The text goes to stdout and the sources to stderr.
-    Show,
+    Show {
+        #[arg(long, default_value = "plain", help = output_format_help())]
+        format: OutputFormat,
+    },
     /// Show where standing instructions are looked for
     ///
     /// The files `[instructions].files` names are listed after the config directory's, resolved
     /// against the current directory.
-    Path,
+    Path {
+        #[arg(long, default_value = "plain", help = output_format_help())]
+        format: OutputFormat,
+    },
 }
 
 /// Inspect and curate the agent's durable notes. The agent maintains these itself through the

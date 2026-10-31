@@ -96,10 +96,8 @@ impl Tool for SearchContentsTool {
         // Cap precedence, as `file_find` has it: an explicit `limit` wins, clamped to the inline
         // cap the way `memory_search` clamps its own; with none, `scratchpad` lifts the cap so the
         // agent can collect an unbounded result set.
-        let max_results = match input.get("limit").and_then(serde_json::Value::as_u64) {
-            Some(limit) => usize::try_from(limit)
-                .unwrap_or(usize::MAX)
-                .clamp(1, MAX_INLINE_MATCHES),
+        let max_results = match super::util::optional_count(&input, "limit", "file_search")? {
+            Some(limit) => limit.clamp(1, MAX_INLINE_MATCHES),
             None if redirects_to_scratchpad(&input) => usize::MAX,
             None => MAX_INLINE_MATCHES,
         };

@@ -332,16 +332,8 @@ impl Tool for SkillWriteTool {
         // `Some("")` is an explicit request to clear the body, as it is on `memory_write`.
         let body: Option<String> =
             optional_str_allowing_empty(&input, "body", "skill_write")?.map(str::to_string);
-        let requested_priority = match input.get("priority") {
-            Some(serde_json::Value::Null) | None => None,
-            Some(value) => {
-                let raw = value.as_i64().ok_or_else(|| MekaError::ToolExecution {
-                    tool_name: "skill_write".to_string(),
-                    message: format!("'priority' must be a whole number, got {value}"),
-                })?;
-                Some(crate::entry::parse_priority(Some(raw), "skill", &name))
-            }
-        };
+        let requested_priority = super::util::optional_i64(&input, "priority", "skill_write")?
+            .map(|raw| crate::entry::parse_priority(Some(raw), "skill", &name));
 
         let installed = self.skills.current().await;
         // Omitted means "leave it alone", as `PUT /v1/skills` has it: reading the absence as the
@@ -544,16 +536,8 @@ impl Tool for SkillEditTool {
         let old_string = require_str(&input, "old_string", "skill_edit")?;
         let new_string =
             super::util::require_str_allowing_empty(&input, "new_string", "skill_edit")?;
-        let replace_all = match input.get("replace_all") {
-            None | Some(serde_json::Value::Null) => false,
-            Some(serde_json::Value::Bool(replace_all)) => *replace_all,
-            Some(value) => {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "skill_edit".to_string(),
-                    message: format!("'replace_all' must be true or false, got {value}"),
-                });
-            }
-        };
+        let replace_all =
+            super::util::optional_bool(&input, "replace_all", "skill_edit")?.unwrap_or(false);
 
         let installed = self.skills.current().await;
         // Unreadable first, for the reason `skill_write` gives.

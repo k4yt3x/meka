@@ -264,7 +264,7 @@ pub(crate) struct ResolvedServeConfig {
     pub(crate) relay_provider_errors: bool,
     /// Whether `/v1/openapi.json` is served. Off unless asked for.
     pub(crate) docs: bool,
-    /// How many SSE events per turn to retain for `Last-Event-ID` replay.
+    /// How many of a session feed's latest SSE events to retain for `Last-Event-ID` replay.
     pub(crate) stream_replay_events: usize,
     /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
     /// reconnect. Zero cancels the turn the moment the stream drops.

@@ -911,6 +911,38 @@ fn an_unresolvable_workspace_directory_warns_without_failing_the_run() {
     );
 }
 
+/// A prompt and a skill are a run's first turn, which neither long-lived host has: their turns
+/// come from the editor or the API. And `meka serve` refuses the directory flags, which no HTTP
+/// session reads. Taken silently, `meka acp -p -` read the whole JSON-RPC stream as the prompt.
+#[test]
+fn the_long_lived_hosts_refuse_the_flags_that_belong_to_a_run() {
+    let install = Install::new();
+    let directory = install.root().to_string_lossy().into_owned();
+    for (host, flag) in [
+        ("acp", vec!["-p", "hello"]),
+        ("serve", vec!["-p", "hello"]),
+        ("acp", vec!["--skill", "demo"]),
+        ("serve", vec![
+            "--additional-workspace-directory",
+            directory.as_str(),
+        ]),
+        ("serve", vec![
+            "--additional-readable-directory",
+            directory.as_str(),
+        ]),
+    ] {
+        let mut args = flag.clone();
+        args.push(host);
+        let output = run_isolated(&install, &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains("does not take"),
+            "meka {} {host} should be refused, got: {stderr}",
+            flag.join(" ")
+        );
+    }
+}
+
 /// `--continue` and `--resume` name *this run's session*, and neither long-lived host has one:
 /// each creates a session per `session/new` or `POST /v1/sessions`. Parsing and doing nothing would
 /// be worse than it sounds: `-c` / `-r` set `session_resume`, which switches off the
@@ -2881,6 +2913,39 @@ fn a_session_is_labeled_title_in_show_and_list() {
         stdout.contains("name the session"),
         "and the row shows it: {stdout}"
     );
+}
+
+/// A run opened with `--skill` is titled by the words `--prompt` gave it, or by the skill's name
+/// without them, never by the body the skill expanded to.
+#[test]
+fn a_skill_run_is_titled_by_what_was_asked() {
+    let install = Install::new();
+    write_provider_config(&install, "alpha", &["alpha"]);
+    let skill = install.config_dir().join("skills").join("demo");
+    std::fs::create_dir_all(&skill).expect("skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\ndescription: a demo\n---\nsay something brief\n",
+    )
+    .expect("write SKILL.md");
+    for (args, title) in [
+        (
+            vec!["--oneshot", "--skill", "demo", "-p", "the parser"],
+            "the parser",
+        ),
+        (vec!["--oneshot", "--skill", "demo"], "demo"),
+    ] {
+        let created = run_scripted(&install, &args);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let listed = run_isolated(&install, &["session", "list", "--format", "json"]);
+        let sessions: serde_json::Value =
+            serde_json::from_slice(&listed.stdout).expect("the listing is JSON");
+        assert_eq!(sessions["sessions"][0]["title"], title, "{sessions}");
+    }
 }
 
 /// Every command that prints survives a reader that hangs up, and none of them calls that failure.

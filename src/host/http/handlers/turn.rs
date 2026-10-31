@@ -256,7 +256,7 @@ pub(crate) async fn submit_turn(
             None
         };
 
-    let message = if let Some(skill_name) = body.options.skill.as_deref() {
+    let invocation = if let Some(skill_name) = body.options.skill.as_deref() {
         let snapshot = state.shared.skills.current().await;
         let skill = snapshot.find(skill_name).ok_or_else(|| {
             // `unavailable`, not a flat "unknown skill": a `SKILL.md` that will not parse is in no
@@ -278,16 +278,13 @@ pub(crate) async fn submit_turn(
                     error,
                 )
             })?;
-        // The composition `--skill [PROMPT]` and the screen's `/skill` use: the body alone when
-        // nothing was typed, so a skill invoked without a message is a turn rather than a blank
-        // line above one.
-        if body.message.trim().is_empty() {
-            skill_body
-        } else {
-            format!("{}\n\n{}", body.message, skill_body)
-        }
+        Some(crate::skills::invocation(
+            skill_name,
+            body.message.clone(),
+            skill_body,
+        ))
     } else {
-        body.message
+        None
     };
 
     // Resolved before anything is admitted, because the rest of the body's validation needs it:
@@ -318,9 +315,12 @@ pub(crate) async fn submit_turn(
     //
     // The retention is stated before any outcome rides along: a carried outcome overrides the
     // client's answer with `Keep`, and the override has to be the last word.
-    let input = crate::agent::TurnInput::from_parts(message, images)
-        .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?
-        .retaining(body.options.unanswered_message);
+    let input = match invocation {
+        Some(invocation) => crate::agent::TurnInput::sent(vec![invocation], images),
+        None => crate::agent::TurnInput::from_parts(body.message, images),
+    }
+    .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?
+    .retaining(body.options.unanswered_message);
 
     // Taken only once the request is known to be one meka will act on. The guard marks the
     // session as busy, and a request rejected above never runs a turn, so acquiring first made a
@@ -384,9 +384,9 @@ pub(crate) async fn submit_turn(
     } else {
         Vec::new()
     };
-    // This turn and the poller are the two ways an outcome leaves the undelivered pool, and
-    // subscribers are owed it whichever one takes it: a task that finishes between two ticks and is
-    // claimed here would otherwise never be announced at all.
+    // A claim leaves the pool the poller announces from, so subscribers are told by whoever claims:
+    // the session's frontend tells them of what a turn claims once it is in the conversation, and
+    // this claim is told here, ahead of a turn that may be refused before its opening is appended.
     // Best-effort here, unlike the poller: this claim is already stamped, and refusing the user's
     // turn over a webhook bookkeeping failure would be the wrong trade. It is logged.
     let _announced = state
@@ -400,6 +400,7 @@ pub(crate) async fn submit_turn(
         renders: body.stream,
     };
     if body.stream {
+        let revoked = state.auth.revoked(&principal, &["sessions:w"]);
         run_streaming_turn(
             state,
             entry,
@@ -409,6 +410,7 @@ pub(crate) async fn submit_turn(
             turn_guard,
             opener,
             idempotency_ticket,
+            revoked,
         )
         .await
     } else {
@@ -864,7 +866,7 @@ async fn run_json_turn(
     // On the feed like every other turn, so a subscriber sees the turn as it runs.
     let (listening, _ids) = entry.frontend.begin_turn(
         turn_id,
-        crate::host::http::http_frontend::TurnSource::Client,
+        crate::host::http::http_frontend::TurnStarter::Client,
         opener,
         state.config.stream_reattach_grace,
         state.config.stream_replay_events,
@@ -994,6 +996,7 @@ async fn run_streaming_turn(
     turn_guard: TurnGuard,
     opener: Opener,
     idempotency_ticket: Option<crate::host::http::idempotency::IdempotencyTicket>,
+    revoked: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<Response, ProblemDetail> {
     // Subscribe to the broadcast BEFORE installing: install_stream returns a receiver that
     // captures the first event onwards.
@@ -1033,10 +1036,7 @@ async fn run_streaming_turn(
     // Where the stream stands before it has received anything: just ahead of the turn's own
     // `turn.started`, which was published after the receiver subscribed. Read now, while the live
     // turn is certainly this one, rather than at the stream's first poll.
-    let joined_after = entry
-        .frontend
-        .turn_started_id()
-        .and_then(|id| id.checked_sub(1));
+    let joined_after = entry.frontend.position_before_turn_started();
 
     let entry_for_task = entry.clone();
     let cancel_for_task = cancellation.clone();
@@ -1096,24 +1096,7 @@ async fn run_streaming_turn(
         opener.holds,
         attendance,
     );
-    let sse = Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(std::time::Duration::from_secs(20))
-            .text("keep-alive"),
-    );
-
-    let mut response = sse.into_response();
-    response.headers_mut().insert(
-        "X-Accel-Buffering",
-        axum::http::HeaderValue::from_static("no"),
-    );
-    response.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-cache, no-transform"),
-    );
-    // No explicit `Connection: keep-alive`: it's forbidden on HTTP/2 (RFC 9113 §8.2.2)
-    // and hyper sets it automatically on HTTP/1.1.
-    Ok(response)
+    Ok(sse_response(stream, revoked))
 }
 
 #[allow(
@@ -1846,17 +1829,15 @@ pub(crate) struct StreamQuery {
     pub(crate) attend: bool,
 }
 
-/// `GET /v1/sessions/{id}/stream`: rejoin the current turn's SSE stream.
+/// `GET /v1/sessions/{id}/stream`: the session's feed, every event of every turn.
 ///
-/// Replays the events after `Last-Event-ID` from a bounded per-turn ring, then follows the live
-/// stream. When the turn has already ended, the backlog plus its terminal event are delivered and
-/// the connection closes, so a client that dropped at the last moment still learns the outcome.
+/// Replays the events after `Last-Event-ID` from the feed's bounded ring, which spans turns, then
+/// follows the live feed for as long as the connection is held. A client that rejoins after a turn
+/// ended still learns how it ended from the replay.
 ///
-/// Two limits worth stating plainly. The ring holds `[serve] stream_replay_events` events, so a
-/// client that was away longer than that gets a `notice` saying its replay has a hole rather than a
-/// transcript that silently skips. And only the most recent turn is retained: reconnecting after a
-/// *newer* turn has started returns that turn's stream, which the `turn_id` on the re-issued
-/// `turn.started` identifies.
+/// The ring holds the latest `[serve] stream_replay_events` events within its byte budget, so a
+/// client that was away longer than that is handed a `feed.gap` event saying its replay has a hole
+/// rather than a transcript that silently skips.
 ///
 /// A sub-agent's id names its own feed for as long as this process runs it: the same events a
 /// session's feed carries, read-only, with `turn.started` naming the parent and its `agent_spawn`
@@ -1909,11 +1890,12 @@ pub(crate) async fn stream_turn(
             )
             .with("session_id", id.to_string()));
         }
-        let Some(attachment) = feed.attach_stream(last_event_id, false) else {
+        let Some(attachment) = feed.attach_stream(last_event_id, false, false) else {
             return Err(no_stream_to_join(id));
         };
         let stream = build_reattach_stream(id, attachment, feed, state.shutdown.clone());
-        return Ok(sse_response(stream));
+        let revoked = state.auth.revoked(&scoped.principal, &["sessions:r"]);
+        return Ok(sse_response(stream, revoked));
     }
     if let Some(terms) = state
         .shared
@@ -1959,7 +1941,13 @@ pub(crate) async fn stream_turn(
         }
     };
 
-    let Some(attachment) = entry.frontend.attach_stream(last_event_id, query.attend) else {
+    // A reader keeps the session loaded when its token could have loaded it, and only then: one
+    // that may only read a loaded session must not hold one a writer has let go.
+    let keeps_loaded = scoped.principal.has_scope("sessions:w");
+    let Some(attachment) = entry
+        .frontend
+        .attach_stream(last_event_id, query.attend, keeps_loaded)
+    else {
         return Err(no_stream_to_join(id));
     };
     let stream = build_reattach_stream(
@@ -1968,7 +1956,16 @@ pub(crate) async fn stream_turn(
         Arc::clone(&entry.frontend),
         state.shutdown.clone(),
     );
-    Ok(sse_response(stream))
+    // An attending reader answers prompts, and a reader that keeps the session loaded holds what
+    // only a loader may, both of which `sessions:w` grants; a plain one only reads. Either way the
+    // stream ends when the token stops granting what it holds.
+    let required: &'static [&'static str] = if query.attend || keeps_loaded {
+        &["sessions:r", "sessions:w"]
+    } else {
+        &["sessions:r"]
+    };
+    let revoked = state.auth.revoked(&scoped.principal, required);
+    Ok(sse_response(stream, revoked))
 }
 
 /// The id a client resumes from: the `Last-Event-ID` header, or the query parameter for a
@@ -1981,12 +1978,15 @@ fn last_event_id_of(headers: &HeaderMap, query: Option<u64>) -> Option<u64> {
         .or(query)
 }
 
-/// An event stream as every feed answers with it: a keep-alive comment every twenty seconds and
-/// the headers that keep a proxy from buffering it.
+/// An event stream as every SSE route answers with it: a keep-alive comment every twenty seconds
+/// and the headers that keep a proxy from buffering it, ended once `revoked` resolves, when the
+/// token it was opened under no longer grants every scope it reads under, which a serving of
+/// `config.toml` can do while it is open.
 fn sse_response(
     stream: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
+    revoked: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Response {
-    let sse = Sse::new(stream).keep_alive(
+    let sse = Sse::new(futures::StreamExt::take_until(stream, revoked)).keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(20))
             .text("keep-alive"),
@@ -2000,6 +2000,8 @@ fn sse_response(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-cache, no-transform"),
     );
+    // No explicit `Connection: keep-alive`: it's forbidden on HTTP/2 (RFC 9113 §8.2.2)
+    // and hyper sets it automatically on HTTP/1.1.
     response
 }
 
@@ -2047,7 +2049,7 @@ pub(crate) struct ServerStreamQuery {
 )]
 pub(crate) async fn stream_server(
     State(state): State<ServerState>,
-    _scoped: scope::Scoped<scope::SessionsRead>,
+    scoped: scope::Scoped<scope::SessionsRead>,
     Query(query): Query<ServerStreamQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, ProblemDetail> {
@@ -2095,7 +2097,8 @@ pub(crate) async fn stream_server(
             }
         }
     };
-    Ok(sse_response(stream))
+    let revoked = state.auth.revoked(&scoped.principal, &["sessions:r"]);
+    Ok(sse_response(stream, revoked))
 }
 
 fn build_reattach_stream(
@@ -2105,8 +2108,10 @@ fn build_reattach_stream(
     shutdown: CancellationToken,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
     async_stream::stream! {
-        // Held for the life of the response: the client attends until it hangs up.
+        // Held for the life of the response: the client attends, and keeps the session loaded,
+        // until it hangs up.
         let _attendance = attachment.attendance;
+        let _keeps_loaded = attachment.keeps_loaded;
         yield Ok::<_, Infallible>(Event::default().retry(std::time::Duration::from_secs(3)));
 
         if let Some(turn_id) = attachment.turn_id {
@@ -2256,13 +2261,13 @@ mod tests {
             },
         );
         let _reattached = frontend
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("a live stream accepts a re-attach");
 
         let cancellation = crate::agent::TurnCancellation::new();
         let canceled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
         assert!(
-            !cancellation.is_cancelled(),
+            !cancellation.is_canceled(),
             "the turn was canceled out from under a consumer that was keeping up"
         );
         assert!(
@@ -2290,7 +2295,7 @@ mod tests {
         let cancellation = crate::agent::TurnCancellation::new();
         let canceled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
         assert!(
-            cancellation.is_cancelled(),
+            cancellation.is_canceled(),
             "nobody is reading, so the turn should not keep running"
         );
         assert!(

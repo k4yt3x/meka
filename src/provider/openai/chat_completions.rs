@@ -40,17 +40,23 @@ pub(crate) struct OpenAiChatCompletionsProvider {
     max_output_tokens: Option<u64>,
     /// See [`crate::config::ProfileConfig::max_request_bytes`]; unset means no ceiling here.
     max_request_bytes: Option<usize>,
+    /// See `AccountConfig::stream_usage`.
+    stream_usage: bool,
 }
 
 impl OpenAiChatCompletionsProvider {
     /// `api_key` is the credential `settings` carries, already checked to be one by the builder.
-    pub(crate) fn new(api_key: String, settings: crate::provider::ProviderBuilder) -> Result<Self> {
+    pub(crate) fn from_settings(
+        api_key: String,
+        settings: crate::provider::ProviderBuilder,
+    ) -> Result<Self> {
         let crate::provider::ProviderBuilder {
             model,
             base_url,
             effort: reasoning_effort,
             max_output_tokens,
             max_request_bytes,
+            stream_usage,
             ..
         } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
@@ -68,6 +74,7 @@ impl OpenAiChatCompletionsProvider {
             resolved_effort,
             max_output_tokens,
             max_request_bytes,
+            stream_usage,
         })
     }
 
@@ -89,6 +96,7 @@ impl OpenAiChatCompletionsProvider {
             Some(max_request_bytes) => crate::provider::budget::fit_body_to_budget(
                 messages,
                 max_request_bytes,
+                None,
                 |messages| {
                     crate::provider::budget::serialize_body(&self.build_request_body(
                         system_prompt,
@@ -275,8 +283,9 @@ impl OpenAiChatCompletionsProvider {
 
         // OpenAI omits `usage` from streamed responses unless explicitly asked; without this the
         // final usage-only chunk never arrives and token accounting (the `/status` context gauge,
-        // auto-compact) silently reads zero for streaming turns.
-        if stream {
+        // auto-compact) silently reads zero for streaming turns. An endpoint that refuses the field
+        // is the account's `stream_usage` to turn off.
+        if stream && self.stream_usage {
             body.insert(
                 "stream_options".into(),
                 serde_json::json!({ "include_usage": true }),
@@ -756,10 +765,30 @@ async fn handle_stream_chunk(
     let accumulators = &mut stream.tool_call_accumulators;
 
     for tool_call in tool_calls {
-        let index = tool_call
-            .get("index")
-            .and_then(|index| index.as_i64())
-            .unwrap_or(0);
+        let index = match tool_call.get("index").and_then(|index| index.as_i64()) {
+            Some(index) => index,
+            // An endpoint that streams each call whole sends no index: a fragment naming another
+            // id than the call being assembled is the next call, not more of that one.
+            None => {
+                let id = tool_call
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .filter(|id| !id.is_empty());
+                match accumulators.keys().max().copied() {
+                    Some(current)
+                        if id.is_some_and(|id| {
+                            accumulators
+                                .get(&current)
+                                .is_some_and(|known| !known.id.is_empty() && known.id != id)
+                        }) =>
+                    {
+                        current + 1
+                    }
+                    Some(current) => current,
+                    None => 0,
+                }
+            }
+        };
 
         let name = tool_call
             .get("function")
@@ -827,9 +856,9 @@ mod tests {
     use crate::conversation::ToolResultContent;
 
     /// A provider against the default endpoint with nothing set on the profile.
-    fn test_provider() -> OpenAiChatCompletionsProvider {
+    fn provider_for_test() -> OpenAiChatCompletionsProvider {
         let api_key: String = "test-key".to_string();
-        OpenAiChatCompletionsProvider::new(
+        OpenAiChatCompletionsProvider::from_settings(
             api_key.clone(),
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::OpenAiChatCompletions,
@@ -841,6 +870,37 @@ mod tests {
             .max_output_tokens(None),
         )
         .expect("build test provider")
+    }
+
+    /// An invocation and an attached resource are text on this wire, in the order the message
+    /// holds them, so the model reads the skill's body and the file among the words.
+    #[test]
+    fn an_invocation_and_a_resource_are_read_in_place() {
+        let messages = [Message::invoked_with_a_resource_for_test()];
+        let body = provider_for_test().build_request_body("", &messages, &[], true);
+        let sent = body["messages"].to_string();
+        let at = |needle: &str| {
+            sent.find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not sent: {sent}"))
+        };
+        assert!(at("the skill's body") < at("compare "), "{sent}");
+        assert!(at("compare ") < at("fn a() {}"), "{sent}");
+        assert!(at("fn a() {}") < at(" with the old one"), "{sent}");
+    }
+
+    /// A streamed request asks for its usage unless the account says its endpoint refuses the
+    /// field, and an unstreamed one never asks.
+    #[test]
+    fn a_streamed_request_asks_for_its_usage_unless_the_account_turns_it_off() {
+        let messages = [Message::user("hi")];
+        let body = provider_for_test().build_request_body("", &messages, &[], true);
+        assert_eq!(body["stream_options"]["include_usage"], true, "{body}");
+        let body = provider_for_test().build_request_body("", &messages, &[], false);
+        assert!(body.get("stream_options").is_none(), "{body}");
+        let mut off = provider_for_test();
+        off.stream_usage = false;
+        let body = off.build_request_body("", &messages, &[], true);
+        assert!(body.get("stream_options").is_none(), "{body}");
     }
 
     /// Drives [`handle_stream_chunk`] over a sequence of chunks and returns everything it produced,
@@ -988,7 +1048,7 @@ mod tests {
     /// spelling, so a `complete` and a streamed turn record the same message.
     #[test]
     fn a_non_streaming_reply_keeps_its_reasoning_as_a_verbatim_thinking_block() {
-        let provider = test_provider();
+        let provider = provider_for_test();
         for field in ["reasoning_content", "reasoning"] {
             let response = serde_json::json!({
                 "choices": [{
@@ -1027,7 +1087,7 @@ mod tests {
     /// and stays out: neither the key nor the text reaches the wire.
     #[test]
     fn only_this_wires_reasoning_is_replayed_as_reasoning_content() {
-        let provider = test_provider();
+        let provider = provider_for_test();
         let thinking = |opaque: Option<OpaqueReasoning>| ContentBlock::Thinking {
             thinking: "the reasoning".to_string(),
             opaque,
@@ -1067,6 +1127,7 @@ mod tests {
             Some(OpaqueReasoning::Sealed {
                 encrypted_content: "SEALED".to_string(),
                 id: None,
+                origin: Some("https://chatgpt.com".to_string()),
             }),
             None,
         ] {
@@ -1248,7 +1309,7 @@ mod tests {
     fn an_openai_base_url_is_normalized_at_construction() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1268,7 +1329,7 @@ mod tests {
         // The version segment belongs in an OpenAI-family base and must survive.
         let default = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1290,7 +1351,7 @@ mod tests {
     fn the_context_block_precedes_the_words() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1312,7 +1373,7 @@ mod tests {
     fn openai_request_body_simple() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1346,7 +1407,7 @@ mod tests {
     fn openai_request_body_user_image_uses_content_array() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1384,7 +1445,7 @@ mod tests {
     fn a_stated_ceiling_refuses_an_oversize_body_here_too() {
         let with_ceiling = |max_request_bytes: Option<usize>| {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1428,7 +1489,7 @@ mod tests {
         // No reasoning_effort, but an explicit cap: `max_completion_tokens` is set.
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1451,7 +1512,7 @@ mod tests {
     fn openai_request_body_effort_alone_sends_no_output_cap() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1474,7 +1535,7 @@ mod tests {
         // With effort and a profile cap, the cap is sent alongside.
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1496,7 +1557,7 @@ mod tests {
     fn openai_request_body_no_cap_without_effort_or_override() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1520,7 +1581,7 @@ mod tests {
         for model in ["gpt-6-astra", "o3", "llama3.1"] {
             let provider = {
                 let api_key: String = "test-key".to_string();
-                OpenAiChatCompletionsProvider::new(
+                OpenAiChatCompletionsProvider::from_settings(
                     api_key.clone(),
                     crate::provider::ProviderBuilder::new(
                         crate::config::Backend::OpenAiChatCompletions,
@@ -1539,7 +1600,7 @@ mod tests {
         // A configured value is absolute, including on a model meka does not recognize.
         let configured = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1560,7 +1621,7 @@ mod tests {
     fn openai_request_body_with_tools() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1597,7 +1658,7 @@ mod tests {
     fn openai_request_body_with_tool_calls() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1652,7 +1713,7 @@ mod tests {
     fn text_beside_tool_results_follows_the_tool_messages_as_a_user_message() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1715,7 +1776,7 @@ mod tests {
     fn openai_parse_non_streaming_text() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1751,7 +1812,7 @@ mod tests {
     fn openai_parse_non_streaming_tool_call() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1804,7 +1865,7 @@ mod tests {
     fn openai_parse_non_streaming_malformed_tool_args() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1859,7 +1920,7 @@ mod tests {
     fn openai_parse_missing_message_in_choice() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1887,7 +1948,7 @@ mod tests {
     fn openai_parse_missing_tool_call_id() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1926,7 +1987,7 @@ mod tests {
     fn openai_parse_missing_tool_call_function_name() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -1965,7 +2026,7 @@ mod tests {
     fn openai_parse_non_streaming_flattened_tool_call() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -2016,7 +2077,7 @@ mod tests {
     fn openai_parse_non_streaming_flattened_missing_name_still_errors() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -2053,7 +2114,7 @@ mod tests {
     fn openai_tool_definitions_use_standard_chat_completions_format() {
         let provider = {
             let api_key: String = "test-key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,
@@ -2137,13 +2198,39 @@ mod tests {
         assert_eq!(accumulator.arguments, "{\"path\": \"a.txt\"}");
     }
 
+    /// Two calls an endpoint streams whole and without an `index` are two calls: the second
+    /// names its own id, and its arguments are not appended to the first's.
+    #[tokio::test]
+    async fn index_less_calls_with_their_own_ids_stay_apart() {
+        let (_events, accumulators, _) = drive_chunks(&[
+            serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "id": "call_a", "function": {"name": "file_read", "arguments": "{\"a\":1}"}
+            }]}}]}),
+            serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "id": "call_b", "function": {"name": "file_read", "arguments": "{\"b\":2}"}
+            }]}}]}),
+        ])
+        .await;
+        assert_eq!(accumulators.len(), 2, "one call per id");
+        let first = accumulators.get(&0).expect("first");
+        let second = accumulators.get(&1).expect("second");
+        assert_eq!(
+            (first.id.as_str(), first.arguments.as_str()),
+            ("call_a", "{\"a\":1}")
+        );
+        assert_eq!(
+            (second.id.as_str(), second.arguments.as_str()),
+            ("call_b", "{\"b\":2}")
+        );
+    }
+
     /// The `tool` message has no `is_error` field in this API; a strict endpoint rejects the
     /// request for one, and only on the turns where a tool failed.
     #[test]
     fn a_failed_tool_result_carries_no_is_error_key() {
         let provider = {
             let api_key: String = "key".to_string();
-            OpenAiChatCompletionsProvider::new(
+            OpenAiChatCompletionsProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiChatCompletions,

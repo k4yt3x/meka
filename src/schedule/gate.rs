@@ -115,27 +115,13 @@ impl GateProbe {
         let Some(object) = value.and_then(|value| value.as_object()) else {
             return Err("`check` must be an object naming either `command` or `tool`".to_string());
         };
-        let command = object.get("command").filter(|value| !value.is_null());
-        let tool = object.get("tool").filter(|value| !value.is_null());
+        let command = request_string(object, "check.command", "command")?;
+        let tool = request_string(object, "check.tool", "tool")?;
         match (command, tool) {
-            (Some(command), None) => {
-                let command = command
-                    .as_str()
-                    .ok_or_else(|| "`check.command` must be a string".to_string())?;
-                if command.trim().is_empty() {
-                    return Err("`check.command` cannot be empty".to_string());
-                }
-                Ok(Self::Shell {
-                    command: command.to_string(),
-                })
-            }
-            (None, Some(tool)) => {
-                let name = tool
-                    .as_str()
-                    .ok_or_else(|| "`check.tool` must be a tool name".to_string())?;
-                if name.trim().is_empty() {
-                    return Err("`check.tool` cannot be empty".to_string());
-                }
+            (Some(command), None) => Ok(Self::Shell {
+                command: command.to_string(),
+            }),
+            (None, Some(name)) => {
                 // Checked against the shape the tool schema declares. Anything else reaches the
                 // tool as null arguments, so the gate errors on every interval instead of being
                 // refused once, here, by the door that could have said which field was wrong.
@@ -161,6 +147,23 @@ impl GateProbe {
         }
     }
 }
+/// A string field of a gate request, read by the rule every tool argument is (see `tools/util.rs`):
+/// absent, `null` and blank are not given, and a value of another type is refused by the name
+/// `label` gives it. Here rather than through those readers because a gate request is parsed below
+/// the tools, for the HTTP route as well as for `schedule_create`.
+fn request_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    label: &str,
+    field: &str,
+) -> std::result::Result<Option<&'a str>, String> {
+    match object.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if crate::text::is_blank(text) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text)),
+        Some(_) => Err(format!("`{label}` must be a string")),
+    }
+}
+
 impl GatePredicate {
     /// Parse the `when` half of a gate request. Absent means [`Self::Changed`], which is the
     /// predicate most watchers want.
@@ -170,11 +173,13 @@ impl GatePredicate {
         const EXPECTED: &str = "expected \"changed\", \"succeeded\", {\"matches\": \"<regex>\"} or \
                                 {\"at\": \"<json pointer>\", \"is\": \"not_empty\"|\"empty\"|\"changed\"}";
 
-        let Some(value) = value.filter(|value| !value.is_null()) else {
+        let Some(value) = value
+            .filter(|value| !value.is_null() && !value.as_str().is_some_and(crate::text::is_blank))
+        else {
             return Ok(Self::Changed);
         };
         if let Some(word) = value.as_str() {
-            return match word {
+            return match word.trim() {
                 "changed" => Ok(Self::Changed),
                 "succeeded" => Ok(Self::Succeeded),
                 other => Err(format!(
@@ -190,15 +195,16 @@ impl GatePredicate {
         // `tool`. Taking `matches` and ignoring `at` would give the model a gate watching something
         // it did not ask for, silently, at both creation doors, and the two halves of a `when` that
         // names both are usually meant as *different* conditions, so neither reading is safe.
-        if object.contains_key("matches") && object.contains_key("at") {
+        let matches = request_string(object, "when.matches", "matches")?;
+        // Blank is a value here, the pointer to the whole document, so only absent and `null` are
+        // left out.
+        let at = object.get("at").filter(|value| !value.is_null());
+        if matches.is_some() && at.is_some() {
             return Err(format!(
                 "`when` names both `matches` and `at`; give exactly one. {EXPECTED}"
             ));
         }
-        if let Some(pattern) = object.get("matches") {
-            let pattern = pattern
-                .as_str()
-                .ok_or_else(|| "`when.matches` must be a regular expression".to_string())?;
+        if let Some(pattern) = matches {
             // Compiled here so a bad pattern is refused by the door that accepted it, rather than
             // becoming a gate that silently never fires.
             regex::Regex::new(pattern)
@@ -207,7 +213,7 @@ impl GatePredicate {
                 pattern: pattern.to_string(),
             });
         }
-        if let Some(pointer) = object.get("at") {
+        if let Some(pointer) = at {
             let pointer = pointer
                 .as_str()
                 .ok_or_else(|| "`when.at` must be a JSON pointer such as \"/chats\"".to_string())?;
@@ -216,7 +222,7 @@ impl GatePredicate {
                     "`when.at` must be a JSON pointer starting with '/', got '{pointer}'"
                 ));
             }
-            let is = match object.get("is").and_then(|value| value.as_str()) {
+            let is = match request_string(object, "when.is", "is")?.map(str::trim) {
                 Some("not_empty") | None => PointerTest::NotEmpty,
                 Some("empty") => PointerTest::Empty,
                 Some("changed") => PointerTest::Changed,
@@ -328,16 +334,16 @@ impl Gate {
 /// Ceiling on gate stdout carried into a turn. A gate is meant to yield a status line, not a
 /// payload; anything past this is truncated so a runaway command cannot push the prompt over the
 /// context window.
-pub(crate) const GATE_OUTPUT_LIMIT: usize = 8 * crate::text::KIB;
+pub(crate) const GATE_OUTPUT_BYTES: usize = 8 * crate::text::KIB;
 /// Ceiling on a probe result meka will parse as JSON, which is a different question from how much
 /// of it the turn is shown.
 ///
-/// Separate from [`GATE_OUTPUT_LIMIT`] because the two bound different costs. That one bounds the
+/// Separate from [`GATE_OUTPUT_BYTES`] because the two bound different costs. That one bounds the
 /// prompt; this one bounds the work an evaluation does, which is the larger number: a `serde_json`
 /// `Value` runs several times the size of its input, and a pointer predicate re-serializes the
 /// part it judges. A megabyte is far past any status a gate should be reading and far short of
 /// what a runaway command can emit.
-pub(crate) const GATE_PARSE_LIMIT: usize = crate::text::MIB;
+pub(crate) const GATE_PARSE_BYTES: usize = crate::text::MIB;
 /// What a gate evaluation decided.
 #[derive(Debug, Clone)]
 pub(crate) struct GateOutcome {
@@ -356,7 +362,7 @@ pub(crate) struct GateOutcome {
 /// What a probe produced, before any predicate is applied to it.
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeOutcome {
-    /// The result as text, trimmed and capped at [`GATE_OUTPUT_LIMIT`]. What the turn is shown.
+    /// The result as text, trimmed and capped at [`GATE_OUTPUT_BYTES`]. What the turn is shown.
     pub(crate) text: String,
     /// The machine-readable result, when there is one: a tool's `structuredContent`, or whatever
     /// the untruncated text parsed as.
@@ -367,7 +373,7 @@ pub(crate) struct ProbeOutcome {
 impl ProbeOutcome {
     /// Assemble a result, parsing before truncating.
     ///
-    /// The order is the point: `text` is capped at [`GATE_OUTPUT_LIMIT`] and gains a truncation
+    /// The order is the point: `text` is capped at [`GATE_OUTPUT_BYTES`] and gains a truncation
     /// marker, and [`crate::scheduler::pointed_at`] falls back to parsing that text whenever there
     /// is no structured value, which is the path every shell probe and most MCP servers take, so a
     /// document over the cap would never parse again. Parsing `raw` keeps the cap bounding what a
@@ -379,7 +385,7 @@ impl ProbeOutcome {
         // evaluation; the MCP layer parsed it before meka saw it, so the bound is on what meka
         // keeps and keeps re-doing.
         let structured = structured.filter(|value| {
-            serde_json::to_string(value).is_ok_and(|rendered| rendered.len() <= GATE_PARSE_LIMIT)
+            serde_json::to_string(value).is_ok_and(|rendered| rendered.len() <= GATE_PARSE_BYTES)
         });
         let structured = structured.or_else(|| {
             // Bounded separately from the display cap: parsing `raw` is what makes a large result
@@ -387,7 +393,7 @@ impl ProbeOutcome {
             // several times that size, re-serialized whole on the scheduler's own task on every
             // evaluation. Past the limit there is no structured value, so a pointer predicate
             // declines with the same answer it gives for a result it cannot read.
-            (raw.len() <= GATE_PARSE_LIMIT)
+            (raw.len() <= GATE_PARSE_BYTES)
                 .then(|| serde_json::from_str::<serde_json::Value>(raw.trim()).ok())
                 .flatten()
         });
@@ -562,11 +568,11 @@ pub(crate) fn elide_for_message(text: &str) -> String {
 /// trailing whitespace varies run to run would fire a `changed` gate forever.
 pub(crate) fn truncate_gate_output(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.len() <= GATE_OUTPUT_LIMIT {
+    if trimmed.len() <= GATE_OUTPUT_BYTES {
         return trimmed.to_string();
     }
     // Cut on a character boundary so the result is still valid UTF-8.
-    let mut end = GATE_OUTPUT_LIMIT;
+    let mut end = GATE_OUTPUT_BYTES;
     while end > 0 && !trimmed.is_char_boundary(end) {
         end -= 1;
     }
@@ -580,6 +586,29 @@ mod tests {
         schedule::tests::{FixedTools, GATE_BUDGET, StillConnecting, gate, probed, tool_probe},
         scheduler::*,
     };
+
+    /// A gate request reads its strings as every tool argument is read: a blank field a model
+    /// filled in because it was shown is not given, and a value of the wrong type is refused by
+    /// name rather than read as the default.
+    #[test]
+    fn a_gate_request_reads_a_blank_field_as_not_given() {
+        let check = serde_json::json!({"command": "gh pr list", "tool": "", "arguments": {}});
+        assert!(matches!(
+            GateProbe::parse_request(Some(&check)),
+            Ok(GateProbe::Shell { command }) if command == "gh pr list"
+        ));
+        assert!(matches!(
+            GatePredicate::parse_request(Some(&serde_json::json!(""))),
+            Ok(GatePredicate::Changed)
+        ));
+        assert!(matches!(
+            GatePredicate::parse_request(Some(&serde_json::json!({"matches": "", "at": "/x", "is": ""}))),
+            Ok(GatePredicate::At { pointer, is: PointerTest::NotEmpty }) if pointer == "/x"
+        ));
+        let refused = GatePredicate::parse_request(Some(&serde_json::json!({"at": "/x", "is": 5})))
+            .expect_err("a number is not a test");
+        assert!(refused.contains("`when.is`"), "{refused}");
+    }
 
     /// A pointer into something that is not a JSON document is an error, not an answer.
     ///
@@ -926,8 +955,8 @@ mod tests {
         let short = truncate_gate_output("  brief  ");
         assert_eq!(short, "brief");
 
-        let long = truncate_gate_output(&"x".repeat(GATE_OUTPUT_LIMIT * 2));
-        assert!(long.len() < GATE_OUTPUT_LIMIT * 2);
+        let long = truncate_gate_output(&"x".repeat(GATE_OUTPUT_BYTES * 2));
+        assert!(long.len() < GATE_OUTPUT_BYTES * 2);
         assert!(long.ends_with("[gate output truncated]"));
     }
 
@@ -938,8 +967,8 @@ mod tests {
         // Three bytes wide, and the limit is not a multiple of three, so the cut lands
         // mid-character and the walk-back actually runs. A two-byte character would divide
         // the even limit exactly and never exercise it.
-        assert_ne!(GATE_OUTPUT_LIMIT % 3, 0, "fixture relies on a ragged cut");
-        let multibyte = "☃".repeat(GATE_OUTPUT_LIMIT);
+        assert_ne!(GATE_OUTPUT_BYTES % 3, 0, "fixture relies on a ragged cut");
+        let multibyte = "☃".repeat(GATE_OUTPUT_BYTES);
         let truncated = truncate_gate_output(&multibyte);
         assert!(truncated.ends_with("[gate output truncated]"));
     }

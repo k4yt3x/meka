@@ -15,6 +15,11 @@ use super::*;
 pub(crate) struct GateToolset {
     pub(super) mcp: Option<std::sync::Arc<crate::mcp::McpClientManager>>,
     pub(super) core: crate::session::CoreMaterials,
+    /// The read boundary and the network a root session of this process holds, which a probe
+    /// holds too: a gate runs on a timer with nobody watching, so it reaches no further than the
+    /// session that set it could.
+    pub(super) read_boundary: crate::workspace::ReadBoundary,
+    pub(super) network: crate::config::Network,
     /// The level built-ins are constructed at.
     ///
     /// Always `Read`, and not the session's level: a gate may only call a tool that resolves to
@@ -39,10 +44,14 @@ impl GateToolset {
     pub(crate) fn new(
         mcp: Option<std::sync::Arc<crate::mcp::McpClientManager>>,
         core: crate::session::CoreMaterials,
+        read_boundary: crate::workspace::ReadBoundary,
+        network: crate::config::Network,
     ) -> Self {
         Self {
             mcp,
             core,
+            read_boundary,
+            network,
             resolution: std::sync::OnceLock::new(),
         }
     }
@@ -79,6 +88,8 @@ impl GateToolset {
             crate::session::ToolSite::detached(
                 Self::dispatch_permission(),
                 crate::workspace::SharedCwd::new(directory),
+                self.read_boundary.clone(),
+                self.network,
             ),
         )
     }
@@ -226,6 +237,8 @@ mod tests {
                 builtin_filter: BuiltinToolFilter::from_config(None, Vec::new(), overrides),
                 ..crate::session::CoreMaterials::for_test()
             },
+            read_boundary: crate::workspace::ReadBoundary::unconfined(),
+            network: crate::config::Network::Host,
             resolution: std::sync::OnceLock::new(),
         };
         use crate::schedule::GateTools;
@@ -256,6 +269,29 @@ mod tests {
             )
             .is_err(),
             "and the door must then refuse it at every level, since a gate needs `read` exactly"
+        );
+    }
+
+    /// A gate holds the process's network setting: under `[permissions].network = "none"` the
+    /// session has no `web_fetch`, and a gate must not get one on a timer either.
+    #[test]
+    fn a_gate_has_no_web_fetch_where_the_network_is_off() {
+        use crate::schedule::GateTools;
+        let toolset = |network| GateToolset {
+            mcp: None,
+            core: crate::session::CoreMaterials::for_test(),
+            read_boundary: crate::workspace::ReadBoundary::unconfined(),
+            network,
+            resolution: std::sync::OnceLock::new(),
+        };
+        assert_eq!(
+            toolset(crate::config::Network::Host).resolve("web_fetch"),
+            Some(Permission::Read)
+        );
+        assert_eq!(
+            toolset(crate::config::Network::None).resolve("web_fetch"),
+            None,
+            "a probe reached a tool the session's network setting withholds"
         );
     }
 
@@ -290,6 +326,8 @@ mod tests {
                 builtin_filter: BuiltinToolFilter::from_config(None, Vec::new(), HashMap::new()),
                 ..crate::session::CoreMaterials::for_test()
             },
+            read_boundary: crate::workspace::ReadBoundary::unconfined(),
+            network: crate::config::Network::Host,
             resolution: std::sync::OnceLock::new(),
         };
 
@@ -342,6 +380,8 @@ mod tests {
                 builtin_filter: BuiltinToolFilter::from_config(None, Vec::new(), HashMap::new()),
                 ..crate::session::CoreMaterials::for_test()
             },
+            read_boundary: crate::workspace::ReadBoundary::unconfined(),
+            network: crate::config::Network::Host,
             resolution: std::sync::OnceLock::new(),
         };
         assert!(
@@ -363,6 +403,8 @@ mod tests {
                     sandbox_capability: capability,
                     ..crate::session::CoreMaterials::for_test()
                 },
+                read_boundary: crate::workspace::ReadBoundary::unconfined(),
+                network: crate::config::Network::Host,
                 resolution: std::sync::OnceLock::new(),
             };
         use crate::schedule::GateTools;

@@ -45,7 +45,8 @@ fn build_tool_use_map(assistant_message: &Message) -> HashMap<String, (String, s
     map
 }
 
-fn build_scratchpad_reference(name: &str, size: usize) -> String {
+/// What a call that named a scratchpad entry is answered with in place of its output.
+pub(crate) fn build_scratchpad_reference(name: &str, size: usize) -> String {
     format!(
         "Output saved to scratchpad entry '{name}' ({size} bytes). \
          Use scratchpad_read to access it.",
@@ -113,9 +114,7 @@ pub(crate) async fn save_explicit_scratchpad_results(
         {
             let scratchpad_name = tool_use_map
                 .get(tool_use_id.as_str())
-                .and_then(|(_, input)| input.get(crate::tools::SCRATCHPAD_PARAMETER))
-                .and_then(|v| v.as_str())
-                .filter(|name| !crate::text::is_blank(name));
+                .and_then(|(_, input)| requested_entry(input));
 
             let Some(name) = scratchpad_name else {
                 continue;
@@ -148,6 +147,14 @@ pub(crate) async fn save_explicit_scratchpad_results(
         }
     }
     Ok(())
+}
+
+/// The entry a call asked its result to be saved under: its `scratchpad` argument, unless blank.
+pub(crate) fn requested_entry(input: &serde_json::Value) -> Option<&str> {
+    input
+        .get(crate::tools::SCRATCHPAD_PARAMETER)
+        .and_then(|value| value.as_str())
+        .filter(|name| !crate::text::is_blank(name))
 }
 
 /// Check each text block in tool results. If oversized, persist to DB and replace with a preview +
@@ -321,7 +328,7 @@ impl Tool for ScratchpadWriteTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name = &super::util::require_str_allowing_empty(&input, "name", "scratchpad_write")?;
+        let name = &super::util::require_str(&input, "name", "scratchpad_write")?;
         let content =
             &super::util::require_str_allowing_empty(&input, "content", "scratchpad_write")?;
 
@@ -415,7 +422,7 @@ impl Tool for ScratchpadReadTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name = &super::util::require_str_allowing_empty(&input, "name", "scratchpad_read")?;
+        let name = &super::util::require_str(&input, "name", "scratchpad_read")?;
         // Parsed ahead of the load and of the regex path, as `file_read` parses it ahead of its
         // I/O, so a malformed range is refused the same way whichever tool and mode it came with.
         let range = line_range(&input, "scratchpad_read")?.unwrap_or(LineRange::WHOLE);
@@ -604,7 +611,7 @@ impl Tool for ScratchpadEditTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name = &super::util::require_str_allowing_empty(&input, "name", "scratchpad_edit")?;
+        let name = &super::util::require_str(&input, "name", "scratchpad_edit")?;
 
         if is_inherited(&self.inherited_names, name) {
             return inherited_write_error(name);
@@ -654,21 +661,32 @@ impl Tool for ScratchpadEditTool {
                 tool_name: "scratchpad_edit".to_string(),
                 message: "missing 'new_string' parameter".to_string(),
             })?;
-        let replace_all = input
-            .get("replace_all")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let replace_all =
+            super::util::optional_bool(&input, "replace_all", "scratchpad_edit")?.unwrap_or(false);
 
-        let existing = self
+        let (wanted, replacement) = (old_string.to_string(), new_string.to_string());
+        let replaced = self
             .store
-            .load_scratchpad_entry(session_id, name)
+            .edit_scratchpad_entry(session_id, name, move |existing| {
+                if !existing.contains(&wanted) {
+                    return (None, None);
+                }
+                let (updated, count) = if replace_all {
+                    let count = existing.matches(&wanted).count();
+                    (existing.replace(&wanted, &replacement), count)
+                } else {
+                    (existing.replacen(&wanted, &replacement, 1), 1)
+                };
+                let bytes = updated.len();
+                (Some(updated), Some((count, bytes)))
+            })
             .await?
             .ok_or_else(|| MekaError::ToolExecution {
                 tool_name: "scratchpad_edit".to_string(),
                 message: format!("scratchpad entry '{name}' not found"),
             })?;
 
-        if !existing.contains(old_string) {
+        let Some((count, bytes)) = replaced else {
             return Ok(ToolOutput::text(
                 format!(
                     "Error: '{}' not found in scratchpad entry '{}'",
@@ -677,26 +695,10 @@ impl Tool for ScratchpadEditTool {
                 ),
                 true,
             ));
-        }
-
-        let (updated_content, count) = if replace_all {
-            let count = existing.matches(old_string).count();
-            (existing.replace(old_string, new_string), count)
-        } else {
-            (existing.replacen(old_string, new_string, 1), 1)
         };
 
-        self.store
-            .update_scratchpad_entry(session_id, name, &updated_content)
-            .await?;
-
         Ok(ToolOutput::text(
-            format!(
-                "Scratchpad entry '{}': replaced {} occurrence(s) ({} bytes)",
-                name,
-                count,
-                updated_content.len(),
-            ),
+            format!("Scratchpad entry '{name}': replaced {count} occurrence(s) ({bytes} bytes)"),
             false,
         ))
     }
@@ -841,8 +843,7 @@ impl Tool for ScratchpadMergeTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let target =
-            &super::util::require_str_allowing_empty(&input, "target", "scratchpad_merge")?;
+        let target = &super::util::require_str(&input, "target", "scratchpad_merge")?;
 
         if is_inherited(&self.inherited_names, target) {
             return inherited_write_error(target);
@@ -1003,7 +1004,7 @@ impl Tool for ScratchpadDeleteTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name = &super::util::require_str_allowing_empty(&input, "name", "scratchpad_delete")?;
+        let name = &super::util::require_str(&input, "name", "scratchpad_delete")?;
 
         if is_inherited(&self.inherited_names, name) {
             return inherited_write_error(name);
@@ -1071,8 +1072,8 @@ impl Tool for ScratchpadRenameTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let old = &super::util::require_str_allowing_empty(&input, "old", "scratchpad_rename")?;
-        let new = &super::util::require_str_allowing_empty(&input, "new", "scratchpad_rename")?;
+        let old = &super::util::require_str(&input, "old", "scratchpad_rename")?;
+        let new = &super::util::require_str(&input, "new", "scratchpad_rename")?;
 
         // Block both ends. Renaming away from an inherited source would be a no-op against the
         // parent's row but implies the sub-agent owns the name; renaming to an inherited target
@@ -1167,9 +1168,8 @@ impl Tool for ScratchpadLoadFileTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let path = super::util::require_str_allowing_empty(&input, "path", "scratchpad_load_file")?;
-        let name =
-            &super::util::require_str_allowing_empty(&input, "name", "scratchpad_load_file")?;
+        let path = super::util::require_str(&input, "path", "scratchpad_load_file")?;
+        let name = &super::util::require_str(&input, "name", "scratchpad_load_file")?;
 
         if is_inherited(&self.inherited_names, name) {
             return inherited_write_error(name);
@@ -1292,9 +1292,8 @@ impl Tool for ScratchpadSaveFileTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name =
-            &super::util::require_str_allowing_empty(&input, "name", "scratchpad_save_file")?;
-        let path = super::util::require_str_allowing_empty(&input, "path", "scratchpad_save_file")?;
+        let name = &super::util::require_str(&input, "name", "scratchpad_save_file")?;
+        let path = super::util::require_str(&input, "path", "scratchpad_save_file")?;
 
         let session_id = resolve_session_id(&self.site.session_id, "scratchpad_save_file")?;
 
@@ -1327,10 +1326,8 @@ impl Tool for ScratchpadSaveFileTool {
         // Asked under the write lock, so the answer is still true when the write happens. This
         // tool reads as the scratchpad's `file_write`, so it refuses to replace an existing file
         // the same way, and `force` is the same escape hatch, spelled the same way.
-        let force = input
-            .get("force")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let force =
+            super::util::optional_bool(&input, "force", "scratchpad_save_file")?.unwrap_or(false);
         // "Cannot tell" is not "does not exist": a target that is there but cannot be stat'ed (a
         // symlink loop, an I/O error) must not be written over without `force`. `file_write`
         // refuses the same case with the same escape hatch.
@@ -2789,6 +2786,44 @@ mod tests {
             .await
             .expect("load");
         assert_eq!(loaded, Some("qux bar qux baz qux".to_string()));
+    }
+
+    /// One assistant message can carry two edits of one entry, and they run at once. Each reads
+    /// and writes the entry in one step, so the second applies to what the first wrote rather than
+    /// to the copy both started from.
+    #[tokio::test]
+    async fn two_edits_of_one_entry_at_once_both_land() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        store
+            .save_scratchpad_entry(session_id, "doc", "alpha beta")
+            .await
+            .expect("save");
+        let tool = ScratchpadEditTool {
+            store: store.clone(),
+            inherited_names: Vec::new(),
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(session_id_for_test(session_id)),
+        };
+        let edit = |old_string: &str, new_string: &str| {
+            tool.execute(
+                serde_json::json!({"name": "doc", "old_string": old_string, "new_string": new_string}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+        };
+
+        let (first, second) = tokio::join!(edit("alpha", "ALPHA"), edit("beta", "BETA"));
+        assert!(!first.expect("first edit").is_error);
+        assert!(!second.expect("second edit").is_error);
+
+        let loaded = store
+            .load_scratchpad_entry(session_id, "doc")
+            .await
+            .expect("load");
+        assert_eq!(loaded.as_deref(), Some("ALPHA BETA"));
     }
 
     // -- scratchpad_list --

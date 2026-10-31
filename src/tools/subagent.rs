@@ -690,8 +690,7 @@ impl Tool for AgentSpawnTool {
         // Optional `max_depth`: the caller's override for how deep this sub-agent's own subtree may
         // recurse. Consumed by `child_spawn_depth` when deciding whether to grant a nested
         // `agent_spawn` below.
-        let max_depth_override =
-            optional_u64(&input, "max_depth", "agent_spawn")?.map(|value| value as usize);
+        let max_depth_override = super::util::optional_count(&input, "max_depth", "agent_spawn")?;
 
         // Resolve parent session ID. By the time a tool runs, `Agent::run_turn` has already written
         // `shared_session_id` before dispatching tools. A missing value here means an agent ran a
@@ -722,7 +721,7 @@ impl Tool for AgentSpawnTool {
                         tool_name: "agent_spawn".to_string(),
                         message: format!("failed to load skill: {error}"),
                     })?;
-                Some(body)
+                Some((skill.name.as_str(), body))
             }
             None => None,
         };
@@ -730,13 +729,12 @@ impl Tool for AgentSpawnTool {
         // Compose the first-turn task: parent directive first, skill body second. The at-least-one
         // check above guarantees a `Some`, but it is resolved here, before the row exists, so that
         // every fallible step of a spawn happens while there is still nothing to clean up.
-        let task =
-            compose_subagent_task(prompt.as_deref(), skill_body.as_deref()).ok_or_else(|| {
-                MekaError::ToolExecution {
-                    tool_name: "agent_spawn".to_string(),
-                    message: "agent_spawn requires 'prompt', 'skill', or both".to_string(),
-                }
-            })?;
+        let task = compose_subagent_task(prompt.as_deref(), skill_body).ok_or_else(|| {
+            MekaError::ToolExecution {
+                tool_name: "agent_spawn".to_string(),
+                message: "agent_spawn requires 'prompt', 'skill', or both".to_string(),
+            }
+        })?;
 
         // Bound the sub-agent's own recursion budget before the spec is written:
         // `child_spawn_depth` turns this tool's counters plus the optional `max_depth`
@@ -933,10 +931,10 @@ impl Tool for AgentSpawnTool {
         let mut messages = Conversation::new();
         // Every request the sub-agent makes is attributed as one (`Attribution::subagent`, from its
         // role), which the Claude OAuth billing header reports as `cc_is_subagent=true;`.
-        sub_agent
+        let outcome = sub_agent
             .run_turn(
                 &mut messages,
-                crate::agent::TurnInput::from_parts(task, Vec::new()).map_err(|empty| {
+                crate::agent::TurnInput::sent(vec![task], Vec::new()).map_err(|empty| {
                     MekaError::ToolExecution {
                         tool_name: "agent_spawn".to_string(),
                         message: empty.to_string(),
@@ -947,27 +945,61 @@ impl Tool for AgentSpawnTool {
                     crate::store::turns::CancelReason::Parent,
                 ),
             )
-            .await?;
-
-        let report = messages
-            .last_assistant_text()
-            .unwrap_or_else(|| "(sub-agent produced no final text)".to_string());
-        // Lead with the id and the scope the worker holds, so the report stays the tail of the
-        // output, where a model reading a long result looks for the conclusion.
-        //
-        // Skipped when the caller redirected the report to a scratchpad. That redirect is universal
-        // (`scratchpad::save_explicit_scratchpad_results` keys off the `scratchpad` argument, not
-        // the tool) and stores the whole result text, so a header here would be written into the
-        // entry and handed to whatever later reads it, while the model, which now sees only a
-        // reference, would not get the id anyway. A scratchpad holds output the parent means to
-        // pass around; the id is metadata about the call, and `agent_list` is where to find it.
-        let output = if super::util::redirects_to_scratchpad(&input) {
-            report
-        } else {
-            format!("Agent: {sub_session_id}\n{scope_lines}\n{report}")
-        };
-        Ok(ToolOutput::text(output, false))
+            .await;
+        worker_report(
+            sub_session_id,
+            &scope_lines,
+            outcome,
+            &messages,
+            super::util::redirects_to_scratchpad(&input),
+        )
     }
+}
+
+/// What a worker's turn comes back to its parent as: its last words under the id and the scope it
+/// holds, with how it stopped when that was not its own choice. A turn that failed comes back under
+/// the same header, so the parent can follow up on the conversation the worker kept rather than
+/// spawn another to repeat its work; an interrupt is the parent's own and goes back up as one.
+///
+/// The header leads, so the report stays the tail of the output, where a model reading a long
+/// result looks for the conclusion. It is left off when the caller redirected the report to a
+/// scratchpad: that redirect is universal (`scratchpad::save_explicit_scratchpad_results` keys off
+/// the `scratchpad` argument, not the tool) and stores the whole result text, so a header would be
+/// written into the entry and handed to whatever later reads it, while the model, which sees only a
+/// reference, would not get the id anyway; `agent_list` is where to find it.
+fn worker_report(
+    agent_id: Uuid,
+    scope_lines: &str,
+    outcome: Result<crate::agent::TurnOutcome>,
+    messages: &Conversation,
+    redirected: bool,
+) -> Result<ToolOutput> {
+    let stopped = match outcome {
+        Err(MekaError::Interrupted) => return Err(MekaError::Interrupted),
+        Err(error) => {
+            return Ok(ToolOutput::text(
+                format!("Agent: {agent_id}\n{scope_lines}\nIts turn failed: {error}"),
+                true,
+            ));
+        }
+        Ok(crate::agent::TurnOutcome::EndTurn) => None,
+        Ok(crate::agent::TurnOutcome::MaxTokens) => {
+            Some("It stopped at its output limit, so this may be cut short.\n")
+        }
+        Ok(crate::agent::TurnOutcome::Refusal(_)) => Some("It refused the task.\n"),
+    };
+    let report = messages
+        .last_assistant_text()
+        .unwrap_or_else(|| "(sub-agent produced no final text)".to_string());
+    let output = if redirected {
+        report
+    } else {
+        format!(
+            "Agent: {agent_id}\n{scope_lines}\n{stopped}{report}",
+            stopped = stopped.unwrap_or_default()
+        )
+    };
+    Ok(ToolOutput::text(output, false))
 }
 
 /// Register `agent_spawn` and the three lifecycle tools that operate on what it produced.
@@ -1233,7 +1265,7 @@ impl Tool for AgentListTool {
                 .tool_builder_params
                 .materials
                 .store
-                .load_events(row.id)
+                .load_history(row.id)
                 .await
                 .map(|events| {
                     events
@@ -1329,10 +1361,8 @@ impl Tool for AgentSteerTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let message = super::util::require_str(&input, "message", "agent_steer")?;
-        let interrupt = input
-            .get("interrupt")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let interrupt =
+            super::util::optional_bool(&input, "interrupt", "agent_steer")?.unwrap_or(false);
         let (_parent_sid, row) =
             require_child_session(&self.tool_builder_params, "agent_steer", &input).await?;
         let class = if interrupt {
@@ -1784,7 +1814,7 @@ impl Tool for AgentFollowupTool {
                 ),
             })?;
 
-        sub_agent
+        let outcome = sub_agent
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::from_parts(prompt, Vec::new()).map_err(|empty| {
@@ -1798,19 +1828,14 @@ impl Tool for AgentFollowupTool {
                     crate::store::turns::CancelReason::Parent,
                 ),
             )
-            .await?;
-
-        let report = messages
-            .last_assistant_text()
-            .unwrap_or_else(|| "(sub-agent produced no final text)".to_string());
-        // Skipped when the caller redirected the report to a scratchpad, for the reason the spawn
-        // skips its own header.
-        let output = if super::util::redirects_to_scratchpad(&input) {
-            report
-        } else {
-            format!("Agent: {agent_id}\n{scope_lines}\n{report}")
-        };
-        Ok(ToolOutput::text(output, false))
+            .await;
+        worker_report(
+            agent_id,
+            &scope_lines,
+            outcome,
+            &messages,
+            super::util::redirects_to_scratchpad(&input),
+        )
     }
 }
 
@@ -1892,7 +1917,7 @@ impl Tool for AgentDeleteTool {
         self.tool_builder_params
             .materials
             .store
-            .delete_session_tree_unless_attached(row.id)
+            .delete_session_unless_attached(row.id)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_delete".to_string(),
@@ -2073,7 +2098,7 @@ async fn build_subagent(
     // follow-up still owes what the worker left open.
     let sub_checklist = crate::checklist::SharedChecklist::default();
     let sub_shared_session_id = crate::session::SharedSessionId::new(Some(sub_session_id));
-    // Wrap so permission prompts surface in the parent's UI while emits stay silent (the
+    // Wrap so approval prompts surface in the parent's UI while emits stay silent (the
     // sub-agent's output flows back as this tool's result, not as live notifications). The one
     // exception is the sub-agent's tool calls, which are rolled up into this call's own display
     // so a long run is not an opaque spinner, hence the tool-call id.
@@ -2284,38 +2309,6 @@ fn name_list(input: &serde_json::Value, key: &str) -> Result<Option<Vec<String>>
     }))
 }
 
-/// An unsigned integer parameter, or an error if the model sent something else: `"0"` read as
-/// absent would give a worker the nesting budget its caller had just tried to deny it.
-fn optional_u64(
-    input: &serde_json::Value,
-    key: &str,
-    tool_name: &'static str,
-) -> Result<Option<u64>> {
-    match input.get(key) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::Number(number)) if number.as_u64().is_some() => Ok(number.as_u64()),
-        Some(other) => Err(MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
-            message: format!(
-                "'{}' must be a non-negative integer, got {}. Leave it out to use the default.",
-                key,
-                json_type_name(other)
-            ),
-        }),
-    }
-}
-
-fn json_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
-
 /// Parse the caller's optional `permission` string. An unrecognized string is a hard error, not a
 /// silent fallback.
 fn parse_subagent_permission(requested: Option<&str>) -> Result<Option<Permission>> {
@@ -2441,15 +2434,23 @@ fn child_spawn_depth(
     (child_remaining, child_absolute, allow_nested)
 }
 
-/// Compose the sub-agent's first-turn task from an optional parent directive and an optional
-/// rendered skill body. Mirrors the CLI's `--skill` ordering (`host::build_skill_prompt`): the
-/// parent directive comes first, the skill body second. Returns `None` only
-/// when both inputs are absent; the caller treats that as an error.
-fn compose_subagent_task(prompt: Option<&str>, skill_body: Option<&str>) -> Option<String> {
-    match (prompt, skill_body) {
-        (Some(prompt), Some(body)) => Some(format!("{prompt}\n\n{body}")),
-        (Some(prompt), None) => Some(prompt.to_string()),
-        (None, Some(body)) => Some(body.to_string()),
+/// Compose the sub-agent's first-turn message from an optional parent directive and an optional
+/// skill with its rendered body: the invocation [`crate::skills::invocation`] makes when there is
+/// a skill, the directive as words when not. Returns `None` only when both inputs are absent; the
+/// caller treats that as an error.
+fn compose_subagent_task(
+    prompt: Option<&str>,
+    skill: Option<(&str, String)>,
+) -> Option<crate::conversation::ContentBlock> {
+    match (prompt, skill) {
+        (prompt, Some((name, body))) => Some(crate::skills::invocation(
+            name,
+            prompt.unwrap_or_default().to_string(),
+            body,
+        )),
+        (Some(prompt), None) => Some(crate::conversation::ContentBlock::Text {
+            text: prompt.to_string(),
+        }),
         (None, None) => None,
     }
 }
@@ -2518,18 +2519,33 @@ mod tests {
 
     #[test]
     fn compose_subagent_task_combinations() {
+        use crate::conversation::{ContentBlock, InvocationKind};
+        let invocation = |directive: &str, text: &str| ContentBlock::Invocation {
+            kind: InvocationKind::Skill,
+            name: "news".to_string(),
+            directive: directive.to_string(),
+            text: text.to_string(),
+        };
         assert_eq!(
-            compose_subagent_task(Some("focus on UK news"), Some("skill body")),
-            Some("focus on UK news\n\nskill body".to_string()),
+            compose_subagent_task(
+                Some("focus on UK news"),
+                Some(("news", "skill body".to_string()))
+            ),
+            Some(invocation(
+                "focus on UK news",
+                "focus on UK news\n\nskill body"
+            )),
             "parent directive must come first, skill body second",
         );
         assert_eq!(
             compose_subagent_task(Some("just a prompt"), None),
-            Some("just a prompt".to_string()),
+            Some(ContentBlock::Text {
+                text: "just a prompt".to_string()
+            }),
         );
         assert_eq!(
-            compose_subagent_task(None, Some("skill body")),
-            Some("skill body".to_string()),
+            compose_subagent_task(None, Some(("news", "skill body".to_string()))),
+            Some(invocation("", "skill body")),
         );
         assert_eq!(compose_subagent_task(None, None), None);
     }
@@ -2734,24 +2750,6 @@ mod tests {
         assert_eq!(
             name_list(&input, "bare").expect("one name"),
             Some(vec!["notion".to_string()])
-        );
-        assert!(
-            optional_u64(
-                &serde_json::json!({"max_depth": "0"}),
-                "max_depth",
-                "agent_spawn"
-            )
-            .is_err(),
-            "a quoted zero is not a depth"
-        );
-        assert_eq!(
-            optional_u64(
-                &serde_json::json!({"max_depth": 0}),
-                "max_depth",
-                "agent_spawn"
-            )
-            .expect("an integer"),
-            Some(0)
         );
     }
 
@@ -3341,6 +3339,54 @@ mod tests {
         );
     }
 
+    /// A worker whose turn failed still names itself, so the parent can follow up on the work it
+    /// kept, and one cut at its output limit says so ahead of its words.
+    #[test]
+    fn a_worker_s_report_names_it_however_its_turn_ended() {
+        let id = Uuid::new_v4();
+        let failed = worker_report(
+            id,
+            "Permission: read",
+            Err(MekaError::Provider(
+                "provider temporarily unavailable".to_string(),
+            )),
+            &Conversation::new(),
+            false,
+        )
+        .expect("a failure is the parent's to read");
+        assert!(failed.is_error);
+        let text = failed.text_content();
+        assert!(text.starts_with(&format!("Agent: {id}\n")), "{text}");
+        assert!(text.contains("temporarily unavailable"), "{text}");
+
+        let mut messages = Conversation::new();
+        messages.append(crate::conversation::Message::assistant_text(
+            "half a report",
+        ));
+        let cut = worker_report(
+            id,
+            "Permission: read",
+            Ok(crate::agent::TurnOutcome::MaxTokens),
+            &messages,
+            false,
+        )
+        .expect("report");
+        let text = cut.text_content();
+        assert!(text.contains("output limit"), "{text}");
+        assert!(text.ends_with("half a report"), "{text}");
+
+        assert!(matches!(
+            worker_report(
+                id,
+                "",
+                Err(MekaError::Interrupted),
+                &Conversation::new(),
+                false
+            ),
+            Err(MekaError::Interrupted)
+        ));
+    }
+
     #[tokio::test]
     async fn spawn_followup_and_delete_round_trip() {
         let store = store_for_test().await;
@@ -3384,6 +3430,12 @@ mod tests {
             .expect("spawn succeeds");
         let text = output.text_content();
         assert!(text.contains("first answer"), "{text}");
+        let stats = params.materials.session_stats.snapshot();
+        assert_eq!(
+            (stats.turns, stats.input_tokens),
+            (0, 12_345),
+            "a worker's turn is its root's spend, not one of its root's turns"
+        );
 
         let agent_id: Uuid = text
             .lines()

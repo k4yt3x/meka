@@ -50,7 +50,10 @@ pub(crate) struct AnthropicMessagesProvider {
 
 impl AnthropicMessagesProvider {
     /// `api_key` is the credential `settings` carries, already checked to be one by the builder.
-    pub(crate) fn new(api_key: String, settings: crate::provider::ProviderBuilder) -> Result<Self> {
+    pub(crate) fn from_settings(
+        api_key: String,
+        settings: crate::provider::ProviderBuilder,
+    ) -> Result<Self> {
         let crate::provider::ProviderBuilder {
             model,
             base_url,
@@ -296,7 +299,7 @@ mod tests {
     ) -> AnthropicMessagesProvider {
         {
             let api_key: String = "test-key".to_string();
-            AnthropicMessagesProvider::new(
+            AnthropicMessagesProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::AnthropicMessages,
@@ -497,7 +500,7 @@ mod tests {
     #[test]
     fn an_account_that_withholds_the_beta_sends_no_beta_header() {
         let build = |interleaved_thinking: bool| {
-            AnthropicMessagesProvider::new(
+            AnthropicMessagesProvider::from_settings(
                 "test-key".to_string(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::AnthropicMessages,
@@ -572,7 +575,7 @@ mod tests {
         // thinking-enabled request still sends only the interleaved beta.
         let thinking_on = {
             let api_key: String = "test-key".to_string();
-            AnthropicMessagesProvider::new(
+            AnthropicMessagesProvider::from_settings(
                 api_key.clone(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::AnthropicMessages,
@@ -734,7 +737,7 @@ mod tests {
             }
         }
         let build = |cache_control: bool| {
-            AnthropicMessagesProvider::new(
+            AnthropicMessagesProvider::from_settings(
                 "test-key".to_string(),
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::AnthropicMessages,

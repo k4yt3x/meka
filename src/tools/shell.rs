@@ -144,6 +144,16 @@ fn bwrap_args(
         args.push(root.into());
     }
 
+    // Every directory between a writable root and a private directory under it, bound onto itself
+    // so it is a mount point, which cannot be renamed or removed. The masks below are anchored to
+    // paths: a command that renamed `~/.local` would carry the credential store out from under the
+    // path the next command's mask names, and that command would read it at the new one.
+    for directory in crate::workspace::pinned_ancestors(writable, private) {
+        args.push("--bind-try".into());
+        args.push(directory.clone().into());
+        args.push(directory.into());
+    }
+
     // meka's own directories, masked after every bind so they stay hidden under a writable root
     // that contains them: later mounts win, which is what would otherwise let a root at `$HOME`
     // hand `~/.config/meka` and the credential store beside it to a confined shell. See
@@ -395,9 +405,7 @@ impl Tool for ExecuteCommandTool {
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
         let command = require_str(&input, "command", "shell_execute")?;
-        let timeout = input
-            .get("timeout_ms")
-            .and_then(serde_json::Value::as_u64)
+        let timeout = super::util::optional_u64(&input, "timeout_ms", "shell_execute")?
             .map(std::time::Duration::from_millis)
             .unwrap_or(DEFAULT_TIMEOUT);
         let permission = self.site.permission.get();
@@ -2956,6 +2964,52 @@ mod tests {
                 Some(7) => panic!("the home directory was visible"),
                 other => panic!("bwrap did not run the command: exit {other:?}"),
             }
+        }
+
+        /// A confined command under a writable root cannot rename or remove a directory on the
+        /// way down to a private one. The masks name paths, so a rename would leave the next
+        /// command's mask over an empty directory and the credential store readable where it went.
+        #[test]
+        fn a_bubblewrapped_shell_cannot_move_a_private_directory_from_under_its_mask() {
+            let Some(bwrap) = which_bwrap() else {
+                return;
+            };
+            let temp = tempfile::tempdir().expect("tempdir");
+            let home = crate::workspace::canonical_for_test(temp.path());
+            let private = home.join(".local").join("share").join("meka");
+            std::fs::create_dir_all(&private).expect("private");
+            std::fs::write(private.join("meka.db"), "secret\n").expect("write");
+
+            let status = std::process::Command::new(bwrap)
+                .args(super::bwrap_args(
+                    std::slice::from_ref(&home),
+                    None,
+                    &home,
+                    std::slice::from_ref(&private),
+                    crate::config::Network::Host,
+                ))
+                .arg("--")
+                .arg("sh")
+                .arg("-c")
+                .arg(
+                    "mv .local .local.moved 2>/dev/null; mv .local/share .local/moved \
+                     2>/dev/null; rmdir .local/share/meka 2>/dev/null; touch .local/written; \
+                     exit 0",
+                )
+                .status()
+                .expect("spawn bwrap");
+            assert!(
+                status.success(),
+                "bwrap did not run the command: {status:?}"
+            );
+            assert!(
+                private.join("meka.db").exists(),
+                "the private directory moved out from under its mask"
+            );
+            assert!(
+                home.join(".local").join("written").exists(),
+                "a write inside the root was refused"
+            );
         }
 
         /// The level `shell_execute` needs depends on whether a sandbox can actually confine it.

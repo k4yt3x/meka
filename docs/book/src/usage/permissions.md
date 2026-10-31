@@ -53,9 +53,8 @@ belonging to the process rather than to the session; pass an absolute path when 
 directory inside the session's.
 
 `--additional-workspace-directory` and `--additional-readable-directory` belong to the process and
-reach the screen, a one-shot run, and an ACP session. Neither reaches a session created through
-`POST /v1/sessions`: the HTTP API is single-directory, so a session there is confined to its own
-`working_directory` and nothing else. Extra directories supplied by an ACP client apply to that
+reach the screen, a one-shot run, and an ACP session. `meka serve` refuses both: the HTTP API is
+single-directory, so a session there is confined to its own `working_directory` and nothing else. Extra directories supplied by an ACP client apply to that
 client's session only, and meka does not report your flags back to the client as though the client
 had asked for them.
 
@@ -195,6 +194,14 @@ at `read` can still read the config directory and the store, account credentials
 workspace directory containing them can write them; see
 [Shell](../tools/shell.md#windows-pick-a-backend). Only `unrestricted` writes there on the other
 backends.
+
+The host's input is hidden from every confined command as well: opening another terminal's pty, or
+the device a keyboard is read from, would take what is typed there, a password at a prompt
+included, from the program it was typed to. Bubblewrap gives each command a `/dev` of its own,
+Landlock leaves `/dev/pts`, `/dev/input`, the raw keyboard devices (`/dev/hidraw*`) and the
+virtual consoles, their terminals (`/dev/tty0` and on) and screens (`/dev/vcs*`), out of what it
+grants, and `sandbox-exec` refuses `/dev/ttys*` but for a pty the command opened itself.
+A command meka runs has no terminal to need: it starts in a session of its own with stdin closed.
 
 The Windows restricted token works differently enough to be worth stating; none of this applies
 under the AppContainer backend, where the environment grants the workspace directories and nothing

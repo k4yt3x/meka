@@ -141,7 +141,7 @@ impl Default for SessionCapabilities {
 use super::feed::{
     Attendance, CaughtUp, FEED_BROADCAST_CAPACITY, LiveTurn, Opener, SessionFeed, StreamAttachment,
 };
-pub(crate) use crate::host::scheduler::TurnSource;
+pub(crate) use crate::host::scheduler::TurnStarter;
 
 /// One parked prompt: the channel its answer arrives on. What the prompt is about rides the
 /// `permission_required` or `elicitation_required` event, which the feed replays while the prompt
@@ -301,6 +301,15 @@ impl HttpFrontend {
             live_output: Mutex::new(HashMap::new()),
             ids: Arc::new(EventIdGenerator::default()),
         }
+    }
+
+    /// The id the feed issued first, which a test reads positions from.
+    #[cfg(test)]
+    fn first_event_id(&self) -> u64 {
+        crate::sync::lock(&self.feed)
+            .as_ref()
+            .map(|feed| feed.ids.origin())
+            .expect("a feed is installed")
     }
 
     #[cfg(test)]
@@ -506,7 +515,7 @@ impl HttpFrontend {
     pub(crate) fn begin_turn(
         &self,
         turn_id: uuid::Uuid,
-        source: TurnSource,
+        source: TurnStarter,
         opener: Opener,
         reattach_grace: Duration,
         replay_capacity: usize,
@@ -566,7 +575,7 @@ impl HttpFrontend {
         );
         self.begin_turn(
             turn_id,
-            TurnSource::Client,
+            TurnStarter::Client,
             opener,
             reattach_grace,
             replay_capacity,
@@ -583,7 +592,7 @@ impl HttpFrontend {
             .and_then(|feed| feed.turn.as_ref())
             .map(|turn| crate::store::turns::TurnRecord {
                 id: turn.turn_id,
-                source: turn.source.name().to_string(),
+                source: turn.source.source(),
                 started_at: turn.started_at.clone(),
                 ended_at: None,
                 status: None,
@@ -648,6 +657,15 @@ impl HttpFrontend {
         }
     }
 
+    /// How many feed readers keep the session loaded right now; see [`Self::attach_stream`].
+    pub(crate) fn readers_keeping_loaded(&self) -> usize {
+        let guard = crate::sync::lock(&self.feed);
+        guard.as_ref().map_or(0, |feed| {
+            feed.keeping_loaded
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
     /// How many consumers are reading the feed right now.
     pub(crate) fn subscriber_count(&self) -> usize {
         let guard = crate::sync::lock(&self.feed);
@@ -656,13 +674,14 @@ impl HttpFrontend {
             .map_or(0, |feed| feed.sender.receiver_count())
     }
 
-    /// The id of the live turn's `turn.started`, once it is published: where a stream opened on
-    /// the turn stands before it has received anything.
-    pub(crate) fn turn_started_id(&self) -> Option<u64> {
-        crate::sync::lock(&self.feed)
-            .as_ref()
-            .and_then(|feed| feed.turn.as_ref())
-            .and_then(|turn| turn.started_id)
+    /// The position just ahead of the in-flight turn's `turn.started`, once it is published: where
+    /// a stream opened on the turn stands before it has received anything, and `None` when that
+    /// event was the feed's first, as for a reader that has been handed nothing.
+    pub(crate) fn position_before_turn_started(&self) -> Option<u64> {
+        crate::sync::lock(&self.feed).as_ref().and_then(|feed| {
+            let started = feed.turn.as_ref()?.started_id?;
+            (started > feed.ids.origin()).then(|| started - 1)
+        })
     }
 
     /// Close the turn's view of the feed. The feed itself stays open: the next turn, whoever
@@ -692,7 +711,9 @@ impl HttpFrontend {
     }
 
     /// Attach to the feed, replaying anything after `last_event_id`. With `attend`, the reader is
-    /// counted as one that answers approval prompts for as long as the attachment lives.
+    /// counted as one that answers approval prompts for as long as the attachment lives; with
+    /// `keeps_loaded`, as one that keeps the session loaded, which is a reader whose token could
+    /// load it.
     ///
     /// The backlog snapshot and the `subscribe()` happen under one lock, and [`Self::emit`] takes
     /// the same lock to append. That is what makes the replay gap-free: without it an event
@@ -703,6 +724,7 @@ impl HttpFrontend {
         &self,
         last_event_id: Option<u64>,
         attend: bool,
+        keeps_loaded: bool,
     ) -> Option<StreamAttachment> {
         let mut guard = crate::sync::lock(&self.feed);
         let feed = guard.as_mut()?;
@@ -713,8 +735,7 @@ impl HttpFrontend {
         if let Some(turn) = feed.turn.as_mut() {
             turn.disconnected_since = None;
         }
-        let next_id = feed.ids.peek();
-        let mut replay = feed.ring.replay(last_event_id, next_id);
+        let mut replay = feed.ring.replay(last_event_id, &feed.ids);
         // Taking `pending` while holding `feed` is safe in this order only: `request_permission`
         // releases `pending` before it acquires `feed` (see `park_permission` / `emit_pause`),
         // and `resolve_permission` never touches `feed` at all, so there is no inversion.
@@ -746,17 +767,19 @@ impl HttpFrontend {
             None => feed.terminal.as_ref().map(|(_, event)| event.clone()),
         };
         let attendance = attend.then(|| Self::attendance_of(feed));
+        let keeps_loaded = keeps_loaded.then(|| super::feed::KeepsLoaded::of(&feed.keeping_loaded));
         let attachment = StreamAttachment {
             turn_id,
             turn_source,
             turn_opening,
             attendance,
+            keeps_loaded,
             backlog: replay.backlog,
             receiver: feed.sender.subscribe(),
             terminal,
             gap: replay.gap,
             resume_from: replay.resume_from,
-            joined_after: next_id.checked_sub(1),
+            joined_after: feed.ids.last_issued(),
         };
         drop(guard);
         Some(attachment)
@@ -768,7 +791,7 @@ impl HttpFrontend {
     pub(crate) fn catch_up(&self, last_delivered: Option<u64>) -> Option<CaughtUp> {
         let guard = crate::sync::lock(&self.feed);
         let feed = guard.as_ref()?;
-        let mut replay = feed.ring.replay(last_delivered, feed.ids.peek());
+        let mut replay = feed.ring.replay(last_delivered, &feed.ids);
         let still_pending = crate::sync::lock(&self.pending);
         Self::withhold_answered_prompts(&mut replay.backlog, &still_pending);
         drop(still_pending);
@@ -917,6 +940,27 @@ impl HttpFrontend {
 #[async_trait]
 impl Frontend for HttpFrontend {
     async fn emit(&self, event: FrontendEvent) {
+        // Every outcome a turn claims reaches the frontend with the event that puts it in the
+        // conversation, a report at a round boundary or the message it rides, whichever door
+        // claimed it; the claim took it out of the pool the poller announces from, so the
+        // subscribers are told here. On a task of its own, so the event is not held back for a
+        // store write, and nothing waits on the delivery anyway.
+        let claimed = match &event {
+            FrontendEvent::BackgroundReported { tasks, .. } => tasks.as_slice(),
+            FrontendEvent::MessageAppended { outcomes, .. } => outcomes.as_slice(),
+            _ => &[],
+        };
+        if !claimed.is_empty() {
+            let announcer = crate::sync::lock(&self.wiring)
+                .as_ref()
+                .and_then(|wiring| Some((wiring.webhooks.clone()?, wiring.background.clone()?)));
+            if let Some((webhooks, background)) = announcer {
+                let tasks = claimed.to_vec();
+                tokio::spawn(async move {
+                    webhooks.announce_claimed_tasks(&background, &tasks).await;
+                });
+            }
+        }
         self.push_event(event);
     }
 
@@ -943,6 +987,7 @@ impl Frontend for HttpFrontend {
         // record changes; a grandchild's feed is wired by this one, the feed above it.
         feed.install_feed(child, &FeedWiring {
             webhooks: None,
+            background: None,
             server: None,
             children: Some(Arc::clone(&children)),
             ..wiring
@@ -1272,6 +1317,8 @@ pub(crate) struct FeedWiring {
     pub(crate) replay_capacity: usize,
     pub(crate) reattach_grace: Duration,
     pub(crate) webhooks: Option<super::webhook::WebhookDispatcher>,
+    /// Where a finished task is stamped announced, beside `webhooks`, which announce it.
+    pub(crate) background: Option<crate::store::background::BackgroundStore>,
     pub(crate) server: Option<super::feed::SharedServerFeed>,
     /// Where a sub-agent's feed is registered for as long as its run lasts, so the stream route
     /// can attach to it by the sub-agent's id.
@@ -1289,6 +1336,7 @@ impl FeedWiring {
             replay_capacity,
             reattach_grace,
             webhooks: None,
+            background: None,
             server: None,
             children: None,
         }
@@ -1372,7 +1420,7 @@ impl Frontend for SubagentFeed {
             FrontendEvent::TurnStarted { turn_id } => {
                 self.feed.begin_turn(
                     *turn_id,
-                    TurnSource::Parent {
+                    TurnStarter::Parent {
                         parent_id: self.parent_id,
                         tool_call_id: self.tool_call_id.clone(),
                     },
@@ -1428,6 +1476,10 @@ impl Frontend for SubagentFeed {
         self.forward.delegate_fs_write(path, content).await
     }
 
+    fn accepts_fs_writes(&self) -> bool {
+        self.forward.accepts_fs_writes()
+    }
+
     async fn handle_elicitation(&self, prompt: ElicitationPrompt) -> ElicitationResponse {
         self.forward.handle_elicitation(prompt).await
     }
@@ -1456,7 +1508,7 @@ impl Drop for SubagentFeed {
 mod tests {
     use super::*;
 
-    /// Wait until `count` permission prompts are parked, rather than sleeping and betting that
+    /// Wait until `count` approval prompts are parked, rather than sleeping and betting that
     /// the spawned task has registered its entry by then.
     async fn wait_for_pending(frontend: &HttpFrontend, count: usize) {
         for _ in 0..2000 {
@@ -1506,7 +1558,7 @@ mod tests {
         assert_eq!(frontend.subscriber_count(), 1, "the turn's own consumer");
 
         let second = frontend
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("a live stream accepts a re-attach");
         assert_eq!(
             frontend.subscriber_count(),
@@ -1537,7 +1589,7 @@ mod tests {
         );
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x1),
-            TurnSource::Inbox {
+            TurnStarter::Inbox {
                 item_ids: Vec::new(),
             },
             Opener::DRIVER,
@@ -1549,10 +1601,13 @@ mod tests {
             primary_param: None,
             input: serde_json::Value::Null,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            tool_call_id: None,
             subagent_id: None,
         };
 
-        let _bare = frontend.attach_stream(None, false).expect("feed installed");
+        let _bare = frontend
+            .attach_stream(None, false, false)
+            .expect("feed installed");
         let refused = tokio::time::timeout(
             Duration::from_secs(5),
             frontend.request_permission(request()),
@@ -1561,7 +1616,9 @@ mod tests {
         .expect("a bare subscriber must not park the prompt");
         assert_eq!(refused, PermissionOutcome::Deny);
 
-        let attendee = frontend.attach_stream(None, true).expect("feed installed");
+        let attendee = frontend
+            .attach_stream(None, true, false)
+            .expect("feed installed");
         let asked = tokio::spawn({
             let frontend = Arc::clone(&frontend);
             async move { frontend.request_permission(request()).await }
@@ -1595,14 +1652,16 @@ mod tests {
         );
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x5),
-            TurnSource::Inbox {
+            TurnStarter::Inbox {
                 item_ids: Vec::new(),
             },
             Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
-        let attendee = frontend.attach_stream(None, true).expect("feed installed");
+        let attendee = frontend
+            .attach_stream(None, true, false)
+            .expect("feed installed");
         let asked = tokio::spawn({
             let frontend = Arc::clone(&frontend);
             async move {
@@ -1612,6 +1671,7 @@ mod tests {
                         primary_param: None,
                         input: serde_json::Value::Null,
                         cancellation: tokio_util::sync::CancellationToken::new(),
+                        tool_call_id: None,
                         subagent_id: None,
                     })
                     .await
@@ -1644,7 +1704,7 @@ mod tests {
         );
         let (mut receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x6),
-            TurnSource::Client,
+            TurnStarter::Client,
             Opener::DRIVER,
             Duration::from_secs(30),
             16,
@@ -1707,7 +1767,9 @@ mod tests {
                 holds: true,
                 renders: true,
             });
-        let attendee = frontend.attach_stream(None, true).expect("feed installed");
+        let attendee = frontend
+            .attach_stream(None, true, false)
+            .expect("feed installed");
         let asked = tokio::spawn({
             let frontend = Arc::clone(&frontend);
             async move { frontend.request_permission(prompt_for_test()).await }
@@ -1730,12 +1792,14 @@ mod tests {
         frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x2),
-            TurnSource::Background,
+            TurnStarter::Background,
             Opener::DRIVER,
             Duration::ZERO,
             16,
         );
-        let attendee = frontend.attach_stream(None, true).expect("feed installed");
+        let attendee = frontend
+            .attach_stream(None, true, false)
+            .expect("feed installed");
         let asked = tokio::spawn({
             let frontend = Arc::clone(&frontend);
             async move { frontend.request_permission(prompt_for_test()).await }
@@ -1761,12 +1825,14 @@ mod tests {
         );
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x2),
-            TurnSource::Background,
+            TurnStarter::Background,
             Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
-        let attendee = frontend.attach_stream(None, true).expect("feed installed");
+        let attendee = frontend
+            .attach_stream(None, true, false)
+            .expect("feed installed");
         let asked = tokio::spawn({
             let frontend = Arc::clone(&frontend);
             async move { frontend.request_permission(prompt_for_test()).await }
@@ -1782,7 +1848,9 @@ mod tests {
         );
         assert!(!asked.is_finished(), "and still waiting on an answer");
 
-        let _back = frontend.attach_stream(None, true).expect("feed installed");
+        let _back = frontend
+            .attach_stream(None, true, false)
+            .expect("feed installed");
         let request_id = crate::sync::lock(&frontend.pending)
             .keys()
             .next()
@@ -1805,7 +1873,9 @@ mod tests {
             uuid::Uuid::nil(),
             &FeedWiring::bare(16, 16, Duration::from_secs(30)),
         );
-        let attendee = frontend.attach_stream(None, true).expect("feed installed");
+        let attendee = frontend
+            .attach_stream(None, true, false)
+            .expect("feed installed");
         let asked = tokio::spawn({
             let frontend = Arc::clone(&frontend);
             async move { frontend.request_permission(prompt_for_test()).await }
@@ -1854,7 +1924,7 @@ mod tests {
             .get(&child)
             .cloned()
             .expect("registered while it runs");
-        let attachment = feed.attach_stream(None, false).expect("attaches");
+        let attachment = feed.attach_stream(None, false, false).expect("attaches");
         child_frontend
             .emit(FrontendEvent::TurnEnded {
                 turn_id,
@@ -1902,7 +1972,7 @@ mod tests {
             );
             frontend.begin_turn(
                 uuid::Uuid::from_u128(0x20),
-                TurnSource::Client,
+                TurnStarter::Client,
                 Opener::DRIVER,
                 Duration::from_secs(30),
                 ring,
@@ -1911,41 +1981,49 @@ mod tests {
         };
         let handed = |frontend: &HttpFrontend, last: Option<u64>| {
             frontend
-                .attach_stream(last, false)
+                .attach_stream(last, false, false)
                 .expect("feed installed")
                 .turn_opening
                 .is_some()
         };
 
-        // Ids: 0 the turn.started, 1 the opening, 2 a delta.
+        // Ids from the first: the turn.started, then the opening, then a delta.
         let roomy = frontend_with_ring(16);
         roomy.push_event(opening());
         roomy.push_event(FrontendEvent::AssistantTextDelta("a".into()));
+        let first = roomy.first_event_id();
         assert!(!handed(&roomy, None), "the replay carries it to a joiner");
         assert!(
-            !handed(&roomy, Some(0)),
+            !handed(&roomy, Some(first)),
             "and to a reader resuming from behind it"
         );
-        assert!(!handed(&roomy, Some(1)), "a reader resuming from it has it");
         assert!(
-            !handed(&roomy, Some(2)),
+            !handed(&roomy, Some(first + 1)),
+            "a reader resuming from it has it"
+        );
+        assert!(
+            !handed(&roomy, Some(first + 2)),
             "and so has one resuming from past it"
         );
 
         let tight = frontend_with_ring(1);
         tight.push_event(opening());
         tight.push_event(FrontendEvent::AssistantTextDelta("a".into()));
+        let first = tight.first_event_id();
         assert!(
             handed(&tight, None),
             "the ring let it go, so a joiner is handed it"
         );
         assert!(
-            handed(&tight, Some(0)),
+            handed(&tight, Some(first)),
             "and so is a reader resuming from behind it"
         );
-        assert!(!handed(&tight, Some(1)), "a reader resuming from it has it");
         assert!(
-            !handed(&tight, Some(2)),
+            !handed(&tight, Some(first + 1)),
+            "a reader resuming from it has it"
+        );
+        assert!(
+            !handed(&tight, Some(first + 2)),
             "and so has one resuming from past it"
         );
     }
@@ -1977,7 +2055,7 @@ mod tests {
         let under_the_stream = crate::sync::lock(&children).get(&child).is_some();
         let (_receiver, _ids) = root.begin_turn(
             uuid::Uuid::from_u128(0x8),
-            TurnSource::Client,
+            TurnStarter::Client,
             Opener::DRIVER,
             Duration::from_secs(30),
             16,
@@ -2000,6 +2078,7 @@ mod tests {
             primary_param: None,
             input: serde_json::Value::Null,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            tool_call_id: None,
             subagent_id: None,
         }
     }
@@ -2019,17 +2098,21 @@ mod tests {
         );
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x3),
-            TurnSource::Background,
+            TurnStarter::Background,
             Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
-        let _bare = frontend.attach_stream(None, false).expect("feed installed");
+        let _bare = frontend
+            .attach_stream(None, false, false)
+            .expect("feed installed");
         assert!(
             !frontend.retains_reasoning(),
             "a bare subscriber keeps the retry"
         );
-        let attendee = frontend.attach_stream(None, true).expect("feed installed");
+        let attendee = frontend
+            .attach_stream(None, true, false)
+            .expect("feed installed");
         assert!(frontend.retains_reasoning(), "an attendee is a renderer");
         drop(attendee);
         assert!(!frontend.retains_reasoning());
@@ -2047,7 +2130,7 @@ mod tests {
         );
         let (mut receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x4),
-            TurnSource::Client,
+            TurnStarter::Client,
             Opener::DRIVER,
             Duration::from_secs(30),
             16,
@@ -2093,15 +2176,16 @@ mod tests {
             seen[3].data["chunk"], "two\n",
             "the buffered remainder is flushed just ahead of the completion"
         );
-        assert_eq!(seen[4].id, Some(2));
+        let first = frontend.first_event_id();
+        assert_eq!(seen[4].id, Some(first + 2));
         assert_eq!(
             seen[5].id,
-            Some(3),
+            Some(first + 3),
             "ids stay dense across transient events"
         );
 
         let backlog = frontend
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("feed installed")
             .backlog;
         assert_eq!(
@@ -2139,6 +2223,7 @@ mod tests {
                 primary_param: Some("rm /tmp/x".into()),
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                tool_call_id: None,
                 subagent_id: None,
             })
             .await;
@@ -2185,6 +2270,7 @@ mod tests {
                 primary_param: Some("rm /tmp/x".into()),
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                tool_call_id: None,
                 subagent_id: None,
             }),
         )
@@ -2233,6 +2319,7 @@ mod tests {
                 primary_param: None,
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                tool_call_id: None,
                 subagent_id: None,
             })
             .await;
@@ -2262,6 +2349,7 @@ mod tests {
                 primary_param: None,
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                tool_call_id: None,
                 subagent_id: None,
             })
             .await;
@@ -2287,6 +2375,7 @@ mod tests {
                 primary_param: Some("/tmp/x".into()),
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                tool_call_id: None,
                 subagent_id: None,
             };
             let join =
@@ -2409,6 +2498,7 @@ mod tests {
                     primary_param: Some("rm -rf /".into()),
                     input: serde_json::Value::Null,
                     cancellation: waiter,
+                    tool_call_id: None,
                     subagent_id: None,
                 })
                 .await
@@ -2473,6 +2563,7 @@ mod tests {
                         primary_param: Some("/tmp/x".into()),
                         input: serde_json::json!({"path": "/tmp/x", "content": "the payload"}),
                         cancellation,
+                        tool_call_id: None,
                         subagent_id: None,
                     })
                     .await
@@ -2529,6 +2620,7 @@ mod tests {
                     primary_param: Some("echo hi".into()),
                     input: serde_json::Value::Null,
                     cancellation: tokio_util::sync::CancellationToken::new(),
+                    tool_call_id: None,
                     subagent_id: None,
                 })
                 .await
@@ -2628,7 +2720,7 @@ mod tests {
         assert!(!frontend.client_disconnected(), "grace period starts");
 
         let attachment = frontend
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("a stream is installed");
         let _receiver = attachment.receiver;
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -2655,17 +2747,18 @@ mod tests {
         }
 
         let all = frontend
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("stream installed");
         assert_eq!(
             all.backlog.len(),
             3,
             "the ring holds its capacity, not the history"
         );
-        // Id 0 is the turn's own `turn.started`; the five chunks are 1 to 5.
+        // The first id is the turn's own `turn.started`; the five chunks follow it.
+        let first = frontend.first_event_id();
         assert_eq!(
             all.backlog[0].id,
-            Some(3),
+            Some(first + 3),
             "oldest-first eviction keeps the newest three"
         );
         assert!(
@@ -2674,26 +2767,30 @@ mod tests {
         );
 
         let resumed = frontend
-            .attach_stream(Some(4), false)
+            .attach_stream(Some(first + 4), false, false)
             .expect("stream installed");
         let ids: Vec<u64> = resumed
             .backlog
             .iter()
             .filter_map(|event| event.id)
             .collect();
-        assert_eq!(ids, vec![5], "resume delivers strictly after the given id");
+        assert_eq!(
+            ids,
+            vec![first + 5],
+            "resume delivers strictly after the given id"
+        );
         assert!(
             resumed.gap.is_none(),
-            "id 4 is still buffered, so the replay is contiguous"
+            "the fifth is still buffered, so the replay is contiguous"
         );
 
         let stale = frontend
-            .attach_stream(Some(0), false)
+            .attach_stream(Some(first), false, false)
             .expect("stream installed");
         assert_eq!(
             stale.gap.and_then(|gap| gap.dropped),
             Some(2),
-            "resuming from id 0 when the ring starts at 3 skips events 1 and 2, and must say so"
+            "resuming from the first when the ring starts at the fourth skips two, and says so"
         );
     }
 
@@ -2716,7 +2813,7 @@ mod tests {
         frontend.end_turn();
 
         let attachment = frontend
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("stream retained past the turn");
         assert!(
             attachment.turn_id.is_none(),
@@ -2754,6 +2851,7 @@ mod tests {
                     primary_param: Some("echo hi".into()),
                     input: serde_json::Value::Null,
                     cancellation: tokio_util::sync::CancellationToken::new(),
+                    tool_call_id: None,
                     subagent_id: None,
                 })
                 .await
@@ -2762,7 +2860,7 @@ mod tests {
 
         // While parked, the prompt is real and must be replayed.
         let parked = frontend
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("stream installed");
         assert!(
             parked
@@ -2784,7 +2882,7 @@ mod tests {
         assert_eq!(join.await.expect("task"), PermissionOutcome::Allow);
 
         let after = frontend
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("stream installed");
         assert!(
             !after
@@ -2807,7 +2905,7 @@ mod tests {
         frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x9),
-            TurnSource::Client,
+            TurnStarter::Client,
             Opener {
                 holds: false,
                 renders: false,
@@ -2822,7 +2920,9 @@ mod tests {
         wait_for_pending(&frontend, 1).await;
         // An attendee comes and goes. Under a zero grace its leaving abandons the prompt on any
         // other session.
-        let attendee = frontend.attach_stream(None, true).expect("feed installed");
+        let attendee = frontend
+            .attach_stream(None, true, false)
+            .expect("feed installed");
         drop(attendee);
         tokio::time::sleep(DISCONNECT_POLL_INTERVAL * 3).await;
         assert!(
@@ -2881,7 +2981,7 @@ mod tests {
         );
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0xb),
-            TurnSource::Client,
+            TurnStarter::Client,
             Opener {
                 holds: true,
                 renders: false,
@@ -2924,7 +3024,7 @@ mod tests {
             frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
             let (receiver, _ids) = frontend.begin_turn(
                 uuid::Uuid::from_u128(0xc),
-                TurnSource::Client,
+                TurnStarter::Client,
                 opener,
                 Duration::ZERO,
                 16,
@@ -2946,14 +3046,14 @@ mod tests {
         let turn_id = uuid::Uuid::from_u128(0xa);
         let (_receiver, _ids) = frontend.begin_turn(
             turn_id,
-            TurnSource::Client,
+            TurnStarter::Client,
             Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
         let record = frontend.in_flight_turn().expect("a turn is live");
         assert_eq!(record.id, turn_id);
-        assert_eq!(record.source, "client");
+        assert_eq!(record.source, crate::store::turns::TurnSource::Client);
         assert!(record.status.is_none() && record.ended_at.is_none());
         frontend.end_turn();
         assert!(frontend.in_flight_turn().is_none());
@@ -3028,7 +3128,7 @@ mod tests {
         );
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x9),
-            TurnSource::Client,
+            TurnStarter::Client,
             Opener {
                 holds: true,
                 renders: false,
@@ -3055,7 +3155,7 @@ mod tests {
         frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x9),
-            TurnSource::Client,
+            TurnStarter::Client,
             Opener {
                 holds: false,
                 renders: false,
@@ -3078,7 +3178,9 @@ mod tests {
                 .await
         });
         wait_for_pending(&frontend, 1).await;
-        let parked = frontend.attach_stream(None, false).expect("feed installed");
+        let parked = frontend
+            .attach_stream(None, false, false)
+            .expect("feed installed");
         let request_id = parked
             .backlog
             .iter()
@@ -3092,7 +3194,9 @@ mod tests {
             join.await.expect("task"),
             ElicitationResponse::Decline
         ));
-        let after = frontend.attach_stream(None, false).expect("feed installed");
+        let after = frontend
+            .attach_stream(None, false, false)
+            .expect("feed installed");
         assert!(
             !after
                 .backlog
@@ -3115,7 +3219,7 @@ mod tests {
         frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x9),
-            TurnSource::Client,
+            TurnStarter::Client,
             Opener {
                 holds: false,
                 renders: false,
@@ -3139,7 +3243,9 @@ mod tests {
             matches!(response, Ok(ElicitationResponse::Decline)),
             "the frontend's own wait ends the prompt"
         );
-        let feed = frontend.attach_stream(None, false).expect("feed installed");
+        let feed = frontend
+            .attach_stream(None, false, false)
+            .expect("feed installed");
         let resolved = feed
             .backlog
             .iter()
@@ -3176,12 +3282,12 @@ mod tests {
             .emit(FrontendEvent::TurnStarted { turn_id })
             .await;
         let attachment = grandchild_feed
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("the grandchild's feed attaches");
         assert_eq!(attachment.turn_id, Some(turn_id));
         assert_eq!(
             attachment.turn_source,
-            Some(TurnSource::Parent {
+            Some(TurnStarter::Parent {
                 parent_id: Some(child),
                 tool_call_id: Some("tu_2".into()),
             }),
@@ -3189,7 +3295,7 @@ mod tests {
         );
         let child_attachment = feed_of(child)
             .expect("still registered")
-            .attach_stream(None, false)
+            .attach_stream(None, false, false)
             .expect("the child's feed attaches");
         assert_eq!(
             child_attachment.turn_id, None,
@@ -3232,12 +3338,15 @@ mod tests {
             ),
             "a channel of four overflows under eleven events"
         );
-        // `turn.started` is id 0, the last thing this reader delivered before it fell behind.
-        let caught_up = frontend.catch_up(Some(0)).expect("feed installed");
+        // `turn.started` is the first id, the last thing this reader delivered before it fell
+        // behind.
+        let first = frontend.first_event_id();
+        let caught_up = frontend.catch_up(Some(first)).expect("feed installed");
         let ids: Vec<u64> = caught_up
             .backlog
             .iter()
             .filter_map(|event| event.id)
+            .map(|id| id - first)
             .collect();
         assert_eq!(
             ids,
@@ -3253,7 +3362,11 @@ mod tests {
             .emit(FrontendEvent::AssistantTextDelta("after".into()))
             .await;
         let next = receiver.recv().await.expect("the new subscription is live");
-        assert_eq!(next.id, Some(11), "and continues where the backlog ended");
+        assert_eq!(
+            next.id,
+            Some(first + 11),
+            "and continues where the backlog ended"
+        );
 
         let short = HttpFrontend::new();
         let (_receiver, _ids) = short.install_stream(
@@ -3271,17 +3384,19 @@ mod tests {
                 .emit(FrontendEvent::AssistantTextDelta(format!("chunk{index}")))
                 .await;
         }
-        let caught_up = short.catch_up(Some(0)).expect("feed installed");
+        let first = short.first_event_id();
+        let caught_up = short.catch_up(Some(first)).expect("feed installed");
         let ids: Vec<u64> = caught_up
             .backlog
             .iter()
             .filter_map(|event| event.id)
+            .map(|id| id - first)
             .collect();
         assert_eq!(ids, vec![7, 8, 9, 10], "the four the ring still holds");
         assert_eq!(
             caught_up.gap.and_then(|gap| gap.dropped),
             Some(6),
-            "ids 1 through 6 are gone, and the hole is counted"
+            "six are gone, and the hole is counted"
         );
     }
 }

@@ -176,26 +176,37 @@ impl TokenStore {
     /// rule behind it, so `[accounts."a/b"]` would otherwise name a path. A readable prefix is
     /// kept so an operator listing the directory can see what these files are.
     pub(crate) fn try_lock_account_credential(&self, account: &str) -> Result<Option<FileLock>> {
+        try_lock_file(&self.credential_lock_path(ACCOUNT_LOCK_PREFIX, account))
+    }
+
+    /// [`Self::try_lock_account_credential`] for an MCP server's OAuth bundle, which a refresh
+    /// rotates the same way: two processes on one server would each spend the refresh token the
+    /// other is about to.
+    pub(crate) fn try_lock_mcp_credential(&self, server: &str) -> Result<Option<FileLock>> {
+        try_lock_file(&self.credential_lock_path(MCP_LOCK_PREFIX, server))
+    }
+
+    /// The lock file for one credential, under `prefix`: the name hashed, since neither an account
+    /// nor a server name has a charset rule that keeps it a file name, with a readable part kept so
+    /// an operator listing the directory can see what the file is.
+    fn credential_lock_path(&self, prefix: &str, name: &str) -> std::path::PathBuf {
         use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(account.as_bytes());
-        let readable: String = account
+        let digest = Sha256::digest(name.as_bytes());
+        let readable: String = name
             .chars()
             .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
             .take(24)
             .collect();
-        let path = self.lock_dir.join(format!(
-            "{}{}-{:x}.lock",
-            ACCOUNT_LOCK_PREFIX,
-            readable,
-            // The digest's leading four bytes: injective on `u32`, so two accounts never share a
-            // file, and short enough that the name stays readable. Rendered by `{:x}`, which drops
-            // leading zeros, so this is up to eight hex digits rather than always eight.
+        self.lock_dir.join(format!(
+            "{prefix}{readable}-{:x}.lock",
+            // The digest's leading four bytes, short enough that the name stays readable; the
+            // readable part beside it keeps a collision to names that also agree on it. Rendered
+            // by `{:x}`, which drops leading zeros, so this is up to eight hex digits.
             digest
                 .iter()
                 .take(4)
                 .fold(0u32, |word, &byte| (word << 8) | u32::from(byte))
-        ));
-        try_lock_file(&path)
+        ))
     }
 
     /// Load the stored credential (API key or OAuth bundle) for an account, keyed by the
@@ -710,10 +721,10 @@ pub(crate) enum AuthCredential {
         access_token: String,
         refresh_token: Option<String>,
         expires_at: Option<i64>,
-        /// Provider-specific identity carried alongside the bearer token. Only
-        /// `chatgpt-subscription` populates it, with the `chatgpt_account_id` read out of the
-        /// id_token JWT and sent on every request as `ChatGPT-Account-ID`; Claude OAuth leaves it
-        /// `None`.
+        /// The account the bearer token belongs to, as each subscription names it:
+        /// `chatgpt-subscription` reads `chatgpt_account_id` out of the id_token JWT and sends it
+        /// as `ChatGPT-Account-ID`; `claude-subscription` takes the token response's account UUID
+        /// and sends it in `metadata.user_id`.
         account_id: Option<String>,
     },
 }

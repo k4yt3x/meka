@@ -293,7 +293,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         &self,
         entry: &Self::Entry,
         turn_id: uuid::Uuid,
-        source: crate::host::scheduler::TurnSource,
+        source: crate::host::scheduler::TurnStarter,
     ) {
         let (_feed, _ids) = entry.frontend.begin_turn(
             turn_id,
@@ -312,7 +312,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         &self,
         entry: &Self::Entry,
         turn_id: uuid::Uuid,
-        origin: &crate::host::scheduler::TurnSource,
+        origin: &crate::host::scheduler::TurnStarter,
         outcome: &Result<crate::agent::TurnOutcome, crate::error::MekaError>,
         cancellation: &crate::agent::TurnCancellation,
     ) {
@@ -338,7 +338,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         );
         entry.frontend.record_terminal(event_type, data);
         entry.frontend.end_turn();
-        if matches!(origin, crate::host::scheduler::TurnSource::Inbox { .. }) {
+        if matches!(origin, crate::host::scheduler::TurnStarter::Inbox { .. }) {
             notify_turn_end(&self.state.webhooks, event_type, turn_id, entry.id);
         }
     }

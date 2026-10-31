@@ -37,7 +37,7 @@ meka instructions show     # the resolved text, plus where it came from
 meka instructions path     # the paths meka checks, and whether each exists
 ```
 
-`show` prints the text on stdout and the source on stderr, so `meka instructions show 2>/dev/null` pipes cleanly.
+`show` prints the text on stdout and the source on stderr, so `meka instructions show 2>/dev/null` pipes cleanly. Under `--format json`, `show` prints one object, `{"source", "files", "content"}`, each field left out when there is nothing to say, and `path` prints `{"paths": [{"path", "exists"}]}`.
 
 ## Passing them as a string
 

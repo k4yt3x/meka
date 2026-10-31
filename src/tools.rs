@@ -221,7 +221,7 @@ pub(crate) fn admit_arguments(
         .and_then(|value| value.as_str())
     {
         return Err(ToolOutput::text(
-            format!("Tool call rejected: {reason}"),
+            format!("Tool call refused: {reason}"),
             true,
         ));
     }

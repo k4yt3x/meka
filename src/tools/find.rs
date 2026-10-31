@@ -128,14 +128,12 @@ impl Tool for FindFilesTool {
         }
 
         // Cap precedence:
-        //   1. explicit `limit` parameter: honored verbatim
+        //   1. explicit `limit` parameter: honored, from its schema's minimum of 1
         //   2. no limit + `scratchpad` set: unbounded (preserves the "collect everything" escape
         //      hatch)
         //   3. otherwise: DEFAULT_INLINE_RESULTS
-        let explicit_limit = input
-            .get("limit")
-            .and_then(|value| value.as_u64())
-            .map(|value| usize::try_from(value).unwrap_or(usize::MAX));
+        let explicit_limit =
+            super::util::optional_count(&input, "limit", "file_find")?.map(|limit| limit.max(1));
         let cap = match explicit_limit {
             Some(limit) => limit,
             None if redirects_to_scratchpad(&input) => usize::MAX,

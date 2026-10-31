@@ -115,6 +115,11 @@ pub(crate) struct Context {
     /// form a stored credential records, or what this process's environment leaves unresolved
     /// in the `url`. Empty when the caller read no file.
     pub(crate) mcp_endpoints: Vec<(String, std::result::Result<String, String>)>,
+    /// Each profile `config.toml` configures on a `chatgpt-subscription` account, by name, with
+    /// the origin of the endpoint its requests went to. The one backend that asked for sealed
+    /// reasoning before the origin was recorded, so what such a profile's turns sealed was sealed
+    /// there. Empty when the caller read no file.
+    pub(crate) chatgpt_origins: Vec<(String, String)>,
 }
 
 impl Context {
@@ -125,6 +130,7 @@ impl Context {
             config_unreadable: false,
             default_permission: String::new(),
             mcp_endpoints: Vec::new(),
+            chatgpt_origins: Vec::new(),
         }
     }
 
@@ -143,6 +149,12 @@ impl Context {
         self
     }
 
+    /// The same, with the endpoint each `chatgpt-subscription` profile's reasoning was sealed at.
+    pub(crate) fn sealing_chatgpt_reasoning_at(mut self, origins: Vec<(String, String)>) -> Self {
+        self.chatgpt_origins = origins;
+        self
+    }
+
     /// What a caller hands over when `config.toml` could not be parsed or read.
     ///
     /// Deliberately still openable: a store already at head runs no step that consults this, so the
@@ -156,6 +168,7 @@ impl Context {
             config_unreadable: true,
             default_permission: String::new(),
             mcp_endpoints: Vec::new(),
+            chatgpt_origins: Vec::new(),
         }
     }
 }
@@ -462,7 +475,323 @@ const MIGRATIONS: &[Migration] = &[
         name: "mcp_credentials_name_their_endpoint",
         step: Step::Contextual(mcp_credentials_name_their_endpoint),
     },
+    // 0.86 writes an `unsign` row, which a build before it does not know and would drop on a
+    // read, sending the thinking the row took away again. Nothing to convert: the step moves the
+    // version, so an older build refuses the store rather than misreading it.
+    Migration {
+        name: "messages_record_unsigned_thinking",
+        step: Step::Sql(""),
+    },
+    // 0.87 reads a cron job's pattern in the IANA zone the job names, and in the machine's own
+    // zone when it names none, which is what every job written before the column means.
+    Migration {
+        name: "scheduled_jobs_name_their_zone",
+        step: Step::Rust(scheduled_jobs_name_their_zone),
+    },
+    // 0.87 records on each sealed reasoning block the origin of the endpoint that sealed it, and
+    // sends a block back to that endpoint alone. Only `chatgpt-subscription` asked for sealed
+    // reasoning before, so a block a turn on such a profile wrote was sealed at its endpoint; any
+    // other block records none, which sends it nowhere.
+    Migration {
+        name: "sealed_reasoning_names_its_endpoint",
+        step: Step::Contextual(sealed_reasoning_names_its_endpoint),
+    },
+    // 0.87 writes a skill or an MCP prompt somebody invoked, and a resource an editor attached,
+    // as blocks of their own, which a build before it does not know and would refuse to read.
+    // Nothing to convert: a message written before keeps its words as text.
+    Migration {
+        name: "messages_hold_invocations_and_resources",
+        step: Step::Sql(""),
+    },
+    // 0.87 links each copy a compaction that kept the recent turns writes after its boundary to
+    // the row it copies, so every reader that shows history says those turns once, where they were
+    // first said, and shows the copy once that row is gone. A copy written before the column is
+    // linked by what it holds to the row before its boundary that holds the same.
+    Migration {
+        name: "messages_mark_the_copies_compactions_kept",
+        step: Step::Rust(messages_mark_the_copies_compactions_kept),
+    },
+    // 0.87 copies a fork's or an import's rows in short transactions behind a session row marked
+    // unfinished, which no listing shows until the copy is whole. Every row written before is
+    // whole, which the column's default says.
+    Migration {
+        name: "sessions_mark_an_unfinished_copy",
+        step: Step::Rust(sessions_mark_an_unfinished_copy),
+    },
 ];
+
+/// The column that marks a session whose copy is unfinished. Safe to replay: the column is added
+/// once.
+fn sessions_mark_an_unfinished_copy(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "sessions", "incomplete")? {
+        transaction.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    Ok(())
+}
+
+/// The column that links a copy a compaction kept to the row it copies, the index the turn sweep
+/// finds a row's copies by, and every copy written before the column, linked by
+/// [`kept_copies_0_87`] over the rows of each session a compaction ran on. A copy whose row is
+/// gone, or holds something else, stays unlinked and reads as a row of its own. Safe to replay: the
+/// links are made only by the run that adds the column, so a replay over a store whose sweep has
+/// since taken a copy's row leaves that copy standing on its own.
+fn messages_mark_the_copies_compactions_kept(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let linking = !table_has_column(transaction, "messages", "copy_of")?;
+    if linking {
+        transaction.execute_batch("ALTER TABLE messages ADD COLUMN copy_of INTEGER")?;
+    }
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messages_copies ON messages(copy_of) \
+         WHERE copy_of IS NOT NULL",
+    )?;
+    if !linking {
+        return Ok(());
+    }
+    let sessions: Vec<String> = transaction
+        .prepare("SELECT DISTINCT session_id FROM messages WHERE kind = 'compact_boundary'")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut rows_of = transaction.prepare(
+        "SELECT id, kind, content, created_at, turn_id FROM messages WHERE session_id = ?1 \
+         ORDER BY id",
+    )?;
+    let mut link = transaction.prepare("UPDATE messages SET copy_of = ?2 WHERE id = ?1")?;
+    for session in sessions {
+        let rows: Vec<(i64, String, String, String, Option<String>)> = rows_of
+            .query_map([&session], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let facts: Vec<RowFacts087<'_, (&str, &str)>> = rows
+            .iter()
+            .map(|(_, kind, content, created_at, turn_id)| {
+                (
+                    kind == "compact_boundary",
+                    matches!(
+                        kind.as_str(),
+                        "user" | "user_blocks" | "assistant" | "tool_results"
+                    ),
+                    created_at.as_str(),
+                    turn_id.as_deref(),
+                    (kind.as_str(), content.as_str()),
+                )
+            })
+            .collect();
+        for (copy, original) in kept_copies_0_87(&facts) {
+            if let (Some((copy, ..)), Some((original, ..))) = (rows.get(copy), rows.get(original)) {
+                link.execute([copy, original])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What [`kept_copies_0_87`] reads of a row: whether it is a compaction's boundary, whether it is a
+/// message, the time and the turn it was written under, and what it holds.
+type RowFacts087<'a, K> = (bool, bool, &'a str, Option<&'a str>, K);
+
+/// The copies a log's compactions kept, each with the row it copies, by position: the messages
+/// right after a boundary that a compaction wrote in the one write it made of the boundary and
+/// them, which gave every row of it the boundary's time and turn and which no later row shares;
+/// paired with the messages between the boundary before and its own by the alignment that pairs
+/// the most of them with rows holding what they hold, in order, each with the latest row it can. A
+/// copy no row matches is left out. One reading serves the ledger step and the archive door.
+/// Copies written before 0.42, which saved each row on its own with its own time, are not found
+/// and stay rows of their own.
+fn kept_copies_0_87<K: PartialEq>(rows: &[RowFacts087<'_, K>]) -> Vec<(usize, usize)> {
+    let mut links = Vec::new();
+    let mut floor = 0;
+    let mut index = 0;
+    while let Some((boundary, _, at, turn, _)) = rows.get(index) {
+        if !boundary {
+            index += 1;
+            continue;
+        }
+        let first = index + 1;
+        let mut end = first;
+        while let Some((false, true, copy_at, copy_turn, _)) = rows.get(end) {
+            if copy_at != at || copy_turn != turn {
+                break;
+            }
+            end += 1;
+        }
+        let pool: Vec<usize> = (floor..index)
+            .filter(|position| rows.get(*position).is_some_and(|(_, message, ..)| *message))
+            .collect();
+        let held = |position: &usize| rows.get(*position).map(|(.., held)| held);
+        let copies: Vec<Option<&K>> = (first..end).map(|position| held(&position)).collect();
+        let originals: Vec<Option<&K>> = pool.iter().map(held).collect();
+        for (offset, paired) in aligned_0_87(&copies, &originals).into_iter().enumerate() {
+            if let Some(original) = paired.and_then(|paired| pool.get(paired)) {
+                links.push((first + offset, *original));
+            }
+        }
+        floor = first;
+        index = end;
+    }
+    links
+}
+
+/// For each of `copies`, the position in `rows` it pairs with in the longest alignment that keeps
+/// both orders, each pairing with the latest row it can, or `None`.
+fn aligned_0_87<K: PartialEq>(copies: &[Option<&K>], rows: &[Option<&K>]) -> Vec<Option<usize>> {
+    let width = rows.len() + 1;
+    let mut longest = vec![0_u32; (copies.len() + 1) * width];
+    let at = |longest: &[u32], i: usize, j: usize| longest.get(i * width + j).copied().unwrap_or(0);
+    let pairs = |i: usize, j: usize| matches!((copies.get(i), rows.get(j)), (Some(Some(copy)), Some(Some(row))) if copy == row);
+    for i in 0..copies.len() {
+        for j in 0..rows.len() {
+            let value = if pairs(i, j) {
+                at(&longest, i, j) + 1
+            } else {
+                at(&longest, i, j + 1).max(at(&longest, i + 1, j))
+            };
+            if let Some(cell) = longest.get_mut((i + 1) * width + j + 1) {
+                *cell = value;
+            }
+        }
+    }
+    let mut paired = vec![None; copies.len()];
+    let (mut i, mut j) = (copies.len(), rows.len());
+    while i > 0 && j > 0 {
+        if pairs(i - 1, j - 1) && at(&longest, i, j) == at(&longest, i - 1, j - 1) + 1 {
+            if let Some(slot) = paired.get_mut(i - 1) {
+                *slot = Some(j - 1);
+            }
+            i -= 1;
+            j -= 1;
+        } else if at(&longest, i, j - 1) >= at(&longest, i - 1, j) {
+            j -= 1;
+        } else {
+            i -= 1;
+        }
+    }
+    paired
+}
+
+/// Name `origin` on every sealed reasoning block under `value` that names none, at any depth, and
+/// report whether any did. One walk serves the ledger step and the archive door, the two places an
+/// older shape is converted.
+fn name_sealed_origin_0_87(value: &mut serde_json::Value, origin: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut changed = false;
+            let kind = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if kind.as_deref() == Some("thinking")
+                && let Some(serde_json::Value::Object(opaque)) = fields.get_mut("opaque")
+                && opaque.get("type").and_then(serde_json::Value::as_str) == Some("sealed")
+                && !opaque.contains_key("origin")
+            {
+                opaque.insert("origin".to_string(), origin.clone());
+                changed = true;
+            }
+            // A tool call's arguments are what the model sent, whatever shape they take.
+            for (key, nested) in fields.iter_mut() {
+                if kind.as_deref() == Some("tool_use") && key == "input" {
+                    continue;
+                }
+                changed |= name_sealed_origin_0_87(nested, origin);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= name_sealed_origin_0_87(item, origin);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// 0.87: every sealed reasoning block names the origin of the endpoint that sealed it: the origin
+/// `context` gives for the profile that served the block's turn, the turn's own when it records
+/// one and else its session's, or `null`. Refused, aborting the transaction, while a block is to
+/// be named and the caller could not read `config.toml`, so the naming is made on a later run that
+/// can rather than to nothing. Safe to replay: a block that names an origin, `null` included, is
+/// left alone.
+fn sealed_reasoning_names_its_endpoint(
+    transaction: &rusqlite::Transaction<'_>,
+    context: &Context,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String, Option<String>)> = {
+        let mut statement = transaction.prepare(
+            "SELECT m.id, m.content, COALESCE(t.profile, s.profile)
+             FROM messages m
+             JOIN sessions s ON s.id = m.session_id
+             LEFT JOIN turns t ON t.id = m.turn_id
+             WHERE m.content LIKE '%\"sealed\"%'",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut updates = Vec::new();
+    for (id, content, profile) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let origin = profile
+            .and_then(|profile| {
+                context
+                    .chatgpt_origins
+                    .iter()
+                    .find(|(name, _)| *name == profile)
+                    .map(|(_, origin)| serde_json::Value::String(origin.clone()))
+            })
+            .unwrap_or(serde_json::Value::Null);
+        if name_sealed_origin_0_87(&mut value, &origin) {
+            updates.push((id, value.to_string()));
+        }
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
+    if context.config_unreadable {
+        // `InvalidParameterName` for the reason the 0.44 step gives.
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "cannot record where {count} message(s)' sealed reasoning was sealed while \
+             config.toml cannot be read; fix the file and start meka again",
+            count = updates.len()
+        )));
+    }
+    for (id, content) in updates {
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![content, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// 0.87: a cron job may name the zone its pattern is read in. `NULL` is the machine's zone, which
+/// is every existing job's meaning. Safe to replay: a column that exists is left alone.
+fn scheduled_jobs_name_their_zone(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('scheduled_jobs') WHERE name = 'timezone')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        transaction.execute_batch("ALTER TABLE scheduled_jobs ADD COLUMN timezone TEXT")?;
+    }
+    Ok(())
+}
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
 /// in both for a session that numbers nothing, zero in both for one numbering from its next turn.
@@ -890,7 +1219,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 7_151_354_190_224_943_844;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 13_439_582_009_043_392_022;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -3186,6 +3515,8 @@ const ARCHIVE_FORMAT_0_83: u64 = 15;
 /// The archive `format_version` 0.84 and 0.85 wrote, whose events never record that Claude's
 /// thinking stopped being sent.
 const ARCHIVE_FORMAT_0_85: u64 = 16;
+/// The archive `format_version` 0.86 wrote, whose sealed reasoning names no endpoint.
+const ARCHIVE_FORMAT_0_86: u64 = 17;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -3722,12 +4053,14 @@ pub(crate) fn bring_memory_file_forward(
 /// 0.76 gives an inbox item, a scheduled fire and a background report, by
 /// [`type_user_events_0_76`], in a repair's messages too and with a report naming only its
 /// tasks, by [`type_repairs_and_name_report_tasks_0_76`]. Every version before 0.79 then gives a
-/// spec from before 0.76 the two allow-list keys it lacks, by [`name_allow_lists_0_76`].
+/// spec from before 0.76 the two allow-list keys it lacks, by [`name_allow_lists_0_76`]. The three
+/// that recognize an old shape by a text block's opening words are gated on the format, since in a
+/// later archive those words can only be a person's.
 pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
-    match document
+    let from = document
         .get("format_version")
-        .and_then(|version| version.as_u64())
-    {
+        .and_then(|version| version.as_u64());
+    match from {
         Some(ARCHIVE_FORMAT_0_59) => {
             rename_tools_0_60(document);
             if let Some(sessions) = document
@@ -3757,7 +4090,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_78_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_78)
         | Some(ARCHIVE_FORMAT_0_83)
-        | Some(ARCHIVE_FORMAT_0_85) => {}
+        | Some(ARCHIVE_FORMAT_0_85)
+        | Some(ARCHIVE_FORMAT_0_86) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -3779,14 +4113,78 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         }
     }
     snapshot_checklists_0_70(document);
-    block_nudges_0_70(document);
+    // The conversions that recognize an old shape by a text block's opening words run only on the
+    // formats that held it: in a later archive the same words are a person's, or a bridge's.
+    let from = from.unwrap_or(current);
+    if from < ARCHIVE_FORMAT_0_75 {
+        block_nudges_0_70(document);
+    }
     name_working_directories_0_76(document);
     name_allow_lists_0_76(document);
-    type_user_events_0_76(document);
-    type_repairs_and_name_report_tasks_0_76(document);
+    if from < ARCHIVE_FORMAT_0_76 {
+        type_user_events_0_76(document);
+        type_repairs_and_name_report_tasks_0_76(document);
+    }
     record_compactions_0_84(document);
+    // Where an archive's reasoning was sealed is not something the archive says, so none is named
+    // and the block is sent nowhere.
+    name_sealed_origin_0_87(document, &serde_json::Value::Null);
+    link_kept_copies_0_87(document);
     document["format_version"] = current.into();
     true
+}
+
+/// [`kept_copies_0_87`] over each session of an archive: every event names the position of the one
+/// it copies, or none, which an archive from before 0.87 does not, and a session whose events all
+/// say already is left alone.
+fn link_kept_copies_0_87(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        else {
+            continue;
+        };
+        if events.iter().all(|event| event.get("copy_of").is_some()) {
+            continue;
+        }
+        let links: std::collections::HashMap<usize, usize> = {
+            let facts: Vec<RowFacts087<'_, Option<&serde_json::Value>>> = events
+                .iter()
+                .map(|event| {
+                    let inner = event.get("event");
+                    (
+                        inner
+                            .and_then(|inner| inner.get("CompactBoundary"))
+                            .is_some(),
+                        inner.and_then(|inner| inner.get("Append")).is_some(),
+                        event
+                            .get("at")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                        event.get("turn_id").and_then(serde_json::Value::as_str),
+                        inner,
+                    )
+                })
+                .collect();
+            kept_copies_0_87(&facts).into_iter().collect()
+        };
+        for (position, event) in events.iter_mut().enumerate() {
+            if let Some(event) = event.as_object_mut() {
+                event.entry("copy_of").or_insert(
+                    links
+                        .get(&position)
+                        .map_or(serde_json::Value::Null, |original| (*original).into()),
+                );
+            }
+        }
+    }
 }
 
 /// [`record_compaction_0_84`] over every event of every session in an archive.
@@ -5048,16 +5446,36 @@ mod tests {
                 "mcp_credentials_name_their_endpoint",
                 16595899173170091335_u64,
             ),
+            ("messages_record_unsigned_thinking", 5083750834782537321_u64),
+            ("scheduled_jobs_name_their_zone", 5013015663447183594_u64),
+            (
+                "sealed_reasoning_names_its_endpoint",
+                3354420230335719451_u64,
+            ),
+            (
+                "messages_hold_invocations_and_resources",
+                1827432928261299486_u64,
+            ),
+            (
+                "messages_mark_the_copies_compactions_kept",
+                6026873272331046982_u64,
+            ),
+            ("sessions_mark_an_unfinished_copy", 8572168703950525872_u64),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
         /// its helpers', so both are what freezing it means; a shared helper that changes changes
         /// every step that calls it, which is the signal.
         fn source_of(production: &str, name: &str) -> String {
+            // A generic helper's header goes on with `<`, and a helper that escaped the search
+            // would be one a step could change without its digest moving.
+            fn header_of(production: &str, name: &str) -> Option<usize> {
+                production
+                    .find(&format!("\nfn {name}("))
+                    .or_else(|| production.find(&format!("\nfn {name}<")))
+            }
             fn body_of<'a>(production: &'a str, name: &str) -> &'a str {
-                let header = format!("\nfn {name}(");
-                let start = production
-                    .find(&header)
+                let start = header_of(production, name)
                     .unwrap_or_else(|| panic!("no column-zero `fn {name}` in migrations.rs"));
                 let rest = &production[start + 1..];
                 let end = rest
@@ -5085,7 +5503,7 @@ mod tests {
                     if !ident.is_empty()
                         && ident != current
                         && !seen.contains(&ident)
-                        && production.contains(&format!("\nfn {ident}("))
+                        && header_of(production, &ident).is_some()
                     {
                         wanted.push(ident);
                     }
@@ -5481,7 +5899,13 @@ mod tests {
 
         let mut connection = rusqlite::Connection::open(&path).expect("reopen");
         let after = stored_messages(&connection);
-        assert_eq!(after[1].1, retagged, "a row in the new shape is untouched");
+        // Untouched by the retag; the 0.87 step names the endpoint its sealed block came from,
+        // none here, as it does for every sealed block written before it.
+        assert_eq!(
+            after[1].1,
+            r#"{"Repair":{"replaced_count":1,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E","origin":null}}]}]}}"#,
+            "a row in the new shape is untouched"
+        );
         assert_eq!(
             after[2].1, arguments,
             "a tool call's arguments are not a thinking block"
@@ -6074,6 +6498,45 @@ mod tests {
         );
     }
 
+    /// Words that open the way meka's own text did before 0.76 typed it are a person's in an
+    /// archive written since, and stay as typed: only the formats that held the old shape are read
+    /// by its opening words.
+    #[test]
+    fn a_later_archive_keeps_a_person_s_words_that_open_like_an_old_header() {
+        let mut document = serde_json::json!({
+            "format_version": ARCHIVE_FORMAT_0_85,
+            "meka_version": "0.85.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "events": [
+                    {
+                        "at": "2020-01-01T00:00:00Z",
+                        "turn_id": null,
+                        "event": {"Append": {"role": "user", "content": [
+                            {"type": "text", "text": "[Message from Alice, arrived Monday]\nhi"}
+                        ]}},
+                    },
+                    {
+                        "at": "2020-01-01T00:00:00Z",
+                        "turn_id": null,
+                        "event": {"Append": {"role": "user", "content": [
+                            {"type": "text", "text": "[Checklist: items are still open, so this turn is not over.]"}
+                        ]}},
+                    }
+                ],
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let events = &document["sessions"][0]["events"];
+        assert_eq!(events[0]["event"]["Append"]["content"][0]["type"], "text");
+        assert_eq!(events[1]["event"]["Append"]["content"][0]["type"], "text");
+    }
+
     /// An archive from the builds that wrote a nudge as text takes the nudge's block on import.
     #[test]
     fn a_format_8_archive_takes_the_nudges_block() {
@@ -6568,9 +7031,10 @@ mod tests {
                     "assistant".to_string(),
                     r#"[{"type":"thinking","thinking":"hmm","opaque":{"type":"signed","signature":"SIG"}},{"type":"text","text":"hi"}]"#.to_string()
                 ),
+                // Respelled; the 0.87 step names no endpoint on a sealed block from before it.
                 (
                     "assistant".to_string(),
-                    r#"[{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E","id":"rs_1"}}]"#.to_string()
+                    r#"[{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E","id":"rs_1","origin":null}}]"#.to_string()
                 ),
                 ("assistant".to_string(), arguments.to_string()),
                 ("user".to_string(), "a plain row that says opaque".to_string()),
@@ -7341,23 +7805,23 @@ mod tests {
     /// the empty case and stay green.
     #[test]
     fn only_a_store_with_unreadable_gates_is_warned_about() {
-        crate::render::log_capture::start();
+        let logs = crate::streams::capture::capture_logs(tracing::Level::WARN);
 
         let mut clean = store_as_0_42_left_it();
         plant_job(&clean, "fine", Some("gh pr checks"), Some("on-change"));
         let clean_plan = plan(&clean).expect("classified");
         apply(&mut clean, clean_plan, &Context::default()).expect("converted");
         assert!(
-            !crate::render::log_capture::warnings().contains("stay inert"),
+            !logs.logged().contains("stay inert"),
             "a store whose gates all convert must not be warned about: {}",
-            crate::render::log_capture::warnings()
+            logs.logged()
         );
 
         let mut damaged = store_as_0_42_left_it();
         plant_job(&damaged, "unreadable", Some("echo hi"), Some("on-tuesday"));
         let damaged_plan = plan(&damaged).expect("classified");
         apply(&mut damaged, damaged_plan, &Context::default()).expect("converted");
-        let warnings = crate::render::log_capture::warnings();
+        let warnings = logs.logged();
         assert!(warnings.contains("stay inert"), "{warnings}");
         assert!(
             warnings.contains("unreadable"),
@@ -8822,6 +9286,8 @@ mod tests {
         let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
         let mut before = document.clone();
         before["format_version"] = current.into();
+        // An event copies none, which an archive before 0.87 does not say.
+        before["sessions"][0]["events"][0]["copy_of"] = serde_json::Value::Null;
         assert!(bring_archive_forward(&mut document, current));
         assert_eq!(document, before, "nothing to convert but the version stamp");
         let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
@@ -9152,13 +9618,117 @@ mod tests {
                 "scratchpad_entries": {},
             }],
         });
-        let before = document["sessions"].clone();
+        let mut before = document["sessions"].clone();
+        // An event copies none, which an archive before 0.87 does not say.
+        before[0]["events"][0]["copy_of"] = serde_json::Value::Null;
         let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
         assert!(bring_archive_forward(&mut document, current));
         assert_eq!(document["sessions"], before, "nothing to convert");
         assert_eq!(document["format_version"], current);
         let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
             .expect("a format 16 archive reads");
+        assert_eq!(export.sessions[0].events.len(), 1);
+    }
+
+    /// A format 17 archive's sealed reasoning names no endpoint, and the archive cannot say which
+    /// one sealed it, so it comes forward naming none and is sent nowhere.
+    /// A 0.86 archive says nothing of which events are copies a compaction kept, so they are
+    /// found as a store's are, the messages written with their boundary at its time and turn, and
+    /// each linked to the event before the boundary that holds what it holds.
+    #[test]
+    fn a_format_17_archive_s_kept_copies_are_linked() {
+        let message = |role: &str, text: &str, at: &str| {
+            serde_json::json!({
+                "at": at,
+                "turn_id": null,
+                "event": {"Append": {"role": role, "content": [{"type": "text", "text": text}]}},
+            })
+        };
+        let mut document = serde_json::json!({
+            "format_version": 17,
+            "sessions": [{
+                "events": [
+                    message("user", "first", "t1"),
+                    message("assistant", "one", "t2"),
+                    {
+                        "at": "t3",
+                        "turn_id": null,
+                        "event": {"CompactBoundary": {"kept_recent": true}},
+                    },
+                    message("assistant", "one", "t3"),
+                    message("user", "next", "t4"),
+                ],
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let links: Vec<&serde_json::Value> = document["sessions"][0]["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .map(|event| &event["copy_of"])
+            .collect();
+        let none = serde_json::Value::Null;
+        assert_eq!(links, [&none, &none, &none, &serde_json::json!(1), &none]);
+    }
+
+    /// A 0.86 archive's sealed reasoning names no endpoint, since the archive does not say which
+    /// sealed it, and so is sent nowhere.
+    #[test]
+    fn a_format_17_archive_s_sealed_reasoning_names_no_endpoint() {
+        let mut document = serde_json::json!({
+            "format_version": 17,
+            "meka_version": "0.86.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "working_directory": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_workspace_directories": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "project": "",
+                "stats": {
+                    "turns": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 1, "turn_index": 1},
+                },
+                "turns": [],
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "event": {"Append": {"role": "assistant", "content": [{
+                        "type": "thinking",
+                        "thinking": "s",
+                        "opaque": {"type": "sealed", "encrypted_content": "E", "id": "rs_1"},
+                    }]}},
+                    "turn_id": null,
+                }],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let opaque =
+            &document["sessions"][0]["events"][0]["event"]["Append"]["content"][0]["opaque"];
+        assert!(
+            opaque["origin"].is_null() && opaque.get("origin").is_some(),
+            "{opaque}"
+        );
+        let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
+            .expect("a format 17 archive reads");
         assert_eq!(export.sessions[0].events.len(), 1);
     }
 
@@ -9266,8 +9836,276 @@ mod tests {
         );
     }
 
-    /// The shape the project step converts from: a store at head with `sessions.project` gone and
-    /// `memories` under its old constraint, stamped one step short.
+    /// A store at head holding three sealed blocks that name no endpoint, as a build before 0.87
+    /// wrote them: one on a session served by a ChatGPT profile, one in a turn a ChatGPT profile
+    /// served on a session that runs elsewhere, and one nothing says was ChatGPT's. Stamped one
+    /// step short of naming them.
+    fn store_with_unnamed_sealed_reasoning() -> rusqlite::Connection {
+        let mut connection = rusqlite::Connection::open_in_memory().expect("open");
+        let to_head = plan(&connection).expect("plan");
+        apply(&mut connection, to_head, &Context::default()).expect("apply");
+        let sealed = |id: &str| {
+            format!(
+                r#"[{{"type":"thinking","thinking":"s","opaque":{{"type":"sealed","encrypted_content":"E","id":"{id}"}}}}]"#
+            )
+        };
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO sessions (id, created_at, updated_at, profile) VALUES
+                     ('chatgpt', 'now', 'now', 'gpt'),
+                     ('elsewhere', 'now', 'now', 'local');
+                 INSERT INTO turns (id, session_id, source, started_at, profile) VALUES
+                     ('served', 'elsewhere', 'client', 'now', 'gpt');
+                 INSERT INTO messages (session_id, kind, content, created_at, turn_id) VALUES
+                     ('chatgpt', 'assistant', '{own}', 'now', NULL),
+                     ('elsewhere', 'assistant', '{served}', 'now', 'served'),
+                     ('elsewhere', 'assistant', '{unknown}', 'now', NULL);
+                 PRAGMA user_version = {short};",
+                own = sealed("rs_own"),
+                served = sealed("rs_served"),
+                unknown = sealed("rs_unknown"),
+                short = position_of("sealed_reasoning_names_its_endpoint"),
+            ))
+            .expect("the shape before the step");
+        connection
+    }
+
+    /// The origin each sealed block in `connection` names, by its reasoning id.
+    fn sealed_origins(connection: &rusqlite::Connection) -> Vec<(String, serde_json::Value)> {
+        let mut statement = connection
+            .prepare("SELECT content FROM messages ORDER BY id")
+            .expect("prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .map(|content| {
+                let value: serde_json::Value =
+                    serde_json::from_str(&content.expect("row")).expect("json");
+                let opaque = &value[0]["opaque"];
+                (
+                    opaque["id"].as_str().expect("id").to_string(),
+                    opaque.get("origin").cloned().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// A block a ChatGPT profile's turn sealed names ChatGPT's endpoint, whether the session or the
+    /// turn records the profile, and one nothing ties to ChatGPT names none, which sends it
+    /// nowhere. A replay finds every block named and leaves it.
+    #[test]
+    fn sealed_reasoning_names_the_endpoint_its_profile_reached() {
+        let mut connection = store_with_unnamed_sealed_reasoning();
+        let context = Context::default().sealing_chatgpt_reasoning_at(vec![(
+            "gpt".to_string(),
+            "https://chatgpt.com".to_string(),
+        )]);
+        let steps = plan(&connection).expect("plan");
+        apply(&mut connection, steps, &context).expect("apply");
+        let named = sealed_origins(&connection);
+        let chatgpt = serde_json::json!("https://chatgpt.com");
+        assert_eq!(named, [
+            ("rs_own".to_string(), chatgpt.clone()),
+            ("rs_served".to_string(), chatgpt),
+            ("rs_unknown".to_string(), serde_json::Value::Null),
+        ]);
+
+        connection
+            .execute_batch(&format!(
+                "PRAGMA user_version = {};",
+                position_of("sealed_reasoning_names_its_endpoint")
+            ))
+            .expect("rewind the stamp");
+        let replay = plan(&connection).expect("plan");
+        apply(&mut connection, replay, &Context::default()).expect("replay");
+        assert_eq!(sealed_origins(&connection), named, "a replay is a no-op");
+    }
+
+    /// Naming an endpoint from a profile needs the profiles, so a store with blocks to name is
+    /// refused, and left as it was, while `config.toml` cannot be read.
+    #[test]
+    fn sealed_reasoning_is_not_named_while_the_config_cannot_be_read() {
+        let mut connection = store_with_unnamed_sealed_reasoning();
+        let steps = plan(&connection).expect("plan");
+        let refused =
+            apply(&mut connection, steps, &Context::on_unreadable_config()).expect_err("refused");
+        assert!(refused.to_string().contains("config.toml"), "{refused}");
+        let named: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE content LIKE '%\"origin\"%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(named, 0, "nothing named");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(
+            version,
+            i64::try_from(position_of("sealed_reasoning_names_its_endpoint")).expect("fits")
+        );
+    }
+
+    /// The copies a compaction kept before the link existed are the messages right after its
+    /// boundary written in the one write with it, the boundary's time and turn, which a later row,
+    /// even one repeating a kept message word for word, never shares; each is linked to the row
+    /// before the boundary that holds what it holds, one whose row a sweep took stays a row of its
+    /// own, and one that matches only an older row leaves the others on theirs. A replay, over a
+    /// store whose column exists, links nothing again.
+    #[test]
+    fn copies_written_before_the_link_are_linked_to_the_rows_they_copy() {
+        let mut connection = rusqlite::Connection::open_in_memory().expect("open");
+        let to_head = plan(&connection).expect("plan");
+        apply(&mut connection, to_head, &Context::default()).expect("apply");
+        connection
+            .execute_batch(
+                "DROP INDEX idx_messages_copies; ALTER TABLE messages DROP COLUMN copy_of;",
+            )
+            .expect("the shape before the step");
+        let assistant = |text: &str| format!(r#"[{{"type":"text","text":"{text}"}}]"#);
+        let boundary = r#"{"CompactBoundary":{"kept_recent":true}}"#.to_string();
+        let rows: Vec<(&str, &str, String, &str, Option<&str>)> = vec![
+            ("kept", "user", "second".to_string(), "t1", None),
+            ("kept", "assistant", assistant("two"), "t2", None),
+            (
+                "kept",
+                "compact_boundary",
+                boundary.clone(),
+                "t5",
+                Some("turn"),
+            ),
+            ("kept", "user", "second".to_string(), "t5", Some("turn")),
+            ("kept", "assistant", assistant("two"), "t5", Some("turn")),
+            ("kept", "user", "second".to_string(), "t6", None),
+            ("kept", "assistant", assistant("two"), "t6", None),
+            (
+                "other",
+                "compact_boundary",
+                boundary.clone(),
+                "t7",
+                Some("turn"),
+            ),
+            (
+                "other",
+                "user",
+                "same time, another turn".to_string(),
+                "t7",
+                None,
+            ),
+            (
+                "swept",
+                "compact_boundary",
+                boundary.clone(),
+                "t9",
+                Some("turn"),
+            ),
+            (
+                "swept",
+                "user",
+                "its row is gone".to_string(),
+                "t9",
+                Some("turn"),
+            ),
+            ("older", "user", "yes".to_string(), "t1", None),
+            ("older", "assistant", assistant("noted"), "t2", None),
+            ("older", "user", "go on".to_string(), "t3", None),
+            ("older", "compact_boundary", boundary, "t5", Some("turn")),
+            ("older", "assistant", assistant("noted"), "t5", Some("turn")),
+            ("older", "user", "go on".to_string(), "t5", Some("turn")),
+            ("older", "user", "yes".to_string(), "t5", Some("turn")),
+        ];
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES
+                     ('kept', 'now', 'now'), ('other', 'now', 'now'), ('swept', 'now', 'now'),
+                     ('older', 'now', 'now');
+                 INSERT INTO turns (id, session_id, source, started_at)
+                     VALUES ('turn', 'kept', 'client', 'now');",
+            )
+            .expect("sessions");
+        for (session, kind, content, created_at, turn_id) in &rows {
+            connection
+                .execute(
+                    "INSERT INTO messages (session_id, kind, content, created_at, turn_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![session, kind, content, created_at, turn_id],
+                )
+                .expect("a row");
+        }
+        let rewind = |connection: &rusqlite::Connection| {
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA user_version = {};",
+                    position_of("messages_mark_the_copies_compactions_kept")
+                ))
+                .expect("rewind the stamp");
+        };
+        rewind(&connection);
+        let steps = plan(&connection).expect("plan");
+        apply(&mut connection, steps, &Context::default()).expect("apply");
+        let links = |connection: &rusqlite::Connection| -> Vec<Option<i64>> {
+            connection
+                .prepare("SELECT copy_of FROM messages ORDER BY id")
+                .expect("prepare")
+                .query_map([], |row| row.get::<_, Option<i64>>(0))
+                .expect("query")
+                .map(|link| link.expect("row"))
+                .collect()
+        };
+        // The last of `older`'s copies repeats a row from before the others' and has none of its
+        // own after them, so it pairs with nothing, and the two before it keep their rows.
+        let expected = [
+            None,
+            None,
+            None,
+            Some(1),
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(13),
+            Some(14),
+            None,
+        ];
+        assert_eq!(links(&connection), expected);
+
+        connection
+            .execute_batch("UPDATE messages SET copy_of = NULL WHERE id = 4")
+            .expect("a sweep releases a copy");
+        rewind(&connection);
+        let replay = plan(&connection).expect("plan");
+        apply(&mut connection, replay, &Context::default()).expect("replay");
+        let mut released = expected;
+        released[3] = None;
+        assert_eq!(links(&connection), released, "a replay links nothing again");
+    }
+
+    /// A sealed block is named only where it is a thinking block's reasoning; a tool call's
+    /// arguments shaped like one are the model's, and left as sent.
+    #[test]
+    fn the_sealed_origin_names_thinking_alone() {
+        let mut message = serde_json::json!([
+            {"type": "thinking", "thinking": "s",
+             "opaque": {"type": "sealed", "encrypted_content": "E"}},
+            {"type": "tool_use", "id": "t1", "name": "remember",
+             "input": {"type": "sealed", "encrypted_content": "theirs"}},
+        ]);
+        assert!(name_sealed_origin_0_87(
+            &mut message,
+            &serde_json::json!("https://chatgpt.com")
+        ));
+        assert_eq!(message[0]["opaque"]["origin"], "https://chatgpt.com");
+        assert!(message[1]["input"].get("origin").is_none(), "{message}");
+    }
+
     /// Where `name` sits in the ledger, which is the `user_version` a store stopped ahead of it
     /// carries.
     fn position_of(name: &str) -> usize {
@@ -9277,6 +10115,8 @@ mod tests {
             .unwrap_or_else(|| panic!("no ledger entry named {name}"))
     }
 
+    /// The shape the project step converts from: a store at head with `sessions.project` gone and
+    /// `memories` under its old constraint, stamped one step short.
     fn store_before_projects() -> rusqlite::Connection {
         let mut connection = rusqlite::Connection::open_in_memory().expect("open");
         let to_head = plan(&connection).expect("plan");

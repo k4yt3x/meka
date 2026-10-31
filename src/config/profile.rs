@@ -78,7 +78,33 @@ pub(crate) struct AccountConfig {
     /// sends whenever thinking is on. Unset is `true`, the direct API's answer; an endpoint
     /// that refuses the header sets it `false`. The other backends never read it.
     pub(crate) interleaved_thinking: Option<bool>,
+    /// `openai-responses` only: whether the endpoint takes `prompt_cache_key`, OpenAI's hint for
+    /// routing a conversation's requests to one prompt cache. Unset is `true`, OpenAI's own API;
+    /// an endpoint that refuses the field sets it `false`.
+    pub(crate) prompt_cache_key: Option<bool>,
+    /// `openai-chat-completions` only: whether a streamed request asks for its usage with
+    /// `stream_options.include_usage`, without which OpenAI's own API reports none. Unset is
+    /// `true`; an endpoint that refuses the field sets it `false`, and its usage then reads zero
+    /// unless it reports it unasked.
+    pub(crate) stream_usage: Option<bool>,
+    /// The longest tool name the endpoint takes, in bytes, on the three backends whose endpoint
+    /// the user names. Unset is the wire's own limit as its owner documents it
+    /// ([`crate::config::Backend::max_tool_name_bytes`]); a gateway holding names to less states
+    /// what it holds them to, and a longer name is cut to it.
+    #[serde(default, deserialize_with = "deserialize_tool_name_bytes")]
+    pub(crate) max_tool_name_bytes: Option<usize>,
     pub(crate) device_id: Option<String>,
+}
+
+/// An account's `max_tool_name_bytes`, refused below what a cut name needs.
+fn deserialize_tool_name_bytes<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::{Deserialize, de::Error};
+    Option::<usize>::deserialize(deserializer)?
+        .map(|bytes| crate::config::check_tool_name_bytes(bytes).map_err(D::Error::custom))
+        .transpose()
 }
 /// One named profile from `[profiles.<name>]`: which account it bills, and what meka asks that
 /// account's endpoint for and how.
@@ -150,6 +176,15 @@ pub(crate) struct ProfileConfig {
     /// `claude-subscription` only: how the model's thinking is presented, one of Claude Code's
     /// three display modes. Defaults to `updates`, Claude Code's own default.
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
+    /// `openai-responses` only: whether a request asks for the model's reasoning sealed, with
+    /// `include: ["reasoning.encrypted_content"]`, and sends it back on the turn's later requests
+    /// so the model reasons on from where it was. Defaults to `true`, what OpenAI's own API
+    /// carries for a reasoning model; a model or endpoint that refuses the field sets it `false`.
+    pub(crate) encrypted_reasoning: Option<bool>,
+    /// `openai-responses` only: whether a request asks for `reasoning.summary`, the digest of the
+    /// model's reasoning meka shows as its thinking. Defaults to `true`; a model or endpoint that
+    /// refuses the field sets it `false`.
+    pub(crate) reasoning_summary: Option<bool>,
 }
 /// [`AccountConfig`]'s field order, as the key names a `config.toml` account table carries.
 pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
@@ -158,6 +193,9 @@ pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
     "oauth_token_url",
     "client_id",
     "interleaved_thinking",
+    "prompt_cache_key",
+    "stream_usage",
+    "max_tool_name_bytes",
     "device_id",
 ];
 /// [`ProfileConfig`]'s field order, as the key names a `config.toml` profile table carries.
@@ -179,6 +217,8 @@ pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
     "thinking_budget",
     "cache_control",
     "thinking_display",
+    "encrypted_reasoning",
+    "reasoning_summary",
 ];
 /// Put one table's keys into `order`.
 ///
@@ -260,6 +300,16 @@ pub(crate) struct ProfileSettings {
     /// See [`ProfileConfig::cache_control`]; resolved to the default here.
     pub(crate) cache_control: bool,
     pub(crate) thinking_display: crate::config::ThinkingDisplay,
+    /// See [`ProfileConfig::encrypted_reasoning`]; resolved to the default here.
+    pub(crate) encrypted_reasoning: bool,
+    /// See [`ProfileConfig::reasoning_summary`]; resolved to the default here.
+    pub(crate) reasoning_summary: bool,
+    /// See [`AccountConfig::prompt_cache_key`]; resolved to the default here.
+    pub(crate) prompt_cache_key: bool,
+    /// See [`AccountConfig::stream_usage`]; resolved to the default here.
+    pub(crate) stream_usage: bool,
+    /// See [`AccountConfig::max_tool_name_bytes`]; resolved to the backend's here.
+    pub(crate) max_tool_name_bytes: usize,
 }
 /// The selected profile's name, read straight off disk without resolving anything else.
 ///
@@ -375,6 +425,16 @@ pub(crate) fn resolve_profile(
             .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
         cache_control: profile.cache_control.unwrap_or(true),
         thinking_display: profile.thinking_display.unwrap_or_default(),
+        encrypted_reasoning: profile.encrypted_reasoning.unwrap_or(true),
+        reasoning_summary: profile.reasoning_summary.unwrap_or(true),
+        prompt_cache_key: account.prompt_cache_key.unwrap_or(true),
+        stream_usage: account.stream_usage.unwrap_or(true),
+        // Only where the backend reads it: a hand-edited file can state it anywhere, and load warns
+        // that it is never read, which has to be so.
+        max_tool_name_bytes: account
+            .max_tool_name_bytes
+            .filter(|_| backend.reads_account_key("max_tool_name_bytes"))
+            .unwrap_or(backend.max_tool_name_bytes()),
     })
 }
 /// The `claude-subscription` device identifier for one account, seeding and persisting one when
@@ -836,6 +896,36 @@ mod tests {
         assert_eq!(settings.effort, None, "no effort means the provider's own");
     }
 
+    /// An account's tool-name cap is the wire's own limit unless the account states the
+    /// endpoint's, and one too small to hold a cut name is refused where the file is read.
+    #[test]
+    fn the_tool_name_cap_is_the_wire_s_unless_the_account_states_one() {
+        let bare = ProfileConfig::default();
+        let resolve = |account: &AccountConfig| {
+            resolve_profile(&bare, account, None, None, String::new())
+                .expect("resolves")
+                .max_tool_name_bytes
+        };
+        assert_eq!(resolve(&account_on("anthropic-messages")), 128);
+        assert_eq!(resolve(&account_on("openai-chat-completions")), 64);
+        let mut gateway = account_on("anthropic-messages");
+        gateway.max_tool_name_bytes = Some(64);
+        assert_eq!(resolve(&gateway), 64);
+        let mut subscription = account_on("claude-subscription");
+        subscription.max_tool_name_bytes = Some(20);
+        assert_eq!(
+            resolve(&subscription),
+            128,
+            "a backend that never reads the key keeps its own cap"
+        );
+
+        let refused = toml::from_str::<AccountConfig>(
+            "backend = \"anthropic-messages\"\nmax_tool_name_bytes = 8\n",
+        )
+        .expect_err("too small for a cut name");
+        assert!(refused.to_string().contains("at least 16"), "{refused}");
+    }
+
     /// The key resolves to the endpoint's default when unset, and to what the profile says
     /// otherwise.
     #[test]
@@ -1127,6 +1217,9 @@ mod tests {
             "oauth_token_url = \"https://example.invalid/token\"\n",
             "client_id = \"a-client\"\n",
             "interleaved_thinking = false\n",
+            "prompt_cache_key = false\n",
+            "stream_usage = false\n",
+            "max_tool_name_bytes = 64\n",
             "device_id = \"a-device\"\n",
             "\n",
             "[profiles.work]\n",
@@ -1143,6 +1236,8 @@ mod tests {
             "thinking_budget = 32000\n",
             "cache_control = false\n",
             "thinking_display = \"redacted\"\n",
+            "encrypted_reasoning = false\n",
+            "reasoning_summary = false\n",
         );
 
         let parsed: ConfigFile =

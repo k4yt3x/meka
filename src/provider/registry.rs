@@ -31,6 +31,16 @@ pub(crate) struct ProviderBuilder {
     pub(super) context_window: Option<u64>,
     pub(super) max_output_tokens: Option<u64>,
     pub(super) max_request_bytes: Option<usize>,
+    /// See `ProfileConfig::encrypted_reasoning`; read by `openai-responses` alone.
+    pub(super) encrypted_reasoning: bool,
+    /// See `ProfileConfig::reasoning_summary`; read by `openai-responses` alone.
+    pub(super) reasoning_summary: bool,
+    /// See `AccountConfig::prompt_cache_key`; read by `openai-responses` alone.
+    pub(super) prompt_cache_key: bool,
+    /// See `AccountConfig::stream_usage`; read by `openai-chat-completions` alone.
+    pub(super) stream_usage: bool,
+    /// The longest tool name the endpoint takes; the backend's own when the account states none.
+    max_tool_name_bytes: Option<usize>,
 }
 impl ProviderBuilder {
     pub(crate) fn new(
@@ -58,6 +68,11 @@ impl ProviderBuilder {
             context_window: None,
             max_output_tokens: None,
             max_request_bytes: None,
+            encrypted_reasoning: true,
+            reasoning_summary: true,
+            prompt_cache_key: true,
+            stream_usage: true,
+            max_tool_name_bytes: None,
         }
     }
 
@@ -87,8 +102,6 @@ impl ProviderBuilder {
         self
     }
 
-    /// Sink for refreshed OAuth tokens. Consumed by both subscription backends; when `None`,
-    /// refreshed tokens are held in memory only.
     /// Whether the endpoint takes the `interleaved-thinking` beta; `anthropic-messages` alone.
     pub(crate) fn interleaved_thinking(mut self, value: bool) -> Self {
         self.interleaved_thinking = value;
@@ -101,6 +114,38 @@ impl ProviderBuilder {
         self
     }
 
+    /// Whether a request asks for sealed reasoning and sends it back; `openai-responses` alone.
+    pub(crate) fn encrypted_reasoning(mut self, value: bool) -> Self {
+        self.encrypted_reasoning = value;
+        self
+    }
+
+    /// Whether a request asks for a reasoning summary; `openai-responses` alone.
+    pub(crate) fn reasoning_summary(mut self, value: bool) -> Self {
+        self.reasoning_summary = value;
+        self
+    }
+
+    /// Whether `prompt_cache_key` goes out; `openai-responses` alone.
+    pub(crate) fn prompt_cache_key(mut self, value: bool) -> Self {
+        self.prompt_cache_key = value;
+        self
+    }
+
+    /// The longest tool name the endpoint takes, in bytes.
+    pub(crate) fn max_tool_name_bytes(mut self, value: usize) -> Self {
+        self.max_tool_name_bytes = Some(value);
+        self
+    }
+
+    /// Whether a streamed request asks for its usage; `openai-chat-completions` alone.
+    pub(crate) fn stream_usage(mut self, value: bool) -> Self {
+        self.stream_usage = value;
+        self
+    }
+
+    /// Sink for refreshed OAuth tokens. Consumed by both subscription backends; when `None`,
+    /// refreshed tokens are held in memory only.
     pub(crate) fn token_store(mut self, value: Option<Arc<TokenStore>>) -> Self {
         self.token_store = value;
         self
@@ -184,7 +229,18 @@ impl ProviderBuilder {
         })
     }
 
+    /// The provider this builder describes, every tool name it sends held to its endpoint's cap.
     pub(crate) fn build(self) -> Result<Arc<dyn Provider>> {
+        let max_tool_name_bytes = self
+            .max_tool_name_bytes
+            .unwrap_or(self.backend.max_tool_name_bytes());
+        Ok(crate::provider::wire_names::cap_tool_names(
+            self.build_driver()?,
+            max_tool_name_bytes,
+        ))
+    }
+
+    fn build_driver(self) -> Result<Arc<dyn Provider>> {
         match self.backend {
             Backend::OpenAiResponses => {
                 // Same credential handling as `openai-chat-completions`: these two differ by
@@ -199,7 +255,9 @@ impl ProviderBuilder {
                         ));
                     }
                 };
-                Ok(Arc::new(OpenAiResponsesProvider::new(api_key, self)?))
+                Ok(Arc::new(OpenAiResponsesProvider::from_settings(
+                    api_key, self,
+                )?))
             }
             Backend::OpenAiChatCompletions => {
                 let api_key = match &self.credential {
@@ -212,7 +270,9 @@ impl ProviderBuilder {
                         ));
                     }
                 };
-                Ok(Arc::new(OpenAiChatCompletionsProvider::new(api_key, self)?))
+                Ok(Arc::new(OpenAiChatCompletionsProvider::from_settings(
+                    api_key, self,
+                )?))
             }
             Backend::AnthropicMessages => {
                 let api_key = match &self.credential {
@@ -225,7 +285,9 @@ impl ProviderBuilder {
                         ));
                     }
                 };
-                Ok(Arc::new(AnthropicMessagesProvider::new(api_key, self)?))
+                Ok(Arc::new(AnthropicMessagesProvider::from_settings(
+                    api_key, self,
+                )?))
             }
             Backend::ClaudeSubscription => {
                 if matches!(self.credential, AuthCredential::ApiKey(_)) {
@@ -235,7 +297,7 @@ impl ProviderBuilder {
                             .to_string(),
                     ));
                 }
-                Ok(Arc::new(ClaudeSubscriptionProvider::new(self)?))
+                Ok(Arc::new(ClaudeSubscriptionProvider::from_settings(self)?))
             }
             Backend::ChatGptSubscription => {
                 if matches!(self.credential, AuthCredential::ApiKey(_)) {
@@ -245,7 +307,7 @@ impl ProviderBuilder {
                             .to_string(),
                     ));
                 }
-                Ok(Arc::new(ChatGptSubscriptionProvider::new(self)?))
+                Ok(Arc::new(ChatGptSubscriptionProvider::from_settings(self)?))
             }
         }
     }
@@ -641,6 +703,11 @@ impl ProviderRegistry {
             .context_window(settings.context_window)
             .max_output_tokens(settings.max_output_tokens)
             .max_request_bytes(settings.max_request_bytes)
+            .encrypted_reasoning(settings.encrypted_reasoning)
+            .reasoning_summary(settings.reasoning_summary)
+            .prompt_cache_key(settings.prompt_cache_key)
+            .stream_usage(settings.stream_usage)
+            .max_tool_name_bytes(settings.max_tool_name_bytes)
             .build()?;
 
         let provider = {
@@ -714,9 +781,9 @@ impl ProviderRegistry {
     pub(super) async fn credential_for(&self, account: &str) -> Result<AuthCredential> {
         match self.token_store.load_account_credential(account).await? {
             Some(credential) => Ok(credential),
-            None => Err(MekaError::Config(format!(
-                "account '{account}' has no stored credential; run `meka account login {account}`"
-            ))),
+            None => Err(MekaError::AccountLoginRequired {
+                account: account.to_string(),
+            }),
         }
     }
 

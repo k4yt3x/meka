@@ -121,9 +121,10 @@ pub(crate) type UiSender = tokio::sync::mpsc::UnboundedSender<UiEvent>;
 
 /// What the screen sends the host loop.
 pub(crate) enum HostEvent {
-    /// A prompt from the composer, with the images attached to it.
+    /// A prompt from the composer, or the run's own from `--prompt` or `--skill`, as the blocks
+    /// the turn's message carries, with the images attached to it.
     UserInput {
-        text: String,
+        parts: Vec<crate::conversation::ContentBlock>,
         images: Vec<crate::image::ImageSource>,
     },
     Command(super::commands::SlashCommand),
@@ -360,6 +361,7 @@ mod tests {
                 primary_param: Some("/tmp/x".to_string()),
                 input: serde_json::json!({"path": "/tmp/x"}),
                 cancellation,
+                tool_call_id: None,
                 subagent_id: None,
             }),
         )
@@ -381,6 +383,7 @@ mod tests {
             primary_param: None,
             input: serde_json::json!({"command": "ls"}),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            tool_call_id: None,
             subagent_id: None,
         };
         let asking = tokio::spawn({

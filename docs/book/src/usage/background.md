@@ -56,13 +56,13 @@ a stage direction above the reply says what reported, `Background task 7f3a1c22 
 `notice`, with the tasks and their outcomes under `_meta.background`, or as a parenthesized chunk
 when it renders no notices; the prompt itself is shown to no editor.
 
-When the task ends while a turn is running, the outcome lands inside that turn instead, at its
-next tool-round boundary: behind the results of the round that was running, in the same message,
-the way a message sent to a working agent does. The header is the same, and the trailer tells the
-model to carry on rather than to answer. A turn that is one long reply has no boundary, so the
-outcome waits for it to end; nothing cuts a reply for a report. The screen says the same stage
-direction, `meka serve` puts a `task.reported` event on the turn with the text the model read, and
-an ACP editor gets the same notice. A resumed session replays the direction where the report
+When the task ends while a turn is running, the outcome lands inside that turn instead, at its next
+round boundary: behind the results of the round that was running, in the same message, or after the
+reply that would have ended the turn, which then goes on, the way a message sent to a working agent
+does. The header is the same, and the trailer tells the model to carry on rather than to answer.
+Nothing cuts a reply for a report: the outcome waits for the reply to end. The screen says the same
+stage direction, `meka serve` puts a `task.reported` event on the turn with the text the model read,
+and an ACP editor gets the same notice. A resumed session replays the direction where the report
 landed, since the log records a report as a block of its own rather than as words.
 
 Running tasks also appear in the per-turn context under `[Background]`, so the agent can see what it already started and does not launch a second copy:
@@ -85,11 +85,11 @@ Every task ends in one of four states, and every one of them is reported: inside
 | `completed` | The tool returned successfully |
 | `failed` | The tool returned an error |
 | `canceled` | Stopped on request, via `task_cancel`, `/task cancel`, or a second Ctrl+C |
-| `interrupted` | The process holding it went away |
+| `interrupted` | The session holding it went away: meka exited or was signaled, or the client closed the session |
 
-`interrupted` is the one that matters most. A task in flight when meka exits cannot be resumed, so it is retired and reported the next time something takes ownership of that session: a screen resume, a `meka serve` reattach, or an ACP `session/load`. Nothing is written at exit; the *next* owner does the retiring, because holding the session lock is what proves the previous owner is gone. Without this the agent would wait forever on a result it had usually already promised someone.
+`interrupted` is the one that matters most. A task in flight when meka lets go of its session cannot be resumed, so it is stopped and recorded as interrupted on the way out, and reported the next time something takes ownership of that session: a screen resume, a `meka serve` reattach, or an ACP `session/load`. A process that dies writes nothing; the *next* owner does the retiring then, because holding the session lock is what proves the previous owner is gone. Without this the agent would wait forever on a result it had usually already promised someone.
 
-Large output is written to a [scratchpad](../tools/scratchpad.md) entry and the delivered turn carries the beginning plus the entry name, so a long build log does not occupy the conversation permanently.
+Large output is written to a [scratchpad](../tools/scratchpad.md) entry and the delivered turn carries the beginning plus the entry name, so a long build log does not occupy the conversation permanently. A call that names a `scratchpad` entry has its whole output saved there instead, whatever its size, and the delivered turn says where it went rather than carrying it; a task stopped before its work came back writes nothing there.
 
 ## Managing tasks
 
@@ -146,7 +146,7 @@ A **second** press during the same turn stops them. Between turns, `/task cancel
 
 | Host | Behavior |
 |------|-----------|
-| Screen | Full. An outcome lands in a running turn at its next tool-round boundary, else between turns |
+| Screen | Full. An outcome lands in a running turn at its next round boundary, else between turns |
 | `meka serve` | Full, for sessions currently resident |
 | ACP | Full, for sessions the editor has open |
 | `--oneshot` | A round boundary of the one turn carries what has ended; the run waits for the rest before exiting |

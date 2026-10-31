@@ -38,6 +38,8 @@ pub(crate) async fn run(
             thinking_budget,
             cache_control,
             thinking_display,
+            encrypted_reasoning,
+            reasoning_summary,
         } => run_add(name, account.as_deref(), model.clone(), ProfileTuning {
             fallbacks: fallback.clone(),
             context_window: *context_window,
@@ -50,6 +52,8 @@ pub(crate) async fn run(
             thinking_budget: *thinking_budget,
             cache_control: *cache_control,
             thinking_display: *thinking_display,
+            encrypted_reasoning: *encrypted_reasoning,
+            reasoning_summary: *reasoning_summary,
         }),
         ProfileAction::List { format } => run_list(*format),
         ProfileAction::Set {
@@ -202,6 +206,8 @@ pub(super) const SETTABLE_PROFILE_KEYS: &[&str] = &[
     "thinking_budget",
     "cache_control",
     "thinking_display",
+    "encrypted_reasoning",
+    "reasoning_summary",
 ];
 
 /// One `key`/`value` pair as typed at a shell, as the edit door takes it; `None` removes the key.
@@ -257,6 +263,8 @@ fn parse_profile_change(key: &str, value: Option<&str>) -> anyhow::Result<Profil
         "vision" => changes.vision = boolean("vision")?,
         "thinking_budget" => changes.thinking_budget = integer("thinking_budget")?,
         "cache_control" => changes.cache_control = boolean("cache_control")?,
+        "encrypted_reasoning" => changes.encrypted_reasoning = boolean("encrypted_reasoning")?,
+        "reasoning_summary" => changes.reasoning_summary = boolean("reasoning_summary")?,
         "deferred_tools" => {
             changes.deferred_tools = patch(value, |value| {
                 value
@@ -438,7 +446,7 @@ fn report_broken_profiles(config_file: &config::ConfigFile) {
             "`default_profile` names '{default}': {}",
             crate::text::unknown_name("profile", &default, config_file.profiles.keys())
         ));
-        crate::render::render_hint("point it at one with `meka profile use <name>`");
+        crate::render::render_hint("Point it at one with `meka profile use <name>`.");
     }
     // A profile whose account is gone is listed with `-` for its backend, and said aloud: it is the
     // state a hand-deleted `[accounts.<name>]` leaves, and every session on it refuses to run.
@@ -451,7 +459,7 @@ fn report_broken_profiles(config_file: &config::ConfigFile) {
                 "Profile '{name}': {}",
                 crate::text::unknown_name("account", &account, config_file.accounts.keys())
             ));
-            crate::render::render_hint(&format!("create it with `meka account add {account}`"));
+            crate::render::render_hint(&format!("Create it with `meka account add {account}`."));
         }
     }
     crate::cli::account::report_unknown_backends(config_file);
@@ -523,32 +531,50 @@ fn resolve_tuning(
     // about it nor told what it defaults to: writing the key there would produce a setting that
     // reads plausibly and does nothing.
     let takes_thinking = backend.takes_thinking();
-    let mut flags = flags;
-    // The flags are dropped, not just left unprompted. Guarding only the prompt produced a run that
-    // printed "Using defaults:" without thinking *and* wrote `thinking` into the profile. Every
-    // backend-specific flag, through the one function that knows which backend reads what: a list
-    // of the thinking three here let `--max-request-bytes` onto an `openai-responses` profile,
-    // reported as set, where nothing ever read it.
-    let mut dropped: Vec<&str> = Vec::new();
-    if !backend.reads_profile_key("thinking") && flags.thinking.take().is_some() {
-        dropped.push("--thinking");
-    }
-    if !backend.reads_profile_key("thinking_budget") && flags.thinking_budget.take().is_some() {
-        dropped.push("--thinking-budget");
-    }
-    if !backend.reads_profile_key("thinking_display") && flags.thinking_display.take().is_some() {
-        dropped.push("--thinking-display");
-    }
-    if !backend.reads_profile_key("cache_control") && flags.cache_control.take().is_some() {
-        dropped.push("--cache-control");
-    }
-    if !backend.reads_profile_key("deferred_tools") && flags.deferred_tools.take().is_some() {
-        dropped.push("--deferred-tools");
-    }
-    if !dropped.is_empty() {
-        tracing::warn!(
-            "ignoring {dropped}: a '{backend}' account never sends the field",
-            dropped = dropped.join(", ")
+    // Refused ahead of any prompt, as the door refuses the keys over HTTP: a flag the backend never
+    // sends would be written as a setting that reads plausibly and does nothing. Through the one
+    // function that knows which backend reads what, so no flag is missed.
+    let inert: Vec<&str> = [
+        ("thinking", "--thinking", flags.thinking.is_some()),
+        (
+            "thinking_budget",
+            "--thinking-budget",
+            flags.thinking_budget.is_some(),
+        ),
+        (
+            "thinking_display",
+            "--thinking-display",
+            flags.thinking_display.is_some(),
+        ),
+        (
+            "cache_control",
+            "--cache-control",
+            flags.cache_control.is_some(),
+        ),
+        (
+            "deferred_tools",
+            "--deferred-tools",
+            flags.deferred_tools.is_some(),
+        ),
+        (
+            "encrypted_reasoning",
+            "--encrypted-reasoning",
+            flags.encrypted_reasoning.is_some(),
+        ),
+        (
+            "reasoning_summary",
+            "--reasoning-summary",
+            flags.reasoning_summary.is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(key, _, given)| *given && !backend.reads_profile_key(key))
+    .map(|(_, flag, _)| flag)
+    .collect();
+    if !inert.is_empty() {
+        anyhow::bail!(
+            "a '{backend}' account never sends {}; nothing was written",
+            inert.join(", ")
         );
     }
     let complete = flags.context_window.is_some()
@@ -640,6 +666,8 @@ fn resolve_tuning(
         max_request_bytes: flags.max_request_bytes,
         cache_control: flags.cache_control,
         deferred_tools: flags.deferred_tools,
+        encrypted_reasoning: flags.encrypted_reasoning,
+        reasoning_summary: flags.reasoning_summary,
     })
 }
 
@@ -699,131 +727,125 @@ mod tests {
         );
     }
 
-    /// Every thinking flag must be *dropped* on a backend whose requests have no thinking field,
-    /// not merely left unprompted.
-    ///
-    /// Guarding only the prompt is the bug this closes: the run then printed a "Using defaults:"
-    /// line with no thinking in it *and* wrote `thinking` into the profile anyway, so the file
-    /// disagreed with what the user had just been told, and the key sat there reading plausibly
-    /// while doing nothing. Both halves are asserted, because either one alone passes the wrong
-    /// implementation.
-    ///
-    /// All three flags: the three are one request field between them, so a guard that names one of
-    /// them is a guard for none of them, and `--thinking-budget` walks straight through a guard on
-    /// `thinking` alone.
+    /// A flag the account's backend never sends is refused before anything is asked or written,
+    /// naming it, as the door refuses the key over HTTP; the same flag on a backend that sends it
+    /// is kept.
     #[test]
-    fn a_thinking_flag_aimed_at_a_backend_without_thinking_is_dropped() {
-        let flags = || ProfileTuning {
+    fn a_flag_the_backend_never_sends_is_refused_and_one_it_sends_is_kept() {
+        let thinking = || ProfileTuning {
             thinking: Some(config::ThinkingMode::Budgeted),
             thinking_budget: Some(2_048),
-            thinking_display: Some(crate::config::ThinkingDisplay::Redacted),
             context_window: Some(1_024),
             effort: Some("low".to_string()),
             ..Default::default()
         };
         // Every setting is pinned, so this returns before any prompt: no stdin involved.
-        let openai = resolve_tuning(
-            flags(),
+        let Err(refused) = resolve_tuning(
+            thinking(),
             config::Backend::OpenAiChatCompletions,
             "oai",
             None,
             None,
-        )
-        .expect("resolve");
-        assert_eq!(openai.thinking, None, "written into an OpenAI profile");
-        assert_eq!(
-            openai.thinking_budget, None,
-            "the budget is the same request field, one key over"
+        ) else {
+            panic!("thinking on an OpenAI profile was kept");
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("--thinking, --thinking-budget"),
+            "{refused}"
         );
-        assert_eq!(
-            openai.thinking_display, None,
-            "and so is the redaction of what it produces"
-        );
-        assert_eq!(openai.context_window, Some(1_024));
-        assert_eq!(openai.effort.as_deref(), Some("low"));
-
         let claude = resolve_tuning(
-            flags(),
+            thinking(),
             config::Backend::AnthropicMessages,
             "work",
             None,
             None,
         )
-        .expect("resolve");
-        assert_eq!(
-            claude.thinking,
-            Some(config::ThinkingMode::Budgeted),
-            "the same flag must still reach a Claude profile"
-        );
-        assert_eq!(
-            claude.thinking_budget,
-            Some(2_048),
-            "and so must the budget"
-        );
-        // Not the redaction flag, which is a narrower question: `thinking_display` gates a beta
-        // header only `claude-subscription` sends, so an `anthropic-messages` profile that stored
-        // it would carry a setting that reads plausibly and is never consulted. See
-        // `Backend::reads_profile_key`.
-        assert_eq!(
-            claude.thinking_display, None,
-            "anthropic-messages takes a thinking field but never sends the redaction beta"
+        .expect("a Claude profile takes thinking");
+        assert_eq!(claude.thinking, Some(config::ThinkingMode::Budgeted));
+        assert_eq!(claude.thinking_budget, Some(2_048));
+
+        // `thinking_display` gates a beta header only `claude-subscription` sends.
+        let display = || ProfileTuning {
+            thinking_display: Some(crate::config::ThinkingDisplay::Redacted),
+            ..thinking()
+        };
+        let Err(refused) = resolve_tuning(
+            display(),
+            config::Backend::AnthropicMessages,
+            "work",
+            None,
+            None,
+        ) else {
+            panic!("anthropic-messages never sends the redaction beta, and kept the flag");
+        };
+        assert!(
+            refused.to_string().contains("--thinking-display"),
+            "{refused}"
         );
         let subscription = resolve_tuning(
-            flags(),
+            display(),
             config::Backend::ClaudeSubscription,
             "work",
             None,
             None,
         )
-        .expect("resolve");
+        .expect("the one backend that sends it");
         assert_eq!(
             subscription.thinking_display,
-            Some(crate::config::ThinkingDisplay::Redacted),
-            "the one backend that does send it keeps the flag"
+            Some(crate::config::ThinkingDisplay::Redacted)
         );
     }
 
-    /// `--cache-control` is dropped on every backend but `anthropic-messages`: the OpenAI wires
-    /// have no breakpoint to withhold, and `claude-subscription` pins its own to the captured
-    /// wire.
+    /// `--cache-control` is read on `anthropic-messages` alone: the OpenAI wires have no
+    /// breakpoint to withhold, and `claude-subscription` pins its own to the captured wire.
     #[test]
-    fn a_cache_control_flag_aimed_at_a_backend_that_never_reads_it_is_dropped() {
-        let flags = || ProfileTuning {
-            cache_control: Some(false),
-            thinking: Some(config::ThinkingMode::Off),
-            context_window: Some(1_024),
-            effort: Some("low".to_string()),
-            ..Default::default()
-        };
-        for (backend, kept) in [
-            (config::Backend::AnthropicMessages, Some(false)),
-            (config::Backend::ClaudeSubscription, None),
-            (config::Backend::OpenAiChatCompletions, None),
-            (config::Backend::OpenAiResponses, None),
-            (config::Backend::ChatGptSubscription, None),
-        ] {
+    fn a_cache_control_flag_is_kept_only_where_it_is_read() {
+        for backend in config::Backend::ALL {
+            let flags = ProfileTuning {
+                cache_control: Some(false),
+                thinking: backend
+                    .takes_thinking()
+                    .then_some(config::ThinkingMode::Off),
+                context_window: Some(1_024),
+                effort: Some("low".to_string()),
+                ..Default::default()
+            };
             // Every prompted setting is pinned, so this returns before any prompt: no stdin.
-            let tuning = resolve_tuning(flags(), backend, "work", None, None).expect("resolve");
-            assert_eq!(tuning.cache_control, kept, "{backend}");
+            let resolved = resolve_tuning(flags, backend, "work", None, None);
+            if backend == config::Backend::AnthropicMessages {
+                assert_eq!(resolved.expect("read").cache_control, Some(false));
+            } else {
+                assert!(resolved.is_err(), "{backend} kept a flag it never sends");
+            }
         }
     }
 
-    /// Chat Completions has no declaration to make, so the flag is dropped there and kept on the
+    /// Chat Completions has no declaration to make, so the flag is refused there and kept on the
     /// four wires that have one.
     #[test]
-    fn a_deferred_tools_flag_is_dropped_only_for_chat_completions() {
-        let flags = || ProfileTuning {
-            deferred_tools: Some(config::DeferredTools::Native),
-            thinking: Some(config::ThinkingMode::Off),
-            context_window: Some(1_024),
-            effort: Some("low".to_string()),
-            ..Default::default()
-        };
+    fn a_deferred_tools_flag_is_refused_only_for_chat_completions() {
         for backend in config::Backend::ALL {
-            let tuning = resolve_tuning(flags(), backend, "work", None, None).expect("resolve");
-            let kept = (backend != config::Backend::OpenAiChatCompletions)
-                .then_some(config::DeferredTools::Native);
-            assert_eq!(tuning.deferred_tools, kept, "{backend}");
+            let flags = ProfileTuning {
+                deferred_tools: Some(config::DeferredTools::Native),
+                thinking: backend
+                    .takes_thinking()
+                    .then_some(config::ThinkingMode::Off),
+                context_window: Some(1_024),
+                effort: Some("low".to_string()),
+                ..Default::default()
+            };
+            let resolved = resolve_tuning(flags, backend, "work", None, None);
+            if backend == config::Backend::OpenAiChatCompletions {
+                assert!(resolved.is_err(), "{backend} kept a flag it never sends");
+            } else {
+                assert_eq!(
+                    resolved.expect("read").deferred_tools,
+                    Some(config::DeferredTools::Native),
+                    "{backend}"
+                );
+            }
         }
     }
 
@@ -982,7 +1004,7 @@ mod tests {
             let sample = match *key {
                 "context_window" | "max_output_tokens" | "thinking_budget"
                 | "max_request_bytes" => "1000",
-                "vision" | "cache_control" => "true",
+                "vision" | "cache_control" | "encrypted_reasoning" | "reasoning_summary" => "true",
                 "thinking_display" => "updates",
                 "thinking" => "adaptive",
                 "deferred_tools" => "native",

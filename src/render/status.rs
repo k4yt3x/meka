@@ -5,7 +5,10 @@ use super::*;
 use crate::streams::write_stderr_line;
 
 pub(crate) fn render_session_id(label: &str, id: &str) {
-    write_stderr_line(format!("{label}: {id}").with(Color::DarkGrey));
+    write_stderr_line(super::output::colored_for_stderr(
+        format!("{label}: {id}"),
+        Color::DarkGrey,
+    ));
 }
 /// The resolved model parameters shown at the top of the `/status` report, borrowed from the active
 /// config plus the provider's settled effort. All optional so a mis-selected profile still renders.
@@ -258,24 +261,23 @@ pub(crate) struct MissingSessionProfile<'a> {
 /// that is what this adds. No line suggests recreating the missing profile: meka never saw it, so
 /// any account or model it named would be invented.
 ///
-/// `None` says nothing about *why* setup failed: the caller prints the error first, and it is as
-/// often a configured profile missing its credential as no profile at all.
-pub(crate) fn render_profile_setup_hint(missing: Option<MissingSessionProfile<'_>>) {
-    match missing {
-        Some(missing) => write_stderr_line(format!(
-            "Move this session onto a configured profile: `meka -r {} --profile {}`",
-            missing.session_id, missing.move_to
-        )),
-        None => write_stderr_line("Run `meka profile list` to see the configured profiles."),
-    }
+/// Nothing in any other case: the error above names its own remedy, whether a credential to log in
+/// or the profiles that are configured, and a second one beside it would be an alternative.
+pub(crate) fn render_profile_setup_hint(missing: MissingSessionProfile<'_>) {
+    write_stderr_line(format!(
+        "Move this session onto a configured profile: `meka -r {} --profile {}`",
+        missing.session_id, missing.move_to
+    ));
 }
 
 /// The row that closes a turn: how it ended, then the facts `facts` lists, in their order. `None`
 /// when nothing is listed. A fact with nothing to say, a duration with no start or a usage of
-/// nothing, is left out rather than stated as zero.
+/// nothing, is left out rather than stated as zero. A turn that ended on the model's output limit
+/// or its refusal says so, since its last answer would otherwise read as complete.
 pub(crate) fn turn_end_summary(
     facts: &[crate::config::TurnEndFact],
     status: crate::store::turns::TurnStatus,
+    stop_reason: Option<&str>,
     ended_at: chrono::DateTime<chrono::Utc>,
     elapsed: Option<std::time::Duration>,
     usage: &crate::store::turns::TurnUsage,
@@ -285,10 +287,12 @@ pub(crate) fn turn_end_summary(
     if facts.is_empty() {
         return None;
     }
-    let mut sentence = match status {
-        TurnStatus::Succeeded => "Finished",
-        TurnStatus::Failed => "Failed",
-        TurnStatus::Canceled => "Interrupted",
+    let mut sentence = match (status, stop_reason) {
+        (TurnStatus::Succeeded, Some("max_tokens")) => "Hit the output limit",
+        (TurnStatus::Succeeded, Some("refusal")) => "Declined by the model",
+        (TurnStatus::Succeeded, _) => "Finished",
+        (TurnStatus::Failed, _) => "Failed",
+        (TurnStatus::Canceled, _) => "Interrupted",
     }
     .to_string();
     for fact in facts {
@@ -531,6 +535,29 @@ mod tests {
         );
     }
 
+    /// A turn that ran into the output limit, or that the model declined, says so where the row
+    /// would otherwise call it finished, since its last answer reads as complete.
+    #[test]
+    fn a_turn_cut_at_the_output_limit_says_so() {
+        let usage = crate::store::turns::TurnUsage::default();
+        let now = chrono::Utc::now();
+        let row = |stop_reason| {
+            turn_end_summary(
+                &crate::config::TurnEndFact::DEFAULT_SUMMARY,
+                crate::store::turns::TurnStatus::Succeeded,
+                stop_reason,
+                now,
+                None,
+                &usage,
+                now,
+            )
+            .expect("a row")
+        };
+        assert!(row(Some("max_tokens")).starts_with("Hit the output limit"));
+        assert!(row(Some("refusal")).starts_with("Declined by the model"));
+        assert!(row(Some("end_turn")).starts_with("Finished"));
+    }
+
     /// The row that closes a turn reads as one sentence: how it ended, then the facts listed in
     /// their order, each left out when it has nothing to say.
     #[test]
@@ -552,7 +579,7 @@ mod tests {
             cache_read_input_tokens: 11_300,
         };
         let summary = |facts: &[TurnEndFact], status, elapsed, usage, now| {
-            turn_end_summary(facts, status, ended, elapsed, usage, now)
+            turn_end_summary(facts, status, None, ended, elapsed, usage, now)
         };
         assert_eq!(
             summary(

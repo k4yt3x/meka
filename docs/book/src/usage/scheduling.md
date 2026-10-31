@@ -20,7 +20,7 @@ A job pairs a **schedule** with a **prompt**. When it fires, the prompt is deliv
 |----------|---------|---------|
 | `at` | Fire once, then delete itself | `20m`, `2h`, `2026-08-12T09:00:00Z` |
 | `every` | Fire on a fixed interval | `30m`, `1h`, `1d` |
-| `cron` | Fire on a 5-field cron expression, in local time | `0 9 * * 1-5` |
+| `cron` | Fire on a 5-field cron expression, in the job's `timezone` | `0 9 * * 1-5` |
 
 Durations use the same syntax as `config.toml`, so `every = "30m"` means what
 `[serve] idle_timeout = "30m"` means. Two things to know about it: **`m` is minutes and `M` is
@@ -30,6 +30,14 @@ Cron expressions have **no seconds field**, and follow standard Vixie semantics:
 day-of-month and day-of-week are set, the job fires when **either** matches, not both. A six-field
 expression is refused rather than read as Quartz, where `*/10 * * * * *` would mean every ten
 seconds instead of the every-ten-minutes it looks like.
+
+A cron pattern is read in the zone its job names in `timezone`, an IANA name such as
+`Asia/Tokyo`, and in the machine's own zone when it names none, looked up at each fire, so a machine
+that changes zone takes those jobs with it. The zone's own daylight-saving rules decide the instant:
+`0 9 * * *` in `America/New_York` fires at 09:00 there on both sides of a change. `timezone` beside
+`at` or `every` is refused, since neither reads one. Zone names come from the system's time-zone
+database, kept current by the operating system; Windows, which has none, uses a copy built into
+meka.
 
 A pattern that matches no calendar date (`0 0 30 2 *`) is refused when the job is created. One whose
 next occurrence is far off is not: `0 0 29 2 *` waits up to four years for the next February 29th and

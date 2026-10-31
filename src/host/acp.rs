@@ -14,7 +14,7 @@
 //! conversation, cancellation token, `Agent` and `AcpFrontend`, over process-wide dependencies held
 //! by `Arc`. Nothing serializes turns, so two `session/prompt` calls run in parallel. A sub-agent
 //! reaches the parent's client through [`crate::frontend::PermissionForwardingFrontend`], so its
-//! permission prompts and fs delegates surface in the parent session's editor UI.
+//! approval prompts and fs delegates surface in the parent session's editor UI.
 
 mod elicitation;
 pub(crate) mod frontend;
@@ -41,7 +41,7 @@ use agent_client_protocol::{
         NewSessionRequest, NewSessionResponse, NoticeSeverity, PermissionOption,
         PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
         PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+        RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, ResumeSessionRequest,
         ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
         SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
         SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
@@ -62,10 +62,9 @@ use tokio_util::{
 
 use self::{frontend::*, prompt::*, session::*};
 use crate::{
-    agent::Agent,
     checklist::{ChecklistItem, ChecklistStatus},
     config::ResolvedConfig,
-    conversation::{ContentBlock as MekaContentBlock, Conversation, Role, ToolResultContent},
+    conversation::{ContentBlock as MekaContentBlock, Role, ToolResultContent},
     error::MekaError,
     frontend::{
         Frontend, FrontendError, FrontendEvent, PermissionOutcome, PermissionRequest,
@@ -127,60 +126,49 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
         };
         agent_client_protocol::util::internal_error(data)
     };
-    match error {
-        MekaError::Config(_)
-        | MekaError::Usage(_)
-        | MekaError::SessionLocked(_)
-        | MekaError::SessionNotDrivable(_)
-        | MekaError::SessionNotFound(_)
-        | MekaError::TurnInFlight { .. }
-        | MekaError::EmptyPrompt
-        | MekaError::RequestTooLarge(_)
-        | MekaError::DisabledLevel { .. }
-        | MekaError::ProfileNotConfigured { .. }
-        | MekaError::UnknownProject { .. } => invalid_params_error(error),
+    // Classified by the kind every surface reads, so a refusal added to `MekaError` lands where
+    // its kind says rather than in a catch-all here.
+    match error.kind() {
+        crate::error::ErrorKind::InvalidBody
+        | crate::error::ErrorKind::RequestTooLarge
+        | crate::error::ErrorKind::SessionNotDrivable
+        | crate::error::ErrorKind::SessionLocked
+        | crate::error::ErrorKind::SessionNotFound
+        | crate::error::ErrorKind::TurnInFlight
+        | crate::error::ErrorKind::AccountInUse => invalid_params_error(error),
+        crate::error::ErrorKind::Provider
+        | crate::error::ErrorKind::ProviderUnavailable
+        | crate::error::ErrorKind::ProviderExhausted
+        | crate::error::ErrorKind::ContextOverflow => {
+            // The quota sentence says what happened and when it ends, not where the response
+            // went, which the editor is owed with the response withheld.
+            let sentence = match error {
+                MekaError::ProviderExhausted { .. } => {
+                    format!("{}; its response is in the meka log", error.sentence())
+                }
+                _ => error.sentence(),
+            };
+            withhold_or_relay(&sentence, error.upstream_body().unwrap_or_default())
+        }
+        // The names travel and the reasons do not: a connector's reason has carried a spawn
+        // failure complete with the command line and its path.
+        crate::error::ErrorKind::McpUnavailable => {
+            tracing::warn!("an MCP server kept the request from running: {error}");
+            agent_client_protocol::util::internal_error(error.sentence())
+        }
         // The operator's `ca_cert_file`, proxy or `base_url`. Its own words are for the terminal
         // `meka acp` was started from, not for the editor on the other end of the pipe, which can
         // do nothing with a path in someone else's configuration file.
-        MekaError::Installation(message) => {
-            tracing::error!("installation error: {message}");
+        _ if matches!(error, MekaError::Installation(_)) => {
+            tracing::error!("installation error: {error}");
             agent_client_protocol::util::internal_error(
                 "meka is misconfigured; the detail is in the meka log",
             )
         }
-        MekaError::Provider(message) | MekaError::InvalidRequest(message) => withhold_or_relay(
-            "the provider rejected or failed this turn; its response is in the meka log",
-            message,
-        ),
-        MekaError::StreamError(message) | MekaError::RetryableProvider { message, .. } => {
-            withhold_or_relay(
-                "the provider did not complete this turn; its response is in the meka log",
-                message,
-            )
-        }
-        MekaError::ProviderExhausted { message, .. } => withhold_or_relay(
-            &format!("{}; its response is in the meka log", error.sentence()),
-            message,
-        ),
-        MekaError::ContextOverflow(message) => withhold_or_relay(
-            "the conversation exceeds the model's context window; shorten it before retrying",
-            message,
-        ),
-        // The names travel and the reasons do not, which is the policy the arms above state. A
-        // reason here is the connector's own text and has carried a spawn failure complete with the
-        // command line and its path.
-        MekaError::McpTurnGated { servers } => {
-            tracing::warn!("mcp gate declined a turn: {error}");
-            let names: Vec<&str> = servers.iter().map(|(name, _)| name.as_str()).collect();
-            agent_client_protocol::util::internal_error(format!(
-                "required MCP server(s) not ready: {}; each server's reason is in the meka log",
-                names.join(", ")
-            ))
-        }
         // A store path, a filesystem path, or a fault nobody classified. The `Display` names
         // meka's own directories either way.
-        other => {
-            tracing::error!("unhandled agent error reported to the client: {other}");
+        _ => {
+            tracing::error!("agent error reported to the client: {error}");
             agent_client_protocol::util::internal_error(
                 "meka could not complete this request; the detail is in the meka log",
             )
@@ -470,18 +458,18 @@ pub(crate) async fn run_acp(
                         );
                     }
 
-                    // Push the initial skill palette + the configured mode picker so the editor's
-                    // UI is populated before the user types their first prompt.
+                    // The mode picker rides the response; the skill palette and the context seed
+                    // follow it, since a client registers the session only once the response
+                    // names its id and drops a notification for an id it does not know yet.
                     let modes = build_mode_state(&permission);
                     let config_options =
                         build_config_options(&state.shared, &permission, Some(session_uuid)).await;
-                    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
-
                     let responded = responder.respond(
-                        NewSessionResponse::new(session_id)
+                        NewSessionResponse::new(session_id.clone())
                             .modes(modes)
                             .config_options(config_options),
                     );
+                    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
                     frontend.emit(seed).await;
                     responded
                 }
@@ -503,8 +491,10 @@ pub(crate) async fn run_acp(
                             .and_then(|entry| entry.admit_turn(None).ok())
                     };
                     let state_for_spawn = Arc::clone(&state);
+                    let connection = cx.clone();
                     cx.spawn(async move {
-                        run_prompt_turn(state_for_spawn, request, responder, pending).await
+                        run_prompt_turn(state_for_spawn, request, responder, pending, connection)
+                            .await
                     })?;
                     Ok(())
                 }
@@ -572,8 +562,8 @@ pub(crate) async fn run_acp(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |request: SetSessionModeRequest, responder, _cx: ConnectionTo<Client>| {
-                    handle_set_session_mode(Arc::clone(&state), request, responder).await
+                async move |request: SetSessionModeRequest, responder, cx: ConnectionTo<Client>| {
+                    handle_set_session_mode(Arc::clone(&state), request, responder, cx).await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -588,8 +578,15 @@ pub(crate) async fn run_acp(
                     // this one reaches the session runtime, and parking the dispatch loop on
                     // anything a turn holds deadlocks every session in the process.
                     let state_for_spawn = Arc::clone(&state);
+                    let connection = cx.clone();
                     cx.spawn(async move {
-                        handle_set_session_config_option(state_for_spawn, request, responder).await
+                        handle_set_session_config_option(
+                            state_for_spawn,
+                            request,
+                            responder,
+                            connection,
+                        )
+                        .await
                     })?;
                     Ok(())
                 }
@@ -653,6 +650,29 @@ mod tests {
     // per-session behavior is covered end-to-end in `tests/acp.rs`. The pure helpers below are
     // what this unit-test module owns.
 
+    /// A prompt's `usage` is what that turn spent, the session's counters after it less before,
+    /// not the session's running total.
+    #[test]
+    fn a_prompt_s_usage_is_the_turn_s_own() {
+        let before = crate::stats::SessionStatsSnapshot {
+            input_tokens: 1_000,
+            output_tokens: 200,
+            cache_read_input_tokens: 5_000,
+            ..Default::default()
+        };
+        let after = crate::stats::SessionStatsSnapshot {
+            input_tokens: 1_100,
+            output_tokens: 230,
+            cache_read_input_tokens: 9_000,
+            ..Default::default()
+        };
+        let usage = turn_usage(&before, &after);
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cached_read_tokens, Some(4_000));
+        assert_eq!(usage.total_tokens, 4_130);
+    }
+
     /// A request the user has already stopped must not wait on the client's answer.
     ///
     /// Every `fs/read_text_file`, `fs/write_text_file` and elicitation is a round trip to an editor
@@ -697,6 +717,25 @@ mod tests {
             outcome.expect("a live turn must get its answer"),
             "contents"
         );
+    }
+
+    /// A refusal the editor can act on is `InvalidParams` with meka's sentence, whichever variant
+    /// carries it: the kind decides, so one added after this host was written is not reported as
+    /// an internal error.
+    #[test]
+    fn a_refusal_the_editor_can_act_on_is_invalid_params() {
+        let reported = acp_error_for(
+            &MekaError::ProfileNamesNoModel {
+                profile: "work".to_string(),
+            },
+            false,
+        );
+        assert_eq!(
+            reported.code,
+            agent_client_protocol::ErrorCode::InvalidParams
+        );
+        let data = serde_json::to_string(&reported.data).unwrap_or_default();
+        assert!(data.contains("work"), "{data}");
     }
 
     /// What an editor may read of a failed turn, per class.
@@ -770,7 +809,7 @@ mod tests {
             let data = serde_json::to_string(&withheld.data).unwrap_or_default();
             assert!(!data.contains("acct-0f3c"), "{error}: {data}");
             assert!(
-                data.contains("meka log") || data.contains("shorten it"),
+                data.contains("meka log") || data.contains("compact it"),
                 "and the client must be told where the detail went, or what to do: {data}"
             );
 
@@ -1738,42 +1777,148 @@ mod tests {
         );
     }
 
+    /// A replay says the turns before a compaction, then the compaction where it happened,
+    /// numbered from the generation the page starts at, and never its summary as a user turn.
+    #[test]
+    fn a_replay_says_a_compaction_where_it_happened() {
+        use crate::conversation::{Event, Message};
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("the summary"),
+            replaced_count: 4,
+            record: crate::conversation::CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        let events = vec![
+            Event::Append(Message::user("first")),
+            Event::Append(Message::assistant_text("one")),
+            boundary,
+            Event::Append(Message::user("third")),
+        ];
+        let said: Vec<String> = replay_entries(&events, 3)
+            .iter()
+            .map(|entry| match entry {
+                Replayed::Message(message) => message.text_content(),
+                Replayed::Compaction { generation, .. } => format!("compaction {generation}"),
+            })
+            .collect();
+        assert_eq!(said, ["first", "one", "compaction 3", "third"]);
+    }
+
+    /// An ACP prompt of `text` alone, as the slash tests send one.
+    fn words(text: &str) -> Vec<crate::conversation::ContentBlock> {
+        vec![crate::conversation::ContentBlock::Text {
+            text: text.to_string(),
+        }]
+    }
+
+    /// A skill invoked with a file attached among the words takes the whole prompt: the model reads
+    /// the request with the file where it was attached, then the body, and a history shows the
+    /// words with the file as its mention.
     #[tokio::test]
-    async fn slash_to_prompt_text_passes_through_non_slash() {
+    async fn an_invocation_takes_the_words_and_files_sent_with_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join("demo");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: demo skill\n---\nthe method\n",
+        )
+        .expect("write SKILL.md");
+        let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
+        let parts = vec![
+            crate::conversation::ContentBlock::Text {
+                text: "/demo compare ".to_string(),
+            },
+            crate::conversation::ContentBlock::Resource {
+                uri: "file:///a.rs".to_string(),
+                name: "a.rs".to_string(),
+                text: "<resource uri=\"file:///a.rs\">fn a() {}</resource>".to_string(),
+            },
+            crate::conversation::ContentBlock::Text {
+                text: " with the old one".to_string(),
+            },
+        ];
+        let Some(crate::conversation::ContentBlock::Invocation {
+            directive, text, ..
+        }) = slash_to_invocation(&parts, &cache).await.expect("ok")
+        else {
+            panic!("a known skill is an invocation");
+        };
+        assert_eq!(directive, "compare @a.rs with the old one");
+        let request = text.find("with the old one").expect("the request");
+        assert!(
+            text.find("fn a() {}").expect("the file") < request,
+            "{text}"
+        );
+        assert!(
+            request < text.find("the method").expect("the body"),
+            "{text}"
+        );
+
+        // Two text blocks side by side are two lines, as the prompt's joined words read them.
+        let split = vec![
+            crate::conversation::ContentBlock::Text {
+                text: "/demo fix".to_string(),
+            },
+            crate::conversation::ContentBlock::Text {
+                text: "this".to_string(),
+            },
+        ];
+        let Some(crate::conversation::ContentBlock::Invocation { directive, .. }) =
+            slash_to_invocation(&split, &cache).await.expect("ok")
+        else {
+            panic!("a known skill is an invocation");
+        };
+        assert_eq!(directive, "fix\nthis");
+    }
+
+    /// A local command followed by words is prose for the model, not a skill that is missing.
+    #[tokio::test]
+    async fn a_local_command_with_words_after_it_reaches_the_model() {
         let cache = SkillCache::for_root(None);
-        let out = slash_to_prompt_text("just a normal prompt".to_string(), &cache)
+        let out = slash_to_invocation(&words("/usage looks wrong, why?"), &cache)
             .await
-            .expect("ok");
-        assert_eq!(out, "just a normal prompt");
+            .expect("pass-through");
+        assert_eq!(out, None);
     }
 
     #[tokio::test]
-    async fn slash_to_prompt_text_passes_through_paste_shaped_input() {
+    async fn slash_to_invocation_passes_through_non_slash() {
+        let cache = SkillCache::for_root(None);
+        let out = slash_to_invocation(&words("just a normal prompt"), &cache)
+            .await
+            .expect("ok");
+        assert_eq!(out, None);
+    }
+
+    #[tokio::test]
+    async fn slash_to_invocation_passes_through_paste_shaped_input() {
         // A pasted path like `/etc/hosts is a config file` has an invalid skill-name first token
         // (slash inside the name), so the helper must NOT touch it.
         let cache = SkillCache::for_root(None);
-        let out = slash_to_prompt_text("/etc/hosts is the config file".to_string(), &cache)
+        let out = slash_to_invocation(&words("/etc/hosts is the config file"), &cache)
             .await
             .expect("pass-through");
-        assert_eq!(out, "/etc/hosts is the config file");
+        assert_eq!(out, None);
     }
 
     #[tokio::test]
-    async fn slash_to_prompt_text_passes_through_double_slash_comment() {
+    async fn slash_to_invocation_passes_through_double_slash_comment() {
         // `//foo` parses as name="/foo", which is invalid; pass through.
         let cache = SkillCache::for_root(None);
-        let out = slash_to_prompt_text("//comment line".to_string(), &cache)
+        let out = slash_to_invocation(&words("//comment line"), &cache)
             .await
             .expect("pass-through");
-        assert_eq!(out, "//comment line");
+        assert_eq!(out, None);
     }
 
     #[tokio::test]
-    async fn slash_to_prompt_text_unknown_but_valid_name_errors() {
+    async fn slash_to_invocation_unknown_but_valid_name_errors() {
         // A clean `/<name>` shape with a syntactically valid skill name that isn't installed:
         // error, since the only realistic source of this shape is a typo'd palette pick.
         let cache = SkillCache::for_root(None);
-        let err = slash_to_prompt_text("/nonexistent".to_string(), &cache)
+        let err = slash_to_invocation(&words("/nonexistent"), &cache)
             .await
             .expect_err("should error");
         assert!(
@@ -1788,7 +1933,7 @@ mod tests {
     /// This is a person typing a name they know exists, so answering that it does not sends them
     /// looking for something they already have.
     #[tokio::test]
-    async fn slash_to_prompt_text_reports_a_broken_skill_as_broken() {
+    async fn slash_to_invocation_reports_a_broken_skill_as_broken() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skill_dir = temp.path().join("wrecked");
         std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
@@ -1799,7 +1944,7 @@ mod tests {
         .expect("write skill");
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
 
-        let err = slash_to_prompt_text("/wrecked".to_string(), &cache)
+        let err = slash_to_invocation(&words("/wrecked"), &cache)
             .await
             .expect_err("should error");
         let message = err.to_string();
@@ -1810,8 +1955,10 @@ mod tests {
         assert!(message.contains("frontmatter"), "{message}");
     }
 
+    /// A known skill becomes an invocation: the words typed with it kept apart as its directive,
+    /// and the text the model reads leading with them, then the body under its header.
     #[tokio::test]
-    async fn slash_to_prompt_text_known_skill_composes_body() {
+    async fn slash_to_invocation_known_skill_composes_body() {
         // Drop a SKILL.md under a tempdir, point a fresh cache at it.
         let temp = tempfile::tempdir().expect("tempdir");
         let skill_dir = temp.path().join("demo");
@@ -1823,25 +1970,37 @@ mod tests {
         .expect("write SKILL.md");
 
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
-        let out = slash_to_prompt_text("/demo only fetch UK news".to_string(), &cache)
+        let out = slash_to_invocation(&words("/demo only fetch UK news"), &cache)
             .await
             .expect("ok");
+        let Some(crate::conversation::ContentBlock::Invocation {
+            kind,
+            name,
+            directive,
+            text,
+        }) = out
+        else {
+            panic!("a known skill is an invocation: {out:?}");
+        };
+        assert_eq!(kind, crate::conversation::InvocationKind::Skill);
+        assert_eq!(name, "demo");
+        assert_eq!(directive, "only fetch UK news");
         assert!(
-            out.starts_with("only fetch UK news\n\n"),
-            "extra context must lead: {out}"
+            text.starts_with("only fetch UK news\n\n"),
+            "extra context must lead: {text}"
         );
         assert!(
-            out.contains("run ls in scripts/"),
-            "body must be passed through verbatim: {out}"
+            text.contains("run ls in scripts/"),
+            "body must be passed through verbatim: {text}"
         );
         assert!(
-            out.contains("Base directory for this skill"),
-            "skill_context_header must be present: {out}"
+            text.contains("Base directory for this skill"),
+            "skill_context_header must be present: {text}"
         );
     }
 
     #[tokio::test]
-    async fn slash_to_prompt_text_known_skill_no_extra() {
+    async fn slash_to_invocation_known_skill_no_extra() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skill_dir = temp.path().join("ping");
         std::fs::create_dir_all(&skill_dir).expect("mkdir");
@@ -1852,15 +2011,22 @@ mod tests {
         .expect("write");
 
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
-        let out = slash_to_prompt_text("/ping".to_string(), &cache)
+        let out = slash_to_invocation(&words("/ping"), &cache)
             .await
             .expect("ok");
+        let Some(crate::conversation::ContentBlock::Invocation {
+            directive, text, ..
+        }) = out
+        else {
+            panic!("a known skill is an invocation: {out:?}");
+        };
         // No `extra\n\n` prefix when the user passed only the skill name; the body stands alone.
+        assert_eq!(directive, "");
         assert!(
-            !out.starts_with("\n\n"),
-            "bare /skill must not have a leading newline: {out:?}"
+            !text.starts_with("\n\n"),
+            "bare /skill must not have a leading newline: {text:?}"
         );
-        assert!(out.contains("pong"));
+        assert!(text.contains("pong"));
     }
 
     #[test]

@@ -211,9 +211,9 @@ impl SkillIndex {
             Some(reason) => {
                 format!("skill '{name}' exists on disk but failed to load: {reason}")
             }
-            // The `unknown_name` head without its configured list: a targeted resolve holds only
-            // the skill it was asked for, so listing what this index knows would say "none".
-            None => format!("no skill named '{name}'"),
+            // Without a list: a targeted resolve holds only the skill it was asked for, so listing
+            // what this index knows would say "none".
+            None => crate::text::no_entry_named("skill", name),
         }
     }
 
@@ -1074,6 +1074,42 @@ pub(crate) async fn load_skill_body(skill: &Skill) -> Result<String, String> {
     ))
 }
 
+/// The block a skill invocation sends: its text the directive typed with it first, as typed, then
+/// the skill's [`load_skill_body`] as the method, or the body alone when nothing but whitespace was
+/// typed, so an invocation without a message is a turn rather than a blank line above one. The one
+/// composition for `--skill`, the screen's `/skill`, the HTTP turn's `skill` and `agent_spawn`'s,
+/// and through [`invocation_with_words`] an editor's `/<skill-name>`.
+pub(crate) fn invocation(
+    name: &str,
+    directive: String,
+    body: String,
+) -> crate::conversation::ContentBlock {
+    let words = directive.clone();
+    invocation_with_words(name, directive, words, body)
+}
+
+/// [`invocation`] where the model reads more of the words than a history shows: an editor's
+/// prompt whose words carry attached files, which `directive` names by their mentions and
+/// `words` holds whole.
+pub(crate) fn invocation_with_words(
+    name: &str,
+    directive: String,
+    words: String,
+    body: String,
+) -> crate::conversation::ContentBlock {
+    let text = if words.trim().is_empty() {
+        body
+    } else {
+        format!("{words}\n\n{body}")
+    };
+    crate::conversation::ContentBlock::Invocation {
+        kind: crate::conversation::InvocationKind::Skill,
+        name: name.to_string(),
+        directive,
+        text,
+    }
+}
+
 /// The skill body exactly as stored, frontmatter stripped and nothing added.
 ///
 /// [`load_skill_body`] is the *agent-facing* rendering: it prepends a base-directory line so
@@ -1679,6 +1715,26 @@ mod tests {
     }
 
     use super::*;
+
+    /// The words typed with an invocation reach the model as typed, ahead of the skill's method;
+    /// nothing typed sends the method alone.
+    #[test]
+    fn an_invocation_sends_its_words_as_typed() {
+        let crate::conversation::ContentBlock::Invocation { text, .. } = invocation(
+            "demo",
+            "  indented\nline".to_string(),
+            "the method".to_string(),
+        ) else {
+            panic!("an invocation");
+        };
+        assert_eq!(text, "  indented\nline\n\nthe method");
+        let crate::conversation::ContentBlock::Invocation { text, .. } =
+            invocation("demo", " ".to_string(), "the method".to_string())
+        else {
+            panic!("an invocation");
+        };
+        assert_eq!(text, "the method");
+    }
     use crate::paths::skill_roots;
 
     /// Discover one root, through the same code every caller uses.
@@ -2015,16 +2071,12 @@ mod tests {
         );
     }
 
-    /// Run `body` and return the warnings it logged.
-    ///
-    /// See [`crate::render::log_capture`] for why the subscriber behind this is global and why
-    /// there is exactly one of it.
+    /// Run `body` and return the warnings it logged. Warnings alone, since several of the
+    /// assertions below are that a conforming skill is *silent*.
     fn capture_warnings(body: impl FnOnce()) -> String {
-        crate::render::log_capture::start();
+        let logs = crate::streams::capture::capture_logs(tracing::Level::WARN);
         body();
-        // Filtered to warnings: the shared subscriber captures `info!` too, and several of the
-        // assertions below are that a conforming skill is *silent*.
-        crate::render::log_capture::warnings()
+        logs.logged()
     }
 
     /// Rendering is a fixed point: parse, render, parse, render again, and the two renders match

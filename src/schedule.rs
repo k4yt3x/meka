@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use croner::Cron;
 // Reached through `humantime_serde`'s re-export rather than a direct dependency, which is also
 // how `crate::config` gets at it. One duration syntax, one copy of the parser.
@@ -66,8 +66,41 @@ pub(crate) enum Schedule {
     At(DateTime<Utc>),
     /// Fire repeatedly, this far apart.
     Every(Duration),
-    /// Fire on a 5-field cron pattern, evaluated in the host's local time.
-    Cron(Box<Cron>),
+    /// Fire on a 5-field cron pattern, read in the zone the job names, else the machine's.
+    Cron(Box<Cron>, Option<CronZone>),
+}
+
+/// A named IANA zone a cron pattern's fields are read in.
+#[derive(Debug, Clone)]
+pub(crate) struct CronZone {
+    name: String,
+    zone: jiff::tz::TimeZone,
+}
+
+impl CronZone {
+    /// The zone `name` names, from the system's zone database where it has one. A machine with
+    /// no database is said to have none, rather than every name being called wrong.
+    pub(crate) fn resolve(name: &str) -> Result<Self, String> {
+        let name = name.trim();
+        jiff::tz::TimeZone::get(name)
+            .map(|zone| Self {
+                name: name.to_string(),
+                zone,
+            })
+            .map_err(|_| {
+                if jiff::tz::db().is_definitively_empty() {
+                    format!("'{name}' cannot be looked up: this machine has no time zone database")
+                } else {
+                    format!("'{name}' is not an IANA time zone name")
+                }
+            })
+    }
+}
+
+/// The machine's zone by its IANA name, for a surface that tells the model or a person what a
+/// cron job without a zone is read in; `None` where the system does not name it.
+pub(crate) fn machine_zone_name() -> Option<String> {
+    jiff::tz::TimeZone::system().iana_name().map(str::to_string)
 }
 
 impl Schedule {
@@ -110,13 +143,13 @@ impl Schedule {
         Ok(Self::Every(interval))
     }
 
-    /// Parse a 5-field cron pattern, evaluated in the host's local time.
+    /// Parse a 5-field cron pattern, read in `zone`, else the machine's zone.
     ///
     /// Rejects a well-formed but unsatisfiable pattern like `0 0 30 2 *` (February 30th) at
     /// creation, which is the only way to catch it instead of leaving a job that silently never
     /// fires. croner reports its own search-limit error for those, so this only has to ask it for
     /// one occurrence.
-    pub(crate) fn parse_cron(input: &str) -> Result<Self, String> {
+    pub(crate) fn parse_cron(input: &str, zone: Option<CronZone>) -> Result<Self, String> {
         let input = input.trim();
         // Five fields, explicitly. `Cron::from_str` defaults to `Seconds::Optional`, so a six-field
         // pattern would parse with the first field as seconds, and `*/10 * * * * *`, written by a
@@ -132,7 +165,7 @@ impl Schedule {
             .build()
             .parse(input)
             .map_err(|error| format!("'{input}' is not a valid cron expression: {error}"))?;
-        let schedule = Self::Cron(Box::new(cron));
+        let schedule = Self::Cron(Box::new(cron), zone);
         if schedule.next_after(Utc::now()).is_none() {
             return Err(format!(
                 "cron expression '{input}' matches no calendar date"
@@ -141,9 +174,61 @@ impl Schedule {
         Ok(schedule)
     }
 
-    /// Rebuild a schedule from its two persisted columns. The inverse of [`Schedule::kind_str`] +
-    /// [`Schedule::spec`].
-    pub(crate) fn from_stored(kind: &str, spec: &str) -> Result<Self, String> {
+    /// The schedule a request names: exactly one of `at`, `every` and `cron`, with `timezone`
+    /// beside a cron pattern alone, since nothing else reads it. The one reading for every door
+    /// that creates a job. Ambiguity is refused rather than resolved by precedence: honoring one
+    /// and dropping the other would make a job fire on a schedule nobody asked for.
+    pub(crate) fn parse_request(
+        at: Option<&str>,
+        every: Option<&str>,
+        cron: Option<&str>,
+        timezone: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, String> {
+        let given: Vec<(&str, &str)> = [("at", at), ("every", every), ("cron", cron)]
+            .into_iter()
+            .filter_map(|(key, value)| {
+                value
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| (key, value))
+            })
+            .collect();
+        let timezone = timezone.map(str::trim).filter(|zone| !zone.is_empty());
+        match (given.as_slice(), timezone) {
+            ([("cron", value)], zone) => {
+                Self::parse_cron(value, zone.map(CronZone::resolve).transpose()?)
+            }
+            ([(key, _)], Some(_)) => Err(format!(
+                "`timezone` applies to a `cron` pattern alone; an `{key}` schedule does not read \
+                 one"
+            )),
+            ([("at", value)], None) => Self::parse_at(value, now),
+            ([(_, value)], None) => Self::parse_every(value),
+            ([], _) => {
+                Err("give one of `at` (once), `every` (interval), or `cron` (expression)".into())
+            }
+            (several, _) => Err(format!(
+                "give exactly one schedule, got {}",
+                several
+                    .iter()
+                    .map(|(key, _)| format!("`{key}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )),
+        }
+    }
+
+    /// Rebuild a schedule from its persisted columns. The inverse of [`Schedule::kind_str`],
+    /// [`Schedule::spec`] and [`Schedule::timezone`].
+    pub(crate) fn from_stored(
+        kind: &str,
+        spec: &str,
+        timezone: Option<&str>,
+    ) -> Result<Self, String> {
+        if timezone.is_some() && kind != "cron" {
+            return Err(format!("a stored '{kind}' schedule names a zone"));
+        }
         match kind {
             "at" => DateTime::parse_from_rfc3339(spec)
                 .map(|absolute| Self::At(absolute.with_timezone(&Utc)))
@@ -154,7 +239,10 @@ impl Schedule {
             // a six-field pattern's first field as seconds, giving a stored job a different meaning
             // on reload than it had at creation. A spec that does not parse under those rules is
             // surfaced as an error rather than silently reinterpreted.
-            "cron" => Self::parse_cron(spec)
+            "cron" => timezone
+                .map(CronZone::resolve)
+                .transpose()
+                .and_then(|zone| Self::parse_cron(spec, zone))
                 .map_err(|error| format!("stored cron spec '{spec}' is invalid: {error}")),
             other => Err(crate::text::unknown_name("schedule kind", other, [
                 "at", "every", "cron",
@@ -167,7 +255,16 @@ impl Schedule {
         match self {
             Self::At(_) => "at",
             Self::Every(_) => "every",
-            Self::Cron(_) => "cron",
+            Self::Cron(..) => "cron",
+        }
+    }
+
+    /// The zone a cron schedule names, as persisted in `scheduled_jobs.timezone`; `None` for one
+    /// read in the machine's zone and for every other kind.
+    pub(crate) fn timezone(&self) -> Option<&str> {
+        match self {
+            Self::Cron(_, Some(zone)) => Some(&zone.name),
+            _ => None,
         }
     }
 
@@ -176,7 +273,7 @@ impl Schedule {
         match self {
             Self::At(instant) => instant.to_rfc3339(),
             Self::Every(interval) => humantime::format_duration(*interval).to_string(),
-            Self::Cron(cron) => cron.pattern.to_string(),
+            Self::Cron(cron, _) => cron.pattern.to_string(),
         }
     }
 
@@ -232,7 +329,7 @@ impl Schedule {
                 }
                 Some(next)
             }
-            Self::Cron(_) => self.next_after(now),
+            Self::Cron(..) => self.next_after(now),
         }
     }
 
@@ -251,19 +348,32 @@ impl Schedule {
                 let interval = chrono::Duration::from_std(*interval).ok()?;
                 anchor.checked_add_signed(interval)
             }
-            Self::Cron(cron) => {
-                // Cron patterns are wall-clock expressions: "0 9 * * *" means 09:00 where the user
-                // lives, so the search runs in local time and the result converts back to the UTC
-                // meka stores.
-                let local_anchor = anchor.with_timezone(&Local);
+            Self::Cron(cron, zone) => {
+                // Cron patterns are wall-clock expressions: "0 9 * * *" means 09:00 in the job's
+                // zone, so the search runs there and the result converts back to the UTC meka
+                // stores. A job naming no zone is read in the machine's, looked up now, so a
+                // machine that changes zone takes its jobs with it.
+                let zone = zone
+                    .as_ref()
+                    .map_or_else(jiff::tz::TimeZone::system, |zone| zone.zone.clone());
+                let anchor = jiff::Timestamp::new(
+                    anchor.timestamp(),
+                    i32::try_from(anchor.timestamp_subsec_nanos()).ok()?,
+                )
+                .ok()?
+                .to_zoned(zone);
                 // croner bounds its own forward search and reports a search-limit error for a
                 // pattern that matches no calendar date, so its verdict is the whole answer. An
                 // extra horizon here would be indistinguishable from that verdict at the call site,
                 // and `prepare` retires a job whose schedule has no next occurrence: a 366-day one
                 // would delete `0 0 29 2 *` the first time it fired, because the next February
                 // 29th is up to four years out.
-                let next = cron.find_next_occurrence(&local_anchor, false).ok()?;
-                Some(next.with_timezone(&Utc))
+                let next = cron.find_next_occurrence(&anchor, false).ok()?;
+                let next = next.timestamp();
+                DateTime::from_timestamp(
+                    next.as_second(),
+                    u32::try_from(next.subsec_nanosecond()).ok()?,
+                )
             }
         }
     }
@@ -279,7 +389,8 @@ impl Schedule {
             Self::Every(interval) => {
                 format!("every {}", humantime::format_duration(*interval))
             }
-            Self::Cron(cron) => cron.pattern.to_string(),
+            Self::Cron(cron, None) => cron.pattern.to_string(),
+            Self::Cron(cron, Some(zone)) => format!("{} in {}", cron.pattern, zone.name),
         }
     }
 }
@@ -370,7 +481,7 @@ pub(crate) fn occurrences_between(
                 .unwrap_or(MAX_COALESCED_REPORTED)
                 .min(MAX_COALESCED_REPORTED)
         }
-        Schedule::Cron(_) => {
+        Schedule::Cron(..) => {
             // Counts occurrences in `(from, to]`, i.e. everything after the one being delivered,
             // matching the `Every` arm above, which divides the same open interval.
             let mut cursor = from;
@@ -473,8 +584,8 @@ mod tests {
     fn parse_cron_accepts_five_fields() {
         // The reason croner is used over the `cron` crate: `cron` demands a seconds field, so the
         // five-field expressions users and models actually write would fail to parse.
-        assert!(Schedule::parse_cron("0 9 * * 1-5").is_ok());
-        assert!(Schedule::parse_cron("*/5 * * * *").is_ok());
+        assert!(Schedule::parse_cron("0 9 * * 1-5", None).is_ok());
+        assert!(Schedule::parse_cron("*/5 * * * *", None).is_ok());
     }
 
     /// The five-field rule has to reach the rows already on disk, which is the only population it
@@ -483,17 +594,91 @@ mod tests {
     #[test]
     fn a_stored_cron_spec_is_read_with_the_same_grammar_it_was_created_under() {
         assert!(
-            Schedule::parse_cron("*/10 * * * * *").is_err(),
+            Schedule::parse_cron("*/10 * * * * *", None).is_err(),
             "six fields are refused at creation"
         );
         assert!(
-            Schedule::from_stored("cron", "*/10 * * * * *").is_err(),
+            Schedule::from_stored("cron", "*/10 * * * * *", None).is_err(),
             "and refused on the way back out of the database"
         );
 
         // A legitimate five-field row still round-trips.
-        let stored = Schedule::from_stored("cron", "0 9 * * 1-5").expect("five fields still load");
+        let stored =
+            Schedule::from_stored("cron", "0 9 * * 1-5", None).expect("five fields still load");
         assert_eq!(stored.spec(), "0 9 * * 1-5");
+    }
+
+    /// A pattern that names a zone is read there, whatever the machine's zone: 09:00 in Tokyo is
+    /// midnight UTC.
+    #[test]
+    fn a_cron_pattern_is_read_in_the_zone_it_names() {
+        let schedule = Schedule::parse_request(
+            None,
+            None,
+            Some("0 9 * * *"),
+            Some("Asia/Tokyo"),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .expect("parses");
+        assert_eq!(
+            schedule.next_after(at("2025-12-31T23:30:00Z")),
+            Some(at("2026-01-01T00:00:00Z"))
+        );
+        assert_eq!(schedule.timezone(), Some("Asia/Tokyo"));
+        assert_eq!(schedule.describe(), "0 9 * * * in Asia/Tokyo");
+    }
+
+    /// The zone's own rules decide the instant, so a job at 09:00 in New York fires at 09:00
+    /// local on both sides of the spring change, which is 14:00 UTC before it and 13:00 after.
+    #[test]
+    fn a_named_zone_keeps_its_wall_clock_across_daylight_saving() {
+        let schedule = Schedule::parse_request(
+            None,
+            None,
+            Some("0 9 * * *"),
+            Some("America/New_York"),
+            at("2026-03-01T00:00:00Z"),
+        )
+        .expect("parses");
+        assert_eq!(
+            schedule.next_after(at("2026-03-07T12:00:00Z")),
+            Some(at("2026-03-07T14:00:00Z"))
+        );
+        assert_eq!(
+            schedule.next_after(at("2026-03-07T15:00:00Z")),
+            Some(at("2026-03-08T13:00:00Z"))
+        );
+    }
+
+    /// `timezone` belongs to a cron pattern alone, an unknown name is refused rather than read as
+    /// the machine's zone, and a blank one is not given.
+    #[test]
+    fn a_zone_is_refused_where_it_would_do_nothing_or_names_nothing() {
+        let now = at("2026-01-01T00:00:00Z");
+        let refused = Schedule::parse_request(Some("20m"), None, None, Some("UTC"), now)
+            .expect_err("an `at` reads no zone");
+        assert!(
+            refused.contains("`timezone`") && refused.contains("`at`"),
+            "{refused}"
+        );
+        assert!(Schedule::parse_request(None, Some("1h"), None, Some("UTC"), now).is_err());
+        let unknown =
+            Schedule::parse_request(None, None, Some("0 9 * * *"), Some("Mars/Olympus"), now)
+                .expect_err("not a zone");
+        assert!(unknown.contains("'Mars/Olympus'"), "{unknown}");
+        let blank = Schedule::parse_request(None, None, Some("0 9 * * *"), Some("  "), now)
+            .expect("a blank zone is not given");
+        assert_eq!(blank.timezone(), None);
+    }
+
+    /// A stored zone reads back as it was written, and a zone stored beside anything but a cron
+    /// pattern is a damaged row rather than a job.
+    #[test]
+    fn a_stored_zone_round_trips_and_belongs_to_cron_alone() {
+        let stored =
+            Schedule::from_stored("cron", "0 9 * * 1-5", Some("Europe/Berlin")).expect("loads");
+        assert_eq!(stored.timezone(), Some("Europe/Berlin"));
+        assert!(Schedule::from_stored("every", "1h", Some("Europe/Berlin")).is_err());
     }
 
     /// `5/5` starts at minute 5 and steps from there, where croner's strict default refuses it. A
@@ -503,10 +688,11 @@ mod tests {
     fn a_step_after_a_bare_number_starts_the_range_there() {
         use chrono::{TimeZone, Timelike};
 
-        let schedule = Schedule::from_stored("cron", "5/5 * * * *").expect("the lenient grammar");
+        let schedule =
+            Schedule::from_stored("cron", "5/5 * * * *", None).expect("the lenient grammar");
         // Anchored in local time, the clock cron reads, so the host's offset cannot move the
         // minute.
-        let anchor = Local
+        let anchor = chrono::Local
             .with_ymd_and_hms(2026, 1, 1, 12, 57, 0)
             .single()
             .expect("anchor")
@@ -514,7 +700,7 @@ mod tests {
         let next = schedule
             .next_after(anchor)
             .expect("has a next occurrence")
-            .with_timezone(&Local);
+            .with_timezone(&chrono::Local);
         assert_eq!((next.hour(), next.minute()), (13, 5), "{next}");
     }
 
@@ -522,7 +708,7 @@ mod tests {
     fn parse_cron_rejects_unsatisfiable_pattern() {
         // Well-formed but matches no calendar date; caught at creation rather than leaving a job
         // that silently never fires.
-        assert!(Schedule::parse_cron("0 0 30 2 *").is_err());
+        assert!(Schedule::parse_cron("0 0 30 2 *", None).is_err());
     }
 
     /// A pattern whose next occurrence is years away is satisfiable, and `prepare` retires a job
@@ -532,7 +718,7 @@ mod tests {
     fn a_schedule_whose_next_occurrence_is_years_away_still_has_one() {
         use chrono::TimeZone;
 
-        let schedule = Schedule::parse_cron("0 0 29 2 *").expect("Feb 29 is a real date");
+        let schedule = Schedule::parse_cron("0 0 29 2 *", None).expect("Feb 29 is a real date");
         let anchor = Utc
             .with_ymd_and_hms(2026, 8, 16, 12, 0, 0)
             .single()
@@ -545,8 +731,8 @@ mod tests {
 
     #[test]
     fn parse_cron_rejects_malformed_pattern() {
-        assert!(Schedule::parse_cron("not a cron").is_err());
-        assert!(Schedule::parse_cron("99 * * * *").is_err());
+        assert!(Schedule::parse_cron("not a cron", None).is_err());
+        assert!(Schedule::parse_cron("99 * * * *", None).is_err());
     }
 
     #[test]
@@ -586,10 +772,11 @@ mod tests {
         for original in [
             Schedule::parse_at("2026-08-12T09:30:00Z", at("2026-08-11T12:00:00Z")).expect("parses"),
             Schedule::parse_every("45m").expect("parses"),
-            Schedule::parse_cron("0 9 * * 1-5").expect("parses"),
+            Schedule::parse_cron("0 9 * * 1-5", None).expect("parses"),
         ] {
-            let restored = Schedule::from_stored(original.kind_str(), &original.spec())
-                .expect("stored form parses back");
+            let restored =
+                Schedule::from_stored(original.kind_str(), &original.spec(), original.timezone())
+                    .expect("stored form parses back");
             assert_eq!(restored.kind_str(), original.kind_str());
             assert_eq!(restored.spec(), original.spec());
         }
@@ -597,7 +784,7 @@ mod tests {
 
     #[test]
     fn from_stored_rejects_unknown_kind() {
-        assert!(Schedule::from_stored("on-exit", "make build").is_err());
+        assert!(Schedule::from_stored("on-exit", "make build", None).is_err());
     }
 
     /// A gate command that creates `path`, in whichever shell the host will run it under.
@@ -739,10 +926,10 @@ mod tests {
     /// return JSON" about a probe that did.
     #[test]
     fn a_pointer_reads_a_document_larger_than_the_turn_is_shown() {
-        let filler = "x".repeat(GATE_OUTPUT_LIMIT);
+        let filler = "x".repeat(GATE_OUTPUT_BYTES);
         let raw = format!(r#"{{"filler": "{filler}", "chats": [{{"id": "a"}}]}}"#);
         assert!(
-            raw.len() > GATE_OUTPUT_LIMIT,
+            raw.len() > GATE_OUTPUT_BYTES,
             "the document exceeds the cap"
         );
 
@@ -811,20 +998,15 @@ mod tests {
     /// the job's state after a sweep is identical whether the line was written or not. Capturing
     /// the output is the only way to tell a fix from a no-op here.
     ///
-    /// Capture goes through [`crate::render::log_capture`], which explains why the subscriber
-    /// behind it is global rather than a `tracing::subscriber::set_default`.
-    ///
     /// `#[tokio::test]` is single-threaded, so `body` is polled on the thread that owns the
-    /// capture buffer throughout.
+    /// capture throughout.
     async fn warnings_from<F>(body: F) -> usize
     where
         F: std::future::Future<Output = ()>,
     {
-        crate::render::log_capture::start();
+        let logs = crate::streams::capture::capture_logs(tracing::Level::WARN);
         body.await;
-        crate::render::log_capture::warnings()
-            .matches("not fired:")
-            .count()
+        logs.logged().matches("not fired:").count()
     }
 
     /// A held job says so once, not once per poll interval, including a one-shot.
@@ -1789,7 +1971,7 @@ mod tests {
 
         for schedule in [
             Schedule::parse_every("1h").expect("parses"),
-            Schedule::parse_cron("0 9 * * 1-5").expect("parses"),
+            Schedule::parse_cron("0 9 * * 1-5", None).expect("parses"),
         ] {
             assert_eq!(
                 recurring(schedule).prompt_retention(),
@@ -1812,7 +1994,7 @@ mod tests {
         let to = at("2026-08-11T12:05:00Z");
         let every = occurrences_between(&Schedule::parse_every("1m").expect("parses"), from, to);
         let cron = occurrences_between(
-            &Schedule::parse_cron("* * * * *").expect("parses"),
+            &Schedule::parse_cron("* * * * *", None).expect("parses"),
             from,
             to,
         );
@@ -2029,7 +2211,7 @@ mod tests {
         assert_eq!((resumed - delivered).num_milliseconds() % 5_000, 0);
 
         // Cron is absolute wall-clock and must be untouched by any of this.
-        let cron = Schedule::parse_cron("*/5 * * * *").expect("parses");
+        let cron = Schedule::parse_cron("*/5 * * * *", None).expect("parses");
         assert_eq!(
             cron.next_after_delivering(delivered, now),
             cron.next_after(now),
@@ -2547,6 +2729,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             last_fired_at: None,
             next_fire_at: Utc::now().to_rfc3339(),
+            timezone: None,
         };
 
         // A value no build of meka resolves.
@@ -3897,9 +4080,10 @@ mod tests {
                 .await;
         }
 
-        crate::render::log_capture::start();
+        let logs = crate::streams::capture::capture_logs(tracing::Level::INFO);
         harness.tick().await;
-        let reported = crate::render::log_capture::infos();
+        let reported = logs.logged();
+        drop(logs);
         assert!(
             reported.contains("held over 3 due job(s)"),
             "five due jobs against a budget of two leaves three, and the count has to be right or \
@@ -3916,10 +4100,10 @@ mod tests {
                 chrono::Duration::hours(6),
             )
             .await;
-        crate::render::log_capture::start();
+        let logs = crate::streams::capture::capture_logs(tracing::Level::INFO);
         harness.tick().await;
         assert!(
-            !crate::render::log_capture::infos().contains("held over"),
+            !logs.logged().contains("held over"),
             "one job and a budget of five is not a bounded sweep"
         );
     }
@@ -4623,7 +4807,7 @@ mod tests {
         assert!(!Schedule::At(at("2026-08-12T09:00:00Z")).is_recurring());
         assert!(Schedule::parse_every("1h").expect("parses").is_recurring());
         assert!(
-            Schedule::parse_cron("0 9 * * *")
+            Schedule::parse_cron("0 9 * * *", None)
                 .expect("parses")
                 .is_recurring()
         );

@@ -57,7 +57,9 @@ fn extract_first_user_message_text(messages: &[Message]) -> String {
                 if let ContentBlock::Text { text }
                 | ContentBlock::Inbox { text, .. }
                 | ContentBlock::Scheduled { text, .. }
-                | ContentBlock::BackgroundReport { text, .. } = block
+                | ContentBlock::BackgroundReport { text, .. }
+                | ContentBlock::Invocation { text, .. }
+                | ContentBlock::Resource { text, .. } = block
                 {
                     return text.clone();
                 }

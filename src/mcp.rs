@@ -256,6 +256,7 @@ fn build_entry(
         client_context,
         state: RwLock::new(initial_state),
         reconnect_lock: Mutex::new(()),
+        renewal_refused: std::sync::atomic::AtomicU64::new(0),
         removed: CancellationToken::new(),
         tool_call_timeout,
         refused,
@@ -263,6 +264,8 @@ fn build_entry(
         request_timeout: OnceLock::new(),
         background_retry: OnceLock::new(),
         dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+        listings: ToolListings::default(),
+        connection: std::sync::atomic::AtomicU64::new(0),
         subscriptions: subscriptions::Subscriptions::default(),
         legacy_era: std::sync::atomic::AtomicBool::new(false),
         connects,
@@ -488,10 +491,69 @@ pub(crate) struct NotConnected {
     pub(crate) state: ServerState,
 }
 
-/// The manager a retried entry heals into, and the default its tools are classified against.
+/// A request's hold on the connection it runs on; see [`ServerEntry::live_connection`].
+pub(crate) struct LiveConnection {
+    /// The connection's peer, which the request is sent through.
+    pub(crate) peer: Peer<RoleClient>,
+    /// Which of the entry's connections this is, for [`ServerEntry::reconnect_replacing`].
+    pub(crate) generation: u64,
+    _service: Arc<McpRunningService>,
+}
+
+/// How hard a reconnect tries before it gives up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Persistence {
+    /// The transport's schedule: five attempts over HTTP with a backoff between, one for stdio.
+    Backoff,
+    /// One attempt, for a connection the server rejected as unauthorized: a fresh `headers_helper`
+    /// token either works at once or the next attempt runs the same helper again.
+    Once,
+}
+
+/// What a reconnect that gives up leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GiveUp {
+    /// The transport had closed: the entry is recorded as failed and handed to the background
+    /// retry.
+    RecordFailure,
+    /// The connection is still open: it goes on serving, and only the caller hears the failure.
+    KeepConnection,
+}
+
+/// The manager a retried entry heals into, whose default its tools are classified against.
 pub(crate) struct BackgroundRetry {
     pub(crate) manager: std::sync::Weak<McpClientManager>,
-    pub(crate) mcp_default_permission: Option<Permission>,
+}
+
+/// Whether the server rejected a request as unauthorized, by the HTTP status alone: rmcp reports a
+/// 401 down the chain of the transport error it wraps, as an `AuthRequiredError` when the server
+/// sent a challenge, as an unexpected response naming the status when it sent none, and as the
+/// client's own status error on the requests it checks that way. Never read from what an error
+/// says in words, which a tool's own failure or a URL's port can say too. A 401 whose body is a
+/// JSON-RPC error reaches meka as that error with the status gone, and is not seen.
+pub(crate) fn rejected_as_unauthorized(error: &ServiceError) -> bool {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    let ServiceError::TransportSend(error) = error else {
+        return false;
+    };
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error.error.as_ref());
+    while let Some(cause) = current {
+        if connector::chain_holds_auth_required(cause)
+            || match cause.downcast_ref::<StreamableHttpError<reqwest::Error>>() {
+                Some(StreamableHttpError::UnexpectedServerResponse(response)) => {
+                    response.starts_with("HTTP 401 ")
+                }
+                Some(StreamableHttpError::Client(client)) => {
+                    client.status() == Some(reqwest::StatusCode::UNAUTHORIZED)
+                }
+                _ => false,
+            }
+        {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
 }
 
 /// `error` with the URLs in its words redacted, as `connector::record_connect_failure` redacts
@@ -517,6 +579,19 @@ fn redact_mcp_error(error: MekaError) -> MekaError {
     }
 }
 
+/// One server's tool listings: the lock that holds them to one at a time, and the asks made and
+/// answered, which let an ask a later listing covered skip its own.
+#[derive(Default)]
+pub(crate) struct ToolListings {
+    running: Mutex<()>,
+    /// Asks made, counted from one.
+    asked: std::sync::atomic::AtomicU64,
+    /// The last ask a finished listing answered: every ask made before it started.
+    answered: std::sync::atomic::AtomicU64,
+    /// How many tools that listing registered.
+    registered: std::sync::atomic::AtomicUsize,
+}
+
 /// Holds the lifecycle state of a single MCP server plus reconnection machinery. Wrapped in an
 /// [`Arc`] and shared between the manager, the per-server tool adapters, and the resource/prompt
 /// builtin tools so every caller sees the current service (or the current failure) via
@@ -537,6 +612,10 @@ pub(crate) struct ServerEntry {
     pub(crate) client_context: Arc<McpClientContext>,
     pub(crate) state: RwLock<ServerState>,
     pub(crate) reconnect_lock: Mutex<()>,
+    /// One past the generation of the connection whose renewal after a rejection as unauthorized
+    /// failed, or zero: that connection is not renewed again, so a server that keeps rejecting
+    /// what the helper gives it costs each request its own answer rather than another reconnect.
+    pub(crate) renewal_refused: std::sync::atomic::AtomicU64,
     /// Cancelled when the manager takes the entry out, so a connect or a retry in flight on it
     /// ends at once rather than at its bound, child and all; a shutdown ends every entry's through
     /// `connects` instead.
@@ -578,6 +657,11 @@ pub(crate) struct ServerEntry {
     /// what the server offers and what meka registered is indistinguishable, from the outside,
     /// from a tool the server never had.
     pub(crate) dropped_tools: std::sync::atomic::AtomicUsize,
+    /// This server's tool listings, one at a time; see [`McpClientManager::list_and_register`].
+    pub(crate) listings: ToolListings,
+    /// Which connection is live, counted up on each one adopted, so requests that met the end of
+    /// the same connection share one reconnect; see [`Self::on_a_connection`].
+    pub(crate) connection: std::sync::atomic::AtomicU64,
     /// What the model subscribed to on this server, carried onto every connection the entry
     /// adopts; see `subscriptions.rs`.
     pub(crate) subscriptions: subscriptions::Subscriptions,
@@ -681,8 +765,9 @@ impl ServerEntry {
         &self,
         timeout: std::time::Duration,
     ) -> Result<Vec<rmcp::model::Tool>> {
-        let peer = self.require_connected().await?;
-        let listed = tokio::time::timeout(timeout, peer.list_all_tools())
+        // Held while it runs, as every request's is, so a shutdown's grace waits for it too.
+        let connection = self.live_connection().await?;
+        let listed = tokio::time::timeout(timeout, connection.peer.list_all_tools())
             .await
             .map_err(|_elapsed| MekaError::McpConnection {
                 server_name: self.server_name.clone(),
@@ -692,6 +777,7 @@ impl ServerEntry {
                 server_name: self.server_name.clone(),
                 message: format!("failed to list tools: {error}"),
             })?;
+        drop(connection);
 
         let advertised = listed.len();
         let kept = cap_advertised_tools(listed, &self.server_name);
@@ -712,14 +798,147 @@ impl ServerEntry {
         if let ServerState::Connected { service } = &*state {
             return Ok(service.peer().clone());
         }
-        // Same wording the unregistered-tool path uses, so one condition reads one way however the
-        // agent reached it.
-        Err(MekaError::McpConnection {
+        let reason = state.unavailable_reason();
+        drop(state);
+        Err(self.unavailable(reason))
+    }
+
+    /// The refusal for a request that finds the server other than connected, in the words of the
+    /// state it found, read under the guard it found it with. Same wording the unregistered-tool
+    /// path uses, so one condition reads one way however the agent reached it.
+    fn unavailable(&self, reason: Option<String>) -> MekaError {
+        MekaError::McpConnection {
             server_name: self.server_name.clone(),
-            message: state
-                .unavailable_reason()
-                .unwrap_or_else(|| "is unavailable".to_string()),
-        })
+            message: reason.unwrap_or_else(|| "is unavailable".to_string()),
+        }
+    }
+
+    /// The live connection, taken for one request: its peer, which connection it is, read with it
+    /// so the request knows what it ran on when the answer says the connection is no good, and the
+    /// service itself, held while the request runs so a replacement leaves this connection open
+    /// under the requests already on it rather than ending them with a closed transport.
+    pub(crate) async fn live_connection(&self) -> Result<LiveConnection> {
+        let state = self.state.read().await;
+        if let ServerState::Connected { service } = &*state {
+            return Ok(LiveConnection {
+                peer: service.peer().clone(),
+                generation: self.connection.load(std::sync::atomic::Ordering::SeqCst),
+                _service: Arc::clone(service),
+            });
+        }
+        let reason = state.unavailable_reason();
+        drop(state);
+        Err(self.unavailable(reason))
+    }
+
+    /// Run `attempt` on the live connection, and once more on a fresh one when the first ended in
+    /// what a fresh one mends: a transport that closed, or, on a server whose headers come from
+    /// `headers_helper`, a rejection as unauthorized, since the helper runs again on connect and
+    /// its token may be what expired. Requests that met the end of the same connection share one
+    /// reconnect. The attempt holds its connection, so a replacement another request makes does
+    /// not cut it short.
+    ///
+    /// The one door every request to the server takes but two: a tool listing, whose reconnect
+    /// would re-list inside the listing it came from, so a listing that fails keeps the tools it
+    /// had and the next request mends the connection; and the notification stream, which every
+    /// connection opens for itself when it is adopted.
+    pub(crate) async fn on_a_connection<T, F, Fut>(
+        self: &Arc<Self>,
+        cancellation: &CancellationToken,
+        attempt: F,
+    ) -> Result<std::result::Result<T, ServiceError>>
+    where
+        F: Fn(Peer<RoleClient>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, ServiceError>>,
+    {
+        let first = self.live_connection().await?;
+        match attempt(first.peer.clone()).await {
+            Err(ServiceError::TransportClosed) => self.reconnect(cancellation).await?,
+            Err(error)
+                if self.config().headers_helper.is_some() && rejected_as_unauthorized(&error) =>
+            {
+                if !self.renew_rejected(first.generation, cancellation).await? {
+                    return Ok(Err(error));
+                }
+            }
+            settled => return Ok(settled),
+        }
+        drop(first);
+        let second = self.live_connection().await?;
+        Ok(attempt(second.peer.clone()).await)
+    }
+
+    /// Replace connection `seen` with a fresh one, whether or not its transport has closed: what a
+    /// server rejecting the headers it was opened with, or a person asking for a reconnect, needs.
+    /// Serialized on `reconnect_lock` like [`Self::reconnect`]; a caller that finds `seen`
+    /// replaced already returns at once. A connection still open is replaced only by one that
+    /// opened: giving up leaves it serving, where a closed one is recorded as failed.
+    pub(crate) async fn reconnect_replacing(
+        self: &Arc<Self>,
+        seen: u64,
+        cancellation: &CancellationToken,
+        persistence: Persistence,
+    ) -> Result<()> {
+        let _guard = tokio::select! {
+            guard = self.reconnect_lock.lock() => guard,
+            _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+        };
+        if self.connection.load(std::sync::atomic::Ordering::SeqCst) != seen {
+            return Ok(());
+        }
+        if let Some(reason) = &self.refused {
+            return Err(MekaError::McpConnection {
+                server_name: self.server_name.clone(),
+                message: reason.clone(),
+            });
+        }
+        let given_up = if self.needs_reconnect().await {
+            GiveUp::RecordFailure
+        } else {
+            GiveUp::KeepConnection
+        };
+        self.reconnect_attempts(cancellation, given_up, persistence)
+            .await
+    }
+
+    /// Replace connection `seen`, which the server rejected as unauthorized, with one that runs
+    /// `headers_helper` again; whether a new connection is there to retry on. Once per connection:
+    /// one that failed to renew is not tried again, and its requests get their own rejection
+    /// back, so a server that keeps rejecting the helper's token costs no request a reconnect.
+    pub(crate) async fn renew_rejected(
+        self: &Arc<Self>,
+        seen: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        if self
+            .renewal_refused
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == seen + 1
+        {
+            return Ok(false);
+        }
+        tracing::info!(
+            "MCP server '{name}' rejected a request as unauthorized; reconnecting once to run \
+             `headers_helper` again",
+            name = self.server_name
+        );
+        match self
+            .reconnect_replacing(seen, cancellation, Persistence::Once)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(MekaError::Interrupted) => Err(MekaError::Interrupted),
+            Err(error) => {
+                self.renewal_refused
+                    .store(seen + 1, std::sync::atomic::Ordering::SeqCst);
+                tracing::warn!(
+                    "failed to renew MCP server '{name}' after it rejected a request as \
+                     unauthorized; not trying again on this connection: {error}",
+                    name = self.server_name
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// The refusal a connect ended by a shutdown answers with.
@@ -785,11 +1004,10 @@ impl ServerEntry {
         *state = ServerState::Connected {
             service: Arc::new(service),
         };
+        self.connection
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(state);
-        tokio::spawn({
-            let entry = Arc::clone(self);
-            async move { subscriptions::resume(&entry).await }
-        });
+        tokio::spawn(subscriptions::resumption(Arc::clone(self)));
         Ok(())
     }
 
@@ -835,7 +1053,8 @@ impl ServerEntry {
             "MCP server '{server_name}' transport closed; attempting reconnect",
             server_name = self.server_name
         );
-        self.reconnect_attempts(cancellation).await
+        self.reconnect_attempts(cancellation, GiveUp::RecordFailure, Persistence::Backoff)
+            .await
     }
 
     /// The attempts [`Self::reconnect`] makes and what giving up leaves behind, under the lock the
@@ -849,10 +1068,12 @@ impl ServerEntry {
     async fn reconnect_attempts(
         self: &Arc<Self>,
         cancellation: &tokio_util::sync::CancellationToken,
+        given_up: GiveUp,
+        persistence: Persistence,
     ) -> Result<()> {
-        let max_attempts: u32 = match self.config().transport {
-            McpTransport::Stdio => 1,
-            McpTransport::Http => 5,
+        let max_attempts: u32 = match (self.config().transport, persistence) {
+            (McpTransport::Stdio, _) | (_, Persistence::Once) => 1,
+            (McpTransport::Http, Persistence::Backoff) => 5,
         };
         let bound = self.request_timeout();
         let mut last_error: Option<MekaError> = None;
@@ -943,13 +1164,17 @@ impl ServerEntry {
             server_name: self.server_name.clone(),
             message: "reconnect made no attempt".to_string(),
         });
+        // Asked again now: the connection kept for its being open may have closed while the
+        // attempts ran, and a kept one over a closed transport is the state this records away.
+        if given_up == GiveUp::KeepConnection && !self.needs_reconnect().await {
+            return Err(error);
+        }
         let (cause, needs) = connector::failure_cause(&error);
         connector::record_connect_failure(self, &self.server_name, cause, needs).await;
         if let Some(retry) = self.background_retry.get() {
             tokio::spawn(connector::retry_until_connected(
                 Arc::clone(self),
                 retry.manager.clone(),
-                retry.mcp_default_permission,
                 bound,
                 connector::INITIAL_RETRY_BACKOFF,
             ));
@@ -1253,10 +1478,8 @@ impl McpClientManager {
         };
         let manager = Arc::clone(self);
         let settled = self.settled.clone();
-        let mcp_default_permission = self.mcp_default_permission;
         tokio::spawn(async move {
-            connector::run_connector(pending, manager, mcp_default_permission, runtime, settled)
-                .await;
+            connector::run_connector(pending, manager, runtime, settled).await;
         });
     }
 
@@ -1386,7 +1609,6 @@ impl McpClientManager {
             .background_retry
             .set(BackgroundRetry {
                 manager: Arc::downgrade(self),
-                mcp_default_permission: self.mcp_default_permission,
             })
             .is_err()
         {
@@ -1431,7 +1653,6 @@ impl McpClientManager {
         if entry.wants_connecting() {
             let manager = Arc::clone(self);
             let entry = Arc::clone(&entry);
-            let mcp_default_permission = self.mcp_default_permission;
             tokio::spawn(async move {
                 // Under the lock `connect_one` asks its callers to hold, since a reconnect asked
                 // over HTTP could reach the entry while it connects.
@@ -1440,7 +1661,6 @@ impl McpClientManager {
                     connector::connect_one(
                         Arc::clone(&entry),
                         Arc::clone(&manager),
-                        mcp_default_permission,
                         connect_timeout,
                     )
                     .await;
@@ -1453,7 +1673,6 @@ impl McpClientManager {
                     connector::retry_until_connected(
                         entry,
                         Arc::downgrade(&manager),
-                        mcp_default_permission,
                         connect_timeout,
                         connector::INITIAL_RETRY_BACKOFF,
                     )
@@ -1465,8 +1684,8 @@ impl McpClientManager {
     }
 
     /// Take a server out of a running manager, as `DELETE /v1/mcp/{name}` does once the entry is
-    /// out of `config.toml`: its connection is closed, and every session's registry drops its
-    /// tools. An unknown name is refused naming the configured ones.
+    /// out of `config.toml`: its connection is closed, once the requests still on it end, and every
+    /// session's registry drops its tools. An unknown name is refused naming the configured ones.
     pub(crate) async fn remove_server(&self, name: &str) -> Result<()> {
         let entry = {
             let mut servers = crate::sync::write(&self.servers);
@@ -1494,8 +1713,10 @@ impl McpClientManager {
         if let Some(service) = service {
             match Arc::try_unwrap(service) {
                 Ok(owned) => close_service(name, owned).await,
+                // Closed by its drop guard as the last of them lets go, which a process that goes
+                // on serving runs.
                 Err(_held) => tracing::debug!(
-                    "MCP server '{name}' still had in-flight calls on removal; left to its drop guard"
+                    "MCP server '{name}' still had in-flight calls on removal; closed once they end"
                 ),
             }
         }
@@ -1639,11 +1860,36 @@ impl McpClientManager {
     /// list means meka does not know what the server has, which is not the same as knowing it has
     /// nothing.
     pub(crate) async fn refresh_server_tools(&self, entry: &Arc<ServerEntry>) -> Result<usize> {
+        self.list_and_register(entry, self.request_timeout()).await
+    }
+
+    /// List `entry`'s tools and register what the listing found: the one door every listing goes
+    /// through, a connect's, a change notice's and a reconnect's.
+    ///
+    /// One at a time per server, so a listing that started first cannot register after one that
+    /// started later and put the older set back. An ask that a listing started after it has
+    /// already answered is not listed again: a burst of change notices costs one listing more
+    /// than were running, not one each. Answers how many tools the listing that served the ask
+    /// registered.
+    pub(super) async fn list_and_register(
+        &self,
+        entry: &Arc<ServerEntry>,
+        timeout: std::time::Duration,
+    ) -> Result<usize> {
+        use std::sync::atomic::Ordering;
+        let ask = entry.listings.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        let _running = entry.listings.running.lock().await;
+        if entry.listings.answered.load(Ordering::SeqCst) >= ask {
+            return Ok(entry.listings.registered.load(Ordering::SeqCst));
+        }
+        // Every ask made by now is answered by this listing, which starts after all of them.
+        let answers = entry.listings.asked.load(Ordering::SeqCst);
         let (adapters, policy) =
-            connector::build_mcp_tools(entry, self.mcp_default_permission, self.request_timeout())
-                .await?;
+            connector::build_mcp_tools(entry, self.mcp_default_permission, timeout).await?;
         let count = adapters.len();
         self.register_server_tools(entry, adapters, policy).await;
+        entry.listings.registered.store(count, Ordering::SeqCst);
+        entry.listings.answered.store(answers, Ordering::SeqCst);
         Ok(count)
     }
 
@@ -1670,13 +1916,12 @@ impl McpClientManager {
 
     /// Heal one server on demand, picking the right repair for the state it is actually in.
     ///
-    /// The dispatch is the whole point, because the two repairs are not interchangeable.
-    /// [`ServerEntry::reconnect`] reopens a transport that has closed under a state still claiming
-    /// `Connected`, and no-ops when it has not. An entry that is `Failed` has no transport to
+    /// The dispatch is the whole point, because the two repairs are not interchangeable. A
+    /// `Connected` entry has its connection replaced by [`ServerEntry::reconnect_replacing`],
+    /// whether or not the transport has closed. An entry that is `Failed` has no transport to
     /// reopen and never reached tool discovery in the first place, so [`connector::connect_one`],
-    /// which does the whole handshake, is the right call there.
-    /// Both end in a `tools/list`, because a new connection is a new session and its tool set is
-    /// only knowable by asking.
+    /// which does the whole handshake, is the right call there. Both end in a `tools/list`,
+    /// because a new connection is a new session and its tool set is only knowable by asking.
     ///
     /// A `Failed` server is already being retried in the background with exponential backoff, so
     /// this is an impatience button rather than the only route back: it collapses the wait for an
@@ -1716,18 +1961,23 @@ impl McpClientManager {
                 });
             }
             ServerState::Connected { .. } => {
-                // Reconnect is still the right call: it no-ops unless the transport has actually
-                // closed underneath a state that still says `Connected`, which is exactly the case
-                // an operator reaching for this button cannot see from outside.
+                // Replaced whether or not its transport has closed: an operator reaching for this
+                // button is asking for a new connection, the one thing that runs a
+                // `headers_helper` again, and a connection that answers is not proof the server
+                // still accepts its headers.
                 //
-                // Bounded here rather than inside: `ServerEntry::reconnect` retries an HTTP
-                // transport up to five times with its own backoff and wraps none of it in a
-                // timeout, so an endpoint that blackholes connections would hold this request far
-                // past the budget the caller passed in. The re-list it ends with carries its own
-                // bound, so this covers the whole of it either way.
+                // Bounded here rather than inside: a reconnect retries an HTTP transport up to
+                // five times with its own backoff and wraps none of it in a timeout, so an
+                // endpoint that blackholes connections would hold this request far past the
+                // budget the caller passed in. The re-list it ends with carries its own bound, so
+                // this covers the whole of it either way.
                 tokio::time::timeout(
                     connect_timeout,
-                    entry.reconnect(&tokio_util::sync::CancellationToken::new()),
+                    entry.reconnect_replacing(
+                        entry.connection.load(std::sync::atomic::Ordering::SeqCst),
+                        &tokio_util::sync::CancellationToken::new(),
+                        Persistence::Backoff,
+                    ),
                 )
                 .await
                 .map_err(|_| MekaError::McpConnection {
@@ -1745,13 +1995,8 @@ impl McpClientManager {
                 // Re-checked under the lock: whoever held it may have just connected this entry,
                 // in which case a second connect would replace a healthy transport for nothing.
                 if matches!(entry.state().await, ServerState::Failed { .. }) {
-                    connector::connect_one(
-                        Arc::clone(&entry),
-                        Arc::clone(self),
-                        self.mcp_default_permission,
-                        connect_timeout,
-                    )
-                    .await;
+                    connector::connect_one(Arc::clone(&entry), Arc::clone(self), connect_timeout)
+                        .await;
                 }
             }
         }
@@ -1824,10 +2069,10 @@ impl McpClientManager {
 
     /// [`Self::shutdown`] under a total wall-clock bound.
     ///
-    /// The loop is serial and each server can spend up to `CLOSE_TIMEOUT`, so an exit's cost scales
-    /// with the number of servers that refuse to answer. Every caller is on its way out and some of
-    /// them are being timed by something else (systemd, a container runtime, a user holding a
-    /// terminal), so the whole teardown gets one budget rather than each server getting its own.
+    /// A teardown waits on stopping connects, then on one grace for the calls in flight, then on
+    /// the closes. Every caller is on its way out and some of them are being timed by something
+    /// else (systemd, a container runtime, a user holding a terminal), so the whole teardown gets
+    /// one budget rather than each step or server getting its own.
     /// Overrunning it is not an error: the remaining servers fall to rmcp's drop guards, which is
     /// exactly where they were before any of this ran.
     pub(crate) async fn shutdown_within(&self, budget: std::time::Duration) {
@@ -1858,8 +2103,7 @@ impl McpClientManager {
     /// entry as it was; a connector still working through its queue finds every connect ending at
     /// once and drains.
     pub(crate) async fn shutdown(&self) {
-        /// Max time to wait for in-flight tool calls to complete before we drop the shared service
-        /// Arc and let the drop-guard cancel it.
+        /// How long the calls in flight are given to finish before they are ended.
         const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
 
         if !self.connects.stop(CONNECT_UNWIND_GRACE).await {
@@ -1869,41 +2113,59 @@ impl McpClientManager {
             );
         }
 
+        let mut services = Vec::new();
         for (server_name, entry) in self.entries() {
             // Only Connected entries have a service to close; Pending / Failed / Disabled entries
             // are tear-down no-ops. Taken under the write lock so a concurrent reconnect can't
             // hand this loop a service it is about to replace.
-            let service = {
-                let mut state = entry.state.write().await;
-                let taken = std::mem::replace(&mut *state, ServerState::Disabled);
-                let ServerState::Connected { service } = taken else {
-                    *state = taken;
-                    continue;
-                };
-                drop(state);
-                service
+            let mut state = entry.state.write().await;
+            let taken = std::mem::replace(&mut *state, ServerState::Disabled);
+            let ServerState::Connected { service } = taken else {
+                *state = taken;
+                continue;
             };
+            drop(state);
+            services.push((server_name, service));
+        }
 
-            // Meant to let in-flight tool calls finish before the transport goes, and currently
-            // ineffective: dispatch goes through `require_connected`, which clones
-            // `service.peer()`, and rmcp 3.1's `Peer` holds channels rather than an
-            // `Arc<RunningService>`, so the count is already 1 and the loop exits at once. The fix
-            // belongs in what dispatch holds, not here.
-            let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-            while Arc::strong_count(&service) > 1 && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-
-            match Arc::try_unwrap(service) {
-                Ok(owned_service) => close_service(&server_name, owned_service).await,
-                Err(_arc) => {
-                    tracing::debug!(
-                        "MCP server '{server_name}' still had in-flight calls after {SHUTDOWN_GRACE:?}; \
-                         left to its drop guard"
-                    );
-                }
+        // One grace for every server, so calls in flight on several finish together. A request
+        // holds its connection's service for as long as it runs; one still holding it after the
+        // grace is cut short through the service's token, which ends the request and lets the
+        // close below reach the transport, where leaving it to the drop guard would leave a stdio
+        // child to a runtime that may never run that guard.
+        let held = |services: &[(String, Arc<McpRunningService>)]| {
+            services
+                .iter()
+                .any(|(_, service)| Arc::strong_count(service) > 1)
+        };
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        while held(&services) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for (server_name, service) in &services {
+            if Arc::strong_count(service) > 1 {
+                tracing::debug!(
+                    "MCP server '{server_name}' still had in-flight calls after {SHUTDOWN_GRACE:?}; \
+                     ending them"
+                );
+                service.cancellation_token().cancel();
             }
         }
+        let deadline = tokio::time::Instant::now() + CLOSE_TIMEOUT;
+        while held(&services) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        futures::future::join_all(services.into_iter().map(|(server_name, service)| async move {
+            match Arc::try_unwrap(service) {
+                Ok(owned_service) => close_service(&server_name, owned_service).await,
+                Err(_held) => tracing::debug!(
+                    "MCP server '{server_name}' was still held after its calls were ended; left \
+                     to its drop guard"
+                ),
+            }
+        }))
+        .await;
     }
 }
 
@@ -2024,26 +2286,15 @@ pub(crate) async fn list_resources(
     cancellation: &CancellationToken,
 ) -> Result<Vec<Resource>> {
     bounded(entry, "resources/list", cancellation, async {
-        let peer = entry.require_connected().await?;
-        match peer.list_all_resources().await {
-            Ok(resources) => Ok(resources),
-            Err(ServiceError::TransportClosed) => {
-                entry
-                    .reconnect(&tokio_util::sync::CancellationToken::new())
-                    .await?;
-                let peer = entry.require_connected().await?;
-                peer.list_all_resources()
-                    .await
-                    .map_err(|error| MekaError::McpConnection {
-                        server_name: entry.server_name.clone(),
-                        message: format!("failed to list resources: {error}"),
-                    })
-            }
-            Err(error) => Err(MekaError::McpConnection {
+        entry
+            .on_a_connection(cancellation, |peer| async move {
+                peer.list_all_resources().await
+            })
+            .await?
+            .map_err(|error| MekaError::McpConnection {
                 server_name: entry.server_name.clone(),
                 message: format!("failed to list resources: {error}"),
-            }),
-        }
+            })
     })
     .await
 }
@@ -2082,18 +2333,10 @@ pub(crate) async fn read_resource(
             server_name: entry.server_name.clone(),
             message: format!("failed to read resource '{uri}': {error}"),
         };
-        let peer = entry.require_connected().await?;
-        match rounds(entry, peer, params.clone()).await {
-            Ok(result) => Ok(result),
-            Err(ServiceError::TransportClosed) => {
-                entry
-                    .reconnect(&tokio_util::sync::CancellationToken::new())
-                    .await?;
-                let peer = entry.require_connected().await?;
-                rounds(entry, peer, params).await.map_err(failed)
-            }
-            Err(error) => Err(failed(error)),
-        }
+        entry
+            .on_a_connection(cancellation, |peer| rounds(entry, peer, params.clone()))
+            .await?
+            .map_err(failed)
     })
     .await
 }
@@ -2103,26 +2346,16 @@ pub(crate) async fn list_prompts(
     cancellation: &CancellationToken,
 ) -> Result<Vec<Prompt>> {
     bounded(entry, "prompts/list", cancellation, async {
-        let peer = entry.require_connected().await?;
-        match peer.list_all_prompts().await {
-            Ok(prompts) => Ok(prompts),
-            Err(ServiceError::TransportClosed) => {
-                entry
-                    .reconnect(&tokio_util::sync::CancellationToken::new())
-                    .await?;
-                let peer = entry.require_connected().await?;
-                peer.list_all_prompts()
-                    .await
-                    .map_err(|error| MekaError::McpConnection {
-                        server_name: entry.server_name.clone(),
-                        message: format!("failed to list prompts: {error}"),
-                    })
-            }
-            Err(error) => Err(MekaError::McpConnection {
+        entry
+            .on_a_connection(
+                cancellation,
+                |peer| async move { peer.list_all_prompts().await },
+            )
+            .await?
+            .map_err(|error| MekaError::McpConnection {
                 server_name: entry.server_name.clone(),
                 message: format!("failed to list prompts: {error}"),
-            }),
-        }
+            })
     })
     .await
 }
@@ -2163,18 +2396,10 @@ pub(crate) async fn get_prompt(
             server_name: entry.server_name.clone(),
             message: format!("failed to render prompt '{name}': {error}"),
         };
-        let peer = entry.require_connected().await?;
-        match rounds(entry, peer, params.clone()).await {
-            Ok(result) => Ok(result),
-            Err(ServiceError::TransportClosed) => {
-                entry
-                    .reconnect(&tokio_util::sync::CancellationToken::new())
-                    .await?;
-                let peer = entry.require_connected().await?;
-                rounds(entry, peer, params).await.map_err(failed)
-            }
-            Err(error) => Err(failed(error)),
-        }
+        entry
+            .on_a_connection(cancellation, |peer| rounds(entry, peer, params.clone()))
+            .await?
+            .map_err(failed)
     })
     .await
 }
@@ -2847,6 +3072,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            renewal_refused: std::sync::atomic::AtomicU64::new(0),
             removed: CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
@@ -2854,6 +3080,8 @@ mod tests {
             request_timeout: OnceLock::new(),
             background_retry: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            listings: ToolListings::default(),
+            connection: std::sync::atomic::AtomicU64::new(0),
             subscriptions: subscriptions::Subscriptions::default(),
             legacy_era: std::sync::atomic::AtomicBool::new(false),
             connects: Connects::new(),
@@ -2910,7 +3138,6 @@ mod tests {
         connector::connect_one(
             Arc::clone(&entry),
             Arc::clone(&manager),
-            None,
             std::time::Duration::from_secs(20),
         )
         .await;
@@ -2976,7 +3203,6 @@ mod tests {
             connector::connect_one(
                 Arc::clone(&entry),
                 Arc::clone(&manager),
-                None,
                 std::time::Duration::from_secs(20),
             )
             .await;
@@ -3040,7 +3266,6 @@ mod tests {
         connector::connect_one(
             Arc::clone(&entry),
             Arc::clone(&manager),
-            None,
             std::time::Duration::from_secs(20),
         )
         .await;
@@ -3083,6 +3308,533 @@ mod tests {
             Some("https://example.test/${MEKA_TEST_UNSET_SECRET:-expanded}"),
             "the doors read the reference"
         );
+    }
+
+    /// A burst of change notices lists the server once more than were running, not once each:
+    /// listings run one at a time, and an ask a listing started after it has answered is not
+    /// listed again. Driven against a real peer whose listing takes long enough for the asks to
+    /// overlap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_burst_of_refreshes_lists_the_server_once_more_than_were_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path().join("stub.json");
+        let log = temp.path().join("requests.jsonl");
+        std::fs::write(
+            &state,
+            // Legacy, whose listing carries no time to live a refresh could be answered from.
+            serde_json::json!({
+                "tools": ["search"],
+                "list_delay_ms": 300,
+                "legacy_only": true,
+                "log": log.display().to_string(),
+            })
+            .to_string(),
+        )
+        .expect("write the stub's state");
+        let mut config = McpServerConfig::for_test("stub");
+        config.transport = McpTransport::Stdio;
+        config.url = None;
+        config.command = Some("python3".to_string());
+        config.args = Some(vec![
+            format!(
+                "{}/tests/fixtures/mcp_stub_server.py",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            state.display().to_string(),
+        ]);
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        let entry = manager.entry("stub").expect("the configured entry");
+        connector::connect_one(
+            Arc::clone(&entry),
+            Arc::clone(&manager),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        let listings = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains("\"tools/list\""))
+                .count()
+        };
+        assert_eq!(listings(), 1, "the connect lists once");
+
+        let refreshes = (0..5).map(|_| manager.refresh_server_tools(&entry));
+        for counted in futures::future::join_all(refreshes).await {
+            assert_eq!(counted.expect("refreshed"), 1);
+        }
+        let after = listings();
+        assert!(
+            (2..=3).contains(&after),
+            "five overlapping asks list once or twice more, not five times: {after}"
+        );
+    }
+
+    /// A legacy Streamable HTTP server that accepts one bearer token at a time and counts the
+    /// handshakes it answers.
+    #[cfg(all(unix, feature = "serve"))]
+    struct TokenServer {
+        token: std::sync::Mutex<String>,
+        handshakes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(all(unix, feature = "serve"))]
+    async fn answer_with_a_token(
+        axum::extract::State(server): axum::extract::State<Arc<TokenServer>>,
+        headers: axum::http::HeaderMap,
+        axum::Json(message): axum::Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let expected = format!("Bearer {}", server.token.lock().expect("token"));
+        let sent = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        if sent != Some(expected.as_str()) {
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+        let Some(id) = message.get("id").cloned() else {
+            return axum::http::StatusCode::ACCEPTED.into_response();
+        };
+        let reply = match message["method"].as_str() {
+            Some("initialize") => {
+                server
+                    .handshakes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                serde_json::json!({
+                    "protocolVersion": handler::LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}, "prompts": {}},
+                    "serverInfo": {"name": "stub", "version": "1"},
+                })
+            }
+            Some("tools/list") => serde_json::json!({"tools": []}),
+            Some("prompts/list") => serde_json::json!({"prompts": []}),
+            _ => {
+                return axum::Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": "method not found"},
+                }))
+                .into_response();
+            }
+        };
+        axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": reply})).into_response()
+    }
+
+    /// A server whose headers come from `headers_helper` and that rejects them as unauthorized is
+    /// reconnected, which runs the helper again, and the request is sent once more on the fresh
+    /// connection; requests rejected on the same connection share that one reconnect.
+    #[cfg(all(unix, feature = "serve"))]
+    #[tokio::test]
+    async fn a_rejected_helper_token_is_renewed_by_one_reconnect() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let token = temp.path().join("token");
+        std::fs::write(&token, "first").expect("write the token");
+        let helper = temp.path().join("helper.sh");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf 'Authorization: Bearer %s\\n' \"$(cat '{}')\"\n",
+                token.display()
+            ),
+        )
+        .expect("write the helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        let server = Arc::new(TokenServer {
+            token: std::sync::Mutex::new("first".to_string()),
+            handshakes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(answer_with_a_token))
+            .with_state(Arc::clone(&server));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut config = McpServerConfig::for_test("tenant");
+        config.url = Some(url);
+        config.headers_helper = Some(helper.display().to_string());
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        let entry = manager.entry("tenant").expect("the configured entry");
+        connector::connect_one(
+            Arc::clone(&entry),
+            Arc::clone(&manager),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        assert_eq!(
+            server.handshakes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the connect opens one session"
+        );
+
+        std::fs::write(&token, "second").expect("rotate the token");
+        *server.token.lock().expect("token") = "second".to_string();
+        let cancellation = CancellationToken::new();
+        let requests = (0..3).map(|_| list_prompts(&entry, &cancellation));
+        for listed in futures::future::join_all(requests).await {
+            assert!(listed.expect("listed on the renewed token").is_empty());
+        }
+        assert_eq!(
+            server.handshakes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "three rejections on one connection share one reconnect"
+        );
+    }
+
+    /// A server that rejects the token the helper keeps giving is renewed once, with one attempt,
+    /// and not again on the same connection: every request after that gets its own rejection back
+    /// at once, where it would otherwise wait out a reconnect's backoff each time.
+    #[cfg(all(unix, feature = "serve"))]
+    #[tokio::test]
+    async fn a_token_the_server_keeps_rejecting_is_renewed_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runs = temp.path().join("runs");
+        let helper = temp.path().join("helper.sh");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\necho run >> '{}'\nprintf 'Authorization: Bearer first\\n'\n",
+                runs.display()
+            ),
+        )
+        .expect("write the helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let helper_runs = || {
+            std::fs::read_to_string(&runs)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+
+        let server = Arc::new(TokenServer {
+            token: std::sync::Mutex::new("first".to_string()),
+            handshakes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(answer_with_a_token))
+            .with_state(Arc::clone(&server));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut config = McpServerConfig::for_test("tenant");
+        config.url = Some(url);
+        config.headers_helper = Some(helper.display().to_string());
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        let entry = manager.entry("tenant").expect("the configured entry");
+        connector::connect_one(
+            Arc::clone(&entry),
+            Arc::clone(&manager),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        let connected = helper_runs();
+
+        *server.token.lock().expect("token") = "second".to_string();
+        let cancellation = CancellationToken::new();
+        let started = std::time::Instant::now();
+        assert!(list_prompts(&entry, &cancellation).await.is_err());
+        assert_eq!(helper_runs(), connected + 1, "one renewal, one attempt");
+        assert!(list_prompts(&entry, &cancellation).await.is_err());
+        assert_eq!(
+            helper_runs(),
+            connected + 1,
+            "not renewed again on this connection"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "no backoff: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A stdio stub connected through the connector, with the state file it reads on every request
+    /// and the log it appends every request to.
+    #[cfg(unix)]
+    async fn connected_stub(
+        state: serde_json::Value,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Arc<McpClientManager>,
+        Arc<ServerEntry>,
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_path = temp.path().join("stub.json");
+        let log = temp.path().join("requests.jsonl");
+        let mut state = state;
+        state["log"] = log.display().to_string().into();
+        std::fs::write(&state_path, state.to_string()).expect("write the stub's state");
+        let mut config = McpServerConfig::for_test("stub");
+        config.transport = McpTransport::Stdio;
+        config.url = None;
+        config.command = Some("python3".to_string());
+        config.args = Some(vec![
+            format!(
+                "{}/tests/fixtures/mcp_stub_server.py",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            state_path.display().to_string(),
+        ]);
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        let entry = manager.entry("stub").expect("the configured entry");
+        connector::connect_one(
+            Arc::clone(&entry),
+            Arc::clone(&manager),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        (temp, state_path, log, manager, entry)
+    }
+
+    /// How many requests of `method` the stub logged.
+    #[cfg(unix)]
+    fn logged(log: &std::path::Path, method: &str) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(&format!("\"{method}\"")))
+            .count()
+    }
+
+    /// A connection replaced while a call runs on it carries the call to its end rather than
+    /// closing under it: a call ended by a closed transport is sent again, and a tool with side
+    /// effects would run twice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_in_flight_finishes_on_the_connection_a_reconnect_replaces() {
+        let (_temp, _state, log, manager, entry) = connected_stub(serde_json::json!({
+            "tools": ["search"],
+            "call_delay_ms": 2000,
+            "legacy_only": true,
+        }))
+        .await;
+        let call = tokio::spawn({
+            let entry = Arc::clone(&entry);
+            async move {
+                entry
+                    .on_a_connection(&CancellationToken::new(), |peer| async move {
+                        peer.call_tool(rmcp::model::CallToolRequestParams::new("search"))
+                            .await
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let replaced = manager
+            .reconnect_server("stub", std::time::Duration::from_secs(20))
+            .await
+            .expect("replaced");
+        assert!(matches!(replaced, ServerState::Connected { .. }));
+        assert!(
+            !call.is_finished(),
+            "the replacement landed while the call ran, which is the case under test"
+        );
+        let result = call
+            .await
+            .expect("the call's task")
+            .expect("a connection")
+            .expect("the call finished");
+        assert!(format!("{result:?}").contains("search ran"), "{result:?}");
+        assert_eq!(logged(&log, "tools/call"), 1, "sent once");
+    }
+
+    /// A replacement that fails to connect leaves the connection it was to replace serving: an
+    /// open connection is not torn down for one that never opened.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_replacement_keeps_the_open_connection() {
+        let (_temp, state, _log, manager, entry) = connected_stub(serde_json::json!({
+            "tools": ["search"],
+            "legacy_only": true,
+        }))
+        .await;
+        std::fs::write(
+            &state,
+            serde_json::json!({
+                "tools": ["search"],
+                "legacy_only": true,
+                "fail_initialize": true,
+            })
+            .to_string(),
+        )
+        .expect("rewrite the stub's state");
+        assert!(
+            manager
+                .reconnect_server("stub", std::time::Duration::from_secs(20))
+                .await
+                .is_err(),
+            "the new connection cannot start"
+        );
+        assert!(
+            matches!(entry.state().await, ServerState::Connected { .. }),
+            "still connected"
+        );
+        entry
+            .on_a_connection(&CancellationToken::new(), |peer| async move {
+                peer.call_tool(rmcp::model::CallToolRequestParams::new("search"))
+                    .await
+            })
+            .await
+            .expect("a connection")
+            .expect("the old connection still answers");
+    }
+
+    /// A rejection as unauthorized is read from the HTTP status the transport reports, never from
+    /// words: a server's own error that says 401, or any other failure, is not one.
+    #[test]
+    fn only_an_http_401_is_a_rejection_as_unauthorized() {
+        use rmcp::transport::streamable_http_client::StreamableHttpError;
+        let transport = |error: StreamableHttpError<reqwest::Error>| {
+            ServiceError::TransportSend(rmcp::transport::DynamicTransportError::new::<
+                rmcp::transport::StreamableHttpClientTransport<reqwest::Client>,
+                RoleClient,
+            >(error))
+        };
+        assert!(rejected_as_unauthorized(&transport(
+            StreamableHttpError::UnexpectedServerResponse("HTTP 401 Unauthorized: no".into())
+        )));
+        assert!(!rejected_as_unauthorized(&transport(
+            StreamableHttpError::UnexpectedServerResponse("HTTP 500 Internal: port 4010".into())
+        )));
+        assert!(!rejected_as_unauthorized(&ServiceError::McpError(
+            rmcp::model::ErrorData::internal_error("upstream API returned 401 Unauthorized", None)
+        )));
+        assert!(!rejected_as_unauthorized(&ServiceError::TransportClosed));
+        let status = |code: u16| {
+            reqwest::Response::from(
+                http::Response::builder()
+                    .status(code)
+                    .body(Vec::<u8>::new())
+                    .expect("a response"),
+            )
+            .error_for_status()
+            .expect_err("an error status")
+        };
+        assert!(rejected_as_unauthorized(&transport(
+            StreamableHttpError::Client(status(401))
+        )));
+        assert!(!rejected_as_unauthorized(&transport(
+            StreamableHttpError::Client(status(403))
+        )));
+    }
+
+    /// Carrying the subscriptions over onto a connection just adopted asks for no reconnect when
+    /// it fails: a legacy server that dies on the subscribe would otherwise be connected to again
+    /// and again, each new connection dying on the same carry-over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn carrying_subscriptions_over_never_reconnects() {
+        let (_temp, state, log, manager, entry) = connected_stub(serde_json::json!({
+            "tools": ["search"],
+            "resources": ["file:///a"],
+            "legacy_only": true,
+        }))
+        .await;
+        subscriptions::subscribe(&entry, "file:///a".to_string(), &CancellationToken::new())
+            .await
+            .expect("subscribed");
+        std::fs::write(
+            &state,
+            serde_json::json!({
+                "tools": ["search"],
+                "resources": ["file:///a"],
+                "legacy_only": true,
+                "exit_on_subscribe": true,
+                "log": log.display().to_string(),
+            })
+            .to_string(),
+        )
+        .expect("rewrite the stub's state");
+        manager
+            .reconnect_server("stub", std::time::Duration::from_secs(20))
+            .await
+            .expect("replaced");
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(
+            logged(&log, "initialize"),
+            2,
+            "the first connection and its replacement, nothing after"
+        );
+    }
+
+    /// A shutdown ends a call still running after its grace, so the connection under it is closed
+    /// rather than left to a drop guard the process may never run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shutdown_ends_a_call_that_outlives_its_grace() {
+        let (_temp, _state, _log, manager, entry) = connected_stub(serde_json::json!({
+            "tools": ["search"],
+            "call_delay_ms": 30_000,
+            "legacy_only": true,
+        }))
+        .await;
+        let call = tokio::spawn({
+            let entry = Arc::clone(&entry);
+            async move {
+                entry
+                    .on_a_connection(&CancellationToken::new(), |peer| async move {
+                        peer.call_tool(rmcp::model::CallToolRequestParams::new("search"))
+                            .await
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        manager.shutdown_within(SHUTDOWN_BUDGET).await;
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), call).await;
+        assert!(ended.is_ok(), "the call ended with the shutdown");
     }
 
     /// A reconnect is a new session with the server, and its tool set is only knowable by asking.
@@ -3141,7 +3893,6 @@ mod tests {
         connector::connect_one(
             Arc::clone(&entry),
             Arc::clone(&manager),
-            None,
             std::time::Duration::from_secs(20),
         )
         .await;
@@ -3508,6 +4259,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            renewal_refused: std::sync::atomic::AtomicU64::new(0),
             removed: CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
@@ -3515,6 +4267,8 @@ mod tests {
             request_timeout: OnceLock::new(),
             background_retry: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            listings: ToolListings::default(),
+            connection: std::sync::atomic::AtomicU64::new(0),
             subscriptions: subscriptions::Subscriptions::default(),
             legacy_era: std::sync::atomic::AtomicBool::new(false),
             connects: Connects::new(),
@@ -3536,7 +4290,11 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            entry.reconnect_attempts(&tokio_util::sync::CancellationToken::new()),
+            entry.reconnect_attempts(
+                &tokio_util::sync::CancellationToken::new(),
+                GiveUp::RecordFailure,
+                Persistence::Backoff,
+            ),
         )
         .await
         .expect("the bound ends the attempt, not the test's deadline");
@@ -3580,7 +4338,7 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            entry.reconnect_attempts(&cancellation),
+            entry.reconnect_attempts(&cancellation, GiveUp::RecordFailure, Persistence::Backoff),
         )
         .await
         .expect("the stop ends the attempt, not the test's deadline");
@@ -4103,7 +4861,6 @@ mod tests {
             connector::connect_one(
                 Arc::clone(&self.entry),
                 Arc::clone(&self.manager),
-                None,
                 std::time::Duration::from_secs(20),
             )
             .await;
@@ -4331,8 +5088,7 @@ mod tests {
             let entry = Arc::clone(&stub.entry);
             let manager = Arc::clone(&stub.manager);
             async move {
-                connector::connect_one(entry, manager, None, std::time::Duration::from_secs(60))
-                    .await;
+                connector::connect_one(entry, manager, std::time::Duration::from_secs(60)).await;
             }
         });
         assert!(
@@ -4421,8 +5177,7 @@ mod tests {
             let entry = Arc::clone(&stub.entry);
             let manager = Arc::clone(&stub.manager);
             async move {
-                connector::connect_one(entry, manager, None, std::time::Duration::from_secs(60))
-                    .await;
+                connector::connect_one(entry, manager, std::time::Duration::from_secs(60)).await;
             }
         });
         assert!(
@@ -4889,7 +5644,11 @@ mod tests {
             let started = std::time::Instant::now();
             let outcome = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                entry.reconnect_attempts(&tokio_util::sync::CancellationToken::new()),
+                entry.reconnect_attempts(
+                    &tokio_util::sync::CancellationToken::new(),
+                    GiveUp::RecordFailure,
+                    Persistence::Backoff,
+                ),
             )
             .await
             .expect("the stop ends the attempts, not their backoff");
@@ -4988,7 +5747,6 @@ mod tests {
         connector::connect_one(
             Arc::clone(&stub.entry),
             Arc::clone(&stub.manager),
-            None,
             std::time::Duration::from_secs(7),
         )
         .await;

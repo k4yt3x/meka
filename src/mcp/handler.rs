@@ -530,6 +530,7 @@ impl McpTool {
     /// under one deadline. A closed transport is the caller's to reopen.
     async fn call_tool_once(
         &self,
+        peer: Peer<RoleClient>,
         mut params: CallToolRequestParams,
         context: &CallContext,
     ) -> std::result::Result<rmcp::model::CallToolResult, ServiceError> {
@@ -548,15 +549,6 @@ impl McpTool {
             );
         }
         params.meta = Some(meta);
-
-        // `call` has already refused a server that is not connected in the state's own words; a
-        // state that changed between there and here is a transport that closed, which is what
-        // the retry in `call` reconnects.
-        let peer: Peer<RoleClient> = self
-            .entry
-            .require_connected()
-            .await
-            .map_err(|_| ServiceError::TransportClosed)?;
 
         // One deadline for every round: a server that asks and asks again is still one tool call
         // to the turn, and the model's wait is what the timeout bounds.
@@ -695,54 +687,41 @@ impl McpTool {
         // a server somebody shut down.
         self.entry.require_connected().await?;
 
-        // First attempt. On TransportClosed, reconnect and retry once.
-        let result = match self.call_tool_once(params.clone(), context).await {
+        let failed = |error: ServiceError| MekaError::McpToolExecution {
+            server_name: self.entry.server_name().to_string(),
+            tool_name: self.remote_tool_name.clone(),
+            message: crate::text::redact_urls(&error.to_string()),
+        };
+        let result = match self
+            .entry
+            .on_a_connection(&context.cancellation, |peer| {
+                self.call_tool_once(peer, params.clone(), context)
+            })
+            .await?
+        {
             Ok(result) => result,
             Err(ServiceError::Cancelled { reason })
                 if reason.as_deref() == Some("user interrupt") =>
             {
                 return Err(MekaError::Interrupted);
             }
-            Err(error) if is_timeout(&error) => {
-                return Err(MekaError::McpToolExecution {
-                    server_name: self.entry.server_name().to_string(),
-                    tool_name: self.remote_tool_name.clone(),
-                    message: crate::text::redact_urls(&error.to_string()),
-                });
-            }
-            Err(ServiceError::TransportClosed) => {
-                self.entry.reconnect(&context.cancellation).await?;
-                match self.call_tool_once(params, context).await {
-                    Ok(result) => result,
-                    Err(ServiceError::Cancelled { reason })
-                        if reason.as_deref() == Some("user interrupt") =>
-                    {
-                        return Err(MekaError::Interrupted);
-                    }
-                    Err(error) => {
-                        return Err(MekaError::McpToolExecution {
-                            server_name: self.entry.server_name().to_string(),
-                            tool_name: self.remote_tool_name.clone(),
-                            message: crate::text::redact_urls(&error.to_string()),
-                        });
-                    }
-                }
-            }
+            Err(error) if is_timeout(&error) => return Err(failed(error)),
             Err(error) => {
-                // Matched on the text because the transport surfaces the status inside the error
-                // rather than as a field, so a bare `Unauthorized` with no code still counts.
-                let text = error.to_string().to_ascii_lowercase();
-                if text.contains("401") || text.contains("unauthorized") {
+                if crate::mcp::rejected_as_unauthorized(&error) {
                     let server_name = self.entry.server_name();
-                    tracing::warn!(
-                        "MCP server '{server_name}' rejected the call as unauthorized; run `meka mcp login {server_name}` to re-authenticate"
-                    );
+                    if self.entry.config().headers_helper.is_some() {
+                        tracing::warn!(
+                            "MCP server '{server_name}' rejected the call as unauthorized with the \
+                             headers `headers_helper` printed, run again on a new connection"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "MCP server '{server_name}' rejected the call as unauthorized; run \
+                             `meka mcp login {server_name}` to re-authenticate"
+                        );
+                    }
                 }
-                return Err(MekaError::McpToolExecution {
-                    server_name: self.entry.server_name().to_string(),
-                    tool_name: self.remote_tool_name.clone(),
-                    message: crate::text::redact_urls(&error.to_string()),
-                });
+                return Err(failed(error));
             }
         };
 

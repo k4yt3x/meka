@@ -46,7 +46,7 @@ fn show_lines(task: &crate::store::background::BackgroundTask) -> String {
             "tool",
             crate::text::sanitize_to_line(&task.tool, usize::MAX),
         ),
-        ("elapsed", format_elapsed(task)),
+        ("elapsed", crate::background::format_elapsed(task)),
         (
             "started",
             crate::text::format_timestamp(task.started_at, crate::text::Precision::Seconds),
@@ -102,18 +102,15 @@ pub(crate) async fn cancel(
 ) -> Result<Vec<String>> {
     let Some(id_prefix) = id_prefix else {
         let store = store.background_store();
-        let running: Vec<String> = store
+        let running = store
             .list_running_background_tasks(session)
             .await?
             .into_iter()
             .map(|task| task.id)
             .collect();
-        for id in &running {
-            store
-                .finish_background_task(id, TaskStatus::Canceled, None, None)
-                .await?;
-        }
-        return Ok(running);
+        return store
+            .stop_background_tasks(running, TaskStatus::Canceled)
+            .await;
     };
 
     let Some(task) = store
@@ -132,28 +129,18 @@ pub(crate) async fn cancel(
             task.status.name()
         )));
     }
-    store
+    let stopped = store
         .background_store()
-        .finish_background_task(&task.id, TaskStatus::Canceled, None, None)
+        .stop_background_tasks(vec![task.id.clone()], TaskStatus::Canceled)
         .await?;
-    Ok(vec![task.id])
-}
-
-/// How long a task ran, or has been running, in a cell the table can budget for.
-///
-/// `humantime` spells a duration in full (`3years 4months 16days 17h 28m 57s` is 33 columns) and
-/// nothing bounds how long a task has been running, so the two coarsest units are kept: they are
-/// what a reader takes from this cell anyway.
-fn format_elapsed(task: &crate::store::background::BackgroundTask) -> String {
-    let seconds = task.elapsed().num_seconds().max(0) as u64;
-    let spelled =
-        humantime_serde::re::humantime::format_duration(std::time::Duration::from_secs(seconds))
-            .to_string();
-    spelled
-        .split_whitespace()
-        .take(2)
-        .collect::<Vec<_>>()
-        .join(" ")
+    // The task finished between the read above and the stop.
+    if stopped.is_empty() {
+        return Err(MekaError::Usage(format!(
+            "task {} already finished",
+            task.short_id()
+        )));
+    }
+    Ok(stopped)
 }
 
 #[cfg(test)]

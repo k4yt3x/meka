@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 17;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 18;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -164,6 +164,9 @@ pub(crate) struct ExportedEvent {
     pub(crate) event: crate::conversation::Event,
     /// The turn that added the row, one of the session's `turns`, or none.
     pub(crate) turn_id: Option<String>,
+    /// For a copy a compaction kept, the position among the session's `events` of the one it
+    /// copies, always an earlier one: history shows that one and the model reads this.
+    pub(crate) copy_of: Option<usize>,
 }
 /// A turn as its row records it: the stored names (`status`, `error_type`) rather than the API's
 /// spellings, so an import writes the row back as it was.
@@ -190,7 +193,7 @@ impl From<crate::store::turns::TurnRecord> for ExportedTurn {
         };
         Self {
             id: turn.id.to_string(),
-            source: turn.source,
+            source: turn.source.name().to_string(),
             started_at: turn.started_at,
             ended_at: turn.ended_at,
             status: turn.status.map(|status| status.name().to_string()),
@@ -213,14 +216,21 @@ pub(crate) async fn build_session_export(
     let mut sessions = Vec::with_capacity(tree.len());
     let mut referenced: Vec<String> = Vec::new();
     for meta in tree {
-        let events: Vec<ExportedEvent> = store
-            .load_events_with_timestamps(meta.id)
-            .await?
+        let loaded = store.load_events_with_timestamps(meta.id).await?;
+        let positions: std::collections::HashMap<i64, usize> = loaded
+            .iter()
+            .enumerate()
+            .map(|(position, (stamp, _))| (stamp.id, position))
+            .collect();
+        let events: Vec<ExportedEvent> = loaded
             .into_iter()
             .map(|(stamp, event)| ExportedEvent {
                 at: stamp.created_at,
                 event,
                 turn_id: stamp.turn_id.map(|id| id.to_string()),
+                copy_of: stamp
+                    .copy_of
+                    .and_then(|original| positions.get(&original).copied()),
             })
             .collect();
         let turns: Vec<ExportedTurn> = store
@@ -286,15 +296,17 @@ pub(crate) async fn build_session_export(
         blobs,
     })
 }
-/// The refusal for an archive stamp that is not RFC 3339, the one shape every row's stamp has.
-fn require_rfc3339(session: &str, what: &str, stamp: &str) -> crate::error::Result<()> {
-    chrono::DateTime::parse_from_rfc3339(stamp)
-        .map(|_| ())
-        .map_err(|error| {
-            crate::error::MekaError::Usage(format!(
-                "session '{session}' carries a `{what}` that is not RFC 3339 ('{stamp}'): {error}"
-            ))
-        })
+/// An archive stamp as the store writes one: RFC 3339 in UTC, the shape every reader compares as
+/// text, so an archive's `+05:00` or `Z` is converted here rather than misordered against the
+/// store's own stamps. A stamp that is not RFC 3339 is refused.
+fn utc_rfc3339(session: &str, what: &str, stamp: &mut String) -> crate::error::Result<()> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(stamp).map_err(|error| {
+        crate::error::MekaError::Usage(format!(
+            "session '{session}' carries a `{what}` that is not RFC 3339 ('{stamp}'): {error}"
+        ))
+    })?;
+    *stamp = parsed.with_timezone(&chrono::Utc).to_rfc3339();
+    Ok(())
 }
 
 /// Turn a deserialized [`SessionExport`] into the parents-first
@@ -303,7 +315,7 @@ fn require_rfc3339(session: &str, what: &str, stamp: &str) -> crate::error::Resu
 /// pointing outside the exported set collapses to `None`, importing that session as a new root
 /// session). Pure and I/O-free so the ID-remap and ordering are unit-testable.
 pub(crate) fn plan_import(
-    export: SessionExport,
+    mut export: SessionExport,
     // How each session's profile is settled, here rather than at the reader because an import is
     // where a session enters *this* installation.
     installation: ImportInstallation<'_>,
@@ -333,18 +345,19 @@ pub(crate) fn plan_import(
 
     // A stamp meka did not write is refused ahead of any row: every listing reads them back, and
     // a column cut from one has to be cut from a shape it knows.
-    for session in &export.sessions {
+    for session in &mut export.sessions {
+        let id = session.id.clone();
         for (what, stamp) in [
-            ("created_at", Some(&session.created_at)),
-            ("updated_at", Some(&session.updated_at)),
-            ("pinned_at", session.pinned_at.as_ref()),
+            ("created_at", Some(&mut session.created_at)),
+            ("updated_at", Some(&mut session.updated_at)),
+            ("pinned_at", session.pinned_at.as_mut()),
         ] {
             if let Some(stamp) = stamp {
-                require_rfc3339(&session.id, what, stamp)?;
+                utc_rfc3339(&id, what, stamp)?;
             }
         }
-        for event in &session.events {
-            require_rfc3339(&session.id, "an event's `at`", &event.at)?;
+        for event in &mut session.events {
+            utc_rfc3339(&id, "an event's `at`", &mut event.at)?;
         }
     }
 
@@ -389,6 +402,14 @@ pub(crate) fn plan_import(
                     blob.hash
                 ))
             })?;
+        // Served back as the `Content-Type` of the blob route, so a label that is not an image
+        // would have a client's browser render the bytes as whatever it names.
+        if !crate::image::is_raster_media_type(&blob.media_type) {
+            return Err(crate::error::MekaError::Usage(format!(
+                "archive blob {} is labeled '{}', which is not an image type",
+                blob.hash, blob.media_type
+            )));
+        }
         let actual = super::blobs::content_hash(&bytes);
         if actual != blob.hash {
             return Err(crate::error::MekaError::Usage(format!(
@@ -425,9 +446,28 @@ pub(crate) fn plan_import(
             std::collections::HashMap::new();
         let mut turns = Vec::with_capacity(session.turns.len());
         for mut turn in session.turns {
-            require_rfc3339(&session.id, "a turn's started_at", &turn.started_at)?;
-            if let Some(ended_at) = &turn.ended_at {
-                require_rfc3339(&session.id, "a turn's ended_at", ended_at)?;
+            utc_rfc3339(&session.id, "a turn's started_at", &mut turn.started_at)?;
+            if let Some(ended_at) = &mut turn.ended_at {
+                utc_rfc3339(&session.id, "a turn's ended_at", ended_at)?;
+            }
+            if turn
+                .source
+                .parse::<crate::store::turns::TurnSource>()
+                .is_err()
+            {
+                return Err(crate::error::MekaError::Usage(format!(
+                    "session {} in the archive records a turn source meka does not know: '{}'",
+                    session.id, turn.source
+                )));
+            }
+            if let Some(reason) = &turn.cancel_reason
+                && reason.parse::<crate::store::turns::CancelReason>().is_err()
+            {
+                return Err(crate::error::MekaError::Usage(format!(
+                    "session {} in the archive records a cancel reason meka does not know: \
+                     '{reason}'",
+                    session.id
+                )));
             }
             if let Some(status) = &turn.status
                 && status.parse::<crate::store::turns::TurnStatus>().is_err()
@@ -465,7 +505,32 @@ pub(crate) fn plan_import(
                 })?),
                 None => None,
             };
-            events.push((event.at, event.event, turn));
+            // A link hides the copy from every history, so it is taken only between two messages,
+            // the one shape a compaction writes: on anything else it would hide what it names.
+            if let Some(original) = event.copy_of {
+                let copies_a_message = matches!(event.event, crate::conversation::Event::Append(_))
+                    && matches!(
+                        events.get(original),
+                        Some(crate::store::ImportedEvent {
+                            event: crate::conversation::Event::Append(_),
+                            ..
+                        })
+                    );
+                if !copies_a_message {
+                    return Err(crate::error::MekaError::Usage(format!(
+                        "session {} in the archive has event {position} copying event {original}, \
+                         which is not an earlier message or is not one itself",
+                        session.id,
+                        position = events.len()
+                    )));
+                }
+            }
+            events.push(crate::store::ImportedEvent {
+                at: event.at,
+                event: event.event,
+                turn_id: turn,
+                copy_of: event.copy_of,
+            });
         }
         let permission = match (session.permission, default_permission) {
             (Some(level), _) => level,
@@ -487,15 +552,13 @@ pub(crate) fn plan_import(
             // Refused rather than written: a row naming a profile this installation lacks is a
             // session every resume refuses by name, and a state no other door can produce.
             (None, false, _) => {
-                if let Some(configured) = installation.configured {
-                    crate::config::require_profile(&session.profile, configured).map_err(
-                        |refusal| {
-                            crate::error::MekaError::Usage(format!(
-                                "{refusal}; the archive names it, so import it with `meka --profile \
-                                 <name> session import`"
-                            ))
-                        },
-                    )?;
+                if let Some(configured) = installation.configured
+                    && !configured.contains_key(&session.profile)
+                {
+                    return Err(crate::error::MekaError::ImportNamesUnknownProfile {
+                        name: session.profile,
+                        known: configured.keys().cloned().collect(),
+                    });
                 }
                 session.profile
             }
@@ -503,21 +566,16 @@ pub(crate) fn plan_import(
             // Refused rather than left blank, for the same reason: a session with no profile
             // cannot run, and a blank is a state no other door can produce.
             (None, true, None) => {
-                return Err(crate::error::MekaError::Usage(
-                    "this archive names no profile and no default profile is set; import it with \
-                     `meka --profile <name> session import`"
-                        .to_string(),
-                ));
+                return Err(crate::error::MekaError::ImportNamesNoProfile);
             }
         };
         // Refused rather than written, as a profile is: a row naming a project this installation
         // lacks is a session every resume refuses by name.
         if !session.project.is_empty() && !installation.projects.contains(&session.project) {
-            return Err(crate::error::MekaError::Usage(format!(
-                "{}; the archive names it, so add it with `meka project add {}` first",
-                crate::text::unknown_name("project", &session.project, &installation.projects),
-                session.project
-            )));
+            return Err(crate::error::MekaError::ImportNamesUnknownProject {
+                name: session.project,
+                known: installation.projects,
+            });
         }
         records.push(crate::store::ImportSessionRecord {
             new_id,
@@ -698,7 +756,7 @@ mod tests {
     fn refusal(outcome: crate::error::Result<ImportPlan>) -> String {
         match outcome {
             Ok(_) => panic!("the import must be refused"),
-            Err(crate::error::MekaError::Usage(message)) => message,
+            Err(error) if error.kind() == crate::error::ErrorKind::InvalidBody => error.to_string(),
             Err(other) => panic!("the refusal must be the caller's to act on, got {other}"),
         }
     }
@@ -723,6 +781,124 @@ mod tests {
             message.contains("'work'") && message.contains("--profile <name> session import"),
             "{message}"
         );
+    }
+
+    /// An archive stamp in another zone is stored in UTC, the shape every reader compares as text,
+    /// so it orders against the store's own stamps by the instant it names.
+    #[test]
+    fn an_archive_s_stamps_are_stored_in_utc() {
+        let profiles = configured(&["work"]);
+        let mut archive = archive_on("work");
+        archive.sessions[0].created_at = "2020-01-01T05:00:00+05:00".to_string();
+        let plan = plan_import(
+            archive,
+            ImportInstallation {
+                selected: None,
+                default: Some("work"),
+                configured: Some(&profiles),
+                projects: Vec::new(),
+            },
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plans");
+        assert_eq!(plan.records[0].created_at, "2020-01-01T00:00:00+00:00");
+    }
+
+    /// A link hides the copy from every history, so an archive may draw one only from a message to
+    /// an earlier message: one onto a repair, or forward, is refused.
+    #[test]
+    fn an_archive_link_is_refused_unless_it_joins_two_messages_in_order() {
+        let profiles = configured(&["work"]);
+        let plan = |events: serde_json::Value| {
+            let mut archive = archive_on("work");
+            archive.sessions[0].events =
+                serde_json::from_value(events).expect("well-formed events");
+            plan_import(
+                archive,
+                ImportInstallation {
+                    selected: None,
+                    default: Some("work"),
+                    configured: Some(&profiles),
+                    projects: Vec::new(),
+                },
+                Some(crate::permission::Permission::Read),
+            )
+        };
+        let message = |copy_of: Option<usize>| {
+            serde_json::json!({
+                "at": "2020-01-01T00:00:00Z",
+                "event": {"Append": {"role": "user", "content": [{"type": "text", "text": "hi"}]}},
+                "turn_id": null,
+                "copy_of": copy_of,
+            })
+        };
+        let repair = serde_json::json!({
+            "at": "2020-01-01T00:00:00Z",
+            "event": {"Repair": {"replaced_count": 1, "messages": []}},
+            "turn_id": null,
+            "copy_of": null,
+        });
+        assert!(plan(serde_json::json!([message(None), message(Some(0))])).is_ok());
+        assert!(plan(serde_json::json!([repair, message(Some(0))])).is_err());
+        assert!(plan(serde_json::json!([message(Some(1)), message(None)])).is_err());
+    }
+
+    /// A blob is served back under the label it carries, so an archive whose blob claims to be a
+    /// page rather than an image is refused, however well its bytes hash.
+    #[test]
+    fn an_archive_blob_labeled_as_anything_but_an_image_is_refused() {
+        use base64::Engine;
+        let profiles = configured(&["work"]);
+        let bytes = b"<script>alert(1)</script>";
+        let mut archive = archive_on("work");
+        archive.blobs.push(ExportedBlob {
+            hash: super::super::blobs::content_hash(bytes),
+            media_type: "text/html".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        let message = refusal(plan_import(
+            archive,
+            ImportInstallation {
+                selected: None,
+                default: Some("work"),
+                configured: Some(&profiles),
+                projects: Vec::new(),
+            },
+            Some(crate::permission::Permission::Read),
+        ));
+        assert!(message.contains("'text/html'"), "{message}");
+    }
+
+    /// A turn's source is read back typed, so an archive naming one meka does not know is refused
+    /// at the door rather than written into a row every listing of the session then fails on.
+    #[test]
+    fn an_archive_turn_with_an_unknown_source_is_refused() {
+        let profiles = configured(&["work"]);
+        let mut archive = archive_on("work");
+        archive.sessions[0].turns.push(ExportedTurn {
+            id: uuid::Uuid::new_v4().to_string(),
+            source: "screen".to_string(),
+            started_at: "2020-01-01T00:00:00+00:00".to_string(),
+            ended_at: None,
+            status: None,
+            stop_reason: None,
+            error_type: None,
+            detail: None,
+            cancel_reason: None,
+            profile: None,
+            usage: crate::store::turns::TurnUsage::default(),
+        });
+        let message = refusal(plan_import(
+            archive,
+            ImportInstallation {
+                selected: None,
+                default: Some("work"),
+                configured: Some(&profiles),
+                projects: Vec::new(),
+            },
+            Some(crate::permission::Permission::Read),
+        ));
+        assert!(message.contains("'screen'"), "{message}");
     }
 
     /// A project this installation does not define is refused ahead of any row, as a profile is;

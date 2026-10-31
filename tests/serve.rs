@@ -5144,6 +5144,16 @@ fn a_turn_naming_a_skill_with_no_message_runs_the_skill_body_alone() {
         "no blank line above the body: {words:?}"
     );
     assert!(words.trim_end().ends_with("THEIRS"), "{words:?}");
+    // Typed as what was invoked, so a client shows the skill rather than its body.
+    let invocation = first_user["content"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .find(|block| block["type"] == "invocation")
+        .expect("the skill is an invocation block");
+    assert_eq!(invocation["kind"], "skill");
+    assert_eq!(invocation["name"], "borrowed");
+    assert_eq!(invocation["directive"], "");
 }
 
 /// Unknown fields under `options` produce 422 invalid-body.
@@ -5803,9 +5813,11 @@ fn streaming_turn_event_ids_are_dense_and_monotonic() {
         !ids.is_empty(),
         "streaming turn must emit at least one id-bearing event; body was:\n{body}",
     );
-    assert_eq!(
-        ids[0], 0,
-        "first event id must be 0 per spec example; ids were {ids:?}",
+    // The sequence starts above anything an earlier incarnation of the feed issued: the
+    // microseconds since the epoch at the earliest, which no small number reaches.
+    assert!(
+        ids[0] > 1_000_000_000_000_000,
+        "the first id starts at the clock, not at zero; ids were {ids:?}",
     );
     for window in ids.windows(2) {
         let [a, b] = [window[0], window[1]];
@@ -9205,6 +9217,42 @@ fn instructions_endpoint_reports_absence_rather_than_failing() {
     );
 }
 
+/// Where the instructions file sits is a host path, which a token that may only read sessions is
+/// not shown; whether a write would land is still said.
+#[test]
+fn the_instructions_path_is_shown_only_to_a_token_that_reads_the_installation() {
+    let harness =
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
+    let body: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/instructions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(body["writable"], true, "{body}");
+    assert!(
+        body.get("path").is_none(),
+        "a host path reached a session reader: {body}"
+    );
+
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "config:r",
+    ]);
+    let body: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/instructions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        body["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("instructions.md")),
+        "the installation's reader is told where a write lands: {body}"
+    );
+}
+
 #[test]
 fn profiles_endpoint_lists_profiles_and_marks_the_active_one() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
@@ -11645,16 +11693,20 @@ fn reattach_warns_when_the_replay_buffer_cannot_reach_back_far_enough() {
     // A ring of 2 cannot cover a turn that emits more than that.
     let harness = ServeTestHarness::spawn("stream_replay_events = 2\n", script);
     let id = start_streaming_session(&harness);
-    harness
+    let original = harness
         .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": true}))
         .send()
         .expect("send")
         .text()
         .expect("body");
+    let first = sse_event_ids(&original)
+        .first()
+        .copied()
+        .expect("the turn's first event");
 
     let body = read_feed_until(
-        open_feed(&harness, &id, Some(0), Duration::from_secs(30)),
+        open_feed(&harness, &id, Some(first), Duration::from_secs(30)),
         |text| text.contains("event: feed.gap"),
     );
     let gap = sse_event_data(&body, "feed.gap")
@@ -12475,6 +12527,63 @@ fn a_canceled_task_rides_on_the_next_turn_instead_of_causing_one() {
 
 /// A session with a detached command still running is not idle, however long since its last turn.
 ///
+/// A feed reader keeps its session loaded only when its token could have loaded the session
+/// itself: a `sessions:w` reader holds it past the idle timeout, and a `sessions:r` one does not,
+/// or a dashboard that may only watch would keep every session it watches resident for good.
+#[test]
+fn only_a_reader_that_could_load_the_session_keeps_it_loaded() {
+    let harness = ServeTestHarness::spawn(
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"200ms\"\n\n[[serve.tokens]]\ntoken = \
+         \"reader\"\nscopes = [\"sessions:r\"]\n",
+        mock_simple_turn(),
+    );
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "hello", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200, "{}", turn.text().unwrap_or_default());
+    let open_feed = |token: &str| {
+        let response = reqwest::blocking::Client::new()
+            .get(format!("{}/v1/sessions/{id}/stream", harness.base_url))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .expect("send");
+        assert_eq!(response.status(), 200);
+        response
+    };
+    let resident = |harness: &ServeTestHarness| {
+        !harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
+            .send()
+            .expect("send")
+            .json::<serde_json::Value>()
+            .expect("parse")["message_count"]
+            .is_null()
+    };
+
+    let writer = open_feed(&harness.token);
+    // Well past `idle_timeout` and many scans.
+    std::thread::sleep(Duration::from_millis(3000));
+    assert!(
+        resident(&harness),
+        "a writer's reader keeps the session loaded"
+    );
+    let reader = open_feed("reader");
+    drop(writer);
+    harness.wait_until_evicted(&id);
+    drop(reader);
+}
+
 /// The GC counted in-flight *turns* only, so a session whose turn had finished but whose background
 /// command had not was evicted on schedule. Eviction drops the `SessionEntry`, which drops the
 /// session's file lock, while the detached task keeps running -- and the next thing to open the
@@ -17485,6 +17594,83 @@ fn open_server_feed(
         request = request.header("Last-Event-ID", last.to_string());
     }
     request.send().expect("send")
+}
+
+/// A token taken out of `config.toml` stops being honored at the reload rather than at a
+/// restart: its next request is refused, and the stream it held open ends.
+#[test]
+fn a_reload_applies_the_tokens_the_file_now_holds() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "[[serve.tokens]]\ntoken = \"reader\"\nscopes = [\"sessions:r\"]\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "config:r", "config:w"],
+    );
+    let config_path = harness.install.config_dir().join("config.toml");
+    let as_reader = |path: &str| {
+        harness
+            .client
+            .get(format!("{}{path}", harness.base_url))
+            .header("Authorization", "Bearer reader")
+            .send()
+            .expect("send")
+    };
+    assert_eq!(as_reader("/v1/sessions").status(), 200);
+    let held = std::thread::spawn({
+        let base_url = harness.base_url.clone();
+        move || {
+            let mut stream = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .expect("client")
+                .get(format!("{base_url}/v1/stream"))
+                .header("Authorization", "Bearer reader")
+                .send()
+                .expect("send");
+            assert_eq!(stream.status(), 200);
+            let started = Instant::now();
+            let mut sink = Vec::new();
+            // Read to the end: the server ends the stream, or the client's timeout fails it.
+            let ended = std::io::Read::read_to_end(&mut stream, &mut sink).is_ok();
+            (ended, started.elapsed())
+        }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+
+    let original = std::fs::read_to_string(&config_path).expect("read config");
+    let without_reader = original.replace(
+        "[[serve.tokens]]\ntoken = \"reader\"\nscopes = [\"sessions:r\"]\n",
+        "",
+    );
+    assert_ne!(
+        without_reader, original,
+        "the reader's entry is in the file"
+    );
+    std::fs::write(&config_path, &without_reader).expect("write config");
+    let reloaded = harness
+        .request(reqwest::Method::POST, "/v1/config/reload")
+        .send()
+        .expect("send");
+    assert_eq!(
+        reloaded.status(),
+        200,
+        "{}",
+        reloaded.text().unwrap_or_default()
+    );
+    let reloaded: serde_json::Value = reloaded.json().expect("parse");
+    assert!(
+        !reloaded["restart_required"]
+            .as_array()
+            .is_some_and(|sections| sections.iter().any(|section| section == "serve")),
+        "the tokens are served, so they wait on no restart: {reloaded}"
+    );
+    assert_eq!(as_reader("/v1/sessions").status(), 401);
+    let (ended, after) = held.join().expect("reader thread");
+    assert!(
+        ended && after < Duration::from_secs(30),
+        "the stream ended at the reload"
+    );
 }
 
 /// `POST /v1/config/reload` serves what the file now holds, as a write over HTTP would have: a

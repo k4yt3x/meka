@@ -68,8 +68,7 @@ impl LoadToolTool {
              discovery]` in the conversation context, or search with `{SEARCH_TOOL_NAME}`."
         );
         if hint.is_empty() {
-            let registered: Vec<Arc<dyn Tool>> =
-                crate::sync::read(tools).tools().cloned().collect();
+            let registered = self.carried_tools(tools);
             let deferred = deferred_names(&self.deferred);
             if let Some((matches, _)) = render_search(
                 &registered,
@@ -83,6 +82,18 @@ impl LoadToolTool {
             }
         }
         message
+    }
+
+    /// The registered tools this session's wire carries: what a search may answer with.
+    fn carried_tools(
+        &self,
+        tools: &Arc<RwLock<super::registry::Registered>>,
+    ) -> Vec<Arc<dyn Tool>> {
+        crate::sync::read(tools)
+            .iter()
+            .filter(|entry| is_carried_by_wire(&self.profile, &entry.definition.name))
+            .map(|entry| Arc::clone(&entry.tool))
+            .collect()
     }
 
     /// The state of the MCP server behind `name`, when the name is unfindable *because* its
@@ -352,11 +363,7 @@ impl Tool for ToolSearchTool {
                 true,
             ));
         };
-        let registered: Vec<Arc<dyn Tool>> = crate::sync::read(&tools)
-            .iter()
-            .filter(|entry| is_carried_by_wire(&self.loader.profile, &entry.definition.name))
-            .map(|entry| Arc::clone(&entry.tool))
-            .collect();
+        let registered = self.loader.carried_tools(&tools);
         let deferred = deferred_names(&self.loader.deferred);
         let Some((text, matched_deferred)) = render_search(
             &registered,
@@ -950,6 +957,28 @@ mod tests {
             text.contains("fixture_alpha") && !text.contains("mcp_probe"),
             "{text}"
         );
+    }
+
+    /// A name that resolves to nothing is answered with the matches the wire carries, never with
+    /// a tool the wire refuses.
+    #[tokio::test]
+    async fn a_load_miss_suggests_only_what_the_wire_carries() {
+        let fixture = build_test_tool(vec![fake_tool("mcp_probe"), fake_tool("fixture_alpha")], &[
+            "mcp_probe",
+            "fixture_alpha",
+        ]);
+        refuse(&fixture, "mcp_probe");
+        let missed = fixture
+            .tool_load
+            .execute(
+                serde_json::json!({"name": "probe"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("answers");
+        let text = crate::conversation::ContentBlock::tool_result_text_content(&missed.content);
+        assert!(text.contains("is not registered"), "{text}");
+        assert!(!text.contains("mcp_probe"), "{text}");
     }
 
     fn references_in(output: &ToolOutput) -> Vec<String> {

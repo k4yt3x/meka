@@ -621,15 +621,14 @@ impl TurnRecovery {
         let mut nudge = Message::nudge_message(kind, text.clone());
         let arrivals = agent.take_arrivals(session_id, &self.inbox_ids).await;
         nudge.content.extend(arrivals.blocks());
-        let steered = arrivals.item_ids();
         agent
-            .save_events_atomic_marking_inbox(
+            .save_carrying(
                 session_id,
                 vec![
                     crate::conversation::Event::Append(assistant_message.clone()),
                     crate::conversation::Event::Append(nudge.clone()),
                 ],
-                &steered,
+                &arrivals,
             )
             .await?;
         messages.append(assistant_message.clone());
@@ -696,11 +695,11 @@ impl TurnRecovery {
 /// How much of the provider's rejection text is carried into the conversation. Long enough to keep
 /// the specific complaint (Anthropic's runs to about 150 characters), short enough that a provider
 /// echoing the request body back can't flood the window.
-pub(super) const REJECTION_REASON_LIMIT: usize = 600;
+pub(super) const REJECTION_REASON_CHARS: usize = 600;
 /// How much of a neutralized `tool_use`'s arguments are quoted in its result. They are there so
 /// the model can see what it sent, which a short prefix answers; carrying them whole would re-send
 /// the very bytes the provider may have objected to.
-pub(super) const QUOTED_ARGUMENTS_LIMIT: usize = 400;
+pub(super) const QUOTED_ARGUMENTS_CHARS: usize = 400;
 /// Rewrite `messages` so nothing the provider can refuse on content grounds survives, to the depth
 /// `tier` allows, replacing what it removes with a note carrying `reason`. Returns `None` when this
 /// tier found nothing to rewrite, which the caller reads as "try the next tier, and if there isn't
@@ -719,7 +718,7 @@ pub(super) fn degrade_rejected_content(
     reason: &str,
     tier: DegradeTier,
 ) -> Option<Vec<Message>> {
-    let reason = elide(&scrub_for_harness_note(reason), REJECTION_REASON_LIMIT);
+    let reason = elide(&scrub_for_harness_note(reason), REJECTION_REASON_CHARS);
     match tier {
         DegradeTier::Attachments => strip_non_text_content(messages, &reason),
         DegradeTier::ToolExchanges => {
@@ -857,7 +856,7 @@ pub(super) fn neutralize_tool_exchanges(
                 format!(
                     "`{}` with {}",
                     name,
-                    elide(&input.to_string(), QUOTED_ARGUMENTS_LIMIT)
+                    elide(&input.to_string(), QUOTED_ARGUMENTS_CHARS)
                 ),
             )),
             _ => None,
@@ -1021,7 +1020,7 @@ mod tests {
     ///
     /// The marker is what tells a model that the sentence around it comes from the harness rather
     /// than from the tool or the provider, so nothing interpolated into the note may reproduce it.
-    /// This needs no hostile gateway: `REJECTION_REASON_LIMIT` names the realistic path, a provider
+    /// This needs no hostile gateway: `REJECTION_REASON_CHARS` names the realistic path, a provider
     /// echoing the request body back, which reproduces any harness note already in the
     /// conversation.
     ///
@@ -1933,7 +1932,7 @@ mod tests {
     /// spend the tier and change nothing.
     #[test]
     fn quoted_arguments_are_capped() {
-        let huge = "x".repeat(QUOTED_ARGUMENTS_LIMIT * 4);
+        let huge = "x".repeat(QUOTED_ARGUMENTS_CHARS * 4);
         let degraded = degrade_rejected_content(
             &[
                 tool_call("call_1", "file_write", serde_json::json!({"body": huge})),
@@ -1948,7 +1947,7 @@ mod tests {
             other => panic!("expected a ToolResult, got {other:?}"),
         });
         assert!(
-            quoted.chars().count() < QUOTED_ARGUMENTS_LIMIT * 2,
+            quoted.chars().count() < QUOTED_ARGUMENTS_CHARS * 2,
             "the arguments are a hint, not a payload: {} chars",
             quoted.chars().count()
         );
@@ -2042,20 +2041,20 @@ mod tests {
 
     #[test]
     fn elide_caps_a_provider_echoing_the_request_body() {
-        let long = "x".repeat(REJECTION_REASON_LIMIT * 2);
-        let elided = elide(&long, REJECTION_REASON_LIMIT);
-        assert_eq!(elided.chars().count(), REJECTION_REASON_LIMIT + 1);
+        let long = "x".repeat(REJECTION_REASON_CHARS * 2);
+        let elided = elide(&long, REJECTION_REASON_CHARS);
+        assert_eq!(elided.chars().count(), REJECTION_REASON_CHARS + 1);
         assert!(elided.ends_with('…'));
-        assert_eq!(elide("short", REJECTION_REASON_LIMIT), "short");
+        assert_eq!(elide("short", REJECTION_REASON_CHARS), "short");
     }
 
     /// Multi-byte input must not be sliced mid-character.
     #[test]
     fn elide_respects_char_boundaries() {
-        let long = "é".repeat(REJECTION_REASON_LIMIT + 10);
+        let long = "é".repeat(REJECTION_REASON_CHARS + 10);
         assert_eq!(
-            elide(&long, REJECTION_REASON_LIMIT).chars().count(),
-            REJECTION_REASON_LIMIT + 1
+            elide(&long, REJECTION_REASON_CHARS).chars().count(),
+            REJECTION_REASON_CHARS + 1
         );
     }
 

@@ -68,7 +68,7 @@ A session records what it runs on, and a resume brings all of it back:
 Everything the profile and its account state comes with it: the model, the endpoint, the context
 window the gauge and auto-compaction measure against, and whether images may be attached. A session
 records the profile's *name*, not a copy of its settings, so editing the profile with
-[`meka profile set`](../configuration/config-file.md#meka-profile-cli) moves every session on it.
+[`meka profile set`](./accounts-and-profiles.md#meka-profile-cli) moves every session on it.
 Two sessions on one `meka serve` can sit on profiles with different windows and each is measured
 against its own.
 
@@ -302,7 +302,7 @@ turn_retention = "90d"   # delete turns that ended over 90 days ago, once summar
 
 The sweep takes only what a compaction has summarized: the turns before the session's latest compaction, since the summary is what stands in for them, and never the turns the model is still working from. When one of those is older than the window, the next turn compacts first, keeping no rounds verbatim and quoting none, and the sweep takes it afterward; `turn_retention` therefore needs `auto_compact` on. It runs at startup, at the start of each turn for that turn's session, and hourly while a long-lived host stays up, and reports what it took at `warn` level.
 
-A turn goes whole: its messages, its record, its words in the search index and the images only it carried. Inbox items and background outcomes go once they have been delivered or withdrawn for longer than the window. Scratchpad entries and memories stay, since they are the agent's own notes rather than the conversation. A fork copies what has survived, and an import brings in turns the next sweep will date like any other. What remains of a deleted turn is whatever the compaction summary said about it, which is the model's memory and the only thing retention cannot take.
+A turn goes whole: its messages, its record, its words in the search index and the images only it carried. A turn the latest compaction kept verbatim stays in the model's view as the copy the compaction wrote, and history shows that copy once the turn's own rows are gone. Inbox items and background outcomes go once they have been delivered or withdrawn for longer than the window. Scratchpad entries and memories stay, since they are the agent's own notes rather than the conversation. A fork copies what has survived, and an import brings in turns the next sweep will date like any other. What remains of a deleted turn is whatever the compaction summary said about it, which is the model's memory and the only thing retention cannot take.
 
 See [Config file](../configuration/config-file.md#session) for details.
 
@@ -317,6 +317,8 @@ With `auto_compact = false` the conversation grows until the provider rejects a 
 ### Compacting a session
 
 When a session becomes too long, `/compact` replaces the older turns with a summary. A token-budgeted tail of recent messages may be kept verbatim, without splitting tool calls from their results. If too little older history remains to summarize, the whole conversation is summarized instead; an unanswered trailing prompt is still kept.
+
+The kept tail is written after the summary as copies the model alone reads. Everything that shows the session's history (the screen on a resume, an editor's reload, `conversation_search` and `conversation_read`, the session search, a Markdown export and the turn count `agent_list` gives) shows each kept turn once, where it was first said, and shows the copy once turn retention has taken the turn's own rows. A kept message the view had rewritten on its way to the model (thinking it stripped, an image it replaced) matches no row of its own and shows twice.
 
 Whoever writes the summary, it has four sections: the rules and authorizations the user stated, in their words; each commitment and its state (done, pending, blocked, or superseded) and what must happen before the next; the facts established, each with its source; and the next action. A `/compact <instructions>` focus adds emphasis within those sections and never drops one.
 
@@ -489,7 +491,8 @@ meka session show 550e8400 --format json | jq .working_directory
 ## Titling a session
 
 A session is labeled by the words of its first message, which is not always what you want to find
-it by later. Give it a title of your own:
+it by later. A session opened on a skill or an MCP prompt is labeled by the words typed with it, or
+by its name when none were, never by the body it expanded to. Give it a title of your own:
 
 ```bash
 meka session set 550e8400 title "Research: LLM security blind spots"
@@ -603,7 +606,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 15`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 14), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 18`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 17), which is brought forward as it is read. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 
@@ -660,6 +663,8 @@ The same operation is available from the screen as `/fork`, which switches you i
 
 Both produce a runnable copy under a new id. Reach for `fork` to branch a conversation you're working on, and for `export` + `import` to move a session between machines or keep an archive. Export/import also copies sub-agent transcripts and preserves `created_at`, because an archive should restore whole.
 
+Both copy a long session in short transactions, so another meka process writing to the store meanwhile is not held up for the length of the copy. The copy appears in listings, searches and `meka -c` only once it is whole. One that a crash interrupted is deleted the next time a meka host starts, unless another process still holds it.
+
 ## Rewinding a session
 
 Drop the most recent turns from a session:
@@ -679,7 +684,7 @@ meka repairs a rejection caused by content added since the last request the prov
 
 Neither step changes the shape of the conversation: a tool call stays a tool call and its result stays its result, marked as an error. That is deliberate. Removing one half of a pair is the one thing every provider refuses outright, so a repair that could do it might turn a recoverable rejection into a permanent one. The model sees a failed tool call, which it already knows how to read, with the arguments it sent quoted in the failure so it can tell which call not to repeat.
 
-Nothing a repair removes is deleted. The log is append-only (within [turn retention](#turn-retention), when set), so the superseded messages stay on disk and [`meka session export`](#exporting-a-session) renders them above a marker saying what replaced them. Use `--format json` to get a removed attachment back: the markdown export writes each message as its text and leaves image blocks out. Only the conversation the model sees is changed.
+Nothing a repair removes is deleted. The log is append-only (within [turn retention](#turn-retention), when set), so the superseded messages stay on disk and [`meka session export`](#exporting-a-session) renders them above a marker saying what replaced them. Use `--format json` to get a removed attachment back: the markdown export writes each message as a person said it, an invoked skill or prompt as the invocation rather than the body it expanded to and an attached file by its mention, and leaves image blocks out. Only the conversation the model sees is changed.
 
 Whatever is removed is restored untouched if the retry carrying it is refused too. That restore is what bounds the risk, and it bounds it only in that direction: each step spends a fresh retry sequence rather than a single request, and a step whose retry *succeeds* keeps the loss, so the trigger is deliberately narrow. The words you typed are never rewritten by either step, though an image you attached to that prompt is exactly what the first one removes, replacing it with a note. Notes meka inserts into a conversation are prefixed `[meka harness]`.
 

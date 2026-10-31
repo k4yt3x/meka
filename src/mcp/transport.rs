@@ -146,6 +146,39 @@ fn run_headers_helper(
         ))
     })?;
 
+    // stdout is the header list, rarely more than a few KiB; stderr is repeated verbatim in the
+    // error message, so it is kept tight.
+    const MAX_HELPER_STDOUT_BYTES: u64 = 64 * crate::text::KIB as u64;
+    const MAX_HELPER_STDERR_BYTES: u64 = 4 * crate::text::KIB as u64;
+
+    // Read while the helper runs, not after it exits: one that writes more than a pipe holds
+    // blocks until it is read, and would otherwise sit out the timeout. What is past the cap is
+    // read and dropped, for the same reason.
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+        max_bytes: u64,
+    ) -> Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>> {
+        pipe.map(|pipe| {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut kept = Vec::new();
+                let mut pipe = pipe;
+                (&mut pipe).take(max_bytes).read_to_end(&mut kept)?;
+                std::io::copy(&mut pipe, &mut std::io::sink())?;
+                Ok(kept)
+            })
+        })
+    }
+    let stdout_reader = drain(child.stdout.take(), MAX_HELPER_STDOUT_BYTES);
+    let stderr_reader = drain(child.stderr.take(), MAX_HELPER_STDERR_BYTES);
+    let collect = |reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>| match reader
+        .map(std::thread::JoinHandle::join)
+    {
+        None => Ok(Vec::new()),
+        Some(Ok(read)) => read,
+        Some(Err(_)) => Err(std::io::Error::other("the pipe reader panicked")),
+    };
+
     // `std::process::Child` has no `wait_timeout`, so the budget is a `try_wait` loop.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let status = loop {
@@ -155,6 +188,8 @@ fn run_headers_helper(
                 if std::time::Instant::now() >= deadline {
                     if let Err(error) = child.kill() {
                         tracing::debug!("failed to kill the headers helper: {error}");
+                    } else if let Err(error) = child.wait() {
+                        tracing::debug!("failed to reap the headers helper: {error}");
                     }
                     return Err(connection_error(format!(
                         "`headers_helper` '{script}' timed out after 15s"
@@ -170,22 +205,11 @@ fn run_headers_helper(
         }
     };
 
-    // stdout is the header list, rarely more than a few KiB; stderr is repeated verbatim in the
-    // error message, so it is kept tight.
-    const MAX_HELPER_STDOUT_BYTES: u64 = 64 * crate::text::KIB as u64;
-    const MAX_HELPER_STDERR_BYTES: u64 = 4 * crate::text::KIB as u64;
-
     if !status.success() {
-        let mut stderr_buffer = Vec::new();
-        if let Some(stderr) = child.stderr.take() {
-            use std::io::Read;
-            if let Err(error) = stderr
-                .take(MAX_HELPER_STDERR_BYTES)
-                .read_to_end(&mut stderr_buffer)
-            {
-                tracing::debug!("failed to read the headers helper's stderr: {error}");
-            }
-        }
+        let stderr_buffer = collect(stderr_reader).unwrap_or_else(|error| {
+            tracing::debug!("failed to read the headers helper's stderr: {error}");
+            Vec::new()
+        });
         let stderr_text = String::from_utf8_lossy(&stderr_buffer);
         return Err(connection_error(format!(
             "`headers_helper` '{}' exited with status {}: {}",
@@ -195,17 +219,11 @@ fn run_headers_helper(
         )));
     }
 
-    let mut stdout_buffer = Vec::new();
-    if let Some(pipe) = child.stdout.take() {
-        use std::io::Read;
-        pipe.take(MAX_HELPER_STDOUT_BYTES)
-            .read_to_end(&mut stdout_buffer)
-            .map_err(|error| {
-                connection_error(format!(
-                    "failed to read `headers_helper` '{script}' stdout: {error}"
-                ))
-            })?;
-    }
+    let stdout_buffer = collect(stdout_reader).map_err(|error| {
+        connection_error(format!(
+            "failed to read `headers_helper` '{script}' stdout: {error}"
+        ))
+    })?;
     let stdout = String::from_utf8_lossy(&stdout_buffer);
 
     parse_header_lines(&stdout).map_err(|message| {
@@ -362,6 +380,28 @@ mod tests {
             .expect_err("a bare name is not searched on PATH")
             .to_string();
         assert!(error.contains("is not a file"), "{error}");
+    }
+
+    /// A helper that writes more than a pipe holds, to stderr here, is read while it runs rather
+    /// than left blocked on the write until the timeout kills it.
+    #[cfg(unix)]
+    #[test]
+    fn a_chatty_headers_helper_still_finishes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nhead -c 262144 /dev/zero | tr '\\0' x >&2\nprintf 'X-Test: found\\n'\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let started = std::time::Instant::now();
+        let headers = run_headers_helper("s", "http://example.test", &script.to_string_lossy())
+            .expect("the helper's headers");
+        assert_eq!(headers.get("X-Test").map(String::as_str), Some("found"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]

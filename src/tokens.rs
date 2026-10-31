@@ -113,7 +113,9 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
             | ContentBlock::Nudge { text, .. }
             | ContentBlock::Inbox { text, .. }
             | ContentBlock::Scheduled { text, .. }
-            | ContentBlock::BackgroundReport { text, .. } => estimate_text(text),
+            | ContentBlock::BackgroundReport { text, .. }
+            | ContentBlock::Invocation { text, .. }
+            | ContentBlock::Resource { text, .. } => estimate_text(text),
             ContentBlock::Image { .. } => IMAGE_TOKENS,
             // The readable half only, which is the whole cost under `Signed` and an under-read
             // under `Sealed`: there the text is a summary and the reasoning is the sealed blob

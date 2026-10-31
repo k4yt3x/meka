@@ -118,19 +118,31 @@ impl ScreenLogs {
         self.receiver.try_recv().ok()
     }
 
-    /// Stop queuing and write what was queued to stderr, where it would have gone unqueued. Done
+    /// Stop queuing and write what was queued to stderr, where it would have gone unqueued: the
+    /// lines the user's own filter passes, the screen having queued the rest for `/log` alone. Done
     /// before an error is printed on the way out, so the lines read in the order they happened.
     pub(crate) fn release(&self) {
         RELAY.set_screen_attached(false);
-        while let Ok(line) = self.receiver.try_recv() {
-            crate::streams::write_stderr_line(format!(
-                "{} {:>5} {}: {}",
-                crate::text::format_timestamp(line.at, crate::text::Precision::Seconds),
-                line.level,
-                line.target,
-                line.message
-            ));
+        for line in self.drain_shown() {
+            crate::streams::write_stderr_line(line);
         }
+    }
+
+    /// The queued lines the user's filter passes, as stderr would have shown them, emptying the
+    /// queue.
+    fn drain_shown(&self) -> Vec<String> {
+        std::iter::from_fn(|| self.receiver.try_recv().ok())
+            .filter(|line| line.shown)
+            .map(|line| {
+                format!(
+                    "{} {:>5} {}: {}",
+                    crate::text::format_timestamp(line.at, crate::text::Precision::Seconds),
+                    line.level,
+                    line.target,
+                    line.message
+                )
+            })
+            .collect()
     }
 }
 
@@ -297,6 +309,28 @@ mod tests {
         // Held to here: once the receiver is gone the channel answers `Disconnected`, which never
         // blocks either, and the test would pass without a full queue.
         drop(receiver);
+    }
+
+    /// A queue handed back to stderr writes the lines the user's filter shows, not the ones the
+    /// screen queued at a finer level for `/log`.
+    #[test]
+    fn a_released_queue_writes_only_what_the_filter_shows() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        let logs = ScreenLogs { receiver };
+        for (message, shown) in [("kept", true), ("hidden", false)] {
+            sender
+                .send(LogLine {
+                    at: chrono::Utc::now(),
+                    level: tracing::Level::INFO,
+                    target: "meka".to_string(),
+                    message: message.to_string(),
+                    shown,
+                })
+                .expect("queue");
+        }
+        let lines = logs.drain_shown();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("meka: kept"), "{lines:?}");
     }
 
     /// An event's fields read as the formatting layer prints them: the message, then the rest.

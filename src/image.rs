@@ -12,15 +12,18 @@ use serde::{Deserialize, Serialize};
 /// MB, a safe ceiling across providers.
 pub(crate) const MAX_IMAGE_RAW_BYTES: usize = 3_750_000;
 
-/// Formats a multimodal provider (Claude, OpenAI) accepts directly in an `Image` content block.
-/// Anything else must be converted to PNG.
+/// Formats a multimodal provider (Claude, OpenAI) accepts directly in an `Image` content block:
+/// the four both document. Anything else must be converted to PNG.
 const NATIVE_FORMATS: &[ImageFormat] = &[
     ImageFormat::Png,
     ImageFormat::Jpeg,
     ImageFormat::Gif,
     ImageFormat::WebP,
-    ImageFormat::Bmp,
 ];
+
+/// The JPEG qualities a downscaled image is tried at, best first, until one fits
+/// [`MAX_IMAGE_RAW_BYTES`].
+const JPEG_QUALITIES: [u8; 4] = [85, 70, 55, 40];
 
 /// Classification of an input image for downstream handling.
 #[derive(Debug, PartialEq, Eq)]
@@ -66,6 +69,12 @@ pub(crate) fn classify_content_type(content_type: &str) -> ImageHandling {
         Some(format) => classify_format(format),
         None => ImageHandling::Unsupported,
     }
+}
+
+/// Whether `media_type` names a raster image format this build decodes: what a stored blob may be
+/// labeled, since the label is served back as a `Content-Type`.
+pub(crate) fn is_raster_media_type(media_type: &str) -> bool {
+    classify_content_type(media_type) != ImageHandling::Unsupported
 }
 
 /// Classify a file extension (lowercase, no leading dot).
@@ -237,13 +246,18 @@ pub(crate) fn read_image_dimensions(
 }
 
 /// Decode `bytes`, downscale (preserving aspect ratio) if either dimension exceeds `max_dim`, and
-/// re-encode as PNG. Provider-agnostic plumbing (called by the Claude provider, where Anthropic
-/// enforces a 2000 px cap on multi-image requests). Other providers shouldn't need this.
+/// re-encode within [`MAX_IMAGE_RAW_BYTES`], returning `(media_type, bytes)`. Provider-agnostic
+/// plumbing (called by the Claude provider, where Anthropic enforces a 2000 px cap on multi-image
+/// requests). Other providers shouldn't need this.
+///
+/// A photograph (a JPEG or WebP source) comes back as JPEG: as PNG, a 2000 px photo is several
+/// megabytes past the per-image ceiling, which the provider refuses. Anything else comes back as
+/// PNG, whose screenshots and diagrams compress well, and as JPEG only when the PNG does not fit.
 pub(crate) fn downscale_to_dim_cap(
     bytes: &[u8],
     source: ImageFormat,
     max_dim: u32,
-) -> Result<Vec<u8>, String> {
+) -> Result<(&'static str, Vec<u8>), String> {
     // Ask the header first. An image already inside the cap needs no work at all, and decoding it
     // only to re-encode the same pixels is the common case: every request would re-decode every
     // attached image, most of which are never oversized.
@@ -252,7 +266,7 @@ pub(crate) fn downscale_to_dim_cap(
         && height <= max_dim
         && source == ImageFormat::Png
     {
-        return Ok(bytes.to_vec());
+        return Ok(("image/png", bytes.to_vec()));
     }
 
     let decoded = decode_with_limits(bytes, source)?;
@@ -261,11 +275,31 @@ pub(crate) fn downscale_to_dim_cap(
     } else {
         decoded
     };
-    let mut out = Vec::new();
-    scaled
-        .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
-        .map_err(|error| format!("failed to re-encode image as PNG: {error}"))?;
-    Ok(out)
+    if !matches!(source, ImageFormat::Jpeg | ImageFormat::WebP) {
+        let mut png = Vec::new();
+        scaled
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .map_err(|error| format!("failed to re-encode image as PNG: {error}"))?;
+        if png.len() <= MAX_IMAGE_RAW_BYTES {
+            return Ok(("image/png", png));
+        }
+    }
+    let pixels = scaled.to_rgb8();
+    for quality in JPEG_QUALITIES {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality)
+            .encode_image(&pixels)
+            .map_err(|error| format!("failed to re-encode image as JPEG: {error}"))?;
+        if jpeg.len() <= MAX_IMAGE_RAW_BYTES {
+            return Ok(("image/jpeg", jpeg));
+        }
+    }
+    Err(format!(
+        "a {}x{} image does not fit {} even as a JPEG",
+        scaled.width(),
+        scaled.height(),
+        crate::text::format_size(MAX_IMAGE_RAW_BYTES)
+    ))
 }
 
 /// Run the classification pipeline end-to-end: reject what does not decode, pass through native
@@ -531,10 +565,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_content_type_bmp_alias_passes_through() {
+    fn classify_content_type_bmp_alias_converts() {
         assert_eq!(
             classify_content_type("image/x-ms-bmp"),
-            ImageHandling::PassThrough(ImageFormat::Bmp)
+            ImageHandling::Convert(ImageFormat::Bmp)
         );
     }
 
@@ -605,7 +639,7 @@ mod tests {
         );
         assert_eq!(
             classify_extension("bmp"),
-            ImageHandling::PassThrough(ImageFormat::Bmp)
+            ImageHandling::Convert(ImageFormat::Bmp)
         );
     }
 
@@ -993,7 +1027,8 @@ mod tests {
     #[test]
     fn downscale_to_dim_cap_resizes_oversized() {
         let png = synthesize_image_bytes_sized(ImageFormat::Png, 2400, 1200);
-        let out = downscale_to_dim_cap(&png, ImageFormat::Png, 2000).expect("ok");
+        let (media_type, out) = downscale_to_dim_cap(&png, ImageFormat::Png, 2000).expect("ok");
+        assert_eq!(media_type, "image/png");
         let decoded = image::load_from_memory_with_format(&out, ImageFormat::Png).expect("decode");
         assert!(decoded.width() <= 2000 && decoded.height() <= 2000);
         // Aspect ratio preserved (2:1).
@@ -1004,7 +1039,7 @@ mod tests {
     fn downscale_to_dim_cap_passes_through_dimensions_when_within_cap() {
         // Always re-encodes as PNG, but dimensions match the input when already within cap.
         let png = synthesize_image_bytes_sized(ImageFormat::Png, 800, 400);
-        let out = downscale_to_dim_cap(&png, ImageFormat::Png, 2000).expect("ok");
+        let (_, out) = downscale_to_dim_cap(&png, ImageFormat::Png, 2000).expect("ok");
         let decoded = image::load_from_memory_with_format(&out, ImageFormat::Png).expect("decode");
         assert_eq!((decoded.width(), decoded.height()), (800, 400));
     }
@@ -1012,9 +1047,35 @@ mod tests {
     #[test]
     fn downscale_to_dim_cap_handles_non_native_format() {
         let bmp = synthesize_image_bytes_sized(ImageFormat::Bmp, 2400, 600);
-        let png = downscale_to_dim_cap(&bmp, ImageFormat::Bmp, 2000).expect("ok");
+        let (media_type, png) = downscale_to_dim_cap(&bmp, ImageFormat::Bmp, 2000).expect("ok");
+        assert_eq!(media_type, "image/png");
         let decoded = image::load_from_memory_with_format(&png, ImageFormat::Png).expect("decode");
         assert!(decoded.width() <= 2000 && decoded.height() <= 2000);
+    }
+
+    /// A photograph downscaled to the cap stays a JPEG inside the per-image ceiling: as a PNG, a
+    /// photo at 2000 px is several megabytes past it, and the provider refuses an image over it.
+    #[test]
+    fn a_downscaled_photo_stays_a_jpeg_inside_the_ceiling() {
+        let mut seed: u32 = 0x2545_F491;
+        let photo = image::RgbImage::from_fn(1200, 900, |_, _| {
+            let mut channel = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed & 0xFF) as u8
+            };
+            image::Rgb([channel(), channel(), channel()])
+        });
+        let mut jpeg = Vec::new();
+        photo
+            .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .expect("encode");
+        let (media_type, out) = downscale_to_dim_cap(&jpeg, ImageFormat::Jpeg, 1000).expect("ok");
+        assert_eq!(media_type, "image/jpeg");
+        assert!(out.len() <= MAX_IMAGE_RAW_BYTES, "{} bytes", out.len());
+        let decoded = image::load_from_memory_with_format(&out, ImageFormat::Jpeg).expect("decode");
+        assert_eq!((decoded.width(), decoded.height()), (1000, 750));
     }
 
     #[test]

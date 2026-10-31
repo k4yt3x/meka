@@ -842,9 +842,9 @@ pub(super) enum FileRoute {
     /// A client exists and was asked, and answered that it cannot serve this path. The call runs
     /// against the local filesystem and says so.
     LocalUnservable,
-    /// The client served the *read* but offers no `fs.writeTextFile`, so the write had to go to
-    /// disk anyway. Distinct from [`FileRoute::LocalUnservable`] because here the client does hold
-    /// a buffer for the file, which the local write has just diverged from.
+    /// The client serves this path but offers no `fs.writeTextFile`, so the call reads and writes
+    /// the disk. Distinct from [`FileRoute::LocalUnservable`] because here the client does hold a
+    /// buffer for the file, which the local write diverges from.
     LocalWriteUnsupported,
 }
 
@@ -903,11 +903,10 @@ async fn read_local_text(canonical: &Path, tool_name: &str, path: &str) -> Resul
 
 /// Write `content` to `target` through `route`, returning the route the write *actually* took.
 ///
-/// The returned route is not always the one passed in: a client may offer `fs.readTextFile`
-/// without `fs.writeTextFile`, reading for us but expecting us to do the write ourselves, so a
-/// delegated read can still end on disk. The disclosure has to be built from what happened rather
-/// than from what was planned, or that case reports nothing while being the one where the client
-/// holds a buffer the write has just diverged from.
+/// The returned route is not always the one passed in: a client that answers the write
+/// [`Delegation::Local`] leaves it on disk. The disclosure has to be built from what happened
+/// rather than from what was planned, or that case reports nothing while being the one where the
+/// client holds a buffer the write has just diverged from.
 async fn apply_write(
     frontend: &Arc<dyn crate::frontend::Frontend>,
     route: FileRoute,
@@ -1013,7 +1012,7 @@ impl Tool for ReadFileTool {
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
-        let path = super::util::require_str_allowing_empty(&input, "path", "file_read")?;
+        let path = super::util::require_str(&input, "path", "file_read")?;
 
         let canonical = super::util::admit_read("file_read", &self.site, &path).await?;
 
@@ -1099,8 +1098,11 @@ impl Tool for ReadFileTool {
         let range = line_range(&input, "file_read")?;
         let regex = optional_str(&input, "regex", "file_read")?;
 
-        // Text reads delegate to the editor when it offers `fs.read_text_file`, so the model is
+        // Text reads delegate to the editor when it takes both reads and writes, so the model is
         // shown the document the editor will apply an edit against rather than the bytes under it.
+        // An editor that takes no writes leaves every edit to the disk, so the read is of the disk
+        // too: what the model reads is what its edit is computed from, and its stamp is the one
+        // the edit's freshness check compares.
         //
         // Including a regex read: there is no `fs/*` analog for searching, so the file is fetched
         // through the same route and filtered here, or a find-then-edit would search the disk while
@@ -1110,11 +1112,15 @@ impl Tool for ReadFileTool {
         // returns: a stamp of the slice would make every later `file_edit` report a false change,
         // and a cut at exactly `limit` lines would be indistinguishable from a file that ends
         // there.
-        let delegated = match context
-            .frontend
-            .delegate_fs_read(&canonical, None, None)
-            .await
-        {
+        let delegated = if !context.frontend.accepts_fs_writes() {
+            Delegation::Local
+        } else {
+            context
+                .frontend
+                .delegate_fs_read(&canonical, None, None)
+                .await
+        };
+        let delegated = match delegated {
             Delegation::Served(content) => Some(content),
             // The client will not serve this path, so it holds no buffer for it either: the local
             // bytes are not a degraded substitute for the delegate's view, they are the same view.
@@ -1357,14 +1363,9 @@ impl Tool for EditFileTool {
     ) -> Result<ToolOutput> {
         let path = require_str(&input, "path", "file_edit")?;
         let old_string = require_str(&input, "old_string", "file_edit")?;
-        let replace_all = input
-            .get("replace_all")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let force = input
-            .get("force")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let replace_all =
+            super::util::optional_bool(&input, "replace_all", "file_edit")?.unwrap_or(false);
+        let force = super::util::optional_bool(&input, "force", "file_edit")?.unwrap_or(false);
 
         // An empty `new_string` is the replacement that deletes `old_string`; an empty insertion
         // would insert nothing, so it counts as not asked for.
@@ -1464,6 +1465,12 @@ impl Tool for EditFileTool {
             .delegate_fs_read(&canonical, None, None)
             .await
         {
+            // The write will land on disk, so the edit is computed from disk: one computed from
+            // the buffer would carry the buffer's text over every edit already written.
+            Delegation::Served(_) if !context.frontend.accepts_fs_writes() => (
+                read_local_text(&canonical, "file_edit", &path).await?,
+                FileRoute::LocalWriteUnsupported,
+            ),
             Delegation::Served(text) => (text, FileRoute::Delegated),
             // The client cannot serve this path, so it holds no buffer for it and will not
             // accept the write either. Run the whole edit locally rather than refusing: an
@@ -1483,6 +1490,11 @@ impl Tool for EditFileTool {
             Delegation::Failed(error) if error.is_canceled() => {
                 return Err(MekaError::Interrupted);
             }
+            // The write goes to disk whatever the probe said, so disk is what the edit reads.
+            Delegation::Failed(_) if !context.frontend.accepts_fs_writes() => (
+                read_local_text(&canonical, "file_edit", &path).await?,
+                FileRoute::LocalWriteUnsupported,
+            ),
             // Any other failure has to short-circuit. The client may own this file and hold
             // unsaved changes; diffing against on-disk bytes and then writing the result
             // through the delegate would overwrite the user's unsaved work with an edit
@@ -1708,10 +1720,7 @@ impl Tool for WriteFileTool {
     ) -> Result<ToolOutput> {
         let path = require_str(&input, "path", "file_write")?;
         let content = super::util::require_str_allowing_empty(&input, "content", "file_write")?;
-        let force = input
-            .get("force")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let force = super::util::optional_bool(&input, "force", "file_write")?.unwrap_or(false);
 
         let (target, _write_guard) =
             resolve_write_target("file_write", &self.site.cwd, &self.scope, &path).await?;
@@ -1742,6 +1751,11 @@ impl Tool for WriteFileTool {
         // the delegate, but the `old_text` meka reasons from came off disk.
         let mut degraded_pre_read = false;
         let (old_text, route) = match context.frontend.delegate_fs_read(&target, None, None).await {
+            // As in `file_edit`: the write lands on disk, so disk is what it is judged against.
+            Delegation::Served(_) if !context.frontend.accepts_fs_writes() => (
+                local_old_text(&target).await,
+                FileRoute::LocalWriteUnsupported,
+            ),
             Delegation::Served(text) => {
                 let old = if text.is_empty() && !target.exists() {
                     None
@@ -1763,6 +1777,11 @@ impl Tool for WriteFileTool {
             Delegation::Failed(error) if error.is_canceled() => {
                 return Err(MekaError::Interrupted);
             }
+            // As above: the write goes to disk, so disk is the text it is judged against.
+            Delegation::Failed(_) if !context.frontend.accepts_fs_writes() => (
+                local_old_text(&target).await,
+                FileRoute::LocalWriteUnsupported,
+            ),
             // The client did not disown the path, it just failed this probe. The write still goes
             // to it; only the `old_text` is degraded. The route stays `Delegated` (the write really
             // does go to the client, and the disclosure has to say so) and the staleness check is
@@ -2001,6 +2020,10 @@ mod tests {
                 *buffer = content.to_string();
             }
             outcome
+        }
+
+        fn accepts_fs_writes(&self) -> bool {
+            !matches!(self.write, Delegation::Local)
         }
     }
 
@@ -2723,22 +2746,21 @@ mod tests {
         );
     }
 
+    /// A client may advertise `fs.readTextFile` without `fs.writeTextFile`: it reads for meka but
+    /// leaves the write to it, and its buffer does not follow what lands on disk. Each edit is
+    /// computed from disk, where the last one landed, so the second keeps the first, and each
+    /// result says the editor's buffer now differs.
     #[tokio::test]
-    async fn edit_file_discloses_local_write_when_client_cannot_write() {
-        // A client may advertise `fs.readTextFile` without `fs.writeTextFile`: it reads for us but
-        // expects us to do the write. The edit is then computed from its buffer and lands on disk,
-        // so the file it is showing the user now differs from what is stored, which the result
-        // has to say, even though the read was delegated.
+    async fn consecutive_edits_compose_when_the_client_takes_no_writes() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = temp_dir.path().join("open.md");
-        std::fs::write(&file_path, "stale disk bytes\n").expect("write");
+        std::fs::write(&file_path, "one\ntwo\n").expect("write");
         let canonical = crate::workspace::canonical_for_test(&file_path);
 
         let frontend = Arc::new(ScriptedDelegateFrontend {
-            read: Delegation::Served("unsaved buffer\n".to_string()),
-            // No `fs.writeTextFile` capability.
+            read: Delegation::Served("one\ntwo\n".to_string()),
             write: Delegation::Local,
-            buffer: std::sync::Mutex::new(Some("unsaved buffer\n".to_string())),
+            buffer: std::sync::Mutex::new(Some("one\ntwo\n".to_string())),
             delegated_writes: std::sync::Mutex::new(Vec::new()),
         });
         let tracker = tracker_for_test();
@@ -2748,30 +2770,90 @@ mod tests {
             read_tracker: tracker,
             site: crate::session::ToolSite::for_test().with_cwd(crate::workspace::cwd_for_test()),
         };
+        for (old_string, new_string) in [("one", "ONE"), ("two", "TWO")] {
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "path": file_path.to_str().expect("path"),
+                        "old_string": old_string,
+                        "new_string": new_string,
+                    }),
+                    crate::tools::ToolContext {
+                        frontend: frontend.clone(),
+                        ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    },
+                )
+                .await
+                .expect("edit applies");
+            assert!(!result.is_error, "{}", result.text_content());
+            assert!(
+                result.text_content().contains("does not accept writes"),
+                "divergence from the client's buffer must be disclosed, got: {}",
+                result.text_content(),
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "ONE\nTWO\n"
+        );
+    }
+
+    /// On the same client the read is of the disk too, so the whole-file write after it judges
+    /// freshness against what the read stamped: a change made on disk after the read is refused
+    /// rather than passed over as a read from another source.
+    #[tokio::test]
+    async fn a_write_is_judged_against_disk_when_the_client_takes_no_writes() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("open.md");
+        std::fs::write(&file_path, "as read\n").expect("write");
+        let tracker = tracker_for_test();
+        let frontend = Arc::new(ScriptedDelegateFrontend {
+            read: Delegation::Served("as read\n".to_string()),
+            write: Delegation::Local,
+            buffer: std::sync::Mutex::new(Some("as read\n".to_string())),
+            delegated_writes: std::sync::Mutex::new(Vec::new()),
+        });
+        let read = ReadFileTool {
+            read_tracker: tracker.clone(),
+            site: crate::session::ToolSite::for_test().with_cwd(crate::workspace::cwd_for_test()),
+        }
+        .execute(
+            serde_json::json!({"path": file_path.to_str().expect("path")}),
+            crate::tools::ToolContext {
+                frontend: frontend.clone(),
+                ..crate::tools::ToolContext::detached(CancellationToken::new())
+            },
+        )
+        .await
+        .expect("read");
+        assert!(!read.is_error, "{}", read.text_content());
+        std::fs::write(&file_path, "changed on disk since\n").expect("write");
+
+        let tool = WriteFileTool {
+            scope: crate::workspace::WriteScope::unconfined(),
+            read_tracker: tracker,
+            site: crate::session::ToolSite::for_test().with_cwd(crate::workspace::cwd_for_test()),
+        };
         let result = tool
             .execute(
                 serde_json::json!({
                     "path": file_path.to_str().expect("path"),
-                    "old_string": "unsaved buffer",
-                    "new_string": "edited buffer",
+                    "content": "from a stale copy\n",
                 }),
                 crate::tools::ToolContext {
-                    frontend: frontend.clone(),
+                    frontend,
                     ..crate::tools::ToolContext::detached(CancellationToken::new())
                 },
             )
             .await
-            .expect("edit must still apply");
+            .expect("write runs");
 
-        assert!(!result.is_error);
+        assert!(result.is_error, "{}", result.text_content());
+        assert!(result.text_content().contains("changed on disk"));
         assert_eq!(
             std::fs::read_to_string(&file_path).expect("read back"),
-            "edited buffer\n"
-        );
-        assert!(
-            result.text_content().contains("does not accept writes"),
-            "divergence from the client's buffer must be disclosed, got: {}",
-            result.text_content(),
+            "changed on disk since\n"
         );
     }
 

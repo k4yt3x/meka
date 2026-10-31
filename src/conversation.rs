@@ -399,11 +399,13 @@ impl Conversation {
     ///
     /// Read from the log rather than the view, because a compaction replaces the view's first user
     /// message with its summary and a label that changed when the session was reopened would name
-    /// nothing. The words are the first non-blank `Text` block of a user `Append` that is not a
-    /// stand-in meka wrote ([`is_harness_stand_in`]); a turn's context block is not a `Text`
-    /// block. The store's `title_of_first_user_row` selects the same row in SQL. A log pruned by
-    /// [`Self::prune_compacted_events`] starts at its last boundary and no longer holds the first
-    /// turn; every surface that labels a stored session reads the store's rows, which do.
+    /// nothing. The words are the first block of a user `Append` that carries a person's words by
+    /// [`ContentBlock::spoken_words`]: typed text that is not a stand-in meka wrote
+    /// ([`is_harness_stand_in`]), an inbox item's body, a fire's prompt, an invocation's words or
+    /// name; a turn's context block carries none. The store's `title_of_first_user_row` selects the
+    /// same row in SQL. A log pruned by [`Self::prune_compacted_events`] starts at its last
+    /// boundary and no longer holds the first turn; every surface that labels a stored session
+    /// reads the store's rows, which do.
     pub(crate) fn title(&self) -> String {
         self.title_within(TITLE_CHARS)
     }
@@ -908,11 +910,20 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
                         rewind.first = rewind.at;
                     }
                 }
+                // A summary something joined, as an interrupt joins the items that arrived onto
+                // a lone summary, still stands for its boundary: the list the boundary recorded
+                // is the checklist's baseline, and the marker is what a reader of the log shows.
+                let (source, marker) = match &rejoined {
+                    Some(taken) if matches!(taken.source, Source::Boundary(_)) => {
+                        (taken.source, taken.marker.clone())
+                    }
+                    _ => (Source::Append(index), None),
+                };
                 placed.push(Placed {
                     message: message.clone(),
-                    source: Source::Append(index),
+                    source,
                     origin: rejoined.map_or(index, |taken| taken.origin),
-                    marker: None,
+                    marker,
                 });
             }
             Event::CompactBoundary {
@@ -1384,6 +1395,12 @@ pub(crate) enum OpaqueReasoning {
         encrypted_content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        /// The origin of the endpoint that sealed it, `scheme://host[:port]`: only that endpoint
+        /// can open it, so it goes back there alone. `None` where nothing records which endpoint
+        /// it was, which sends it nowhere. Always written, so a block without the key is one the
+        /// migration has not reached.
+        #[serde(deserialize_with = "Option::deserialize")]
+        origin: Option<String>,
     },
     /// Chat Completions. The reasoning is the block's `thinking` text, and that text is what goes
     /// back, as the `reasoning_content` of its assistant message: DeepSeek's thinking mode
@@ -1482,6 +1499,105 @@ impl From<InboxClass> for String {
     }
 }
 
+/// What a [`ContentBlock::Invocation`] invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum InvocationKind {
+    /// A skill, named as it is installed.
+    Skill,
+    /// An MCP server's prompt, named `server:prompt`.
+    McpPrompt,
+}
+
+impl InvocationKind {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [InvocationKind; 2] = [Self::Skill, Self::McpPrompt];
+
+    /// The one spelling of this value, in the stored block and on the wire.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::McpPrompt => "mcp_prompt",
+        }
+    }
+}
+
+impl std::fmt::Display for InvocationKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for InvocationKind {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not an invocation kind. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl InvocationKind {
+    /// The stage direction a history says where a turn opened on an invocation of `name` begins,
+    /// live and on a replay alike; the words typed with it follow as the person's. The name is
+    /// sanitized because an MCP prompt's is the server's.
+    pub(crate) fn direction(self, name: &str) -> String {
+        let name = crate::text::sanitize_to_line(name, crate::text::NAME_WIDTH);
+        match self {
+            Self::Skill => format!("Running skill '{name}'."),
+            Self::McpPrompt => format!("Running prompt '{name}'."),
+        }
+    }
+}
+
+/// A user message's words with each resource an editor attached among them shown as its mention,
+/// `@name`, in the words' block: an editor sends the words around a mention as blocks of their
+/// own, and drawn apart they would read as separate prompts. A stand-in meka wrote stays a block
+/// of its own, as it is drawn without resources.
+pub(crate) fn mentions_inline(content: &[ContentBlock]) -> Vec<ContentBlock> {
+    let mut joined: Vec<ContentBlock> = Vec::new();
+    for block in content {
+        let piece = match block {
+            ContentBlock::Text { text } if !is_harness_stand_in(text) => text.clone(),
+            ContentBlock::Resource { name, .. } => format!("@{name}"),
+            other => {
+                joined.push(other.clone());
+                continue;
+            }
+        };
+        match joined.last_mut() {
+            Some(ContentBlock::Text { text }) if !is_harness_stand_in(text) => {
+                text.push_str(&piece);
+            }
+            _ => joined.push(ContentBlock::Text { text: piece }),
+        }
+    }
+    joined
+}
+
+impl TryFrom<String> for InvocationKind {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<InvocationKind> for String {
+    fn from(kind: InvocationKind) -> Self {
+        kind.name().to_string()
+    }
+}
+
 /// One block of a message, in the shape the session store persists and every provider maps from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1536,6 +1652,27 @@ pub(crate) enum ContentBlock {
         task_ids: Vec<String>,
         text: String,
     },
+    /// A skill or an MCP prompt somebody invoked by name, as the model read it: `text` is what the
+    /// invocation expanded to, behind the words typed with it for a skill (an MCP prompt renders
+    /// its arguments itself), and `directive` those words alone, a file an editor attached among
+    /// them named in place by its mention (`@name`), blank when none were typed. Its own block, so
+    /// a title, a search and a replay read what was done rather than the body it expanded to. A
+    /// user message that carries one carries nothing else that was sent with it but its images.
+    Invocation {
+        kind: InvocationKind,
+        name: String,
+        directive: String,
+        text: String,
+    },
+    /// A resource an editor attached among the person's words, as the model read it: `text` is
+    /// the resource's tag, with its contents inside when the editor sent them, and `uri` and
+    /// `name` are what an editor shows of it. Its own block, in the place it was attached, so a
+    /// replay shows the mention rather than the contents and a title reads the words around it.
+    Resource {
+        uri: String,
+        name: String,
+        text: String,
+    },
     /// Image supplied as *input* (e.g. an ACP client's @-mention or pasted screenshot). Distinct
     /// from a tool result's image, which travels inside [`ContentBlock::ToolResult`] as a
     /// [`ToolResultContent::Image`].
@@ -1587,14 +1724,18 @@ impl ContentBlock {
     /// The block as one searchable string, labeled by what it is where it is not plain text, or
     /// `None` for a block that holds no words: an image, and the context block meka writes ahead
     /// of a turn. The one definition of a block's text for search, read by the
-    /// `conversation_search` tool over every block and by the session search index over the
-    /// `Text` blocks alone, so what one finds the other can.
+    /// `conversation_search` tool over every block; the session search index reads the person's
+    /// words alone, by [`Self::spoken_words`].
     pub(crate) fn search_text(&self) -> Option<String> {
         match self {
             ContentBlock::Text { text }
             | ContentBlock::Inbox { text, .. }
             | ContentBlock::Scheduled { text, .. }
-            | ContentBlock::BackgroundReport { text, .. } => Some(text.clone()),
+            | ContentBlock::BackgroundReport { text, .. }
+            | ContentBlock::Resource { text, .. } => Some(text.clone()),
+            ContentBlock::Invocation {
+                kind, name, text, ..
+            } => Some(format!("[{kind}: {name}] {text}")),
             ContentBlock::TurnContext { .. }
             | ContentBlock::Nudge { .. }
             | ContentBlock::Image { .. } => None,
@@ -1621,13 +1762,22 @@ impl ContentBlock {
 
     /// The words a person sent in this block, for a title and the search index: typed text, an
     /// inbox item's body under the header meka wrote, a scheduled job's prompt under its fire
-    /// header. `None` for what meka wrote, a stand-in it put where content was included, and for
-    /// a block that holds no words.
+    /// header, the words typed with an invocation (a file attached among them by its mention, as
+    /// the editor showed it) or, with none, the name it invoked. `None` for what meka wrote, a
+    /// stand-in it put where content was included, a resource block of its own, and for a block
+    /// that holds no words.
     pub(crate) fn spoken_words(&self) -> Option<&str> {
         match self {
             ContentBlock::Text { text } if !is_harness_stand_in(text) => Some(text.as_str()),
             ContentBlock::Inbox { body, .. } => Some(body.as_str()),
             ContentBlock::Scheduled { prompt, .. } => Some(prompt.as_str()),
+            ContentBlock::Invocation {
+                name, directive, ..
+            } => Some(if crate::text::is_blank(directive) {
+                name.as_str()
+            } else {
+                directive.as_str()
+            }),
             _ => None,
         }
     }
@@ -1751,6 +1901,37 @@ impl Message {
         }
     }
 
+    /// An opening as an editor's `/review the parser` with a file attached among words sends it:
+    /// the context block, the invocation, then the words and the resource in their places.
+    #[cfg(test)]
+    pub(crate) fn invoked_with_a_resource_for_test() -> Self {
+        Self {
+            role: Role::User,
+            content: vec![
+                ContentBlock::TurnContext {
+                    text: "<context/>".to_string(),
+                },
+                ContentBlock::Invocation {
+                    kind: InvocationKind::Skill,
+                    name: "review".to_string(),
+                    directive: "the parser".to_string(),
+                    text: "the parser\n\nthe skill's body".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "compare ".to_string(),
+                },
+                ContentBlock::Resource {
+                    uri: "file:///a.rs".to_string(),
+                    name: "a.rs".to_string(),
+                    text: "<resource uri=\"file:///a.rs\">fn a() {}</resource>".to_string(),
+                },
+                ContentBlock::Text {
+                    text: " with the old one".to_string(),
+                },
+            ],
+        }
+    }
+
     /// User message carrying a text block followed by zero or more input images; `images` empty
     /// yields the same shape as [`Message::user`].
     #[cfg(test)]
@@ -1799,7 +1980,36 @@ impl Message {
             .filter_map(|block| match block {
                 ContentBlock::Text { text }
                 | ContentBlock::Inbox { text, .. }
-                | ContentBlock::Scheduled { text, .. } => Some(text.as_str()),
+                | ContentBlock::Scheduled { text, .. }
+                | ContentBlock::Invocation { text, .. }
+                | ContentBlock::Resource { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// A user message's words as a history shows them, a blank line between: what was typed with
+    /// each attached resource as its mention among the words, an invocation as what was invoked
+    /// and the words typed with it, an inbox item and a fire as the model read them. Never an
+    /// invocation's body or a resource's contents, which are the model's to read.
+    pub(crate) fn shown_words(&self) -> String {
+        mentions_inline(&self.content)
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text }
+                | ContentBlock::Inbox { text, .. }
+                | ContentBlock::Scheduled { text, .. } => Some(text.clone()),
+                ContentBlock::Invocation {
+                    kind,
+                    name,
+                    directive,
+                    ..
+                } => Some(if crate::text::is_blank(directive) {
+                    format!("*{}*", kind.direction(name))
+                } else {
+                    format!("*{}*\n\n{}", kind.direction(name), directive.trim())
+                }),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1818,7 +2028,9 @@ impl Message {
                 | ContentBlock::Nudge { text, .. }
                 | ContentBlock::Inbox { text, .. }
                 | ContentBlock::Scheduled { text, .. }
-                | ContentBlock::BackgroundReport { text, .. } => Some(text.as_str()),
+                | ContentBlock::BackgroundReport { text, .. }
+                | ContentBlock::Invocation { text, .. }
+                | ContentBlock::Resource { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1984,10 +2196,9 @@ pub(crate) fn format_session_as_markdown(
     let mut output = String::new();
     writeln!(output, "# Session {session_id}\n").ok();
 
-    // Walk the raw event log so the full conversation is exported, including turns a compaction
+    // Walk the log as history so the full conversation is exported, including turns a compaction
     // later hid from the model. Each `CompactBoundary` becomes a marker; the turns it summarized
-    // stay above it (the kept tail is re-appended after it, so the recent turns appear on both
-    // sides of the marker, as stored).
+    // stay above it, and the turns it kept are said once, above it, where they were first said.
     for event in events {
         match event {
             Event::Append(message) => {
@@ -2106,7 +2317,7 @@ pub(crate) fn write_message_markdown(
                 writeln!(output, "{report}\n").ok();
                 reported = true;
             }
-            let words = message.text_paragraphs();
+            let words = message.shown_words();
             if !words.is_empty() {
                 writeln!(output, "## User\n").ok();
                 writeln!(output, "{words}\n").ok();
@@ -2142,6 +2353,8 @@ pub(crate) fn write_message_markdown(
                     | crate::conversation::ContentBlock::Inbox { .. }
                     | crate::conversation::ContentBlock::Scheduled { .. }
                     | crate::conversation::ContentBlock::BackgroundReport { .. }
+                    | crate::conversation::ContentBlock::Invocation { .. }
+                    | crate::conversation::ContentBlock::Resource { .. }
                     | crate::conversation::ContentBlock::Thinking { .. }
                     | crate::conversation::ContentBlock::RedactedThinking { .. }
                     | crate::conversation::ContentBlock::Image { .. } => {}
@@ -2280,9 +2493,67 @@ mod tests {
         assert_eq!(conversation.title(), "find rust files");
     }
 
-    /// What meka put in place of an attachment is a `Text` block like the words, and is not a
-    /// title: a first turn that carried only an image has none, whether the image was redacted by
-    /// the budget or replaced by a harness note, until a user says something.
+    /// A session opened on an invocation is named by the words typed with it, or by what it
+    /// invoked when none were, never by the body it expanded to; a resource an editor attached is
+    /// not words, and the words after it name the session.
+    #[test]
+    fn a_title_reads_an_invocation_and_not_its_body() {
+        let invoked = |directive: &str| {
+            Conversation::from_vec(vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::TurnContext {
+                        text: "<context/>".to_string(),
+                    },
+                    ContentBlock::Invocation {
+                        kind: InvocationKind::Skill,
+                        name: "review".to_string(),
+                        directive: directive.to_string(),
+                        text: format!(
+                            "{directive}\n\nBase directory for this skill: /skills/review"
+                        ),
+                    },
+                ],
+            }])
+        };
+        assert_eq!(invoked("the parser").title(), "the parser");
+        assert_eq!(invoked(" ").title(), "review");
+        let attached = Conversation::from_vec(vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Resource {
+                    uri: "file:///a.rs".to_string(),
+                    name: "a.rs".to_string(),
+                    text: "<resource uri=\"file:///a.rs\">fn main() {}</resource>".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "explain it".to_string(),
+                },
+            ],
+        }]);
+        assert_eq!(attached.title(), "explain it");
+    }
+
+    /// The Markdown export says what was done, as every history does: an invocation as what was
+    /// invoked and the words typed with it, an attached file as its mention, never the skill's body
+    /// or the file's contents.
+    #[test]
+    fn the_export_shows_an_invocation_and_a_file_as_what_was_done() {
+        let markdown = format_session_as_markdown(
+            uuid::Uuid::nil(),
+            &[Event::Append(Message::invoked_with_a_resource_for_test())],
+            &std::collections::HashMap::new(),
+        );
+        assert!(markdown.contains("*Running skill 'review'.*"), "{markdown}");
+        assert!(markdown.contains("the parser"), "{markdown}");
+        assert!(
+            markdown.contains("compare @a.rs with the old one"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("the skill's body"), "{markdown}");
+        assert!(!markdown.contains("fn a() {}"), "{markdown}");
+    }
+
     /// A session opened on an inbox item is named by the message, not by the header meka wrote
     /// above it.
     #[test]
@@ -2312,6 +2583,9 @@ mod tests {
         assert_eq!(unnamed.title(), "What is 6+6?");
     }
 
+    /// What meka put in place of an attachment is a `Text` block like the words, and is not a
+    /// title: a first turn that carried only an image has none, whether the image was redacted by
+    /// the budget or replaced by a harness note, until a user says something.
     #[test]
     fn a_title_skips_what_meka_put_in_place_of_an_attachment() {
         let image = ImageSource::Base64 {
@@ -2757,6 +3031,7 @@ mod tests {
             opaque: Some(OpaqueReasoning::Sealed {
                 encrypted_content: "sealed".to_string(),
                 id: None,
+                origin: Some("https://chatgpt.com".to_string()),
             }),
         };
         let message = Message {
@@ -3308,6 +3583,45 @@ mod tests {
         assert_eq!(rewinds(&stamped(&summary_joined)), vec![rewind(
             2, 2, 1, true
         )]);
+    }
+
+    /// Items an interrupt joins onto a lone summary leave the summary standing for its boundary:
+    /// the checklist the boundary recorded is still the baseline, and the log's reader still sees
+    /// the compaction.
+    #[test]
+    fn a_summary_something_joined_still_stands_for_its_boundary() {
+        let mut checklist = crate::checklist::ChecklistState::default();
+        checklist.add(vec![crate::checklist::NewItem {
+            text: "keep going".to_string(),
+            status: crate::checklist::ChecklistStatus::Pending,
+        }]);
+        let mut steered = Message::user("summary");
+        steered.content.push(ContentBlock::Text {
+            text: "and this".to_string(),
+        });
+        let events = vec![
+            Event::Append(Message::user("old turn")),
+            Event::CompactBoundary {
+                summary: Message::user("summary"),
+                replaced_count: 1,
+                record: CompactionRecord::for_test(),
+                loaded_tools_snapshot: Default::default(),
+                checklist_snapshot: checklist.clone(),
+            },
+            Event::Repair {
+                replaced_count: 1,
+                messages: Vec::new(),
+            },
+            Event::Append(steered),
+        ];
+        let conversation = Conversation::from_events(events.clone());
+        assert_eq!(conversation.checklist_baseline().0, checklist);
+        let stamped: Vec<(usize, Event)> = events.into_iter().enumerate().collect();
+        let view = materialize_annotated(&stamped);
+        assert!(
+            view.markers[0].is_some(),
+            "the compaction left the log's view"
+        );
     }
 
     #[test]

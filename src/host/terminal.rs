@@ -125,12 +125,15 @@ pub(crate) fn install_interrupt_handler(
 
     let leave: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(leave);
     // A hangup or a termination has no ladder: the terminal is going or gone, so the turn is
-    // stopped and the host leaves through its own exit, which kills a `!command` still running
-    // and gives the terminal back where there is one.
+    // stopped, and the background tasks with it, whose process groups would otherwise outlive the
+    // exit untracked; then the host leaves through its own exit, which kills a `!command` still
+    // running and gives the terminal back where there is one.
     #[cfg(unix)]
     tokio::spawn({
         let leave = std::sync::Arc::clone(&leave);
         let cancel = cancel.clone();
+        let tasks = agent.background_tasks();
+        let store = agent.store();
         async move {
             use tokio::signal::unix::{SignalKind, signal};
             let (Ok(mut hangup), Ok(mut terminate)) = (
@@ -145,6 +148,21 @@ pub(crate) fn install_interrupt_handler(
                 _ = terminate.recv() => {}
             }
             cancel.cancel(crate::store::turns::CancelReason::ServerShutdown);
+            // The process is going away under them, which is what `interrupted` says.
+            tasks
+                .stop_all(
+                    &store.background_store(),
+                    crate::store::background::TaskStatus::Interrupted,
+                )
+                .await;
+            if tokio::time::timeout(INTERRUPT_DRAIN_GRACE, tasks.wait_all())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "background tasks did not unwind within {INTERRUPT_DRAIN_GRACE:?}; exiting anyway"
+                );
+            }
             leave();
         }
     });
@@ -162,7 +180,12 @@ pub(crate) fn install_interrupt_handler(
                 // `count_press` has already fired the turn's token, when there was one.
                 Escalation::CancelTurn => {}
                 Escalation::CancelBackgroundTasks => {
-                    let signaled = cancel_background_tasks(&tasks, &store).await;
+                    let signaled = tasks
+                        .stop_all(
+                            &store.background_store(),
+                            crate::store::background::TaskStatus::Canceled,
+                        )
+                        .await;
                     if let Some(notice) = background_cancellation_notice(signaled) {
                         announce(&notice);
                     }
@@ -182,29 +205,6 @@ pub(crate) fn install_interrupt_handler(
             }
         }
     });
-}
-/// Stop every background task of this process, recording each as canceled first so what the
-/// agent hears is "you stopped it" rather than the `failed` its own interruption would write.
-/// Returns how many were signaled.
-pub(crate) async fn cancel_background_tasks(
-    tasks: &crate::background::BackgroundTasks,
-    store: &Store,
-) -> usize {
-    for id in tasks.task_ids().await {
-        if let Err(error) = store
-            .background_store()
-            .finish_background_task(
-                &id,
-                crate::store::background::TaskStatus::Canceled,
-                None,
-                None,
-            )
-            .await
-        {
-            tracing::warn!("failed to record task {id} as canceled: {error}");
-        }
-    }
-    tasks.cancel_all().await
 }
 /// Publish a turn's token where Ctrl+C reaches it, and start the escalation count over: the
 /// first press of a new turn cancels that turn, whatever happened during the last one.
@@ -255,6 +255,7 @@ pub(crate) async fn compact_interruptible(
 /// tool and sub-agent it spawned. Every `run_turn` callsite on the screen / CLI path must go
 /// through here; a bare `CancellationToken` with no signal source silently swallows Ctrl+C.
 pub(crate) async fn run_turn_interruptible(
+    shared: &crate::host::SharedDeps,
     cancel: &crate::host::CancelCell,
     admission: crate::host::Admission,
     agent: &Agent,
@@ -262,6 +263,17 @@ pub(crate) async fn run_turn_interruptible(
     messages: &mut crate::conversation::Conversation,
     input: crate::agent::TurnInput,
 ) -> crate::error::Result<crate::agent::TurnOutcome> {
+    // The row is the carrier, as on every server's turn doors: a rename another process made
+    // moves the row, and the turn runs on what the row names now rather than on what this
+    // process last read.
+    if let Some(id) = *session_id
+        && let Err(error) = crate::host::apply_recorded_bindings(shared, agent, id).await
+    {
+        return Err(match error.downcast::<crate::error::MekaError>() {
+            Ok(error) => error,
+            Err(error) => crate::error::MekaError::Internal(format!("{error:#}")),
+        });
+    }
     let cancellation = crate::agent::TurnCancellation::new();
     let _published = publish_for_interrupts(cancel, admission, cancellation.clone());
     // The screen does not surface a stop reason; `--oneshot --format json` reports it.
@@ -312,7 +324,7 @@ mod tests {
         let token = crate::agent::TurnCancellation::new();
         let published = cancel.publish(token.clone(), cancel.admit());
         assert_eq!(relay.count_press(&cancel), 1);
-        assert!(token.is_cancelled(), "the first press cancels the turn");
+        assert!(token.is_canceled(), "the first press cancels the turn");
         assert_eq!(
             relay.count_press(&cancel),
             2,

@@ -55,7 +55,6 @@ fn probe_window(request_timeout: Duration) -> Duration {
 pub(super) async fn run_connector(
     pending: Vec<Arc<ServerEntry>>,
     manager: Arc<McpClientManager>,
-    mcp_default_permission: Option<Permission>,
     runtime: McpRuntimeConfig,
     settled: tokio::sync::watch::Sender<bool>,
 ) {
@@ -84,7 +83,7 @@ pub(super) async fn run_connector(
         .map(move |entry| {
             let manager = Arc::clone(&stdio_manager);
             async move {
-                connect_one(entry, manager, mcp_default_permission, timeout).await;
+                connect_one(entry, manager, timeout).await;
             }
         })
         .buffer_unordered(stdio_limit)
@@ -94,7 +93,7 @@ pub(super) async fn run_connector(
         .map(move |entry| {
             let manager = Arc::clone(&http_manager);
             async move {
-                connect_one(entry, manager, mcp_default_permission, timeout).await;
+                connect_one(entry, manager, timeout).await;
             }
         })
         .buffer_unordered(http_limit)
@@ -114,7 +113,6 @@ pub(super) async fn run_connector(
             tokio::spawn(retry_until_connected(
                 entry,
                 Arc::downgrade(&manager),
-                mcp_default_permission,
                 timeout,
                 INITIAL_RETRY_BACKOFF,
             ));
@@ -143,7 +141,6 @@ pub(super) async fn run_connector(
 pub(super) async fn retry_until_connected(
     entry: Arc<ServerEntry>,
     manager: std::sync::Weak<McpClientManager>,
-    mcp_default_permission: Option<Permission>,
     connect_timeout: Duration,
     initial_backoff: Duration,
 ) {
@@ -183,13 +180,7 @@ pub(super) async fn retry_until_connected(
             if !matches!(entry.state().await, ServerState::Failed { .. }) {
                 return;
             }
-            connect_one(
-                Arc::clone(&entry),
-                manager,
-                mcp_default_permission,
-                connect_timeout,
-            )
-            .await;
+            connect_one(Arc::clone(&entry), manager, connect_timeout).await;
         }
 
         if !matches!(entry.state().await, ServerState::Failed { .. }) {
@@ -275,7 +266,6 @@ pub(super) async fn record_connect_failure(
 pub(crate) async fn connect_one(
     entry: Arc<ServerEntry>,
     manager: Arc<McpClientManager>,
-    mcp_default_permission: Option<Permission>,
     connect_timeout: std::time::Duration,
 ) {
     let server_name = entry.server_name.clone();
@@ -365,7 +355,7 @@ pub(crate) async fn connect_one(
     // holds this task open for the life of the process.
     let discovery = tokio::time::timeout(
         connect_timeout,
-        discover_and_register_tools(&entry, mcp_default_permission, &manager),
+        discover_and_register_tools(&entry, &manager),
     )
     .await
     .unwrap_or_else(|_elapsed| {
@@ -398,18 +388,11 @@ pub(crate) async fn connect_one(
 /// carries both facts to every registry, the ones attached now and the ones that attach later.
 async fn discover_and_register_tools(
     entry: &Arc<ServerEntry>,
-    mcp_default_permission: Option<Permission>,
     manager: &Arc<McpClientManager>,
 ) -> Result<usize> {
-    let (adapters, policy) = build_mcp_tools(
-        entry,
-        mcp_default_permission,
-        super::DEFAULT_MCP_REQUEST_TIMEOUT,
-    )
-    .await?;
-    let registered_count = adapters.len();
-    manager.register_server_tools(entry, adapters, policy).await;
-    Ok(registered_count)
+    manager
+        .list_and_register(entry, super::DEFAULT_MCP_REQUEST_TIMEOUT)
+        .await
 }
 
 /// The raw name that already took `namespaced` on this server, or `None` after recording `raw`
@@ -638,7 +621,13 @@ fn challenged(error: &rmcp::service::ClientInitializeError) -> bool {
     let rmcp::service::ClientInitializeError::TransportError { error, .. } = error else {
         return false;
     };
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error.error.as_ref());
+    chain_holds_auth_required(error.error.as_ref())
+}
+
+/// Whether `error` or anything down its chain is rmcp's `AuthRequiredError`: a 401 challenge, at
+/// a handshake or at any request after it.
+pub(super) fn chain_holds_auth_required(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(cause) = current {
         if cause
             .downcast_ref::<rmcp::transport::streamable_http_client::AuthRequiredError>()
@@ -687,10 +676,10 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
                 // inherited environment hands it every variable meka was started with:
                 // `ANTHROPIC_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, the lot. Configuring a server is a
                 // decision to run its code, not a decision to hand it every credential on the
-                // machine. What survives is the same curated base a read-mode shell gets (`PATH`,
-                // `HOME`, locale), so servers still resolve their own binaries; a server that
-                // genuinely needs a secret asks for it by name, and `${VAR}` in the `env` table
-                // still reads it from meka's environment.
+                // machine. What survives is the same curated base a shell confined at `read` gets
+                // (`PATH`, `HOME`, locale), so servers still resolve their own binaries; a server
+                // that genuinely needs a secret asks for it by name, and `${VAR}` in the `env`
+                // table still reads it from meka's environment.
                 command.env_clear();
                 command.envs(crate::sandbox::sandbox_child_env());
                 if let Some(env) = &config.env {
@@ -997,6 +986,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            renewal_refused: std::sync::atomic::AtomicU64::new(0),
             removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
@@ -1004,6 +994,8 @@ mod tests {
             request_timeout: std::sync::OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            listings: crate::mcp::ToolListings::default(),
+            connection: std::sync::atomic::AtomicU64::new(0),
             subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
             legacy_era: std::sync::atomic::AtomicBool::new(false),
             connects: crate::mcp::Connects::new(),
@@ -1032,6 +1024,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            renewal_refused: std::sync::atomic::AtomicU64::new(0),
             removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
@@ -1039,6 +1032,8 @@ mod tests {
             request_timeout: std::sync::OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            listings: crate::mcp::ToolListings::default(),
+            connection: std::sync::atomic::AtomicU64::new(0),
             subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
             legacy_era: std::sync::atomic::AtomicBool::new(false),
             connects: crate::mcp::Connects::new(),
@@ -1055,7 +1050,6 @@ mod tests {
         connect_one(
             Arc::clone(&entry),
             manager,
-            None,
             std::time::Duration::from_secs(5),
         )
         .await;
@@ -1104,6 +1098,7 @@ mod tests {
                 needs: None,
             }),
             reconnect_lock: Mutex::new(()),
+            renewal_refused: std::sync::atomic::AtomicU64::new(0),
             removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: Some(reason.to_string()),
@@ -1111,6 +1106,8 @@ mod tests {
             request_timeout: std::sync::OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            listings: crate::mcp::ToolListings::default(),
+            connection: std::sync::atomic::AtomicU64::new(0),
             subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
             legacy_era: std::sync::atomic::AtomicBool::new(false),
             connects: crate::mcp::Connects::new(),
@@ -1128,7 +1125,6 @@ mod tests {
         connect_one(
             Arc::clone(&entry),
             manager,
-            None,
             std::time::Duration::from_secs(5),
         )
         .await;
@@ -1164,6 +1160,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            renewal_refused: std::sync::atomic::AtomicU64::new(0),
             removed: tokio_util::sync::CancellationToken::new(),
             tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
@@ -1171,6 +1168,8 @@ mod tests {
             request_timeout: OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            listings: crate::mcp::ToolListings::default(),
+            connection: std::sync::atomic::AtomicU64::new(0),
             subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
             legacy_era: std::sync::atomic::AtomicBool::new(false),
             connects: crate::mcp::Connects::new(),
@@ -1191,7 +1190,6 @@ mod tests {
         connect_one(
             Arc::clone(&entry),
             manager,
-            None,
             std::time::Duration::from_millis(50),
         )
         .await;
@@ -1245,7 +1243,6 @@ mod tests {
         let handle = tokio::spawn(retry_until_connected(
             Arc::clone(&entry),
             Arc::downgrade(&manager),
-            None,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_millis(10),
         ));
@@ -1270,7 +1267,6 @@ mod tests {
         let handle = tokio::spawn(retry_until_connected(
             Arc::clone(&entry),
             Arc::downgrade(&manager),
-            None,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_millis(10),
         ));
@@ -1296,7 +1292,6 @@ mod tests {
         let handle = tokio::spawn(retry_until_connected(
             Arc::clone(&entry),
             Arc::downgrade(&manager),
-            None,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_millis(10),
         ));
@@ -1331,7 +1326,6 @@ mod tests {
         let handle = tokio::spawn(retry_until_connected(
             Arc::clone(&entry),
             Arc::downgrade(&manager),
-            None,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_millis(10),
         ));

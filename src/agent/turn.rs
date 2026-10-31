@@ -56,7 +56,10 @@ pub(crate) struct TurnInput {
 }
 
 enum Prompt {
-    Typed(String),
+    /// What somebody sent, as the blocks the turn's message carries them in: typed words, an
+    /// invocation, the resources an editor attached among the words, in the order sent. Empty
+    /// for a turn opened on images or inbox items alone.
+    Sent(Vec<ContentBlock>),
     /// A scheduled job's fire: the job, its words, the text the model reads, header and gate
     /// output included, and how late it was when that is worth announcing.
     Scheduled {
@@ -79,8 +82,39 @@ impl TurnInput {
         if prompt.trim().is_empty() && images.is_empty() {
             return Err(MekaError::EmptyPrompt);
         }
+        let words = if prompt.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text { text: prompt }]
+        };
         Ok(Self {
-            prompt: Prompt::Typed(prompt),
+            prompt: Prompt::Sent(words),
+            images,
+            retention: PromptRetention::Keep,
+            riding: Vec::new(),
+            inbox: Vec::new(),
+            origin: crate::provider::TurnOrigin::Human,
+            turn_id: Uuid::new_v4(),
+        })
+    }
+
+    /// What was sent as blocks: an editor's words and the resources attached among them in its
+    /// order, an invocation from [`crate::skills::invocation`] or an MCP prompt. Refused when it
+    /// holds nothing but blank words and no image, for the reason [`Self::from_parts`] refuses
+    /// blank text.
+    pub(crate) fn sent(
+        parts: Vec<ContentBlock>,
+        images: Vec<ImageSource>,
+    ) -> crate::error::Result<Self> {
+        let says_something = parts.iter().any(|part| match part {
+            ContentBlock::Text { text } => !crate::text::is_blank(text),
+            _ => true,
+        });
+        if !says_something && images.is_empty() {
+            return Err(MekaError::EmptyPrompt);
+        }
+        Ok(Self {
+            prompt: Prompt::Sent(parts),
             images,
             retention: PromptRetention::Keep,
             riding: Vec::new(),
@@ -126,7 +160,7 @@ impl TurnInput {
             return Err(MekaError::EmptyPrompt);
         }
         Ok(Self {
-            prompt: Prompt::Typed(String::new()),
+            prompt: Prompt::Sent(Vec::new()),
             images: Vec::new(),
             retention: PromptRetention::Keep,
             riding: Vec::new(),
@@ -136,12 +170,12 @@ impl TurnInput {
         })
     }
 
-    /// The typed words after a host expanded a slash command in them. The prompt was admitted on
-    /// what the user typed, ahead of the session being taken, and an expansion only adds to it;
-    /// nothing to replace on a batch of outcomes, which no host expands.
-    pub(crate) fn with_words(mut self, words: String) -> Self {
-        if let Prompt::Typed(text) = &mut self.prompt {
-            *text = words;
+    /// What was sent after a host expanded a slash command in it. The prompt was admitted on what
+    /// was sent, ahead of the session being taken, and an expansion only adds to it; nothing to
+    /// replace on a fire or a batch of outcomes, which no host expands.
+    pub(crate) fn expanded(mut self, parts: Vec<ContentBlock>) -> Self {
+        if let Prompt::Sent(sent) = &mut self.prompt {
+            *sent = parts;
         }
         self
     }
@@ -190,33 +224,36 @@ impl TurnInput {
         self
     }
 
-    /// The words the turn answers, for a compaction to quote: as typed, a scheduled job's own,
-    /// or nothing for a turn that only delivers background outcomes.
+    /// The words the turn answers, for a compaction to quote: what was sent as the model reads
+    /// it, a scheduled job's own, or nothing for a turn that only delivers background outcomes.
     fn words(&self) -> String {
         match &self.prompt {
-            Prompt::Typed(text) => text.clone(),
+            Prompt::Sent(parts) => Message {
+                role: crate::conversation::Role::User,
+                content: parts.clone(),
+            }
+            .text_paragraphs(),
             Prompt::Scheduled { prompt, .. } => prompt.clone(),
             Prompt::Outcomes(_) => String::new(),
         }
     }
 
-    /// The words as the block the turn's message carries: typed text, or a scheduled job's fire;
-    /// `None` for a turn opened on a report, an image or inbox items alone.
-    fn spoken(&self) -> Option<ContentBlock> {
+    /// The words as the blocks the turn's message carries: what was sent, or a scheduled job's
+    /// fire; none for a turn opened on a report, an image or inbox items alone.
+    fn spoken(&self) -> Vec<ContentBlock> {
         match &self.prompt {
-            Prompt::Typed(text) if text.is_empty() => None,
-            Prompt::Typed(text) => Some(ContentBlock::Text { text: text.clone() }),
+            Prompt::Sent(parts) => parts.clone(),
             Prompt::Scheduled {
                 job_id,
                 prompt,
                 text,
                 ..
-            } => Some(ContentBlock::Scheduled {
+            } => vec![ContentBlock::Scheduled {
                 job_id: job_id.clone(),
                 prompt: prompt.clone(),
                 text: text.clone(),
-            }),
-            Prompt::Outcomes(_) => None,
+            }],
+            Prompt::Outcomes(_) => Vec::new(),
         }
     }
 
@@ -224,7 +261,7 @@ impl TurnInput {
     fn lateness(&self) -> Option<crate::frontend::FireLateness> {
         match &self.prompt {
             Prompt::Scheduled { late, .. } => *late,
-            Prompt::Typed(_) | Prompt::Outcomes(_) => None,
+            Prompt::Sent(_) | Prompt::Outcomes(_) => None,
         }
     }
 
@@ -233,7 +270,7 @@ impl TurnInput {
     fn outcome_rows(&self) -> Vec<crate::store::background::BackgroundTask> {
         match &self.prompt {
             Prompt::Outcomes(outcomes) => outcomes.clone(),
-            Prompt::Typed(_) | Prompt::Scheduled { .. } => self.riding.clone(),
+            Prompt::Sent(_) | Prompt::Scheduled { .. } => self.riding.clone(),
         }
     }
 
@@ -451,14 +488,21 @@ pub(super) fn should_nudge_thinking_only(
         && !already_nudged
         && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_))
 }
+/// Say that a compaction the turn ran on its own failed; a stop is the user's, said where the
+/// turn ends, and not a failure of the compaction's.
+fn warn_unless_interrupted(what: &str, error: &MekaError) {
+    if matches!(error, MekaError::Interrupted) {
+        tracing::debug!("{what} stopped by the turn's cancellation");
+    } else {
+        tracing::warn!("{what} failed: {error}");
+    }
+}
+
 /// Preprocess message content blocks for the compaction summarizer: replace images with "[image]"
-/// markers and truncate large text blocks.
+/// markers and truncate large text blocks, and the long strings of a tool call's arguments, which
+/// on a session that wrote files are most of what it holds.
 pub(super) fn strip_images_and_truncate(content: &mut [ContentBlock]) {
     use crate::conversation::ToolResultContent;
-
-    const MAX_TEXT_CHARS: usize = 2000;
-    const HEAD_CHARS: usize = 1000;
-    const TAIL_CHARS: usize = 500;
 
     for block in content.iter_mut() {
         match block {
@@ -475,18 +519,7 @@ pub(super) fn strip_images_and_truncate(content: &mut [ContentBlock]) {
                         }
                         // A name, already as short as it gets.
                         ToolResultContent::ToolReference { .. } => {}
-                        ToolResultContent::Text { text } => {
-                            if text.len() > MAX_TEXT_CHARS {
-                                let head_end = text.floor_char_boundary(HEAD_CHARS);
-                                let tail_start =
-                                    text.floor_char_boundary(text.len().saturating_sub(TAIL_CHARS));
-                                *text = format!(
-                                    "{}\n... (truncated for compaction) ...\n{}",
-                                    &text[..head_end],
-                                    &text[tail_start..],
-                                );
-                            }
-                        }
+                        ToolResultContent::Text { text } => truncate_for_compaction(text),
                     }
                 }
             }
@@ -498,25 +531,49 @@ pub(super) fn strip_images_and_truncate(content: &mut [ContentBlock]) {
             | ContentBlock::Inbox { text, .. }
             | ContentBlock::Scheduled { text, .. }
             | ContentBlock::BackgroundReport { text, .. }
-                if text.len() > MAX_TEXT_CHARS =>
-            {
-                let head_end = text.floor_char_boundary(HEAD_CHARS);
-                let tail_start = text.floor_char_boundary(text.len().saturating_sub(TAIL_CHARS));
-                *text = format!(
-                    "{}\n... (truncated for compaction) ...\n{}",
-                    &text[..head_end],
-                    &text[tail_start..],
-                );
-            }
+            | ContentBlock::Invocation { text, .. }
+            | ContentBlock::Resource { text, .. } => truncate_for_compaction(text),
+            ContentBlock::ToolUse { input, .. } => truncate_strings_for_compaction(input),
             _ => {}
         }
     }
 }
 
+/// Cut `text` to its head and tail when it is longer than the summarizer needs.
+fn truncate_for_compaction(text: &mut String) {
+    const MAX_TEXT_CHARS: usize = 2000;
+    const HEAD_CHARS: usize = 1000;
+    const TAIL_CHARS: usize = 500;
+    if text.len() <= MAX_TEXT_CHARS {
+        return;
+    }
+    let head_end = text.floor_char_boundary(HEAD_CHARS);
+    let tail_start = text.floor_char_boundary(text.len().saturating_sub(TAIL_CHARS));
+    *text = format!(
+        "{}\n... (truncated for compaction) ...\n{}",
+        &text[..head_end],
+        &text[tail_start..],
+    );
+}
+
+/// [`truncate_for_compaction`] on every string in a tool call's arguments, however deep.
+fn truncate_strings_for_compaction(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => truncate_for_compaction(text),
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(truncate_strings_for_compaction)
+        }
+        serde_json::Value::Object(fields) => fields
+            .values_mut()
+            .for_each(truncate_strings_for_compaction),
+        _ => {}
+    }
+}
+
 /// What a turn opens on: the words, images, inbox items and delivered outcomes its input carried.
 struct TurnMaterials {
-    /// The words the turn answers, as the block the message carries; see [`TurnInput::spoken`].
-    spoken: Option<ContentBlock>,
+    /// The words the turn answers, as the blocks the message carries; see [`TurnInput::spoken`].
+    spoken: Vec<ContentBlock>,
     images: Vec<ImageSource>,
     inbox: Vec<crate::store::inbox::InboxItem>,
     /// The finished background work the turn delivers; see [`TurnInput::report`].
@@ -527,7 +584,7 @@ struct TurnMaterials {
     late: Option<crate::frontend::FireLateness>,
     turn_id: Uuid,
     /// Who opened the turn, in the API's words, for its row.
-    source: &'static str,
+    source: crate::store::turns::TurnSource,
 }
 
 /// Clears the agent's current turn on every exit of the run that set it, so a row written after
@@ -627,16 +684,52 @@ impl Agent {
             .await
     }
 
-    /// [`Store::save_events_atomic_marking_inbox`] naming the turn this agent is running.
-    pub(super) async fn save_events_atomic_marking_inbox(
+    /// Save a round that carries `arrivals`, its items stamped with the round: the one door for
+    /// a round [`Self::take_arrivals`] read for. The outcomes among them were claimed on reading,
+    /// so a save that fails puts them back, where nothing else would offer them again; an item
+    /// is unstamped then and is offered again the same way. A session that stays loaded may then
+    /// read either twice, once from the round its memory kept and once from the next turn, which
+    /// is the side to fail on: a restart reads the store, which lacks the round.
+    pub(super) async fn save_carrying(
         &self,
         session_id: Uuid,
         events: Vec<crate::conversation::Event>,
-        inbox_items: &[Uuid],
+        arrivals: &Arrivals,
     ) -> Result<()> {
-        self.store
-            .save_events_atomic_marking_inbox(session_id, events, inbox_items, self.current_turn())
+        let saved = self
+            .store
+            .save_events_atomic_marking_inbox(
+                session_id,
+                events,
+                &arrivals.item_ids(),
+                self.current_turn(),
+            )
+            .await;
+        if saved.is_err() {
+            self.put_back(arrivals).await;
+        }
+        saved
+    }
+
+    /// Put the outcomes `arrivals` claimed back in the undelivered pool, for a round that will not
+    /// carry them after all: a later turn then reads them, where otherwise nothing would.
+    pub(super) async fn put_back(&self, arrivals: &Arrivals) {
+        if arrivals.outcomes().is_empty() {
+            return;
+        }
+        let ids: Vec<String> = arrivals
+            .outcomes()
+            .iter()
+            .map(|task| task.id.clone())
+            .collect();
+        if let Err(error) = self
+            .store
+            .background_store()
+            .release_background_tasks(&ids)
             .await
+        {
+            tracing::warn!("failed to put background outcomes back after a failed save: {error}");
+        }
     }
 }
 
@@ -644,7 +737,7 @@ impl Agent {
 /// it: the finished background outcomes first, then the inbox items, so the person's words come
 /// last. The outcomes are claimed already, by the compare-and-swap every claimer makes, and
 /// rendered once, so the text the conversation holds is the text the frontend is shown; the items
-/// are stamped with the round's save ([`Agent::save_events_atomic_marking_inbox`]).
+/// are stamped with the round's save ([`Agent::save_carrying`]).
 pub(super) struct Arrivals {
     items: Vec<crate::store::inbox::InboxItem>,
     outcomes: Vec<crate::store::background::BackgroundTask>,
@@ -765,7 +858,7 @@ impl TurnCancellation {
         &self.token
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_canceled(&self) -> bool {
         self.token.is_cancelled()
     }
 
@@ -1114,7 +1207,7 @@ impl Agent {
                 turn_id,
                 // A worker's turns are opened by its parent, through a spawn or a follow-up.
                 source: if self.role.is_worker() {
-                    "parent"
+                    crate::store::turns::TurnSource::Parent
                 } else {
                     origin.source()
                 },
@@ -1124,9 +1217,18 @@ impl Agent {
             Some(prompt) => Arc::from(prompt.as_str()),
             None => Arc::from(prompt::build_system_prompt(self.system_prompt_inputs())),
         };
-        compacted_before_the_loop |= self
-            .compact_for_projection(messages, &system_prompt, cancellation.token(), &mut opening)
-            .await;
+        // Not after a compaction the turn already attempted: one that failed would fail the same
+        // way again, at the same cost, and one that worked has done what this one would.
+        if !compacted_before_the_loop {
+            compacted_before_the_loop = self
+                .compact_for_projection(
+                    messages,
+                    &system_prompt,
+                    cancellation.token(),
+                    &mut opening,
+                )
+                .await;
+        }
 
         let mut run = TurnRun {
             session_id,
@@ -1238,7 +1340,7 @@ impl Agent {
             )
             .await
         {
-            tracing::warn!("auto-compact failed: {error}");
+            warn_unless_interrupted("auto-compact", &error);
         }
         true
     }
@@ -1287,7 +1389,7 @@ impl Agent {
             .compact_session(messages, request, cancellation.clone())
             .await
         {
-            tracing::warn!("retention compaction failed: {error}");
+            warn_unless_interrupted("retention compaction", &error);
         }
         true
     }
@@ -1377,7 +1479,7 @@ impl Agent {
                 inbox
             }
         };
-        if spoken.is_none() && images.is_empty() && inbox.is_empty() && report.is_none() {
+        if spoken.is_empty() && images.is_empty() && inbox.is_empty() && report.is_none() {
             // Everything this turn was opened on was withdrawn while it was starting. Nothing
             // to say, and a message that says nothing is not sent; the world-state snapshot
             // rendered for it goes back to what the model has actually seen, as a withdrawn
@@ -1528,7 +1630,7 @@ impl Agent {
                 }
                 opening.user_eagerly_saved = true;
             }
-            Err(error) => tracing::warn!("proactive compaction failed: {error}"),
+            Err(error) => warn_unless_interrupted("proactive compaction", &error),
         }
         true
     }
@@ -1551,7 +1653,7 @@ impl Agent {
             // unmoved. Under ACP `client_disconnected` becomes true precisely while a turn is
             // stalled on a failing provider, which is when a repair is most likely to be in
             // flight.
-            if run.cancellation.is_cancelled() {
+            if run.cancellation.is_canceled() {
                 run.recovery.undo_rejected_repair(messages);
                 return Err(MekaError::Interrupted);
             }
@@ -1594,7 +1696,7 @@ impl Agent {
                     continue;
                 }
                 Err(MekaError::Interrupted)
-                    if round.is_cancelled() && !run.cancellation.is_cancelled() =>
+                    if round.is_cancelled() && !run.cancellation.is_canceled() =>
                 {
                     // An inbox interrupt dropped the request before the provider answered, so
                     // nothing was judged and nothing streamed: the message joins the prompt and
@@ -1715,7 +1817,7 @@ impl Agent {
                 }
             }
 
-            if run.cancellation.is_cancelled() {
+            if run.cancellation.is_canceled() {
                 // Interrupted mid-stream. Persist the partial assistant text so it survives resume
                 // instead of being discarded, but drop any `tool_use` blocks first: no tools run
                 // on an interrupt, so a persisted `tool_use` would be orphaned (no matching
@@ -1868,6 +1970,20 @@ impl Agent {
             )];
 
             if !has_tool_calls {
+                // The end of a reply is a round boundary like a tool round's: a steer, an
+                // interrupt or a finished task that arrived while the model wrote it is answered
+                // in this turn rather than left for whichever turn opens next. Only a reply that
+                // ended normally; a cut or a refusal ends the turn with what it is.
+                if matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_)) {
+                    let arrivals = self
+                        .take_arrivals(session_id, &run.recovery.inbox_ids)
+                        .await;
+                    if !arrivals.is_empty() {
+                        self.append_reply_arrivals(session_id, messages, round_events, arrivals)
+                            .await?;
+                        continue;
+                    }
+                }
                 // No tool calls: the assistant message stands alone and ends the turn. Save it
                 // before returning so the persistent log includes it.
                 self.save_events_atomic(session_id, round_events).await?;
@@ -1984,6 +2100,20 @@ impl Agent {
         }
     }
 
+    /// The tools the model has loaded in `events`, and the set a request carries for them, both
+    /// read off the wire serving now.
+    pub(super) fn request_tools(
+        &self,
+        events: &[crate::conversation::Event],
+    ) -> (Vec<String>, crate::tools::ActiveTools) {
+        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
+            events,
+            self.tool_registry.deferred_tool_delivery(),
+        );
+        let active = self.tool_registry.active_tools(&loaded);
+        (loaded, active)
+    }
+
     /// One request: the active tool set, the overhead it costs the gauge, and the provider's
     /// answer, streamed or whole. Returns the tools the model has loaded with it, which the tool
     /// round reads too.
@@ -2013,13 +2143,12 @@ impl Agent {
         // Read from events (not the materialized slice) so the deferred-tool snapshot stored on
         // `Event::CompactBoundary` survives across compaction; otherwise tools the model loaded
         // pre-compaction would silently drop out of the active set on the next turn.
-        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
-            messages.events(),
-            self.tool_registry.deferred_tool_delivery(),
-        );
-        let active = self.tool_registry.active_tools(&loaded);
+        let (loaded, active) = self.request_tools(messages.events());
         let tools: Arc<[ToolDefinition]> = Arc::from(active.definitions);
         let deferred_tools: Arc<[ToolDefinition]> = Arc::from(active.deferred_definitions);
+        // What a fallback onto another profile sends instead: which tools a wire carries, and how
+        // it carries the deferred ones, are the serving profile's.
+        let rebuild = || self.request_tools(messages.events()).1;
 
         // The part of the window that is not conversation, for `context_check` to report.
         // Re-stamped per round because the active tool set grows as `tool_load` pulls in deferred
@@ -2049,8 +2178,8 @@ impl Agent {
             self.run_streaming(
                 Arc::clone(&run.system_prompt),
                 Arc::from(api_messages),
-                tools,
-                deferred_tools,
+                (tools, deferred_tools),
+                &rebuild,
                 request_attribution,
                 round.clone(),
                 progress,
@@ -2066,6 +2195,7 @@ impl Agent {
                     CompletionRequest::new(&run.system_prompt, api_messages, &tools)
                         .declaring(&deferred_tools)
                         .attributed(request_attribution),
+                    Some(&rebuild),
                     round,
                     round,
                 )
@@ -2136,13 +2266,13 @@ impl Agent {
             .cache_read_input_tokens
             .saturating_add(usage.cache_read_input_tokens);
         tracing::debug!(
-            "round usage: input={} cache_creation={} cache_read={} output={} messages={sent_len} \
-             subagent={}",
-            usage.input_tokens,
-            usage.cache_creation_input_tokens,
-            usage.cache_read_input_tokens,
-            usage.output_tokens,
-            !self.role.is_root()
+            "round usage: input={input} cache_creation={cache_creation} cache_read={cache_read} \
+             output={output} messages={sent_len} subagent={subagent}",
+            input = usage.input_tokens,
+            cache_creation = usage.cache_creation_input_tokens,
+            cache_read = usage.cache_read_input_tokens,
+            output = usage.output_tokens,
+            subagent = !self.role.is_root()
         );
     }
 
@@ -2260,7 +2390,6 @@ impl Agent {
             .take_arrivals(session_id, &run.recovery.inbox_ids)
             .await;
         tool_results.extend(arrivals.blocks());
-        let steered = arrivals.item_ids();
 
         let result_message = Message {
             role: Role::User,
@@ -2281,7 +2410,7 @@ impl Agent {
         round_events.push(crate::conversation::Event::Append(result_message.clone()));
         let tool_calls = result_message.content.len();
         messages.append(result_message);
-        self.save_events_atomic_marking_inbox(session_id, round_events, &steered)
+        self.save_carrying(session_id, round_events, &arrivals)
             .await
             .map_err(|error| {
                 tracing::warn!(
@@ -2317,7 +2446,7 @@ impl Agent {
         // `compact_session`, which refuses to rewrite on a fired token and catches the interrupt
         // that arrives after this point too. The loop head breaks the turn on the next pass, so
         // dropping the request here is all that is owed.
-        if run.cancellation.is_cancelled() {
+        if run.cancellation.is_canceled() {
             tracing::debug!("dropping a compaction request on an interrupted turn");
             return false;
         }
@@ -2343,7 +2472,7 @@ impl Agent {
             // An interrupt is not a failure to report: the loop's own check breaks the turn on
             // the next pass, and warning here would put a line about compaction in front of every
             // Ctrl+C that lands during one.
-            Err(_) if run.cancellation.is_cancelled() => {}
+            Err(_) if run.cancellation.is_canceled() => {}
             // Non-fatal otherwise, as it is on the post-loop path: the turn's own work is what the
             // user asked for, and it can still finish uncompacted.
             Err(error) => tracing::warn!("requested compaction failed: {error}"),
@@ -2374,7 +2503,7 @@ impl Agent {
                     run.recovery.ceiling_compacted = true;
                     return;
                 }
-                if run.cancellation.is_cancelled() {
+                if run.cancellation.is_canceled() {
                     return;
                 }
                 run.recovery.ceiling_compacted = true;
@@ -2393,7 +2522,7 @@ impl Agent {
                     .await
                 {
                     Ok(_) => run.recovery.after_conversation_rewrite(),
-                    Err(_) if run.cancellation.is_cancelled() => {}
+                    Err(_) if run.cancellation.is_canceled() => {}
                     Err(error) => tracing::warn!("compaction between rounds failed: {error}"),
                 }
             }
@@ -2423,8 +2552,9 @@ impl Agent {
         // Rolled into the session-level counters surfaced by `/status` here rather than inside
         // the round, so a single reading reflects whole turns. A completed turn counts as one; a
         // turn that failed or was canceled still spent what its finished rounds reported, and
-        // that spend is kept the way compaction's is, without counting a turn.
-        if result.is_ok() {
+        // that spend is kept the way compaction's is, without counting a turn. A worker shares its
+        // root's counters, so its turns are the root's spend and not the root's turns.
+        if result.is_ok() && self.role.is_root() {
             self.session_stats.record_turn(&turn_usage);
         } else {
             self.session_stats.record_untracked_tokens(&turn_usage);
@@ -2548,35 +2678,12 @@ impl Agent {
             _ => {}
         }
 
-        // The sweeper for a request the tool loop's own drain never reached. A turn that parked
-        // one and then failed before that drain is the only way to arrive here holding a request,
-        // and the `result.is_ok()` below then declines to act on it, so this exists to empty the
-        // slot, not to compact: the slot outlives the turn.
-        //
-        // Taken in its own binding rather than inside the `if` below so the
-        // `std::sync::MutexGuard` is dropped before the `.await`; held across one it would make
-        // this future non-`Send` and break every `tokio::spawn` of a turn.
-        //
-        // Taken unconditionally, so a request left behind by a turn that then failed cannot
-        // linger and fire against a later, unrelated turn.
-        let requested_compaction = crate::sync::lock(&self.cells.pending_compaction).take();
-        // Acted on only when the turn succeeded: an interrupted or failed turn has just popped or
-        // repaired its own messages, and compacting on top of that would rewrite a conversation
-        // still being put back together. The request is dropped rather than deferred; the agent
-        // can ask again on a turn that works.
-        if let Some(request) = requested_compaction
-            && result.is_ok()
-        {
-            tracing::info!("compacting at the agent's request");
-            if let Err(error) = self
-                .compact_session(messages, request, cancellation.token().clone())
-                .await
-            {
-                // Non-fatal, and deliberately not surfaced as a turn error: the turn itself
-                // succeeded, and its answer is what the user asked for.
-                tracing::warn!("requested compaction failed: {error}");
-            }
-        }
+        // The sweeper for a request the tool loop's own drain never reached: a turn that parked
+        // one and then failed before that drain. Dropped rather than acted on, since that turn has
+        // just popped or repaired its own messages, and emptied so it cannot fire against a later,
+        // unrelated turn; the agent can ask again on a turn that works. A turn that ended well
+        // drained its request already, since a tool call is never a turn's last round.
+        drop(crate::sync::lock(&self.cells.pending_compaction).take());
     }
 
     /// Hand a provider advisory to the frontend, counting what it reports against this session.
@@ -2639,6 +2746,32 @@ impl Agent {
         }
     }
 
+    /// Answer a reply that ended the turn with what arrived while it was written: the reply and
+    /// the arrivals behind it saved as one unit, the items stamped with it, so the next request
+    /// carries them and the turn goes on.
+    async fn append_reply_arrivals(
+        &self,
+        session_id: Uuid,
+        messages: &mut Conversation,
+        mut round_events: Vec<crate::conversation::Event>,
+        arrivals: Arrivals,
+    ) -> Result<()> {
+        let arrived = Message {
+            role: Role::User,
+            content: arrivals.blocks(),
+        };
+        round_events.push(crate::conversation::Event::Append(arrived.clone()));
+        self.save_carrying(session_id, round_events, &arrivals)
+            .await?;
+        messages.append(arrived.clone());
+        tracing::info!(
+            "{count} item(s) arrived while the reply was written; the turn continues",
+            count = arrivals.items().len() + arrivals.outcomes().len()
+        );
+        self.announce_arrived(arrived, &arrivals).await;
+        Ok(())
+    }
+
     /// Announce the message an interrupt appended whole, as the opening is announced. Items that
     /// joined the cut opening instead are not: that message was announced already, and the items
     /// are announced when the provider reads them.
@@ -2682,9 +2815,10 @@ impl Agent {
         if arrivals.is_empty() {
             return Ok(());
         }
-        recovery
-            .ensure_prompt_saved(self, session_id, prompt)
-            .await?;
+        if let Err(error) = recovery.ensure_prompt_saved(self, session_id, prompt).await {
+            self.put_back(&arrivals).await;
+            return Err(error);
+        }
         let ids = arrivals.item_ids();
         let blocks = arrivals.blocks();
         let partial = partial
@@ -2712,13 +2846,13 @@ impl Agent {
                     role: Role::User,
                     content: blocks,
                 };
-                self.save_events_atomic_marking_inbox(
+                self.save_carrying(
                     session_id,
                     vec![
                         Event::Append(partial.clone()),
                         Event::Append(arrived.clone()),
                     ],
-                    &ids,
+                    &arrivals,
                 )
                 .await?;
                 messages.append(partial);
@@ -2736,7 +2870,7 @@ impl Agent {
                     });
                 joined.content.extend(blocks);
                 let prompt_stood_alone = messages.events_len() == recovery.prompt_only_events;
-                self.save_events_atomic_marking_inbox(
+                self.save_carrying(
                     session_id,
                     vec![
                         Event::Repair {
@@ -2745,7 +2879,7 @@ impl Agent {
                         },
                         Event::Append(joined.clone()),
                     ],
-                    &ids,
+                    &arrivals,
                 )
                 .await?;
                 messages.replace_tail(1, Vec::new());
@@ -2767,12 +2901,8 @@ impl Agent {
                     role: Role::User,
                     content: blocks,
                 };
-                self.save_events_atomic_marking_inbox(
-                    session_id,
-                    vec![Event::Append(arrived.clone())],
-                    &ids,
-                )
-                .await?;
+                self.save_carrying(session_id, vec![Event::Append(arrived.clone())], &arrivals)
+                    .await?;
                 messages.append(arrived.clone());
                 appended_whole = Some(arrived);
             }
@@ -2821,8 +2951,8 @@ impl Agent {
         &self,
         system_prompt: Arc<str>,
         messages: Arc<[Message]>,
-        tools: Arc<[ToolDefinition]>,
-        deferred_tools: Arc<[ToolDefinition]>,
+        (mut tools, mut deferred_tools): (Arc<[ToolDefinition]>, Arc<[ToolDefinition]>),
+        rebuild: &(dyn Fn() -> crate::tools::ActiveTools + Sync),
         attribution: crate::provider::Attribution,
         cancellation: CancellationToken,
         progress: &mut StreamProgress,
@@ -2874,6 +3004,9 @@ impl Agent {
                         if self.fall_back(&error, progress.content_started).await {
                             retries = 0;
                             started = std::time::Instant::now();
+                            let active = rebuild();
+                            tools = Arc::from(active.definitions);
+                            deferred_tools = Arc::from(active.deferred_definitions);
                             continue;
                         }
                         return Err(error);
@@ -4114,6 +4247,76 @@ mod tests {
         assert_eq!(item.state(), crate::store::inbox::InboxState::Delivered);
     }
 
+    /// A steer that arrives while the model writes the reply that would end the turn is answered
+    /// in the same turn: the reply is kept, the steer follows it, and the model answers again,
+    /// rather than the steer waiting for whichever turn opens next.
+    #[tokio::test]
+    async fn a_steer_that_arrives_during_the_final_reply_continues_the_turn() {
+        use crate::provider::mock::MockStopReason;
+
+        let (agent, provider, store, session_id, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::Sleep { ms: 400 },
+                MockEvent::Text {
+                    text: "first answer".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            answer_round("second answer", MockStopReason::EndTurn),
+        ])
+        .await;
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Steer,
+            "and in French",
+            std::time::Duration::from_millis(150),
+        );
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("answer".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs on");
+        let item_id = enqueued.await.expect("enqueued");
+
+        assert!(matches!(outcome, TurnOutcome::EndTurn), "{outcome:?}");
+        let requests = provider.streams();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the steer earned the turn a second request"
+        );
+        let last = requests[1].messages.last().expect("a message");
+        assert!(
+            last.role == Role::User
+                && text_blocks(last)
+                    .iter()
+                    .any(|text| text.ends_with("while you were working]\nand in French")),
+            "the second request ends on the steer: {last:?}"
+        );
+        let replies: Vec<String> = messages
+            .as_slice()
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .map(Message::text_content)
+            .collect();
+        assert_eq!(replies, ["first answer", "second answer"]);
+        let item = store
+            .inbox_store()
+            .get(item_id)
+            .await
+            .expect("read")
+            .expect("the item");
+        assert_eq!(item.state(), crate::store::inbox::InboxState::Delivered);
+    }
+
     /// An interrupt that lands during a nudge round rides the nudge, as a text block behind the
     /// nudge's own: the message stays a nudge by its shape, and the person's words stay the
     /// person's, in memory and in the store alike.
@@ -4292,6 +4495,84 @@ mod tests {
                 .state(),
             InboxState::Delivered
         );
+    }
+
+    /// An interrupt whose prompt cannot be saved puts back the outcomes it claimed with the
+    /// interrupt: no message carries them, so a later turn reads them, where otherwise nothing
+    /// would.
+    #[tokio::test]
+    async fn an_interrupt_that_cannot_save_its_prompt_puts_its_outcomes_back() {
+        let (mut agent, _provider, store, session_id, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::Sleep { ms: 5000 },
+                MockEvent::Text {
+                    text: "late".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::EndTurn,
+                },
+            ],
+            text_round("carrying on"),
+        ])
+        .await;
+        agent.enable_background_for_test(2);
+        let task = crate::store::background::BackgroundTask {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            tool: "shell_execute".to_string(),
+            label: "cargo test".to_string(),
+            status: crate::store::background::TaskStatus::Running,
+            outcome: None,
+            scratchpad_entry: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            announced_at: None,
+            delivered_at: None,
+            subagent_id: None,
+        };
+        let background = store.background_store();
+        background
+            .start_background_task(&task)
+            .await
+            .expect("start");
+        background
+            .finish_background_task(
+                &task.id,
+                crate::store::background::TaskStatus::Completed,
+                Some("42 passed".to_string()),
+                None,
+            )
+            .await
+            .expect("finish");
+        store
+            .run_sql_for_test(
+                "CREATE TRIGGER refuse_the_prompt BEFORE INSERT ON messages \
+                 WHEN NEW.content LIKE '%unsavable prompt%' \
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .await;
+        let _enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "actually, this",
+            std::time::Duration::from_millis(300),
+        );
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("unsavable prompt".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        assert!(outcome.is_err(), "the prompt cannot be saved: {outcome:?}");
+        let undelivered = background
+            .list_undelivered_background_tasks(session_id)
+            .await
+            .expect("tasks");
+        assert_eq!(undelivered.len(), 1, "the outcome is offered again");
     }
 
     /// The blocking path has nothing partial to keep, so a whole reply still being generated is
@@ -6439,6 +6720,57 @@ mod tests {
         );
     }
 
+    /// A compaction a turn start attempted and failed is not attempted again by the projection
+    /// check behind it: the second would fail the same way, at the same cost.
+    #[tokio::test]
+    async fn a_failed_turn_start_compaction_is_not_tried_twice() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::Fail {
+                message: "the summarizer failed".to_string(),
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "ok".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (mut agent, _store) = agent_that_compacts_for_test(handle).await;
+        let occupancy = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        agent.set_context_tokens_for_test(Arc::clone(&occupancy));
+        let threshold = agent.auto_compact_ceiling().expect("auto-compaction is on");
+        occupancy.store(threshold + 1, std::sync::atomic::Ordering::Relaxed);
+
+        // Long enough that the projection check, estimated from the text, is over the line too.
+        let mut messages = Conversation::new();
+        for index in 0..4 {
+            messages.append(Message::user(format!(
+                "question {index} {}",
+                "x".repeat(200_000)
+            )));
+            messages.append(Message::assistant_text(format!("answer {index}")));
+        }
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("next".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(
+            provider.completions().len(),
+            1,
+            "the failed compaction was tried again"
+        );
+    }
+
     /// The reactive check fires *above* the ceiling, not at it, and never on one message.
     ///
     /// [`Agent::auto_compact_ceiling`] pins the number; this pins the comparisons that read it,
@@ -6583,7 +6915,12 @@ mod tests {
         let a_hundred_days_ago = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
         store
             .turn_store()
-            .open_turn(session_id, old, "client", &a_hundred_days_ago)
+            .open_turn(
+                session_id,
+                old,
+                crate::store::turns::TurnSource::Client,
+                &a_hundred_days_ago,
+            )
             .await
             .expect("open");
         // Enough rounds, and long enough, that a compaction keeping its usual tail would leave
@@ -7214,6 +7551,26 @@ mod tests {
         assert_eq!(content[1], ContentBlock::Text {
             text: "short".to_string()
         });
+    }
+
+    /// A tool call's long arguments are cut for the summarizer as a long result is: a session that
+    /// wrote large files overflows on them, and an emergency summary that sent them whole would
+    /// overflow the same way.
+    #[test]
+    fn the_summarizer_truncates_a_tool_call_s_long_arguments() {
+        let mut content = vec![ContentBlock::ToolUse {
+            id: "call".to_string(),
+            name: "file_write".to_string(),
+            input: serde_json::json!({"path": "a.txt", "content": "x".repeat(50_000)}),
+        }];
+        super::turn::strip_images_and_truncate(&mut content);
+        let ContentBlock::ToolUse { input, .. } = &content[0] else {
+            panic!("the block keeps its type: {content:?}");
+        };
+        assert_eq!(input["path"], "a.txt");
+        let written = input["content"].as_str().expect("a string still");
+        assert!(written.len() < 2_000, "{}", written.len());
+        assert!(written.contains("truncated for compaction"));
     }
 
     /// A redaction the budget reports is recorded on the conversation, once: the image the
@@ -8762,6 +9119,7 @@ mod tests {
                 opaque: Some(crate::conversation::OpaqueReasoning::Sealed {
                     encrypted_content: "OPAQUE".to_string(),
                     id: Some("rs_1".to_string()),
+                    origin: Some("https://chatgpt.com".to_string()),
                 }),
             },
             MockEvent::Text {
@@ -8802,6 +9160,7 @@ mod tests {
                 Some(crate::conversation::OpaqueReasoning::Sealed {
                     encrypted_content: "OPAQUE".to_string(),
                     id: Some("rs_1".to_string()),
+                    origin: Some("https://chatgpt.com".to_string()),
                 })
             )
         );
@@ -9090,6 +9449,110 @@ mod tests {
         tasks.remove(0)
     }
 
+    /// A detached call that names a scratchpad entry has its output saved there when it finishes,
+    /// as an inline call's would be, and the report points at the entry.
+    #[tokio::test]
+    async fn a_background_call_saves_its_output_where_it_asked() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "shell_execute".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({
+                        "command": "cargo test",
+                        "background": true,
+                        "scratchpad": "suite",
+                    }),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("started it"),
+        ]));
+        let (agent, store) = background_agent(provider, Arc::new(QuickFixture)).await;
+
+        let task = finished_background_task(&agent, &store).await;
+        assert_eq!(
+            task.outcome.as_deref(),
+            Some(
+                crate::tools::scratchpad::build_scratchpad_reference("suite", "42 passed".len())
+                    .as_str()
+            ),
+            "the report says where the output went, and not the output: {task:?}"
+        );
+        let saved = store
+            .load_scratchpad_entry(agent.session_id().expect("session"), "suite")
+            .await
+            .expect("load");
+        assert_eq!(saved.as_deref(), Some("42 passed"));
+    }
+
+    /// A task stopped before its work came back has no say over the entry the call named: the
+    /// work finishing anyway writes nothing there.
+    #[tokio::test]
+    async fn a_stopped_background_call_leaves_the_entry_it_named_alone() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "shell_execute".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({
+                        "command": "cargo test",
+                        "background": true,
+                        "scratchpad": "suite",
+                    }),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("started it"),
+        ]));
+        let (agent, store) = background_agent(provider, Arc::new(GatedFixture(gate.clone()))).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("run the suite".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn must not block on the task");
+        let session = agent.session_id().expect("session");
+        let running: Vec<String> = store
+            .background_store()
+            .list_running_background_tasks(session)
+            .await
+            .expect("running")
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        // Recorded as stopped while its work goes on, as a cancel from another process leaves it.
+        store
+            .background_store()
+            .stop_background_tasks(running, crate::store::background::TaskStatus::Canceled)
+            .await
+            .expect("canceled");
+        gate.notify_one();
+        agent.background_tasks().wait_all().await;
+        let saved = store
+            .load_scratchpad_entry(session, "suite")
+            .await
+            .expect("load");
+        assert_eq!(saved, None);
+    }
+
     /// A finished task whose outcome write fails once is recorded on the retry.
     #[tokio::test]
     async fn a_background_outcome_write_is_retried_once() {
@@ -9211,6 +9674,72 @@ mod tests {
             }
             panic!("the task never finished");
         }
+    }
+
+    /// An outcome claimed at a round boundary whose save then fails goes back to the undelivered
+    /// pool, so a later turn reads it, rather than being stamped delivered and held by nothing.
+    #[tokio::test]
+    async fn an_outcome_whose_round_fails_to_save_is_offered_again() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("cargo test"),
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-2".to_string(),
+                    name: "await_finished".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("carried on"),
+        ]));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let store = Store::for_test().await;
+        let registry = crate::tools::ToolRegistry::new();
+        registry.enable_background();
+        registry
+            .register(Arc::new(GatedFixture(gate.clone())))
+            .expect("register the gated fixture");
+        registry
+            .register(Arc::new(AwaitFinished {
+                gate,
+                store: store.clone(),
+            }))
+            .expect("register the waiter");
+        let mut agent =
+            build_test_agent(Arc::clone(&provider) as Arc<dyn Provider>, registry, &store);
+        agent.enable_background_for_test(2);
+        store
+            .run_sql_for_test(
+                "CREATE TRIGGER refuse_the_report BEFORE INSERT ON messages \
+                 WHEN NEW.content LIKE '%[Background task reporting at%' \
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .await;
+
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("run the suite".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("the round carrying the report cannot be saved");
+
+        let session = agent.cells().session_id.get().expect("a session");
+        let undelivered = store
+            .background_store()
+            .list_undelivered_background_tasks(session)
+            .await
+            .expect("tasks");
+        assert_eq!(undelivered.len(), 1, "the outcome is offered again");
     }
 
     /// An outcome that lands while a turn runs reaches the model at the turn's next round

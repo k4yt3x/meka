@@ -516,11 +516,8 @@ fn upsert_account_document(
     if let Some(client_id) = account.settings.client_id.as_deref() {
         table.insert("client_id", toml_edit::value(client_id));
     }
-    if let Some(interleaved_thinking) = account.interleaved_thinking {
-        table.insert(
-            "interleaved_thinking",
-            toml_edit::value(interleaved_thinking),
-        );
+    for (key, value) in account.endpoint.stated() {
+        table.insert(key, toml_edit::Item::Value(value));
     }
     // The one line that makes "every writer leaves the canonical order" true of this writer
     // whatever order the inserts above run in.
@@ -545,23 +542,61 @@ pub(crate) struct NewAccount<'a> {
     pub(crate) backend: config::Backend,
     pub(crate) base_url: Option<&'a str>,
     pub(crate) settings: &'a OAuthSettings,
+    pub(crate) endpoint: EndpointSettings,
+}
+
+/// What an account states its endpoint takes, beside the settings a login is made against: each
+/// field the endpoint takes or refuses, and the longest tool name it takes, unset for the
+/// backend's default.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct EndpointSettings {
     pub(crate) interleaved_thinking: Option<bool>,
+    pub(crate) prompt_cache_key: Option<bool>,
+    pub(crate) stream_usage: Option<bool>,
+    pub(crate) max_tool_name_bytes: Option<usize>,
+}
+
+impl EndpointSettings {
+    /// Each setting stated, with its key and its value as `config.toml` takes it, in the order the
+    /// file carries them.
+    fn stated(&self) -> Vec<(&'static str, toml_edit::Value)> {
+        let switches = [
+            ("interleaved_thinking", self.interleaved_thinking),
+            ("prompt_cache_key", self.prompt_cache_key),
+            ("stream_usage", self.stream_usage),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, toml_edit::Value::from(value))));
+        let cap = self
+            .max_tool_name_bytes
+            .and_then(|bytes| i64::try_from(bytes).ok())
+            .map(|bytes| ("max_tool_name_bytes", toml_edit::Value::from(bytes)));
+        switches.chain(cap).collect()
+    }
 }
 
 /// Refuse a setting `backend` never reads: a body or a command states exactly what it means to
 /// write, and a setting written and never read reads as configured while doing nothing.
 pub(crate) fn refuse_inert_account_keys(account: &NewAccount<'_>) -> crate::error::Result<()> {
+    // First, so a value the file cannot hold is refused rather than left out of what is stated.
+    if let Some(bytes) = account.endpoint.max_tool_name_bytes {
+        config::check_tool_name_bytes(bytes).map_err(super::refusal)?;
+    }
     for (key, given) in [
         (
             "oauth_token_url",
             account.settings.oauth_token_url.is_some(),
         ),
         ("client_id", account.settings.client_id.is_some()),
-        (
-            "interleaved_thinking",
-            account.interleaved_thinking.is_some(),
-        ),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        account
+            .endpoint
+            .stated()
+            .into_iter()
+            .map(|(key, _)| (key, true)),
+    ) {
         if given && !account.backend.reads_account_key(key) {
             return Err(super::refusal(format!(
                 "an account on '{backend}' never reads `{key}`; drop it",
@@ -1194,7 +1229,7 @@ async fn accept_codex_callback(
     expected_state: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<(String, String)> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -1210,38 +1245,19 @@ async fn accept_codex_callback(
             Err(_) => anyhow::bail!("authorization timed out after {}s", timeout.as_secs()),
         };
 
-        const MAX_BYTES: usize = 64 * crate::text::KIB;
-        let mut buffer = Vec::with_capacity(4096);
-        let mut temp = [0u8; 4096];
-        let headers_complete = loop {
-            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                break true;
-            }
-            if buffer.len() >= MAX_BYTES {
-                break false;
-            }
-            let read_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if read_remaining.is_zero() {
-                anyhow::bail!("authorization timed out after {}s", timeout.as_secs());
-            }
-            match tokio::time::timeout(read_remaining, stream.read(&mut temp)).await {
-                Ok(Ok(0)) => break buffer.windows(4).any(|window| window == b"\r\n\r\n"),
-                Ok(Ok(n)) => buffer.extend(temp.iter().take(n)),
-                Ok(Err(error)) => {
-                    anyhow::bail!("failed to read the OAuth callback request: {error}")
+        let buffer = match crate::oauth::read_callback_request(&mut stream, deadline).await {
+            None => anyhow::bail!("authorization timed out after {}s", timeout.as_secs()),
+            Some(crate::oauth::CallbackRequest::Abandoned) => continue,
+            Some(crate::oauth::CallbackRequest::Oversized) => {
+                if let Err(error) = stream
+                    .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await {
+                    tracing::debug!("failed to answer the callback client: {error}");
                 }
-                Err(_) => anyhow::bail!("authorization timed out after {}s", timeout.as_secs()),
+                continue;
             }
+            Some(crate::oauth::CallbackRequest::Head(buffer)) => buffer,
         };
-
-        if !headers_complete {
-            if let Err(error) = stream
-                .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await {
-                tracing::debug!("failed to answer the callback client: {error}");
-            }
-            continue;
-        }
 
         let request = String::from_utf8_lossy(&buffer);
         match parse_codex_callback_query(&request) {
@@ -1288,6 +1304,19 @@ async fn accept_codex_callback(
                     )
                     .await
                 {
+                    tracing::debug!("failed to answer the callback client: {error}");
+                }
+                continue;
+            }
+            // An error or a missing code ends the login only when it is this login's answer: under
+            // another state, or none, it is anyone's to send.
+            CodexCallback::Malformed(_) | CodexCallback::AuthError(_)
+                if crate::oauth::callback_state(&request).as_deref() != Some(expected_state) =>
+            {
+                tracing::warn!("OAuth callback without this login's state; still waiting");
+                if let Err(error) = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await {
                     tracing::debug!("failed to answer the callback client: {error}");
                 }
                 continue;
@@ -1505,6 +1534,37 @@ mod tests {
 
         let (_lock, _, document) = result.expect("a missing config is not an error");
         assert!(document.as_table().is_empty());
+    }
+
+    /// The write door refuses a tool-name cap a backend never reads, one too small for a cut name,
+    /// and one the file cannot hold, ahead of any write.
+    #[test]
+    fn a_tool_name_cap_is_refused_where_it_is_inert_too_small_or_too_large() {
+        let settings = OAuthSettings::default();
+        let refusal = |backend: &str, bytes: usize| {
+            refuse_inert_account_keys(&NewAccount {
+                name: "a",
+                backend: backend.parse().expect("a backend"),
+                base_url: None,
+                settings: &settings,
+                endpoint: EndpointSettings {
+                    max_tool_name_bytes: Some(bytes),
+                    ..EndpointSettings::default()
+                },
+            })
+            .err()
+            .map(|error| error.to_string())
+        };
+        assert_eq!(refusal("anthropic-messages", 64), None);
+        let inert = refusal("claude-subscription", 64).expect("refused");
+        assert!(
+            inert.contains("never reads `max_tool_name_bytes`"),
+            "{inert}"
+        );
+        let small = refusal("anthropic-messages", 8).expect("refused");
+        assert!(small.contains("at least 16"), "{small}");
+        let large = refusal("claude-subscription", usize::MAX).expect("refused");
+        assert!(large.contains("holds at most"), "{large}");
     }
 
     /// The hint tells the accounts configured from the credentials no account claims, since the
@@ -1988,7 +2048,7 @@ mod tests {
             backend: config::Backend::AnthropicMessages,
             base_url: None,
             settings: &OAuthSettings::default(),
-            interleaved_thinking: None,
+            endpoint: EndpointSettings::default(),
         })
         .expect("upsert");
         let rendered = bare.to_string();
@@ -2005,7 +2065,7 @@ mod tests {
                 oauth_token_url: Some("https://auth.invalid/token".to_string()),
                 client_id: Some("my-client".to_string()),
             },
-            interleaved_thinking: None,
+            endpoint: EndpointSettings::default(),
         })
         .expect("upsert");
         // Read back through the real parser, so a key written under the wrong name or type is
@@ -2036,7 +2096,7 @@ mod tests {
             backend: config::Backend::OpenAiResponses,
             base_url: None,
             settings: &OAuthSettings::default(),
-            interleaved_thinking: None,
+            endpoint: EndpointSettings::default(),
         })
         .expect_err("an inline `accounts` must be refused, not overwritten");
         assert!(
@@ -2152,6 +2212,52 @@ mod tests {
             .expect("join")
             .expect("the login's own callback");
         assert_eq!((code.as_str(), state.as_str()), ("c2", "good"));
+    }
+
+    /// A connection that never sends, as a browser's speculative one, holds the listener for a
+    /// few seconds at most, and an error under no state is nobody's answer to this login: the
+    /// login's own callback still lands after both.
+    #[tokio::test(start_paused = true)]
+    async fn the_loopback_listener_waits_past_an_idle_connection_and_a_stateless_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let accept = tokio::spawn(accept_codex_callback(
+            listener,
+            "good",
+            std::time::Duration::from_secs(60),
+        ));
+        let _idle = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        let answer = |query: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect");
+            stream
+                .write_all(
+                    format!("GET /auth/callback?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .expect("write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.expect("read");
+            response
+        };
+
+        let refused = answer("error=access_denied").await;
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        let accepted = answer("code=c2&state=good").await;
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+        let (code, _) = accept
+            .await
+            .expect("join")
+            .expect("the login's own callback");
+        assert_eq!(code, "c2");
     }
 
     #[test]

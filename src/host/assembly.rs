@@ -49,7 +49,13 @@ pub(crate) struct SharedDeps {
     /// The last whole read of `config.toml`: the one the process started on, and each serving of
     /// the file since.
     whole_read: Arc<std::sync::Mutex<WholeRead>>,
+    /// What a host serves of `config.toml` beyond what every host serves, applied to each file
+    /// [`Self::serve_installation`] serves, under the same doors: `meka serve`'s tokens.
+    serve_also: Arc<std::sync::OnceLock<ServeHook>>,
 }
+
+/// A host's part of serving `config.toml`; see [`SharedDeps::serve_also`].
+type ServeHook = Box<dyn Fn(&crate::config::ConfigFile) + Send + Sync>;
 
 /// One whole read of `config.toml`: when it was made, and the file's modification time as it was
 /// then, which a host compares with the file's now to say whether an edit is unread.
@@ -329,6 +335,9 @@ impl SharedDeps {
             .map_err(ServeFailure::Unservable)?;
         let wanted = config_file.mcp_servers();
         self.providers.replace_catalog(&config_file);
+        if let Some(hook) = self.serve_also.get() {
+            hook(&config_file);
+        }
         // As at startup, so a session's first use of an account writes nothing into the file this
         // read did not see; the write is meka's own and counts as read.
         let wrote_device_ids = self.providers.preload_device_ids().await;
@@ -362,6 +371,17 @@ impl SharedDeps {
             removed = served.removed.len()
         );
         Ok(served)
+    }
+
+    /// Have every serving of `config.toml` also run `hook`, for what one host serves of the file
+    /// beyond the rest. One per process; a second is ignored.
+    pub(crate) fn serve_also(
+        &self,
+        hook: impl Fn(&crate::config::ConfigFile) + Send + Sync + 'static,
+    ) {
+        if self.serve_also.set(Box::new(hook)).is_err() {
+            tracing::debug!("a host's serving hook is set already; the second is ignored");
+        }
     }
 
     /// The profile `--profile` named when this host started, which the catalog selects as the
@@ -518,11 +538,10 @@ pub(crate) async fn refuse_a_spawned_session(
 ///
 /// **The row is the carrier, and the only one.** A host's own profile switch moves the agent
 /// itself, but the row is the billing record, and a turn that ran on another profile than the
-/// row names would bill an account the record does not. The session lock refuses every other
-/// meka process a write to a resident row, so this defends the record against a hand-edited row,
-/// which is the guard a store created five minutes ago needs as much as an old one: read where the
-/// data is read, on every server's turn doors, the out-of-band ones included, so a scheduled fire
-/// or a background-outcome turn cannot run on, and bill, a profile the row has left.
+/// row names would bill an account the record does not. Another meka process may move a resident
+/// row without its lock, as `meka profile rename` moves every row on the name, and a hand-edit may
+/// too, so the row is read where the data is read, on every host's turn doors, the out-of-band
+/// ones included, and a turn cannot run on, and bill, a profile the row has left.
 ///
 /// Cheap when nothing has changed: one indexed row read and a comparison, with no resolution at
 /// all unless the two differ. Must be called under the conversation lock, which is what makes
@@ -684,6 +703,8 @@ pub(crate) async fn build_shared_deps(
         Some(Arc::new(crate::tools::GateToolset::new(
             mcp_manager.clone(),
             CoreMaterials::from_config(&config, builtin_filter.clone(), &sandbox),
+            read_boundary.clone(),
+            config.network,
         )));
 
     // Read here rather than during configuration: the tier is config's choice, the text is a
@@ -739,6 +760,7 @@ pub(crate) async fn build_shared_deps(
         running_subagents: crate::session::RunningSubagents::default(),
         installation_doors: Arc::new(tokio::sync::Mutex::new(())),
         whole_read,
+        serve_also: Arc::new(std::sync::OnceLock::new()),
     })
 }
 /// Per-session agent assembly behind [`build_session_agent`]. Builds the tool registry (with the
@@ -922,7 +944,15 @@ pub(crate) async fn release_agent(
     // A release that still finds a turn is one a client asked for (`session/close`, a screen
     // leaving); a shutdown stops every turn as the server's own ahead of releasing anything.
     cancel.cancel(crate::store::turns::CancelReason::Client);
-    let stopped = agent.background_tasks().cancel_all().await;
+    // Recorded as the session let go of, ahead of the signal, as every bulk stop does: the work
+    // would otherwise record its own interruption as a failure.
+    let stopped = agent
+        .background_tasks()
+        .stop_all(
+            &agent.store().background_store(),
+            crate::store::background::TaskStatus::Interrupted,
+        )
+        .await;
     if let Some(manager) = mcp_manager {
         crate::tools::mcp_adapter::detach_session_registry(manager, agent.tool_registry()).await;
     }

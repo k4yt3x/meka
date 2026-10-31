@@ -18,9 +18,6 @@
 //! session's tasks.
 
 use chrono::Utc;
-// Reached through `humantime_serde`'s re-export rather than a direct dependency, matching
-// `crate::schedule`.
-use humantime_serde::re::humantime;
 use uuid::Uuid;
 
 use crate::store::background::BackgroundTask;
@@ -127,41 +124,37 @@ impl BackgroundTasks {
         self.inner.lock().await.keys().cloned().collect()
     }
 
-    /// Every task id this process is running for one session, without touching them.
-    pub(crate) async fn session_task_ids(&self, session_id: Uuid) -> Vec<String> {
-        self.inner
-            .lock()
+    /// Stop every task this process runs, recording each still running as stopped with `status`
+    /// first, so what the agent hears says why rather than the `failed` its own interruption would
+    /// write; how many were signaled. Every one is signaled, a task still starting whose row has
+    /// not landed included, since nothing else would stop it, and one whose outcome landed first
+    /// keeps it. A record that cannot be made stops them all the same: stopping is what was asked,
+    /// and only the word the agent hears is lost.
+    pub(crate) async fn stop_all(
+        &self,
+        store: &crate::store::background::BackgroundStore,
+        status: crate::store::background::TaskStatus,
+    ) -> usize {
+        if let Err(error) = store
+            .stop_background_tasks(self.task_ids().await, status)
             .await
-            .iter()
-            .filter(|(_, handle)| handle.session_id == session_id)
-            .map(|(id, _)| id.clone())
-            .collect()
+        {
+            tracing::warn!(
+                "failed to record background tasks as {status}; stopping them anyway: {error}",
+                status = status.name()
+            );
+        }
+        self.cancel_all().await
     }
 
-    /// Signal every task this process is running, returning how many were signaled.
-    ///
-    /// For the screen's second Ctrl+C, which cannot name a session: on the first turn the id does
-    /// not exist yet (`run_turn` creates it), and a screen process has exactly one conversation
-    /// anyway, since sub-agents never get background calls.
+    /// Signal every task this process is running, returning how many were signaled: the signal
+    /// [`Self::stop_all`] sends once it has recorded why.
     pub(crate) async fn cancel_all(&self) -> usize {
         let guard = self.inner.lock().await;
         for handle in guard.values() {
             handle.cancellation.cancel();
         }
         guard.len()
-    }
-
-    /// Signal every one of this session's tasks to stop, returning how many were signaled. Backs
-    /// `task_cancel --all`.
-    pub(crate) async fn cancel_session(&self, session_id: Uuid) -> usize {
-        let guard = self.inner.lock().await;
-        let mut signaled = 0;
-        for handle in guard.values().filter(|h| h.session_id == session_id) {
-            handle.cancellation.cancel();
-            signaled += 1;
-        }
-        drop(guard);
-        signaled
     }
 
     /// Wait for every task this process is running, for a host that is about to exit.
@@ -244,7 +237,7 @@ impl BackgroundTasks {
 /// `split_outcome` keeps only the head, because an outcome arrives unbidden and should cost less
 /// window than a result the model asked for. Nothing is lost either way: the scratchpad holds all
 /// of it.
-pub(crate) const OUTCOME_INLINE_LIMIT: usize = 4 * crate::text::KIB;
+pub(crate) const OUTCOME_INLINE_BYTES: usize = 4 * crate::text::KIB;
 
 /// Longest task label shown in the `[Background]` index and in delivered headers.
 pub(crate) const LABEL_MAX_CHARS: usize = 80;
@@ -336,7 +329,7 @@ pub(crate) fn report_direction(tasks: &[BackgroundTask]) -> String {
             "Background task {} {} after {}",
             task.short_id(),
             task.status.headline(),
-            format_elapsed(task.elapsed())
+            format_elapsed(task)
         ),
         _ => {
             let ended = tasks
@@ -432,7 +425,7 @@ fn render_outcomes_with_trailer(tasks: &[BackgroundTask], trailer: &str) -> Stri
             task.short_id(),
             shown_label(task),
             task.status.headline(),
-            format_elapsed(task.elapsed()),
+            format_elapsed(task),
         ));
         if let Some(name) = &task.scratchpad_entry {
             rendered.push_str(&format!(
@@ -463,10 +456,10 @@ fn render_outcomes_with_trailer(tasks: &[BackgroundTask], trailer: &str) -> Stri
 /// spill an output whose "head" is then the whole of it: a delivered turn announcing a scratchpad
 /// entry and quoting the entire text it was supposed to spare the conversation.
 pub(crate) fn split_outcome(output: &str) -> (String, Option<String>) {
-    if output.len() <= OUTCOME_INLINE_LIMIT {
+    if output.len() <= OUTCOME_INLINE_BYTES {
         return (output.to_string(), None);
     }
-    let mut end = OUTCOME_INLINE_LIMIT;
+    let mut end = OUTCOME_INLINE_BYTES;
     while end > 0 && !output.is_char_boundary(end) {
         end -= 1;
     }
@@ -480,14 +473,9 @@ pub(crate) fn spill_entry_name(task_id: &str, tool_name: &str) -> String {
     format!("task_{short}_{tool_name}")
 }
 
-/// Human-readable duration, coarse on purpose: nobody needs milliseconds on a twenty-minute build.
-/// How long a task ran, in words: "less than a second", "30s", "12m 4s".
-pub(crate) fn format_elapsed(elapsed: chrono::Duration) -> String {
-    let seconds = elapsed.num_seconds().max(0) as u64;
-    if seconds == 0 {
-        return "less than a second".to_string();
-    }
-    humantime::format_duration(std::time::Duration::from_secs(seconds)).to_string()
+/// How long a task ran, or has been running, as every surface states a duration.
+pub(crate) fn format_elapsed(task: &BackgroundTask) -> String {
+    crate::text::format_elapsed(task.elapsed().to_std().unwrap_or_default())
 }
 
 /// A single-line excerpt of `text`, whitespace collapsed and clipped to `limit`. For listing a
@@ -642,6 +630,73 @@ mod tests {
         );
     }
 
+    /// A stop records its word for every task still running before it signals them, so the work,
+    /// which records its own interruption as a failure, finds the row already terminal. A second
+    /// connection holds the write lock for a while as the stop begins: a stop that records first
+    /// waits on it and cannot have signaled inside that while, where one that signaled first would
+    /// have.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_records_its_word_before_the_work_records_a_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let store = crate::store::Store::open(Some(&path), &Default::default())
+            .await
+            .expect("open");
+        let session_id = store
+            .create_session(None, "p".to_string())
+            .await
+            .expect("session");
+        let tasks = BackgroundTasks::default();
+        let token = tokio_util::sync::CancellationToken::new();
+        let row = BackgroundTask {
+            session_id,
+            status: TaskStatus::Running,
+            finished_at: None,
+            ..task(TaskStatus::Running, None)
+        };
+        let background = store.background_store();
+        background.start_background_task(&row).await.expect("start");
+        assert!(
+            tasks
+                .try_reserve(row.id.clone(), session_id, token.clone(), 4)
+                .await
+        );
+        let (locked, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn({
+            let (token, path) = (token.clone(), path.clone());
+            move || {
+                let connection = rusqlite::Connection::open(&path).expect("second connection");
+                connection
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .expect("the write lock");
+                locked.send(()).expect("say it is held");
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while !token.is_cancelled() && std::time::Instant::now() < until {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let signaled_while_held = token.is_cancelled();
+                connection.execute_batch("ROLLBACK").expect("let go");
+                signaled_while_held
+            }
+        });
+        held.recv().expect("the lock is held");
+
+        assert_eq!(
+            tasks.stop_all(&background, TaskStatus::Interrupted).await,
+            1
+        );
+
+        assert!(
+            !holder.join().expect("the holder"),
+            "the signal waited for the record"
+        );
+        let recorded = background
+            .list_background_tasks(session_id)
+            .await
+            .expect("tasks");
+        assert_eq!(recorded[0].status, TaskStatus::Interrupted);
+    }
+
     /// The ceiling is per session, so one session filling it must not starve another.
     #[tokio::test]
     async fn the_ceiling_is_per_session() {
@@ -736,9 +791,9 @@ mod tests {
         assert_eq!(inline, "short");
         assert!(spilled.is_none());
 
-        let long = "x".repeat(OUTCOME_INLINE_LIMIT + 100);
+        let long = "x".repeat(OUTCOME_INLINE_BYTES + 100);
         let (inline, spilled) = split_outcome(&long);
-        assert_eq!(inline.len(), OUTCOME_INLINE_LIMIT);
+        assert_eq!(inline.len(), OUTCOME_INLINE_BYTES);
         assert_eq!(spilled.as_deref(), Some(long.as_str()));
     }
 
@@ -748,12 +803,12 @@ mod tests {
     #[test]
     fn split_outcome_bounds_multibyte_output_by_bytes() {
         // Over the limit in bytes (three each), comfortably under it in characters.
-        let log = "√".repeat(OUTCOME_INLINE_LIMIT / 2);
-        assert!(log.len() > OUTCOME_INLINE_LIMIT);
-        assert!(log.chars().count() < OUTCOME_INLINE_LIMIT);
+        let log = "√".repeat(OUTCOME_INLINE_BYTES / 2);
+        assert!(log.len() > OUTCOME_INLINE_BYTES);
+        assert!(log.chars().count() < OUTCOME_INLINE_BYTES);
 
         let (inline, spilled) = split_outcome(&log);
-        assert!(inline.len() <= OUTCOME_INLINE_LIMIT, "{}", inline.len());
+        assert!(inline.len() <= OUTCOME_INLINE_BYTES, "{}", inline.len());
         assert!(
             inline.len() < log.len(),
             "a spilled outcome must not also carry the whole log inline",

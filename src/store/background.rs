@@ -4,6 +4,14 @@ use chrono::{DateTime, Utc};
 
 use super::*;
 
+/// A background call's whole output, for the scratchpad entry the call named.
+#[derive(Clone)]
+pub(crate) struct SavedOutput {
+    pub(crate) session_id: Uuid,
+    pub(crate) name: String,
+    pub(crate) content: String,
+}
+
 /// Background work's slice of the session database, handed out by
 /// [`crate::store::Store::background_store`].
 #[derive(Clone)]
@@ -69,6 +77,86 @@ impl BackgroundStore {
                     rusqlite::params![id, status, outcome, scratchpad_entry, finished_at],
                 )?;
                 Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to finish background task: {error}"))
+            })
+    }
+
+    /// Record each of `ids` still running as stopped with `status`, in one transaction, and answer
+    /// the ids whose row moved: the ones to signal, since a task whose own outcome landed first
+    /// keeps it. Recorded ahead of the signal, because the work reacting to it reports an
+    /// interruption, which would otherwise land as `failed` and tell the agent its build broke.
+    pub(crate) async fn stop_background_tasks(
+        &self,
+        ids: Vec<String>,
+        status: TaskStatus,
+    ) -> crate::error::Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        let status = status.name().to_string();
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                let mut canceled = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let moved = transaction.execute(
+                        "UPDATE background_tasks SET status = ?3, finished_at = ?2 \
+                         WHERE id = ?1 AND status = 'running'",
+                        rusqlite::params![id, finished_at, status],
+                    )?;
+                    if moved > 0 {
+                        canceled.push(id);
+                    }
+                }
+                transaction.commit()?;
+                Ok(canceled)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to stop background tasks: {error}"))
+            })
+    }
+
+    /// [`Self::finish_background_task`] for a call that named a scratchpad entry: the entry is
+    /// saved with the outcome, in one transaction and only while the row is still running, so a
+    /// task stopped before its work came back has no say over an entry the model named.
+    pub(crate) async fn finish_background_task_into_entry(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        outcome: String,
+        entry: SavedOutput,
+    ) -> crate::error::Result<()> {
+        let id = id.to_string();
+        let status = status.name().to_string();
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let finished = transaction.execute(
+                    "UPDATE background_tasks \
+                     SET status = ?2, outcome = ?3, scratchpad_entry = NULL, finished_at = ?4 \
+                     WHERE id = ?1 AND status = 'running'",
+                    rusqlite::params![id, status, outcome, finished_at],
+                )?;
+                if finished > 0 {
+                    transaction.execute(
+                        "INSERT OR REPLACE INTO scratchpad_entries \
+                         (session_id, name, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            entry.session_id.to_string(),
+                            entry.name,
+                            entry.content,
+                            finished_at
+                        ],
+                    )?;
+                }
+                transaction.commit()
             })
             .await
             .map_err(|error| {
@@ -171,6 +259,34 @@ impl BackgroundStore {
             .await
             .map_err(|error| {
                 MekaError::Database(format!("failed to mark tasks delivered: {error}"))
+            })
+    }
+
+    /// Put claimed outcomes back in the undelivered pool, for a claimer whose save of the message
+    /// carrying them failed: a later turn then reads them, where otherwise nothing would. A crash
+    /// releases nothing, which keeps the rule [`Self::mark_background_tasks_delivered`] gives.
+    pub(crate) async fn release_background_tasks(
+        &self,
+        ids: &[String],
+    ) -> crate::error::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let ids = ids.to_vec();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                for id in &ids {
+                    transaction.execute(
+                        "UPDATE background_tasks SET delivered_at = NULL WHERE id = ?1",
+                        [id],
+                    )?;
+                }
+                transaction.commit()
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to release background outcomes: {error}"))
             })
     }
 
@@ -574,7 +690,7 @@ pub(crate) struct BackgroundTask {
     pub(crate) label: String,
     pub(crate) status: TaskStatus,
     /// The tool's own output, for a terminal task. Truncated to
-    /// [`crate::background::OUTCOME_INLINE_LIMIT`] when it is also spilled to the scratchpad.
+    /// [`crate::background::OUTCOME_INLINE_BYTES`] when it is also spilled to the scratchpad.
     pub(crate) outcome: Option<String>,
     /// Scratchpad entry holding the full output, when it was too large to carry inline.
     pub(crate) scratchpad_entry: Option<String>,

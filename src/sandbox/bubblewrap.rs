@@ -23,7 +23,7 @@ pub(super) fn probe_bubblewrap() -> BackendProbe {
 }
 pub(super) const BWRAP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 pub(super) const BWRAP_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-pub(super) const BWRAP_STDERR_LIMIT: usize = 64 * crate::text::KIB;
+pub(super) const BWRAP_STDERR_BYTES: usize = 64 * crate::text::KIB;
 /// Stderr substrings that indicate the kernel refused the user namespace request rather than some
 /// other transient failure. Mirrors the fingerprint list Codex uses in
 /// `codex-rs/sandboxing/src/bwrap.rs`.
@@ -199,7 +199,7 @@ pub(super) fn smoke_test_bwrap(
                             }
                         }
                         let mut bytes = Vec::new();
-                        let mut take = handle.by_ref().take(BWRAP_STDERR_LIMIT as u64);
+                        let mut take = handle.by_ref().take(BWRAP_STDERR_BYTES as u64);
                         if let Err(error) = take.read_to_end(&mut bytes)
                             && error.kind() != std::io::ErrorKind::WouldBlock
                         {

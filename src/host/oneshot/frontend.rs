@@ -82,7 +82,7 @@ impl Frontend for PlainFrontend {
             // Said the way a notice is: a one-shot's stdout is the answer alone, and the row the
             // screen would draw is a lifecycle signpost here.
             FrontendEvent::Compacted { record, .. } => {
-                tracing::info!("{}", record.note());
+                tracing::info!("{note}", note = record.note());
                 crate::sync::lock(&self.answer).boundary();
             }
             _ => {}
@@ -192,6 +192,7 @@ mod tests {
                 primary_param: Some("rm -rf /".to_string()),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                tool_call_id: None,
                 subagent_id: None,
             })
             .await;

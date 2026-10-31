@@ -157,6 +157,22 @@ fn api_sentence(error: &MekaError) -> Option<String> {
             };
             obstacle.sentence(server_name, &remedy)
         }
+        MekaError::AccountLoginRequired { account } => format!(
+            "account '{account}' has no stored credential; log in with \
+             `POST /v1/accounts/{account}/login`"
+        ),
+        MekaError::ImportNamesUnknownProfile { name, known } => format!(
+            "{}; the archive names it, so add it with `POST /v1/profiles` first",
+            crate::text::unknown_name("profile", name, known)
+        ),
+        MekaError::ImportNamesNoProfile => "this archive names no profile and no default profile \
+                                            is set; make one the default with `PATCH \
+                                            /v1/profiles/{name}` and `\"default\": true`"
+            .to_string(),
+        MekaError::ImportNamesUnknownProject { name, known } => format!(
+            "{}; the archive names it, so add it with `POST /v1/projects` first",
+            crate::text::unknown_name("project", name, known)
+        ),
         MekaError::McpLoginRequired { server_name } => format!(
             "MCP server '{server_name}' has no OAuth credentials for its URL; log in with \
              `POST /v1/mcp/{server_name}/login`"
@@ -455,8 +471,8 @@ mod tests {
         ] {
             let withheld = ProblemDetail::for_error(&error, false);
             // Kept because a deleted arm falls to the catch-all, whose detail is "internal server
-            // error; consult server logs" -- it contains neither secret and does contain "server
-            // log" as a substring of "server logs", so the redaction checks alone would pass it.
+            // error; consult server logs" -- it contains neither secret, so the redaction checks
+            // alone would pass it.
             assert_eq!(withheld.status, 502, "{error}");
             let body = serde_json::to_string(&withheld).expect("serialize");
             assert!(
@@ -469,7 +485,7 @@ mod tests {
             let detail = withheld.detail.as_deref().unwrap_or_default().to_string();
             if !matches!(error, MekaError::ContextOverflow(_)) {
                 assert!(
-                    detail.contains("server log"),
+                    detail.contains("the meka log"),
                     "and the caller must be told where the detail went: {error}",
                 );
             }
@@ -814,6 +830,29 @@ mod tests {
             !problem.extensions.contains_key("provider_response"),
             "nothing upstream judged this request, so there is no response to relay"
         );
+    }
+
+    /// A refusal whose remedy is a command names this API's route, not the shell's.
+    #[test]
+    fn a_login_or_an_import_refusal_names_the_route_that_fixes_it() {
+        let login = ProblemDetail::for_error(
+            &MekaError::AccountLoginRequired {
+                account: "work".to_string(),
+            },
+            false,
+        );
+        let detail = login.detail.unwrap_or_default();
+        assert!(detail.contains("POST /v1/accounts/work/login"), "{detail}");
+        assert!(!detail.contains("meka account"), "{detail}");
+        let project = ProblemDetail::for_error(
+            &MekaError::ImportNamesUnknownProject {
+                name: "movie".to_string(),
+                known: Vec::new(),
+            },
+            false,
+        );
+        let detail = project.detail.unwrap_or_default();
+        assert!(detail.contains("POST /v1/projects"), "{detail}");
     }
 
     /// The refusals every door raises by variant land on the status and `type` the API documents,

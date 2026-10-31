@@ -47,21 +47,25 @@ struct AuthEntry {
 
 /// Shared state the middleware reads on every request. Owned by the top-level `ServerState` and
 /// cloned into the middleware via axum's `State` extractor.
+///
+/// The table is replaced whole each time the server serves `config.toml`, so a token added,
+/// removed or rescoped there applies to the next request, and an open stream whose token no
+/// longer grants what it needs ends ([`Self::revoked`]).
 #[derive(Clone)]
 pub(crate) struct AuthRegistry {
-    entries: Arc<[AuthEntry]>,
+    entries: Arc<tokio::sync::watch::Sender<Arc<[AuthEntry]>>>,
 }
 
 // Manual `Debug` so the raw token strings never reach logs: only the count and the non-secret
 // fingerprints are printed, mirroring `ResolvedServeToken`'s redacting `Debug`.
 impl std::fmt::Debug for AuthRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entries = Arc::clone(&self.entries.borrow());
         f.debug_struct("AuthRegistry")
-            .field("token_count", &self.entries.len())
+            .field("token_count", &entries.len())
             .field(
                 "token_ids",
-                &self
-                    .entries
+                &entries
                     .iter()
                     .map(|entry| entry.principal.token_id.as_str())
                     .collect::<Vec<_>>(),
@@ -72,7 +76,14 @@ impl std::fmt::Debug for AuthRegistry {
 
 impl AuthRegistry {
     pub(crate) fn new(tokens: Vec<ResolvedServeToken>) -> Self {
-        let entries = tokens
+        let (entries, _receiver) = tokio::sync::watch::channel(Self::entries_of(tokens));
+        Self {
+            entries: Arc::new(entries),
+        }
+    }
+
+    fn entries_of(tokens: Vec<ResolvedServeToken>) -> Arc<[AuthEntry]> {
+        tokens
             .into_iter()
             .map(|entry| AuthEntry {
                 principal: Principal {
@@ -81,8 +92,43 @@ impl AuthRegistry {
                 },
                 token: entry.token,
             })
-            .collect();
-        Self { entries }
+            .collect()
+    }
+
+    /// Replace the table with `tokens`, which the next request is checked against.
+    pub(crate) fn replace(&self, tokens: Vec<ResolvedServeToken>) {
+        self.entries.send_replace(Self::entries_of(tokens));
+    }
+
+    /// Resolves once the table no longer grants `principal` every scope in `required`: its token
+    /// removed or changed, or one of the scopes taken from it. Never resolves while it does, so a
+    /// stream opened under the token ends when the token stops covering it.
+    ///
+    /// The table is read before every wait, the first included: one replaced between the request's
+    /// own check and this subscription is a change the subscription would never report.
+    pub(crate) fn revoked(
+        &self,
+        principal: &Principal,
+        required: &'static [&'static str],
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut receiver = self.entries.subscribe();
+        let token_id = principal.token_id.clone();
+        async move {
+            loop {
+                let grants = receiver.borrow_and_update().iter().any(|entry| {
+                    entry.principal.token_id == token_id
+                        && required
+                            .iter()
+                            .all(|scope| entry.principal.has_scope(scope))
+                });
+                if !grants {
+                    return;
+                }
+                if receiver.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
     }
 
     /// Constant-time lookup. Iterates every configured token even on early match so a timing
@@ -91,8 +137,9 @@ impl AuthRegistry {
     /// deployment configures.
     pub(crate) fn lookup(&self, presented: &str) -> Option<Principal> {
         let presented = presented.as_bytes();
+        let entries = Arc::clone(&self.entries.borrow());
         let mut matched: Option<&Principal> = None;
-        for entry in self.entries.iter() {
+        for entry in entries.iter() {
             // ConstantTimeEq returns Choice::from(1u8) on match. Bytes-of-different-length never
             // match (no early return based on length difference).
             let candidate = entry.token.as_bytes();
@@ -138,7 +185,7 @@ pub(crate) async fn bearer_auth(
     let presented = match extract_bearer(&headers) {
         Ok(token) => token,
         Err(problem) => {
-            tracing::debug!("auth rejected: {title}", title = problem.title);
+            tracing::debug!("authentication refused: {title}", title = problem.title);
             return problem
                 .instance(request.uri().path().to_string())
                 .into_response();
@@ -238,6 +285,55 @@ mod tests {
         let registry = AuthRegistry::new(vec![entry("sk_test_secret", &["sessions:r"])]);
         assert!(registry.lookup("sk_test_").is_none());
         assert!(registry.lookup("sk_test_secrets").is_none());
+    }
+
+    /// A token dropped between the request's check and the stream's subscription is revoked at
+    /// once, and a stream that needs two scopes ends when either goes.
+    #[tokio::test(start_paused = true)]
+    async fn a_revocation_reads_the_table_it_subscribes_to() {
+        let registry = AuthRegistry::new(vec![entry("sk_writer", &["sessions:r", "sessions:w"])]);
+        let principal = registry.lookup("sk_writer").expect("match");
+        registry.replace(Vec::new());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            registry.revoked(&principal, &["sessions:r"]),
+        )
+        .await
+        .expect("revoked before the subscription");
+
+        registry.replace(vec![entry("sk_writer", &["sessions:r", "sessions:w"])]);
+        let principal = registry.lookup("sk_writer").expect("match");
+        let revoked = registry.revoked(&principal, &["sessions:r", "sessions:w"]);
+        tokio::pin!(revoked);
+        registry.replace(vec![entry("sk_writer", &["sessions:r"])]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut revoked)
+            .await
+            .expect("revoked when `sessions:w` goes");
+    }
+
+    /// A replaced table applies to the next lookup, and a stream's revocation resolves once its
+    /// token loses the scope it needs, and not while a change leaves that scope in place.
+    #[tokio::test(start_paused = true)]
+    async fn a_replaced_table_applies_at_once_and_revokes_what_it_drops() {
+        let registry = AuthRegistry::new(vec![entry("sk_reader", &["sessions:r", "mcp:r"])]);
+        let principal = registry.lookup("sk_reader").expect("match");
+        let revoked = registry.revoked(&principal, &["sessions:r"]);
+        tokio::pin!(revoked);
+
+        registry.replace(vec![entry("sk_reader", &["sessions:r"])]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut revoked)
+                .await
+                .is_err(),
+            "the scope it needs is still granted"
+        );
+
+        registry.replace(vec![entry("sk_other", &["sessions:r"])]);
+        assert!(registry.lookup("sk_reader").is_none());
+        assert!(registry.lookup("sk_other").is_some());
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut revoked)
+            .await
+            .expect("the token is gone, so the stream ends");
     }
 
     #[test]

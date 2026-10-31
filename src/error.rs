@@ -1,5 +1,6 @@
-//! Crate-wide [`MekaError`] enum and [`Result`] alias. All non-binary code paths return `Result<T,
-//! MekaError>`; the `main` binary wraps these in `anyhow::Result` for top-level reporting.
+//! Crate-wide [`MekaError`] enum and [`Result`] alias: what a refusal or a failure is, and the one
+//! classification every surface reads it by ([`MekaError::kind`]). The hosts and `main` carry it
+//! inside `anyhow::Result` where an error crosses code that adds context of its own.
 
 use std::time::Duration;
 
@@ -216,6 +217,35 @@ pub(crate) enum MekaError {
         name: String,
         remaining: Vec<String>,
     },
+
+    /// An account no credential is stored for, which only a login supplies. The display is the
+    /// shell's sentence; a surface with a login of its own words it from the field.
+    #[error("account '{account}' has no stored credential; run `meka account login {account}`")]
+    AccountLoginRequired { account: String },
+
+    /// An archive's session names a profile this installation does not configure. The display is
+    /// the shell's sentence; a surface that cannot pick another profile for the import words it
+    /// from the fields.
+    #[error(
+        "{}; the archive names it, so import it with `meka --profile <name> session import`",
+        crate::text::unknown_name("profile", name, known)
+    )]
+    ImportNamesUnknownProfile { name: String, known: Vec<String> },
+
+    /// An archive's session names no profile and none is the default. The display is the shell's
+    /// sentence; a surface without `--profile` words it otherwise.
+    #[error(
+        "this archive names no profile and no default profile is set; import it with `meka --profile <name> session import`"
+    )]
+    ImportNamesNoProfile,
+
+    /// An archive's session names a project this installation does not have. The display is the
+    /// shell's sentence; a surface with a door of its own for projects words it from the fields.
+    #[error(
+        "{}; the archive names it, so add it with `meka project add {name}` first",
+        crate::text::unknown_name("project", name, known)
+    )]
+    ImportNamesUnknownProject { name: String, known: Vec<String> },
 
     /// A credential stored for an MCP server stands in the way of what a door was asked. The
     /// display is the shell's sentence; a door with a remedy of its own words it from the
@@ -807,7 +837,7 @@ pub(crate) const INTERNAL_SENTENCE: &str = "internal server error; consult serve
 /// `Retry-After` to relay. Named rather than written twice because a caller matching on `type`
 /// gets one answer and a human reading `detail` must not get two.
 const PROVIDER_UNAVAILABLE_SENTENCE: &str =
-    "the provider did not complete this turn; its response is in the server log";
+    "the provider did not complete this turn; its response is in the meka log";
 
 impl MekaError {
     /// Where this error sits in the catalog. The one classification, so the HTTP surface and the
@@ -823,6 +853,10 @@ impl MekaError {
             | Self::ProfileNotConfigured { .. }
             | Self::UnknownProject { .. }
             | Self::ProfileDefaultStillNeeded { .. }
+            | Self::AccountLoginRequired { .. }
+            | Self::ImportNamesUnknownProfile { .. }
+            | Self::ImportNamesNoProfile
+            | Self::ImportNamesUnknownProject { .. }
             | Self::AccountCredentialKind { .. }
             | Self::AccountCredentialLeftOver { .. }
             | Self::ProfileNamesNoModel { .. }
@@ -896,6 +930,10 @@ impl MekaError {
             | Self::ProfileNotConfigured { .. }
             | Self::UnknownProject { .. }
             | Self::ProfileDefaultStillNeeded { .. }
+            | Self::AccountLoginRequired { .. }
+            | Self::ImportNamesUnknownProfile { .. }
+            | Self::ImportNamesNoProfile
+            | Self::ImportNamesUnknownProject { .. }
             | Self::AccountCredentialKind { .. }
             | Self::AccountCredentialLeftOver { .. }
             | Self::AccountRefreshing { .. }
@@ -909,7 +947,7 @@ impl MekaError {
             | Self::SessionNotFound(_)
             | Self::TurnInFlight { .. } => self.to_string(),
             Self::Provider(_) | Self::InvalidRequest(_) => {
-                "the provider rejected or failed this turn; its response is in the server log"
+                "the provider rejected or failed this turn; its response is in the meka log"
                     .to_string()
             }
             Self::StreamError(_) | Self::RetryableProvider { .. } => {
@@ -930,7 +968,7 @@ impl MekaError {
             // can carry a spawn failure complete with the command line and its path; the names
             // are the operator's own configuration and the only part a caller can act on.
             Self::McpTurnGated { servers } => format!(
-                "required MCP server(s) not ready: {}; each server's reason is in the server log",
+                "required MCP server(s) not ready: {}; each server's reason is in the meka log",
                 servers
                     .iter()
                     .map(|(name, _)| name.as_str())
@@ -1056,9 +1094,9 @@ impl MekaError {
 /// a multi-megabyte error page should cost a truncated string rather than a copy per reader.
 ///
 /// Far above any real provider error, which run to a few hundred bytes of JSON.
-pub(crate) const RELAYED_BODY_CAP: usize = 4 * crate::text::KIB;
+pub(crate) const RELAYED_BODY_BYTES: usize = 4 * crate::text::KIB;
 
-/// Truncation marker, charged against [`RELAYED_BODY_CAP`] rather than added on top of it.
+/// Truncation marker, charged against [`RELAYED_BODY_BYTES`] rather than added on top of it.
 pub(crate) const TRUNCATION_MARKER: &str = "… (truncated; the full text is in the log)";
 
 /// The two constants above are subtracted from each other, so their relationship is load-bearing
@@ -1066,12 +1104,12 @@ pub(crate) const TRUNCATION_MARKER: &str = "… (truncated; the full text is in 
 /// panic inside a handler, on attacker-influenced input: the subtraction underflows, and a wrapped
 /// `usize` then indexes far past the end of the string.
 const _: () = assert!(
-    RELAYED_BODY_CAP > TRUNCATION_MARKER.len() + 4,
-    "RELAYED_BODY_CAP must exceed the marker by at least one UTF-8 character, or \
+    RELAYED_BODY_BYTES > TRUNCATION_MARKER.len() + 4,
+    "RELAYED_BODY_BYTES must exceed the marker by at least one UTF-8 character, or \
      `bounded_upstream_body` underflows its budget"
 );
 
-/// Repeat at most [`RELAYED_BODY_CAP`] bytes of `message`, marking the cut when one happens.
+/// Repeat at most [`RELAYED_BODY_BYTES`] bytes of `message`, marking the cut when one happens.
 ///
 /// Shared by the HTTP host's `provider_response` member and the ACP host's `error.data`, so the
 /// two cannot disagree about how much of an upstream a caller sees. The result never exceeds the
@@ -1082,10 +1120,10 @@ const _: () = assert!(
 /// Cuts on a character boundary. Multi-byte text is ordinary here (a provider error in Japanese,
 /// an emoji in a proxy's HTML page) and slicing mid-codepoint panics.
 pub(crate) fn bounded_upstream_body(message: &str) -> String {
-    if message.len() <= RELAYED_BODY_CAP {
+    if message.len() <= RELAYED_BODY_BYTES {
         return message.to_string();
     }
-    let mut end = RELAYED_BODY_CAP - TRUNCATION_MARKER.len();
+    let mut end = RELAYED_BODY_BYTES - TRUNCATION_MARKER.len();
     while !message.is_char_boundary(end) {
         end -= 1;
     }
@@ -1452,6 +1490,10 @@ pub(crate) fn provider_stream_error(code: &str, message: String) -> MekaError {
         };
     }
     match code {
+        // OpenAI Responses `error.code` on a `response.failed`, which is how the ChatGPT backend
+        // reports an input past the model's window: a code, so an overflow is read from structure
+        // here as it is from the status on a response.
+        "context_length_exceeded" => MekaError::ContextOverflow(message),
         // Anthropic `error.type`.
         "overloaded_error" | "rate_limit_error" | "api_error"
         // OpenAI Responses `error.code`; `server_is_overloaded` is the ChatGPT backend's, captured
@@ -1705,32 +1747,32 @@ mod tests {
     /// The size bound never exceeds the cap, never grows the input, and cuts on a character
     /// boundary.
     ///
-    /// The four-byte case carries a one-byte prefix on purpose: `RELAYED_BODY_CAP` is 4096, which
+    /// The four-byte case carries a one-byte prefix on purpose: `RELAYED_BODY_BYTES` is 4096, which
     /// is itself divisible by four, so an unprefixed run of four-byte characters lands the cut on a
     /// boundary already and a naive slice would pass. Only a misaligned input exercises the walk.
     #[test]
     fn the_relayed_body_is_bounded_and_cut_on_a_character_boundary() {
         for (label, body) in [
-            ("three-byte", "\u{3042}".repeat(RELAYED_BODY_CAP)),
+            ("three-byte", "\u{3042}".repeat(RELAYED_BODY_BYTES)),
             (
                 "four-byte misaligned",
-                format!("a{}", "\u{1F642}".repeat(RELAYED_BODY_CAP)),
+                format!("a{}", "\u{1F642}".repeat(RELAYED_BODY_BYTES)),
             ),
             (
                 "mixed",
                 format!(
                     "{}{}",
-                    "a".repeat(RELAYED_BODY_CAP - 1),
+                    "a".repeat(RELAYED_BODY_BYTES - 1),
                     "\u{3042}".repeat(16)
                 ),
             ),
             // Just over the cap, which is the one size a bound must not grow: adding a marker on
             // top would return more bytes than it was given.
-            ("one byte over", "a".repeat(RELAYED_BODY_CAP + 1)),
+            ("one byte over", "a".repeat(RELAYED_BODY_BYTES + 1)),
         ] {
             let out = bounded_upstream_body(&body);
             assert!(
-                out.len() <= RELAYED_BODY_CAP,
+                out.len() <= RELAYED_BODY_BYTES,
                 "{label}: a bound that can be exceeded is not one; got {} bytes",
                 out.len()
             );
@@ -1747,7 +1789,7 @@ mod tests {
                  provider's error type sits"
             );
         }
-        let exact = "x".repeat(RELAYED_BODY_CAP);
+        let exact = "x".repeat(RELAYED_BODY_BYTES);
         assert_eq!(
             bounded_upstream_body(&exact),
             exact,
@@ -2621,6 +2663,19 @@ mod tests {
             }
             other => panic!("expected RetryableProvider, got {other:?}"),
         }
+    }
+
+    /// An overflow reported inside a stream is an overflow, so the turn compacts and resends
+    /// rather than failing every turn after it.
+    #[test]
+    fn a_stream_s_context_length_code_is_an_overflow() {
+        assert!(matches!(
+            provider_stream_error(
+                "context_length_exceeded",
+                "Your input exceeds the context window of this model.".to_string()
+            ),
+            MekaError::ContextOverflow(_)
+        ));
     }
 
     /// The overflow phrases are read on a 4xx and nowhere else.

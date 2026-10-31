@@ -13,15 +13,21 @@ pub(super) struct StoredMessage {
     pub(super) content: String,
     pub(super) created_at: String,
     pub(super) turn_id: Option<String>,
+    /// The row this one copies; see [`super::search::NewMessage`].
+    pub(super) copy_of: Option<i64>,
 }
 
-/// When a stored event was written, and under which turn, for a reader of the whole log.
+/// Which row a stored event is, when it was written, and under which turn, for a reader of the
+/// whole log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EventStamp {
+    pub(crate) id: i64,
     pub(crate) created_at: String,
     /// The turn that added the row; `None` for a row no turn added, such as a compaction
     /// boundary written between turns or a rewind's repair.
     pub(crate) turn_id: Option<Uuid>,
+    /// The row this one copies, for a copy a compaction kept while that row stands.
+    pub(crate) copy_of: Option<i64>,
 }
 
 /// One row of the log with its id, for a reader that walks the log in pages.
@@ -152,11 +158,21 @@ pub(crate) struct ImportSessionRecord {
     pub(crate) stats: crate::stats::SessionStatsSnapshot,
     /// The session's turns, under the ids the archive's events were remapped to.
     pub(crate) turns: Vec<super::export::ExportedTurn>,
-    /// `(created_at, event, turn)` triples in chronological order; timestamps are preserved
-    /// verbatim and the turn is one of `turns` or none.
-    pub(crate) events: Vec<(String, crate::conversation::Event, Option<Uuid>)>,
+    /// The events in chronological order.
+    pub(crate) events: Vec<ImportedEvent>,
     /// `(name, content)` scratchpad entries referenced by name from tool-call inputs.
     pub(crate) scratchpad_entries: Vec<(String, String)>,
+}
+/// One event of an imported session, as its archive carried it.
+pub(crate) struct ImportedEvent {
+    /// When the row was written, preserved verbatim.
+    pub(crate) at: String,
+    pub(crate) event: crate::conversation::Event,
+    /// The turn that added the row, one of the record's `turns`, or none.
+    pub(crate) turn_id: Option<Uuid>,
+    /// The position among the record's events of the one this copies, for a copy a compaction
+    /// kept; always an earlier one.
+    pub(crate) copy_of: Option<usize>,
 }
 /// A row's evidence that another session spawned it. See [`Store::spawn_terms`].
 #[derive(Debug, Clone, Copy)]
@@ -225,6 +241,71 @@ fn ids_returned(
         .collect()
 }
 
+/// Whether a session row is whole: false while a fork or an import is still copying its rows in,
+/// and for one a crash left half written, which the startup sweep removes. Every reader that
+/// enumerates sessions asks it, so a copy is listed, searched, resumed as the last, found by a
+/// prefix, counted, handed out among a session's sub-agents or judged by the turn sweep only once
+/// whole; a reader that names an id needs no check, since a copy's id is the copier's alone until
+/// it is whole, and its lock refuses anyone else meanwhile. The deleting doors take every row
+/// instead: locking a tree to delete it, since the rows still being written go with it, deleting
+/// every session, and taking back the unfinished copies themselves.
+pub(crate) fn whole_session_sql(qualifier: &str) -> String {
+    format!("{qualifier}incomplete = 0")
+}
+
+/// [`whole_session_sql`]'s negation, as the condition the sweep of unfinished copies re-applies
+/// inside its delete, which takes a constant.
+const UNFINISHED_COPY: &str = "incomplete <> 0";
+
+/// Rows a fork or an import copies per transaction: a few milliseconds each with the search
+/// index, so a writer in another process waits for one chunk, not for the copy.
+const COPY_ROWS_PER_TRANSACTION: usize = 2_000;
+
+/// A session's turn ids to its copy's.
+type TurnIds = std::collections::HashMap<String, String>;
+
+/// The rows of a copy in progress, taken back if its future is dropped partway, as a request whose
+/// client went away drops it: neither its error path nor its last transaction then runs, and the
+/// copy would wait unlisted for the next startup.
+struct UnfinishedCopies {
+    store: Store,
+    ids: Vec<Uuid>,
+}
+
+impl UnfinishedCopies {
+    fn new(store: Store, ids: Vec<Uuid>) -> Self {
+        Self { store, ids }
+    }
+
+    /// The copy ran to its end, whole or failed; its ids, for the caller that takes a failed one
+    /// back itself.
+    fn settled(mut self) -> Vec<Uuid> {
+        std::mem::take(&mut self.ids)
+    }
+}
+
+impl Drop for UnfinishedCopies {
+    fn drop(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        let (store, ids) = (self.store.clone(), std::mem::take(&mut self.ids));
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { store.remove_unfinished_copies(ids).await });
+            }
+            Err(_) => tracing::warn!(
+                "failed to take back an unfinished copy outside the runtime; the next startup \
+                 removes it"
+            ),
+        }
+    }
+}
+
+/// An imported session's events as the import writes them: when each was written, the event
+/// prepared for its row, the turn that added it, and the position of the event it copies.
+type PreparedRows = Vec<(String, PreparedEvent, Option<String>, Option<usize>)>;
+
 pub(crate) fn spawned_session_sql(qualifier: &str) -> String {
     format!(
         "({qualifier}parent_session_id IS NOT NULL OR {qualifier}subagent_spec_json IS NOT NULL)"
@@ -247,17 +328,21 @@ impl SessionReach {
     /// The `WHERE` term keeping rows of the `sessions` alias `s` within reach, and the id a tree
     /// binds as `:root`. The term is `1` when nothing is excluded, so a caller can `AND` it on.
     pub(super) fn sql_term(self) -> (String, Option<String>) {
+        let whole = whole_session_sql("s.");
         match self {
             Self::Tree(root) => (
-                "(s.id = :root OR s.parent_session_id = :root)".to_string(),
+                format!("(s.id = :root OR s.parent_session_id = :root) AND {whole}"),
                 Some(root.to_string()),
             ),
             Self::Store {
                 include_children: true,
-            } => ("1".to_string(), None),
+            } => (whole, None),
             Self::Store {
                 include_children: false,
-            } => (format!("NOT {}", spawned_session_sql("s.")), None),
+            } => (
+                format!("NOT {} AND {whole}", spawned_session_sql("s.")),
+                None,
+            ),
         }
     }
 }
@@ -540,7 +625,8 @@ pub(super) const UNSIGN_KIND: &str = "unsign";
 /// The `messages` row a session's title is read from, as a `WHERE` over `messages` correlated to
 /// `sessions s`: the first user message that carries words. A `user` row is text by construction; a
 /// `user_blocks` row is a JSON array of blocks and is passed over while none of them carries a
-/// person's words, a `text` block, an `inbox` item's body or a `scheduled` fire's prompt
+/// person's words, a `text` block, an `inbox` item's body, a `scheduled` fire's prompt or an
+/// `invocation`, which always names what it invoked
 /// ([`crate::conversation::ContentBlock::spoken_words`] spelled in SQL), so an image sent alone
 /// does not leave the session unlabeled once words follow. Blank text and a stand-in meka wrote
 /// do not count as words in either shape, which is [`crate::conversation::is_harness_stand_in`]
@@ -568,7 +654,8 @@ static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                   AND EXISTS (SELECT 1 FROM json_each(messages.content)
                               WHERE ({kind} = 'text' AND {text_words})
                                  OR ({kind} = 'inbox' AND {body_words})
-                                 OR ({kind} = 'scheduled' AND {prompt_words}))))",
+                                 OR ({kind} = 'scheduled' AND {prompt_words})
+                                 OR {kind} = 'invocation')))",
         user_words = is_words("messages.content"),
         kind = "json_extract(CASE WHEN json_each.type = 'object' THEN json_each.value END, \
                 '$.type')",
@@ -655,6 +742,10 @@ pub(super) struct PreparedEvent {
     event: crate::conversation::Event,
     blobs: Vec<super::blobs::NewBlob>,
     references: Vec<String>,
+    copy_of: Option<i64>,
+    /// A copy a compaction kept, whose row [`link_kept_copies`] finds in the transaction that
+    /// writes it.
+    kept: bool,
 }
 
 impl PreparedEvent {
@@ -665,7 +756,21 @@ impl PreparedEvent {
             event,
             blobs,
             references,
+            copy_of: None,
+            kept: false,
         }
+    }
+
+    /// The row as a copy a compaction kept, written after its boundary.
+    pub(super) fn kept(mut self) -> Self {
+        self.kept = true;
+        self
+    }
+
+    /// The row as a copy a compaction kept of row `copy_of`, when it names one.
+    pub(super) fn copy_of(mut self, copy_of: Option<i64>) -> Self {
+        self.copy_of = copy_of;
+        self
     }
 
     /// The blob hashes the row will reference, for a check ahead of the write.
@@ -694,16 +799,98 @@ pub(super) fn insert_event(
     let (kind, content) = encode_event_for_db(&prepared.event)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     super::blobs::insert_blobs(transaction, &prepared.blobs, created_at)?;
-    let message_id = super::search::insert_message(
-        transaction,
-        session_id,
-        &kind,
-        &content,
-        created_at,
-        turn_id,
-    )?;
+    let message_id =
+        super::search::insert_message(transaction, session_id, &super::search::NewMessage {
+            kind: &kind,
+            content: &content,
+            created_at,
+            turn_id,
+            copy_of: prepared.copy_of,
+        })?;
     super::blobs::link_message_blobs(transaction, message_id, &prepared.references)?;
     Ok(message_id)
+}
+
+/// Name, on each of `prepared`'s copies a compaction kept, the row it copies, among the rows after
+/// the session's latest boundary: the alignment that pairs the most copies with rows holding what
+/// they hold, in order, each with the latest row it can take. Called ahead of the batch's own
+/// boundary. A copy no row holds names none and is a row of its own, so history keeps what it says
+/// (a prompt whose own save failed, or a message the view rewrote on its way to the model), and it
+/// cannot draw the copies before it off their rows by taking an older row that happens to match.
+fn link_kept_copies(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    prepared: &mut [PreparedEvent],
+) -> rusqlite::Result<()> {
+    if !prepared.iter().any(|event| event.kept) {
+        return Ok(());
+    }
+    let floor: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1 AND kind = ?2",
+        rusqlite::params![session_id, COMPACT_BOUNDARY_KIND],
+        |row| row.get(0),
+    )?;
+    let view: Vec<(i64, (String, String))> = transaction
+        .prepare(
+            "SELECT id, kind, content FROM messages WHERE session_id = ?1 AND id > ?2 ORDER BY id",
+        )?
+        .query_map(rusqlite::params![session_id, floor], |row| {
+            Ok((row.get(0)?, (row.get(1)?, row.get(2)?)))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut copies: Vec<&mut PreparedEvent> =
+        prepared.iter_mut().filter(|event| event.kept).collect();
+    let held: Vec<(String, String)> = copies
+        .iter()
+        .map(|copy| encode_event_for_db(&copy.event))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let rows: Vec<&(String, String)> = view.iter().map(|(_, row)| row).collect();
+    let held: Vec<&(String, String)> = held.iter().collect();
+    for (copy, row) in copies.iter_mut().zip(align_in_order(&held, &rows)) {
+        copy.copy_of = row.and_then(|row| view.get(row)).map(|(id, _)| *id);
+    }
+    Ok(())
+}
+
+/// For each of `copies`, the position in `rows` it pairs with in the longest alignment that keeps
+/// both orders, each pairing with the latest row it can, or `None`.
+fn align_in_order<T: PartialEq>(copies: &[T], rows: &[T]) -> Vec<Option<usize>> {
+    let width = rows.len() + 1;
+    // `longest[i * width + j]`: the most pairs between the first `i` copies and the first `j` rows.
+    let mut longest = vec![0_u32; (copies.len() + 1) * width];
+    let at = |longest: &[u32], i: usize, j: usize| longest.get(i * width + j).copied().unwrap_or(0);
+    for (i, copy) in copies.iter().enumerate() {
+        for (j, row) in rows.iter().enumerate() {
+            let value = if copy == row {
+                at(&longest, i, j) + 1
+            } else {
+                at(&longest, i, j + 1).max(at(&longest, i + 1, j))
+            };
+            if let Some(cell) = longest.get_mut((i + 1) * width + j + 1) {
+                *cell = value;
+            }
+        }
+    }
+    let mut paired = vec![None; copies.len()];
+    let (mut i, mut j) = (copies.len(), rows.len());
+    while i > 0 && j > 0 {
+        let pairs = copies
+            .get(i - 1)
+            .is_some_and(|copy| rows.get(j - 1) == Some(copy));
+        if pairs && at(&longest, i, j) == at(&longest, i - 1, j - 1) + 1 {
+            if let Some(slot) = paired.get_mut(i - 1) {
+                *slot = Some(j - 1);
+            }
+            i -= 1;
+            j -= 1;
+        } else if at(&longest, i, j - 1) >= at(&longest, i - 1, j) {
+            j -= 1;
+        } else {
+            i -= 1;
+        }
+    }
+    paired
 }
 
 /// Encode an [`crate::conversation::Event`] into the `(kind, content)` columns of the `messages`
@@ -810,8 +997,11 @@ pub(super) fn decode_event_from_row(
 /// Which rows of a session's log a read takes.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum RowRange {
-    /// Every row: the readers that want history.
+    /// Every row: the readers that replay the conversation, or carry the log whole.
     All,
+    /// Every row but the copies a compaction kept: the readers that show history, which say a
+    /// kept turn once, where it was first said.
+    History,
     /// The last `compact_boundary` row and everything after it, or every row when there is none:
     /// the rows that produce the model's view. See [`Store::load_view_events`].
     FromLastBoundary,
@@ -836,6 +1026,7 @@ fn stored_row_with_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, StoredM
         content: row.get(2)?,
         created_at: row.get(3)?,
         turn_id: row.get(4)?,
+        copy_of: row.get(5)?,
     }))
 }
 
@@ -912,8 +1103,10 @@ fn decode_rows(
         match decode_event_from_row(&row) {
             Ok(Some(event)) => events.push((
                 EventStamp {
+                    id,
                     created_at: row.created_at,
                     turn_id: row.turn_id.as_deref().and_then(session_id_in),
+                    copy_of: row.copy_of,
                 },
                 event,
             )),
@@ -1197,8 +1390,9 @@ impl Store {
                 connection.query_row(
                     &format!(
                         "SELECT COUNT(*) FROM sessions
-                         WHERE profile = ?1 AND NOT {}",
-                        spawned_session_sql("")
+                         WHERE profile = ?1 AND NOT {} AND {}",
+                        spawned_session_sql(""),
+                        whole_session_sql("")
                     ),
                     rusqlite::params![profile],
                     |row| row.get::<_, i64>(0),
@@ -1296,7 +1490,8 @@ impl Store {
     /// What runs on the name `profile`, which a rename onto it would move to another profile: the
     /// root sessions that record it, each running on its row, and the roots of the trees holding
     /// a sub-agent pinned to it. A sub-agent that follows its parent runs on the parent's profile
-    /// whatever its row records, so its row is not counted.
+    /// whatever its row records, so its row is not counted. A copy a fork or an import is still
+    /// writing counts: it runs on its row once whole.
     pub(crate) async fn sessions_run_on_profile_name(&self, profile: &str) -> Result<RunOnName> {
         let profile = profile.to_string();
         self.connection
@@ -1654,8 +1849,8 @@ impl Store {
     }
 
     /// Copy `source`'s conversation into a new session and return it, or `Ok(None)` when `source`
-    /// doesn't exist (callers map that to their own not-found shape). The whole copy is one
-    /// transaction, so a failure leaves no half-built session behind.
+    /// doesn't exist (callers map that to their own not-found shape). The copy is listed by nothing
+    /// until it is whole, and a failure takes back what it wrote; see [`Self::fork_session_into`].
     ///
     /// What travels: the event log verbatim (per-event timestamps included), `scratchpad_entries`,
     /// `permission`, `capabilities_json`, the cumulative stats, and `cwd` / `additional_roots`
@@ -1729,10 +1924,12 @@ impl Store {
                 return Ok(None);
             }
             Err(error) => {
-                // Nothing was written under the copy's id, so its claim goes, file included, or
-                // every failed copy leaves a file per attempt. The source's is only released: its
-                // row is still there, and its file is the one every other process locks it by, so
-                // unlinking it could leave two holders on two inodes.
+                // A copy that failed has taken back what it wrote, so its claim goes, file
+                // included, or every failed copy leaves a file per attempt; one whose taking back
+                // failed is unlisted, and the startup sweep locks it afresh to delete it. The
+                // source's is only released: its row is still there, and its file is the one
+                // every other process locks it by, so unlinking it could leave two holders on two
+                // inodes.
                 self.discard_unused_claim(lock, new_id);
                 drop(source_held);
                 return Err(error);
@@ -1775,16 +1972,27 @@ impl Store {
         };
 
         let created_at_for_db = created_at.clone();
-        let inserted = self
+        // The row first, marked unfinished, with the turns under fresh ids and the scratchpad
+        // entries: one short transaction. Nothing lists the copy until the last transaction marks
+        // it whole, and its lock, which the caller holds, refuses anyone who names it meanwhile.
+        //
+        // The messages follow in short transactions, so another process's write waits for one of
+        // them rather than for the whole copy, which on a long session runs past its busy timeout.
+        // No turn adds to the source in between, since every fork door holds its lock, and the copy
+        // is bounded by the last row it held when the row was copied. The turn sweep takes no lock
+        // and may take rows below the source's view meanwhile; the copy then lacks them, as a fork
+        // made after that sweep would, except a kept turn whose row a chunk had copied before the
+        // sweep released its copy, which the fork then shows twice.
+        //
+        // Guarded from before the first write: a future dropped while it is in flight leaves a row
+        // that commits all the same.
+        let unfinished = UnfinishedCopies::new(self.clone(), vec![new_id]);
+        let started = self
             .connection
-            .call(move |connection| -> rusqlite::Result<bool> {
+            .call(move |connection| -> rusqlite::Result<Option<(TurnIds, i64)>> {
                 let transaction = connection.transaction()?;
                 let source_id = source.to_string();
                 let new_id_string = new_id.to_string();
-
-                // The enclosing transaction is what makes the three statements below a consistent
-                // snapshot: the first `INSERT` takes SQLite's write lock, so no other connection
-                // can append an event to the source between the row copy and the message copy.
                 let rows = transaction.execute(
                     "INSERT INTO sessions (
                          id, created_at, updated_at, parent_session_id, subagent_spec_json,
@@ -1795,7 +2003,7 @@ impl Store {
                          cache_creation_input_tokens, cache_read_input_tokens,
                          redactions, redacted_images, redacted_bytes,
                          prompt_index, turn_index,
-                         context_tokens, title
+                         context_tokens, title, incomplete
                      )
                      SELECT ?1, ?2, ?2, parent_session_id, subagent_spec_json,
                             COALESCE(?3, working_directory), permission, approvals,
@@ -1806,7 +2014,7 @@ impl Store {
                             cache_creation_input_tokens, cache_read_input_tokens,
                             redactions, redacted_images, redacted_bytes,
                             prompt_index, turn_index,
-                            context_tokens, title
+                            context_tokens, title, 1
                      FROM sessions WHERE id = ?7",
                     rusqlite::params![
                         new_id_string,
@@ -1821,13 +2029,9 @@ impl Store {
                 if rows == 0 {
                     // No source row: nothing was inserted, so the rollback is a formality.
                     transaction.rollback()?;
-                    return Ok(false);
+                    return Ok(None);
                 }
 
-                // Row by row rather than one `INSERT ... SELECT`, because each copied message needs
-                // the source row's blob references under its own new id: a reference is what keeps
-                // an image from the sweep when the source is deleted, and what lets this fork read
-                // it over the API.
                 // The turns travel under fresh ids, since a turn belongs to one session, and each
                 // copied message keeps naming the turn that added it.
                 let mut turn_ids: std::collections::HashMap<String, String> =
@@ -1854,39 +2058,6 @@ impl Store {
                         turn_ids.insert(old, new);
                     }
                 }
-                {
-                    let mut select = transaction.prepare(
-                        "SELECT id, kind, content, created_at, turn_id FROM messages \
-                         WHERE session_id = ?1 ORDER BY id ASC",
-                    )?;
-                    let mut link = transaction.prepare(
-                        "INSERT OR IGNORE INTO message_blobs (message_id, hash) \
-                         SELECT ?1, hash FROM message_blobs WHERE message_id = ?2",
-                    )?;
-                    let rows = select.query_map(rusqlite::params![source_id], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                        ))
-                    })?;
-                    for row in rows {
-                        let (source_message_id, kind, content, created_at, turn_id) = row?;
-                        let message_id = super::search::insert_message(
-                            &transaction,
-                            &new_id_string,
-                            &kind,
-                            &content,
-                            &created_at,
-                            turn_id
-                                .and_then(|old| turn_ids.get(&old))
-                                .map(String::as_str),
-                        )?;
-                        link.execute(rusqlite::params![message_id, source_message_id])?;
-                    }
-                }
                 transaction.execute(
                     "INSERT INTO scratchpad_entries (session_id, name, content, created_at)
                      SELECT ?1, name, content, created_at
@@ -1894,19 +2065,284 @@ impl Store {
                     rusqlite::params![new_id_string, source_id],
                 )?;
 
+                let ceiling: Option<i64> = transaction.query_row(
+                    "SELECT MAX(id) FROM messages WHERE session_id = ?1",
+                    rusqlite::params![source_id],
+                    |row| row.get(0),
+                )?;
                 transaction.commit()?;
-                Ok(true)
+                Ok(Some((turn_ids, ceiling.unwrap_or(0))))
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to fork session: {error}")))?;
-
-        if !inserted {
-            return Ok(None);
+            .map_err(|error| MekaError::Database(format!("failed to fork session: {error}")));
+        let (turn_ids, ceiling) = match started {
+            Ok(Some(started)) => started,
+            // Nothing was written: the transaction rolled back.
+            Ok(None) => {
+                unfinished.settled();
+                return Ok(None);
+            }
+            Err(error) => {
+                unfinished.settled();
+                return Err(error);
+            }
+        };
+        let copied = match self.copy_messages(source, new_id, turn_ids, ceiling).await {
+            Ok(()) => self.mark_copies_whole(vec![new_id]).await,
+            Err(error) => Err(error),
+        };
+        let ids = unfinished.settled();
+        if let Err(error) = copied {
+            self.remove_unfinished_copies(ids).await;
+            return Err(error);
         }
         Ok(Some(CreatedSession {
             id: new_id,
             created_at,
         }))
+    }
+
+    /// Copy `source`'s messages up to row `ceiling` into `target`, [`COPY_ROWS_PER_TRANSACTION`]
+    /// to a transaction, each naming the turn `turn_ids` maps its own to and a copy a compaction
+    /// kept naming the new row of the one it copies.
+    ///
+    /// Row by row rather than one `INSERT ... SELECT`, because each copied message needs the
+    /// source row's blob references under its own new id: a reference is what keeps an image from
+    /// the sweep when the source is deleted, and what lets the copy read it over the API.
+    async fn copy_messages(
+        &self,
+        source: Uuid,
+        target: Uuid,
+        turn_ids: TurnIds,
+        ceiling: i64,
+    ) -> Result<()> {
+        let turn_ids = Arc::new(turn_ids);
+        let mut after = 0_i64;
+        // Each source row's new id, carried from one transaction to the next: a copy comes after
+        // the row it copies, so that row's new id is known by the time the copy is written.
+        let mut copied: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        loop {
+            let turn_ids = Arc::clone(&turn_ids);
+            let (source_id, target_id) = (source.to_string(), target.to_string());
+            let carried = std::mem::take(&mut copied);
+            let (last, carried) = self
+                .connection
+                .call(move |connection| -> rusqlite::Result<_> {
+                    let mut copied = carried;
+                    // Immediate, since the chunk reads before it writes: a deferred one would fail
+                    // at once on the upgrade if another process holds the write lock.
+                    let transaction = connection
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    let mut last = None;
+                    {
+                        let mut select = transaction.prepare(
+                            "SELECT id, kind, content, created_at, turn_id, copy_of \
+                             FROM messages WHERE session_id = ?1 AND id > ?2 AND id <= ?3 \
+                             ORDER BY id ASC LIMIT ?4",
+                        )?;
+                        let mut link = transaction.prepare(
+                            "INSERT OR IGNORE INTO message_blobs (message_id, hash) \
+                             SELECT ?1, hash FROM message_blobs WHERE message_id = ?2",
+                        )?;
+                        let rows = select.query_map(
+                            rusqlite::params![
+                                source_id,
+                                after,
+                                ceiling,
+                                COPY_ROWS_PER_TRANSACTION as i64
+                            ],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, String>(3)?,
+                                    row.get::<_, Option<String>>(4)?,
+                                    row.get::<_, Option<i64>>(5)?,
+                                ))
+                            },
+                        )?;
+                        for row in rows {
+                            let (source_message_id, kind, content, created_at, turn_id, copy_of) =
+                                row?;
+                            let message_id = super::search::insert_message(
+                                &transaction,
+                                &target_id,
+                                &super::search::NewMessage {
+                                    kind: &kind,
+                                    content: &content,
+                                    created_at: &created_at,
+                                    turn_id: turn_id
+                                        .and_then(|old| turn_ids.get(&old))
+                                        .map(String::as_str),
+                                    copy_of: copy_of
+                                        .and_then(|original| copied.get(&original).copied()),
+                                },
+                            )?;
+                            link.execute(rusqlite::params![message_id, source_message_id])?;
+                            copied.insert(source_message_id, message_id);
+                            last = Some(source_message_id);
+                        }
+                    }
+                    transaction.commit()?;
+                    Ok((last, copied))
+                })
+                .await
+                .map_err(|error| {
+                    MekaError::Database(format!("failed to copy a session's messages: {error}"))
+                })?;
+            copied = carried;
+            match last {
+                Some(id) => after = id,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Delete the copies a fork or an import left unfinished, which only a process that died
+    /// partway leaves, and how many: one another process holds is spared, since that process may
+    /// be writing it still.
+    pub(crate) async fn delete_unfinished_copies(&self) -> Result<SessionSweep> {
+        let unfinished: Vec<Uuid> = self
+            .connection
+            .call(|connection| -> rusqlite::Result<_> {
+                // The topmost unfinished rows: an import's root, whose rows below it go with it, or
+                // a fork of a sub-agent, whose parent is whole.
+                connection
+                    .prepare(&format!(
+                        "SELECT id FROM sessions WHERE {UNFINISHED_COPY} AND (parent_session_id IS NULL \
+                         OR parent_session_id NOT IN (SELECT id FROM sessions WHERE {UNFINISHED_COPY}))"
+                    ))?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to list unfinished copies: {error}"))
+            })?
+            .iter()
+            .filter_map(|id| session_id_in(id))
+            .collect();
+        if unfinished.is_empty() {
+            return Ok(SessionSweep::default());
+        }
+        self.delete_the_unattached_among(&unfinished, UNFINISHED_COPY, None)
+            .await
+    }
+
+    /// Write an import's events, each session's in order, [`COPY_ROWS_PER_TRANSACTION`] to a
+    /// transaction. Each transaction stores the archive's blobs its rows reference along with them,
+    /// since a blob nothing references is one any process's sweep may take between two, and
+    /// refuses a reference neither it nor the store holds: an image no reader could ever show.
+    async fn import_events(
+        &self,
+        events: Vec<(String, PreparedRows)>,
+        archive_blobs: Vec<super::blobs::NewBlob>,
+        imported_at: String,
+    ) -> Result<()> {
+        let mut carried: std::collections::HashMap<String, super::blobs::NewBlob> = archive_blobs
+            .into_iter()
+            .map(|blob| (blob.hash.clone(), blob))
+            .collect();
+        for (session_id, mut events) in events {
+            // Each event's new row id by its position, carried from one transaction to the next
+            // so a copy names the row of the event it copies, which always comes before it.
+            let mut written: Vec<i64> = Vec::with_capacity(events.len());
+            while !events.is_empty() {
+                let chunk: PreparedRows = events
+                    .drain(..events.len().min(COPY_ROWS_PER_TRANSACTION))
+                    .collect();
+                let blobs: Vec<super::blobs::NewBlob> = chunk
+                    .iter()
+                    .flat_map(|(_, prepared, ..)| prepared.references())
+                    .filter_map(|hash| carried.remove(hash))
+                    .collect();
+                let (session_id, imported_at) = (session_id.clone(), imported_at.clone());
+                let carried_ids = std::mem::take(&mut written);
+                written = self
+                    .connection
+                    .call(move |connection| -> rusqlite::Result<_> {
+                        let mut written = carried_ids;
+                        // Immediate, as a fork's chunk is: one may read before it writes.
+                        let transaction = connection
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                        super::blobs::insert_blobs(&transaction, &blobs, &imported_at)?;
+                        for (created_at, prepared, turn_id, copy_of) in chunk {
+                            if let Some(hash) =
+                                super::blobs::missing_blob(&transaction, prepared.references())?
+                            {
+                                return Err(rusqlite::Error::InvalidParameterName(format!(
+                                    "the archive references image blob {hash}, which it does not \
+                                     carry and this store does not hold"
+                                )));
+                            }
+                            let prepared = prepared.copy_of(
+                                copy_of.and_then(|position| written.get(position).copied()),
+                            );
+                            written.push(insert_event(
+                                &transaction,
+                                &session_id,
+                                &prepared,
+                                &created_at,
+                                turn_id.as_deref(),
+                            )?);
+                        }
+                        transaction.commit()?;
+                        Ok(written)
+                    })
+                    .await
+                    .map_err(|error| {
+                        MekaError::Database(format!("failed to import sessions: {error}"))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark the copies `ids` whole, which lists them: the last transaction of a fork or an import.
+    async fn mark_copies_whole(&self, ids: Vec<Uuid>) -> Result<()> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                for id in &ids {
+                    transaction.execute("UPDATE sessions SET incomplete = 0 WHERE id = ?1", [
+                        id.to_string(),
+                    ])?;
+                }
+                transaction.commit()
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to mark a copied session whole: {error}"))
+            })
+    }
+
+    /// Take back the unfinished copies `ids`, rows, cascade and the blobs nothing references
+    /// afterward, for a fork or an import that failed partway. Best-effort: one this cannot take
+    /// stays unlisted, and the next startup's sweep takes it.
+    async fn remove_unfinished_copies(&self, ids: Vec<Uuid>) {
+        let removed = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                for id in &ids {
+                    transaction.execute(
+                        &format!(
+                            "DELETE FROM sessions WHERE id = ?1 AND NOT {}",
+                            whole_session_sql("")
+                        ),
+                        [id.to_string()],
+                    )?;
+                }
+                super::blobs::sweep_unreferenced_blobs(&transaction)?;
+                transaction.commit()
+            })
+            .await;
+        if let Err(error) = removed {
+            tracing::warn!(
+                "failed to remove an unfinished copy; the next startup removes it: {error}"
+            );
+        }
     }
 
     /// Persist a single event from the conversation log. Events are
@@ -2002,19 +2438,57 @@ impl Store {
         inbox_items: &[Uuid],
         turn: Option<Uuid>,
     ) -> Result<()> {
-        if events.is_empty() {
+        let prepared: Vec<PreparedEvent> = events.iter().map(PreparedEvent::from_event).collect();
+        self.save_prepared_atomic(session_id, prepared, inbox_items, turn)
+            .await
+    }
+
+    /// A compaction's rows in one transaction, for the reason [`Self::save_events_atomic`] gives:
+    /// its boundary, then each message it kept, written as a copy so that every reader that shows
+    /// history says the kept turn once, where it was first said, while the model reads it after
+    /// the boundary.
+    pub(crate) async fn save_compaction(
+        &self,
+        session_id: Uuid,
+        boundary: &crate::conversation::Event,
+        kept: &[crate::conversation::Message],
+        turn: Option<Uuid>,
+    ) -> Result<()> {
+        let prepared: Vec<PreparedEvent> = std::iter::once(PreparedEvent::from_event(boundary))
+            .chain(kept.iter().map(|message| {
+                PreparedEvent::from_event(&crate::conversation::Event::Append(message.clone()))
+                    .kept()
+            }))
+            .collect();
+        self.save_prepared_atomic(session_id, prepared, &[], turn)
+            .await
+    }
+
+    /// The one transaction both doors above write through.
+    async fn save_prepared_atomic(
+        &self,
+        session_id: Uuid,
+        prepared: Vec<PreparedEvent>,
+        inbox_items: &[Uuid],
+        turn: Option<Uuid>,
+    ) -> Result<()> {
+        if prepared.is_empty() {
             return Ok(());
         }
         let appended: Vec<String> = inbox_items.iter().map(Uuid::to_string).collect();
         let now = chrono::Utc::now().to_rfc3339();
         let session_id_str = session_id.to_string();
         let turn = turn.map(|turn| turn.to_string());
-        let prepared: Vec<PreparedEvent> = events.iter().map(PreparedEvent::from_event).collect();
+        let mut prepared = prepared;
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // One transaction, so an event that fails to encode or to write rolls the batch
-                // back whole.
-                let transaction = connection.transaction()?;
+                // back whole. Immediate, since a compaction's links are read before the batch
+                // writes, and a deferred transaction that has read fails at once on the upgrade
+                // when another process holds the write lock.
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                link_kept_copies(&transaction, &session_id_str, &mut prepared)?;
                 for prepared in &prepared {
                     insert_event(
                         &transaction,
@@ -2038,12 +2512,12 @@ impl Store {
             })
     }
 
-    /// Persist a set of imported sessions (a root plus its sub-agent descendants) in a single
-    /// transaction: the `sessions` rows (preserving `created_at` and cumulative stats, but never
-    /// the `token_id` fingerprint), each session's event log (preserving per-event timestamps), and
-    /// its `scratchpad_entries`. `records` MUST be ordered parents-first so every `new_parent_id`
-    /// references an already-inserted row (the `parent_session_id` foreign key is enforced).
-    /// All-or-nothing: any failure rolls back the whole import, leaving no partial tree.
+    /// Persist a set of imported sessions (a root plus its sub-agent descendants): the `sessions`
+    /// rows (preserving `created_at` and cumulative stats, but never the `token_id` fingerprint),
+    /// each session's event log (preserving per-event timestamps), and its `scratchpad_entries`.
+    /// `records` MUST be ordered parents-first so every `new_parent_id` references an
+    /// already-inserted row (the `parent_session_id` foreign key is enforced). The tree is listed
+    /// by nothing until all of it is whole, and a failure takes back every row it wrote.
     ///
     /// `updated_at` is stamped to the import time rather than restored from the export. Retention
     /// GC deletes by `updated_at` ([`Self::delete_expired_sessions`], run at startup when
@@ -2077,9 +2551,8 @@ impl Store {
             title: Option<String>,
             pinned_at: Option<String>,
             stats: crate::stats::SessionStatsSnapshot,
-            /// `(created_at, the event as the door takes it)`.
             turns: Vec<super::export::ExportedTurn>,
-            events: Vec<(String, PreparedEvent, Option<String>)>,
+            events: PreparedRows,
             scratchpad_entries: Vec<(String, String)>,
         }
         let imported_at = chrono::Utc::now().to_rfc3339();
@@ -2100,14 +2573,19 @@ impl Store {
         let mut encoded = Vec::with_capacity(records.len());
         for record in records {
             let mut events = Vec::with_capacity(record.events.len());
-            for (at, event, turn) in record.events {
+            for imported in record.events {
                 // An archive carries references, but one written by hand or by another tool may
                 // carry bytes; either way the row gets a reference and the bytes a blob. The
                 // bytes join the archive's, stored ahead of the rows, so the check below sees
                 // them.
-                let mut prepared = PreparedEvent::from_event(&event);
+                let mut prepared = PreparedEvent::from_event(&imported.event);
                 archive_blobs.append(&mut prepared.take_blobs());
-                events.push((at, prepared, turn.map(|turn| turn.to_string())));
+                events.push((
+                    imported.at,
+                    prepared,
+                    imported.turn_id.map(|turn| turn.to_string()),
+                    imported.copy_of,
+                ));
             }
             encoded.push(EncodedSession {
                 id: record.new_id.to_string(),
@@ -2138,7 +2616,7 @@ impl Store {
             .collect();
         let mut unresolved: Vec<String> = Vec::new();
         for session in &encoded {
-            for (_, prepared, _) in &session.events {
+            for (_, prepared, ..) in &session.events {
                 for hash in prepared.references() {
                     if !carried.contains(hash.as_str()) && !unresolved.contains(hash) {
                         unresolved.push(hash.clone());
@@ -2164,11 +2642,26 @@ impl Store {
             .into_iter()
             .map(|id| (id, self.claim_a_fresh_id(id)))
             .collect();
-        let written = self
+        // The rows first, marked unfinished, with their turns and scratchpad entries: one short
+        // transaction. The events follow in short transactions, as a fork's messages do, and the
+        // last marks every row whole; until then nothing lists them, and the roots' claims refuse
+        // anyone who names one.
+        let ids: Vec<Uuid> = encoded
+            .iter()
+            .filter_map(|session| session_id_in(&session.id))
+            .collect();
+        let events: Vec<(String, PreparedRows)> = encoded
+            .iter_mut()
+            .map(|session| (session.id.clone(), std::mem::take(&mut session.events)))
+            .collect();
+        let rows_imported_at = imported_at.clone();
+        // Guarded from before the first write, as a fork is.
+        let unfinished = UnfinishedCopies::new(self.clone(), ids.clone());
+        let started = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
+                let imported_at = rows_imported_at;
                 let transaction = connection.transaction()?;
-                super::blobs::insert_blobs(&transaction, &archive_blobs, &imported_at)?;
                 for session in &encoded {
                     transaction.execute(
                         "INSERT INTO sessions (
@@ -2178,8 +2671,8 @@ impl Store {
                              turns, input_tokens, output_tokens,
                              cache_creation_input_tokens, cache_read_input_tokens,
                              redactions, redacted_images, redacted_bytes,
-                             title, pinned_at, prompt_index, turn_index, project
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                             title, pinned_at, prompt_index, turn_index, project, incomplete
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 1)",
                         rusqlite::params![
                             session.id,
                             session.created_at,
@@ -2211,28 +2704,6 @@ impl Store {
                         super::turns::insert_turn_row(&transaction, &session.id, turn)?;
                     }
                     {
-                        for (created_at, prepared, turn_id) in &session.events {
-                            // Refused rather than linked to nothing: a reference the archive did
-                            // not carry and the store does not hold would be an image no reader
-                            // could ever show.
-                            if let Some(hash) =
-                                super::blobs::missing_blob(&transaction, prepared.references())?
-                            {
-                                return Err(rusqlite::Error::InvalidParameterName(format!(
-                                    "the archive references image blob {hash}, which it does not \
-                                     carry and this store does not hold"
-                                )));
-                            }
-                            insert_event(
-                                &transaction,
-                                &session.id,
-                                prepared,
-                                created_at,
-                                turn_id.as_deref(),
-                            )?;
-                        }
-                    }
-                    {
                         let mut insert_output = transaction.prepare(
                             "INSERT INTO scratchpad_entries (session_id, name, content, created_at) \
                              VALUES (?1, ?2, ?3, ?4)",
@@ -2252,6 +2723,24 @@ impl Store {
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to import sessions: {error}")));
+        let written = match started {
+            Ok(()) => {
+                let copied = match self.import_events(events, archive_blobs, imported_at).await {
+                    Ok(()) => self.mark_copies_whole(ids).await,
+                    Err(error) => Err(error),
+                };
+                let ids = unfinished.settled();
+                if copied.is_err() {
+                    self.remove_unfinished_copies(ids).await;
+                }
+                copied
+            }
+            // Nothing was written: the transaction rolled back.
+            Err(error) => {
+                unfinished.settled();
+                Err(error)
+            }
+        };
         match written {
             // The rows exist, so their lock files stay, as every session's does.
             Ok(()) => drop(root_claims),
@@ -2270,14 +2759,28 @@ impl Store {
     /// falling back to anything; `compact_boundary` and `repair` rows are deserialized from their
     /// JSON envelope. Unknown roles are skipped with a warning.
     ///
-    /// The whole log, for the readers that want history: `conversation_search` and
-    /// `conversation_read`, `GET /messages`, an export, a rewind. A resume wants the view instead;
-    /// see [`Self::load_view_events`].
+    /// The whole log, the copies a compaction kept included, for the readers that replay the
+    /// conversation: a rewind, a fork's count. A resume wants the view instead; see
+    /// [`Self::load_view_events`]. A reader that shows history wants [`Self::load_history`].
     pub(crate) async fn load_events(
         &self,
         session_id: Uuid,
     ) -> Result<Vec<crate::conversation::Event>> {
         let stored = self.load_rows(session_id, RowRange::All).await?;
+        Ok(decode_rows(stored, &self.warned_rows)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect())
+    }
+
+    /// The log as history: every event but the copies a compaction kept, so a kept turn is said
+    /// once, where it was first said. For `conversation_search` and `conversation_read`, a
+    /// Markdown export and a count of a sub-agent's turns.
+    pub(crate) async fn load_history(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::conversation::Event>> {
+        let stored = self.load_rows(session_id, RowRange::History).await?;
         Ok(decode_rows(stored, &self.warned_rows)
             .into_iter()
             .map(|(_, event)| event)
@@ -2374,24 +2877,32 @@ impl Store {
     /// `parent_session_id`), ordered root-first (breadth-first by depth). Used by JSON session
     /// export to capture an entire agent tree, and the root-first order lets an importer insert
     /// parents before children so the `parent_session_id` foreign key is always satisfied. Returns
-    /// an empty vec when the root session doesn't exist.
+    /// an empty vec when the root session doesn't exist. A descendant a fork or an import is still
+    /// copying is left out, as every reader that enumerates sessions leaves one out.
     pub(crate) async fn load_session_tree(&self, root: Uuid) -> Result<Vec<SessionMetaRow>> {
+        self.load_tree(root, &whole_session_sql("s.")).await
+    }
+
+    /// The tree [`Self::load_session_tree`] reads, its descendants narrowed by `descendants`.
+    async fn load_tree(&self, root: Uuid, descendants: &str) -> Result<Vec<SessionMetaRow>> {
+        let descendants = descendants.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(
+                let mut statement = connection.prepare(&format!(
                     "WITH RECURSIVE tree(id, depth) AS (
                          SELECT id, 0 FROM sessions WHERE id = ?1
                          UNION ALL
                          SELECT s.id, tree.depth + 1
                          FROM sessions s JOIN tree ON s.parent_session_id = tree.id
+                         WHERE {descendants}
                      )
                      SELECT s.id, s.parent_session_id, s.created_at, s.updated_at,
                             s.working_directory, s.permission, s.capabilities_json, s.additional_workspace_directories_json,
                             s.subagent_spec_json, s.profile, s.approvals, s.title, s.pinned_at,
                             s.project
                      FROM sessions s JOIN tree ON s.id = tree.id
-                     ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC",
-                )?;
+                     ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC"
+                ))?;
                 let parse_uuid = |value: String| {
                     Uuid::parse_str(&value)
                         .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))
@@ -2452,10 +2963,13 @@ impl Store {
                 super::search::insert_message(
                     &transaction,
                     &session_id.to_string(),
-                    &kind,
-                    &content,
-                    &now,
-                    None,
+                    &super::search::NewMessage {
+                        kind: &kind,
+                        content: &content,
+                        created_at: &now,
+                        turn_id: None,
+                        copy_of: None,
+                    },
                 )?;
                 transaction.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -2685,6 +3199,7 @@ impl Store {
     ) -> Result<Vec<(i64, StoredMessage)>> {
         let (floor, parameters) = match range {
             RowRange::All => ("", vec![session_id.to_string()]),
+            RowRange::History => ("AND copy_of IS NULL", vec![session_id.to_string()]),
             RowRange::FromLastBoundary => (VIEW_FLOOR_SQL, vec![
                 session_id.to_string(),
                 COMPACT_BOUNDARY_KIND.to_string(),
@@ -2693,7 +3208,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(&format!(
-                    "SELECT id, kind, content, created_at, turn_id FROM messages \
+                    "SELECT id, kind, content, created_at, turn_id, copy_of FROM messages \
                      WHERE session_id = ?1 {floor} ORDER BY id ASC"
                 ))?;
                 let rows = statement
@@ -2810,7 +3325,8 @@ impl Store {
     /// Up to `rows` rows of the log below `before` (from the end when `None`), oldest first, and
     /// whether older rows remain. The session index serves the walk in row order, so a page costs
     /// its rows however long the log is. A row this build cannot read is skipped with a warning,
-    /// as on every other read of the log.
+    /// as on every other read of the log. A page is history, so a copy a compaction kept is left
+    /// out: the row it copies is the turn, where it was said.
     pub(crate) async fn log_page_before(
         &self,
         session_id: Uuid,
@@ -2822,8 +3338,8 @@ impl Store {
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT id, kind, content, created_at, turn_id FROM messages \
-                     WHERE session_id = ?1 AND (?2 IS NULL OR id < ?2) \
+                    "SELECT id, kind, content, created_at, turn_id, copy_of FROM messages \
+                     WHERE session_id = ?1 AND (?2 IS NULL OR id < ?2) AND copy_of IS NULL \
                      ORDER BY id DESC LIMIT ?3",
                 )?;
                 let found = statement
@@ -2853,8 +3369,8 @@ impl Store {
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT id, kind, content, created_at, turn_id FROM messages \
-                     WHERE session_id = ?1 AND id > ?2 AND id <= ?3 \
+                    "SELECT id, kind, content, created_at, turn_id, copy_of FROM messages \
+                     WHERE session_id = ?1 AND id > ?2 AND id <= ?3 AND copy_of IS NULL \
                      ORDER BY id ASC LIMIT ?4",
                 )?;
                 let found = statement
@@ -2941,9 +3457,10 @@ impl Store {
                 let result: std::result::Result<String, _> = connection.query_row(
                     &format!(
                         "SELECT id FROM sessions
-                         WHERE NOT {} AND (?1 IS NULL OR project = ?1)
+                         WHERE NOT {} AND {} AND (?1 IS NULL OR project = ?1)
                          ORDER BY updated_at DESC LIMIT 1",
-                        spawned_session_sql("")
+                        spawned_session_sql(""),
+                        whole_session_sql("")
                     ),
                     rusqlite::params![project],
                     |row| row.get(0),
@@ -3029,7 +3546,10 @@ impl Store {
     pub(crate) async fn all_session_ids(&self) -> Result<Vec<String>> {
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare("SELECT id FROM sessions")?;
+                let mut statement = connection.prepare(&format!(
+                    "SELECT id FROM sessions WHERE {}",
+                    whole_session_sql("")
+                ))?;
                 let ids = statement
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -3061,8 +3581,9 @@ impl Store {
                     // "at least" once the cap is hit and names every id it fetched, which is why
                     // fetching a bounded few is enough.
                     &format!(
-                        "SELECT id FROM sessions WHERE id LIKE ?1 \
-                         ORDER BY updated_at DESC LIMIT {PREFIX_MATCH_CAP}"
+                        "SELECT id FROM sessions WHERE id LIKE ?1 AND {} \
+                         ORDER BY updated_at DESC LIMIT {PREFIX_MATCH_CAP}",
+                        whole_session_sql("")
                     ),
                 )?;
                 let rows = statement.query_map(rusqlite::params![pattern], |row| {
@@ -3140,7 +3661,8 @@ impl Store {
                 // telling the reader to pass `--include-children` to see a row that is already in
                 // front of them.
                 let not_spawned = format!("NOT {}", spawned_session_sql("s."));
-                let mut clauses: Vec<&str> = Vec::new();
+                let whole = whole_session_sql("s.");
+                let mut clauses: Vec<&str> = vec![&whole];
                 // A parent names sub-agents, so the root-only clause gives way to it.
                 if parent_string.is_some() {
                     clauses.push("s.parent_session_id = :parent");
@@ -3650,10 +4172,12 @@ impl Store {
         // The scope is spliced in as text rather than bound as a nullable parameter: an `?3 IS
         // NULL OR session_id = ?3` is planned without knowing which, and the turn start sweep of
         // one session must not scan every session's rows.
+        // A copy a fork or an import is still writing is judged by none of its rows: its latest
+        // boundary may not have arrived yet.
         let scope_clause = if scope_id.is_some() {
-            "WHERE s.id = ?3"
+            format!("WHERE s.id = ?3 AND {}", whole_session_sql("s."))
         } else {
-            ""
+            format!("WHERE {}", whole_session_sql("s."))
         };
         let parameters: Vec<String> = [cutoff.clone(), COMPACT_BOUNDARY_KIND.to_string()]
             .into_iter()
@@ -3716,6 +4240,9 @@ impl Store {
                     // on the upgrade from a read to the delete.
                     let transaction = connection
                         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    // A copy a compaction kept of a row going now is what history shows of it
+                    // from here on, so the turn stays in every history while the model reads it.
+                    super::search::release_copies_of(&transaction, &chunk)?;
                     let placeholders = vec!["?"; chunk.len()].join(",");
                     let deleted = transaction.execute(
                         &format!("DELETE FROM messages WHERE id IN ({placeholders})"),
@@ -4099,10 +4626,31 @@ impl Store {
     /// A caller acting on a session it has never met wants
     /// [`Self::delete_session_unless_attached`] instead. A sub-agent tool is not an owner either:
     /// the child it created may be running in the background under its own lock, and so may a
-    /// sub-agent of that child, which is what [`Self::delete_session_tree_unless_attached`] is
-    /// for.
+    /// sub-agent of that child.
     pub(crate) async fn delete_session(&self, session_id: Uuid) -> Result<bool> {
         let deleted = self.delete_session_row(session_id).await?;
+        self.prune_orphan_lock_files().await;
+        Ok(deleted)
+    }
+
+    /// Delete a root session whose tree is [`EXPIRABLE`], and nothing else: what an idle server
+    /// may take from under nobody, by the rule the retention sweep follows, so a pin or a job
+    /// anywhere in the tree keeps it. `false` when the row was spared or is gone.
+    pub(crate) async fn delete_session_if_expirable(&self, session_id: Uuid) -> Result<bool> {
+        let deleted = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                let deleted = transaction.execute(
+                    &format!("DELETE FROM sessions WHERE id = ?1 AND {EXPIRABLE}"),
+                    rusqlite::params![session_id.to_string()],
+                )?;
+                super::blobs::sweep_unreferenced_blobs(&transaction)?;
+                transaction.commit()?;
+                Ok(deleted > 0)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to delete session: {error}")))?;
         self.prune_orphan_lock_files().await;
         Ok(deleted)
     }
@@ -4130,15 +4678,16 @@ impl Store {
             .map_err(|error| MekaError::Database(format!("failed to delete session: {error}")))
     }
 
-    /// Delete a session, refusing with [`MekaError::SessionLocked`] if another meka process has it
-    /// or a sub-agent under it open. The door for a caller acting on a session it does not hold:
-    /// `meka session remove`, and the servers' deletes of a session they have not loaded.
+    /// Delete a session and every sub-agent under it, refusing with [`MekaError::SessionLocked`]
+    /// while another holder has any of them open. The door for a caller acting on a session it
+    /// does not hold: `meka session remove`, the servers' deletes of a session they have not
+    /// loaded, and `agent_delete`.
     ///
-    /// Without it, `meka session remove <id>` against a live screen exits 0 having said nothing at
-    /// all (the count goes through `tracing::info!`, invisible at the default level) while the row
-    /// and its messages cascade away underneath a conversation that carries on until its next turn
-    /// fails on a foreign-key violation. The sub-agents are locked too, since the cascade takes
-    /// them: one spawned with `background: true` may be running after its parent's turn ended.
+    /// The plain door would cascade the rows away underneath a conversation that carries on until
+    /// its next turn fails on a foreign-key violation. The sub-agents are locked too, since the
+    /// cascade takes them: one spawned with `background: true` may be running after its parent's
+    /// turn ended. Every id is locked before the one statement runs, root first, so the refusal
+    /// names the session that is busy and nothing is deleted ahead of it.
     pub(crate) async fn delete_session_unless_attached(&self, session_id: Uuid) -> Result<bool> {
         let held = self.lock_tree(session_id).await?;
         let deleted = self.delete_session_row(session_id).await?;
@@ -4154,25 +4703,12 @@ impl Store {
     /// the refusal comes back.
     async fn lock_tree(&self, root: Uuid) -> Result<Vec<FileLock>> {
         let mut held = Vec::new();
-        for row in self.load_session_tree(root).await? {
+        // Every row under the root, an unfinished copy included: deleting the root takes it, and
+        // the process writing it holds its lock.
+        for row in self.load_tree(root, "1").await? {
             held.push(self.lock_session(row.id)?);
         }
         Ok(held)
-    }
-
-    /// Delete a session and every sub-agent under it, refusing with [`MekaError::SessionLocked`]
-    /// while any of them is held. The door for `agent_delete`: a child spawned with
-    /// `background: true` keeps its lock for as long as it runs, and a sub-agent running under an
-    /// idle child does the same one level down, where the cascade would take its row from under
-    /// it. Every id is locked before the one statement runs, root first, so the refusal names the
-    /// session that is busy and nothing is deleted ahead of it.
-    pub(crate) async fn delete_session_tree_unless_attached(&self, root: Uuid) -> Result<bool> {
-        let held = self.lock_tree(root).await?;
-        let deleted = self.delete_session_row(root).await?;
-        // Released before the sweep, for the reason `delete_session_unless_attached` gives.
-        drop(held);
-        self.prune_orphan_lock_files().await;
-        Ok(deleted)
     }
 
     /// Delete every session no other meka process has open, and report what was left behind.
@@ -4314,7 +4850,12 @@ mod tests {
         let first = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(id, first, "client", "2026-10-06T10:00:00+00:00")
+            .open_turn(
+                id,
+                first,
+                crate::store::turns::TurnSource::Client,
+                "2026-10-06T10:00:00+00:00",
+            )
             .await
             .expect("open");
         store
@@ -4323,7 +4864,7 @@ mod tests {
             .expect("save");
         let open = row(&store, id).await.last_turn.expect("a turn has begun");
         assert_eq!(open.id, first);
-        assert_eq!(open.source, "client");
+        assert_eq!(open.source, crate::store::turns::TurnSource::Client);
         assert_eq!(
             (open.ended_at, open.status),
             (None, None),
@@ -4367,7 +4908,12 @@ mod tests {
         let second = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(id, second, "schedule", "2026-10-06T11:00:00+00:00")
+            .open_turn(
+                id,
+                second,
+                crate::store::turns::TurnSource::Schedule,
+                "2026-10-06T11:00:00+00:00",
+            )
             .await
             .expect("open");
         // Written between turns while `second` is open and unended, as a rewind's repair is
@@ -4451,7 +4997,12 @@ mod tests {
         let turn = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(id, turn, "client", "2026-10-17T10:00:00+00:00")
+            .open_turn(
+                id,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                "2026-10-17T10:00:00+00:00",
+            )
             .await
             .expect("open");
         store
@@ -4500,7 +5051,12 @@ mod tests {
         let turn = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(id, turn, "client", "2026-10-06T10:00:00+00:00")
+            .open_turn(
+                id,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                "2026-10-06T10:00:00+00:00",
+            )
             .await
             .expect("open");
         store
@@ -4546,7 +5102,12 @@ mod tests {
         let turn = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(id, turn, "client", "2026-10-17T10:00:00+00:00")
+            .open_turn(
+                id,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                "2026-10-17T10:00:00+00:00",
+            )
             .await
             .expect("open");
         store
@@ -4581,7 +5142,12 @@ mod tests {
         let turn = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(id, turn, "client", "2026-10-17T10:00:00+00:00")
+            .open_turn(
+                id,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                "2026-10-17T10:00:00+00:00",
+            )
             .await
             .expect("open");
         store
@@ -4596,7 +5162,12 @@ mod tests {
         let own = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(id, own, "client", "2026-10-17T10:01:00+00:00")
+            .open_turn(
+                id,
+                own,
+                crate::store::turns::TurnSource::Client,
+                "2026-10-17T10:01:00+00:00",
+            )
             .await
             .expect("open");
         store
@@ -4999,6 +5570,42 @@ mod tests {
         );
     }
 
+    /// An idle server's delete takes what the retention sweep would and spares what it spares: a
+    /// pinned root stays, an unpinned one goes.
+    #[tokio::test]
+    async fn an_idle_delete_spares_a_pinned_session() {
+        let store = Store::for_test().await;
+        let pinned = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        store
+            .update_session(pinned, SessionPatch {
+                pinned: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("pin");
+        let plain = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        assert!(
+            !store
+                .delete_session_if_expirable(pinned)
+                .await
+                .expect("delete")
+        );
+        assert!(store.session_info(pinned).await.expect("read").is_some());
+        assert!(
+            store
+                .delete_session_if_expirable(plain)
+                .await
+                .expect("delete")
+        );
+        assert!(store.session_info(plain).await.expect("read").is_none());
+    }
+
     /// A pin is a keep: the sweep leaves a pinned session alone whatever its age, and the parent
     /// chain of a pinned sub-agent session with it, since the cascade would take the child; only
     /// `--all` takes them.
@@ -5062,7 +5669,12 @@ mod tests {
         for turn in [one, two] {
             store
                 .turn_store()
-                .open_turn(id, turn, "screen", "2026-10-29T00:00:00+00:00")
+                .open_turn(
+                    id,
+                    turn,
+                    crate::store::turns::TurnSource::Client,
+                    "2026-10-29T00:00:00+00:00",
+                )
                 .await
                 .expect("open");
         }
@@ -5197,7 +5809,12 @@ mod tests {
         let turn = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(refused, turn, "screen", "2026-10-29T00:00:00+00:00")
+            .open_turn(
+                refused,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                "2026-10-29T00:00:00+00:00",
+            )
             .await
             .expect("open");
         for event in [Event::Append(Message::user("refused?")), Event::Repair {
@@ -6371,6 +6988,9 @@ mod tests {
             // Copied by a fork: the copy continues the conversation in the same project, seeing
             // the memories the source saw.
             "project",
+            // Set by a fork, to unfinished while its rows are copied and whole after: never the
+            // source's, which is whole when it is forked.
+            "incomplete",
         ]);
     }
 
@@ -7514,7 +8134,7 @@ mod tests {
             .0;
 
         let held = store.lock_session(grandchild).expect("hold the grandchild");
-        match store.delete_session_tree_unless_attached(child).await {
+        match store.delete_session_unless_attached(child).await {
             Err(MekaError::SessionLocked(id)) => assert_eq!(id, grandchild),
             other => panic!("expected SessionLocked, got {:?}", other.map(|_| "Ok(_)")),
         }
@@ -7526,7 +8146,7 @@ mod tests {
         drop(held);
         assert!(
             store
-                .delete_session_tree_unless_attached(child)
+                .delete_session_unless_attached(child)
                 .await
                 .expect("delete once nothing under it is held")
         );
@@ -8767,6 +9387,489 @@ mod tests {
         );
     }
 
+    /// A copy a fork or an import has not finished is listed by nothing: not the listing, the
+    /// search, the last session `-c` resumes, nor a prefix. The startup sweep takes one a crash
+    /// left behind, and spares one another process holds, which may be writing it still.
+    #[tokio::test]
+    async fn an_unfinished_copy_is_listed_by_nothing_and_swept_once_unheld() {
+        use crate::conversation::{Event, Message};
+        let store = Store::for_test().await;
+        let whole = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        let unfinished = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        for session in [whole, unfinished] {
+            store
+                .save_event(session, &Event::Append(Message::user("about herons")), None)
+                .await
+                .expect("save");
+        }
+        store
+            .run_sql_for_test(&format!(
+                "UPDATE sessions SET incomplete = 1, title = 'herons' WHERE id = '{unfinished}'"
+            ))
+            .await;
+
+        let (listed, _) = store
+            .list_sessions(10, None, &SessionFilter::default())
+            .await
+            .expect("list");
+        assert_eq!(
+            listed.iter().map(|session| session.id).collect::<Vec<_>>(),
+            [whole]
+        );
+        assert_eq!(
+            store.last_session_id(None).await.expect("last"),
+            Some(whole)
+        );
+        assert!(
+            store
+                .find_sessions_by_prefix(&unfinished.to_string()[..8])
+                .await
+                .expect("prefix")
+                .is_empty()
+        );
+        let found = store
+            .search_sessions("herons", 10, SessionReach::Store {
+                include_children: false,
+            })
+            .await
+            .expect("search");
+        assert_eq!(
+            found.iter().map(|hit| hit.session.id).collect::<Vec<_>>(),
+            [whole]
+        );
+
+        // A fork of a sub-agent keeps its parent, which is whole: the tree it hangs in leaves it
+        // out, and the sweep takes it as it takes an unfinished root.
+        let child = Uuid::new_v4();
+        store
+            .run_sql_for_test(&format!(
+                "INSERT INTO sessions (id, created_at, updated_at, parent_session_id, incomplete) \
+                 VALUES ('{child}', 'now', 'now', '{whole}', 1)"
+            ))
+            .await;
+        assert_eq!(
+            store
+                .load_session_tree(whole)
+                .await
+                .expect("tree")
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [whole]
+        );
+
+        let held = store.lock_session(unfinished).expect("lock");
+        let spared = store.delete_unfinished_copies().await.expect("sweep");
+        assert_eq!((spared.deleted, spared.attached_elsewhere), (1, 1));
+        assert!(!store.session_exists(child).await.expect("exists"));
+        drop(held);
+        let swept = store.delete_unfinished_copies().await.expect("sweep");
+        assert_eq!(swept.deleted, 1);
+        assert!(!store.session_exists(unfinished).await.expect("exists"));
+        assert!(store.session_exists(whole).await.expect("exists"));
+    }
+
+    /// A copy whose future is dropped partway, as a request whose client went away drops it, is
+    /// taken back rather than left for the next startup.
+    #[tokio::test]
+    async fn a_copy_dropped_partway_is_taken_back() {
+        let store = Store::for_test().await;
+        let copy = Uuid::new_v4();
+        store
+            .run_sql_for_test(&format!(
+                "INSERT INTO sessions (id, created_at, updated_at, incomplete) \
+                 VALUES ('{copy}', 'now', 'now', 1)"
+            ))
+            .await;
+        drop(UnfinishedCopies::new(store.clone(), vec![copy]));
+        for _ in 0..100 {
+            if !store.session_exists(copy).await.expect("exists") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the dropped copy is still there");
+    }
+
+    /// The turn sweep judges no session a copy is still being written into: its latest boundary
+    /// may not have arrived.
+    #[tokio::test]
+    async fn the_turn_sweep_passes_over_an_unfinished_copy() {
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let (_, old_rows) = closed_turn(&store, session, "old", days_ago(100)).await;
+        boundary(&store, session).await;
+        store
+            .run_sql_for_test(&format!(
+                "UPDATE sessions SET incomplete = 1 WHERE id = '{session}'"
+            ))
+            .await;
+        let sweep = store
+            .delete_expired_turns(thirty_days_ago(), None)
+            .await
+            .expect("sweep");
+        assert_eq!(sweep, TurnSweep::default());
+        let remaining = row_ids(&store, session).await;
+        assert!(old_rows.iter().all(|id| remaining.contains(id)));
+    }
+
+    /// A fork commits as it goes, so another process's write waits for a chunk rather than for the
+    /// whole copy: a second connection reading while the copy runs sees the copy's row, marked
+    /// unfinished, before it is whole.
+    #[tokio::test]
+    async fn a_fork_commits_as_it_goes() {
+        use crate::conversation::{Event, Message};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("meka.db");
+        let store = Store::open(Some(&path), &Default::default())
+            .await
+            .expect("open");
+        let source = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        let rows = COPY_ROWS_PER_TRANSACTION * 3 + 1;
+        store
+            .save_events_atomic(
+                source,
+                (0..rows)
+                    .map(|row| Event::Append(Message::user(format!("row {row}"))))
+                    .collect(),
+                None,
+            )
+            .await
+            .expect("save");
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = std::thread::spawn({
+            let done = Arc::clone(&done);
+            let path = path.clone();
+            move || {
+                let connection = rusqlite::Connection::open(&path).expect("a second connection");
+                connection
+                    .busy_timeout(std::time::Duration::from_secs(5))
+                    .expect("busy timeout");
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let unfinished: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM sessions WHERE incomplete <> 0",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .expect("read");
+                    if unfinished > 0 {
+                        return true;
+                    }
+                }
+                false
+            }
+        });
+        let forked = store
+            .fork_session_for_test(source, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            watcher.join().expect("the watcher"),
+            "the copy's row was committed ahead of its messages"
+        );
+        assert_eq!(
+            store.load_history(forked.id).await.expect("history").len(),
+            rows,
+            "and every row arrived"
+        );
+        let (listed, _) = store
+            .list_sessions(10, None, &SessionFilter::default())
+            .await
+            .expect("list");
+        assert!(
+            listed.iter().any(|session| session.id == forked.id),
+            "whole"
+        );
+    }
+
+    /// A compaction's copies of the turns it kept are the model's after its boundary and nobody
+    /// else's: the view reads them, while the log's pages, its history and the search index say
+    /// each kept turn once, where it was first said. A later message repeating a kept one is said,
+    /// and a fork and an archive carry the mark.
+    #[tokio::test]
+    async fn a_compaction_s_copies_are_the_model_s_alone() {
+        use crate::conversation::{CompactionRecord, Event, Message};
+        let store = Store::for_test().await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        let said = [
+            Message::user("first"),
+            Message::assistant_text("one"),
+            Message::user("second"),
+            Message::assistant_text("pelicans"),
+        ];
+        store
+            .save_events_atomic(
+                session,
+                said.iter().cloned().map(Event::Append).collect(),
+                None,
+            )
+            .await
+            .expect("save");
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("the summary"),
+            replaced_count: 4,
+            record: CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        store
+            .save_compaction(session, &boundary, &said[2..], None)
+            .await
+            .expect("compaction");
+        store
+            .save_event(session, &Event::Append(Message::user("second")), None)
+            .await
+            .expect("save");
+
+        let texts = |events: Vec<Event>| -> Vec<String> {
+            events
+                .iter()
+                .map(|event| match event {
+                    Event::Append(message) => message.text_content(),
+                    _ => "boundary".to_string(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            texts(store.load_view_events(session).await.expect("view")),
+            ["boundary", "second", "pelicans", "second"]
+        );
+        let history = ["first", "one", "second", "pelicans", "boundary", "second"];
+        assert_eq!(
+            texts(store.load_history(session).await.expect("history")),
+            history
+        );
+        let page = store
+            .log_page_before(session, None, 100)
+            .await
+            .expect("page");
+        assert_eq!(
+            texts(page.rows.into_iter().map(|row| row.event).collect()),
+            history
+        );
+        let indexed: i64 = store
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'pelicans'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("count");
+        assert_eq!(indexed, 1, "the index holds the turn once");
+
+        let forked = store
+            .fork_session_for_test(session, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        assert_eq!(
+            texts(store.load_history(forked.id).await.expect("history")),
+            history
+        );
+        let archive = crate::store::export::build_session_export(&store, session)
+            .await
+            .expect("export");
+        let links: Vec<Option<usize>> = archive.sessions[0]
+            .events
+            .iter()
+            .map(|event| event.copy_of)
+            .collect();
+        assert_eq!(links, [
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(2),
+            Some(3),
+            None
+        ]);
+        let plan = crate::store::export::plan_import(
+            archive,
+            crate::store::export::ImportInstallation {
+                selected: None,
+                default: None,
+                configured: None,
+                projects: Vec::new(),
+            },
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plans");
+        let imported = plan.root_new_id;
+        store
+            .import_sessions(plan.records, plan.blobs)
+            .await
+            .expect("import");
+        assert_eq!(
+            texts(store.load_history(imported).await.expect("history")),
+            history
+        );
+    }
+
+    /// A kept message no row holds of its own, though an older row holds the same words, links
+    /// to nothing and leaves the copies before it on their own rows: history says the repeated
+    /// words twice, as they were said, and every other kept turn once.
+    #[tokio::test]
+    async fn a_kept_message_matching_an_older_row_leaves_the_others_on_their_rows() {
+        use crate::conversation::{CompactionRecord, Event, Message};
+        let store = Store::for_test().await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        let said = [
+            Message::user("yes"),
+            Message::assistant_text("noted"),
+            Message::user("go on"),
+        ];
+        store
+            .save_events_atomic(
+                session,
+                said.iter().cloned().map(Event::Append).collect(),
+                None,
+            )
+            .await
+            .expect("save");
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("the summary"),
+            replaced_count: 3,
+            record: CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        store
+            .save_compaction(
+                session,
+                &boundary,
+                &[
+                    Message::assistant_text("noted"),
+                    Message::user("go on"),
+                    Message::user("yes"),
+                ],
+                None,
+            )
+            .await
+            .expect("compaction");
+        let history: Vec<String> = store
+            .load_history(session)
+            .await
+            .expect("history")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Append(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(history, ["yes", "noted", "go on", "yes"]);
+    }
+
+    /// A kept message no row holds, a prompt whose own save failed before the compaction counted
+    /// as it, is a row of its own: history says it, where otherwise nothing would.
+    #[tokio::test]
+    async fn a_kept_message_no_row_holds_is_said_in_history() {
+        use crate::conversation::{CompactionRecord, Event, Message};
+        let store = Store::for_test().await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        store
+            .save_event(session, &Event::Append(Message::user("saved")), None)
+            .await
+            .expect("save");
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("the summary"),
+            replaced_count: 1,
+            record: CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        store
+            .save_compaction(
+                session,
+                &boundary,
+                &[Message::user("saved"), Message::user("never saved")],
+                None,
+            )
+            .await
+            .expect("compaction");
+        let history: Vec<String> = store
+            .load_history(session)
+            .await
+            .expect("history")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Append(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(history, ["saved", "never saved"]);
+    }
+
+    /// A session that opened on a bare invocation is listed by what it invoked, the row the
+    /// conversation reads its title from; the body the invocation expanded to names nothing.
+    #[tokio::test]
+    async fn list_sessions_title_reads_a_bare_invocation() {
+        use crate::conversation::{ContentBlock, Event, InvocationKind, Message, Role};
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        let opening = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::TurnContext {
+                    text: "<context/>".to_string(),
+                },
+                ContentBlock::Invocation {
+                    kind: InvocationKind::Skill,
+                    name: "review".to_string(),
+                    directive: String::new(),
+                    text: "Base directory for this skill: /skills/review".to_string(),
+                },
+            ],
+        };
+        store
+            .save_event(session_id, &Event::Append(opening), None)
+            .await
+            .expect("save");
+        store
+            .save_event(
+                session_id,
+                &Event::Append(Message::user("later words")),
+                None,
+            )
+            .await
+            .expect("save");
+
+        let (summaries, _next_cursor) = store
+            .list_sessions(10, None, &SessionFilter::default())
+            .await
+            .expect("list_sessions");
+        let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(summary.title, "review");
+    }
+
     /// An archive naming an image blob it does not carry and the store does not hold is refused in
     /// the caller's words, before any row of it is written.
     #[tokio::test]
@@ -8790,18 +9893,20 @@ mod tests {
             pinned_at: None,
             stats: Default::default(),
             turns: Vec::new(),
-            events: vec![(
-                "2026-08-31T00:00:00Z".to_string(),
-                crate::conversation::Event::Append(crate::conversation::Message::user_with_images(
-                    "look",
-                    vec![crate::image::ImageSource::Blob {
-                        hash: hash.clone(),
-                        media_type: "image/png".to_string(),
-                        size: 3,
-                    }],
-                )),
-                None,
-            )],
+            events: vec![ImportedEvent {
+                at: "2026-08-31T00:00:00Z".to_string(),
+                event: crate::conversation::Event::Append(
+                    crate::conversation::Message::user_with_images("look", vec![
+                        crate::image::ImageSource::Blob {
+                            hash: hash.clone(),
+                            media_type: "image/png".to_string(),
+                            size: 3,
+                        },
+                    ]),
+                ),
+                turn_id: None,
+                copy_of: None,
+            }],
             scratchpad_entries: Vec::new(),
         };
         let error = store
@@ -9316,7 +10421,12 @@ mod tests {
         let turn = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(session, turn, "client", &ended_at)
+            .open_turn(
+                session,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                &ended_at,
+            )
             .await
             .expect("open");
         let mut rows = Vec::new();
@@ -9443,6 +10553,72 @@ mod tests {
             view_before,
             "the model's view is not the sweep's to touch"
         );
+    }
+
+    /// A turn a compaction kept a copy of stays in history once the sweep takes its expired rows:
+    /// the copy, which history hid while those rows stood, is what it shows from then on, and the
+    /// search index takes its words. An expired turn the compaction summarized goes as before.
+    #[tokio::test]
+    async fn a_kept_turn_s_copy_stands_in_history_once_its_rows_are_swept() {
+        use crate::conversation::{Event, Message};
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let (_, summarized) = closed_turn(&store, session, "summarized", days_ago(100)).await;
+        let (_, kept) = closed_turn(&store, session, "kept", days_ago(90)).await;
+        let compaction = Event::CompactBoundary {
+            summary: Message::user("summary"),
+            replaced_count: 4,
+            record: crate::conversation::CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        store
+            .save_compaction(
+                session,
+                &compaction,
+                &[Message::user("kept"), Message::assistant_text("about kept")],
+                None,
+            )
+            .await
+            .expect("compaction");
+
+        store
+            .delete_expired_turns(thirty_days_ago(), None)
+            .await
+            .expect("sweep");
+
+        let remaining = row_ids(&store, session).await;
+        assert!(!remaining.iter().any(|id| summarized.contains(id)));
+        assert!(
+            !remaining.iter().any(|id| kept.contains(id)),
+            "{remaining:?}"
+        );
+        let indexed: i64 = store
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'about'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("count");
+        assert_eq!(
+            indexed, 1,
+            "the copy's words are indexed once its row is gone"
+        );
+        let history: Vec<String> = store
+            .load_history(session)
+            .await
+            .expect("history")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Append(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(history, ["kept", "about kept"]);
     }
 
     /// Without a boundary the whole log is the model's view, so a session that was never compacted
@@ -9583,7 +10759,12 @@ mod tests {
         let crashed = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(session, crashed, "client", &days_ago(100))
+            .open_turn(
+                session,
+                crashed,
+                crate::store::turns::TurnSource::Client,
+                &days_ago(100),
+            )
             .await
             .expect("open");
         store
@@ -9818,7 +10999,12 @@ mod tests {
         let turn = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(session, turn, "client", &days_ago(100))
+            .open_turn(
+                session,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                &days_ago(100),
+            )
             .await
             .expect("open");
         store
@@ -9919,7 +11105,12 @@ mod tests {
         let open = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(compacted, open, "client", &chrono::Utc::now().to_rfc3339())
+            .open_turn(
+                compacted,
+                open,
+                crate::store::turns::TurnSource::Client,
+                &chrono::Utc::now().to_rfc3339(),
+            )
             .await
             .expect("open");
         store
@@ -9935,7 +11126,12 @@ mod tests {
         let crashed = Uuid::new_v4();
         store
             .turn_store()
-            .open_turn(crashed_in_view, crashed, "client", &days_ago(100))
+            .open_turn(
+                crashed_in_view,
+                crashed,
+                crate::store::turns::TurnSource::Client,
+                &days_ago(100),
+            )
             .await
             .expect("open");
         store

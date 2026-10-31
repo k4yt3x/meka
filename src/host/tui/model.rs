@@ -443,6 +443,7 @@ impl Transcript {
         let text = crate::render::turn_end_summary(
             &self.settings.turn_end_summary,
             status,
+            record.stop_reason.as_deref(),
             ended_at,
             elapsed,
             &record.usage,
@@ -898,6 +899,7 @@ impl Transcript {
                 if let Some(text) = crate::render::turn_end_summary(
                     &self.settings.turn_end_summary,
                     ending.status,
+                    ending.stop_reason.as_deref(),
                     ended_at,
                     elapsed,
                     &ending.usage,
@@ -936,6 +938,10 @@ impl Transcript {
                 late,
             } => {
                 self.remember_background_tasks(outcomes.clone());
+                let invoked = message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Invocation { .. }));
                 for block in &message.content {
                     let item = match block {
                         ContentBlock::Scheduled { job_id, prompt, .. } => {
@@ -943,6 +949,26 @@ impl Transcript {
                         }
                         ContentBlock::BackgroundReport { .. } => {
                             Item::note(crate::background::report_direction(&outcomes))
+                        }
+                        // A command line is not echoed when it is typed, so what it invoked is
+                        // said here, as a replay says it, with the words typed with it under it.
+                        ContentBlock::Invocation {
+                            kind,
+                            name,
+                            directive,
+                            ..
+                        } => {
+                            self.close_streams();
+                            self.push(Item::note(kind.direction(name)));
+                            if crate::text::is_blank(directive) {
+                                continue;
+                            }
+                            Item::Prompt {
+                                text: directive.trim().to_string(),
+                                class: None,
+                                inbox_id: None,
+                                delivered: true,
+                            }
                         }
                         // Words another client posted to the inbox, read by the model with this
                         // turn: drawn as a replay draws them, unless the screen drew them when it
@@ -963,7 +989,13 @@ impl Transcript {
                                 delivered: false,
                             }
                         }
+                        // The images a command line took, said with what it invoked, as a replay
+                        // says them.
+                        ContentBlock::Image { .. } if invoked => Item::Image,
+                        // Drawn when they were typed; an editor's resources never reach the
+                        // screen live.
                         ContentBlock::Text { .. }
+                        | ContentBlock::Resource { .. }
                         | ContentBlock::TurnContext { .. }
                         | ContentBlock::Nudge { .. }
                         | ContentBlock::Image { .. }
@@ -1317,7 +1349,19 @@ impl Transcript {
                 let entry = self.entry(Item::note(note));
                 out.push(entry);
             }
-            for block in &message.content {
+            let with_mentions;
+            let content = if message.role == Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Resource { .. }))
+            {
+                with_mentions = crate::conversation::mentions_inline(&message.content);
+                with_mentions.as_slice()
+            } else {
+                message.content.as_slice()
+            };
+            for block in content {
                 match block {
                     ContentBlock::Text { text } => {
                         if text.trim().is_empty() {
@@ -1353,6 +1397,28 @@ impl Transcript {
                         });
                         out.push(entry);
                     }
+                    // What was invoked, said as the live screen said it, then the words typed
+                    // with it as the person's.
+                    ContentBlock::Invocation {
+                        kind,
+                        name,
+                        directive,
+                        ..
+                    } => {
+                        let entry = self.entry(Item::note(kind.direction(name)));
+                        out.push(entry);
+                        if !crate::text::is_blank(directive) {
+                            let entry = self.entry(Item::Prompt {
+                                text: directive.trim().to_string(),
+                                class: None,
+                                inbox_id: None,
+                                delivered: true,
+                            });
+                            out.push(entry);
+                        }
+                    }
+                    // Folded into the words around it by `conversation::mentions_inline`.
+                    ContentBlock::Resource { .. } => {}
                     // meka's words: a replay says the stage direction the live screen said.
                     ContentBlock::Scheduled { job_id, prompt, .. } => {
                         let entry = self.entry(Item::note(crate::render::fire_direction(
@@ -1983,6 +2049,79 @@ mod tests {
         assert!(matches!(shown[3], Item::Text { text, streaming: false } if text == "Two files."));
     }
 
+    /// An invocation is said as what was invoked with the words typed with it under it, live and
+    /// on a replay alike, never as the body it expanded to; the words an editor sent around a
+    /// resource replay as one prompt, the resource as its mention.
+    #[test]
+    fn an_invocation_reads_alike_live_and_replayed() {
+        let opening = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::TurnContext {
+                    text: "[context]".into(),
+                },
+                ContentBlock::Invocation {
+                    kind: crate::conversation::InvocationKind::Skill,
+                    name: "review".into(),
+                    directive: "the parser".into(),
+                    text: "the parser\n\nBase directory for this skill: /skills/review".into(),
+                },
+                ContentBlock::Image {
+                    source: crate::image::ImageSource::Blob {
+                        hash: "0".repeat(64),
+                        media_type: "image/png".into(),
+                        size: 3,
+                    },
+                },
+            ],
+        };
+        let mut live = transcript();
+        live.apply(FrontendEvent::MessageAppended {
+            message: opening.clone(),
+            outcomes: Vec::new(),
+            late: None,
+        });
+        let mut replayed = transcript();
+        replayed.load_page_above(page(vec![Event::Append(opening)], 1, false));
+        for shown in [items(&live), items(&replayed)] {
+            assert_eq!(shown.len(), 3, "{shown:?}");
+            assert!(
+                matches!(shown[0], Item::Notice { text, .. } if text == "Running skill 'review'."),
+                "{shown:?}"
+            );
+            assert!(
+                matches!(shown[1], Item::Prompt { text, .. } if text == "the parser"),
+                "{shown:?}"
+            );
+            assert!(matches!(shown[2], Item::Image), "{shown:?}");
+        }
+
+        let mentioned = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "compare ".into(),
+                },
+                ContentBlock::Resource {
+                    uri: "file:///src/a.rs".into(),
+                    name: "a.rs".into(),
+                    text: "<resource uri=\"file:///src/a.rs\">fn a() {}</resource>".into(),
+                },
+                ContentBlock::Text {
+                    text: " with the old one".into(),
+                },
+            ],
+        };
+        let mut replayed = transcript();
+        replayed.load_page_above(page(vec![Event::Append(mentioned)], 1, false));
+        let shown = items(&replayed);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert!(
+            matches!(shown[0], Item::Prompt { text, .. } if text == "compare @a.rs with the old one"),
+            "{shown:?}"
+        );
+    }
+
     /// The global toggles move every item of their kind and decide what a new one starts as.
     #[test]
     fn a_global_toggle_moves_every_item_of_its_kind() {
@@ -2225,7 +2364,7 @@ mod tests {
     fn closed_turn(id: Uuid, status: TurnStatus) -> TurnRecord {
         TurnRecord {
             id,
-            source: "screen".to_string(),
+            source: crate::store::turns::TurnSource::Client,
             started_at: "2026-10-12T12:00:00+00:00".to_string(),
             ended_at: Some("2026-10-12T12:19:19+00:00".to_string()),
             status: Some(status),

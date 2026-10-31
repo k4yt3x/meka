@@ -498,27 +498,14 @@ impl Frontend for AcpFrontend {
                 replaced_count,
                 generation,
                 summary,
-            } => {
-                if !self.client_state.renders_compactions() {
-                    notice_update(
-                        &crate::frontend::Notice::info(record.note()),
-                        self.client_state.renders_notices(),
-                    )
-                } else {
-                    let facts = serde_json::json!(crate::view::CompactionView::new(
-                        &record,
-                        replaced_count,
-                        generation
-                    ));
-                    SessionUpdate::CompactionUpdate(
-                        CompactionUpdate::new(id, CompactionStatus::Completed)
-                            .summary(vec![ContentBlock::Text(
-                                agent_client_protocol::schema::v1::TextContent::new(summary),
-                            )])
-                            .meta(terminal_meta(META_COMPACTION, facts)),
-                    )
-                }
-            }
+            } => compacted_update(
+                &self.client_state,
+                id,
+                &record,
+                replaced_count,
+                generation,
+                summary,
+            ),
             FrontendEvent::CompactionFailed {
                 id,
                 trigger,
@@ -615,7 +602,10 @@ impl Frontend for AcpFrontend {
                         }
                         crate::conversation::ContentBlock::Scheduled { text, .. }
                         | crate::conversation::ContentBlock::Inbox { text, .. } => text,
+                        // What the editor sent, which it drew itself.
                         crate::conversation::ContentBlock::Text { .. }
+                        | crate::conversation::ContentBlock::Invocation { .. }
+                        | crate::conversation::ContentBlock::Resource { .. }
                         | crate::conversation::ContentBlock::TurnContext { .. }
                         | crate::conversation::ContentBlock::Nudge { .. }
                         | crate::conversation::ContentBlock::Image { .. }
@@ -679,9 +669,13 @@ impl Frontend for AcpFrontend {
             ),
         ];
 
-        // Synthetic id: the permission round-trip is its own space, not correlated with the
-        // streaming tool_call lifecycle.
-        let tool_call_id = format!("permission-{}", uuid::Uuid::new_v4());
+        // The call the editor already shows, so it turns that card to awaiting confirmation
+        // rather than drawing a second one nothing ever completes; a made-up id only where no call
+        // is in scope.
+        let tool_call_id = request
+            .tool_call_id
+            .clone()
+            .unwrap_or_else(|| format!("permission-{}", uuid::Uuid::new_v4()));
         // The title is the one line a client is sure to show, and it names the destination for
         // every write-shaped tool; `raw_input` and the content block carry every argument, so a
         // client that renders either shows what is being written and not only where. See
@@ -699,7 +693,7 @@ impl Frontend for AcpFrontend {
 
         let acp_request = RequestPermissionRequest::new(session_id, tool_call, options);
         // Race the round-trip against the per-turn cancellation token. If `session/cancel` fires
-        // while we're waiting for the client to answer the permission prompt, we resolve as
+        // while we're waiting for the client to answer the approval prompt, we resolve as
         // `Canceled` instead of holding the runtime mutex forever, which would block
         // `session/close` and `session/set_mode` too.
         let response = tokio::select! {
@@ -714,7 +708,7 @@ impl Frontend for AcpFrontend {
             // expiry rather than allow: an unanswered prompt is not consent.
             _ = tokio::time::sleep(crate::frontend::APPROVAL_TIMEOUT) => {
                 tracing::warn!(
-                    "the client did not answer the permission prompt for '{tool}' within \
+                    "the client did not answer the approval prompt for '{tool}' within \
                      {timeout:?}; denying it",
                     tool = request.tool_name,
                     timeout = crate::frontend::APPROVAL_TIMEOUT,
@@ -785,8 +779,7 @@ impl Frontend for AcpFrontend {
     }
 
     async fn delegate_fs_write(&self, path: &std::path::Path, content: &str) -> Delegation<()> {
-        let caps = self.client_state.capabilities();
-        if !caps.fs.write_text_file {
+        if !self.accepts_fs_writes() {
             return Delegation::Local;
         }
         let connection = self.connection.clone();
@@ -807,6 +800,10 @@ impl Frontend for AcpFrontend {
             Ok(_) => Delegation::Served(()),
             Err(error) => Delegation::Failed(classify_fs_error("fs/write_text_file", &error)),
         }
+    }
+
+    fn accepts_fs_writes(&self) -> bool {
+        self.client_state.capabilities().fs.write_text_file
     }
 
     async fn handle_elicitation(
@@ -1332,7 +1329,85 @@ pub(super) fn build_completion_content(
         })
         .collect()
 }
-/// Walk a hydrated [`Conversation`] and emit one `session/update` notification per content
+/// One entry of a session's log as a replay says it: a message, or a compaction where the log has
+/// a boundary.
+pub(super) enum Replayed<'a> {
+    Message(&'a crate::conversation::Message),
+    Compaction {
+        id: String,
+        record: &'a crate::conversation::CompactionRecord,
+        replaced_count: usize,
+        generation: u64,
+        summary: String,
+    },
+}
+
+/// A log's events as a replay says them: each message, and each boundary as the compaction it
+/// recorded, numbered from `first_generation`. The log is a page of history, which holds no copy
+/// of the turns a compaction kept, so each is said once, where it was first said.
+pub(super) fn replay_entries(
+    events: &[crate::conversation::Event],
+    first_generation: u64,
+) -> Vec<Replayed<'_>> {
+    use crate::conversation::Event;
+    let mut entries: Vec<Replayed<'_>> = Vec::new();
+    let mut generation = first_generation;
+    for event in events {
+        match event {
+            Event::Append(message) => entries.push(Replayed::Message(message)),
+            Event::CompactBoundary {
+                summary,
+                replaced_count,
+                record,
+                ..
+            } => {
+                entries.push(Replayed::Compaction {
+                    id: format!("replayed-{generation}"),
+                    record,
+                    replaced_count: *replaced_count,
+                    generation,
+                    summary: summary.text_content(),
+                });
+                generation += 1;
+            }
+            // A repair rewrites rows the log keeps, and the log is what is said.
+            Event::Repair { .. } | Event::Redact { .. } | Event::Unsign => {}
+        }
+    }
+    entries
+}
+
+/// The update a finished compaction is, live and on a replay alike: the protocol's compaction
+/// entry for a client that advertised `session.compaction`, else the note the screen shows.
+fn compacted_update(
+    client_state: &SharedClientState,
+    id: String,
+    record: &crate::conversation::CompactionRecord,
+    replaced_count: usize,
+    generation: u64,
+    summary: String,
+) -> SessionUpdate {
+    if !client_state.renders_compactions() {
+        return notice_update(
+            &crate::frontend::Notice::info(record.note()),
+            client_state.renders_notices(),
+        );
+    }
+    let facts = serde_json::json!(crate::view::CompactionView::new(
+        record,
+        replaced_count,
+        generation
+    ));
+    SessionUpdate::CompactionUpdate(
+        CompactionUpdate::new(id, CompactionStatus::Completed)
+            .summary(vec![ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new(summary),
+            )])
+            .meta(terminal_meta(META_COMPACTION, facts)),
+    )
+}
+
+/// Walk a session's replayed log and emit one `session/update` notification per content
 /// block, mirroring the streaming shape the client would have seen had it been connected during
 /// the original turn. Used by `session/load` so an editor that just reopened a session replays the
 /// full history into its UI.
@@ -1346,16 +1421,43 @@ pub(super) fn build_completion_content(
 /// stuck spinner.
 pub(super) fn replay_session_updates(
     connection: &ConnectionTo<Client>,
+    client_state: &SharedClientState,
     session_id: &SessionId,
     cwd: &SharedCwd,
-    messages: &Conversation,
+    entries: &[Replayed<'_>],
     tasks: &[crate::store::background::BackgroundTask],
 ) {
     // Map each open `tool_use_id` to its tool name so the result update can format output per tool
     // and the orphan sweep can close stragglers.
     let mut open_tools: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for message in messages.as_slice() {
+    for entry in entries {
+        let message = match entry {
+            Replayed::Message(message) => *message,
+            // Said as the live run said it, never as the summary's words in a user turn: the
+            // summary is the model's, and the turns before it are replayed above it.
+            Replayed::Compaction {
+                id,
+                record,
+                replaced_count,
+                generation,
+                summary,
+            } => {
+                send_session_update(
+                    connection,
+                    session_id,
+                    compacted_update(
+                        client_state,
+                        id.clone(),
+                        record,
+                        *replaced_count,
+                        *generation,
+                        summary.clone(),
+                    ),
+                );
+                continue;
+            }
+        };
         // A nudge is meka's words, not the person's: the live run said it as a stage direction,
         // and the replay says the same, or nothing for the nudge after a reply with no visible
         // text, as live. What rode behind it, an inbox item, is the person's and follows as a
@@ -1407,6 +1509,63 @@ pub(super) fn replay_session_updates(
                                     ),
                                     false,
                                 ),
+                            );
+                        }
+                        // A skill by the command an editor invokes it with; an MCP prompt, which
+                        // an editor has no command for, by the stage direction the screen says.
+                        // The words typed with it follow either way.
+                        MekaContentBlock::Invocation {
+                            kind,
+                            name,
+                            directive,
+                            ..
+                        } => {
+                            let words = match kind {
+                                crate::conversation::InvocationKind::Skill => {
+                                    format!("/{name} {directive}").trim_end().to_string()
+                                }
+                                crate::conversation::InvocationKind::McpPrompt => {
+                                    send_session_update(
+                                        connection,
+                                        session_id,
+                                        notice_update(
+                                            &crate::frontend::Notice::stage_direction(
+                                                crate::frontend::NoticeLevel::Info,
+                                                kind.direction(name),
+                                            ),
+                                            false,
+                                        ),
+                                    );
+                                    directive.trim().to_string()
+                                }
+                            };
+                            if !words.is_empty() {
+                                send_session_update(
+                                    connection,
+                                    session_id,
+                                    SessionUpdate::UserMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(
+                                            agent_client_protocol::schema::v1::TextContent::new(
+                                                words,
+                                            ),
+                                        ),
+                                    )),
+                                );
+                            }
+                        }
+                        // The mention the editor sent, where it sent it, without the contents.
+                        MekaContentBlock::Resource { uri, name, .. } => {
+                            send_session_update(
+                                connection,
+                                session_id,
+                                SessionUpdate::UserMessageChunk(ContentChunk::new(
+                                    ContentBlock::ResourceLink(
+                                        agent_client_protocol::schema::v1::ResourceLink::new(
+                                            name.clone(),
+                                            uri.clone(),
+                                        ),
+                                    ),
+                                )),
                             );
                         }
                         // What arrived for the model, as it read it: the editor showed it as the
@@ -1569,11 +1728,11 @@ pub(super) fn send_session_update(
     }
 }
 /// Emit a `session_info_update` carrying the session title exactly once. The title is
-/// [`Conversation::title`]'s definition applied by whoever holds the first user words: the
-/// resident log after a first prompt, the session row on a load, resume or fork, since a hydrated
-/// log begins at the last compaction boundary. It never changes once those words are in, so
-/// `title_sent` guards against re-emission across the first prompt and any later reopening of
-/// the same session.
+/// [`crate::conversation::Conversation::title`]'s definition applied by whoever holds the first
+/// user words: the resident log after a first prompt, the session row on a load, resume or fork,
+/// since a hydrated log begins at the last compaction boundary. It never changes once those words
+/// are in, so `title_sent` guards against re-emission across the first prompt and any later
+/// reopening of the same session.
 pub(super) fn maybe_emit_session_title(
     connection: &ConnectionTo<Client>,
     session_id: &SessionId,

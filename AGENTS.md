@@ -7,6 +7,13 @@ practice, then meka-specific rules.
 
 # General principles
 
+## The better design over compatibility
+
+meka does not keep a stable interface. When the cleaner shape breaks a config key, a flag, a tool
+name, a route, a wire value or a stored shape, take the cleaner shape: mark it `**Breaking:**` in
+the changelog, give the remedy in the upgrade guide, and convert stored data once in the migration
+module. Never keep a worse design to spare users an upgrade step.
+
 ## Code
 
 - Correctness and clarity first. Speed and efficiency are secondary unless stated otherwise.
@@ -374,6 +381,11 @@ transaction, behind an automatic backup. Four rules:
    cannot. `Step::Contextual` takes plain data from the caller, and its `Context` is append-only for
    the same reason the ledger is.
 
+A new shape a store can hold moves the version even when nothing converts: a row kind, an event
+variant or a column value an older build would drop or misread takes a ledger step, an empty
+`Step::Sql` when there is nothing to do, so an older build refuses the store instead of reading it
+wrong, as a content change moves an archive's `format_version`.
+
 Rules 2 and 4 are enforced by `the_ledger_is_append_only` and `no_migration_calls_meka_s_own_code`;
 rules 1 and 3 are not, and decay silently. The first digests *every* entry, so a legitimate append
 fires it too: add the new entry's line to the expected vector, never paste current values over the
@@ -446,7 +458,7 @@ change meaning with `action` is a family that wants splitting.
 
 ## Tool arguments
 
-Every tool reads its arguments by two rules, through the readers in `src/tools/util.rs`, never a
+Every tool reads its arguments by four rules, through the readers in `src/tools/util.rs`, never a
 raw `input.get(...)`. A model that fills every field it was shown sends `""` where it has nothing
 to say, which a strict schema spells `null`; both mean the field was left out, and no standard
 defines a blank, so meka does, once.
@@ -462,13 +474,22 @@ defines a blank, so meka does, once.
   make constantly, and the recovery is free), or nothing. A blank entry is dropped, an entry of
   another type is refused, and `[]` stays `[]`, since an empty list is a value (the documented
   "clear" for `tags`).
+- **A boolean.** `optional_bool`: `true`, `false`, or nothing; anything else, the string `"true"`
+  included, is refused naming the field, since read as false it would have the call do the opposite
+  of what it asked.
+- **A number.** `optional_u64` (and `optional_count` over it) or `optional_i64`, through
+  `text::whole_number`: an integer of the type, `2.0` included since JSON Schema's `integer` is,
+  or nothing; a quoted number, a fraction or an out-of-type sign is refused naming the field,
+  since read as absent it hands the call the default it did not ask for. A serde struct reads a
+  number through `text::whole_number` in a deserializer of the field's own, which names the field.
+  A limit past the schema's range is clamped to it; a line or message number below 1 is refused.
 
 A tool that parses through a serde struct carries the string rule with
 `#[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]` on each optional
 string. `tests/layering.rs::tool_arguments_are_read_through_the_shared_readers` fails on a raw read
 anywhere in `src/tools` outside the two functions its ledger names, both of which read recorded
-calls and must tolerate what history holds; a new raw read is a new reader to write, not a ledger
-entry to add.
+calls among others and must tolerate what history holds; a new raw read is a new reader to write,
+not a ledger entry to add.
 
 ## Layering
 

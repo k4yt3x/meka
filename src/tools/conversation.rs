@@ -196,7 +196,9 @@ fn render_message_full(message: &Message) -> String {
             ContentBlock::Nudge { text, .. }
             | ContentBlock::Inbox { text, .. }
             | ContentBlock::Scheduled { text, .. }
-            | ContentBlock::BackgroundReport { text, .. } => segments.push(text.clone()),
+            | ContentBlock::BackgroundReport { text, .. }
+            | ContentBlock::Invocation { text, .. }
+            | ContentBlock::Resource { text, .. } => segments.push(text.clone()),
             ContentBlock::Thinking { thinking, .. } => {
                 segments.push(format!("[thinking]\n{thinking}"))
             }
@@ -547,19 +549,14 @@ impl Tool for ConversationSearchTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let query = require_str(&input, "query", "conversation_search")?;
-        let use_regex = input
-            .get("is_regex")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let limit = input
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize)
+        let use_regex =
+            super::util::optional_bool(&input, "is_regex", "conversation_search")?.unwrap_or(false);
+        let limit = super::util::optional_count(&input, "limit", "conversation_search")?
             .unwrap_or(DEFAULT_CONVERSATION_SEARCH_LIMIT);
 
         let Some(named) = named_sessions(&input)? else {
             let session_id = resolve_session_id(&self.site.session_id, "conversation_search")?;
-            let events = self.store.load_events(session_id).await?;
+            let events = self.store.load_history(session_id).await?;
             return Ok(ToolOutput::text(
                 search_events(&events, &query, use_regex, limit)?,
                 false,
@@ -578,7 +575,7 @@ impl Tool for ConversationSearchTool {
         }
         let mut logs: Vec<(Uuid, Vec<Event>)> = Vec::with_capacity(sessions.len());
         for session in sessions {
-            logs.push((session, self.store.load_events(session).await?));
+            logs.push((session, self.store.load_history(session).await?));
         }
         Ok(ToolOutput::text(
             search_named(&logs, &query, use_regex, limit)?,
@@ -641,19 +638,13 @@ impl Tool for ConversationReadTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let start = input
-            .get("start")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize)
-            .ok_or_else(|| MekaError::ToolExecution {
+        let start = super::util::optional_count(&input, "start", "conversation_read")?.ok_or_else(
+            || MekaError::ToolExecution {
                 tool_name: "conversation_read".to_string(),
-                message: "missing or invalid 'start' parameter".to_string(),
-            })?;
-        let limit = input
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(1);
+                message: "missing 'start' parameter".to_string(),
+            },
+        )?;
+        let limit = super::util::optional_count(&input, "limit", "conversation_read")?.unwrap_or(1);
 
         let named = match optional_str(&input, "session", "conversation_read")? {
             Some(wanted) => {
@@ -669,7 +660,7 @@ impl Tool for ConversationReadTool {
             Some(session) => session,
             None => resolve_session_id(&self.site.session_id, "conversation_read")?,
         };
-        let events = self.store.load_events(session_id).await?;
+        let events = self.store.load_history(session_id).await?;
         Ok(ToolOutput::text(
             read_messages(&events, start, limit, named)?,
             false,
@@ -818,16 +809,12 @@ impl Tool for SessionSearchTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let query = require_str(&input, "query", "session_search")?;
-        let limit = input
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize)
+        let limit = super::util::optional_count(&input, "limit", "session_search")?
             .unwrap_or(DEFAULT_SESSION_SEARCH_LIMIT)
             .clamp(1, MAX_SEARCH_MATCHES);
-        let include_children = input
-            .get("include_children")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let include_children =
+            super::util::optional_bool(&input, "include_children", "session_search")?
+                .unwrap_or(false);
         let reach = readable_sessions(&self.site, include_children, "session_search")?;
         let found = self.store.search_sessions(&query, limit, reach).await?;
         if found.is_empty() {

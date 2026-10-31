@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use self::auth::{extract_account_id, extract_expiration_seconds};
 use super::responses_wire::{
-    build_request_body_for, include_encrypted_reasoning, request_reasoning_summary,
+    ResponsesBackend, build_request_body_for, include_encrypted_reasoning,
+    request_reasoning_summary,
 };
 use crate::{
     conversation::Message,
@@ -66,7 +67,7 @@ pub(crate) struct ChatGptSubscriptionProvider {
 
 impl ChatGptSubscriptionProvider {
     /// Build from a profile's settings, whose credential the builder has checked is an OAuth one.
-    pub(crate) fn new(settings: crate::provider::ProviderBuilder) -> Result<Self> {
+    pub(crate) fn from_settings(settings: crate::provider::ProviderBuilder) -> Result<Self> {
         let credential_key = settings.resolve_credential_key()?;
         let crate::provider::ProviderBuilder {
             credential,
@@ -152,11 +153,10 @@ impl ChatGptSubscriptionProvider {
             self.wire_effort().as_deref(),
             self.max_output_tokens,
             true,
+            self.origin().as_deref(),
         );
-        // Safe here and only here: this backend's endpoint is always ChatGPT, and the first-party
-        // Codex client asks for the same two things, a summary so the reasoning is visible, and
-        // the encrypted content so it survives a stateless round trip. Summary first: it settles
-        // the `reasoning` object the `include` keys off.
+        // What the first-party Codex client asks for: a summary so the reasoning is visible, and
+        // the encrypted content so it survives a stateless round trip.
         request_reasoning_summary(&mut body);
         include_encrypted_reasoning(&mut body);
         // The cache affinity Codex sends, its thread id as `prompt_cache_key`: the endpoint routes
@@ -764,7 +764,7 @@ mod tests {
     }
 
     fn provider_for_test() -> ChatGptSubscriptionProvider {
-        ChatGptSubscriptionProvider::new(
+        ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -795,7 +795,7 @@ mod tests {
         let port = listener.local_addr().expect("the bound address").port();
         drop(listener);
 
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -880,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_request_carries_one_content_type_header() {
         let (local, head_receiver) = mock_endpoint_capturing_the_head().await;
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -948,7 +948,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_request_carries_its_session_in_the_affinity_headers() {
         let (local, head_receiver) = mock_endpoint_capturing_the_head().await;
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -1005,7 +1005,7 @@ mod tests {
         let port = listener.local_addr().expect("the bound address").port();
         drop(listener);
 
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -1077,7 +1077,7 @@ mod tests {
     /// sends `reasoning` on every request and omits only the fields it has no value for.
     #[test]
     fn an_unconfigured_profile_still_asks_for_a_summary_and_encrypted_reasoning() {
-        let unconfigured = ChatGptSubscriptionProvider::new(
+        let unconfigured = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -1108,7 +1108,7 @@ mod tests {
     fn an_unconfigured_profile_sends_no_reasoning_effort() {
         // Effort belongs to the provider: unset means the Responses API applies its own default,
         // which meka asks for by omitting the field rather than by naming a tier.
-        let unconfigured = ChatGptSubscriptionProvider::new(
+        let unconfigured = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -1125,7 +1125,7 @@ mod tests {
         .expect("provider");
         assert_eq!(unconfigured.resolved_effort(), None);
 
-        let configured = ChatGptSubscriptionProvider::new(
+        let configured = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -1276,7 +1276,7 @@ mod tests {
 
     #[test]
     fn responses_url_user_supplied_backend_api_path_preserved() {
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -1311,7 +1311,7 @@ mod tests {
                 "https://proxy.example.com/codex-mirror/backend-api/codex/responses",
             ),
         ] {
-            let provider = ChatGptSubscriptionProvider::new(
+            let provider = ChatGptSubscriptionProvider::from_settings(
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::ChatGptSubscription,
                     credential_for_test(),
@@ -1384,7 +1384,7 @@ mod tests {
     /// the first turn reports the shape rather than a 404 from a path nothing serves.
     #[test]
     fn building_the_provider_refuses_a_base_url_of_neither_shape() {
-        let error = ChatGptSubscriptionProvider::new(
+        let error = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -1406,7 +1406,7 @@ mod tests {
 
     #[test]
     fn responses_url_strips_trailing_slash() {
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
@@ -1440,7 +1440,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_valid_credential_rejects_api_key() {
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 AuthCredential::ApiKey("sk-test".to_string()),
@@ -1462,7 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_valid_credential_no_refresh_token_when_expired() {
         // Token already expired, no refresh available → error.
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 AuthCredential::OAuthToken {
@@ -1540,7 +1540,7 @@ mod tests {
                 expires_at: Some(crate::oauth::now_epoch_millis()),
                 account_id: None,
             };
-            let provider = ChatGptSubscriptionProvider::new(
+            let provider = ChatGptSubscriptionProvider::from_settings(
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::ChatGptSubscription,
                     credential,
@@ -1675,7 +1675,7 @@ mod tests {
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(answer_every_refresh(listener, Arc::clone(&hits)));
 
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 AuthCredential::OAuthToken {
@@ -1741,7 +1741,7 @@ mod tests {
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(answer_every_refresh(listener, Arc::clone(&hits)));
 
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 AuthCredential::OAuthToken {
@@ -1792,7 +1792,7 @@ mod tests {
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(answer_every_refresh(listener, Arc::clone(&hits)));
 
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 AuthCredential::OAuthToken {
@@ -1854,7 +1854,7 @@ mod tests {
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(answer_every_refresh(listener, Arc::clone(&hits)));
 
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 AuthCredential::OAuthToken {
@@ -1962,7 +1962,7 @@ mod tests {
             }
         });
 
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 stale,
@@ -2064,7 +2064,7 @@ mod tests {
             .await
             .expect("the row the failed persist left behind");
 
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 AuthCredential::OAuthToken {
@@ -2102,7 +2102,7 @@ mod tests {
     /// an expiry with no way forward.
     #[tokio::test]
     async fn a_token_with_no_refresh_token_names_the_login_remedy() {
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 AuthCredential::OAuthToken {
@@ -2137,7 +2137,7 @@ mod tests {
     /// endpoints beside `codex`, not under it.
     #[test]
     fn account_urls_for_a_codex_base_land_beside_it() {
-        let provider = ChatGptSubscriptionProvider::new(
+        let provider = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),

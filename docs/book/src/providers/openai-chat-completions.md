@@ -94,6 +94,6 @@ model   = "llama3"
 
 **Streaming:** Uses Server-Sent Events (SSE) with `data: {...}` lines. The stream ends with `data: [DONE]`.
 
-**Usage:** the `cached_tokens` an endpoint reports under `prompt_tokens_details` count as cache reads in `/status` and the per-turn usage line.
+**Usage:** a streamed request asks for its usage with `stream_options.include_usage`, which OpenAI's own API needs before it reports any; an endpoint that refuses the field takes the account's [`stream_usage`](../configuration/config-file.md#stream_usage) set to `false`. The `cached_tokens` an endpoint reports under `prompt_tokens_details` count as cache reads in `/status` and the per-turn usage line.
 
 **Reasoning:** the `reasoning_content` an endpoint streams (or `reasoning`, as vLLM and OpenRouter spell it) is shown as thinking, kept in the session, and sent back on every later request as the assistant message's `reasoning_content`. DeepSeek's thinking mode rejects a request with tools that omits an earlier turn's reasoning; the other endpoints accept or ignore it. Reasoning another backend recorded is never sent here.

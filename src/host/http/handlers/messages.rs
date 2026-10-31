@@ -131,6 +131,23 @@ pub(crate) enum ContentBlockView {
         task_ids: Vec<String>,
         text: String,
     },
+    /// A skill or an MCP prompt somebody invoked by name: `kind` is `skill` or `mcp_prompt`,
+    /// `name` what was invoked (an MCP prompt as `server:prompt`), `directive` the words typed
+    /// with it, a file an editor attached among them named by its mention (`@name`), blank when
+    /// none were, and `text` what the model read, the expanded body and file contents included.
+    Invocation {
+        kind: String,
+        name: String,
+        directive: String,
+        text: String,
+    },
+    /// A resource an editor attached among the person's words, where it was attached: its `uri`
+    /// and `name`, with `text` the tag the model read, contents included.
+    Resource {
+        uri: String,
+        name: String,
+        text: String,
+    },
     Image {
         // Signal an input image was present without the base64 payload, mirroring
         // `ToolResultContentView::Image`, so history responses stay tractable.
@@ -407,6 +424,22 @@ fn view_for_block(block: &ContentBlock) -> ContentBlockView {
             task_ids: task_ids.clone(),
             text: text.clone(),
         },
+        ContentBlock::Invocation {
+            kind,
+            name,
+            directive,
+            text,
+        } => ContentBlockView::Invocation {
+            kind: kind.name().to_string(),
+            name: name.clone(),
+            directive: directive.clone(),
+            text: text.clone(),
+        },
+        ContentBlock::Resource { uri, name, text } => ContentBlockView::Resource {
+            uri: uri.clone(),
+            name: name.clone(),
+            text: text.clone(),
+        },
         ContentBlock::Image { source } => ContentBlockView::Image {
             media_type: source.media_type().to_string(),
             hash: blob_hash(source),
@@ -484,7 +517,14 @@ pub(crate) async fn get_blob(
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to load the image", error))?;
     match blob {
-        Some(blob) => Ok(([(header::CONTENT_TYPE, blob.media_type)], blob.bytes).into_response()),
+        Some(blob) => Ok((
+            [
+                (header::CONTENT_TYPE, blob.media_type),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            ],
+            blob.bytes,
+        )
+            .into_response()),
         None => Err(ProblemDetail::new(
             ErrorKind::NotFound,
             StatusCode::NOT_FOUND,
@@ -518,6 +558,37 @@ mod tests {
             }],
         };
         (call, result)
+    }
+
+    /// An invocation and a resource keep their kind on the wire, with what a client shows of them
+    /// beside the text the model read.
+    #[test]
+    fn the_view_types_an_invocation_and_a_resource() {
+        let message = Message::invoked_with_a_resource_for_test();
+        let views: Vec<serde_json::Value> = message
+            .content
+            .iter()
+            .map(|block| serde_json::to_value(view_for_block(block)).expect("json"))
+            .collect();
+        assert_eq!(
+            views[1],
+            serde_json::json!({
+                "type": "invocation",
+                "kind": "skill",
+                "name": "review",
+                "directive": "the parser",
+                "text": "the parser\n\nthe skill's body",
+            })
+        );
+        assert_eq!(
+            views[3],
+            serde_json::json!({
+                "type": "resource",
+                "uri": "file:///a.rs",
+                "name": "a.rs",
+                "text": "<resource uri=\"file:///a.rs\">fn a() {}</resource>",
+            })
+        );
     }
 
     /// What meka wrote on another's behalf keeps its kind on the wire, with the facts a client

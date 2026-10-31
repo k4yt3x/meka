@@ -167,17 +167,55 @@ impl SseEvent {
 /// Session-scoped rather than per-turn precisely so `Last-Event-ID` works: an id from a finished
 /// turn sorts strictly below everything the current one emits, which is what makes the plain
 /// `event.id > last` replay filter correct without knowing which turn an id belongs to.
-#[derive(Debug, Default)]
+///
+/// And above every id an earlier incarnation of the feed issued, a session evicted and loaded
+/// again or a server restarted: the sequence starts at the microseconds since the epoch, or past
+/// the highest id this process has issued when that is later. Started at zero, a client resuming
+/// from an id of the last incarnation would be handed only what the new one issued after it, with
+/// nothing to say it missed the rest. The microseconds stay inside a JSON number's exact range.
+#[derive(Debug)]
 pub(crate) struct EventIdGenerator {
+    origin: u64,
     next: AtomicU64,
 }
 
+/// The highest event id this process has issued, on any feed, so a feed started within the same
+/// microsecond as another's last event still starts above it.
+static HIGHEST_ISSUED: AtomicU64 = AtomicU64::new(0);
+
+impl Default for EventIdGenerator {
+    fn default() -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+            });
+        let origin = now.max(HIGHEST_ISSUED.load(Ordering::Relaxed).saturating_add(1));
+        Self {
+            origin,
+            next: AtomicU64::new(origin),
+        }
+    }
+}
+
 impl EventIdGenerator {
-    /// Returns a monotonic 0-based id. The spec's example stream shows `id: 0` on the first
-    /// event (`turn.started`) of a session, so the first turn matches that convention exactly;
-    /// later turns continue the sequence rather than restarting.
+    /// Returns the next id of the sequence, which continues across turns rather than restarting.
     pub(crate) fn next(&self) -> u64 {
-        self.next.fetch_add(1, Ordering::Relaxed)
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        HIGHEST_ISSUED.fetch_max(id, Ordering::Relaxed);
+        id
+    }
+
+    /// The first id this feed issues. A `Last-Event-ID` below it is a position in an earlier
+    /// incarnation of the feed, which no replay here can continue.
+    pub(crate) fn origin(&self) -> u64 {
+        self.origin
+    }
+
+    /// The last id issued, or `None` before the first.
+    pub(crate) fn last_issued(&self) -> Option<u64> {
+        let next = self.peek();
+        (next > self.origin).then(|| next - 1)
     }
 
     /// The id the next event would get, i.e. one past the highest issued.
@@ -827,11 +865,16 @@ mod tests {
         );
     }
 
+    /// A feed's ids rise one at a time, and a feed started after another, the same session's
+    /// next incarnation, starts above every id the earlier one issued.
     #[test]
-    fn event_id_generator_is_monotonic_and_zero_based() {
-        let generator = EventIdGenerator::default();
-        assert_eq!(generator.next(), 0, "first id must be 0 per spec example");
-        assert_eq!(generator.next(), 1);
-        assert_eq!(generator.next(), 2);
+    fn event_ids_rise_and_a_later_feed_starts_above_an_earlier_one() {
+        let earlier = EventIdGenerator::default();
+        let first = earlier.next();
+        assert_eq!(first, earlier.origin());
+        assert_eq!(earlier.next(), first + 1);
+        let last = earlier.next();
+        let later = EventIdGenerator::default();
+        assert!(later.next() > last);
     }
 }

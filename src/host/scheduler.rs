@@ -21,7 +21,7 @@ use crate::{
 /// Who started a turn, for the host's own accounting: `serve` names it on the session feed's
 /// `turn.started`, and the hosts that run an out-of-band turn name it to their hooks.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TurnSource {
+pub(crate) enum TurnStarter {
     /// `POST /v1/sessions/{id}/turn`.
     Client,
     /// The inbox driver, on these items.
@@ -39,16 +39,17 @@ pub(crate) enum TurnSource {
     },
 }
 
-impl TurnSource {
-    /// The one spelling of this value: the `source` member of `turn.started`.
-    pub(crate) const fn name(&self) -> &'static str {
+impl TurnStarter {
+    /// The `source` member of `turn.started`, the word the turn's row records.
+    pub(crate) const fn source(&self) -> crate::store::turns::TurnSource {
+        use crate::store::turns::TurnSource;
         match self {
-            Self::Client => "client",
-            Self::Inbox { .. } => "inbox",
-            Self::Schedule { .. } => "schedule",
-            Self::Background => "background",
-            Self::Compaction => "compaction",
-            Self::Parent { .. } => "parent",
+            Self::Client => TurnSource::Client,
+            Self::Inbox { .. } => TurnSource::Inbox,
+            Self::Schedule { .. } => TurnSource::Schedule,
+            Self::Background => TurnSource::Background,
+            Self::Compaction => TurnSource::Compaction,
+            Self::Parent { .. } => TurnSource::Parent,
         }
     }
 
@@ -61,7 +62,7 @@ impl TurnSource {
         };
         object.insert(
             "source".into(),
-            serde_json::Value::String(self.name().to_string()),
+            serde_json::Value::String(self.source().name().to_string()),
         );
         match self {
             Self::Inbox { item_ids } => {
@@ -224,7 +225,7 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
 
     /// An out-of-band turn is about to run under `turn_id`. `serve` opens it on the session feed;
     /// the others have no feed to open it on.
-    fn begin_turn(&self, _entry: &Self::Entry, _turn_id: uuid::Uuid, _origin: TurnSource) {}
+    fn begin_turn(&self, _entry: &Self::Entry, _turn_id: uuid::Uuid, _origin: TurnStarter) {}
 
     /// An out-of-band turn has ended, before [`Self::finished`] announces it. `serve` records the
     /// terminal on the feed, closes the turn there, and posts the turn webhooks an inbox turn
@@ -233,7 +234,7 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
         &self,
         _entry: &Self::Entry,
         _turn_id: uuid::Uuid,
-        _origin: &TurnSource,
+        _origin: &TurnStarter,
         _outcome: &Result<crate::agent::TurnOutcome, MekaError>,
         _cancellation: &crate::agent::TurnCancellation,
     ) {
@@ -411,7 +412,7 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     }
     let input = input.riding(riding);
 
-    let origin = TurnSource::Schedule {
+    let origin = TurnStarter::Schedule {
         job_id: job.id.clone(),
     };
     hooks.begin_turn(&entry, turn_id, origin.clone());
@@ -591,7 +592,7 @@ where
             .cancel
             .publish_turn(cancellation.clone(), busy.admission, turn_id);
         let input = crate::agent::TurnInput::outcomes(ready).identified(turn_id);
-        hooks.begin_turn(&entry, turn_id, TurnSource::Background);
+        hooks.begin_turn(&entry, turn_id, TurnStarter::Background);
         let outcome = entry
             .agent
             .run_turn(&mut conversation, input, cancellation.clone())
@@ -601,7 +602,7 @@ where
             .turn_closed(
                 &entry,
                 turn_id,
-                &TurnSource::Background,
+                &TurnStarter::Background,
                 &outcome,
                 &cancellation,
             )
@@ -792,7 +793,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
             );
         }
         let input = input.riding(riding);
-        let origin = TurnSource::Inbox {
+        let origin = TurnStarter::Inbox {
             item_ids: item_ids.clone(),
         };
         hooks.begin_turn(&entry, turn_id, origin.clone());
@@ -1210,14 +1211,14 @@ mod tests {
         );
 
         let typed = include_str!("tui.rs")
-            .split("HostEvent::UserInput { text, images } => {")
+            .split("HostEvent::UserInput { parts, images } => {")
             .nth(1)
             .expect("the screen's typed-prompt arm")
             .split("HostEvent::Command(command) => {")
             .next()
             .expect("splitting always yields a first part");
         let admitted = typed
-            .find("TurnInput::from_parts(")
+            .find("TurnInput::sent(")
             .expect("the host admits the typed prompt");
         let claimed = typed
             .find("collect_background_outcomes(")

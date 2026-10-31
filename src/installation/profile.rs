@@ -40,6 +40,8 @@ pub(crate) struct ProfileTuning {
     pub(crate) thinking_budget: Option<u64>,
     pub(crate) cache_control: Option<bool>,
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
+    pub(crate) encrypted_reasoning: Option<bool>,
+    pub(crate) reasoning_summary: Option<bool>,
 }
 
 impl ProfileTuning {
@@ -57,6 +59,8 @@ impl ProfileTuning {
             ("thinking_budget", self.thinking_budget.is_some()),
             ("cache_control", self.cache_control.is_some()),
             ("thinking_display", self.thinking_display.is_some()),
+            ("encrypted_reasoning", self.encrypted_reasoning.is_some()),
+            ("reasoning_summary", self.reasoning_summary.is_some()),
         ]
         .into_iter()
         .filter_map(|(key, stated)| stated.then_some(key))
@@ -372,11 +376,13 @@ pub(crate) struct ProfileChanges {
     pub(crate) thinking_budget: Patch<u64>,
     pub(crate) cache_control: Patch<bool>,
     pub(crate) thinking_display: Patch<crate::config::ThinkingDisplay>,
+    pub(crate) encrypted_reasoning: Patch<bool>,
+    pub(crate) reasoning_summary: Patch<bool>,
 }
 
 impl ProfileChanges {
     /// Every key with what happens to it, in the order the file carries the keys.
-    fn states(&self) -> [(&'static str, PatchState); 12] {
+    fn states(&self) -> [(&'static str, PatchState); 14] {
         [
             ("model", self.model.state()),
             ("fallbacks", self.fallbacks.state()),
@@ -390,6 +396,8 @@ impl ProfileChanges {
             ("thinking_budget", self.thinking_budget.state()),
             ("cache_control", self.cache_control.state()),
             ("thinking_display", self.thinking_display.state()),
+            ("encrypted_reasoning", self.encrypted_reasoning.state()),
+            ("reasoning_summary", self.reasoning_summary.state()),
         ]
     }
 
@@ -493,6 +501,8 @@ impl ProfileChanges {
                 _ => None,
             },
         ));
+        changes.extend(boolean("encrypted_reasoning", &self.encrypted_reasoning));
+        changes.extend(boolean("reasoning_summary", &self.reasoning_summary));
         Ok(changes)
     }
 }
@@ -633,6 +643,12 @@ fn upsert_profile_document(
     }
     if let Some(display) = tuning.thinking_display {
         profile.insert("thinking_display", toml_edit::value(display.name()));
+    }
+    if let Some(encrypted_reasoning) = tuning.encrypted_reasoning {
+        profile.insert("encrypted_reasoning", toml_edit::value(encrypted_reasoning));
+    }
+    if let Some(reasoning_summary) = tuning.reasoning_summary {
+        profile.insert("reasoning_summary", toml_edit::value(reasoning_summary));
     }
     // Redundant here, since the inserts above already run in order, and deliberately kept: it is
     // the one line that makes "every writer leaves the canonical order" true of this writer too,

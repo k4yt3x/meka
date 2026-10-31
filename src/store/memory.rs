@@ -871,7 +871,13 @@ impl SearchResults {
     pub(crate) fn merge(mut self, other: SearchResults, limit: usize) -> SearchResults {
         let matched = self.matched.max(other.matched);
         for hit in other.hits {
-            match self.hits.iter_mut().find(|known| known.name == hit.name) {
+            // Keyed on the tier as well as the name: under a view over every tier, two projects
+            // may each hold a memory of one name, and those are two hits.
+            match self
+                .hits
+                .iter_mut()
+                .find(|known| known.name == hit.name && known.project == hit.project)
+            {
                 Some(known) => {
                     known.found_by += hit.found_by;
                     known.score += hit.score;
@@ -3342,6 +3348,26 @@ mod tests {
             "the larger side's count: the unseen cannot be deduplicated, so the union is unknown"
         );
         assert!(merged.pool_exhausted);
+
+        // Two projects' memories of one name are two hits, under a view over every tier.
+        let in_project = |project: &str| Hit {
+            project: project.to_string(),
+            ..hit("notes", 1.0)
+        };
+        let merged = SearchResults {
+            hits: vec![in_project("web")],
+            matched: 1,
+            pool_exhausted: true,
+        }
+        .merge(
+            SearchResults {
+                hits: vec![in_project("movie")],
+                matched: 1,
+                pool_exhausted: true,
+            },
+            5,
+        );
+        assert_eq!(merged.hits.len(), 2);
     }
 
     /// The substring tier ranks before it cuts, and a read does not reindex the document.

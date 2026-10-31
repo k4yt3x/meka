@@ -342,6 +342,12 @@ pub(crate) struct CreateAccountRequest {
     pub(crate) client_id: Option<String>,
     /// Whether to send the interleaved-thinking beta, read by `anthropic-messages` alone.
     pub(crate) interleaved_thinking: Option<bool>,
+    /// Whether to send `prompt_cache_key`, read by `openai-responses` alone.
+    pub(crate) prompt_cache_key: Option<bool>,
+    /// Whether a streamed request asks for its usage, read by `openai-chat-completions` alone.
+    pub(crate) stream_usage: Option<bool>,
+    /// The longest tool name the endpoint takes, in bytes, read by the three API-key backends.
+    pub(crate) max_tool_name_bytes: Option<usize>,
     /// The key an API-key backend presents, stored in the database and never in `config.toml`.
     /// Required on such a backend, refused on one that logs in through the browser.
     #[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]
@@ -390,7 +396,12 @@ pub(crate) async fn create_account(
                 backend,
                 base_url: body.base_url.as_deref(),
                 settings: &settings,
-                interleaved_thinking: body.interleaved_thinking,
+                endpoint: account::EndpointSettings {
+                    interleaved_thinking: body.interleaved_thinking,
+                    prompt_cache_key: body.prompt_cache_key,
+                    stream_usage: body.stream_usage,
+                    max_tool_name_bytes: body.max_tool_name_bytes,
+                },
             },
             credential.as_ref(),
             &token_store,
@@ -1429,7 +1440,14 @@ pub(crate) struct ProfilesResponse {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r", "config:r"]))
+    security(
+        ("bearerAuth" = ["sessions:r"]),
+        ("bearerAuth" = ["mcp:r"]),
+        ("bearerAuth" = ["skills:r"]),
+        ("bearerAuth" = ["memory:r"]),
+        ("bearerAuth" = ["schedule:r"]),
+        ("bearerAuth" = ["config:r"])
+    )
 )]
 pub(crate) async fn profiles(
     State(state): State<ServerState>,
@@ -1522,6 +1540,8 @@ pub(crate) struct CreateProfileRequest {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
+    pub(crate) encrypted_reasoning: Option<bool>,
+    pub(crate) reasoning_summary: Option<bool>,
     /// Make the profile the one a session gets when it names none.
     #[serde(default)]
     pub(crate) default: bool,
@@ -1563,6 +1583,8 @@ pub(crate) async fn create_profile(
         thinking_budget: body.thinking_budget,
         cache_control: body.cache_control,
         thinking_display: body.thinking_display,
+        encrypted_reasoning: body.encrypted_reasoning,
+        reasoning_summary: body.reasoning_summary,
     };
     refuse_a_default_under_the_started_profile(&state, body.default)?;
     write_installation(&state, async |_| {
@@ -1628,6 +1650,12 @@ pub(crate) struct PatchProfileRequest {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub(crate) thinking_display: Patch<crate::config::ThinkingDisplay>,
+    #[serde(default)]
+    #[schema(value_type = Option<bool>)]
+    pub(crate) encrypted_reasoning: Patch<bool>,
+    #[serde(default)]
+    #[schema(value_type = Option<bool>)]
+    pub(crate) reasoning_summary: Patch<bool>,
 }
 
 impl PatchProfileRequest {
@@ -1647,6 +1675,8 @@ impl PatchProfileRequest {
             thinking_budget: self.thinking_budget,
             cache_control: self.cache_control,
             thinking_display: self.thinking_display,
+            encrypted_reasoning: self.encrypted_reasoning,
+            reasoning_summary: self.reasoning_summary,
         }
     }
 }

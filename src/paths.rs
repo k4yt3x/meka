@@ -34,39 +34,74 @@ pub(crate) fn expand_user_path(target: &str) -> Option<PathBuf> {
 /// who want a non-standard location, before falling back to the platform-native
 /// `dirs::config_dir().join("meka")`. The env-var route is the only reliable way to isolate state
 /// on macOS and Windows, where `dirs::config_dir()` doesn't honor `XDG_CONFIG_HOME`.
+///
+/// `None` for a relative override as well as for a platform with no config directory: the user
+/// asked for another directory, and the platform's would be the real one, so a relative value
+/// fails closed. [`refuse_relative_overrides`] says so at startup.
 pub(crate) fn meka_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("MEKA_CONFIG_DIR") {
-        let path = PathBuf::from(dir);
-        // An empty value reads as unset rather than as the current directory. `MEKA_CONFIG_DIR=`
-        // in a shell profile, or an exported-but-unset variable in a systemd unit, would otherwise
-        // load `./config.toml` from whatever directory meka started in, and spawn that file's MCP
-        // servers. A relative value has the same shape of problem: which config you get depends on
-        // your cwd. `MEKA_DATA_DIR` refuses both for the same reasons, and more sharply: `meka.db`
-        // holds every provider credential.
-        if path.as_os_str().is_empty() {
-            // `warn!`, not `debug!`: an override the user set and meka did not honor is exactly
-            // the recoverable-fallback case, and the environment-variable documentation says a
-            // warning is what happens.
-            tracing::warn!("MEKA_CONFIG_DIR is empty; using the platform config directory");
-        } else if !path.is_absolute() {
-            tracing::warn!(
-                "MEKA_CONFIG_DIR '{path}' is not absolute; using the platform config directory",
-                path = path.display()
-            );
-        } else {
-            return Some(path);
+    match override_of(std::env::var_os("MEKA_CONFIG_DIR")) {
+        Override::Absolute(path) => Some(path),
+        Override::Relative(_) => None,
+        Override::Unset => dirs::config_dir().map(|directory| directory.join("meka")),
+    }
+}
+
+/// What a directory override holds. An empty value reads as unset, as an empty `XDG_*` does: a
+/// shell profile's `MEKA_CONFIG_DIR=` or a systemd unit that exports one blank asks for nothing.
+enum Override {
+    Unset,
+    Absolute(PathBuf),
+    Relative(PathBuf),
+}
+
+fn override_of(value: Option<std::ffi::OsString>) -> Override {
+    match value {
+        None => Override::Unset,
+        Some(value) if value.is_empty() => Override::Unset,
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                Override::Absolute(path)
+            } else {
+                Override::Relative(path)
+            }
         }
     }
-    dirs::config_dir().map(|directory| directory.join("meka"))
 }
+
+/// Refuse a relative `MEKA_CONFIG_DIR` or `MEKA_DATA_DIR`, before anything reads either directory.
+///
+/// Falling back to the platform directory would act on the real configuration and the real store,
+/// credentials and all, when the user asked for another place; resolving it against the working
+/// directory would give each launch directory its own store. Neither is what was meant.
+pub(crate) fn refuse_relative_overrides() -> Result<(), String> {
+    for (variable, value) in [
+        ("MEKA_CONFIG_DIR", std::env::var_os("MEKA_CONFIG_DIR")),
+        ("MEKA_DATA_DIR", std::env::var_os("MEKA_DATA_DIR")),
+    ] {
+        if let Override::Relative(path) = override_of(value) {
+            return Err(format!(
+                "`{variable}` must be an absolute path, not '{}'",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The directory `meka.db` lives in: the `MEKA_DATA_DIR` override, else the platform data
-/// directory's `meka` subdirectory. `None` only when the platform names no data directory at all.
+/// directory's `meka` subdirectory. `None` when the platform names no data directory at all, and
+/// for a relative override, for the reason [`meka_config_dir`] gives.
 ///
 /// `dirs::data_dir()` honors `XDG_DATA_HOME` on Linux, returns `~/Library/Application Support` on
 /// macOS, and `%APPDATA%` on Windows. No silent fallback: writing the session store to a
 /// wrong-for-the-platform path is worse than asking the user to set `MEKA_DATA_DIR`.
 pub(crate) fn meka_data_dir() -> Option<PathBuf> {
-    data_dir_override().or_else(|| dirs::data_dir().map(|base| base.join("meka")))
+    match override_of(std::env::var_os("MEKA_DATA_DIR")) {
+        Override::Absolute(path) => Some(path),
+        Override::Relative(_) => None,
+        Override::Unset => dirs::data_dir().map(|base| base.join("meka")),
+    }
 }
 /// `config.toml`'s path, under [`meka_config_dir`].
 pub(crate) fn config_file_path() -> Option<PathBuf> {
@@ -90,25 +125,32 @@ pub(crate) fn skill_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `MEKA_DATA_DIR` when it is set to an absolute path, else `None`.
-///
-/// Absolute only, matching [`meka_config_dir`]. A relative value means the database, which holds
-/// every provider credential, lands under whatever directory meka happened to start in, so `meka`
-/// in one project and `meka` in another silently get different credential stores, and neither is
-/// the one the user set up. Ignored rather than fatal, for the same reason the config directory
-/// ignores it: the platform default is always a usable answer.
-fn data_dir_override() -> Option<PathBuf> {
-    let value = std::env::var_os("MEKA_DATA_DIR")?;
-    if value.is_empty() {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A relative override is refused, and no directory is resolved from it meanwhile, neither
+    /// the platform's nor one under the working directory; an empty one is unset.
+    #[test]
+    fn a_relative_directory_override_is_refused_and_resolves_to_nothing() {
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        // SAFETY: guarded above.
+        unsafe { std::env::set_var("MEKA_DATA_DIR", "relative/data") };
+        let refused = refuse_relative_overrides();
+        let resolved = meka_data_dir();
+        // SAFETY: guarded above.
+        unsafe { std::env::set_var("MEKA_DATA_DIR", "") };
+        let unset = meka_data_dir();
+        // SAFETY: guarded above.
+        unsafe { std::env::remove_var("MEKA_DATA_DIR") };
+
+        let refused = refused.expect_err("a relative override is refused");
+        assert!(refused.contains("`MEKA_DATA_DIR`"), "{refused}");
+        assert_eq!(resolved, None, "and resolves to no directory meanwhile");
+        assert_eq!(
+            unset,
+            dirs::data_dir().map(|base| base.join("meka")),
+            "an empty one is unset"
+        );
     }
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        return Some(path);
-    }
-    tracing::warn!(
-        "MEKA_DATA_DIR '{path}' is not absolute; using the platform data directory",
-        path = path.display()
-    );
-    None
 }

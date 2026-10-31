@@ -95,7 +95,7 @@ pub(crate) async fn subscribe(
 ) -> Result<()> {
     entry.subscriptions.insert(&uri);
     let outcome = if is_modern(entry).await {
-        reopen_stream(entry, cancellation)
+        reopen_stream(entry, cancellation, Mending::Reconnect)
             .await
             .and_then(|accepted| {
                 if accepted.contains(&uri) {
@@ -108,7 +108,7 @@ pub(crate) async fn subscribe(
                 }
             })
     } else {
-        legacy_subscribe(entry, &uri, cancellation).await
+        legacy_subscribe(entry, &uri, cancellation, Mending::Reconnect).await
     };
     if outcome.is_err() {
         entry.subscriptions.remove(&uri);
@@ -124,10 +124,29 @@ pub(crate) async fn unsubscribe(
 ) -> Result<()> {
     entry.subscriptions.remove(&uri);
     if is_modern(entry).await {
-        reopen_stream(entry, cancellation).await.map(|_accepted| ())
+        reopen_stream(entry, cancellation, Mending::Reconnect)
+            .await
+            .map(|_accepted| ())
     } else {
         legacy_unsubscribe(entry, &uri, cancellation).await
     }
+}
+
+/// Whether a request that meets a connection a fresh one would mend asks for one: a closed
+/// transport, or a rejection as unauthorized under `headers_helper`. The carry-over onto a
+/// connection just adopted never does. The fresh connection would carry the set over again, and a
+/// server that rejects it on every connection would be reconnected to without end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mending {
+    Reconnect,
+    Never,
+}
+
+/// [`resume`] as a task's future, boxed under a named type: the stream it opens can, elsewhere, ask
+/// for a reconnect, whose adoption spawns this again, and the future's own type would otherwise
+/// contain itself.
+pub(super) fn resumption(entry: Arc<ServerEntry>) -> futures::future::BoxFuture<'static, ()> {
+    Box::pin(async move { resume(&entry).await })
 }
 
 /// Carry the set over onto the connection `entry` has just adopted, and open the stream a modern
@@ -142,7 +161,7 @@ pub(super) async fn resume(entry: &Arc<ServerEntry>) {
         return;
     }
     if is_modern(entry).await {
-        if let Err(error) = reopen_stream(entry, &cancellation).await {
+        if let Err(error) = reopen_stream(entry, &cancellation, Mending::Never).await {
             tracing::debug!(
                 "MCP server '{server_name}' opened no notification stream: {error}",
                 server_name = entry.server_name
@@ -151,7 +170,7 @@ pub(super) async fn resume(entry: &Arc<ServerEntry>) {
         return;
     }
     for uri in entry.subscriptions.uris() {
-        if let Err(error) = legacy_subscribe(entry, &uri, &cancellation).await {
+        if let Err(error) = legacy_subscribe(entry, &uri, &cancellation, Mending::Never).await {
             if entry.connects.stopping().is_cancelled() {
                 return;
             }
@@ -169,6 +188,7 @@ pub(super) async fn resume(entry: &Arc<ServerEntry>) {
 async fn reopen_stream(
     entry: &Arc<ServerEntry>,
     cancellation: &CancellationToken,
+    mending: Mending,
 ) -> Result<BTreeSet<String>> {
     // The wait for the lock is the caller's to stop too: whoever holds it is inside a bounded
     // request, and a tool call stopped by the user should not sit that bound out first.
@@ -177,7 +197,7 @@ async fn reopen_stream(
         _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
         pump = entry.subscriptions.pump.lock() => pump,
     };
-    let subscription = open_stream(entry, cancellation).await?;
+    let subscription = open_stream(entry, cancellation, mending).await?;
     tracing::debug!(
         "MCP server '{server_name}' acknowledged a notification stream for {filter:?}",
         server_name = entry.server_name,
@@ -198,19 +218,46 @@ async fn reopen_stream(
     Ok(accepted)
 }
 
-/// `subscriptions/listen` for the set as it stands, acknowledged.
+/// `subscriptions/listen` for the set as it stands, acknowledged. A rejection as unauthorized on a
+/// server whose headers come from `headers_helper` renews the connection, when `mending` allows,
+/// and the stream is asked for once more on the new one. The adoption carries the set over too,
+/// and the later of the two streams is the one the entry keeps.
 async fn open_stream(
     entry: &Arc<ServerEntry>,
     cancellation: &CancellationToken,
+    mending: Mending,
 ) -> Result<Subscription> {
+    let failed = |error: rmcp::ServiceError| MekaError::McpConnection {
+        server_name: entry.server_name.clone(),
+        message: format!("failed to open the notification stream: {error}"),
+    };
     bounded(entry, "subscriptions/listen", cancellation, async {
-        let peer = entry.require_connected().await?;
-        peer.listen(listen_filter(&entry.subscriptions.uris()))
+        let connection = entry.live_connection().await?;
+        let error = match connection
+            .peer
+            .listen(listen_filter(&entry.subscriptions.uris()))
             .await
-            .map_err(|error| MekaError::McpConnection {
-                server_name: entry.server_name.clone(),
-                message: format!("failed to open the notification stream: {error}"),
-            })
+        {
+            Ok(subscription) => return Ok(subscription),
+            Err(error) => error,
+        };
+        let renewable = mending == Mending::Reconnect
+            && entry.config().headers_helper.is_some()
+            && crate::mcp::rejected_as_unauthorized(&error);
+        if !renewable
+            || !entry
+                .renew_rejected(connection.generation, cancellation)
+                .await?
+        {
+            return Err(failed(error));
+        }
+        drop(connection);
+        let renewed = entry.live_connection().await?;
+        renewed
+            .peer
+            .listen(listen_filter(&entry.subscriptions.uris()))
+            .await
+            .map_err(failed)
     })
     .await
 }
@@ -380,7 +427,7 @@ async fn reopen(
         if stop.is_cancelled() {
             return None;
         }
-        let opened = open_stream(entry, &CancellationToken::new()).await;
+        let opened = open_stream(entry, &CancellationToken::new(), Mending::Reconnect).await;
         drop(pump);
         match opened {
             Ok(subscription) => {
@@ -452,15 +499,24 @@ async fn legacy_subscribe(
     entry: &Arc<ServerEntry>,
     uri: &str,
     cancellation: &CancellationToken,
+    mending: Mending,
 ) -> Result<()> {
     bounded(entry, "resources/subscribe", cancellation, async {
-        let peer = entry.require_connected().await?;
-        peer.subscribe(SubscribeRequestParams::new(uri.to_string()))
-            .await
-            .map_err(|error| MekaError::McpConnection {
-                server_name: entry.server_name.clone(),
-                message: format!("failed to subscribe to '{uri}': {error}"),
-            })
+        let subscribe = |peer: rmcp::Peer<rmcp::RoleClient>| async move {
+            peer.subscribe(SubscribeRequestParams::new(uri.to_string()))
+                .await
+        };
+        let subscribed = match mending {
+            Mending::Reconnect => entry.on_a_connection(cancellation, subscribe).await?,
+            Mending::Never => {
+                let connection = entry.live_connection().await?;
+                subscribe(connection.peer.clone()).await
+            }
+        };
+        subscribed.map_err(|error| MekaError::McpConnection {
+            server_name: entry.server_name.clone(),
+            message: format!("failed to subscribe to '{uri}': {error}"),
+        })
     })
     .await
 }
@@ -475,9 +531,12 @@ async fn legacy_unsubscribe(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     bounded(entry, "resources/unsubscribe", cancellation, async {
-        let peer = entry.require_connected().await?;
-        peer.unsubscribe(UnsubscribeRequestParams::new(uri.to_string()))
-            .await
+        entry
+            .on_a_connection(cancellation, |peer| async move {
+                peer.unsubscribe(UnsubscribeRequestParams::new(uri.to_string()))
+                    .await
+            })
+            .await?
             .map_err(|error| MekaError::McpConnection {
                 server_name: entry.server_name.clone(),
                 message: format!("failed to unsubscribe from '{uri}': {error}"),

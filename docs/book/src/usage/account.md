@@ -7,7 +7,7 @@ claude`), and a `--format plain|json`. Named nothing, it asks the account the de
 bills, or the one account when there is exactly one. No profile is needed: the views ask the
 account, never a model. The requested data goes to **stdout**; notes and errors go to
 **stderr**, so `meka account … 2>/dev/null | jq` stays clean. The rest of the `meka account` suite
-(`add`, `login`, `list`, `remove`) is documented under [Config file](../configuration/config-file.md#meka-account-cli).
+(`add`, `login`, `list`, `remove`) is documented under [Accounts and profiles](./accounts-and-profiles.md#meka-account-cli).
 
 Availability is per backend: `claude-subscription` and `chatgpt-subscription` (subscription OAuth) support these;
 for `usage` and `stats`, API-key backends, OpenAI-compatible endpoints and Ollama print a short

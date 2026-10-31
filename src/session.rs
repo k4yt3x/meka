@@ -61,9 +61,6 @@ impl CoreMaterials {
     }
 }
 
-/// What a session is made of and never changes while it runs. Every agent built for the session,
-/// and every sub-agent spawned from it, shares these by handle; a sub-agent narrows what it may
-/// reach through its own registry and permission, never through a different set of materials.
 /// The sub-agents this process is running right now, by their session id. A sub-agent is never a
 /// resident session of any host: its parent runs it under the parent's runtime, and only the
 /// child's file lock knows it is busy, which a reader may not probe (a spawn that cannot take the
@@ -171,6 +168,9 @@ impl Drop for RunningGuard {
     }
 }
 
+/// What a session is made of and never changes while it runs. Every agent built for the session,
+/// and every sub-agent spawned from it, shares these by handle; a sub-agent narrows what it may
+/// reach through its own registry and permission, never through a different set of materials.
 #[derive(Clone)]
 pub(crate) struct SessionMaterials {
     pub(crate) core: CoreMaterials,
@@ -414,18 +414,20 @@ pub(crate) struct ToolSite {
 
 impl ToolSite {
     /// A site outside any session, for a gate probe: `permission` in `cwd`, with no roots and no
-    /// session id.
+    /// session id, reading and reaching what a root session of this process would.
     pub(crate) fn detached(
         permission: crate::permission::SharedPermission,
         cwd: crate::workspace::SharedCwd,
+        read_boundary: crate::workspace::ReadBoundary,
+        network: crate::config::Network,
     ) -> Self {
         Self {
             permission,
             cwd,
             roots: crate::workspace::SharedRoots::default(),
             read_only_roots: crate::workspace::SharedRoots::default(),
-            read_boundary: crate::workspace::ReadBoundary::unconfined(),
-            network: crate::config::Network::Host,
+            read_boundary,
+            network,
             session_id: SharedSessionId::default(),
         }
     }
@@ -453,6 +455,8 @@ impl ToolSite {
                 crate::permission::EnabledPermissions::ALL,
             ),
             crate::workspace::SharedCwd::new(std::path::PathBuf::from(".")),
+            crate::workspace::ReadBoundary::unconfined(),
+            crate::config::Network::Host,
         )
     }
 
@@ -907,6 +911,77 @@ mod tests {
         );
     }
 
+    /// An import longer than a transaction arrives whole: every event, the image a row in a later
+    /// transaction references, and the session listed once the last transaction marks it whole.
+    #[tokio::test]
+    async fn an_import_longer_than_a_transaction_arrives_whole() {
+        use crate::{
+            conversation::{Event, Message},
+            image::ImageSource,
+        };
+        let manager = Store::for_test().await;
+        let root = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("root");
+        // Two transactions' worth of rows and more, with an image in the last, whose blob the
+        // archive carries and the last transaction stores.
+        let mut events: Vec<Event> = (0..4_100)
+            .map(|row| Event::Append(Message::user(format!("row {row}"))))
+            .collect();
+        events.push(Event::Append(Message::user_with_images("look", vec![
+            ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "aGk=".to_string(),
+            },
+        ])));
+        manager
+            .save_events_atomic(root, events, None)
+            .await
+            .expect("save");
+        let export = build_session_export(&manager, root).await.expect("export");
+        let json = serde_json::to_string(&export).expect("serialize");
+        let target = Store::for_test().await;
+        let crate::store::export::ImportPlan {
+            records,
+            blobs,
+            root_new_id,
+        } = plan_import(
+            serde_json::from_str(&json).expect("deserialize"),
+            planner_profiles(None),
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plan");
+        target
+            .import_sessions(records, blobs)
+            .await
+            .expect("import");
+        let mut imported = target.load_history(root_new_id).await.expect("history");
+        assert_eq!(imported.len(), 4_101);
+        target.inline_blobs(&mut imported).await.expect("inline");
+        let Some(Event::Append(last)) = imported.last() else {
+            panic!("the last event is the image's message");
+        };
+        assert!(
+            last.content.iter().any(|block| matches!(
+                block,
+                crate::conversation::ContentBlock::Image {
+                    source: ImageSource::Base64 { data, .. }
+                } if data == "aGk="
+            )),
+            "{last:?}"
+        );
+        let (listed, _) = target
+            .list_sessions(10, None, &crate::store::SessionFilter::default())
+            .await
+            .expect("list");
+        assert_eq!(
+            listed.iter().map(|session| session.id).collect::<Vec<_>>(),
+            [root_new_id],
+            "whole once imported"
+        );
+    }
+
     #[tokio::test]
     async fn session_export_import_round_trip() {
         use crate::{
@@ -940,6 +1015,7 @@ mod tests {
                         opaque: Some(crate::conversation::OpaqueReasoning::Sealed {
                             encrypted_content: "OPAQUE".to_string(),
                             id: Some("rs_1".to_string()),
+                            origin: Some("https://chatgpt.com".to_string()),
                         }),
                     },
                     ContentBlock::ToolUse {
@@ -978,7 +1054,12 @@ mod tests {
         let turn = uuid::Uuid::new_v4();
         manager
             .turn_store()
-            .open_turn(root, turn, "client", "2026-08-31T00:00:00+00:00")
+            .open_turn(
+                root,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                "2026-08-31T00:00:00+00:00",
+            )
             .await
             .expect("open");
         for event in [
@@ -1167,7 +1248,7 @@ mod tests {
                 Event::Append(message) => message.content.iter().any(|block| matches!(
                     block,
                     ContentBlock::Thinking {
-                        opaque: Some(crate::conversation::OpaqueReasoning::Sealed { encrypted_content, id }),
+                        opaque: Some(crate::conversation::OpaqueReasoning::Sealed { encrypted_content, id, .. }),
                         ..
                     } if encrypted_content == "OPAQUE" && id.as_deref() == Some("rs_1")
                 )),

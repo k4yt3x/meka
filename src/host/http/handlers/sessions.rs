@@ -973,8 +973,8 @@ pub(crate) async fn announce_subagent_runs(state: ServerState) {
                 Ok(None) => continue,
                 Err(error) => {
                     tracing::warn!(
-                        "failed to read sub-agent {} for the feed: {error}",
-                        change.child
+                        "failed to read sub-agent {child} for the feed: {error}",
+                        child = change.child
                     );
                     continue;
                 }

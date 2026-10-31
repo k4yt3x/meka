@@ -383,8 +383,8 @@ pub(crate) fn normalize_source(source: &str) -> Result<String, String> {
 /// this function's agree.
 pub(crate) fn parse_expiry(raw: &str) -> Result<SystemTime, String> {
     let raw = raw.trim();
-    if let Some(parsed) = parse_stamp(raw) {
-        return Ok(parsed);
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return system_time(parsed.with_timezone(&chrono::Utc), raw);
     }
     let date = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
         .map_err(|_| format!("'{raw}' is not an RFC 3339 timestamp or a YYYY-MM-DD date"))?;
@@ -400,7 +400,7 @@ pub(crate) fn parse_expiry(raw: &str) -> Result<SystemTime, String> {
         .and_local_timezone(chrono::Local)
         .earliest()
         .ok_or_else(|| format!("'{raw}' has no midnight in this time zone"))?;
-    Ok(SystemTime::from(local.with_timezone(&chrono::Utc)))
+    system_time(local.with_timezone(&chrono::Utc), raw)
 }
 
 /// Parse the window an `unverified` filter takes, `"90d"` or `"6months"`: the grammar every other
@@ -446,7 +446,7 @@ pub(crate) fn render_record_caption(memory: &Memory, now: SystemTime) -> String 
 /// Most tags one memory may carry. A tag set is a handful of labels; past this it is a body.
 pub(crate) const MAX_TAGS: usize = 10;
 /// Longest a single tag may be. Bounded so the histogram in the `[Memory]` index stays readable.
-pub(crate) const MAX_TAG_LEN: usize = 32;
+pub(crate) const MAX_TAG_CHARS: usize = 32;
 
 /// Validate one tag: lowercase alphanumerics and hyphens, starting with an alphanumeric.
 ///
@@ -458,8 +458,8 @@ pub(crate) fn validate_tag(tag: &str) -> Result<(), String> {
     if tag.is_empty() {
         return Err("a tag cannot be empty".to_string());
     }
-    if tag.chars().count() > MAX_TAG_LEN {
-        return Err(format!("tag '{tag}' exceeds {MAX_TAG_LEN} characters"));
+    if tag.chars().count() > MAX_TAG_CHARS {
+        return Err(format!("tag '{tag}' exceeds {MAX_TAG_CHARS} characters"));
     }
     let mut chars = tag.chars();
     #[allow(
@@ -511,16 +511,63 @@ pub(crate) fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
     Ok(tags)
 }
 
-/// Parse an RFC 3339 timestamp column, or `None` if it is not one.
+/// Parse an RFC 3339 timestamp column, or `None` if it is not one. A stamp the platform's clock
+/// cannot hold is one from before the clock starts (Windows counts from 1601, and RFC 3339 spells
+/// no year past the clock's end), so it reads as the epoch, long past either way: an expiry that
+/// old has expired.
 pub(crate) fn parse_stamp(raw: &str) -> Option<SystemTime> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|parsed| SystemTime::from(parsed.with_timezone(&chrono::Utc)))
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    Some(system_time(parsed.with_timezone(&chrono::Utc), raw).unwrap_or(SystemTime::UNIX_EPOCH))
 }
 
-/// Render a [`SystemTime`] as the RFC 3339 string the timestamp columns carry.
+/// Parse an RFC 3339 timestamp, saying why one is refused.
+pub(crate) fn parse_rfc3339(raw: &str) -> Result<SystemTime, String> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|_| format!("'{raw}' is not an RFC 3339 timestamp"))?;
+    system_time(parsed.with_timezone(&chrono::Utc), raw)
+}
+
+/// `moment` as a [`SystemTime`], refused past the range the platform's clock holds. Windows counts
+/// from 1601, so a year RFC 3339 accepts can have no `SystemTime` there, and chrono's `From`
+/// conversion panics on one.
+fn system_time(moment: chrono::DateTime<chrono::Utc>, raw: &str) -> Result<SystemTime, String> {
+    let whole = std::time::Duration::from_secs(moment.timestamp().unsigned_abs());
+    let base = if moment.timestamp() >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(whole)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(whole)
+    };
+    base.and_then(|base| {
+        base.checked_add(std::time::Duration::from_nanos(u64::from(
+            moment.timestamp_subsec_nanos(),
+        )))
+    })
+    .ok_or_else(|| format!("'{raw}' is outside the dates this system can represent"))
+}
+
+/// Render a [`SystemTime`] as the RFC 3339 string the timestamp columns carry. A time before the
+/// range a stamp spells, as a cutoff a window of a million years reaches, is rendered as the
+/// range's start, which sorts before every stamp written, as the time itself would; one past its
+/// end, which nothing reaches, as its end. chrono's `From` conversion panics on either.
 pub(crate) fn render_stamp(time: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()
+    let moment = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => i64::try_from(after.as_secs())
+            .ok()
+            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, after.subsec_nanos()))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC),
+        Err(before) => {
+            let before = before.duration();
+            let (seconds, nanos) = match before.subsec_nanos() {
+                0 => (Some(before.as_secs()), 0),
+                nanos => (before.as_secs().checked_add(1), 1_000_000_000 - nanos),
+            };
+            seconds
+                .and_then(|seconds| i64::try_from(seconds).ok())
+                .and_then(|seconds| chrono::DateTime::from_timestamp(-seconds, nanos))
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        }
+    };
+    moment.to_rfc3339()
 }
 
 /// The file name one exported memory lands under. The sole owner of the `<name>.md` layout
@@ -849,10 +896,8 @@ pub(crate) fn memory_from_export(
         None => String::new(),
     };
     let stamp = |field: &str, raw: Option<String>| -> Result<Option<SystemTime>, String> {
-        raw.map(|raw| {
-            parse_stamp(&raw).ok_or_else(|| format!("{field} '{raw}' is not an RFC 3339 timestamp"))
-        })
-        .transpose()
+        raw.map(|raw| parse_rfc3339(&raw).map_err(|reason| format!("{field} {reason}")))
+            .transpose()
     };
     let created_at = stamp("created", header.created)?.unwrap_or_else(SystemTime::now);
     let verified_at = stamp("verified", header.verified)?.unwrap_or(created_at);
@@ -1005,7 +1050,7 @@ mod tests {
             "quote\"mark",
             "comma,tag",
             "bracket]",
-            &"x".repeat(MAX_TAG_LEN + 1),
+            &"x".repeat(MAX_TAG_CHARS + 1),
         ] {
             assert!(validate_tag(bad).is_err(), "'{bad}' must be rejected");
         }
@@ -1231,6 +1276,55 @@ mod tests {
         assert_eq!(render_expiry(now - day / 2, now), "expired today");
         assert_eq!(render_expiry(now - day, now), "expired yesterday");
         assert_eq!(render_expiry(now - day * 2, now), "expired 2 days ago");
+    }
+
+    /// A stamp converts exactly, before the epoch as after it, and one the platform's clock cannot
+    /// hold is refused rather than panicking: Windows counts from 1601.
+    #[test]
+    fn a_stamp_converts_exactly_and_one_past_the_clock_is_refused() {
+        for raw in [
+            "2026-10-30T12:34:56.789Z",
+            "1969-12-31T23:59:59.25Z",
+            "1601-01-01T00:00:00Z",
+        ] {
+            let moment = chrono::DateTime::parse_from_rfc3339(raw)
+                .expect("a stamp")
+                .with_timezone(&chrono::Utc);
+            assert_eq!(parse_rfc3339(raw), Ok(SystemTime::from(moment)), "{raw}");
+        }
+        #[cfg(windows)]
+        for raw in ["1500-01-01T00:00:00Z", "1500-01-01"] {
+            let refused = parse_expiry(raw).expect_err("before the clock");
+            assert!(refused.contains("outside the dates"), "{refused}");
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            parse_stamp("1500-01-01T00:00:00Z"),
+            Some(SystemTime::UNIX_EPOCH),
+            "a stored stamp before the clock reads as long past"
+        );
+    }
+
+    /// A stamp renders as chrono renders it, before the epoch as after it, and a time past the
+    /// range a stamp spells renders as that range's end rather than panicking: a cutoff a huge
+    /// `unverified` window reaches compares before every stamp written.
+    #[test]
+    fn a_stamp_renders_exactly_and_one_past_the_range_renders_as_its_end() {
+        for raw in ["2026-10-30T12:34:56.789Z", "1969-12-31T23:59:59.25Z"] {
+            let moment = chrono::DateTime::parse_from_rfc3339(raw)
+                .expect("a stamp")
+                .with_timezone(&chrono::Utc);
+            assert_eq!(
+                render_stamp(SystemTime::from(moment)),
+                moment.to_rfc3339(),
+                "{raw}"
+            );
+        }
+        let window = std::time::Duration::from_secs(300_000 * 365 * 86_400);
+        if let Some(cutoff) = SystemTime::now().checked_sub(window) {
+            let rendered = render_stamp(cutoff);
+            assert!(rendered.as_str() < "0000", "{rendered}");
+        }
     }
 
     /// The caption states the verification only when one has been made since the note was

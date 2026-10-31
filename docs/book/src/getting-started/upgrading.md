@@ -1,6 +1,6 @@
 # Upgrading
 
-Most upgrades are a binary swap: replace the old executable with the new one and carry on. This page covers the ones that are not.
+Most upgrades are a binary swap: stop every meka process on the store (a `meka serve` unit, an open screen, an editor's `meka acp`), replace the executable, and carry on. An upgrade that changes the store's schema migrates it on the first open, and refuses while another meka process of 0.87 or later has the store open, since that process would go on writing the shape the migration replaced; an older process goes unseen, which is why it is stopped first. This page covers the upgrades that are more than a swap.
 
 ## Copying a store
 
@@ -9,6 +9,73 @@ migration, can sit in `meka.db-wal` beside `meka.db` until SQLite checkpoints th
 takes `meka.db` alone can therefore carry a schema version its tables have not caught up with.
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
+
+## 0.86 to 0.87
+
+Nothing in `config.toml` is renamed. The store moves forward on its first open, and 0.86 refuses a
+store 0.87 has opened; downgrading means restoring the backup the upgrade took. The conversions
+need nothing from you:
+
+- A cron job written before names no time zone and keeps running in the machine's.
+- Reasoning a `chatgpt-subscription` profile sealed names that endpoint, and is sent back to it
+  alone; reasoning from anywhere else names none and is sent nowhere. Naming it reads
+  `config.toml`'s profiles, so an upgrade of a store holding sealed reasoning refuses while the
+  file cannot be read.
+- The copies of the recent turns earlier compactions kept are linked to the rows they copy, so
+  history shows each such turn once; a copy whose row a turn sweep has already taken, or that no
+  row matches, stays in history as the record of what it says.
+- The session search index is rebuilt once.
+
+Session archives are `format_version` 18. A 0.86 archive imports as it is: its kept copies are
+linked the same way, and its sealed reasoning names no endpoint, since the archive does not say
+which.
+
+Two environment values, a handful of flags, two OpenAI request shapes and two HTTP shapes are
+refused or read differently.
+
+**`openai-responses` asks for encrypted reasoning, a reasoning summary and a cache key.** Every
+request carries `include: ["reasoning.encrypted_content"]`, `reasoning.summary` and a
+`prompt_cache_key` naming the session, as OpenAI's own client sends them. A model that does not
+reason refuses the first two, on OpenAI's own API as well (`gpt-4.1`, `gpt-4o`): set
+`encrypted_reasoning = false` and `reasoning_summary = false` on its profile (`meka profile set`).
+An endpoint behind `base_url` that refuses one is answered by turning that one off the same way,
+and `prompt_cache_key = false` in the account's table of `config.toml`.
+
+**`openai-chat-completions` asks for usage on every streamed request**
+(`stream_options.include_usage`), where it asked only some endpoints. An endpoint that refuses the
+field is answered by `stream_usage = false` in the account's table of `config.toml`.
+
+**A relative `MEKA_CONFIG_DIR` or `MEKA_DATA_DIR` is refused.** meka stops at startup naming the
+variable, where it used to fall back to the platform directory with a warning and so ran against
+the real store. Set each to an absolute path.
+
+**`meka serve` and `meka acp` refuse the flags that belong to a run.** Both refuse `--prompt`,
+`--skill` and `--oneshot`, and `meka serve` refuses the directory flags too, where they were
+silently ignored. Remove them from the unit file or the editor's agent command.
+
+**`meka profile add` and `meka profile set` refuse a flag the account's backend never sends**, as
+`meka account add` already did, where they wrote a key nothing reads. Drop the flag; nothing is
+written when it is refused.
+
+**Feed event ids start from the clock.** Each `meka serve` process issues ids above the clock's
+microseconds at its start, so a `Last-Event-ID` saved before a restart is read as a gap (a
+`feed.gap` with no count) rather than as a position in the new process's feed. A client that
+handles `feed.gap` by re-reading `GET /messages` needs no change; one that compared ids against
+small numbers should treat them as opaque, increasing integers.
+
+**`GET /v1/instructions` shows `path` and `source` to a token with `config:r` or `config:w`
+alone.** A token with `sessions:r` still reads the text. Grant `config:r` to a client that needs
+to know where the file is.
+
+**ACP: a prompt response's `usage` is the turn's**, as the protocol defines it, where it was the
+session's running total. An editor that showed it as the session's cost should sum it across
+turns.
+
+**A tool's boolean and number arguments are read strictly.** A boolean is `true` or `false`, a
+number an integer (`2.0` counts as 2, as JSON Schema has it), or the field is left out. Anything
+else, a string such as `"true"` or `"3"`, a fraction, or a negative where a count is asked for, is
+refused naming the field, so a model corrects the call rather than having it read as `false` or as
+the default. `memory_search` read a quoted `limit` as the number it spelled, and now refuses it.
 
 ## 0.85 to 0.86
 

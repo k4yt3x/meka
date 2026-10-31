@@ -539,8 +539,9 @@ const RAW_ARGUMENT_READERS: &[(&str, &str, &str)] = &[
     ),
     (
         "src/tools/scratchpad.rs",
-        "save_explicit_scratchpad_results",
-        "reads the carrier's name back from a recorded call; a blank one is excluded by \
+        "requested_entry",
+        "reads the carrier's name off a recorded call or a live one whose argument types were \
+         checked at admission, so what is not a name is dropped; a blank one is excluded by \
          `text::is_blank` on the spot",
     ),
 ];
@@ -550,7 +551,8 @@ const RAW_ARGUMENT_READERS: &[(&str, &str, &str)] = &[
 /// [`RAW_ARGUMENT_READERS`] names, so blank means "left out" and a wrong type is refused by one
 /// definition rather than one per tool. Matched on the spellings a raw read takes: `.get(...)` of
 /// a field name or a constant chained into `as_str`, a `match` on `input.get(...)` with a
-/// `Value::String` arm, or an `input.get(...)` read into an array.
+/// `Value::String` or `Value::Bool` arm, an `input.get(...)` read into an array, a field read as
+/// a number or a boolean, or `input["field"]` read as any of those.
 #[test]
 fn tool_arguments_are_read_through_the_shared_readers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -559,7 +561,7 @@ fn tool_arguments_are_read_through_the_shared_readers() {
     files.sort();
 
     let raw_read = regex::Regex::new(
-        r#"\.get\((?:"[a-z_]+"|[A-Za-z_:]+)\)\)?\s*\.and_then\((?:serde_json::Value::as_str|\|[a-z_]+\|\s*[a-z_]+\.as_str\(\))\)|match\s+input\s*\.get\("[a-z_]+"\)\s*\{[^}]*Value::String\(|input\s*\.get\((?:"[a-z_]+"|[a-z_]+)\)(?s:.){0,160}?(?:as_array\(\)|Value::Array\()"#,
+        r#"\.get\((?:"[a-z_]+"|[A-Za-z_:]+)\)\)?\s*\.and_then\((?:serde_json::Value::as_str|\|[a-z_]+\|\s*[a-z_]+\.as_str\(\))\)|match\s+input\s*\.get\("[a-z_]+"\)\s*\{[^}]*Value::(?:String|Bool)\(|input\s*\[\s*"[a-z_]+"\s*\]\s*\.\s*as_(?:str|u64|i64|f64|bool|array)\b|input\s*\.get\((?:"[a-z_]+"|[a-z_]+)\)(?s:.){0,160}?(?:as_array\(\)|Value::Array\()|\.get\((?:"[a-z_]+"|[A-Za-z_:]+)\)(?s:.){0,240}?(?:as_u64|as_i64|as_f64|as_bool)\b"#,
     )
     .expect("a valid pattern");
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();

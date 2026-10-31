@@ -52,7 +52,7 @@ pub(crate) struct SessionMatch {
 /// again. `the_definition_number_moves_with_the_words` pins the pair of this number and a digest
 /// of what a fixture of rows yields, so a change to the words without a bump, or a bump without a
 /// change, fails.
-const INDEXED_WORDS_DEFINITION: u32 = 4;
+const INDEXED_WORDS_DEFINITION: u32 = 5;
 
 /// The triggers the index needs, and the single place their text lives, so [`reconcile_index`]
 /// compares against exactly what it will write. A delete reaches the index through the first,
@@ -90,8 +90,12 @@ static TRIGGER_DEFINITIONS: LazyLock<[(&str, String); 2]> = LazyLock::new(|| {
 const FILL_BATCH_ROWS: usize = 2_000;
 
 /// The words a row contributes to the index: [`spoken_words_of_row`] with the scripts the
-/// tokenizer cannot segment spaced out, so a Chinese word is found inside a sentence.
-fn indexed_words(kind: &str, content: &str) -> String {
+/// tokenizer cannot segment spaced out, so a Chinese word is found inside a sentence; none for a
+/// copy a compaction kept, whose words the row it copies holds.
+fn indexed_words(kind: &str, content: &str, copy_of: Option<i64>) -> String {
+    if copy_of.is_some() {
+        return String::new();
+    }
     space_unspaced_scripts(&spoken_words_of_row(kind, content))
 }
 
@@ -104,6 +108,7 @@ fn spoken_words_of_row(kind: &str, content: &str) -> String {
         content: content.to_string(),
         created_at: String::new(),
         turn_id: None,
+        copy_of: None,
     };
     match decode_event_from_row(&row) {
         Ok(Some(Event::Append(message))) => spoken_words(&message),
@@ -200,25 +205,77 @@ fn spoken_words(message: &Message) -> String {
 pub(super) fn insert_message(
     connection: &rusqlite::Connection,
     session_id: &str,
-    kind: &str,
-    content: &str,
-    created_at: &str,
-    turn_id: Option<&str>,
+    row: &NewMessage<'_>,
 ) -> rusqlite::Result<i64> {
     // The writer names the turn: only the agent knows whether the turn open on the session is
     // the one it is running or one a dead process left open, so the store is told rather than
     // left to guess from the table.
     connection.execute(
-        "INSERT INTO messages (session_id, kind, content, created_at, turn_id)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![session_id, kind, content, created_at, turn_id],
+        "INSERT INTO messages (session_id, kind, content, created_at, turn_id, copy_of)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            session_id,
+            row.kind,
+            row.content,
+            row.created_at,
+            row.turn_id,
+            row.copy_of
+        ],
     )?;
     let message_id = connection.last_insert_rowid();
     connection.execute(
         "INSERT INTO messages_fts (rowid, text) VALUES (?1, ?2)",
-        rusqlite::params![message_id, indexed_words(kind, content)],
+        rusqlite::params![
+            message_id,
+            indexed_words(row.kind, row.content, row.copy_of)
+        ],
     )?;
     Ok(message_id)
+}
+
+/// Make the copies of `originals` rows of their own, for a door about to delete those rows: each
+/// copy is then the record history shows of what it copies, and the index takes its words. The
+/// turn sweep is the one door that deletes part of a session it leaves standing, so the one that
+/// calls this.
+pub(super) fn release_copies_of(
+    transaction: &rusqlite::Transaction<'_>,
+    originals: &[i64],
+) -> rusqlite::Result<()> {
+    if originals.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; originals.len()].join(",");
+    let copies: Vec<(i64, String, String)> = transaction
+        .prepare(&format!(
+            "SELECT id, kind, content FROM messages WHERE copy_of IN ({placeholders})"
+        ))?
+        .query_map(rusqlite::params_from_iter(originals.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut release = transaction.prepare("UPDATE messages SET copy_of = NULL WHERE id = ?1")?;
+    let mut forget = transaction.prepare("DELETE FROM messages_fts WHERE rowid = ?1")?;
+    let mut index =
+        transaction.prepare("INSERT INTO messages_fts (rowid, text) VALUES (?1, ?2)")?;
+    for (id, kind, content) in copies {
+        release.execute([id])?;
+        forget.execute([id])?;
+        index.execute(rusqlite::params![id, indexed_words(&kind, &content, None)])?;
+    }
+    Ok(())
+}
+
+/// A `messages` row as [`insert_message`] writes it.
+pub(super) struct NewMessage<'a> {
+    pub(super) kind: &'a str,
+    pub(super) content: &'a str,
+    pub(super) created_at: &'a str,
+    /// The turn that writes the row, or none.
+    pub(super) turn_id: Option<&'a str>,
+    /// The row this one copies, for a copy a compaction kept after its boundary while the row it
+    /// copies stands: the model reads the copy there, and every reader that shows history reads
+    /// the row it copies instead.
+    pub(super) copy_of: Option<i64>,
 }
 
 /// Bring the index into line with the `messages` table and with this build's definition of the
@@ -322,8 +379,8 @@ fn repair_a_desynced_index(connection: &rusqlite::Connection) -> rusqlite::Resul
         }
     }
     tracing::info!(
-        "reconciled the session search index: indexed {added} message(s), dropped {} stale row(s)",
-        stale.len()
+        "reconciled the session search index: indexed {added} message(s), dropped {stale} stale row(s)",
+        stale = stale.len()
     );
     Ok(())
 }
@@ -336,7 +393,7 @@ fn index_rows(
     after: i64,
 ) -> rusqlite::Result<(usize, Option<i64>)> {
     let mut select = transaction.prepare(
-        "SELECT id, kind, content FROM messages
+        "SELECT id, kind, content, copy_of FROM messages
          WHERE id > ?1 AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize WHERE id = messages.id)
          ORDER BY id ASC
          LIMIT ?2",
@@ -348,13 +405,17 @@ fn index_rows(
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
         ))
     })?;
     let mut indexed = 0usize;
     let mut last = None;
     for row in rows {
-        let (id, kind, content) = row?;
-        insert.execute(rusqlite::params![id, indexed_words(&kind, &content)])?;
+        let (id, kind, content, copy_of) = row?;
+        insert.execute(rusqlite::params![
+            id,
+            indexed_words(&kind, &content, copy_of)
+        ])?;
         indexed += 1;
         last = Some(id);
     }
@@ -1107,6 +1168,36 @@ mod tests {
                 }]),
             ),
             (
+                // An invocation contributes the words typed with it, a resource nothing, and the
+                // words around it their own.
+                "user_blocks",
+                blocks(vec![
+                    ContentBlock::Invocation {
+                        kind: crate::conversation::InvocationKind::Skill,
+                        name: "review".to_string(),
+                        directive: "the parser".to_string(),
+                        text: "the parser\n\nthe skill's body".to_string(),
+                    },
+                    text("compare "),
+                    ContentBlock::Resource {
+                        uri: "file:///a.rs".to_string(),
+                        name: "a.rs".to_string(),
+                        text: "<resource uri=\"file:///a.rs\">its contents</resource>".to_string(),
+                    },
+                    text(" with the old one"),
+                ]),
+            ),
+            (
+                // A bare invocation contributes the name it invoked.
+                "user_blocks",
+                blocks(vec![ContentBlock::Invocation {
+                    kind: crate::conversation::InvocationKind::McpPrompt,
+                    name: "server:prompt".to_string(),
+                    directive: String::new(),
+                    text: "user: the prompt's words".to_string(),
+                }]),
+            ),
+            (
                 // A nudge, meka's words in a block of their own, which contributes nothing.
                 "user_blocks",
                 blocks(vec![ContentBlock::Nudge {
@@ -1140,12 +1231,12 @@ mod tests {
         ];
         let words = fixture
             .iter()
-            .map(|(kind, content)| indexed_words(kind, content))
+            .map(|(kind, content)| indexed_words(kind, content, None))
             .collect::<Vec<_>>()
             .join("\u{1e}");
         assert_eq!(
             (INDEXED_WORDS_DEFINITION, digest(&words)),
-            (4, 10_743_907_157_442_872_453_u64),
+            (5, 7_730_688_909_017_102_265_u64),
             "the words a row contributes changed, or the definition number moved without them: \
              bump INDEXED_WORDS_DEFINITION and pin the new pair here (the words were: {words:?})"
         );
@@ -1215,7 +1306,7 @@ mod tests {
             checklist_snapshot: Default::default(),
         })
         .expect("json");
-        let words = indexed_words(COMPACT_BOUNDARY_KIND, &content);
+        let words = indexed_words(COMPACT_BOUNDARY_KIND, &content, None);
         assert!(words.contains("birds were discussed"), "{words}");
         assert!(words.contains("level read"), "{words}");
         assert!(!words.contains("pelicans"), "{words}");

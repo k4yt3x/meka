@@ -40,7 +40,7 @@ fn not_found(noun: &str, name: &str) -> ProblemDetail {
     ProblemDetail::new(
         ErrorKind::NotFound,
         StatusCode::NOT_FOUND,
-        format!("no {noun} named '{name}'"),
+        crate::text::no_entry_named(noun, name),
     )
 }
 
@@ -761,14 +761,15 @@ pub(crate) async fn list_tools(
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct InstructionsResponse {
     /// Where the instructions came from, for an operator diagnosing "why is it behaving like
-    /// that". Absent when none are configured.
+    /// that". Absent when none are configured, and for a caller without `config:r` or `config:w`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source: Option<String>,
     /// The resolved instruction text the agent runs under, omitted when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<String>,
     /// The file `PUT /v1/instructions` writes, `instructions.md` in the config directory, when
-    /// that file is what this server reads; absent when another source is in charge.
+    /// that file is what this server reads; absent when another source is in charge, and for a
+    /// caller without `config:r` or `config:w`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     /// Whether `PUT /v1/instructions` would change what this server's sessions run under.
@@ -805,15 +806,22 @@ fn instructions_target(
         .ok_or_else(|| "failed to determine the config directory".to_string())
 }
 
-/// The instructions as this server holds them now, with where a write would land.
-fn instructions_response(state: &ServerState) -> InstructionsResponse {
+/// The instructions as this server holds them now, with where a write would land. Where they came
+/// from and where a write lands are host paths, which only a caller that may read the
+/// installation is shown.
+fn instructions_response(state: &ServerState, shows_paths: bool) -> InstructionsResponse {
     let found = crate::sync::read(&state.shared.instructions).clone();
     let path = instructions_target(&state.shared.config).ok();
     InstructionsResponse {
-        source: found.as_ref().map(|found| found.source.to_string()),
+        source: found
+            .as_ref()
+            .filter(|_| shows_paths)
+            .map(|found| found.source.to_string()),
         content: found.map(|found| found.text),
         writable: path.is_some(),
-        path: path.map(|path| path.display().to_string()),
+        path: path
+            .filter(|_| shows_paths)
+            .map(|path| path.display().to_string()),
     }
 }
 
@@ -832,14 +840,16 @@ fn instructions_response(state: &ServerState) -> InstructionsResponse {
 )]
 pub(crate) async fn instructions(
     State(state): State<ServerState>,
-    _scoped: scope::Scoped<scope::SessionsRead>,
+    scoped: scope::Scoped<scope::SessionsRead>,
 ) -> Result<Json<InstructionsResponse>, ProblemDetail> {
     // `sessions:r` rather than any read scope: this returns the *whole* system-instruction text,
     // which is the same class of content as a skill body and is gated for the same reason (see
     // `get_skill`). A `schedule:r` token has no business reading the persona the agent runs under.
     // `sessions:r` is the right pairing because anyone who can read a session's messages can
     // already infer much of it.
-    Ok(Json(instructions_response(&state)))
+    let shows_paths =
+        scoped.principal.has_scope("config:r") || scoped.principal.has_scope("config:w");
+    Ok(Json(instructions_response(&state, shows_paths)))
 }
 
 /// The body of `PUT /v1/instructions`.
@@ -926,7 +936,7 @@ pub(crate) async fn put_instructions(
                 )
             }
         })?;
-    Ok(Json(instructions_response(&state)))
+    Ok(Json(instructions_response(&state, true)))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -945,7 +955,14 @@ pub(crate) struct ProjectsResponse {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
-    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r", "config:r"]))
+    security(
+        ("bearerAuth" = ["sessions:r"]),
+        ("bearerAuth" = ["mcp:r"]),
+        ("bearerAuth" = ["skills:r"]),
+        ("bearerAuth" = ["memory:r"]),
+        ("bearerAuth" = ["schedule:r"]),
+        ("bearerAuth" = ["config:r"])
+    )
 )]
 pub(crate) async fn projects(
     State(state): State<ServerState>,

@@ -195,7 +195,7 @@ pub(crate) async fn run_get(
     }
     fields.push((
         "body",
-        format!("{} bytes", entry.body.as_deref().unwrap_or_default().len()),
+        crate::text::format_size(entry.body.as_deref().unwrap_or_default().len()),
     ));
     crate::render::write_stdout(crate::text::format_fields(&fields))?;
     Ok(())

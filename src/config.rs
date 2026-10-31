@@ -1216,6 +1216,8 @@ impl Backend {
             // Not `claude-subscription`: its breakpoint is pinned by the captured wire, and its
             // endpoint cannot vary.
             "cache_control" => matches!(self, Self::AnthropicMessages),
+            // Not `chatgpt-subscription`: its endpoint is always ChatGPT, which takes both.
+            "encrypted_reasoning" | "reasoning_summary" => matches!(self, Self::OpenAiResponses),
             // Chat Completions has no declaration to make.
             "deferred_tools" => !matches!(self, Self::OpenAiChatCompletions),
             _ => true,
@@ -1231,6 +1233,12 @@ impl Backend {
                 matches!(self, Self::ClaudeSubscription | Self::ChatGptSubscription)
             }
             "interleaved_thinking" => matches!(self, Self::AnthropicMessages),
+            "prompt_cache_key" => matches!(self, Self::OpenAiResponses),
+            "stream_usage" => matches!(self, Self::OpenAiChatCompletions),
+            "max_tool_name_bytes" => matches!(
+                self,
+                Self::AnthropicMessages | Self::OpenAiResponses | Self::OpenAiChatCompletions
+            ),
             _ => true,
         }
     }
@@ -1244,6 +1252,43 @@ impl Backend {
             Self::ChatGptSubscription | Self::OpenAiChatCompletions | Self::OpenAiResponses => None,
         }
     }
+
+    /// The longest tool name this backend's wire accepts, in bytes, as the protocol's owner
+    /// documents it: 128 on Anthropic's Messages API and OpenAI's Responses API, 64 on Chat
+    /// Completions. A longer name meka holds is cut to it on the way out; see
+    /// [`crate::provider::wire_names`]. The default of an account's `max_tool_name_bytes` on a
+    /// backend whose endpoint the user names, and the cap itself on the two that have one.
+    pub(crate) const fn max_tool_name_bytes(self) -> usize {
+        match self {
+            Self::AnthropicMessages
+            | Self::ClaudeSubscription
+            | Self::ChatGptSubscription
+            | Self::OpenAiResponses => 128,
+            Self::OpenAiChatCompletions => 64,
+        }
+    }
+}
+
+/// The fewest bytes an account's `max_tool_name_bytes` may name: a cut name keeps at least one
+/// character of the name it stands for beside the 13-byte suffix it ends in.
+pub(crate) const MIN_TOOL_NAME_BYTES: usize = 16;
+
+/// `bytes` as an account's `max_tool_name_bytes`, or why not. The one check for the file's parse
+/// and the write door.
+pub(crate) fn check_tool_name_bytes(bytes: usize) -> std::result::Result<usize, String> {
+    if bytes < MIN_TOOL_NAME_BYTES {
+        return Err(format!(
+            "`max_tool_name_bytes` is {bytes}; a cut name needs at least {MIN_TOOL_NAME_BYTES}"
+        ));
+    }
+    // The file holds a TOML integer, which stops at `i64::MAX`.
+    if i64::try_from(bytes).is_err() {
+        return Err(format!(
+            "`max_tool_name_bytes` is {bytes}; `config.toml` holds at most {}",
+            i64::MAX
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Whether `fallbacks` on profile `name` names other configured profiles, each once: the one rule
@@ -1415,6 +1460,9 @@ fn warn_about_inert_profile_keys(
                 "interleaved_thinking",
                 account.interleaved_thinking.is_some(),
             ),
+            ("prompt_cache_key", account.prompt_cache_key.is_some()),
+            ("stream_usage", account.stream_usage.is_some()),
+            ("max_tool_name_bytes", account.max_tool_name_bytes.is_some()),
         ];
         for (key, is_set) in set {
             if is_set && !backend.reads_account_key(key) {
@@ -1437,6 +1485,8 @@ fn warn_about_inert_profile_keys(
             ("thinking_budget", profile.thinking_budget.is_some()),
             ("cache_control", profile.cache_control.is_some()),
             ("thinking_display", profile.thinking_display.is_some()),
+            ("encrypted_reasoning", profile.encrypted_reasoning.is_some()),
+            ("reasoning_summary", profile.reasoning_summary.is_some()),
         ];
         for (key, is_set) in set {
             if is_set && !backend.reads_profile_key(key) {
@@ -2334,8 +2384,11 @@ const SECTIONS_READ_AT_STARTUP: &[&str] = &[
 
 /// The keys of a section in [`SECTIONS_READ_AT_STARTUP`] that serving the file applies all the
 /// same.
-const KEYS_SERVED_WITH_THE_PROFILES: &[(&str, &str)] =
-    &[("mcp", "servers"), ("session", "context_window")];
+const KEYS_SERVED_WITH_THE_PROFILES: &[(&str, &str)] = &[
+    ("mcp", "servers"),
+    ("session", "context_window"),
+    ("serve", "tokens"),
+];
 
 /// The sections read at startup alone whose content `now` states differently from `started`, the
 /// file this process started on: what only a restart applies.
@@ -2365,7 +2418,7 @@ pub(crate) fn sections_awaiting_restart(
 /// Load `config.toml`, returning the parsed file and any error that stopped it from parsing.
 ///
 /// Warning and falling back to `ConfigFile::default()` is the worst of the options: one mistyped
-/// key silently reconfigures the whole agent, running it with no provider profiles, no MCP servers
+/// key silently reconfigures the whole agent, running it with no profiles, no MCP servers
 /// and default permissions, off a single line the user can easily scroll past. The error is carried
 /// instead and raised by [`ResolvedConfig::validate`], alongside the profile-selection failures, so
 /// [`ResolvedConfig::resolve`] can stay infallible.

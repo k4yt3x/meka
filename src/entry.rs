@@ -265,7 +265,7 @@ pub(crate) fn validate_lookup_name(name: &str, noun: &str) -> Result<(), String>
 /// Rejecting everything outside the character class rules out `..`, path separators, absolute
 /// paths, and dot-files *by construction* rather than by enumerating the attacks. That matters most
 /// for memory, whose tools run at [`crate::permission::Permission`] `Read`: without this check
-/// `memory_write` would be an arbitrary-file-write primitive reachable in read-only mode.
+/// `memory_write` would be an arbitrary-file-write primitive reachable at `read`.
 ///
 /// This is the *write* rule, and the character class is the whole of why it is safe to put a name
 /// that passed it into a path. A caller that only needs to find a row wants

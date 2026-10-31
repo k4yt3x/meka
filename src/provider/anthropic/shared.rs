@@ -408,12 +408,20 @@ pub(super) fn convert_messages_to_claude_content(
                     Some(match block {
                         // The turn's context block, a nudge and what arrived for the model are
                         // text on this wire, in the order the message holds them.
+                        // A blank one is left out: the API refuses a text block with no
+                        // non-whitespace text in it, and a reply that streamed a newline before
+                        // it was cut is saved as one.
                         ContentBlock::Text { text }
                         | ContentBlock::TurnContext { text }
                         | ContentBlock::Nudge { text, .. }
                         | ContentBlock::Inbox { text, .. }
                         | ContentBlock::Scheduled { text, .. }
-                        | ContentBlock::BackgroundReport { text, .. } => {
+                        | ContentBlock::BackgroundReport { text, .. }
+                        | ContentBlock::Invocation { text, .. }
+                        | ContentBlock::Resource { text, .. } => {
+                            if crate::text::is_blank(text) {
+                                return None;
+                            }
                             serde_json::json!({
                                 "type": "text",
                                 "text": text,
@@ -435,6 +443,9 @@ pub(super) fn convert_messages_to_claude_content(
                         } => {
                             let content: Vec<serde_json::Value> = content
                                 .iter()
+                                .filter(|item| {
+                                    !matches!(item, ToolResultContent::Text { text } if crate::text::is_blank(text))
+                                })
                                 .map(|item| match item {
                                     ToolResultContent::Text { text } => {
                                         serde_json::json!({"type": "text", "text": text})
@@ -1173,11 +1184,11 @@ type DownscaleCacheKey = (u64, u64, usize);
 /// Cleared wholesale when full rather than evicted one at a time: the working set is the images in
 /// one conversation, so either they all fit or the conversation has moved on.
 static DOWNSCALE_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<DownscaleCacheKey, String>>,
+    std::sync::Mutex<std::collections::HashMap<DownscaleCacheKey, (&'static str, String)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Entries the downscale cache holds before it is cleared. Each is one base64 PNG, so this bounds
-/// residency by roughly this many downscaled images.
+/// Entries the downscale cache holds before it is cleared. Each is one downscaled image, its media
+/// type and its base64, so this bounds residency by roughly this many downscaled images.
 const DOWNSCALE_CACHE_ENTRIES: usize = 16;
 
 fn downscale_cache_key(source_base64: &str) -> DownscaleCacheKey {
@@ -1198,25 +1209,26 @@ fn downscale_cache_key(source_base64: &str) -> DownscaleCacheKey {
     (hasher.finish(), second.finish(), source_base64.len())
 }
 
-fn downscale_cache_get(source_base64: &str) -> Option<String> {
+fn downscale_cache_get(source_base64: &str) -> Option<(&'static str, String)> {
     let cache = crate::sync::lock(&DOWNSCALE_CACHE);
     cache.get(&downscale_cache_key(source_base64)).cloned()
 }
 
-fn downscale_cache_put(source_base64: &str, downscaled_base64: &str) {
+fn downscale_cache_put(source_base64: &str, media_type: &'static str, downscaled_base64: &str) {
     let mut cache = crate::sync::lock(&DOWNSCALE_CACHE);
     if cache.len() >= DOWNSCALE_CACHE_ENTRIES {
         cache.clear();
     }
     cache.insert(
         downscale_cache_key(source_base64),
-        downscaled_base64.to_string(),
+        (media_type, downscaled_base64.to_string()),
     );
 }
 
 /// Walk `messages` and downscale any image whose pixel dimensions exceed
 /// [`MAX_IMAGE_DIMENSION_PX`] on either axis. The body bytes (base64) for those images are replaced
-/// with a re-encoded PNG that fits within the cap; smaller images are left alone. Returns
+/// with a re-encoding that fits within the cap ([`crate::image::downscale_to_dim_cap`]); smaller
+/// images are left alone. Returns
 /// `Cow::Borrowed` when no work was needed.
 ///
 /// Anthropic-specific: the 2000 px cap only matters for Anthropic's multi-image requests, so the
@@ -1247,8 +1259,8 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
             .unwrap_or(false)
     }
 
-    // Re-encode `source` to a within-cap PNG in place; no-op if it can't be decoded or already
-    // fits. Served from the cache when this exact payload has been downscaled before.
+    // Re-encode `source` within the cap in place; no-op if it can't be decoded or already fits.
+    // Served from the cache when this exact payload has been downscaled before.
     fn downscale_in_place(source: &mut crate::image::ImageSource) {
         // A reference has no bytes to downscale; hydration resolves every one before a request.
         let crate::image::ImageSource::Base64 { media_type, data } = source else {
@@ -1257,8 +1269,8 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
         let Some(format) = parse_format(media_type) else {
             return;
         };
-        if let Some(cached) = downscale_cache_get(data) {
-            *media_type = "image/png".to_string();
+        if let Some((cached_type, cached)) = downscale_cache_get(data) {
+            *media_type = cached_type.to_string();
             *data = cached;
             return;
         }
@@ -1273,10 +1285,10 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
             return;
         }
         match crate::image::downscale_to_dim_cap(&bytes, format, MAX_IMAGE_DIMENSION_PX) {
-            Ok(png) => {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
-                downscale_cache_put(&original, &encoded);
-                *media_type = "image/png".to_string();
+            Ok((downscaled_type, downscaled)) => {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&downscaled);
+                downscale_cache_put(&original, downscaled_type, &encoded);
+                *media_type = downscaled_type.to_string();
                 *data = encoded;
             }
             Err(error) => {
@@ -1321,10 +1333,11 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
 }
 
 /// Serialize a Claude request body: downscale oversized images first, then the budget every
-/// backend applies, [`crate::provider::budget::fit_body_to_budget`]. Both Claude providers run
-/// this; the caller supplies the body builder via `build` so each provider's thinking / metadata
-/// wiring stays in its own file. The downscale is the Anthropic-specific half, for the 2000 px
-/// multi-image cap; the redaction and the refusal are the shared half.
+/// backend applies, [`crate::provider::budget::fit_body_to_budget`], with the API's image count.
+/// Both Claude providers run this; the caller supplies the body builder via `build` so each
+/// provider's thinking / metadata wiring stays in its own file. The downscale is the
+/// Anthropic-specific half, for the 2000 px multi-image cap; the redaction and the refusal are the
+/// shared half.
 pub(super) fn build_body_within_budget<F>(
     messages: &[Message],
     max_request_bytes: usize,
@@ -1334,7 +1347,12 @@ where
     F: FnMut(&[Message]) -> Result<String>,
 {
     let prepared = downscale_oversized_images(messages);
-    crate::provider::budget::fit_body_to_budget(prepared.as_ref(), max_request_bytes, build)
+    crate::provider::budget::fit_body_to_budget(
+        prepared.as_ref(),
+        max_request_bytes,
+        Some(crate::provider::budget::ANTHROPIC_MAX_REQUEST_IMAGES),
+        build,
+    )
 }
 
 #[cfg(test)]
@@ -1449,6 +1467,29 @@ mod tests {
             content[1].get("cache_control").is_some(),
             "the moving breakpoint lands on the new last block"
         );
+    }
+
+    /// An invocation and an attached resource are text on this wire, each where the message holds
+    /// it, so the model reads the skill's body and the file among the words.
+    #[test]
+    fn an_invocation_and_a_resource_are_read_in_place() {
+        let converted = convert_messages_to_claude_content(
+            &[Message::invoked_with_a_resource_for_test()],
+            None,
+        );
+        let texts: Vec<&str> = converted[0]["content"]
+            .as_array()
+            .expect("content array")
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect();
+        assert_eq!(texts, [
+            "<context/>",
+            "the parser\n\nthe skill's body",
+            "compare ",
+            "<resource uri=\"file:///a.rs\">fn a() {}</resource>",
+            " with the old one",
+        ]);
     }
 
     /// The breakpoint lands on the last block that is actually sent. Attached before the trailing
@@ -2098,6 +2139,7 @@ mod tests {
             OpaqueReasoning::Sealed {
                 encrypted_content: "OPENAI_SEALED".to_string(),
                 id: Some("rs_1".to_string()),
+                origin: Some("https://chatgpt.com".to_string()),
             },
             OpaqueReasoning::Verbatim,
         ] {
@@ -2216,6 +2258,41 @@ mod tests {
         assert_eq!(content.len(), 1, "{content:?}");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "[No message content]");
+    }
+
+    /// A reply that streamed only whitespace before it was cut is saved as such, and the API
+    /// refuses a text block with nothing but whitespace in it: left in, every later request
+    /// fails. It goes out as the placeholder, and a blank line in a tool's result is left out.
+    #[test]
+    fn whitespace_only_text_never_reaches_the_wire() {
+        let messages = [
+            crate::conversation::Message::user("first"),
+            crate::conversation::Message::assistant_text("\n\n"),
+            crate::conversation::Message {
+                role: crate::conversation::Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call".to_string(),
+                    content: vec![
+                        ToolResultContent::Text {
+                            text: " ".to_string(),
+                        },
+                        ToolResultContent::Text {
+                            text: "kept".to_string(),
+                        },
+                    ],
+                    is_error: false,
+                }],
+            },
+        ];
+        let converted = convert_messages_to_claude_content(&messages, None);
+        assert_eq!(
+            converted[1]["content"],
+            serde_json::json!([{"type": "text", "text": "[No message content]"}])
+        );
+        assert_eq!(
+            converted[2]["content"][0]["content"],
+            serde_json::json!([{"type": "text", "text": "kept"}])
+        );
     }
 
     #[test]

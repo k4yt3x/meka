@@ -69,6 +69,50 @@ impl Store {
             })
     }
 
+    /// Rewrite an entry from its current content in one transaction, so another write of the entry
+    /// cannot land between the read and the write and be lost. `edit` answers the new content, or
+    /// `None` to leave the entry as it is, beside what the caller reports; the whole answer is
+    /// `None` when there is no entry of that name.
+    pub(crate) async fn edit_scratchpad_entry<T: Send + 'static>(
+        &self,
+        session_id: Uuid,
+        name: &str,
+        edit: impl FnOnce(&str) -> (Option<String>, T) + Send + 'static,
+    ) -> Result<Option<T>> {
+        let name = name.to_string();
+
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let existing: Option<String> = transaction
+                    .query_row(
+                        "SELECT content FROM scratchpad_entries \
+                         WHERE session_id = ?1 AND name = ?2",
+                        rusqlite::params![session_id.to_string(), name],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(existing) = existing else {
+                    return Ok(None);
+                };
+                let (content, answer) = edit(&existing);
+                if let Some(content) = content {
+                    transaction.execute(
+                        "UPDATE scratchpad_entries SET content = ?1 \
+                         WHERE session_id = ?2 AND name = ?3",
+                        rusqlite::params![content, session_id.to_string(), name],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(Some(answer))
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to edit the scratchpad entry: {error}"))
+            })
+    }
+
     /// Remove an entry; `false` when there was none of that name.
     pub(crate) async fn delete_scratchpad_entry(
         &self,

@@ -46,6 +46,7 @@ impl ScheduleStore {
         let session_id = job.session_id.to_string();
         let kind = job.schedule.kind_str().to_string();
         let spec = job.schedule.spec();
+        let timezone = job.schedule.timezone().map(str::to_string);
         let prompt = job.prompt.clone();
         let gate_kind = job
             .gate
@@ -74,8 +75,8 @@ impl ScheduleStore {
                 transaction.execute(
                     "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, gate_kind, \
                      gate_spec_json, gate_last_output, gate_permission, created_at, \
-                     last_fired_at, next_fire_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     last_fired_at, next_fire_at, timezone) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     rusqlite::params![
                         id,
                         session_id,
@@ -88,7 +89,8 @@ impl ScheduleStore {
                         gate_permission,
                         created_at,
                         last_fired_at,
-                        next_fire_at
+                        next_fire_at,
+                        timezone
                     ],
                 )?;
                 transaction.commit()?;
@@ -106,10 +108,10 @@ impl ScheduleStore {
         session_id: uuid::Uuid,
     ) -> crate::error::Result<Vec<ScheduledJob>> {
         self.query_scheduled_jobs(
-            "SELECT id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, \
-             gate_last_output, gate_permission, created_at, last_fired_at, next_fire_at, \
-             attempts FROM scheduled_jobs WHERE session_id = ?1 ORDER BY next_fire_at ASC"
-                .to_string(),
+            format!(
+                "SELECT {JOB_COLUMNS} FROM scheduled_jobs WHERE session_id = ?1 \
+                 ORDER BY next_fire_at ASC"
+            ),
             vec![session_id.to_string()],
         )
         .await
@@ -119,10 +121,7 @@ impl ScheduleStore {
     /// cancel`, which work from a job id and so cannot ask the caller which session to look in.
     pub(crate) async fn list_all_scheduled_jobs(&self) -> crate::error::Result<Vec<ScheduledJob>> {
         self.query_scheduled_jobs(
-            "SELECT id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, \
-             gate_last_output, gate_permission, created_at, last_fired_at, next_fire_at, \
-             attempts FROM scheduled_jobs ORDER BY next_fire_at ASC"
-                .to_string(),
+            format!("SELECT {JOB_COLUMNS} FROM scheduled_jobs ORDER BY next_fire_at ASC"),
             Vec::new(),
         )
         .await
@@ -136,10 +135,7 @@ impl ScheduleStore {
     ) -> crate::error::Result<Vec<ScheduledJob>> {
         self.query_scheduled_jobs(
             format!(
-                "SELECT id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, \
-                 gate_last_output, gate_permission, created_at, last_fired_at, \
-                 next_fire_at, attempts FROM scheduled_jobs \
-                 WHERE next_fire_at <= ?1 AND {} \
+                "SELECT {JOB_COLUMNS} FROM scheduled_jobs WHERE next_fire_at <= ?1 AND {} \
                  ORDER BY next_fire_at ASC",
                 no_live_claim("?1")
             ),
@@ -178,6 +174,7 @@ impl ScheduleStore {
                             last_fired_at: row.get(10)?,
                             next_fire_at: row.get(11)?,
                             attempts: row.get::<_, i64>(12)?.max(0) as u32,
+                            timezone: row.get(13)?,
                         })
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -608,6 +605,10 @@ pub(crate) fn no_live_claim(now: &str) -> String {
 /// resolution, which cannot conflate two occurrences: `MIN_EVERY` is a second.
 pub(crate) const SAME_OCCURRENCE: &str =
     "(next_fire_at = ?2 OR julianday(next_fire_at) = julianday(?2))";
+/// The columns every job read selects, in the order [`ScheduledJobRow`] reads them.
+const JOB_COLUMNS: &str = "id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, \
+                           gate_last_output, gate_permission, created_at, last_fired_at, \
+                           next_fire_at, attempts, timezone";
 /// Raw `scheduled_jobs` row, decoded into a [`ScheduledJob`] outside the database closure so parse
 /// failures can be logged and skipped individually.
 pub(crate) struct ScheduledJobRow {
@@ -624,6 +625,7 @@ pub(crate) struct ScheduledJobRow {
     pub(crate) last_fired_at: Option<String>,
     pub(crate) next_fire_at: String,
     pub(crate) attempts: u32,
+    pub(crate) timezone: Option<String>,
 }
 impl ScheduledJobRow {
     /// The row as a [`ScheduledJob`], or what about it did not parse.
@@ -670,7 +672,7 @@ impl ScheduledJobRow {
             id: self.id,
             session_id: uuid::Uuid::parse_str(&self.session_id)
                 .map_err(|error| format!("bad session id '{}': {}", self.session_id, error))?,
-            schedule: Schedule::from_stored(&self.kind, &self.spec)?,
+            schedule: Schedule::from_stored(&self.kind, &self.spec, self.timezone.as_deref())?,
             prompt: self.prompt,
             gate,
             created_at: parse_time(&self.created_at)?,

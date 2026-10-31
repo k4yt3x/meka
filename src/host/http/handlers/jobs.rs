@@ -91,9 +91,13 @@ pub(crate) struct CreateJobRequest {
     /// Recurring interval (`"30m"`, `"6h"`).
     #[serde(default)]
     pub(crate) every: Option<String>,
-    /// 5-field cron pattern, evaluated in the host's local time.
+    /// 5-field cron pattern, read in `timezone`.
     #[serde(default)]
     pub(crate) cron: Option<String>,
+    /// IANA time zone a `cron` pattern is read in; the host machine's when omitted. Refused beside
+    /// `at` or `every`, which read none.
+    #[serde(default)]
+    pub(crate) timezone: Option<String>,
     /// Guard the job on a probe: a shell command, or a call to a read-only tool.
     ///
     /// The level required depends on which. A shell command runs unattended and with no sandbox,
@@ -540,51 +544,25 @@ async fn session_permission_from_row(
     Ok(permission_from_summary(state, id, summary.as_ref()))
 }
 
-/// Resolve exactly one of `at` / `every` / `cron`.
-///
-/// Ambiguity is refused rather than resolved by precedence, matching `schedule_create`: silently
-/// honoring one and dropping the other would produce a job firing on a schedule nobody asked for.
+/// The schedule the body names, read by the one rule every door that creates a job uses.
 fn parse_schedule(
     body: &CreateJobRequest,
     now: chrono::DateTime<Utc>,
 ) -> Result<Schedule, ProblemDetail> {
-    let given: Vec<(&str, &str)> = [
-        ("at", body.at.as_deref()),
-        ("every", body.every.as_deref()),
-        ("cron", body.cron.as_deref()),
-    ]
-    .into_iter()
-    .filter_map(|(key, value)| {
-        value
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| (key, value))
-    })
-    .collect();
-
-    let invalid = |message: String| {
+    Schedule::parse_request(
+        body.at.as_deref(),
+        body.every.as_deref(),
+        body.cron.as_deref(),
+        body.timezone.as_deref(),
+        now,
+    )
+    .map_err(|message| {
         ProblemDetail::new(
             ErrorKind::InvalidBody,
             StatusCode::UNPROCESSABLE_ENTITY,
             message,
         )
-    };
-    match given.as_slice() {
-        [("at", value)] => Schedule::parse_at(value, now).map_err(invalid),
-        [("every", value)] => Schedule::parse_every(value).map_err(invalid),
-        [("cron", value)] => Schedule::parse_cron(value).map_err(invalid),
-        [] => Err(invalid(
-            "give one of `at` (once), `every` (interval), or `cron` (expression)".to_string(),
-        )),
-        several => Err(invalid(format!(
-            "give exactly one schedule, got {}",
-            several
-                .iter()
-                .map(|(key, _)| *key)
-                .collect::<Vec<_>>()
-                .join(" and ")
-        ))),
-    }
+    })
 }
 
 /// `DELETE /v1/schedule/{job_id}`: cancel a job.
@@ -780,19 +758,22 @@ pub(crate) async fn cancel_task(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    // Recorded before signaling, exactly as `task_cancel` does: `finish_background_task` only
-    // writes over a `running` row, so a task finishing in the same instant cannot report success
-    // after the caller was told it was stopped.
-    state
+    // Recorded before signaling, exactly as `task_cancel` does: the record writes only over a
+    // `running` row, so a task finishing in the same instant keeps its outcome, is not signaled,
+    // and answers as a finished one does.
+    let stopped = state
         .shared
         .store
         .background_store()
-        .finish_background_task(&task.id, TaskStatus::Canceled, None, None)
+        .stop_background_tasks(vec![task.id.clone()], TaskStatus::Canceled)
         .await
         .map_err(|error| {
             ProblemDetail::internal_sanitized("failed to record task cancellation", error)
                 .with("task_id", task.id.clone())
         })?;
+    if stopped.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
 
     // Read off the entry, not through `runtime.agent`: the registry is hoisted onto `SessionEntry`
     // precisely so this path does not wait on the mutex an in-flight turn holds, which is the

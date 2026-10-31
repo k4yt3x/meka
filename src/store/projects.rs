@@ -7,7 +7,10 @@
 //! the row and every session and memory on it in one transaction, and a removal refuses while any
 //! still names it.
 
-use super::{Store, sessions::spawned_session_sql};
+use super::{
+    Store,
+    sessions::{spawned_session_sql, whole_session_sql},
+};
 use crate::error::{MekaError, Result};
 
 /// A project as the store holds it, with what is on it.
@@ -70,11 +73,12 @@ fn records_in(
         "SELECT p.name, p.created_at,
                 (SELECT COUNT(*) FROM memories m WHERE m.project = p.name),
                 (SELECT COUNT(*) FROM sessions s
-                  WHERE s.project = p.name AND NOT {})
+                  WHERE s.project = p.name AND NOT {} AND {})
          FROM projects p
          WHERE ?1 IS NULL OR p.name = ?1
          ORDER BY p.name ASC",
-        spawned_session_sql("s.")
+        spawned_session_sql("s."),
+        whole_session_sql("s.")
     ))?;
     let rows = statement.query_map(rusqlite::params![name], |row| {
         Ok(ProjectRecord {
@@ -120,12 +124,6 @@ fn taken(name: &str, by: &str) -> MekaError {
     } else {
         format!("a project named '{by}' already exists, and names differ only by case")
     })
-}
-
-/// `count` of `noun`, pluralized the English way `memories` and `sessions` go.
-fn counted(count: u64, singular: &str, plural: &str) -> String {
-    let noun = if count == 1 { singular } else { plural };
-    format!("{count} {noun}")
 }
 
 impl Store {
@@ -241,7 +239,8 @@ impl Store {
             .into_result()
     }
 
-    /// Remove a project, refusing with the counts while any memory or root session is on it.
+    /// Remove a project, refusing with the counts while any memory or root session is on it; a
+    /// sub-agent's row that still names it is left on none.
     pub(crate) async fn remove_project(&self, name: &str) -> Result<()> {
         let name = name.to_string();
         self.connection
@@ -259,8 +258,9 @@ impl Store {
                 )?;
                 let sessions: i64 = transaction.query_row(
                     &format!(
-                        "SELECT COUNT(*) FROM sessions WHERE project = ?1 AND NOT {}",
-                        spawned_session_sql("")
+                        "SELECT COUNT(*) FROM sessions WHERE project = ?1 AND NOT {} AND {}",
+                        spawned_session_sql(""),
+                        whole_session_sql("")
                     ),
                     rusqlite::params![name],
                     |row| row.get(0),
@@ -268,10 +268,22 @@ impl Store {
                 if memories + sessions > 0 {
                     return Ok(Decided::Refused(MekaError::Usage(format!(
                         "project '{name}' has {} and {}; move or remove them first",
-                        counted(memories.max(0) as u64, "memory", "memories"),
-                        counted(sessions.max(0) as u64, "session", "sessions"),
+                        crate::text::counted(memories.max(0) as u64, "memory", "memories"),
+                        crate::text::counted(sessions.max(0) as u64, "session", "sessions"),
                     ))));
                 }
+                // A sub-agent's row records the project it last ran under, which its root may
+                // have left since, and a copy still being written is counted by nothing; with the
+                // project gone, each row says none rather than naming one this store no longer
+                // has, which an export of the tree could not import.
+                transaction.execute(
+                    &format!(
+                        "UPDATE sessions SET project = '' WHERE project = ?1 AND ({} OR NOT {})",
+                        spawned_session_sql(""),
+                        whole_session_sql("")
+                    ),
+                    rusqlite::params![name],
+                )?;
                 transaction.execute("DELETE FROM projects WHERE name = ?1", rusqlite::params![
                     name
                 ])?;
@@ -454,6 +466,49 @@ mod tests {
         assert!(store.project_names().await.expect("names").is_empty());
         let gone = store.remove_project("webdev").await.expect_err("gone");
         assert!(matches!(gone, MekaError::UnknownProject { .. }), "{gone}");
+    }
+
+    /// A sub-agent's row that still names a project its root has left does not hold the project
+    /// in place, and once the project goes it names none, so an export of the tree imports.
+    #[tokio::test]
+    async fn a_removal_leaves_a_sub_agent_on_none_rather_than_on_the_removed_project() {
+        let store = Store::for_test().await;
+        store.add_project("webdev").await.expect("added");
+        let root = store
+            .create_session_in_project_for_test(None, "profile", "webdev")
+            .await
+            .expect("a root on webdev");
+        let (child, _lock) = store
+            .create_child_session_for_test(
+                root,
+                None,
+                Vec::new(),
+                None,
+                "read".to_string(),
+                "profile".to_string(),
+            )
+            .await
+            .expect("a child");
+        store
+            .update_session(child, crate::store::SessionPatch {
+                project: Some("webdev".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("the child ran under webdev");
+        store
+            .update_session(root, crate::store::SessionPatch {
+                project: Some(String::new()),
+                ..Default::default()
+            })
+            .await
+            .expect("the root moved off");
+
+        store.remove_project("webdev").await.expect("removed");
+        assert_eq!(
+            store.recorded_project(child).await.expect("read"),
+            Some(String::new())
+        );
     }
 
     /// A moved row whose id is not one meka wrote fails the rename rather than going unannounced:

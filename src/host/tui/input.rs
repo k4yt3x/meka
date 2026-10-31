@@ -492,6 +492,11 @@ impl Composer {
         self.attachments.push(attachment);
     }
 
+    /// The images riding above the text, in the order attached, left in place.
+    pub(crate) fn attachments(&self) -> &[Attachment] {
+        &self.attachments
+    }
+
     pub(crate) fn has_attachments(&self) -> bool {
         !self.attachments.is_empty()
     }

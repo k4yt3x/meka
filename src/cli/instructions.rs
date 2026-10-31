@@ -11,12 +11,33 @@ pub(crate) fn run_instructions_subcommand(
     action: &crate::cli::InstructionsAction,
 ) -> anyhow::Result<()> {
     match action {
-        crate::cli::InstructionsAction::Show => {
+        crate::cli::InstructionsAction::Show { format } => {
             // `--instructions` belongs to a run, not to this query, so it is deliberately not
             // consulted here; `None` resolves the persistent tiers only.
             let standing = crate::instructions::resolve_for_display()?;
             let listed =
                 crate::instructions::read_files(&listed_entries()?, &std::env::current_dir()?);
+            if *format == crate::cli::OutputFormat::Json {
+                // Absent fields are left out, so a configuration with no instructions is `{}`.
+                #[derive(serde::Serialize)]
+                struct InstructionsView {
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    source: Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    files: Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    content: Option<String>,
+                }
+                let source = standing.as_ref().map(|found| found.source.to_string());
+                let files = listed.as_ref().map(|found| found.source.to_string());
+                let content = crate::instructions::join(standing.map(|found| found.text), listed);
+                crate::cli::write_json(&InstructionsView {
+                    source,
+                    files,
+                    content,
+                })?;
+                return Ok(());
+            }
             if standing.is_none() && listed.is_none() {
                 crate::streams::write_stderr_line(format!(
                     "No instructions configured; write them to {}.",
@@ -38,29 +59,44 @@ pub(crate) fn run_instructions_subcommand(
                 crate::render::write_stdout_line(&text)?;
             }
         }
-        crate::cli::InstructionsAction::Path => {
+        crate::cli::InstructionsAction::Path { format } => {
             let current = std::env::current_dir()?;
             let listed = listed_entries()?
                 .into_iter()
                 .map(|entry| crate::instructions::listed_path(&entry, &current));
-            let rows: Vec<Vec<String>> = [
+            let entries: Vec<(String, bool)> = [
                 crate::instructions::instructions_dir(),
                 crate::instructions::instructions_file(),
             ]
             .into_iter()
             .flatten()
             .chain(listed)
-            .map(|path| {
-                vec![
-                    path.display().to_string(),
-                    if path.exists() { "yes" } else { "no" }.to_string(),
-                ]
-            })
+            .map(|path| (path.display().to_string(), path.exists()))
             .collect();
-            if rows.is_empty() {
+            if *format == crate::cli::OutputFormat::Json {
+                #[derive(serde::Serialize)]
+                struct PathView<'a> {
+                    path: &'a str,
+                    exists: bool,
+                }
+                let views: Vec<PathView<'_>> = entries
+                    .iter()
+                    .map(|(path, exists)| PathView {
+                        path,
+                        exists: *exists,
+                    })
+                    .collect();
+                crate::cli::write_json_listing("paths", &views)?;
+                return Ok(());
+            }
+            if entries.is_empty() {
                 crate::streams::write_stderr_line("No config directory.");
                 return Ok(());
             }
+            let rows: Vec<Vec<String>> = entries
+                .into_iter()
+                .map(|(path, exists)| vec![path, if exists { "yes" } else { "no" }.to_string()])
+                .collect();
             // The path is what you open, so it is shown in full.
             crate::render::write_stdout(crate::text::format_table(
                 &[

@@ -322,7 +322,7 @@ impl Agent {
             // after the turn that caused it, with nothing on screen to explain it, is worse than
             // the round trip it would save.
             if let Some(denial) = self
-                .request_approval(name, input, detach, &schema, &cancellation)
+                .request_approval(tool_call_id, name, input, detach, &schema, &cancellation)
                 .await
             {
                 return denial;
@@ -390,6 +390,7 @@ impl Agent {
     /// explain what it belonged to.
     pub(super) async fn request_approval(
         &self,
+        tool_call_id: &str,
         name: &str,
         input: &serde_json::Value,
         detach: bool,
@@ -405,6 +406,7 @@ impl Agent {
                 primary_param,
                 input: approval_input(input, detach),
                 cancellation: cancellation.clone(),
+                tool_call_id: Some(tool_call_id.to_string()),
                 subagent_id: None,
             })
             .await;
@@ -529,6 +531,7 @@ impl Agent {
             );
         }
 
+        let requested_entry = crate::tools::scratchpad::requested_entry(input).map(str::to_string);
         let join = tokio::spawn({
             let tool = Arc::clone(tool);
             let input = input.clone();
@@ -574,26 +577,59 @@ impl Agent {
 
                 let text =
                     crate::conversation::ContentBlock::tool_result_text_content(&output.content);
-                let (inline, spilled) = crate::background::split_outcome(&text);
-                let mut scratchpad_entry = None;
-                if let Some(full) = spilled {
-                    let name = crate::background::spill_entry_name(&task_id, &tool_name);
-                    match store.save_scratchpad_entry(session_id, &name, &full).await {
-                        Ok(()) => scratchpad_entry = Some(name),
-                        // Not fatal: the head still reaches the model, and losing the tail is far
-                        // better than losing the whole report.
-                        Err(error) => tracing::warn!(
-                            "background task {task_id}: failed to spill output to the scratchpad: {error}"
-                        ),
-                    }
-                }
-
                 let status = if output.is_error {
                     crate::store::background::TaskStatus::Failed
                 } else {
                     crate::store::background::TaskStatus::Completed
                 };
-                record_background_outcome(&store, &task_id, status, inline, scratchpad_entry).await;
+                // The entry the call named takes the whole output and the report says where, as
+                // an inline call's result does; a word about the call rather than its output is
+                // the report itself, as it stays inline there.
+                match requested_entry.filter(|_| output.is_output && !text.is_empty()) {
+                    Some(name) => {
+                        let outcome =
+                            crate::tools::scratchpad::build_scratchpad_reference(&name, text.len());
+                        let entry = crate::store::background::SavedOutput {
+                            session_id,
+                            name,
+                            content: text,
+                        };
+                        record_background_outcome(
+                            &store,
+                            &task_id,
+                            status,
+                            outcome,
+                            None,
+                            Some(entry),
+                        )
+                        .await;
+                    }
+                    None => {
+                        let (inline, spilled) = crate::background::split_outcome(&text);
+                        let mut scratchpad_entry = None;
+                        if let Some(full) = spilled {
+                            let name = crate::background::spill_entry_name(&task_id, &tool_name);
+                            match store.save_scratchpad_entry(session_id, &name, &full).await {
+                                Ok(()) => scratchpad_entry = Some(name),
+                                // Not fatal: the head still reaches the model, and losing the tail
+                                // is far better than losing the whole report.
+                                Err(error) => tracing::warn!(
+                                    "background task {task_id}: failed to spill output to the \
+                                     scratchpad: {error}"
+                                ),
+                            }
+                        }
+                        record_background_outcome(
+                            &store,
+                            &task_id,
+                            status,
+                            inline,
+                            scratchpad_entry,
+                            None,
+                        )
+                        .await;
+                    }
+                }
                 tasks.forget(&task_id).await;
             }
         });
@@ -623,7 +659,7 @@ impl Agent {
         context: crate::tools::ToolContext,
     ) -> crate::tools::ToolOutput {
         match tool.execute(input.clone(), context).await {
-            Ok(output) => crate::tools::ToolOutput {
+            Ok(output) => said_even_when_empty(&tool.definition().name, crate::tools::ToolOutput {
                 is_output: !output.is_error || tool.reports_failure_as_output(),
                 // A failed call changed nothing, whatever it reports, and every frontend's
                 // completion event is built from what leaves here. How a command ended is a fact
@@ -635,12 +671,29 @@ impl Agent {
                     metadata => metadata,
                 },
                 ..output
-            },
+            }),
             Err(MekaError::Interrupted) => {
                 crate::tools::ToolOutput::text("Tool execution interrupted.".to_string(), true)
             }
             Err(error) => crate::tools::ToolOutput::from_error(&error),
         }
+    }
+}
+
+/// A result with nothing in it, said as one: an empty result at the end of a request reads to
+/// the model as the end of its turn, and a wire may refuse the empty text block it would be.
+fn said_even_when_empty(name: &str, output: crate::tools::ToolOutput) -> crate::tools::ToolOutput {
+    let empty = output.content.iter().all(|item| {
+        matches!(item, crate::conversation::ToolResultContent::Text { text } if crate::text::is_blank(text))
+    });
+    if !empty {
+        return output;
+    }
+    crate::tools::ToolOutput {
+        content: vec![crate::conversation::ToolResultContent::Text {
+            text: format!("{name} returned no output."),
+        }],
+        ..output
     }
 }
 
@@ -672,25 +725,33 @@ async fn record_background_outcome(
     status: crate::store::background::TaskStatus,
     outcome: String,
     scratchpad_entry: Option<String>,
+    named_entry: Option<crate::store::background::SavedOutput>,
 ) {
     let background = store.background_store();
-    let Err(error) = background
-        .finish_background_task(
-            task_id,
-            status,
-            Some(outcome.clone()),
-            scratchpad_entry.clone(),
-        )
-        .await
-    else {
+    let finish = |outcome: String, named_entry: Option<crate::store::background::SavedOutput>| {
+        let background = background.clone();
+        let scratchpad_entry = scratchpad_entry.clone();
+        async move {
+            match named_entry {
+                Some(entry) => {
+                    background
+                        .finish_background_task_into_entry(task_id, status, outcome, entry)
+                        .await
+                }
+                None => {
+                    background
+                        .finish_background_task(task_id, status, Some(outcome), scratchpad_entry)
+                        .await
+                }
+            }
+        }
+    };
+    let Err(error) = finish(outcome.clone(), named_entry.clone()).await else {
         return;
     };
     tracing::warn!("background task {task_id} finished but failed to record it; retrying: {error}");
     tokio::time::sleep(OUTCOME_RETRY_DELAY).await;
-    let Err(error) = background
-        .finish_background_task(task_id, status, Some(outcome), scratchpad_entry)
-        .await
-    else {
+    let Err(error) = finish(outcome, named_entry).await else {
         return;
     };
     tracing::warn!(
@@ -717,6 +778,30 @@ async fn record_background_outcome(
 mod tests {
     use super::*;
     use crate::agent::tests::{SendFileFixture, agent_with_registry_for_test, send_file_registry};
+
+    /// A result with nothing in it, as an MCP server's empty `content` arrives, is said as one,
+    /// with the failure flag it came with; a result with words in it is left alone.
+    #[test]
+    fn an_empty_result_says_it_returned_nothing() {
+        let said = said_even_when_empty(
+            "mcp__drive__sync",
+            crate::tools::ToolOutput::text(String::new(), true),
+        );
+        assert!(said.is_error);
+        assert!(matches!(
+            said.content.as_slice(),
+            [crate::conversation::ToolResultContent::Text { text }]
+                if text == "mcp__drive__sync returned no output."
+        ));
+        let kept = said_even_when_empty(
+            "file_read",
+            crate::tools::ToolOutput::text("words".to_string(), false),
+        );
+        assert!(matches!(
+            kept.content.as_slice(),
+            [crate::conversation::ToolResultContent::Text { text }] if text == "words"
+        ));
+    }
 
     /// The prompt claims to show every argument the call was made with. `background` is taken out
     /// of the arguments before dispatch, so without this it would be the one argument a user could

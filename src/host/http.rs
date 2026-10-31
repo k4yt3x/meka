@@ -45,9 +45,6 @@ use crate::{
     store::Store,
 };
 
-/// Run meka as an HTTP server until the listener stops accepting (e.g. on SIGTERM after the
-/// graceful-shutdown drain completes). The signature mirrors [`crate::host::acp::run_acp`] for
-/// consistency with the existing dispatch in `main::async_main`.
 /// `[serve]` as `meka serve` runs it, or why it cannot start on it: the one check its startup asks
 /// and serving the file asks again, so a reload never accepts a file the next start refuses.
 pub(crate) fn resolve_serve(
@@ -63,6 +60,9 @@ pub(crate) fn resolve_serve(
     Ok(serve)
 }
 
+/// Run meka as an HTTP server until the listener stops accepting (e.g. on SIGTERM after the
+/// graceful-shutdown drain completes). The signature mirrors [`crate::host::acp::run_acp`] for
+/// consistency with the existing dispatch in `main::async_main`.
 pub(crate) async fn run_serve(
     mut config: ResolvedConfig,
     store: Store,
@@ -107,11 +107,24 @@ pub(crate) async fn run_serve(
         tracing::info!("{configured} webhook endpoint(s) configured: {endpoints}");
     }
 
-    let auth = AuthRegistry::new(serve.tokens.clone());
     let serve_arc = Arc::new(serve);
     let idempotency_cache = idempotency::IdempotencyCache::standard();
     let shutdown_drain_timeout = serve_arc.shutdown_drain_timeout;
     let state = ServerState::new(shared, serve_arc, idempotency_cache.clone());
+    let auth = state.auth.clone();
+    // Each serving of `config.toml` replaces the tokens with the file's, so a token removed or
+    // rescoped there stops being honored without a restart. The serving has held the section to
+    // what startup holds it to, so it resolves.
+    state.shared.serve_also({
+        let auth = auth.clone();
+        move |file: &crate::config::ConfigFile| match resolve_serve(file.serve.clone()) {
+            Ok(serve) => auth.replace(serve.tokens),
+            Err(error) => tracing::warn!(
+                "failed to apply `[serve]` tokens from config.toml; the last ones stay in force: \
+                 {error}"
+            ),
+        }
+    });
 
     let gc_handle = gc::spawn(state.clone());
     let expiry_sweeper = crate::host::spawn_expiry_sweeper(
@@ -591,8 +604,8 @@ async fn inject_problem_instance(
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     // Problem Details are sub-KB in practice; the cap is a safety net. On failure the status and
     // headers go out with an empty body, since the original stream is already consumed.
-    const PROBLEM_DETAIL_BUFFER_LIMIT: usize = 64 * crate::text::KIB;
-    let bytes = match axum::body::to_bytes(body, PROBLEM_DETAIL_BUFFER_LIMIT).await {
+    const PROBLEM_DETAIL_BUFFER_BYTES: usize = 64 * crate::text::KIB;
+    let bytes = match axum::body::to_bytes(body, PROBLEM_DETAIL_BUFFER_BYTES).await {
         Ok(bytes) => bytes,
         Err(error) => {
             tracing::warn!("failed to buffer a problem detail response body: {error}");

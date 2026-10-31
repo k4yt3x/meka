@@ -29,21 +29,18 @@ use crate::{
     tools::ToolRegistry,
 };
 
-/// Render a `--skill <name>` invocation into the user-message string that drives the first turn.
-/// Returns `Ok(None)` when `--skill` is not set so callers can leave the typed prompt untouched.
+/// Render a `--skill <name>` invocation into the block that opens the first turn, `--prompt` as its
+/// directive, through [`crate::skills::invocation`]. Returns `Ok(None)` when `--skill` is not set
+/// so callers can leave the typed prompt untouched.
 ///
-/// Mirrors the screen's `SlashCommand::SkillInvoke` handler in what it composes: the same
-/// `format!("{extra}\n\n{body}")` order when the positional `[PROMPT]` is supplied.
-///
-/// It does *not* mirror the lookup, and the difference is deliberate. This runs before the agent
-/// exists, so it walks the roots itself; the screen reads `agent.skills().current()`, which is the
-/// live cache. Both resolve the same name to the same file, but only the screen's sees a skill
-/// added mid-session.
-pub(crate) async fn build_skill_prompt(
+/// The lookup differs from the screen's on purpose. This runs before the agent exists, so it walks
+/// the roots itself; the screen reads `agent.skills().current()`, which is the live cache. Both
+/// resolve the same name to the same file, but only the screen's sees a skill added mid-session.
+pub(crate) async fn build_skill_invocation(
     skill: Option<&str>,
     prompt: Option<&str>,
     roots: &[std::path::PathBuf],
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<crate::conversation::ContentBlock>> {
     let Some(name) = skill else {
         return Ok(None);
     };
@@ -52,11 +49,11 @@ pub(crate) async fn build_skill_prompt(
     let body = crate::skills::load_skill_body(&skill)
         .await
         .map_err(|error| anyhow::anyhow!("failed to load skill '{name}': {error}"))?;
-    let combined = match prompt {
-        Some(extra) if !extra.is_empty() => format!("{extra}\n\n{body}"),
-        _ => body,
-    };
-    Ok(Some(combined))
+    Ok(Some(crate::skills::invocation(
+        name,
+        prompt.unwrap_or_default().to_string(),
+        body,
+    )))
 }
 /// Delete the sessions `[session].retention` has expired, sparing any another process holds.
 ///
@@ -138,11 +135,53 @@ impl RetentionWindows {
     }
 }
 
-/// Both retention sweeps, in the order that leaves the second the least to read: a session gone
-/// whole has no turns to date.
+/// What a crash left half copied, then both retention sweeps, in the order that leaves the second
+/// the least to read: a session gone whole has no turns to date.
 pub(crate) async fn sweep_expired(windows: RetentionWindows, store: &Store) -> anyhow::Result<()> {
+    sweep_unfinished_copies(store).await;
     sweep_expired_sessions(windows.sessions, store).await?;
-    sweep_expired_turns(windows.turns, store).await
+    sweep_expired_turns(windows.turns, store).await?;
+    sweep_expired_history(windows, store).await
+}
+
+/// Delete the sessions a fork or an import left half copied when its process died, sparing any
+/// another process is still writing. Reported at `warn`, as a retention deletion is: the copy
+/// someone asked for is gone, and asking again is the remedy. Housekeeping a busy store keeps
+/// from running is said and left for the next start, rather than refusing this one.
+async fn sweep_unfinished_copies(store: &Store) {
+    match store.delete_unfinished_copies().await {
+        Ok(sweep) if sweep.deleted > 0 => tracing::warn!(
+            "deleted {copies} a fork or an import left unfinished",
+            copies = crate::text::counted(sweep.deleted, "session copy", "session copies")
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!("failed to remove unfinished session copies: {error}"),
+    }
+}
+
+/// Delete the screen's input history older than the shorter of the two windows: what a person
+/// typed is in a turn and a session, and must not outlive either where the store keeps it apart.
+async fn sweep_expired_history(windows: RetentionWindows, store: &Store) -> anyhow::Result<()> {
+    let Some(window) = [windows.sessions, windows.turns]
+        .into_iter()
+        .flatten()
+        .min()
+    else {
+        return Ok(());
+    };
+    let cutoff = crate::text::horizon_before(chrono::Utc::now(), window);
+    let deleted = store.delete_prompt_history_before(cutoff).await?;
+    if deleted > 0 {
+        tracing::info!(
+            "deleted {entries} older than the retention window",
+            entries = crate::text::counted(
+                deleted as u64,
+                "input history entry",
+                "input history entries"
+            )
+        );
+    }
+    Ok(())
 }
 
 /// How often a host that stays up re-runs the retention sweeps. A window is written in days or
@@ -214,7 +253,7 @@ pub(crate) async fn wait_for_shutdown_signal() {
 }
 
 /// A slash command a host answers itself. The screen offers every one; an editor over ACP is told
-/// about the ones marked `for_editors`, as its `available_commands`.
+/// about the ones with an `editor_help`, as its `available_commands`.
 ///
 /// The execution-side grammar (aliases, argument splitting, `/mcp` and `/skill` subcommands) stays
 /// in `parse_slash_command`; this table only models the names that are completed and documented.
@@ -224,9 +263,10 @@ pub(crate) struct HostCommand {
     /// Argument syntax shown after the name in help, empty for no-argument commands. A non-empty
     /// hint is the "takes an argument" predicate that drives completion's trailing space.
     pub(crate) arg_hint: &'static str,
-    /// Whether an ACP client is offered it. Only what makes sense with no terminal: the three
-    /// that print a report.
-    pub(crate) for_editors: bool,
+    /// What an ACP client is offered it as, or `None` for a command no client is offered. Only
+    /// what makes sense with no terminal, the three that print a report, and said as an editor
+    /// runs it: there, each takes no argument.
+    pub(crate) editor_help: Option<&'static str>,
 }
 
 pub(crate) const COMMANDS: &[HostCommand] = &[
@@ -234,133 +274,133 @@ pub(crate) const COMMANDS: &[HostCommand] = &[
         name: "help",
         help: "Show this help message",
         arg_hint: "",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "exit",
         help: "Leave",
         arg_hint: "",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "session",
         help: "Show the current session id",
         arg_hint: "",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "title",
         help: "Show or set this session's title",
         arg_hint: "[text]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "permission",
         help: "Pick or set the permission level",
         arg_hint: "[level]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "approvals",
         help: "Pick or set whether calls above the level are submitted for approval",
         arg_hint: "[on|off]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "profile",
         help: "Pick or set the profile this session runs on",
         arg_hint: "[name]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "project",
         help: "Pick, open or close the project this session is on",
         arg_hint: "[open <name>|close]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "resume",
         help: "Pick a session to switch to, or switch to one by id or unique prefix",
         arg_hint: "[session]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "compact",
         help: "Summarize and compact the session, optionally saying what to keep",
         arg_hint: "[instructions]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "rewind",
         help: "Drop the last N turns from the conversation (default 1)",
         arg_hint: "[N]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "export",
         help: "Export the current session as Markdown",
         arg_hint: "",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "fork",
         help: "Fork this session and continue in the copy",
         arg_hint: "",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "cd",
         help: "Change working directory (bare: back to where meka started)",
         arg_hint: "[path]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "skill",
         help: "Pick a skill to run, or run one by name with extra context",
         arg_hint: "[name] [extra]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "memory",
         help: "List saved memories, or show one by name",
         arg_hint: "[name]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "schedule",
         help: "List this session's scheduled jobs, show one, or cancel one by id",
         arg_hint: "[show|cancel <id>]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "task",
         help: "List background tasks, show one, or cancel one by id or all",
         arg_hint: "[show|cancel <id>]",
-        for_editors: false,
+        editor_help: None,
     },
     HostCommand {
         name: "mcp",
         help: "Manage MCP servers and prompts",
         arg_hint: "<subcommand>",
-        for_editors: true,
+        editor_help: Some("List the MCP servers and their connection state"),
     },
     HostCommand {
         name: "status",
         help: "Show the profile, model, context use and cumulative session stats",
         arg_hint: "",
-        for_editors: true,
+        editor_help: Some("Show the profile, model, context use and cumulative session stats"),
     },
     HostCommand {
         name: "usage",
         help: "Show account rate-limit usage (subscription backends)",
         arg_hint: "",
-        for_editors: true,
+        editor_help: Some("Show account rate-limit usage (subscription backends)"),
     },
     HostCommand {
         name: "log",
         help: "Show the recent log lines, at every level",
         arg_hint: "",
-        for_editors: false,
+        editor_help: None,
     },
 ];
 
@@ -518,6 +558,48 @@ impl LiveOutput {
 mod tests {
     use super::*;
 
+    /// What a person typed is swept by the shorter of the two windows: an entry older than the
+    /// turn window goes, one younger stays, and with neither window set nothing is swept.
+    #[tokio::test]
+    async fn the_input_history_is_swept_by_the_shorter_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let store = Store::open(Some(&path), &Default::default())
+            .await
+            .expect("a migrated store");
+        let history = crate::store::history::HistoryStore::open(&path, 100).expect("history");
+        history.append("ten days ago").expect("append");
+        history.append("three days ago").expect("append");
+        let raw = rusqlite::Connection::open(&path).expect("open");
+        for (line, days) in [("ten days ago", 10), ("three days ago", 3)] {
+            raw.execute(
+                "UPDATE prompt_history SET created_at = ?1 WHERE command_line = ?2",
+                rusqlite::params![
+                    (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339(),
+                    line
+                ],
+            )
+            .expect("date the entry");
+        }
+        let day = std::time::Duration::from_secs(86_400);
+
+        sweep_expired(RetentionWindows::default(), &store)
+            .await
+            .expect("sweep");
+        assert_eq!(history.recent(0).expect("read").len(), 2);
+
+        sweep_expired(
+            RetentionWindows {
+                sessions: Some(30 * day),
+                turns: Some(7 * day),
+            },
+            &store,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(history.recent(0).expect("read"), ["three days ago"]);
+    }
+
     /// A host that stays up re-applies the windows on the hour; what aged since startup goes at
     /// the next tick. The one path the startup sweep does not cover, so the wiring is the test.
     #[tokio::test(start_paused = true)]
@@ -536,7 +618,12 @@ mod tests {
         let long_ago = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
         store
             .turn_store()
-            .open_turn(session, turn, "client", &long_ago)
+            .open_turn(
+                session,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                &long_ago,
+            )
             .await
             .expect("open");
         store

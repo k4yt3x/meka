@@ -300,4 +300,28 @@ mod tests {
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
+
+    /// A route any read scope opens lists each scope as a requirement of its own: one requirement
+    /// naming them all would say a caller needs every one of them.
+    #[test]
+    fn a_route_any_read_scope_opens_lists_each_as_an_alternative() {
+        let document = ApiDoc::openapi();
+        let info = document
+            .paths
+            .paths
+            .get("/v1/info")
+            .and_then(|item| item.get.as_ref())
+            .expect("GET /v1/info");
+        let security = serde_json::to_value(&info.security).expect("security serializes");
+        let requirements = security.as_array().expect("requirements");
+        assert_eq!(requirements.len(), 6, "{security}");
+        assert!(
+            requirements
+                .iter()
+                .all(|requirement| requirement["bearerAuth"]
+                    .as_array()
+                    .is_some_and(|scopes| scopes.len() == 1)),
+            "{security}"
+        );
+    }
 }

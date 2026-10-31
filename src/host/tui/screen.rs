@@ -997,7 +997,7 @@ impl Screen {
                         });
                     }
                     self.ask_host(HostEvent::UserInput {
-                        text,
+                        parts: vec![crate::conversation::ContentBlock::Text { text }],
                         images: Vec::new(),
                     });
                 }
@@ -1668,11 +1668,15 @@ impl Screen {
                 }
             }
             Escalation::CancelBackgroundTasks => {
-                let stopped = crate::host::terminal::cancel_background_tasks(
-                    &self.launch.agent.background_tasks(),
-                    &self.launch.agent.store(),
-                )
-                .await;
+                let stopped = self
+                    .launch
+                    .agent
+                    .background_tasks()
+                    .stop_all(
+                        &self.launch.agent.store().background_store(),
+                        crate::store::background::TaskStatus::Canceled,
+                    )
+                    .await;
                 if let Some(notice) = crate::host::terminal::background_cancellation_notice(stopped)
                 {
                     self.push(Item::note(notice));
@@ -1726,12 +1730,40 @@ impl Screen {
             self.reply("An image goes with the next prompt; wait for the turn to end.");
             return;
         }
+        // Asked ahead of taking anything, so a command that takes no image leaves the line and the
+        // image where they were.
+        let routed = if self.composer.has_attachments() && trimmed.starts_with('/') {
+            let images: Vec<crate::image::ImageSource> = self
+                .composer
+                .attachments()
+                .iter()
+                .map(|attachment| attachment.source.clone())
+                .collect();
+            match super::commands::with_images(&trimmed, images) {
+                super::commands::WithImages::TakesNone => {
+                    self.reply(
+                        "An image goes with a prompt, a skill or an MCP prompt; send this command \
+                         without it.",
+                    );
+                    return;
+                }
+                super::commands::WithImages::Invocation(command) => Some(command),
+                super::commands::WithImages::Words => None,
+            }
+        } else {
+            None
+        };
         let attachments = self.composer.take_attachments();
         if !trimmed.is_empty() {
             self.composer.remember(&trimmed);
         }
         self.composer.clear();
         self.back_to_bottom();
+        // Not echoed here, as no command line is: the appended message says it.
+        if let Some(command) = routed {
+            self.ask_host(HostEvent::Command(command));
+            return;
+        }
         if !attachments.is_empty() {
             if !trimmed.is_empty() {
                 self.push(Item::Prompt {
@@ -1745,7 +1777,11 @@ impl Screen {
                 self.push(Item::Image);
             }
             self.ask_host(HostEvent::UserInput {
-                text: trimmed,
+                parts: if trimmed.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![crate::conversation::ContentBlock::Text { text: trimmed }]
+                },
                 images: attachments
                     .into_iter()
                     .map(|attachment| attachment.source)
@@ -1779,16 +1815,17 @@ impl Screen {
             delivered: true,
         });
         self.ask_host(HostEvent::UserInput {
-            text: trimmed,
+            parts: vec![crate::conversation::ContentBlock::Text { text: trimmed }],
             images: Vec::new(),
         });
     }
 
     /// A slash command line, typed or picked. Not echoed as a prompt: a command is not something
-    /// said to the agent, and what it shows or does is its own record. The one door every
-    /// command line passes, so the rule for a busy host is asked here and nowhere else: a command
-    /// the host answers would wait on the turn, and a wait that ran a `/rewind` after the turn it
-    /// was typed during is a surprise, so it is refused instead.
+    /// said to the agent, and what it shows or does is its own record. The door every command line
+    /// passes but an invocation typed with an image, which `submit` routes after the same busy
+    /// check, so the rule for a busy host is asked here: a command the host answers would wait on
+    /// the turn, and a wait that ran a `/rewind` after the turn it was typed during is a surprise,
+    /// so it is refused instead.
     async fn run_command_line(&mut self, line: String) {
         match parse_slash_command(&line) {
             Some(command) => match command.answered_by() {
@@ -2205,8 +2242,12 @@ impl Screen {
                                 self.launch.agent.background_tasks().cancel(task_id).await;
                             }
                             self.push(Item::note(format!(
-                                "Canceling {} background task(s).",
-                                canceled.len()
+                                "Canceling {}",
+                                crate::text::counted(
+                                    canceled.len() as u64,
+                                    "background task",
+                                    "background tasks"
+                                )
                             )));
                         }
                         Err(error) => self.reply(error.to_string()),
@@ -2528,16 +2569,27 @@ impl Screen {
         // A terminal pastes a line break as the carriage return Enter sends, inside a bracketed
         // paste as much as outside one; the composer's lines end in `\n`.
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        // A form's field takes the paste as one line; a panel has nowhere to put one.
-        if let Some(Overlay::Elicitation(elicitation)) = self.overlay.as_mut() {
-            elicitation
-                .answer
-                .push_str(&crate::text::sanitize_to_line(&text, usize::MAX));
-            self.dirty = true;
-            return;
-        }
-        if self.overlay.is_some() {
-            return;
+        // A form's field takes the paste as one line, and so does a picker's filter while one is
+        // being typed, as a session id pasted into `/resume`'s; a panel otherwise has nowhere to
+        // put one.
+        match self.overlay.as_mut() {
+            Some(Overlay::Elicitation(elicitation)) => {
+                elicitation
+                    .answer
+                    .push_str(&crate::text::sanitize_to_line(&text, usize::MAX));
+                self.dirty = true;
+                return;
+            }
+            Some(Overlay::Panel { panel, .. }) => {
+                if panel.is_typing() {
+                    for character in crate::text::sanitize_to_line(&text, usize::MAX).chars() {
+                        panel.filter_type(character);
+                    }
+                    self.dirty = true;
+                }
+                return;
+            }
+            None => {}
         }
         self.dirty = true;
         if let Some(path) = pasted_image_path(&text) {
@@ -3191,9 +3243,9 @@ async fn drained_within(drain: &mut tokio::task::JoinHandle<(Vec<u8>, u64)>) -> 
         Err(_) => {
             drain.abort();
             tracing::debug!(
-                "gave up on the rest of the command's output after {}s; something it started \
-                 still holds the pipe",
-                SHELL_DRAIN_GRACE.as_secs()
+                "gave up on the rest of the command's output after {seconds}s; something it \
+                 started still holds the pipe",
+                seconds = SHELL_DRAIN_GRACE.as_secs()
             );
             (Vec::new(), 0)
         }

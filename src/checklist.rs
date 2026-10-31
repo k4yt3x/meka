@@ -242,7 +242,7 @@ impl PlannedEdit {
 #[serde(deny_unknown_fields)]
 struct ItemObject {
     text: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_blank_status")]
     status: Option<StatusWord>,
 }
 
@@ -251,6 +251,7 @@ struct ItemObject {
 struct AddInput {
     /// Each a bare string or an [`ItemObject`], told apart below rather than by an untagged
     /// enum, whose refusal names neither the key nor the value that was wrong.
+    #[serde(deserialize_with = "deserialize_items")]
     items: Vec<serde_json::Value>,
     #[serde(default, rename = "scratchpad")]
     _scratchpad: Option<String>,
@@ -259,8 +260,9 @@ struct AddInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditInput {
+    #[serde(deserialize_with = "deserialize_item_id")]
     id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_blank_status")]
     status: Option<StatusWord>,
     #[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]
     reason: Option<String>,
@@ -270,6 +272,55 @@ struct EditInput {
     text: Option<String>,
     #[serde(default, rename = "scratchpad")]
     _scratchpad: Option<String>,
+}
+
+/// An item's `id` by the number rule every tool argument follows, refused naming the field: serde
+/// names no field in an error it is handed back.
+fn deserialize_item_id<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    crate::text::whole_number(&value)
+        .and_then(|number| u64::try_from(number).ok())
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "'id' must be a non-negative whole number, got {value}"
+            ))
+        })
+}
+
+/// `items` by the list rule every tool argument follows (`tools/util.rs`): one bare string is a
+/// list of one, and a blank entry is no entry. Objects pass through to be read below.
+fn deserialize_items<'de, D>(deserializer: D) -> Result<Vec<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let blank = |item: &serde_json::Value| item.as_str().is_some_and(crate::text::is_blank);
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Array(items) => {
+            Ok(items.into_iter().filter(|item| !blank(item)).collect())
+        }
+        item @ serde_json::Value::String(_) => {
+            Ok(if blank(&item) { Vec::new() } else { vec![item] })
+        }
+        _ => Err(serde::de::Error::custom(
+            "`items` must be a list of texts or objects {text, status}",
+        )),
+    }
+}
+
+/// A `status` by the string rule: blank is not given, as `null` is.
+fn deserialize_blank_status<'de, D>(deserializer: D) -> Result<Option<StatusWord>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    crate::text::deserialize_blank_as_none(deserializer)?
+        .map(|word| {
+            StatusWord::deserialize(serde_json::Value::String(word.trim().to_string()))
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
 }
 
 /// The items a `checklist_add` call names, or why it names none. One parser for the tool and
@@ -813,6 +864,15 @@ mod tests {
         let edit = parse_edit(&serde_json::json!({"id": 3, "status": "done"})).expect("parses");
         assert_eq!(edit.status, Some(StatusWord::Completed));
         assert_eq!(
+            parse_edit(&serde_json::json!({"id": 3.0, "status": "done"}))
+                .expect("3.0 is the integer 3")
+                .id,
+            3
+        );
+        let refused =
+            parse_edit(&serde_json::json!({"id": "3", "status": "done"})).expect_err("a quoted id");
+        assert!(refused.contains("'id'"), "{refused}");
+        assert_eq!(
             serde_json::to_value(StatusWord::Canceled).expect("serializes"),
             serde_json::json!("canceled"),
             "meka writes one spelling"
@@ -846,6 +906,22 @@ mod tests {
             .expect("parses");
         let refused = state.edit(edit).expect_err("no reason");
         assert!(refused.contains("reason"), "{refused}");
+    }
+
+    /// The add and the edit read their arguments as every tool does: one bare string is a list of
+    /// one, a blank entry is no entry, and a blank status is no status.
+    #[test]
+    fn a_bare_item_is_a_list_and_a_blank_is_not_given() {
+        let one = parse_add(&serde_json::json!({"items": "write the tests"})).expect("one item");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].text, "write the tests");
+        let kept = parse_add(&serde_json::json!({"items": ["a", "", {"text": "b", "status": ""}]}))
+            .expect("the blank entry is dropped");
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].status, ChecklistStatus::Pending);
+        let edit = parse_edit(&serde_json::json!({"id": 3, "status": "", "text": "renamed"}))
+            .expect("a blank status is no status");
+        assert_eq!(edit.status, None);
     }
 
     #[test]

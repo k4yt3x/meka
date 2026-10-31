@@ -162,6 +162,74 @@ pub(super) fn require_str_allowing_empty(
         })
 }
 
+/// An optional boolean parameter: `None` when absent or `null`, refused naming the field when it
+/// holds anything but `true` or `false`. `"true"` read as false would have the call do the
+/// opposite of what it asked, as `force` asked of a write that is then refused for want of it.
+pub(super) fn optional_bool(
+    input: &serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<Option<bool>> {
+    match input.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+        Some(value) => Err(MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("'{field}' must be true or false, got {value}"),
+        }),
+    }
+}
+
+/// An optional whole-number parameter: `None` when absent or `null`, refused naming the field when
+/// it holds anything but a non-negative integer as [`crate::text::whole_number`] reads one, `2.0`
+/// included. Read as absent, `"3"` or `-1` would hand the call its default in place of the bound
+/// it asked for: ten results to a call that asked for three, or a worker the nesting budget its
+/// caller had just tried to deny it.
+pub(super) fn optional_u64(
+    input: &serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<Option<u64>> {
+    match input.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => crate::text::whole_number(value)
+            .and_then(|number| u64::try_from(number).ok())
+            .map(Some)
+            .ok_or_else(|| MekaError::ToolExecution {
+                tool_name: tool_name.to_string(),
+                message: format!("'{field}' must be a non-negative whole number, got {value}"),
+            }),
+    }
+}
+
+/// [`optional_u64`] for a field that may be negative.
+pub(super) fn optional_i64(
+    input: &serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<Option<i64>> {
+    match input.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => crate::text::whole_number(value)
+            .and_then(|number| i64::try_from(number).ok())
+            .map(Some)
+            .ok_or_else(|| MekaError::ToolExecution {
+                tool_name: tool_name.to_string(),
+                message: format!("'{field}' must be a whole number, got {value}"),
+            }),
+    }
+}
+
+/// [`optional_u64`] for a count, an offset or a size, saturating where `usize` is narrower.
+pub(super) fn optional_count(
+    input: &serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<Option<usize>> {
+    Ok(optional_u64(input, field, tool_name)?
+        .map(|value| usize::try_from(value).unwrap_or(usize::MAX)))
+}
+
 /// A field declared as a list of strings, read as the list, as one bare string (a mistake models
 /// make constantly, and the recovery is free), or as nothing: absent, `null` and a blank string
 /// are `None`. A blank entry is no entry, as a blank string is no value. An entry that is not a
@@ -239,12 +307,12 @@ pub(super) fn replace_anchored(
 /// engines already avoid catastrophic backtracking at *match* time; the remaining DoS surface is
 /// the one-time cost of building the automaton, which this bounds.
 pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex::Regex> {
-    const PATTERN_SIZE_LIMIT: usize = crate::text::MIB;
-    const DFA_SIZE_LIMIT: usize = crate::text::MIB;
+    const MAX_PATTERN_BYTES: usize = crate::text::MIB;
+    const MAX_DFA_BYTES: usize = crate::text::MIB;
 
     regex::RegexBuilder::new(pattern)
-        .size_limit(PATTERN_SIZE_LIMIT)
-        .dfa_size_limit(DFA_SIZE_LIMIT)
+        .size_limit(MAX_PATTERN_BYTES)
+        .dfa_size_limit(MAX_DFA_BYTES)
         .build()
         .map_err(|error| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
@@ -397,16 +465,15 @@ pub(super) fn line_range(input: &serde_json::Value, tool_name: &str) -> Result<O
 fn line_number(input: &serde_json::Value, key: &str, tool_name: &str) -> Result<Option<usize>> {
     match input.get(key) {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(value) => match value
-            .as_u64()
-            .and_then(|number| usize::try_from(number).ok())
-        {
-            Some(number) if number >= 1 => Ok(Some(number)),
-            _ => Err(MekaError::ToolExecution {
-                tool_name: tool_name.to_string(),
-                message: format!("'{key}' must be a line number counted from 1, got {value}"),
-            }),
-        },
+        Some(value) => {
+            match crate::text::whole_number(value).and_then(|number| usize::try_from(number).ok()) {
+                Some(number) if number >= 1 => Ok(Some(number)),
+                _ => Err(MekaError::ToolExecution {
+                    tool_name: tool_name.to_string(),
+                    message: format!("'{key}' must be a line number counted from 1, got {value}"),
+                }),
+            }
+        }
     }
 }
 
@@ -580,6 +647,96 @@ mod tests {
     fn walk_budget_reports_its_own_budget() {
         let budget = WalkBudget::with_budget(CancellationToken::new(), Duration::from_secs(5));
         assert_eq!(budget.budget_secs(), 5);
+    }
+
+    /// A boolean parameter is `true`, `false` or not given; a string spelling one is refused by
+    /// name rather than read as false.
+    #[test]
+    fn a_boolean_parameter_is_a_boolean_or_nothing() {
+        let input = serde_json::json!({"yes": true, "no": false, "spelled": "true", "gone": null});
+        assert_eq!(
+            optional_bool(&input, "yes", "a_tool").expect("a bool"),
+            Some(true)
+        );
+        assert_eq!(
+            optional_bool(&input, "no", "a_tool").expect("a bool"),
+            Some(false)
+        );
+        assert_eq!(
+            optional_bool(&input, "gone", "a_tool").expect("not given"),
+            None
+        );
+        assert_eq!(
+            optional_bool(&input, "missing", "a_tool").expect("not given"),
+            None
+        );
+        let refused = optional_bool(&input, "spelled", "a_tool").expect_err("a string");
+        assert!(
+            refused
+                .to_string()
+                .contains("'spelled' must be true or false"),
+            "{refused}"
+        );
+    }
+
+    /// A number parameter is an integer of its type or not given, `2.0` being the integer JSON
+    /// Schema says it is: a quoted number, a fraction, or a negative where only a count makes sense
+    /// is refused naming the field rather than read as absent, since absent is the default the call
+    /// did not ask for.
+    #[test]
+    fn a_number_parameter_is_an_integer_or_nothing() {
+        let input = serde_json::json!({
+            "zero": 0,
+            "negative": -1,
+            "quoted": "0",
+            "fraction": 2.5,
+            "integral": 2.0,
+            "gone": null,
+        });
+        assert_eq!(
+            optional_u64(&input, "zero", "a_tool").expect("a count"),
+            Some(0)
+        );
+        assert_eq!(
+            optional_u64(&input, "integral", "a_tool").expect("2.0 is the integer 2"),
+            Some(2)
+        );
+        assert_eq!(
+            optional_i64(&input, "integral", "a_tool").expect("2.0 is the integer 2"),
+            Some(2)
+        );
+        assert_eq!(
+            optional_count(&input, "zero", "a_tool").expect("a count"),
+            Some(0)
+        );
+        assert_eq!(
+            optional_i64(&input, "negative", "a_tool").expect("signed"),
+            Some(-1)
+        );
+        for key in ["gone", "missing"] {
+            assert_eq!(
+                optional_u64(&input, key, "a_tool").expect("not given"),
+                None
+            );
+            assert_eq!(
+                optional_i64(&input, key, "a_tool").expect("not given"),
+                None
+            );
+        }
+        for key in ["negative", "quoted", "fraction"] {
+            let refused = optional_u64(&input, key, "a_tool").expect_err("not a count");
+            assert!(
+                refused.to_string().contains(&format!("'{key}'")),
+                "{refused}"
+            );
+        }
+        for key in ["quoted", "fraction"] {
+            let refused = optional_i64(&input, key, "a_tool").expect_err("not an integer");
+            assert!(
+                refused.to_string().contains(&format!("'{key}'")),
+                "{refused}"
+            );
+        }
     }
 
     /// Every string parameter is read by one rule: absent, `null` and blank are "not given",

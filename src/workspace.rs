@@ -907,13 +907,40 @@ impl ReadScope {
     }
 }
 
+/// The directories strictly between a writable root and a private directory it contains,
+/// shallowest first. The sandboxes that hide a private directory by its path hold each of these in
+/// place, since a command that could rename one would move the private directory out from under
+/// the path every later command's mask names. A private directory outside every writable root
+/// needs none: nothing on its path is writable.
+pub(crate) fn pinned_ancestors(writable: &[PathBuf], private: &[PathBuf]) -> Vec<PathBuf> {
+    let mut pinned: Vec<PathBuf> = Vec::new();
+    for directory in private {
+        for root in writable {
+            if directory == root || !directory.starts_with(root) {
+                continue;
+            }
+            for ancestor in directory.ancestors().skip(1) {
+                if ancestor == root.as_path() || !ancestor.starts_with(root) {
+                    break;
+                }
+                if !pinned.iter().any(|known| known == ancestor) {
+                    pinned.push(ancestor.to_path_buf());
+                }
+            }
+        }
+    }
+    pinned.sort_by_key(|path| path.components().count());
+    pinned
+}
+
 /// [`is_system_root`] with meka's private directories taken as a parameter, so it can be tested
 /// without the environment deciding where those are.
 ///
 /// A private directory refuses a root **at or under** it, not an ancestor of it. The system masks
 /// refuse ancestors because a bind over one un-masks it; the private masks are applied after every
-/// bind, so a workspace root at `$HOME` still cannot reach `~/.config/meka` and need not be refused
-/// for containing it.
+/// bind, and every directory between the root and a private directory is held in place
+/// ([`pinned_ancestors`]), so a workspace root at `$HOME` still cannot reach `~/.config/meka` and
+/// need not be refused for containing it.
 fn is_masked_root(path: &Path, private: &[PathBuf]) -> bool {
     if private.iter().any(|directory| path.starts_with(directory)) {
         return true;

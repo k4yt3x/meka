@@ -338,17 +338,17 @@ impl Agent {
         }
     }
 
-    /// What this agent runs on, for a host that has to report it.
-    ///
-    /// The session's own profile, which is not the process default once a resume or a switch has
-    /// happened, or the fallback serving this turn in its place; the only thing a status display
-    /// may read if it is to agree with the turn.
     /// How many pieces the standing instructions this session runs under were read as, the
     /// files `[instructions].files` names included; zero for none.
     pub(crate) fn user_instructions_count(&self) -> usize {
         self.options.user_instructions_count
     }
 
+    /// What this agent runs on, for a host that has to report it.
+    ///
+    /// The session's own profile, which is not the process default once a resume or a switch has
+    /// happened, or the fallback serving this turn in its place; the only thing a status display
+    /// may read if it is to agree with the turn.
     pub(crate) fn profile(&self) -> String {
         self.cells.profile.current().profile
     }
@@ -393,7 +393,7 @@ impl Agent {
     /// `frontend` decides where the sub-agent's output and permission requests go. The standard
     /// caller (the `agent_spawn` tool) uses [`crate::frontend::PermissionForwardingFrontend`]
     /// wrapping the parent's frontend. That wrapper drops emits (the sub-agent's report flows back
-    /// via the tool result) but forwards permission prompts so the user is asked in their original
+    /// via the tool result) but forwards approval prompts so the user is asked in their original
     /// UI. Tests can pass [`crate::frontend::SilentFrontend`] for fully-isolated sub-agent
     /// runs.
     ///

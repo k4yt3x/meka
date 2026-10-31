@@ -231,30 +231,46 @@ pub(crate) fn row_is_at_least_as_new(memory: &AuthCredential, row: &AuthCredenti
 /// as a dead login while the holder has just stored a live one.
 pub(crate) const CREDENTIAL_LOCK_WAIT: Duration =
     Duration::from_secs(REFRESH_TIMEOUT.as_secs() + 5);
-/// Wait, briefly, for exclusive use of a profile's credential across processes.
+/// Wait, briefly, for exclusive use of an account's credential across processes.
 ///
 /// `None` means the wait ran out or the lock could not be asked for at all. The caller proceeds
 /// either way: this reduces contention, it does not establish correctness.
 pub(crate) async fn await_credential_lock(
     store: &TokenStore,
-    profile: &str,
+    account: &str,
+) -> Option<crate::fs::FileLock> {
+    await_lock(account, || store.try_lock_account_credential(account)).await
+}
+
+/// [`await_credential_lock`] for an MCP server's OAuth bundle.
+pub(crate) async fn await_mcp_credential_lock(
+    store: &TokenStore,
+    server: &str,
+) -> Option<crate::fs::FileLock> {
+    await_lock(server, || store.try_lock_mcp_credential(server)).await
+}
+
+/// The wait under both: `try_lock` until it hands a lock over or [`CREDENTIAL_LOCK_WAIT`] passes.
+async fn await_lock(
+    name: &str,
+    try_lock: impl Fn() -> Result<Option<crate::fs::FileLock>>,
 ) -> Option<crate::fs::FileLock> {
     let deadline = tokio::time::Instant::now() + CREDENTIAL_LOCK_WAIT;
     loop {
-        match store.try_lock_account_credential(profile) {
+        match try_lock() {
             Ok(Some(lock)) => return Some(lock),
             Ok(None) => {}
             // Not "someone has it" but "we could not ask": an unwritable lock directory, or
             // descriptors exhausted. Retrying would not help and refusing to refresh would be
             // worse than refreshing unserialized, so stop waiting and let the swap arbitrate.
             Err(error) => {
-                tracing::debug!("failed to take the credential lock for '{profile}': {error}");
+                tracing::debug!("failed to take the credential lock for '{name}': {error}");
                 return None;
             }
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::debug!(
-                "another process has been refreshing '{profile}' for {CREDENTIAL_LOCK_WAIT:?}; going ahead"
+                "another process has been refreshing '{name}' for {CREDENTIAL_LOCK_WAIT:?}; going ahead"
             );
             return None;
         }
@@ -480,6 +496,83 @@ pub(crate) fn generate_state() -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// How long one connection to a login's loopback listener has to send its request's head.
+///
+/// Bounded apart from the login's own deadline because a listener reads one connection at a time:
+/// a connection that never sends, a browser's speculative one or any local client's, would
+/// otherwise hold the real callback behind it until the login timed out.
+const CALLBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most of one request on a login's callback port that is read before it is refused: room for
+/// a browser's cookies, which can pass 4 KiB, and a bound on a client that never stops sending.
+const MAX_CALLBACK_REQUEST_BYTES: usize = 64 * crate::text::KIB;
+
+/// What one connection to a login's loopback listener sent.
+pub(crate) enum CallbackRequest {
+    /// The request's head, through the blank line that ends it.
+    Head(Vec<u8>),
+    /// More than [`MAX_CALLBACK_REQUEST_BYTES`] without the head ending.
+    Oversized,
+    /// The connection closed, failed or went quiet first, so there is nothing to answer and the
+    /// wait goes on.
+    Abandoned,
+}
+
+/// Read the head of the request on `stream`; `None` once the login's deadline passes, which ends
+/// the login rather than this connection.
+pub(crate) async fn read_callback_request(
+    stream: &mut tokio::net::TcpStream,
+    login_deadline: tokio::time::Instant,
+) -> Option<CallbackRequest> {
+    use tokio::io::AsyncReadExt;
+    const HEAD_END: &[u8] = b"\r\n\r\n";
+    let connection_deadline =
+        login_deadline.min(tokio::time::Instant::now() + CALLBACK_REQUEST_TIMEOUT);
+    let mut buffer = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    loop {
+        if buffer
+            .windows(HEAD_END.len())
+            .any(|window| window == HEAD_END)
+        {
+            return Some(CallbackRequest::Head(buffer));
+        }
+        if buffer.len() >= MAX_CALLBACK_REQUEST_BYTES {
+            return Some(CallbackRequest::Oversized);
+        }
+        match tokio::time::timeout_at(connection_deadline, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => {
+                let complete = buffer
+                    .windows(HEAD_END.len())
+                    .any(|window| window == HEAD_END);
+                return Some(if complete {
+                    CallbackRequest::Head(buffer)
+                } else {
+                    CallbackRequest::Abandoned
+                });
+            }
+            Ok(Ok(read)) => buffer.extend(chunk.iter().take(read)),
+            Ok(Err(error)) => {
+                tracing::debug!("failed to read a request on the login's callback port: {error}");
+                return Some(CallbackRequest::Abandoned);
+            }
+            Err(_) if tokio::time::Instant::now() >= login_deadline => return None,
+            Err(_) => return Some(CallbackRequest::Abandoned),
+        }
+    }
+}
+
+/// The `state` a request on a login's callback port carries in its query, if any. Asked before a
+/// request that reports an error or lacks a code is allowed to end the login: one that does not
+/// carry this login's state is not its answer, whoever sent it.
+pub(crate) fn callback_state(request_head: &str) -> Option<String> {
+    let target = request_head.lines().next()?.split_whitespace().nth(1)?;
+    let (_, query) = target.split_once('?')?;
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+}
+
 /// What a subscription request authenticates with: the access token and, where the issuer names
 /// one, the account it belongs to.
 pub(crate) struct OAuthAccess {
@@ -577,8 +670,8 @@ impl SubscriptionCredential {
             Ok(None) => return None,
             Err(error) => {
                 tracing::warn!(
-                    "failed to re-read the {} credential after a refused refresh: {error}",
-                    self.backend
+                    "failed to re-read the {backend} credential after a refused refresh: {error}",
+                    backend = self.backend
                 );
                 return None;
             }
@@ -601,8 +694,8 @@ impl SubscriptionCredential {
             return None;
         }
         tracing::info!(
-            "adopting the {} credential another process refreshed",
-            self.backend
+            "adopting the {backend} credential another process refreshed",
+            backend = self.backend
         );
         let access = OAuthAccess {
             access_token: access_token.clone(),
@@ -702,8 +795,8 @@ impl SubscriptionCredential {
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(
-                        "failed to re-read the {} credential before refresh: {error}",
-                        self.backend
+                        "failed to re-read the {backend} credential before refresh: {error}",
+                        backend = self.backend
                     );
                 }
             }

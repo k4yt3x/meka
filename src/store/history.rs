@@ -35,6 +35,29 @@ pub(crate) enum HistoryOrder {
     NewestFirst,
 }
 
+impl super::Store {
+    /// Delete the screen's input history written before `cutoff`, for the retention sweeps:
+    /// nothing a person typed outlives the window the conversation it went into is kept for.
+    /// Answers how many entries went.
+    pub(crate) async fn delete_prompt_history_before(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        let cutoff = cutoff.to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "DELETE FROM prompt_history WHERE julianday(created_at) < julianday(?1)",
+                    params![cutoff],
+                )
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to delete expired input history: {error}"))
+            })
+    }
+}
+
 /// The `prompt_history` table, on its own synchronous connection.
 pub(crate) struct HistoryStore {
     connection: Connection,
@@ -55,7 +78,6 @@ impl HistoryStore {
         })
     }
 
-    /// The most entries the table retains; `0` disables storage.
     /// Most-recent entries, returned oldest-first for display. `limit == 0` returns all of them.
     pub(crate) fn recent(&self, limit: usize) -> Result<Vec<String>> {
         // SQLite treats a negative LIMIT as unbounded, so `0` maps to `-1` and needs no second

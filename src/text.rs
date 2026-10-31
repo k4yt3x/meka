@@ -24,6 +24,20 @@ where
     Ok(value.filter(|text| !is_blank(text)))
 }
 
+/// A JSON number as the integer it spells: an integer, or a number with no fractional part, which
+/// JSON Schema's `integer` matches too, so `2.0` is the 2 a schema declaring an integer accepts.
+/// `None` for a fraction, a string, or a float past what `i64` holds.
+pub(crate) fn whole_number(value: &serde_json::Value) -> Option<i128> {
+    if let Some(number) = value.as_i64() {
+        return Some(i128::from(number));
+    }
+    if let Some(number) = value.as_u64() {
+        return Some(i128::from(number));
+    }
+    let number = value.as_f64()?;
+    (number.fract() == 0.0 && number.abs() < 9_223_372_036_854_775_808.0).then_some(number as i128)
+}
+
 /// Whether `character` belongs to a script written without spaces between words, which a word
 /// tokenizer therefore cannot segment: SQLite's `unicode61` makes a run of it between two
 /// punctuation marks one token, and a word inside the run is unfindable by a word match. Han,
@@ -507,7 +521,7 @@ pub(crate) fn sanitize_for_display(text: &str) -> String {
 /// of it: an assistant that has read attacker text could make a path or a command read as something
 /// else entirely. `char` boundaries are safe per delta because these are single scalars.
 ///
-/// Only the bidi set, unlike [`sanitize_to_line`] and `mcp::sanitize::sanitize_text`, which drop
+/// Only the bidi set, unlike [`sanitize_to_line`] and [`sanitize_text`], which drop
 /// the whole `Cf` category. Those two render *server*-controlled strings into one row of meka's own
 /// chrome, where nothing in `Cf` has a legitimate use. This is prose the model wrote for the user,
 /// and most of `Cf` is ordinary content there: ZWJ builds emoji families and profession sequences,
@@ -1047,6 +1061,18 @@ pub(crate) fn unknown_name(
             known.join(", ")
         )
     }
+}
+
+/// `count` of a noun, in its singular or its plural as the count asks.
+pub(crate) fn counted(count: u64, singular: &str, plural: &str) -> String {
+    let noun = if count == 1 { singular } else { plural };
+    format!("{count} {noun}")
+}
+
+/// The sentence for a name an open store does not hold, a memory or a skill, where listing what it
+/// does hold would be a listing rather than an answer: [`unknown_name`]'s head without its list.
+pub(crate) fn no_entry_named(noun: &str, given: &str) -> String {
+    format!("no {noun} named '{given}'")
 }
 
 /// The one sentence for a memory name that lives in more than one project when the caller named

@@ -194,16 +194,8 @@ impl Tool for MemoryWriteTool {
         // `None` means "leave it alone", which the upsert resolves in SQL: reading the absence as
         // the default would demote an inline standing directive every time the agent reworded
         // it.
-        let priority = match input.get("priority") {
-            Some(serde_json::Value::Null) | None => None,
-            Some(value) => {
-                let raw = value.as_i64().ok_or_else(|| MekaError::ToolExecution {
-                    tool_name: "memory_write".to_string(),
-                    message: format!("'priority' must be a whole number, got {value}"),
-                })?;
-                Some(memory::parse_priority(Some(raw), name))
-            }
-        };
+        let priority = super::util::optional_i64(&input, "priority", "memory_write")?
+            .map(|raw| memory::parse_priority(Some(raw), name));
         let load = match optional_str(&input, "load", "memory_write")? {
             None => None,
             Some(raw) => Some(
@@ -228,16 +220,8 @@ impl Tool for MemoryWriteTool {
                     .map_err(|message| tool_error("memory_write", message))?,
             ),
         };
-        let verified = match input.get("verified") {
-            None | Some(serde_json::Value::Null) => false,
-            Some(serde_json::Value::Bool(verified)) => *verified,
-            Some(value) => {
-                return Err(tool_error(
-                    "memory_write",
-                    format!("'verified' must be true or false, got {value}"),
-                ));
-            }
-        };
+        let verified =
+            super::util::optional_bool(&input, "verified", "memory_write")?.unwrap_or(false);
         // Three answers, like the store's field: absent keeps, `""` clears, anything else is a
         // moment the parser has to accept.
         let expires_at = match optional_str_allowing_empty(&input, "expires", "memory_write")? {
@@ -515,26 +499,10 @@ impl Tool for MemoryEditTool {
         let old_string = require_str(&input, "old_string", "memory_edit")?;
         let new_string =
             super::util::require_str_allowing_empty(&input, "new_string", "memory_edit")?;
-        let replace_all = match input.get("replace_all") {
-            None | Some(serde_json::Value::Null) => false,
-            Some(serde_json::Value::Bool(replace_all)) => *replace_all,
-            Some(value) => {
-                return Err(tool_error(
-                    "memory_edit",
-                    format!("'replace_all' must be true or false, got {value}"),
-                ));
-            }
-        };
-        let verified = match input.get("verified") {
-            None | Some(serde_json::Value::Null) => false,
-            Some(serde_json::Value::Bool(verified)) => *verified,
-            Some(value) => {
-                return Err(tool_error(
-                    "memory_edit",
-                    format!("'verified' must be true or false, got {value}"),
-                ));
-            }
-        };
+        let replace_all =
+            super::util::optional_bool(&input, "replace_all", "memory_edit")?.unwrap_or(false);
+        let verified =
+            super::util::optional_bool(&input, "verified", "memory_edit")?.unwrap_or(false);
         memory::validate_memory_lookup(name)
             .map_err(|message| tool_error("memory_edit", message))?;
 
@@ -552,8 +520,8 @@ impl Tool for MemoryEditTool {
             return Err(tool_error(
                 "memory_edit",
                 format!(
-                    "no memory named '{}'.{}",
-                    name,
+                    "{}.{}",
+                    crate::text::no_entry_named("memory", name),
                     crate::tools::did_you_mean_hint(
                         name,
                         index.iter().map(|entry| entry.name.as_str())
@@ -696,18 +664,7 @@ impl Tool for MemoryReadTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "memory_read")?;
-        let offset = match input.get("offset") {
-            None | Some(serde_json::Value::Null) => 0,
-            Some(value) => value
-                .as_u64()
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| {
-                    tool_error(
-                        "memory_read",
-                        format!("'offset' must be a whole number, got {value}"),
-                    )
-                })?,
-        };
+        let offset = super::util::optional_count(&input, "offset", "memory_read")?.unwrap_or(0);
         let name = name.as_str();
         // Validated here as at every other door: an invalid name would otherwise be reported as
         // merely absent.
@@ -734,8 +691,8 @@ impl Tool for MemoryReadTool {
                 return Err(tool_error(
                     "memory_read",
                     format!(
-                        "no memory named '{}'.{}",
-                        name,
+                        "{}.{}",
+                        crate::text::no_entry_named("memory", name),
                         crate::tools::did_you_mean_hint(
                             name,
                             index.iter().map(|entry| entry.name.as_str())
@@ -1100,16 +1057,8 @@ impl Tool for MemorySearchTool {
                     })?)
                 }
             },
-            expired: match input.get("expired") {
-                None | Some(serde_json::Value::Null) => false,
-                Some(serde_json::Value::Bool(expired)) => *expired,
-                Some(value) => {
-                    return Err(tool_error(
-                        "memory_search",
-                        format!("'expired' must be true or false, got {value}"),
-                    ));
-                }
-            },
+            expired: super::util::optional_bool(&input, "expired", "memory_search")?
+                .unwrap_or(false),
         };
         let queries = queries.unwrap_or_default();
         if queries.is_empty() && filter.is_empty() && tier.is_none() {
@@ -1121,23 +1070,9 @@ impl Tool for MemorySearchTool {
             });
         }
         let described = describe_selection(&filter, tier);
-        // Coerced rather than ignored: `as_u64` alone answers `None` for `"3"`, `3.0` and `-1`
-        // alike, and a silent default would give ten results to a call that asked for three. The
-        // same handler accepts a bare string where `queries` declares an array.
-        let limit = match input.get("limit") {
-            None | Some(serde_json::Value::Null) => DEFAULT_SEARCH_LIMIT,
-            Some(value) => {
-                let number = value
-                    .as_i64()
-                    .or_else(|| value.as_f64().map(|value| value as i64))
-                    .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
-                    .ok_or_else(|| MekaError::ToolExecution {
-                        tool_name: "memory_search".to_string(),
-                        message: format!("'limit' must be a whole number, got {value}"),
-                    })?;
-                number.clamp(1, MAX_SEARCH_LIMIT as i64) as usize
-            }
-        };
+        let limit = super::util::optional_count(&input, "limit", "memory_search")?
+            .unwrap_or(DEFAULT_SEARCH_LIMIT)
+            .clamp(1, MAX_SEARCH_LIMIT);
 
         let store = self.memories.as_ref();
         let now = std::time::SystemTime::now();
@@ -1609,7 +1544,7 @@ impl Tool for MemoryDeleteTool {
         else {
             return Err(tool_error(
                 "memory_delete",
-                format!("no memory named '{name}'"),
+                crate::text::no_entry_named("memory", name),
             ));
         };
 
@@ -3278,10 +3213,10 @@ mod tests {
         );
     }
 
-    /// A `limit` the model spelled as a string or a float is honored, and one that is neither a
-    /// number nor a numeric string is refused rather than silently replaced by the default.
+    /// A `limit` is a count or nothing, `2.0` among them: a string, a fraction or a negative is
+    /// refused naming the field rather than silently replaced by the default.
     #[tokio::test]
-    async fn a_limit_of_the_wrong_type_is_coerced_or_refused_never_ignored() {
+    async fn a_limit_that_is_not_a_count_is_refused_never_ignored() {
         let memories = store().await;
         for index in 0..8 {
             MemoryWriteTool {
@@ -3302,11 +3237,7 @@ mod tests {
             memories: memories.clone(),
             project: Default::default(),
         };
-        for limit in [
-            serde_json::json!(2),
-            serde_json::json!("2"),
-            serde_json::json!(2.0),
-        ] {
+        for limit in [serde_json::json!(2), serde_json::json!(2.0)] {
             let out = search
                 .execute(
                     serde_json::json!({"queries": ["deployment"], "limit": limit}),
@@ -3321,14 +3252,21 @@ mod tests {
                 "limit {limit} was not honored: {out}"
             );
         }
-        let error = search
-            .execute(
-                serde_json::json!({"queries": ["deployment"], "limit": "many"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
-            )
-            .await
-            .expect_err("a non-numeric limit must be refused, not swapped for the default");
-        assert!(error.to_string().contains("'limit'"), "{error}");
+        for limit in [
+            serde_json::json!("2"),
+            serde_json::json!(2.5),
+            serde_json::json!(-1),
+            serde_json::json!("many"),
+        ] {
+            let error = search
+                .execute(
+                    serde_json::json!({"queries": ["deployment"], "limit": limit}),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect_err("a limit that is not a count is refused, not swapped for the default");
+            assert!(error.to_string().contains("'limit'"), "{error}");
+        }
     }
 
     /// A malformed `tags` or `body` argument is refused rather than read as a request to clear:

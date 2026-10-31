@@ -29,7 +29,7 @@ pub(crate) async fn run_interactive(
     config: ResolvedConfig,
     store: Store,
     token_store: TokenStore,
-    initial_prompt: Option<String>,
+    opening: Option<crate::conversation::ContentBlock>,
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
 ) -> anyhow::Result<()> {
     let config = Arc::new(config);
@@ -147,15 +147,15 @@ pub(crate) async fn run_interactive(
 
     // A prompt or skill given without `--oneshot` is the first turn's input. The screen opens
     // busy, so Enter during that turn goes where it goes during any other.
-    let initial_turn_pending = initial_prompt.is_some();
-    if let Some(prompt) = &initial_prompt {
+    let initial_turn_pending = opening.is_some();
+    if let Some(opening) = &opening {
         #[allow(
             clippy::expect_used,
             reason = "the receiver is `host_receiver` above, still owned here, so `send` cannot fail"
         )]
         host_sender
             .send(HostEvent::UserInput {
-                text: prompt.clone(),
+                parts: vec![opening.clone()],
                 images: Vec::new(),
             })
             .expect("a fresh channel accepts its first send");
@@ -227,12 +227,12 @@ pub(crate) async fn run_interactive(
                 .default_profile
                 .as_deref()
                 .or_else(|| config.profiles.keys().next().map(String::as_str));
-            crate::render::render_profile_setup_hint(session_id.filter(|_| gone).zip(move_to).map(
-                |(session_id, move_to)| crate::render::MissingSessionProfile {
+            if let Some((session_id, move_to)) = session_id.filter(|_| gone).zip(move_to) {
+                crate::render::render_profile_setup_hint(crate::render::MissingSessionProfile {
                     session_id,
                     move_to,
-                },
-            ));
+                });
+            }
             return Err(AlreadyReported.into());
         }
     };
@@ -269,9 +269,10 @@ pub(crate) async fn run_interactive(
             id: id.to_string(),
         });
     }
-    if let Some(prompt) = initial_prompt {
+    // Typed words are drawn as typed; an invocation is said where its message is appended.
+    if let Some(crate::conversation::ContentBlock::Text { text }) = opening {
         transcript.push(model::Item::Prompt {
-            text: prompt,
+            text,
             class: None,
             inbox_id: None,
             delivered: true,
@@ -546,11 +547,11 @@ pub(crate) async fn run_interactive(
                 }
                 ui.done();
             }
-            HostEvent::UserInput { text, images } => {
+            HostEvent::UserInput { parts, images } => {
                 // Admitted here, before anything below can wait, so a Ctrl+C in the window counts
                 // against this turn rather than climbing the ladder past it.
                 let admission = cancel.admit();
-                let input = match crate::agent::TurnInput::from_parts(text, images) {
+                let input = match crate::agent::TurnInput::sent(parts, images) {
                     Ok(input) => input,
                     Err(empty) => {
                         ui.error(&empty);
@@ -567,6 +568,7 @@ pub(crate) async fn run_interactive(
                 let input = input.riding(outcomes);
                 let mut messages = conversation.lock().await;
                 match run_turn_interruptible(
+                    &shared,
                     &cancel,
                     admission,
                     &agent,

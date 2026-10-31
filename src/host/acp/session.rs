@@ -48,6 +48,10 @@ pub(super) struct ServerState {
     /// Shared with every per-session `AcpFrontend`; see the field on `AcpFrontend` for the
     /// stdio-level rationale.
     pub(super) transport_dead: Arc<std::sync::atomic::AtomicBool>,
+    /// The sessions the idle sweep released, which the editor still holds open: the next request
+    /// naming one reopens it rather than failing, since an editor keeps a thread and sends to it,
+    /// and has no reason to load what it never closed.
+    pub(super) released: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl ServerState {
@@ -62,7 +66,27 @@ impl ServerState {
             client_state,
             sessions: crate::host::Sessions::new(),
             transport_dead,
+            released: std::sync::Mutex::default(),
         }
+    }
+
+    /// The resident entry for `session_id_str`, reopening one the idle sweep released, as
+    /// `session/resume` would with the directory and roots the row records. `None` for an id this
+    /// process never held, or one the editor closed.
+    pub(super) async fn resident_or_reopened(
+        self: &Arc<Self>,
+        cx: &ConnectionTo<Client>,
+        session_id_str: &str,
+        session_uuid: uuid::Uuid,
+    ) -> Option<Result<SessionEntry, agent_client_protocol::Error>> {
+        if let Some(entry) = self.sessions.read().await.get(session_id_str) {
+            entry.touch();
+            return Some(Ok(entry.clone()));
+        }
+        if !crate::sync::lock(&self.released).remove(session_id_str) {
+            return None;
+        }
+        Some(reopen_released(self, cx, session_id_str, session_uuid).await)
     }
 
     /// The link a new session's frontend talks over.
@@ -225,13 +249,75 @@ pub(super) fn spawn_idle_session_sweep(state: Arc<ServerState>) -> tokio::task::
                 // Same teardown `session/close` does, and for the same reason: without it the
                 // manager keeps fanning `tools/list_changed` out to a registry nobody reads.
                 entry.release(state.shared.mcp_manager.as_ref()).await;
+                crate::sync::lock(&state.released).insert(id.clone());
                 tracing::info!(
-                    "released idle ACP session {id} after {ACP_SESSION_IDLE_TIMEOUT:?}; `session/load` reopens it"
+                    "released idle ACP session {id} after {ACP_SESSION_IDLE_TIMEOUT:?}; the next request naming it reopens it"
                 );
                 drop(entry);
             }
         }
     })
+}
+
+/// Reopen a session the idle sweep released, through the doors `session/resume` takes: refused for
+/// a sub-agent's session, locked before its row is read, at the level the row records clamped to
+/// this configuration, in the directory and roots the row records, and with no replay, since the
+/// editor still shows the thread.
+async fn reopen_released(
+    state: &Arc<ServerState>,
+    cx: &ConnectionTo<Client>,
+    session_id_str: &str,
+    session_uuid: uuid::Uuid,
+) -> Result<SessionEntry, agent_client_protocol::Error> {
+    let relay = state.shared.relay_provider_errors();
+    crate::host::refuse_a_spawned_session(&state.shared.store, Some(session_uuid))
+        .await
+        .map_err(|error| build_failure_error("failed to read session", &error, relay))?;
+    let (session_lock, summary) = state
+        .shared
+        .store
+        .open_session_row(session_uuid)
+        .await
+        .map_err(|error| acp_error_for(&error, false))?;
+    let cwd = summary
+        .cwd
+        .clone()
+        .ok_or_else(|| acp_error_for(&MekaError::SessionNotFound(session_uuid), false))
+        .and_then(|cwd| {
+            crate::workspace::accept_cwd(&cwd).map_err(|error| acp_error_for(&error, false))
+        })?;
+    let permission = state
+        .shared
+        .config
+        .enabled_permissions
+        .admit_recorded(summary.permission, &format!("session {session_uuid}"))
+        .unwrap_or(state.shared.config.permission);
+    let session_id: SessionId = session_id_str.to_string().into();
+    let runtime = build_session_runtime(
+        &state.shared,
+        state.link(cx.clone(), session_id),
+        session_uuid,
+        cwd,
+        summary.additional_roots.clone(),
+        permission,
+        summary.approvals,
+        crate::host::Opening::Hydrate,
+        session_lock,
+    )
+    .await
+    .map_err(|error| build_failure_error("failed to build session runtime", &error, relay))?;
+    let entry = SessionEntry {
+        resident: runtime.resident,
+        title_sent: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        frontend: runtime.frontend,
+    };
+    state
+        .sessions
+        .write()
+        .await
+        .insert(session_id_str.to_string(), entry.clone());
+    tracing::info!("reopened ACP session {session_uuid} the idle sweep had released");
+    Ok(entry)
 }
 
 /// What a reopening client's workspace changes on the row: its `cwd` wins (consistent with
@@ -281,6 +367,7 @@ pub(super) async fn handle_load_session(
     // Refuse if a session with the same id is already loaded. Collisions between different
     // connections aren't possible (one process serves one ACP client) but a re-load of the same
     // session would discard in-flight state.
+    crate::sync::lock(&state.released).remove(&session_id_str);
     if state.sessions.read().await.contains_key(&session_id_str) {
         return responder.respond_with_error(invalid_params_error(
             "session is already loaded; call session/close first",
@@ -397,16 +484,17 @@ pub(super) async fn handle_load_session(
         .emit(context_seed(runtime.resident.cells()))
         .await;
     // Replay before inserting so the client sees the rebuild stream before any new turn-related
-    // update could race in.
-    let conversation = runtime.resident.conversation.lock().await;
-    // The rows are read for a conversation with a report to say, not on every load.
-    let holds_report = conversation.as_slice().iter().any(|message| {
-        message.content.iter().any(|block| {
-            matches!(
-                block,
-                crate::conversation::ContentBlock::BackgroundReport { .. }
-            )
-        })
+    // update could race in. From the log, not the resident view, which begins at the last
+    // compaction: an editor reopening a thread is owed the turns before it, with each compaction
+    // said where it happened.
+    let (events, first_generation) = replay_log(&state.shared.store, session_uuid).await;
+    // The rows are read for a log with a report to say, not on every load.
+    let holds_report = events.iter().any(|event| {
+        matches!(event, crate::conversation::Event::Append(message)
+        if message.content.iter().any(|block| matches!(
+            block,
+            crate::conversation::ContentBlock::BackgroundReport { .. }
+        )))
     });
     let tasks = if holds_report {
         match state
@@ -427,12 +515,12 @@ pub(super) async fn handle_load_session(
     };
     replay_session_updates(
         &cx,
+        &runtime.frontend.client_state,
         &session_id,
         &runtime.resident.cells().cwd,
-        &conversation,
+        &replay_entries(&events, first_generation),
         &tasks,
     );
-    drop(conversation);
 
     let permission = runtime.resident.cells().permission.clone();
     let frontend = Arc::clone(&runtime.frontend);
@@ -530,6 +618,7 @@ pub(super) async fn handle_resume_session(
         Err(error) => return responder.respond_with_error(error),
     };
 
+    crate::sync::lock(&state.released).remove(&session_id_str);
     if state.sessions.read().await.contains_key(&session_id_str) {
         return responder.respond_with_error(invalid_params_error(
             "session is already loaded; call session/close first",
@@ -882,29 +971,79 @@ pub(super) async fn handle_fork_session(
         None => runtime.resident.conversation.lock().await.title(),
     };
     let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    maybe_emit_session_title(&cx, &session_id, &title_sent, title);
     let seed = context_seed(runtime.resident.cells());
+    let checklist = runtime.resident.cells().checklist.get();
     let entry = SessionEntry {
         resident: runtime.resident,
-        title_sent,
+        title_sent: Arc::clone(&title_sent),
         frontend: Arc::clone(&frontend),
     };
     state.sessions.write().await.insert(session_id_str, entry);
 
     tracing::info!("session/fork: {source_uuid} forked into {session_uuid}");
 
+    // Everything about the copy follows the response, which is what tells the client its id: a
+    // notification for an id it does not know yet is dropped. The checklist the build announced
+    // went out before it, so it is said again here.
     let modes = build_mode_state(&permission);
     let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
-    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
-
     let responded = responder.respond(
-        ForkSessionResponse::new(session_id)
+        ForkSessionResponse::new(session_id.clone())
             .modes(modes)
             .config_options(config_options),
     );
+    maybe_emit_session_title(&cx, &session_id, &title_sent, title);
+    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
+    if !checklist.items.is_empty() {
+        frontend
+            .emit(crate::frontend::FrontendEvent::ChecklistUpdated {
+                items: checklist.items,
+            })
+            .await;
+    }
     frontend.emit(seed).await;
     responded
 }
+/// How many of a session's newest log rows `session/load` replays: an editor renders what it is
+/// handed whole, with no paging back for more.
+const REPLAY_ROWS: usize = 2_000;
+
+/// The log `session/load` replays, its newest rows without what a rewind took back and with images
+/// inlined, and the place the first compaction among them has in the session's count of them. A
+/// failed read replays nothing rather than failing the load, which the resident session has
+/// already passed.
+async fn replay_log(
+    store: &crate::store::Store,
+    session: uuid::Uuid,
+) -> (Vec<crate::conversation::Event>, u64) {
+    let page = match store.log_page_before(session, None, REPLAY_ROWS).await {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::warn!("failed to read the log for the replay: {error}");
+            return (Vec::new(), 1);
+        }
+    };
+    let rewound = store.rewound(session).await.unwrap_or_else(|error| {
+        tracing::warn!("failed to read what rewinds took back, for the replay: {error}");
+        Vec::new()
+    });
+    let mut events: Vec<crate::conversation::Event> = page
+        .rows
+        .into_iter()
+        .filter(|row| !rewound.iter().any(|stretch| stretch.rows.contains(&row.id)))
+        .map(|row| row.event)
+        .collect();
+    if let Err(error) = store.inline_blobs(&mut events).await {
+        tracing::warn!("failed to read the images for the replay: {error}");
+    }
+    let shown = events
+        .iter()
+        .filter(|event| matches!(event, crate::conversation::Event::CompactBoundary { .. }))
+        .count() as u64;
+    let total = store.count_compactions(session).await.unwrap_or(shown);
+    (events, total.saturating_sub(shown).saturating_add(1))
+}
+
 /// `session/close`: remove a session from the active map. Cancels any in-flight prompt for that
 /// session before removing it from the map so the agent loop unwinds. Detaches the session's tool
 /// registry from the MCP manager so live `tools/list_changed` updates stop targeting it.
@@ -918,8 +1057,13 @@ pub(super) async fn handle_close_session(
         Ok(uuid) => uuid,
         Err(error) => return responder.respond_with_error(error),
     };
+    let was_released = crate::sync::lock(&state.released).remove(&session_id_str);
     let removed = state.sessions.write().await.remove(&session_id_str);
     let Some(entry) = removed else {
+        // Released by the idle sweep, and now closed: nothing is left to tear down.
+        if was_released {
+            return responder.respond(CloseSessionResponse::new());
+        }
         return responder.respond_with_error(acp_error_for(
             &MekaError::SessionNotFound(session_uuid),
             false,
@@ -961,25 +1105,24 @@ pub(super) async fn handle_set_session_mode(
     state: Arc<ServerState>,
     request: SetSessionModeRequest,
     responder: agent_client_protocol::Responder<SetSessionModeResponse>,
+    cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id_str = request.session_id.0.as_ref().to_string();
     let session_uuid = match parse_session_id(&session_id_str) {
         Ok(uuid) => uuid,
         Err(error) => return responder.respond_with_error(error),
     };
-    let entry = {
-        let sessions = state.sessions.read().await;
-        match sessions.get(&session_id_str) {
-            Some(entry) => {
-                entry.touch();
-                entry.clone()
-            }
-            None => {
-                return responder.respond_with_error(acp_error_for(
-                    &MekaError::SessionNotFound(session_uuid),
-                    false,
-                ));
-            }
+    let entry = match state
+        .resident_or_reopened(&cx, &session_id_str, session_uuid)
+        .await
+    {
+        Some(Ok(entry)) => entry,
+        Some(Err(error)) => return responder.respond_with_error(error),
+        None => {
+            return responder.respond_with_error(acp_error_for(
+                &MekaError::SessionNotFound(session_uuid),
+                false,
+            ));
         }
     };
     let permission = match parse_mode_id(request.mode_id.0.as_ref()) {
@@ -1038,25 +1181,24 @@ pub(super) async fn handle_set_session_config_option(
     state: Arc<ServerState>,
     request: SetSessionConfigOptionRequest,
     responder: agent_client_protocol::Responder<SetSessionConfigOptionResponse>,
+    cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id_str = request.session_id.0.as_ref().to_string();
     let session_uuid = match parse_session_id(&session_id_str) {
         Ok(uuid) => uuid,
         Err(error) => return responder.respond_with_error(error),
     };
-    let entry = {
-        let sessions = state.sessions.read().await;
-        match sessions.get(&session_id_str) {
-            Some(entry) => {
-                entry.touch();
-                entry.clone()
-            }
-            None => {
-                return responder.respond_with_error(acp_error_for(
-                    &MekaError::SessionNotFound(session_uuid),
-                    false,
-                ));
-            }
+    let entry = match state
+        .resident_or_reopened(&cx, &session_id_str, session_uuid)
+        .await
+    {
+        Some(Ok(entry)) => entry,
+        Some(Err(error)) => return responder.respond_with_error(error),
+        None => {
+            return responder.respond_with_error(acp_error_for(
+                &MekaError::SessionNotFound(session_uuid),
+                false,
+            ));
         }
     };
     // The switch is a boolean where the two pickers take a value id, so it is read first and on
@@ -1255,11 +1397,11 @@ pub(super) async fn build_session_runtime(
     session_lock: crate::fs::FileLock,
 ) -> anyhow::Result<BuiltSession> {
     let cwd = SharedCwd::new(cwd_path);
-    // `--writable-root` is a flag on the process the editor launched, so it belongs to every
-    // session that process serves, not only the screen's. Merged into the live handle and
-    // deliberately not into the persisted row: the row is what `session/load` hands back to the
-    // client as its `additionalDirectories`, and reporting a folder the client never asked for
-    // would misdescribe its own request to it.
+    // `--additional-workspace-directory` is a flag on the process the editor launched, so it
+    // belongs to every session that process serves, not only the screen's. Merged into the live
+    // handle and deliberately not into the persisted row: the row is what `session/load` hands back
+    // to the client as its `additionalDirectories`, and reporting a folder the client never asked
+    // for would misdescribe its own request to it.
     let roots = SharedRoots::new(
         additional_roots
             .into_iter()

@@ -196,7 +196,10 @@ fn get_fields(skill: &skills::Skill, body_bytes: u64) -> Vec<(Cow<'static, str>,
     for (key, value) in &skill.extra {
         fields.push((format!("extra.{}", sanitized(key)).into(), sanitized(value)));
     }
-    fields.push(("body".into(), format!("{body_bytes} bytes")));
+    fields.push((
+        "body".into(),
+        crate::text::format_size(usize::try_from(body_bytes).unwrap_or(usize::MAX)),
+    ));
     fields
 }
 
@@ -371,7 +374,7 @@ pub(crate) async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> 
         // the exit code says success.
         kept.sort();
         crate::render::render_hint(&format!(
-            "the skill was written; failed to remove {} from the previous version",
+            "The skill was written; removing {} from the previous version failed.",
             kept.join(", ")
         ));
     }

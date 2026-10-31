@@ -13,9 +13,15 @@ request, so a test can change what the server does between two requests to it. T
       "tools": ["search", "create_page"],   tools advertised; each takes no arguments
       "instructions": "call search first",
       "exit_after": 1,                      tools/list calls to serve before exiting
+      "list_delay_ms": 300,                 how long each tools/list takes to answer
+      "call_delay_ms": 300,                 how long each tools/call takes to answer
+      "fail_initialize": true,              answer initialize with an error, as a server that
+                                            cannot start a session
       "resources": ["file:///a"],           resources advertised, and the ones a subscription
                                             to updates is accepted for
       "legacy_only": true,                  answer server/discover with method-not-found
+      "exit_on_subscribe": true,            exit on resources/subscribe, as a legacy server that
+                                            dies on a request it cannot serve
       "exit_on_probe": true,                exit on server/discover, as a server that dies on a
                                             method it does not know
       "ignore_probe": true,                 answer nothing to server/discover, or to anything
@@ -185,6 +191,8 @@ class Server:
             if current.get("instructions") is not None:
                 result["instructions"] = current["instructions"]
             reply(message_id, self.result(result))
+        elif method == "initialize" and current.get("fail_initialize"):
+            fail(message_id, -32603, "initialize refused")
         elif method == "initialize":
             result = {
                 "protocolVersion": LEGACY,
@@ -195,6 +203,7 @@ class Server:
                 result["instructions"] = current["instructions"]
             reply(message_id, result)
         elif method == "tools/list":
+            time.sleep(current.get("list_delay_ms", 0) / 1000)
             result = {
                 "tools": [
                     {
@@ -263,6 +272,8 @@ class Server:
                 self.result({"messages": [{"role": "user", "content": {"type": "text", "text": text}}]}),
             )
         elif method == "resources/subscribe" and self.era == LEGACY:
+            if current.get("exit_on_subscribe"):
+                sys.exit(0)
             uri = params.get("uri")
             if uri in current.get("resources", []):
                 self.legacy_subscribed.add(uri)
@@ -317,6 +328,7 @@ class Server:
 
     def call_tool(self, message_id, params, meta, current):
         name = params.get("name")
+        time.sleep(current.get("call_delay_ms", 0) / 1000)
         if current.get("progress") and meta.get("progressToken") is not None:
             notify(
                 "notifications/progress",

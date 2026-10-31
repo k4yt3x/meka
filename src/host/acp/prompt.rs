@@ -2,12 +2,28 @@
 
 use super::*;
 
-/// Append one prompt content block to `prompt_text`, inserting a newline separator between blocks.
-pub(super) fn push_prompt_block(prompt_text: &mut String, block: &str) {
-    if !prompt_text.is_empty() {
-        prompt_text.push('\n');
-    }
-    prompt_text.push_str(block);
+/// What an editor's prompt says as one string, its parts' text a newline apart, for the local
+/// commands to recognize: a command with a resource attached is not one.
+pub(super) fn sent_text(parts: &[crate::conversation::ContentBlock]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            crate::conversation::ContentBlock::Text { text }
+            | crate::conversation::ContentBlock::Resource { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+/// The name a resource is shown by when the editor sent its contents without one: the last
+/// segment of its URI, which for a file is its name.
+fn resource_name(uri: &str) -> String {
+    uri.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(uri)
+        .to_string()
 }
 /// Append a ` mime="..."` attribute to a resource/resource_link tag when one is present.
 pub(super) fn push_mime_attr(tag: &mut String, mime: &Option<String>) {
@@ -43,6 +59,44 @@ pub(super) fn format_embedded_resource(embedded: &EmbeddedResource) -> String {
         _ => "<resource/>".to_string(),
     }
 }
+/// An ACP embedded resource as the block the turn's message carries: the tag
+/// [`format_embedded_resource`] renders, beside the URI and the name an editor shows it by.
+pub(super) fn embedded_resource_block(
+    embedded: &EmbeddedResource,
+) -> crate::conversation::ContentBlock {
+    let uri = match &embedded.resource {
+        EmbeddedResourceResource::TextResourceContents(text) => text.uri.clone(),
+        EmbeddedResourceResource::BlobResourceContents(blob) => blob.uri.clone(),
+        _ => String::new(),
+    };
+    // A kind this build cannot read names nothing, and is shown by what it is.
+    let name = if uri.is_empty() {
+        "resource".to_string()
+    } else {
+        resource_name(&uri)
+    };
+    crate::conversation::ContentBlock::Resource {
+        name,
+        uri,
+        text: format_embedded_resource(embedded),
+    }
+}
+/// An ACP resource link as the block the turn's message carries: a `<resource_link>` tag
+/// carrying the link's name, URI and description, since meka does not fetch it.
+pub(super) fn resource_link_block(link: &ResourceLink) -> crate::conversation::ContentBlock {
+    let mut tag = format!("<resource_link name=\"{}\" uri=\"{}\"", link.name, link.uri);
+    push_mime_attr(&mut tag, &link.mime_type);
+    tag.push('>');
+    if let Some(description) = &link.description {
+        tag.push_str(description);
+    }
+    tag.push_str("</resource_link>");
+    crate::conversation::ContentBlock::Resource {
+        uri: link.uri.clone(),
+        name: link.name.clone(),
+        text: tag,
+    }
+}
 /// Decode an ACP image content block into meka's internal [`crate::image::ImageSource`] via the
 /// shared client-image pipeline, so ACP and the HTTP API enforce the same limits.
 ///
@@ -62,8 +116,8 @@ pub(super) async fn decode_acp_image(
 }
 
 /// If `prompt_text` is a [`crate::host::COMMANDS`] invocation, render its output; otherwise `None`
-/// so the prompt falls through to skill resolution / the model. Text after the command name is
-/// ignored (these commands take no arguments).
+/// so the prompt falls through to skill resolution / the model. These commands take no argument,
+/// so one followed by words is prose for the model, as `/usage looks wrong, why?` is.
 pub(super) async fn try_local_command(
     prompt_text: &str,
     agent: &crate::agent::Agent,
@@ -71,7 +125,10 @@ pub(super) async fn try_local_command(
     permission: &crate::permission::SharedPermission,
     shared: &crate::host::SharedDeps,
 ) -> Option<String> {
-    let (name, _extra) = split_acp_slash(prompt_text)?;
+    let (name, extra) = split_acp_slash(prompt_text)?;
+    if !crate::text::is_blank(&extra) {
+        return None;
+    }
     match name.as_str() {
         "status" => Some(build_status_text(agent, conversation_len, permission, shared).await),
         "mcp" => Some(build_mcp_list_text(shared).await),
@@ -138,7 +195,7 @@ pub(super) async fn build_mcp_list_text(shared: &crate::host::SharedDeps) -> Str
     out
 }
 /// Emit a `session/update: available_commands_update` listing the [`crate::host::COMMANDS`] marked
-/// `for_editors`, followed by every installed skill, each as an [`AvailableCommand`].
+/// with an `editor_help`, followed by every installed skill, each as an [`AvailableCommand`].
 /// Editor clients render these as slash commands in their prompt input; picking one inserts
 /// `/<name> `. Skills whose name collides with a built-in command are dropped so the palette has no
 /// duplicates.
@@ -153,8 +210,11 @@ pub(super) async fn emit_available_commands(
     let snapshot = skills.current().await;
     let mut commands: Vec<AvailableCommand> = crate::host::COMMANDS
         .iter()
-        .filter(|command| command.for_editors)
-        .map(|command| AvailableCommand::new(command.name, command.help))
+        .filter_map(|command| {
+            command
+                .editor_help
+                .map(|help| AvailableCommand::new(command.name, help))
+        })
         .collect();
     commands.extend(
         snapshot
@@ -163,7 +223,7 @@ pub(super) async fn emit_available_commands(
             .filter(|skill| {
                 !crate::host::COMMANDS
                     .iter()
-                    .any(|command| command.for_editors && command.name == skill.name)
+                    .any(|command| command.editor_help.is_some() && command.name == skill.name)
             })
             .map(|skill| {
                 // Sanitized, like every other place a skill description is shown. The store hands
@@ -223,25 +283,30 @@ pub(super) fn split_acp_slash(prompt_text: &str) -> Option<(String, String)> {
         None => (rest.to_string(), String::new()),
     })
 }
-/// Intercept `/<skill-name> [extra]` invocations in an ACP prompt's
-/// text. Returns the text the agent should actually run with:
+/// Intercept a `/<skill-name> [extra]` invocation that opens an ACP prompt. Returns the one block
+/// that takes the place of every part, or `None` when they stay as they are:
 ///
-/// - Non-slash input: returned unchanged.
+/// - Non-slash input: `None`.
 /// - Slash followed by a name that isn't a syntactically valid skill identifier (e.g. a pasted path
-///   like `/etc/hosts` or a `//` comment): returned unchanged so the model can see it.
-/// - `/<skill-name>` matching an installed skill: returns `extra\n\n{body}` where `body` is
-///   [`crate::skills::load_skill_body`]'s output (the skill's base-directory header followed by its
-///   body verbatim). Empty `extra` collapses to just `body`. Same composition the screen's
-///   `SlashCommand::SkillInvoke` handler uses.
+///   like `/etc/hosts` or a `//` comment): `None`, so the model sees it.
+/// - `/<skill-name>` matching an installed skill: the invocation of all that follows the name, the
+///   words and the resources attached among them, so the model reads the whole request ahead of the
+///   skill's body as [`crate::skills::invocation`] composes it, and a history shows the words with
+///   each resource as its mention.
 /// - `/<name>` with a syntactically valid skill name but no installed skill of that name:
 ///   `SkillNotFound`. The caller sends the original text to the model rather than failing the
 ///   prompt, because `/usr local lib` parses the same way.
-pub(super) async fn slash_to_prompt_text(
-    prompt_text: String,
+pub(super) async fn slash_to_invocation(
+    parts: &[crate::conversation::ContentBlock],
     skills: &Arc<SkillCache>,
-) -> Result<String, SlashInvocationError> {
-    let Some((name, extra)) = split_acp_slash(&prompt_text) else {
-        return Ok(prompt_text);
+) -> Result<Option<crate::conversation::ContentBlock>, SlashInvocationError> {
+    let Some((crate::conversation::ContentBlock::Text { text: opening }, rest)) =
+        parts.split_first()
+    else {
+        return Ok(None);
+    };
+    let Some((name, extra)) = split_acp_slash(opening) else {
+        return Ok(None);
     };
     // Anything that doesn't even look like a skill identifier was never going to match. Pass
     // through so pasted paths and code comments reach the model unchanged.
@@ -251,7 +316,14 @@ pub(super) async fn slash_to_prompt_text(
     // predates the spec still resolves (`/My_Skill`), but a line like `/v1.2 of the API` stays
     // prose rather than becoming "no such skill".
     if !crate::skills::looks_like_skill_invocation(&name) {
-        return Ok(prompt_text);
+        return Ok(None);
+    }
+    // A local command with words after it, which `try_local_command` left for the model.
+    if crate::host::COMMANDS
+        .iter()
+        .any(|command| command.editor_help.is_some() && command.name == name)
+    {
+        return Ok(None);
     }
     let snapshot = skills.current().await;
     let Some(skill) = snapshot.find(&name) else {
@@ -265,11 +337,43 @@ pub(super) async fn slash_to_prompt_text(
             name: name.clone(),
             source,
         })?;
-    Ok(if extra.is_empty() {
-        body
-    } else {
-        format!("{extra}\n\n{body}")
-    })
+    // The words after the name as typed, so a mention reads where it was attached among them.
+    let typed = opening
+        .strip_prefix('/')
+        .and_then(|rest| rest.strip_prefix(name.as_str()))
+        .unwrap_or(&extra)
+        .trim_start();
+    let (mut directive, mut words) = (typed.to_string(), typed.to_string());
+    // Two text blocks side by side are two lines, as the prompt's joined words read them; one
+    // beside a mention runs into it, as the editor laid them out.
+    let mut after_text = true;
+    for part in rest {
+        match part {
+            crate::conversation::ContentBlock::Text { text } => {
+                if after_text {
+                    directive.push('\n');
+                    words.push('\n');
+                }
+                directive.push_str(text);
+                words.push_str(text);
+                after_text = true;
+            }
+            crate::conversation::ContentBlock::Resource { name, text, .. } => {
+                directive.push_str(&format!("@{name}"));
+                words.push_str(&format!("\n{text}\n"));
+                after_text = false;
+            }
+            _ => {}
+        }
+    }
+    // The words are cut at their ends here alone: a file attached first or last leaves the line
+    // breaks that set its contents apart at the edge of the words.
+    Ok(Some(crate::skills::invocation_with_words(
+        &name,
+        directive.trim().to_string(),
+        words.trim().to_string(),
+        body,
+    )))
 }
 /// Body of the `session/prompt` spawn. Extracted so the closure stays thin. Owns `responder` and
 /// replies exactly once.
@@ -286,38 +390,27 @@ pub(super) async fn run_prompt_turn(
     request: PromptRequest,
     responder: agent_client_protocol::Responder<PromptResponse>,
     admitted: Option<crate::host::TurnGuard>,
+    cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     // Accept `text` + `resource_link` (the ACP baseline) + embedded `resource` and `image`. Whether
     // this session may carry an image is asked below, once its profile has been applied; other
-    // content variants are refused here.
-    let mut prompt_text = String::new();
+    // content variants are refused here. The words and the resources keep the editor's order,
+    // since words around a mention read by where it is.
+    let mut parts: Vec<crate::conversation::ContentBlock> = Vec::new();
     let mut images: Vec<crate::image::ImageSource> = Vec::new();
     for block in &request.prompt {
         match block {
-            ContentBlock::Text(text) => {
-                push_prompt_block(&mut prompt_text, &text.text);
-            }
+            ContentBlock::Text(text) => parts.push(crate::conversation::ContentBlock::Text {
+                text: text.text.clone(),
+            }),
             // `ResourceLink` is part of the ACP baseline that every agent MUST support (alongside
             // `Text`). meka doesn't fetch the resource server-side; the model sees the reference as
-            // a structured tag carrying the link's name, uri, and (optional) description so it can
-            // decide what to do with it.
-            ContentBlock::ResourceLink(link) => {
-                let mut tag =
-                    format!("<resource_link name=\"{}\" uri=\"{}\"", link.name, link.uri,);
-                push_mime_attr(&mut tag, &link.mime_type);
-                tag.push('>');
-                if let Some(description) = &link.description {
-                    tag.push_str(description);
-                }
-                tag.push_str("</resource_link>");
-                push_prompt_block(&mut prompt_text, &tag);
-            }
+            // a structured tag so it can decide what to do with it.
+            ContentBlock::ResourceLink(link) => parts.push(resource_link_block(link)),
             // `Resource` carries an @-mention's inlined contents (the `embedded_context`
             // capability). meka surfaces it to the model as a `<resource>` tag rather than fetching
             // anything server-side, mirroring `ResourceLink`.
-            ContentBlock::Resource(embedded) => {
-                push_prompt_block(&mut prompt_text, &format_embedded_resource(embedded));
-            }
+            ContentBlock::Resource(embedded) => parts.push(embedded_resource_block(embedded)),
             // Decoded here for its payload alone, through the shared image pipeline so the size
             // cap and format conversion match tool-result images. Whether this session admits an
             // image at all is a question for its profile, asked below once that has been applied.
@@ -339,13 +432,23 @@ pub(super) async fn run_prompt_turn(
         }
     }
     let has_images = !images.is_empty();
+    // Blank text ahead of everything else is nothing typed, for every reader below alike: a local
+    // command and a skill are recognized by what the prompt opens with.
+    let typed_from = parts
+        .iter()
+        .position(|part| {
+            !matches!(part, crate::conversation::ContentBlock::Text { text } if crate::text::is_blank(text))
+        })
+        .unwrap_or(parts.len());
+    parts.drain(..typed_from);
 
     // Ahead of the session being taken, so a prompt with nothing in it never holds the runtime
     // mutex or publishes a cancel token: a client that pipelines a real prompt behind it must find
     // the session free, not busy. A prompt of nothing but whitespace costs a provider round-trip to
     // produce nothing, and a client that dropped its content on the floor should hear about it.
     // The words are expanded below once a slash command has been resolved.
-    let input = match crate::agent::TurnInput::from_parts(prompt_text.clone(), images) {
+    let prompt_text = sent_text(&parts);
+    let input = match crate::agent::TurnInput::sent(parts.clone(), images) {
         Ok(input) => input,
         Err(error) => return responder.respond_with_error(acp_error_for(&error, false)),
     };
@@ -358,19 +461,17 @@ pub(super) async fn run_prompt_turn(
         Ok(uuid) => uuid,
         Err(error) => return responder.respond_with_error(error),
     };
-    let entry = {
-        let sessions = state.sessions.read().await;
-        match sessions.get(&session_id_str) {
-            Some(entry) => {
-                entry.touch();
-                entry.clone()
-            }
-            None => {
-                return responder.respond_with_error(acp_error_for(
-                    &MekaError::SessionNotFound(session_uuid),
-                    false,
-                ));
-            }
+    let entry = match state
+        .resident_or_reopened(&cx, &session_id_str, session_uuid)
+        .await
+    {
+        Some(Ok(entry)) => entry,
+        Some(Err(error)) => return responder.respond_with_error(error),
+        None => {
+            return responder.respond_with_error(acp_error_for(
+                &MekaError::SessionNotFound(session_uuid),
+                false,
+            ));
         }
     };
 
@@ -399,10 +500,10 @@ pub(super) async fn run_prompt_turn(
     // asked for a specific account, and answering from another one silently is the failure the
     // whole per-session binding exists to prevent.
     if let Err(error) =
-        crate::host::apply_recorded_profile(&state.shared, &entry.agent, entry.id).await
+        crate::host::apply_recorded_bindings(&state.shared, &entry.agent, entry.id).await
     {
         return responder.respond_with_error(build_failure_error(
-            "cannot run this turn on the profile this session is recorded against",
+            "cannot run this turn on the profile and project this session is recorded against",
             &error,
             state.shared.relay_provider_errors(),
         ));
@@ -467,18 +568,18 @@ pub(super) async fn run_prompt_turn(
                 agent_client_protocol::schema::v1::TextContent::new(body),
             ))),
         );
-        // Reported here too, even though a local command consumes no tokens: `usage` is
-        // session-cumulative, so omitting it would make a client's running total flicker away on
-        // every `/status` turn.
+        // A local command spends nothing, and says so: `usage` is the turn's own.
+        let none = entry.agent.session_stats_snapshot();
         return responder
-            .respond(PromptResponse::new(StopReason::EndTurn).usage(session_usage(&entry.agent)));
+            .respond(PromptResponse::new(StopReason::EndTurn).usage(turn_usage(&none, &none)));
     }
 
-    let original_prompt_text = prompt_text.clone();
-    let prompt_text = match slash_to_prompt_text(prompt_text, &state.shared.skills).await {
-        Ok(text) => text,
+    // An invocation opens the prompt or is not one, and takes the place of everything sent with it.
+    match slash_to_invocation(&parts, &state.shared.skills).await {
+        Ok(Some(invocation)) => parts = vec![invocation],
+        Ok(None) => {}
         Err(SlashInvocationError::SkillNotFound(name)) => {
-            // `slash_to_prompt_text` only returns `SkillNotFound` for strings whose first token is
+            // `slash_to_invocation` only returns `SkillNotFound` for strings whose first token is
             // a syntactically-valid skill name. That's deliberately a narrow filter, but it still
             // false-positives on pasted text like `/usr local lib` (parses as name=`usr`,
             // extra=`local lib`). Treat "no such skill" as "this wasn't a skill invocation after
@@ -488,7 +589,6 @@ pub(super) async fn run_prompt_turn(
             tracing::debug!(
                 "session/prompt: '/{name}' didn't match a registered skill; passing through"
             );
-            original_prompt_text
         }
         Err(SlashInvocationError::SkillLoadFailed { name, source }) => {
             // The skill name was valid and matched an installed skill; the failure is a server-side
@@ -505,7 +605,7 @@ pub(super) async fn run_prompt_turn(
     let agent = &entry.agent;
     let session_uuid = &entry.id;
     let messages = &mut *conversation;
-    let input = input.with_words(prompt_text);
+    let input = input.expanded(parts);
     // An outcome that did not warrant a turn of its own rides on this one, ahead of the editor's
     // prompt rather than as a message of its own: see `background::render_outcomes_riding`.
     let outcomes = if state.shared.config.background.enabled {
@@ -514,11 +614,12 @@ pub(super) async fn run_prompt_turn(
         Vec::new()
     };
     let input = input.riding(outcomes);
-    // Clone the cancellation token so we can probe `is_cancelled()` after the call returns. The
+    // Clone the cancellation token so we can probe `is_canceled()` after the call returns. The
     // spec mandates that any cancel arriving during a turn must surface as `StopReason::Cancelled`,
     // even when the cancellation manifests as a provider / tool error rather than the clean
     // `MekaError::Interrupted` path.
     let cancel_probe = cancellation.clone();
+    let before = agent.session_stats_snapshot();
     let result = agent.run_turn(messages, input, cancellation).await;
     // On both sides of the turn, as every other turn path touches: the idle sweep measures from
     // the last touch, and a long turn touched at its start alone would read as idle at its end.
@@ -530,7 +631,7 @@ pub(super) async fn run_prompt_turn(
         Ok(crate::agent::TurnOutcome::Refusal(_)) => StopReason::Refusal,
         Err(MekaError::Interrupted) => StopReason::Cancelled,
         Err(error) => {
-            if cancel_probe.is_cancelled() {
+            if cancel_probe.is_canceled() {
                 StopReason::Cancelled
             } else {
                 // Through the one classifier, which decides what of a failed turn an editor may
@@ -554,21 +655,38 @@ pub(super) async fn run_prompt_turn(
         messages.title(),
     );
 
-    responder.respond(PromptResponse::new(stop_reason).usage(session_usage(agent)))
+    let after = agent.session_stats_snapshot();
+    responder.respond(PromptResponse::new(stop_reason).usage(turn_usage(&before, &after)))
 }
-/// Session-cumulative token counts for `session/prompt`'s response. Complements the per-turn
-/// `usage_update` notification, which carries the context gauge rather than these totals.
-pub(super) fn session_usage(agent: &Agent) -> Usage {
-    let snapshot = agent.session_stats_snapshot();
-    let mut usage = Usage::new(
-        snapshot
-            .total_input_tokens()
-            .saturating_add(snapshot.output_tokens),
-        snapshot.input_tokens,
-        snapshot.output_tokens,
+/// What one turn spent, for `session/prompt`'s response, which the protocol defines as the turn's
+/// usage: the session's counters after it less before, so a sub-agent's spend and a compaction's
+/// inside the turn count toward it. The `usage_update` notification carries the context gauge
+/// instead.
+pub(super) fn turn_usage(
+    before: &crate::stats::SessionStatsSnapshot,
+    after: &crate::stats::SessionStatsSnapshot,
+) -> Usage {
+    let spent = |after: u64, before: u64| after.saturating_sub(before);
+    let input = spent(after.input_tokens, before.input_tokens);
+    let output = spent(after.output_tokens, before.output_tokens);
+    let cache_read = spent(
+        after.cache_read_input_tokens,
+        before.cache_read_input_tokens,
     );
-    usage.cached_read_tokens = Some(snapshot.cache_read_input_tokens);
-    usage.cached_write_tokens = Some(snapshot.cache_creation_input_tokens);
+    let cache_write = spent(
+        after.cache_creation_input_tokens,
+        before.cache_creation_input_tokens,
+    );
+    let mut usage = Usage::new(
+        input
+            .saturating_add(cache_read)
+            .saturating_add(cache_write)
+            .saturating_add(output),
+        input,
+        output,
+    );
+    usage.cached_read_tokens = Some(cache_read);
+    usage.cached_write_tokens = Some(cache_write);
     // `thought_tokens` is left at its `None` default: meka doesn't meter reasoning separately from
     // output, and reporting a made-up split would be worse than reporting none.
     usage
