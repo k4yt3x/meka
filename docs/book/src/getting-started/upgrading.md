@@ -32,6 +32,11 @@ conversions need nothing from you:
 Session archives are `format_version` 21. A 0.87 archive imports as it is, its turns and
 compactions converted the same way.
 
+An ACP client that did not advertise `session.compaction` is shown each compaction as a
+`tool_call` of kind `think`, closed under the sentence for what set it going, where 0.87 told it
+in a `[meka]` chunk or a `notice`. A client that matched those for a compaction should match the
+card, or advertise the capability and read `compaction_update`.
+
 ## 0.86 to 0.87
 
 Nothing in `config.toml` is renamed. The store moves forward on its first open, and 0.86 refuses a

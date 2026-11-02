@@ -336,7 +336,7 @@ You can say what to keep:
 /compact keep the auth refactor decisions, drop the debugging
 ```
 
-The screen marks it with a rule, `→← Context compacted`, which opens to what set it going, the checkpoint's calls (each memory it wrote among them) and the summary the agent now reads. An editor without compaction support says it in one line, which names what was written, because memories are durable and instance-scoped; a one-shot run logs the same line, shown with `-v`:
+The screen marks it with a rule, `→← Context compacted`, which opens to what set it going, the checkpoint's calls (each memory it wrote among them) and the summary the agent now reads. An editor shows it as a compaction entry, or as a card where it has none, with the checkpoint's calls after it. A one-shot run logs one line, shown with `-v`, which names what was written, because memories are durable and instance-scoped:
 
 ```text
 Compacted the conversation on user request. Wrote 2 memories: deploy-pipeline-quirks, api-rate-limits.

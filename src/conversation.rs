@@ -223,9 +223,9 @@ pub(crate) struct CompactionRecord {
 
 impl CompactionRecord {
     /// What the compaction was, in one line: the sentence for what set it going, then what differs
-    /// from the ordinary case. Said where a compaction is one line nobody can open: in an editor
-    /// without the protocol's compaction entry, on the export's marker and as the one-shot's note.
-    /// The screen says the [`Self::headline`] and shows the rest when the row is opened.
+    /// from the ordinary case. Said where a compaction is one line nobody can open: on the export's
+    /// marker and as the one-shot's note. The screen and an editor's card say the
+    /// [`Self::headline`] and show the rest when the row or the card is opened.
     ///
     /// The memories are named because they are durable and instance-scoped: notes accumulating
     /// unmentioned under an event whose name suggests it only removes things is the surprise this
@@ -234,13 +234,21 @@ impl CompactionRecord {
     /// explanation for the difference.
     pub(crate) fn note(&self) -> String {
         let mut line = String::from(self.headline());
-        for departure in self.departures() {
+        for particular in self.particulars() {
             line.push(' ');
-            line.push_str(departure);
+            line.push_str(&particular);
         }
+        line
+    }
+
+    /// What the [`Self::note`] says past its headline, a sentence each: the departures, then the
+    /// memories written.
+    pub(crate) fn particulars(&self) -> Vec<String> {
+        let mut particulars: Vec<String> =
+            self.departures().into_iter().map(String::from).collect();
         if !self.memories_written.is_empty() {
-            line.push_str(&format!(
-                " Wrote {} {}: {}.",
+            particulars.push(format!(
+                "Wrote {} {}: {}.",
                 self.memories_written.len(),
                 if self.memories_written.len() == 1 {
                     "memory"
@@ -250,7 +258,7 @@ impl CompactionRecord {
                 self.memories_written.join(", "),
             ));
         }
-        line
+        particulars
     }
 
     /// The sentence for what set the compaction going.

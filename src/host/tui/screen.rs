@@ -1402,15 +1402,13 @@ impl Screen {
             self.show_hint("Discarded: the turn had already been stopped");
             return;
         }
-        let word = match decision {
-            ApprovalDecision::Allow => "allowed",
-            ApprovalDecision::AllowAlways => "allowed for the session",
-            ApprovalDecision::Deny => "denied",
-            ApprovalDecision::DenyAlways => "denied for the session",
-        };
-        self.push(Item::note(format!(
-            "{} {word}",
-            one_line(&request.tool_name, 64)
+        self.push(Item::note(crate::frontend::approval_answered(
+            &one_line(&request.tool_name, 64),
+            decision.allows(),
+            matches!(
+                decision,
+                ApprovalDecision::AllowAlways | ApprovalDecision::DenyAlways
+            ),
         )));
         if request.responder.send(decision).is_err() {
             tracing::warn!("failed to send the approval answer: the agent is gone");

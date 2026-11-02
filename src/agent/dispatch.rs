@@ -349,8 +349,17 @@ impl Agent {
             // Approval resolves *before* a detach, never inside it. A prompt surfacing minutes
             // after the turn that caused it, with nothing on screen to explain it, is worse than
             // the round trip it would save.
+            //
+            // A checkpoint's call was never announced: the compaction tells each call as it
+            // finishes, under the id its caller resolved the call by. Its own submission is no
+            // call the compaction tells, and no level asks about it.
+            let prompted = match door {
+                CallDoor::Dispatch => Some(PromptedCall::Announced(tool_call_id.to_string())),
+                CallDoor::Checkpoint => Some(PromptedCall::Unannounced(tool_call_id.to_string())),
+                CallDoor::CheckpointSubmission => None,
+            };
             if let Some(denial) = self
-                .request_approval(tool_call_id, name, input, detach, &cancellation)
+                .request_approval(prompted, name, input, detach, &cancellation)
                 .await
             {
                 return denial;
@@ -418,7 +427,7 @@ impl Agent {
     /// explain what it belonged to.
     pub(super) async fn request_approval(
         &self,
-        tool_call_id: &str,
+        tool_call: Option<PromptedCall>,
         name: &str,
         input: &serde_json::Value,
         detach: bool,
@@ -433,7 +442,7 @@ impl Agent {
                 primary_param,
                 input: approval_input(input, detach),
                 cancellation: cancellation.clone(),
-                tool_call_id: Some(tool_call_id.to_string()),
+                tool_call,
                 subagent_id: None,
             })
             .await;

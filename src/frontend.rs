@@ -521,6 +521,16 @@ pub(crate) enum FrontendEvent {
         input: serde_json::Value,
         display_summary: Option<String>,
     },
+    /// A call the stream announced that nothing will run: its round was cut, or ended on an error
+    /// the turn recovered from, and the turn went on, or its stream was retried and the call did
+    /// not come again. Nothing completes it, and the conversation keeps no trace of it. A call the
+    /// turn's last round left is the turn's end to settle.
+    ToolCallDropped {
+        id: String,
+        /// Whether a [`Self::ToolCallStarted`] announced it; else only its
+        /// [`Self::ToolCallComposing`] did, its arguments unfinished.
+        started: bool,
+    },
     /// A previously-announced tool call has finished. Emitted once per tool in source order after
     /// the parallel dispatch settles. The screen closes the call's row with it; the ACP impl
     /// translates it to `session/update: tool_call_update` with `status: completed | failed`.
@@ -624,6 +634,18 @@ pub(crate) enum FrontendEvent {
         error: String,
         interrupted: bool,
     },
+    /// A call of a compaction's checkpoint finished, under the id [`checkpoint_call_id`] gives
+    /// it, as the compaction's record keeps the call and its result. A screen shows the
+    /// checkpoint once the compaction lands, from the record; an editor is told each call as it
+    /// finishes, since what a call wrote stays written however the compaction ends.
+    CheckpointCallCompleted {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        content: Vec<crate::conversation::ToolResultContent>,
+        is_error: bool,
+        display: Option<crate::conversation::ResultDisplay>,
+    },
 }
 
 /// Structured side-channel a tool can attach to its [`crate::tools::ToolOutput`] for frontends that
@@ -698,15 +720,41 @@ pub(crate) struct PermissionRequest {
     /// round-trip against this so a `session/cancel` during an approval prompt resolves promptly
     /// instead of hanging until the client replies.
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
-    /// The tool call the prompt is about, as this frontend announced it: the call's own id for
-    /// the session's call, and for a sub-agent's, the parent's `agent_spawn` call it runs under,
-    /// which is the one the parent's client has shown. Each forwarding adapter sets its own, so
-    /// the outermost, the one the client knows, is what arrives. `None` where no call is in scope.
-    pub(crate) tool_call_id: Option<String>,
+    /// The tool call the prompt is about. `None` where no call the client is shown is in scope,
+    /// as for a sub-agent's: its calls are rolled into the parent's `agent_spawn` call, so the
+    /// forwarding adapter takes the call off the request.
+    pub(crate) tool_call: Option<PromptedCall>,
     /// The sub-agent whose call this is, when the request reaches a frontend through its
     /// parent's. `None` for the session's own call. Set by the innermost forwarding adapter, so a
     /// grandchild's prompt names the grandchild.
     pub(crate) subagent_id: Option<uuid::Uuid>,
+}
+
+/// The tool call a prompt is about, by the id a frontend shows it under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PromptedCall {
+    /// A call the frontend was told of before the prompt, by a `ToolCallStarted`.
+    Announced(String),
+    /// A call the frontend was never told of: a compaction checkpoint's, which the compaction
+    /// reports once it ends, under the id [`checkpoint_call_id`] gives it.
+    Unannounced(String),
+}
+
+/// The id a compaction checkpoint's call is shown under: the compaction's id and the call's place
+/// among the checkpoint's calls, from 1, since a provider may use one call id in every round.
+pub(crate) fn checkpoint_call_id(compaction_id: &str, place: usize) -> String {
+    format!("{compaction_id}/{place}")
+}
+
+/// What an answer to an approval prompt is said as: the tool, then what was decided.
+pub(crate) fn approval_answered(tool_name: &str, allowed: bool, for_the_session: bool) -> String {
+    let word = match (allowed, for_the_session) {
+        (true, false) => "allowed",
+        (true, true) => "allowed for the session",
+        (false, false) => "denied",
+        (false, true) => "denied for the session",
+    };
+    format!("{tool_name} {word}")
 }
 
 /// Outcome of a [`Frontend::request_permission`] call.
@@ -738,8 +786,9 @@ pub(crate) enum PermissionOutcome {
 /// the delegate.
 pub(crate) struct PermissionForwardingFrontend {
     delegate: Arc<dyn Frontend>,
-    /// The parent's `tool_use_id` for the `agent_spawn` call this sub-agent is running under, when
-    /// one is in scope. `None` outside a tool call (tests, direct construction), which disables
+    /// The `agent_spawn` call this sub-agent is running under, by the id the parent's frontend
+    /// shows it under (the provider's id, or the one an ACP frontend sent the call as), when one
+    /// is in scope. `None` outside a tool call (tests, direct construction), which disables
     /// activity forwarding rather than guessing at a correlation id.
     tool_call_id: Option<String>,
     /// Rolling record of what the sub-agent has done, oldest first, capped at
@@ -853,9 +902,9 @@ impl Frontend for PermissionForwardingFrontend {
         if request.subagent_id.is_none() {
             request.subagent_id = self.subagent_id;
         }
-        if let Some(spawn_call) = &self.tool_call_id {
-            request.tool_call_id = Some(spawn_call.clone());
-        }
+        // The sub-agent's call is not one the parent's client is shown, and a prompt put on the
+        // `agent_spawn` call would recast that call as the one asked about.
+        request.tool_call = None;
         self.delegate.request_permission(request).await
     }
 
@@ -1228,7 +1277,7 @@ mod tests {
                 primary_param: Some("/tmp/foo".to_string()),
                 input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             })
             .await;
@@ -1366,7 +1415,7 @@ mod tests {
                 primary_param: Some("rm -rf /".to_string()),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             })
             .await;
@@ -1689,7 +1738,7 @@ mod tests {
                 primary_param: Some("/tmp/foo".into()),
                 input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             })
             .await;

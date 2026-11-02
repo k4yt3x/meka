@@ -1006,8 +1006,12 @@ impl OutputRelay {
     /// The id has to be captured here rather than inside the drain task: it lives in a task-local
     /// scoped by `Agent::resolve_and_execute_tool`, and `tokio::spawn` does not inherit
     /// task-locals. The relay for a call a model made; a call with no tool-use id has nothing to
-    /// tag chunks with.
+    /// tag chunks with, and a detached call has no view open anywhere: its call returned when it
+    /// detached, so a chunk would land on whatever call the id names next.
     fn for_call(context: &crate::tools::ToolContext) -> Option<Self> {
+        if context.task_id.is_some() {
+            return None;
+        }
         context.tool_call_id.clone().map(|tool_call_id| Self {
             frontend: Arc::clone(&context.frontend),
             tool_call_id,
@@ -1428,6 +1432,24 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+
+    /// A detached command streams nothing: its call returned when it detached, so a chunk would
+    /// land on whatever call the id names next. A call that waits for its command streams.
+    #[test]
+    fn a_detached_command_streams_no_output() {
+        // `detached` is the constructor for a call outside any session; the task id is what
+        // makes a call a background one.
+        let waited_for = crate::tools::ToolContext {
+            tool_call_id: Some("call_0".to_string()),
+            ..crate::tools::ToolContext::detached(CancellationToken::new())
+        };
+        assert!(OutputRelay::for_call(&waited_for).is_some());
+        let in_the_background = crate::tools::ToolContext {
+            task_id: Some("7f3a1c22".to_string()),
+            ..waited_for
+        };
+        assert!(OutputRelay::for_call(&in_the_background).is_none());
+    }
 
     fn shared_permission_for_test() -> crate::permission::SharedPermission {
         crate::permission::SharedPermission::new(

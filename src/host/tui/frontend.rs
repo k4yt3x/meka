@@ -390,7 +390,7 @@ mod tests {
                 primary_param: Some("/tmp/x".to_string()),
                 input: serde_json::json!({"path": "/tmp/x"}),
                 cancellation,
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             }),
         )
@@ -412,7 +412,7 @@ mod tests {
             primary_param: None,
             input: serde_json::json!({"command": "ls"}),
             cancellation: tokio_util::sync::CancellationToken::new(),
-            tool_call_id: None,
+            tool_call: None,
             subagent_id: None,
         };
         let asking = tokio::spawn({

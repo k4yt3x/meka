@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    frontend::Delegation,
+    frontend::{Delegation, PromptedCall},
     host::{LiveOutput, LiveOutputMode},
 };
 
@@ -134,6 +134,12 @@ pub(crate) struct AcpFrontend {
     /// running total has to be kept somewhere; the emitter sends deltas, and this is where
     /// they are added up. Entries are dropped when the call completes.
     pub(super) live_output: std::sync::Mutex<std::collections::HashMap<String, LiveOutput>>,
+    /// The compaction checkpoint's calls a prompt opened a card for, which the compaction's report
+    /// completes rather than opens: the prompt is the first the client hears of such a call.
+    pub(super) prompted: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The ids the client knows this session's tool calls by; see [`CallIds`]. The replay a load
+    /// sends goes through it too, so a call after the load is told apart from the replayed ones.
+    pub(super) call_ids: std::sync::Mutex<CallIds>,
     /// The same cell the session entry holds, so a client round-trip started by this frontend can
     /// be abandoned when `session/cancel` fires. Shared rather than copied: every turn installs a
     /// token of its own, and a frontend holding a stale clone would race against a token nobody
@@ -161,6 +167,9 @@ pub(super) const META_TERMINAL_EXIT: &str = "terminal_exit";
 /// The `_meta` key under which a `compaction_update` carries meka's facts about the compaction:
 /// what set it going, and once it lands, the fields of the `context.compacted` event.
 pub(super) const META_COMPACTION: &str = "compaction";
+/// The title of the card a running compaction is for a client without the protocol's compaction
+/// entry: the screen's words for the same moment.
+const COMPACTION_CARD_TITLE: &str = "Compacting the conversation";
 /// The `_meta` key under which the notice for a background report carries the tasks that reported,
 /// each as the HTTP API's task object.
 pub(super) const META_BACKGROUND: &str = "background";
@@ -188,11 +197,160 @@ pub(super) struct AcpClientLink {
     pub(super) transport_dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// How an approval prompt was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answered {
+    /// For this call alone.
+    Once,
+    /// For this call and every later call to the tool.
+    ForTheSession,
+    /// Not by the user: the prompt timed out, the transport failed, or the turn was stopped.
+    Unanswered,
+}
+
+/// What the client already shows of a session when its frontend is built.
+pub(super) enum EditorThread {
+    /// Nothing: a new session, or one `session/load` is about to replay.
+    Empty,
+    /// A thread no frontend of this process sent: a resumed, forked or reopened session's, whose
+    /// cards may carry any id the provider gave.
+    Inherited,
+}
+
+/// The ids the client knows this session's tool calls by. The protocol wants a call's id unique
+/// within the session, and a provider may give one id to every call, or reuse its ids from round
+/// to round, while a client fills in the newest card it holds under an id. So a call whose id the
+/// client may already hold is sent under one minted here, and every later report of the call goes
+/// under what it was sent as.
+pub(super) struct CallIds {
+    /// Unique to this frontend, so an id minted here is one no earlier frontend sent.
+    token: String,
+    /// Whether the client may hold cards under ids this frontend never saw.
+    inherited: bool,
+    minted: usize,
+    /// Each provider id's calls still running, by what they were sent as, oldest first.
+    running: std::collections::HashMap<String, std::collections::VecDeque<String>>,
+    /// Each provider id's newest call, by what it was sent as: every id this frontend has sent a
+    /// call under.
+    newest: std::collections::HashMap<String, String>,
+    /// The calls that run a worker and whose worker has not taken its card yet, by what they were
+    /// sent as, oldest first: a background spawn's worker starts after its call returned, by
+    /// which time a later call may be the one under the provider's id.
+    workers: std::collections::HashMap<String, std::collections::VecDeque<String>>,
+}
+
+impl CallIds {
+    pub(super) fn new(thread: EditorThread) -> Self {
+        Self {
+            token: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
+            inherited: matches!(thread, EditorThread::Inherited),
+            minted: 0,
+            running: std::collections::HashMap::new(),
+            newest: std::collections::HashMap::new(),
+            workers: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The id a call starting under the provider's `id` is sent as.
+    pub(super) fn open(&mut self, id: &str) -> String {
+        let sent = if !self.inherited && !self.newest.contains_key(id) {
+            id.to_string()
+        } else {
+            self.minted += 1;
+            format!("{id}#{}-{}", self.token, self.minted)
+        };
+        self.running
+            .entry(id.to_string())
+            .or_default()
+            .push_back(sent.clone());
+        self.newest.insert(id.to_string(), sent.clone());
+        sent
+    }
+
+    /// What the oldest call still running under the provider's `id` was sent as.
+    pub(super) fn running(&self, id: &str) -> Option<String> {
+        self.running
+            .get(id)
+            .and_then(|calls| calls.front())
+            .cloned()
+    }
+
+    /// What the call a report under the provider's `id` is about was sent as: the oldest still
+    /// running, else the newest, as a sub-agent left running after its call returned reports.
+    pub(super) fn current(&self, id: &str) -> Option<String> {
+        self.running(id).or_else(|| self.newest.get(id).cloned())
+    }
+
+    /// End the oldest call running under the provider's `id`, and say what it was sent as. A
+    /// completion for a call that never started is sent under the id it names.
+    pub(super) fn close(&mut self, id: &str) -> String {
+        self.close_running(id)
+            .or_else(|| self.newest.get(id).cloned())
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// End the oldest call running under the provider's `id`, if one is, and say what it was sent
+    /// as.
+    pub(super) fn close_running(&mut self, id: &str) -> Option<String> {
+        let closed = self
+            .running
+            .get_mut(id)
+            .and_then(std::collections::VecDeque::pop_front);
+        if self
+            .running
+            .get(id)
+            .is_some_and(std::collections::VecDeque::is_empty)
+        {
+            self.running.remove(id);
+        }
+        closed
+    }
+
+    /// Keep the card of a call that runs a worker, `sent` under the provider's `id`, for its worker
+    /// to take.
+    pub(super) fn await_worker(&mut self, id: &str, sent: &str) {
+        self.workers
+            .entry(id.to_string())
+            .or_default()
+            .push_back(sent.to_string());
+    }
+
+    /// The card a worker started by a call under the provider's `id` reports on: the oldest such
+    /// call whose worker has not taken its card, else the call [`Self::current`] names.
+    pub(super) fn take_worker(&mut self, id: &str) -> Option<String> {
+        let taken = self
+            .workers
+            .get_mut(id)
+            .and_then(std::collections::VecDeque::pop_front);
+        if self
+            .workers
+            .get(id)
+            .is_some_and(std::collections::VecDeque::is_empty)
+        {
+            self.workers.remove(id);
+        }
+        taken.or_else(|| self.current(id))
+    }
+
+    /// Let go of the cards no worker took: a call refused before its worker started leaves one,
+    /// and the turn's end comes after any background worker of its started, since a turn answers
+    /// its tool results with a round of its own.
+    pub(super) fn forget_workers(&mut self) {
+        self.workers.clear();
+    }
+
+    /// End every call still running, and say what each was sent as.
+    pub(super) fn abandon_running(&mut self) -> Vec<String> {
+        self.running.drain().flat_map(|(_, calls)| calls).collect()
+    }
+}
+
 impl AcpFrontend {
     pub(super) fn new(
         link: AcpClientLink,
         cwd: SharedCwd,
         cancel: crate::host::CancelCell,
+        thread: EditorThread,
     ) -> Self {
         let AcpClientLink {
             connection,
@@ -208,6 +366,8 @@ impl AcpFrontend {
             client_state,
             transport_dead,
             live_output: std::sync::Mutex::new(std::collections::HashMap::new()),
+            prompted: std::sync::Mutex::new(std::collections::HashSet::new()),
+            call_ids: std::sync::Mutex::new(CallIds::new(thread)),
             cancel,
         }
     }
@@ -259,6 +419,89 @@ impl AcpFrontend {
     pub(super) fn mark_transport_dead(&self) {
         self.transport_dead
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Close the card of a call that never ran, as failed, with the terminal it opened ended.
+    fn close_unrun(&self, id: String) {
+        let terminal = self.live_output().remove(&id).map(|entry| entry.mode)
+            == Some(LiveOutputMode::Terminal);
+        let mut update = ToolCallUpdate::new(
+            id.clone(),
+            ToolCallUpdateFields::new().status(ToolCallStatus::Failed),
+        );
+        if terminal {
+            update = update.meta(terminal_meta(
+                META_TERMINAL_EXIT,
+                serde_json::json!({ "terminal_id": id, "exit_code": null, "signal": null }),
+            ));
+        }
+        self.send_update(SessionUpdate::ToolCallUpdate(update));
+    }
+
+    /// Put `tool_call` to the client and read its answer, raced against the turn's cancellation
+    /// and the approval timeout, and how it was answered.
+    async fn ask_permission(
+        &self,
+        request: &PermissionRequest,
+        tool_call: ToolCallUpdate,
+        options: Vec<PermissionOption>,
+    ) -> (PermissionOutcome, Answered) {
+        let acp_request =
+            RequestPermissionRequest::new(self.session_id.clone(), tool_call, options);
+        // Race the round-trip against the per-turn cancellation token. If `session/cancel` fires
+        // while we're waiting for the client to answer the approval prompt, we resolve as
+        // `Canceled` instead of holding the runtime mutex forever, which would block
+        // `session/close` and `session/set_mode` too.
+        let response = tokio::select! {
+            biased;
+            _ = request.cancellation.cancelled() => {
+                return (PermissionOutcome::Canceled, Answered::Unanswered);
+            }
+            // The backstop the cancellation race alone does not provide. A client that is
+            // *connected* but never answers -- an editor whose UI thread is wedged, a headless
+            // harness that speaks ACP but implements no prompt -- fires no cancellation, so the
+            // race above waits on it forever and the turn holds the runtime mutex with it. Deny on
+            // expiry rather than allow: an unanswered prompt is not consent.
+            _ = tokio::time::sleep(crate::frontend::APPROVAL_TIMEOUT) => {
+                tracing::warn!(
+                    "the client did not answer the approval prompt for '{tool}' within \
+                     {timeout:?}; denying it",
+                    tool = request.tool_name,
+                    timeout = crate::frontend::APPROVAL_TIMEOUT,
+                );
+                return (PermissionOutcome::Deny, Answered::Unanswered);
+            }
+            result = self.connection.send_request(acp_request).block_task() => match result {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::debug!("failed to send session/request_permission: {error}");
+                    // Spec-conformant clients always reply with a `Selected` or `Cancelled`
+                    // outcome, so an `Err` here is almost certainly transport-level. Mark the
+                    // connection dropped so the agent loop short-circuits on the next pre-iteration
+                    // check instead of running a tool, emitting a denied result, and only then
+                    // discovering the client is gone via the next emit. The FS delegates
+                    // intentionally don't do this: those paths legitimately receive JSON-RPC error
+                    // responses (a path the client won't serve), which would produce false-positive
+                    // disconnects.
+                    self.mark_transport_dead();
+                    return (PermissionOutcome::Deny, Answered::Unanswered);
+                }
+            },
+        };
+
+        let mut answered = Answered::Once;
+        let outcome =
+            translate_permission_outcome(response.outcome, &request.tool_name, |sticky| {
+                answered = Answered::ForTheSession;
+                match sticky {
+                    StickyDecision::AllowAlways => self.sticky.remember_allow(&request.tool_name),
+                    StickyDecision::RejectAlways => self.sticky.remember_deny(&request.tool_name),
+                }
+            });
+        if outcome == PermissionOutcome::Canceled {
+            answered = Answered::Unanswered;
+        }
+        (outcome, answered)
     }
 
     /// Push one `session/update` to the client, latching the transport as dead if it fails.
@@ -346,6 +589,14 @@ impl Frontend for AcpFrontend {
                 // first one the client sees. The title carries the resolved primary argument (the
                 // command, file path, URL, ...) so editors show what's actually running instead of
                 // a bare tool name; `raw_input` still carries the full argument object.
+                let id = {
+                    let mut call_ids = crate::sync::lock(&self.call_ids);
+                    let sent = call_ids.open(&id);
+                    if crate::tools::subagent::runs_a_worker(&name) {
+                        call_ids.await_worker(&id, &sent);
+                    }
+                    sent
+                };
                 let locations = tool_locations(&name, &input, &self.cwd);
                 let title = tool_call_title(&name, display_summary.as_deref());
                 let mut call = ToolCall::new(id.clone(), title)
@@ -373,6 +624,9 @@ impl Frontend for AcpFrontend {
                 SessionUpdate::ToolCall(call)
             }
             FrontendEvent::ToolCallOutputDelta { id, chunk } => {
+                let Some(id) = crate::sync::lock(&self.call_ids).running(&id) else {
+                    return;
+                };
                 // stdout and stderr drain on separate tasks, so two deltas for the same call can
                 // be in flight on two threads at once. Terminal mode appends whatever it is handed,
                 // so draining the buffer and sending it have to be one atomic step: release the
@@ -403,8 +657,9 @@ impl Frontend for AcpFrontend {
                 is_error,
                 content,
                 metadata,
-                ..
+                display,
             } => {
+                let id = crate::sync::lock(&self.call_ids).close(&id);
                 let live = {
                     // The completion update carries the authoritative output, so the live view has
                     // done its job either way; take the mode and any bytes the throttle swallowed.
@@ -447,7 +702,12 @@ impl Frontend for AcpFrontend {
                         }),
                     ));
                 } else {
-                    fields = fields.content(build_completion_content(&name, &content, metadata));
+                    fields = fields.content(build_completion_content(
+                        &name,
+                        &content,
+                        metadata,
+                        display.as_ref(),
+                    ));
                 }
                 // Surface the structured tool output too, so clients (e.g. Zed's tool-call detail
                 // view) can introspect the result beyond the rendered `content` blocks.
@@ -469,58 +729,62 @@ impl Frontend for AcpFrontend {
                 // content while the call is still `in_progress` is what turns an opaque spinner
                 // into a live view of what the sub-agent is doing. The client replaces the content
                 // array on each update, which is why `summary` is the whole block.
+                // Already the id the card was sent under; see `for_subagent`.
                 let fields = ToolCallUpdateFields::new().content(vec![text_content_block(summary)]);
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id, fields))
             }
             FrontendEvent::Notice(notice) => {
                 notice_update(&notice, self.client_state.renders_notices())
             }
-            // A client that advertised `session.compaction` renders a compaction entry of its own,
-            // opened here and closed by the event that next names the id. The protocol lets an
-            // agent send the update to no other client.
             FrontendEvent::CompactionStarted { id, trigger } => {
-                if !self.client_state.renders_compactions() {
-                    return;
-                }
-                SessionUpdate::CompactionUpdate(
-                    CompactionUpdate::new(id, CompactionStatus::InProgress).meta(terminal_meta(
-                        META_COMPACTION,
-                        serde_json::json!({ "trigger": trigger.name() }),
-                    )),
-                )
+                compaction_started_update(&self.client_state, id, trigger)
             }
             // An editor holds a transcript, not a mirror of the model's window, so nothing on
             // screen is invalidated; but the automatic compactions happen with nobody asking, and
-            // a user whose next reply forgets the morning deserves to know why. A client without
-            // the entry is told in the record's own sentence.
+            // a user whose next reply forgets the morning deserves to know why.
             FrontendEvent::Compacted {
                 id,
                 record,
                 replaced_count,
                 generation,
-            } => compacted_update(&self.client_state, id, &record, replaced_count, generation),
+            } => compacted_update(
+                &self.client_state,
+                id,
+                &record,
+                replaced_count,
+                generation,
+                true,
+            ),
             FrontendEvent::CompactionFailed {
                 id,
                 trigger,
                 error,
                 interrupted,
+            } => compaction_failed_update(&self.client_state, id, trigger, error, interrupted),
+            // Told as it finishes, since what it wrote stays written however the compaction ends.
+            // A call put to the client has the card its prompt opened.
+            FrontendEvent::CheckpointCallCompleted {
+                id,
+                name,
+                input,
+                content,
+                is_error,
+                display,
             } => {
-                if !self.client_state.renders_compactions() {
-                    return;
-                }
-                let status = if interrupted {
-                    CompactionStatus::Cancelled
+                let call = checkpoint_call(
+                    id,
+                    &name,
+                    &input,
+                    Some((&content, is_error, display.as_ref())),
+                    &self.cwd,
+                );
+                let prompted =
+                    crate::sync::lock(&self.prompted).remove(call.tool_call_id.0.as_ref());
+                if prompted {
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::from(call))
                 } else {
-                    CompactionStatus::Failed
-                };
-                SessionUpdate::CompactionUpdate(
-                    CompactionUpdate::new(id, status)
-                        .error(error)
-                        .meta(terminal_meta(
-                            META_COMPACTION,
-                            serde_json::json!({ "trigger": trigger.name(), "interrupted": interrupted }),
-                        )),
-                )
+                    SessionUpdate::ToolCall(call)
+                }
             }
             FrontendEvent::McpProgress(update) => {
                 // ACP has no protocol primitive for tool-progress streams. The screen renders these
@@ -623,13 +887,44 @@ impl Frontend for AcpFrontend {
                 }
                 return;
             }
+            // A call whose arguments never finished was never shown, so it has no card to close.
+            FrontendEvent::ToolCallDropped { id, started } => {
+                if !started {
+                    return;
+                }
+                let dropped = crate::sync::lock(&self.call_ids).close_running(&id);
+                if let Some(id) = dropped {
+                    self.close_unrun(id);
+                }
+                return;
+            }
+            // A call still running when its turn ends never ran: its stream was cut and the turn
+            // ended there. A stop the client asked for is the client's to mark, as the protocol
+            // has it do for every call unfinished at a `session/cancel`.
+            FrontendEvent::TurnEnded { ending, .. } => {
+                let unrun = {
+                    let mut call_ids = crate::sync::lock(&self.call_ids);
+                    call_ids.forget_workers();
+                    call_ids.abandon_running()
+                };
+                if ending.reason == Some(crate::store::turns::CancelReason::Client) {
+                    let mut live = self.live_output();
+                    for id in &unrun {
+                        live.remove(id);
+                    }
+                } else {
+                    for id in unrun {
+                        self.close_unrun(id);
+                    }
+                }
+                return;
+            }
             // Screen signage. The editor named the session it created, and the `session/prompt`
             // response is what tells it the turn is over. A withdrawn prompt is a scheduled fire's,
             // never one the editor sent, so its transcript has nothing to amend. Spelled out rather
             // than left to a catch-all so a variant added later has to be placed here on purpose.
             FrontendEvent::SessionStarted { .. }
             | FrontendEvent::TurnFinished
-            | FrontendEvent::TurnEnded { .. }
             | FrontendEvent::PromptWithdrawn
             | FrontendEvent::InboxDelivered { .. }
             | FrontendEvent::Nudged { .. } => return,
@@ -643,14 +938,37 @@ impl Frontend for AcpFrontend {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The default adapter, told the call that runs the worker by the id its card was sent under:
+    /// a worker can outlast its call, as a background spawn's does, so its activity names the card
+    /// rather than whichever call holds the provider's id when it reports.
+    fn for_subagent(
+        &self,
+        this: Arc<dyn Frontend>,
+        child: uuid::Uuid,
+        tool_call_id: Option<String>,
+    ) -> Arc<dyn Frontend> {
+        let card = tool_call_id.map(|id| {
+            crate::sync::lock(&self.call_ids)
+                .take_worker(&id)
+                .unwrap_or(id)
+        });
+        Arc::new(crate::frontend::PermissionForwardingFrontend::new(
+            this,
+            card,
+            Some(child),
+        ))
+    }
+
     async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
         // Honor sticky decisions from earlier `*_always` selections.
         if let Some(remembered) = self.sticky.remembered(&request.tool_name) {
             return remembered;
         }
-
-        let connection = self.connection.clone();
-        let session_id = self.session_id.clone();
+        // A turn already stopped has nobody to ask, and a card opened for the question would only
+        // close again.
+        if request.cancellation.is_cancelled() {
+            return PermissionOutcome::Canceled;
+        }
 
         // The sticky options name the *tool*, because that is their scope: the decision is keyed on
         // the tool name alone and applies to every later call to it, whatever its arguments. The
@@ -674,78 +992,75 @@ impl Frontend for AcpFrontend {
             ),
         ];
 
-        // The call the editor already shows, so it turns that card to awaiting confirmation
-        // rather than drawing a second one nothing ever completes; a made-up id only where no call
-        // is in scope.
-        let tool_call_id = request
-            .tool_call_id
-            .clone()
-            .unwrap_or_else(|| format!("permission-{}", uuid::Uuid::new_v4()));
+        // The call the editor already shows turns to awaiting confirmation rather than a second
+        // card being drawn. One it was never shown is opened first, so the request names a call
+        // the client knows: a checkpoint's, under the id the compaction's report completes it by,
+        // or with no call in scope, as for a sub-agent's, a card of the prompt's own, closed once
+        // answered since no report follows.
+        let (tool_call_id, announced, owned) = match request.tool_call.clone() {
+            Some(PromptedCall::Announced(id)) => {
+                let sent = crate::sync::lock(&self.call_ids).current(&id);
+                (sent.unwrap_or(id), true, false)
+            }
+            Some(PromptedCall::Unannounced(id)) => (id, false, false),
+            None => (format!("permission-{}", uuid::Uuid::new_v4()), false, true),
+        };
         // The title is the one line a client is sure to show, and it names the destination for
         // every write-shaped tool; `raw_input` and the content block carry every argument, so a
         // client that renders either shows what is being written and not only where. See
         // `PermissionRequest::input`.
         let title = tool_call_title(&request.tool_name, request.primary_param.as_deref());
+        let content = vec![text_content_block(approval_arguments_block(&request.input))];
+        if !announced {
+            if !owned {
+                crate::sync::lock(&self.prompted).insert(tool_call_id.clone());
+            }
+            self.send_update(SessionUpdate::ToolCall(
+                ToolCall::new(tool_call_id.clone(), title.clone())
+                    .kind(tool_kind_for(&request.tool_name))
+                    .status(ToolCallStatus::Pending)
+                    .content(content.clone())
+                    .raw_input(request.input.clone()),
+            ));
+        }
         let fields = ToolCallUpdateFields::new()
             .kind(tool_kind_for(&request.tool_name))
             .title(title)
             .status(ToolCallStatus::Pending)
-            .content(vec![text_content_block(approval_arguments_block(
-                &request.input,
-            ))])
+            .content(content)
             .raw_input(request.input.clone());
-        let tool_call = ToolCallUpdate::new(tool_call_id, fields);
+        let tool_call = ToolCallUpdate::new(tool_call_id.clone(), fields);
 
-        let acp_request = RequestPermissionRequest::new(session_id, tool_call, options);
-        // Race the round-trip against the per-turn cancellation token. If `session/cancel` fires
-        // while we're waiting for the client to answer the approval prompt, we resolve as
-        // `Canceled` instead of holding the runtime mutex forever, which would block
-        // `session/close` and `session/set_mode` too.
-        let response = tokio::select! {
-            biased;
-            _ = request.cancellation.cancelled() => {
-                return PermissionOutcome::Canceled;
+        let (outcome, answered) = self.ask_permission(&request, tool_call, options).await;
+        // Said as the screen says the answer, since the card stands for the question: the call
+        // itself is reported nowhere the client sees. A stop the client asked for is the client's
+        // to mark, as it marks every call unfinished at a `session/cancel`; any other, a stopped
+        // background task's, is not one it knows of.
+        let client_stopped = outcome == PermissionOutcome::Canceled
+            && self.cancel.live().and_then(|turn| turn.reason())
+                == Some(crate::store::turns::CancelReason::Client);
+        if owned && !client_stopped {
+            let mut fields =
+                ToolCallUpdateFields::new().status(if outcome == PermissionOutcome::Allow {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                });
+            if answered != Answered::Unanswered {
+                fields = fields.content(vec![text_content_block(
+                    crate::frontend::approval_answered(
+                        &request.tool_name,
+                        outcome == PermissionOutcome::Allow,
+                        answered == Answered::ForTheSession,
+                    ),
+                )]);
             }
-            // The backstop the cancellation race alone does not provide. A client that is
-            // *connected* but never answers -- an editor whose UI thread is wedged, a headless
-            // harness that speaks ACP but implements no prompt -- fires no cancellation, so the
-            // race above waits on it forever and the turn holds the runtime mutex with it. Deny on
-            // expiry rather than allow: an unanswered prompt is not consent.
-            _ = tokio::time::sleep(crate::frontend::APPROVAL_TIMEOUT) => {
-                tracing::warn!(
-                    "the client did not answer the approval prompt for '{tool}' within \
-                     {timeout:?}; denying it",
-                    tool = request.tool_name,
-                    timeout = crate::frontend::APPROVAL_TIMEOUT,
-                );
-                return PermissionOutcome::Deny;
-            }
-            result = connection.send_request(acp_request).block_task() => match result {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::debug!("failed to send session/request_permission: {error}");
-                    // Spec-conformant clients always reply with a `Selected` or `Cancelled`
-                    // outcome, so an `Err` here is almost certainly transport-level. Mark the
-                    // connection dropped so the agent loop short-circuits on the next pre-iteration
-                    // check instead of running a tool, emitting a denied result, and only then
-                    // discovering the client is gone via the next emit. The FS delegates
-                    // intentionally don't do this: those paths legitimately receive JSON-RPC error
-                    // responses (a path the client won't serve), which would produce false-positive
-                    // disconnects.
-                    self.mark_transport_dead();
-                    return PermissionOutcome::Deny;
-                }
-            },
-        };
-
-        translate_permission_outcome(
-            response.outcome,
-            &request.tool_name,
-            |sticky| match sticky {
-                StickyDecision::AllowAlways => self.sticky.remember_allow(&request.tool_name),
-                StickyDecision::RejectAlways => self.sticky.remember_deny(&request.tool_name),
-            },
-        )
+            self.send_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                tool_call_id,
+                fields,
+            )));
+        }
+        outcome
     }
 
     async fn delegate_fs_read(
@@ -1188,40 +1503,57 @@ pub(super) fn tool_locations(
     })
     .unwrap_or_default()
 }
-/// The block for a change: the protocol's `diff`, which names a file and its text after the
-/// call, when the change has both, so an editor opens its diff view on the file; otherwise the
-/// change as a unified diff in a `diff` code block, the way a command's output rides in a
-/// `console` one. A memory has no file, and a delete leaves no text, so the protocol's shape
-/// would name a file the editor cannot open or show a deleted skill as a file emptied out.
-pub(super) fn change_content_block(
-    path: Option<std::path::PathBuf>,
-    old_text: Option<String>,
-    new_text: Option<String>,
-) -> ToolCallContent {
-    match (path, new_text) {
-        (Some(path), Some(new_text)) => {
-            let mut diff = Diff::new(path, new_text);
-            if let Some(old) = old_text {
-                diff = diff.old_text(old);
-            }
-            ToolCallContent::Diff(diff)
+/// A recorded change as a unified diff in a `diff` code block. The record holds the change's
+/// hunks, not the texts the protocol's `diff` needs, and each line numbered on one side only, so
+/// the other side's numbers come from how far the hunks before have moved them: the record keeps
+/// the hunks in order and a prefix of them, so those hold every change ahead of this one.
+pub(super) fn recorded_change_block(change: &crate::conversation::Change) -> ToolCallContent {
+    use crate::conversation::ChangeKind;
+    let mut unified = String::new();
+    let mut drift: isize = 0;
+    for hunk in &change.hunks {
+        let Some(first) = hunk.first() else {
+            continue;
+        };
+        let old_lines = hunk
+            .iter()
+            .filter(|line| line.kind != ChangeKind::Added)
+            .count();
+        let new_lines = hunk
+            .iter()
+            .filter(|line| line.kind != ChangeKind::Removed)
+            .count();
+        let number = isize::try_from(first.number).unwrap_or(isize::MAX);
+        let (old_start, new_start) = match first.kind {
+            ChangeKind::Added => (number.saturating_sub(drift), number),
+            ChangeKind::Kept | ChangeKind::Removed => (number, number.saturating_add(drift)),
+        };
+        // A side with no lines is numbered by the line before it, as a unified diff numbers it.
+        let start = |start: isize, lines: usize| if lines == 0 { start - 1 } else { start };
+        unified.push_str(&format!(
+            "@@ -{},{old_lines} +{},{new_lines} @@\n",
+            start(old_start, old_lines),
+            start(new_start, new_lines)
+        ));
+        for line in hunk {
+            unified.push(match line.kind {
+                ChangeKind::Kept => ' ',
+                ChangeKind::Removed => '-',
+                ChangeKind::Added => '+',
+            });
+            unified.push_str(&line.text);
+            unified.push('\n');
         }
-        (path, new_text) => {
-            let diff = similar::TextDiff::from_lines(
-                old_text.as_deref().unwrap_or(""),
-                new_text.as_deref().unwrap_or(""),
-            );
-            let mut unified = diff.unified_diff();
-            // The file lines name the file when there is one; a memory's change is hunks alone,
-            // under a title that already names the memory.
-            if let Some(path) = &path {
-                let path = path.display().to_string();
-                unified.header(&path, "/dev/null");
-            }
-            let fence = fence_for(&unified.to_string());
-            text_content_block(format!("{fence}diff\n{unified}{fence}"))
-        }
+        drift += isize::try_from(new_lines).unwrap_or(0) - isize::try_from(old_lines).unwrap_or(0);
     }
+    let fence = fence_for(&unified);
+    // The screen's words for the lines the record's budget left out.
+    let left_out = match change.lines_left_out() {
+        0 => String::new(),
+        1 => "\n… +1 line".to_string(),
+        lines => format!("\n… +{lines} lines"),
+    };
+    text_content_block(format!("{fence}diff\n{unified}{fence}{left_out}"))
 }
 /// A code fence no line of `text` can close: one backtick longer than the longest run opening a
 /// line, and never shorter than the three a plain block uses. A memory or a skill holds fenced
@@ -1296,14 +1628,29 @@ pub(super) fn build_completion_content(
     tool_name: &str,
     content: &[ToolResultContent],
     metadata: Option<ToolOutputMetadata>,
+    display: Option<&crate::conversation::ResultDisplay>,
 ) -> Vec<ToolCallContent> {
+    // A file the call left text in: the protocol's `diff`, which names the file and its text after
+    // the call, so an editor opens its diff view on it. Only the live run has the texts.
     if let Some(ToolOutputMetadata::Diff {
-        path,
+        path: Some(path),
         old_text,
-        new_text,
+        new_text: Some(new_text),
     }) = metadata
     {
-        return vec![change_content_block(path, old_text, new_text)];
+        let mut diff = Diff::new(path, new_text);
+        if let Some(old) = old_text {
+            diff = diff.old_text(old);
+        }
+        return vec![ToolCallContent::Diff(diff)];
+    }
+    // Any other change, a memory's, which has no file, or a delete's, which leaves no text, as its
+    // result records it, so a replay shows it as the live run did.
+    if let Some(change) = display
+        .and_then(|display| display.change.as_ref())
+        .filter(|change| !change.hunks.is_empty())
+    {
+        return vec![recorded_change_block(change)];
     }
 
     if tool_name == "shell_execute" {
@@ -1379,33 +1726,206 @@ pub(super) fn replay_entries(
     entries
 }
 
+/// The update a compaction's start is. A client that advertised `session.compaction` renders a
+/// compaction entry of its own, opened here and closed by the update that next names the id; the
+/// protocol lets an agent send the entry to no other client, so any other gets a card under the
+/// same id instead.
+pub(super) fn compaction_started_update(
+    client_state: &SharedClientState,
+    id: String,
+    trigger: crate::conversation::CompactionTrigger,
+) -> SessionUpdate {
+    if client_state.renders_compactions() {
+        SessionUpdate::CompactionUpdate(
+            CompactionUpdate::new(id, CompactionStatus::InProgress).meta(terminal_meta(
+                META_COMPACTION,
+                serde_json::json!({ "trigger": trigger.name() }),
+            )),
+        )
+    } else {
+        SessionUpdate::ToolCall(
+            ToolCall::new(id, COMPACTION_CARD_TITLE)
+                .kind(ToolKind::Think)
+                .status(ToolCallStatus::InProgress),
+        )
+    }
+}
+
+/// The update a compaction that ended without replacing the window is. A cancel is the user's own
+/// act, so the entry says it by its status alone; a card has no canceled status, so it closes as
+/// failed and says so.
+pub(super) fn compaction_failed_update(
+    client_state: &SharedClientState,
+    id: String,
+    trigger: crate::conversation::CompactionTrigger,
+    error: String,
+    interrupted: bool,
+) -> SessionUpdate {
+    if client_state.renders_compactions() {
+        let status = if interrupted {
+            CompactionStatus::Cancelled
+        } else {
+            CompactionStatus::Failed
+        };
+        let mut update = CompactionUpdate::new(id, status).meta(terminal_meta(
+            META_COMPACTION,
+            serde_json::json!({ "trigger": trigger.name(), "interrupted": interrupted }),
+        ));
+        if !interrupted {
+            update = update.error(error);
+        }
+        return SessionUpdate::CompactionUpdate(update);
+    }
+    let said = if interrupted {
+        "Interrupted".to_string()
+    } else {
+        format!("Compaction failed: {error}")
+    };
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        id,
+        ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Failed)
+            .content(vec![text_content_block(said)]),
+    ))
+}
+
 /// The update a finished compaction is, live and on a replay alike: the protocol's compaction
-/// entry for a client that advertised `session.compaction`, else the record's note as a notice.
-fn compacted_update(
+/// entry for a client that advertised `session.compaction`, else the card claude-agent-acp shows
+/// such a client, titled by the record's headline. `announced` when the compaction's start opened
+/// the card, which a replay has no record of, so its report is the card's first.
+pub(super) fn compacted_update(
     client_state: &SharedClientState,
     id: String,
     record: &crate::conversation::CompactionRecord,
     replaced_count: usize,
     generation: u64,
+    announced: bool,
 ) -> SessionUpdate {
-    if !client_state.renders_compactions() {
-        return notice_update(
-            &crate::frontend::Notice::info(record.note()),
-            client_state.renders_notices(),
-        );
-    }
     let facts = serde_json::json!(crate::view::CompactionView::new(
         record,
         replaced_count,
         generation
     ));
-    SessionUpdate::CompactionUpdate(
-        CompactionUpdate::new(id, CompactionStatus::Completed)
-            .summary(vec![ContentBlock::Text(
-                agent_client_protocol::schema::v1::TextContent::new(record.written_summary.clone()),
-            )])
-            .meta(terminal_meta(META_COMPACTION, facts)),
-    )
+    // An empty summary would leave an entry that opens onto nothing.
+    let summary =
+        (!crate::text::is_blank(&record.written_summary)).then(|| record.written_summary.clone());
+    if client_state.renders_compactions() {
+        let mut update = CompactionUpdate::new(id, CompactionStatus::Completed)
+            .meta(terminal_meta(META_COMPACTION, facts));
+        if let Some(summary) = summary {
+            update = update.summary(vec![ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new(summary),
+            )]);
+        }
+        return SessionUpdate::CompactionUpdate(update);
+    }
+    let particulars = record.particulars();
+    let mut content = Vec::new();
+    if !particulars.is_empty() {
+        content.push(text_content_block(particulars.join(" ")));
+    }
+    if let Some(summary) = summary {
+        content.push(text_content_block(summary));
+    }
+    if announced {
+        let mut fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .title(record.headline())
+            .raw_output(facts);
+        if !content.is_empty() {
+            fields = fields.content(content);
+        }
+        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields))
+    } else {
+        SessionUpdate::ToolCall(
+            ToolCall::new(id, record.headline())
+                .kind(ToolKind::Think)
+                .status(ToolCallStatus::Completed)
+                .content(content)
+                .raw_output(facts),
+        )
+    }
+}
+
+/// The calls a compaction's checkpoint made, from its record, as the tool calls a replay shows
+/// after the compaction, in the order the live run told them, each under the id
+/// [`crate::frontend::checkpoint_call_id`] gives it. What the checkpoint thought is left out: a
+/// thought after the compaction reads as the reply's.
+///
+/// A round's results are matched to its calls by place, as the record keeps them, since a
+/// provider may give one id to every call.
+pub(super) fn checkpoint_calls(
+    compaction_id: &str,
+    rounds: &[crate::conversation::Message],
+    cwd: &SharedCwd,
+) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    for (index, round) in rounds.iter().enumerate() {
+        if round.role != Role::Assistant {
+            continue;
+        }
+        let mut results = rounds
+            .get(index + 1)
+            .filter(|next| next.role == Role::User)
+            .into_iter()
+            .flat_map(|next| &next.content)
+            .filter_map(|block| match block {
+                MekaContentBlock::ToolResult {
+                    content,
+                    is_error,
+                    display,
+                    ..
+                } => Some((content.as_slice(), *is_error, display.as_ref())),
+                _ => None,
+            });
+        for block in &round.content {
+            let MekaContentBlock::ToolUse { name, input, .. } = block else {
+                continue;
+            };
+            calls.push(checkpoint_call(
+                crate::frontend::checkpoint_call_id(compaction_id, calls.len() + 1),
+                name,
+                input,
+                results.next(),
+                cwd,
+            ));
+        }
+    }
+    calls
+}
+
+/// One call of a compaction's checkpoint as a finished tool call; `result` is `None` for one the
+/// checkpoint never finished.
+pub(super) fn checkpoint_call(
+    id: String,
+    name: &str,
+    input: &serde_json::Value,
+    result: Option<(
+        &[ToolResultContent],
+        bool,
+        Option<&crate::conversation::ResultDisplay>,
+    )>,
+    cwd: &SharedCwd,
+) -> ToolCall {
+    let display_summary = crate::tools::resolve_primary_param(name, input);
+    let call = ToolCall::new(id, tool_call_title(name, display_summary.as_deref()))
+        .kind(tool_kind_for(name))
+        .locations(tool_locations(name, input, cwd))
+        .raw_input(input.clone());
+    let Some((content, is_error, display)) = result else {
+        return call.status(ToolCallStatus::Failed);
+    };
+    let mut call = call
+        .status(if is_error {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        })
+        .content(build_completion_content(name, content, None, display));
+    if let Ok(raw) = serde_json::to_value(content) {
+        call = call.raw_output(raw);
+    }
+    call
 }
 
 /// Walk a session's replayed log and emit one `session/update` notification per content
@@ -1427,9 +1947,10 @@ pub(super) fn replay_session_updates(
     cwd: &SharedCwd,
     entries: &[Replayed<'_>],
     tasks: &[crate::store::background::BackgroundTask],
+    call_ids: &std::sync::Mutex<CallIds>,
 ) {
-    // Map each open `tool_use_id` to its tool name so the result update can format output per tool
-    // and the orphan sweep can close stragglers.
+    // Each open call's name, by the id it was sent as, so the result update can format output per
+    // tool and the orphan sweep can close stragglers.
     let mut open_tools: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for entry in entries {
@@ -1452,8 +1973,12 @@ pub(super) fn replay_session_updates(
                         record,
                         *replaced_count,
                         *generation,
+                        false,
                     ),
                 );
+                for call in checkpoint_calls(id, &record.checkpoint, cwd) {
+                    send_session_update(connection, session_id, SessionUpdate::ToolCall(call));
+                }
                 continue;
             }
         };
@@ -1587,30 +2112,31 @@ pub(super) fn replay_session_updates(
                             tool_use_id,
                             content,
                             is_error,
-                            ..
+                            display,
                         } => {
                             let status = if *is_error {
                                 ToolCallStatus::Failed
                             } else {
                                 ToolCallStatus::Completed
                             };
-                            let tool_name = open_tools
-                                .get(tool_use_id)
-                                .map(String::as_str)
-                                .unwrap_or("");
-                            let acp_content = build_completion_content(tool_name, content, None);
-                            let fields = ToolCallUpdateFields::new()
-                                .status(status)
-                                .content(acp_content);
+                            let id = crate::sync::lock(call_ids).close(tool_use_id);
+                            let tool_name = open_tools.remove(&id).unwrap_or_default();
+                            let mut fields = ToolCallUpdateFields::new().status(status).content(
+                                build_completion_content(
+                                    &tool_name,
+                                    content,
+                                    None,
+                                    display.as_ref(),
+                                ),
+                            );
+                            if let Ok(raw) = serde_json::to_value(content) {
+                                fields = fields.raw_output(raw);
+                            }
                             send_session_update(
                                 connection,
                                 session_id,
-                                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                                    tool_use_id.clone(),
-                                    fields,
-                                )),
+                                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)),
                             );
-                            open_tools.remove(tool_use_id);
                         }
                         // Re-emit input images so a reopened session shows the attachment.
                         MekaContentBlock::Image { source } => {
@@ -1634,6 +2160,10 @@ pub(super) fn replay_session_updates(
                 }
             }
             Role::Assistant => {
+                // A call no result followed before the next answer never got one, as live, where
+                // a call its round left unrun is dropped before the next round: closed now, so a
+                // later result under its id is not taken for it.
+                close_orphans(connection, session_id, call_ids, &mut open_tools);
                 for block in &message.content {
                     match block {
                         MekaContentBlock::Text { text } => {
@@ -1680,6 +2210,7 @@ pub(super) fn replay_session_updates(
                             // Match the live path's rich title, which is read off the call alone.
                             let display_summary = crate::tools::resolve_primary_param(name, input);
                             let title = tool_call_title(name, display_summary.as_deref());
+                            let id = crate::sync::lock(call_ids).open(id);
                             let call = ToolCall::new(id.clone(), title)
                                 .kind(tool_kind_for(name))
                                 .status(ToolCallStatus::InProgress)
@@ -1690,7 +2221,7 @@ pub(super) fn replay_session_updates(
                                 session_id,
                                 SessionUpdate::ToolCall(call),
                             );
-                            open_tools.insert(id.clone(), name.clone());
+                            open_tools.insert(id, name.clone());
                         }
                         _ => {}
                     }
@@ -1700,8 +2231,23 @@ pub(super) fn replay_session_updates(
     }
 
     // Tool calls without a matching result: close them as failed so the client's "tool running"
-    // indicator doesn't get stuck.
-    for orphan_id in open_tools.into_keys() {
+    // indicator doesn't get stuck, and so a live call after the load is not reported as one of
+    // them.
+    close_orphans(connection, session_id, call_ids, &mut open_tools);
+}
+
+/// Close every call a replay has open as failed, and forget them as running.
+fn close_orphans(
+    connection: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    call_ids: &std::sync::Mutex<CallIds>,
+    open_tools: &mut std::collections::HashMap<String, String>,
+) {
+    if open_tools.is_empty() {
+        return;
+    }
+    crate::sync::lock(call_ids).abandon_running();
+    for orphan_id in open_tools.drain().map(|(id, _)| id) {
         let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Failed);
         send_session_update(
             connection,

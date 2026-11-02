@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     conversation::{ContentBlock, Conversation, HARNESS_NOTE, Message, Role, ToolResultContent},
     error::{MekaError, Result},
-    frontend::{FrontendEvent, PermissionOutcome, PermissionRequest},
+    frontend::{FrontendEvent, PermissionOutcome, PermissionRequest, PromptedCall},
     image::ImageSource,
     prompt,
     provider::{

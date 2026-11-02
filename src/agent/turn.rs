@@ -917,6 +917,25 @@ pub(super) struct StreamProgress {
     /// The stream was stopped after the provider had answered, so the message returned is what
     /// had arrived by then and not the whole reply. Which token stopped it is the caller's to ask.
     pub(crate) cut: bool,
+    /// The calls the stream announced, in order, from the `ToolCallComposing` that opens each,
+    /// and whether a `ToolCallStarted` followed.
+    pub(crate) announced: Vec<(String, bool)>,
+}
+
+impl StreamProgress {
+    /// Mark the call composing under `id` as started, the newest such, or note one that arrived
+    /// whole.
+    fn started(&mut self, id: &str) {
+        match self
+            .announced
+            .iter_mut()
+            .rev()
+            .find(|(call, started)| call == id && !started)
+        {
+            Some((_, started)) => *started = true,
+            None => self.announced.push((id.to_string(), true)),
+        }
+    }
 }
 
 impl Agent {
@@ -1680,6 +1699,9 @@ impl Agent {
         run: &mut TurnRun,
     ) -> Result<TurnOutcome> {
         let session_id = run.session_id;
+        // The calls the last round's stream announced and nothing ran: that round ended on a cut
+        // or a refusal the turn recovered from, and the next round asks again without them.
+        let mut unrun: Vec<(String, bool)> = Vec::new();
         loop {
             // Both exits undo an unvindicated repair first. A degrade that has been applied but
             // not yet retried is parked in memory with no `Event::Repair` on disk, and these are
@@ -1702,6 +1724,7 @@ impl Agent {
                 run.cancellation.cancel(CancelReason::Abandoned);
                 return Err(MekaError::Interrupted);
             }
+            self.drop_unrun(std::mem::take(&mut unrun)).await;
 
             // Conversation length behind this request, stamped onto `last_accepted_len` when the
             // provider takes it.
@@ -1714,6 +1737,7 @@ impl Agent {
             let (call_result, loaded) = self
                 .request_round(messages, run, &round, &mut progress)
                 .await;
+            unrun = std::mem::take(&mut progress.announced);
 
             let (mut assistant_message, stop_reason, usage) = match call_result {
                 Ok(value) => value,
@@ -2041,6 +2065,26 @@ impl Agent {
                      executing them anyway"
                 );
             }
+            // What the round runs is what its message holds; a call the stream announced on an
+            // attempt it then retried, which did not come again, is not among them.
+            let mut running: Vec<&str> = assistant_message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            unrun.retain(
+                |(id, started)| match running.iter().position(|running| running == id) {
+                    Some(place) if *started => {
+                        running.remove(place);
+                        false
+                    }
+                    _ => true,
+                },
+            );
+            self.drop_unrun(std::mem::take(&mut unrun)).await;
             self.run_tool_round(messages, run, &assistant_message, &loaded, round_events)
                 .await?;
             // A tool round is not the stall the cap counts, whatever it did.
@@ -2364,6 +2408,16 @@ impl Agent {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Tell the frontend each call in `unrun` will not run.
+    async fn drop_unrun(&self, unrun: Vec<(String, bool)>) {
+        for (id, started) in unrun {
+            self.cells
+                .frontend
+                .emit(FrontendEvent::ToolCallDropped { id, started })
+                .await;
         }
     }
 
@@ -2998,8 +3052,12 @@ impl Agent {
         loop {
             // Reported back out as well as read here, because `run_turn` needs the same fact for
             // the same reason: whatever it does with a failure, it must not re-send a request whose
-            // output the user has already seen.
-            *progress = StreamProgress::default();
+            // output the user has already seen. What an attempt announced outlasts it, since a
+            // frontend still shows a call the attempt began.
+            *progress = StreamProgress {
+                announced: std::mem::take(&mut progress.announced),
+                ..StreamProgress::default()
+            };
             match self
                 .run_streaming_attempt(
                     Arc::clone(&system_prompt),
@@ -3191,6 +3249,7 @@ impl Agent {
                     // `ThinkingProgress` doesn't: a call whose arguments never finish produced no
                     // output, and the flag is what decides whether a mid-stream failure is still
                     // safe to retry.
+                    progress.announced.push((id.clone(), false));
                     self.cells
                         .frontend
                         .emit(FrontendEvent::ToolCallComposing {
@@ -3202,6 +3261,7 @@ impl Agent {
                 StreamEvent::ToolUseEnd { input } => {
                     progress.content_started = true;
                     let (id, name) = accumulator.pending_tool();
+                    progress.started(id);
                     let display_summary = crate::tools::resolve_primary_param(name, input);
                     self.cells
                         .frontend
@@ -3220,6 +3280,7 @@ impl Agent {
                     // and surfaces an error back to the model rather than running the tool on a
                     // silently-empty argument object. Shown the same way.
                     progress.content_started = true;
+                    progress.started(id);
                     let marker_input = serde_json::json!({
                         crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
                     });
@@ -7481,6 +7542,75 @@ mod tests {
                 .iter()
                 .any(|message| message.text_content().contains("answered on the retry")),
             "and the retry's answer is what lands in the conversation",
+        );
+    }
+
+    /// A call a retried stream had begun and the retry did not bring again is dropped as one that
+    /// never got past its arguments, while the call the retry brought runs and is not dropped.
+    #[tokio::test]
+    async fn a_call_a_retried_stream_did_not_bring_again_is_dropped_as_composing() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call_a".to_string(),
+                    name: "checklist_read".to_string(),
+                },
+                MockEvent::FailRetryable {
+                    message: "overloaded".to_string(),
+                    retry_after_secs: Some(0),
+                },
+            ],
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call_b".to_string(),
+                    name: "checklist_read".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![
+                MockEvent::Text {
+                    text: "done".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, frontend) =
+            agent_recording_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the retry carries the turn");
+
+        let dropped: Vec<(String, bool)> = frontend
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                FrontendEvent::ToolCallDropped { id, started } => Some((id, started)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dropped, [("call_a".to_string(), false)]);
+        assert!(
+            frontend.events().iter().any(
+                |event| matches!(event, FrontendEvent::ToolCallCompleted { id, .. } if id == "call_b")
+            ),
+            "the call the retry brought runs"
         );
     }
 

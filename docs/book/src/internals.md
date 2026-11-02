@@ -356,8 +356,10 @@ to the parent's frontend and drops the rest). Where they differ:
 |-------|------|-----|-------------|---------------|---------------|--------|
 | `Notice` info / warn | a dim `•` row, or a yellow `!` row | `notice` at severity `info` / `warning` when the client advertised `session.notices`, else an agent-message chunk prefixed `[meka]` / `[meka warn]` | `notice` event (`NoticeView`) | `notices[]` | `notices[]` | dropped |
 | `McpProgress` | the running call's progress line under its row | `tracing::info!` | `progress` event | dropped | dropped | dropped |
-| `CompactionStarted` / `CompactionFailed` | the working row's word while nothing more specific is said; a failure is the command's or the turn's to report | `compaction_update` `in_progress`, then `failed` or `cancelled`, for a client that advertised `session.compaction`; dropped otherwise | `context.compacting` / `context.compaction_failed` events | dropped | dropped | dropped |
-| `Compacted` | the `→← Context compacted` rule, which opens to the record's headline and departures, the checkpoint's rounds and the summary as written, live and on a replay of the log alike | `compaction_update` `completed` with the summary and the record in `_meta.compaction`, or the note as an advisory for a client without the entry, as the `Notice` row says | `context.compacted` event | dropped; `GET /messages` carries the record on the summary | `compactions[]` | dropped |
+| `CompactionStarted` / `CompactionFailed` | the working row's word while nothing more specific is said; a failure is the command's or the turn's to report | `compaction_update` `in_progress`, then `failed` or `cancelled`, for a client that advertised `session.compaction`; otherwise a `think` card opened, then closed as failed | `context.compacting` / `context.compaction_failed` events | dropped | dropped | dropped |
+| `Compacted` | the `→← Context compacted` rule, which opens to the record's headline and departures, the checkpoint's rounds and the summary as written, live and on a replay of the log alike | `compaction_update` `completed` with the summary and the record in `_meta.compaction`, or the card closed under the record's headline for a client without the entry, its first report on a replay, which then sends the record's checkpoint calls as `CheckpointCallCompleted` does | `context.compacted` event | dropped; `GET /messages` carries the record on the summary | `compactions[]` | dropped |
+| `CheckpointCallCompleted` (a compaction checkpoint's call finished) | dropped: the compaction's row shows the checkpoint from its record once it lands | a finished `tool_call` under `<compaction id>/<n>`, or the update that completes the card the call's approval prompt opened | dropped: `GET /messages` carries the record | dropped | dropped | dropped |
+| `ToolCallDropped` (a call nothing will run: its round was cut or recovered from, or a retried stream did not bring it again) | the call's row goes, found by its id and whether it had started | the card of one that had started closed `failed`, a terminal it opened ended | dropped: the turn's terminal settles it | dropped | dropped | dropped |
 | Approval with nobody to ask | warn `approval_refused_without_asking`, deny (the screen is gone) | asks the client; deny after `APPROVAL_TIMEOUT`, `Canceled` on cancel | `permission_required` event while a streaming client or a feed reader with `attend=true` is there; deny after `APPROVAL_TIMEOUT`, `Canceled` when the last of them leaves; refused with a warn notice otherwise, unless the session declared `answers_prompts_on_return` and no request holds the turn, in which case it parks and waits out `APPROVAL_TIMEOUT` | as HTTP stream: a feed attendee answers a JSON request's prompt too; without one, warn notice, deny, the same capability aside | warn `approval_refused_without_asking`, deny | deny; the notice goes nowhere |
 | Elicitation | asks the screen; warn `elicitation_declined` and decline when it is gone | `elicitation/create`; warn `elicitation_declined` and decline when the client lacks the mode or two sessions have calls in flight on the server | warn `elicitation_declined`, decline | same | trait default: warn `elicitation_declined`, decline | same, dropped |
 | `TurnOpened` (the level a turn opened under) | the turn's prompts take the level's color on their bar | dropped: the protocol has no place for it | dropped: the turn's record carries it | the in-flight turn's `permission` | dropped | dropped |
@@ -369,6 +371,19 @@ The scheduled-fire failure row comes from each host's `HostHooks` (`finished`) r
 `Frontend`, in `host/tui.rs`, `host/acp/schedule.rs` and `host/http/schedule.rs`. The fire's
 prompt takes no hook: the agent emits `MessageAppended` where it appends a turn's opening, which is
 the one place every door passes, so a report riding a client's turn is announced as a fire's is.
+
+The ACP frontend sends each tool call under an id `CallIds` (`host/acp/frontend.rs`) gives it, since
+a provider may give one id to every call or reuse its ids each round: the provider's own id the
+first time the session sends it, else one minted with a token unique to the frontend, and always a
+minted one when the session was opened as `EditorThread::Inherited` (resume, fork, a reopen after
+the idle sweep), whose thread the editor already holds. Every event about a call after its
+`ToolCallStarted`, an approval prompt's `PromptedCall::Announced` included, goes under that id, the
+oldest still running under the provider's id, and `session/load`'s replay goes through the same
+`CallIds`, so a live call after it is told apart from the replayed ones. A sub-agent's activity goes
+under the id its `agent_spawn` card had when the sub-agent started (`AcpFrontend::for_subagent`),
+since a background sub-agent outlasts its call. A call `ToolCallDropped` names, or one still running
+at `TurnEnded`, is closed `failed`, unless a `session/cancel` stopped the turn, which the client
+marks; a detached command streams no output (`OutputRelay::for_call`), its call having returned.
 
 ## Building
 

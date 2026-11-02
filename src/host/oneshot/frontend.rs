@@ -192,7 +192,7 @@ mod tests {
                 primary_param: Some("rm -rf /".to_string()),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             })
             .await;

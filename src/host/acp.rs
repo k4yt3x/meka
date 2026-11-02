@@ -424,6 +424,7 @@ pub(crate) async fn run_acp(
                         state.shared.config.permission,
                         state.shared.config.approvals,
                         crate::host::Opening::Fresh,
+                        frontend::EditorThread::Empty,
                         session_lock,
                     )
                     .await
@@ -1141,16 +1142,17 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "ignored".to_string(),
         }];
-        let blocks = build_completion_content("file_edit", &content, metadata);
+        let blocks = build_completion_content("file_edit", &content, metadata, None);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ToolCallContent::Diff(_)));
     }
 
     /// A memory has no file and a delete leaves no text, so neither fits the protocol's diff,
     /// which names a file and its text after the call: they ride as a unified diff in a code
-    /// block, a delete's naming the file it removed.
+    /// block, made from the change the result records, which is what a replay has of it.
     #[test]
     fn a_change_without_a_file_or_an_after_is_a_unified_diff_block() {
+        use crate::conversation::{Change, ResultDisplay};
         let text_of = |blocks: Vec<ToolCallContent>| -> String {
             assert_eq!(blocks.len(), 1);
             let ToolCallContent::Content(chunk) = &blocks[0] else {
@@ -1161,40 +1163,52 @@ mod tests {
             };
             text.text.clone()
         };
+        let recorded = |old: Option<&str>, new: Option<&str>| ResultDisplay {
+            change: Some(Change::between(old, new)),
+            ..ResultDisplay::default()
+        };
+        let metadata = |path: Option<&str>, old: Option<&str>, new: Option<&str>| {
+            Some(ToolOutputMetadata::Diff {
+                path: path.map(PathBuf::from),
+                old_text: old.map(str::to_string),
+                new_text: new.map(str::to_string),
+            })
+        };
+        let (old, new) = (Some("a\nb\n"), Some("a\nB\n"));
         let memory = build_completion_content(
             "memory_write",
             &[],
-            Some(ToolOutputMetadata::Diff {
-                path: None,
-                old_text: Some("a\nb\n".to_string()),
-                new_text: Some("a\nB\n".to_string()),
-            }),
+            metadata(None, old, new),
+            Some(&recorded(old, new)),
         );
         assert_eq!(text_of(memory), "```diff\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n```");
+        let replayed =
+            build_completion_content("memory_write", &[], None, Some(&recorded(old, new)));
+        assert_eq!(
+            text_of(replayed),
+            "```diff\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n```",
+            "a replay shows the change as the live run did"
+        );
+        let gone = Some("gone\n");
         let deleted = build_completion_content(
             "skill_delete",
             &[],
-            Some(ToolOutputMetadata::Diff {
-                path: Some(PathBuf::from("/s/demo/SKILL.md")),
-                old_text: Some("gone\n".to_string()),
-                new_text: None,
-            }),
+            metadata(Some("/s/demo/SKILL.md"), gone, None),
+            Some(&recorded(gone, None)),
         );
-        assert_eq!(
-            text_of(deleted),
-            "```diff\n--- /s/demo/SKILL.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n```"
-        );
+        assert_eq!(text_of(deleted), "```diff\n@@ -1,1 +0,0 @@\n-gone\n```");
         // A fence on an unchanged line, which the diff prints behind a space, would close a
         // three-backtick block early; the block's fence outgrows it. An added or removed fence
         // sits behind its marker and cannot close anything.
+        let (old, new) = (
+            Some("```python\nprint(1)\n```\n"),
+            Some("```python\nprint(2)\n```\n"),
+        );
         let fenced = build_completion_content(
             "memory_write",
             &[],
-            Some(ToolOutputMetadata::Diff {
-                path: None,
-                old_text: Some("```python\nprint(1)\n```\n".to_string()),
-                new_text: Some("```python\nprint(2)\n```\n".to_string()),
-            }),
+            metadata(None, old, new),
+            Some(&recorded(old, new)),
         );
         assert_eq!(
             text_of(fenced),
@@ -1278,7 +1292,7 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "hello\nworld\n".to_string(),
         }];
-        let blocks = build_completion_content("shell_execute", &content, None);
+        let blocks = build_completion_content("shell_execute", &content, None, None);
         assert_eq!(blocks.len(), 1);
         let ToolCallContent::Content(chunk) = &blocks[0] else {
             panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);
@@ -1294,7 +1308,7 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "   \n".to_string(),
         }];
-        assert!(build_completion_content("shell_execute", &content, None).is_empty());
+        assert!(build_completion_content("shell_execute", &content, None, None).is_empty());
     }
 
     fn empty_live_output() -> LiveOutput {
@@ -1532,7 +1546,7 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "hello".to_string(),
         }];
-        let blocks = build_completion_content("file_read", &content, None);
+        let blocks = build_completion_content("file_read", &content, None, None);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ToolCallContent::Content(_)));
     }
@@ -1549,7 +1563,7 @@ mod tests {
                 data: "aGVsbG8=".to_string(),
             },
         }];
-        let blocks = build_completion_content("file_read", &content, None);
+        let blocks = build_completion_content("file_read", &content, None, None);
         assert_eq!(blocks.len(), 1);
         let ToolCallContent::Content(chunk) = &blocks[0] else {
             panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);
@@ -1578,7 +1592,7 @@ mod tests {
                 },
             },
         ];
-        let blocks = build_completion_content("file_read", &content, None);
+        let blocks = build_completion_content("file_read", &content, None, None);
         assert_eq!(blocks.len(), 2);
         let ToolCallContent::Content(first) = &blocks[0] else {
             panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);
@@ -1803,6 +1817,355 @@ mod tests {
             })
             .collect();
         assert_eq!(said, ["first", "one", "compaction 3", "third"]);
+    }
+
+    /// A client that advertised `session.compaction` gets the protocol's entry: no error beside a
+    /// cancel, which its status says, and no summary when the record has none to open onto.
+    #[test]
+    fn a_compaction_entry_says_a_cancel_by_its_status_and_opens_onto_a_summary_only() {
+        use crate::conversation::{CompactionRecord, CompactionTrigger};
+        let state = SharedClientState::default();
+        state.record_initialize(
+            serde_json::from_value(serde_json::json!({"session": {"compaction": {}}}))
+                .expect("capabilities"),
+            None,
+        );
+        let said = |update: SessionUpdate| serde_json::to_value(update).expect("serializes");
+        let started = said(frontend::compaction_started_update(
+            &state,
+            "c1".to_string(),
+            CompactionTrigger::Requested,
+        ));
+        assert_eq!(started["sessionUpdate"], "compaction_update", "{started}");
+        assert_eq!(started["status"], "in_progress");
+        let canceled = said(frontend::compaction_failed_update(
+            &state,
+            "c1".to_string(),
+            CompactionTrigger::Requested,
+            "turn was canceled".to_string(),
+            true,
+        ));
+        assert_eq!(canceled["status"], "cancelled", "{canceled}");
+        assert_eq!(canceled.get("error"), None, "{canceled}");
+        let failed = said(frontend::compaction_failed_update(
+            &state,
+            "c1".to_string(),
+            CompactionTrigger::Requested,
+            "the provider refused".to_string(),
+            false,
+        ));
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_eq!(failed["error"], "the provider refused");
+        let record = CompactionRecord {
+            written_summary: " ".to_string(),
+            ..CompactionRecord::for_test()
+        };
+        let landed = said(frontend::compacted_update(
+            &state,
+            "c1".to_string(),
+            &record,
+            4,
+            1,
+            true,
+        ));
+        assert_eq!(landed["status"], "completed", "{landed}");
+        assert_eq!(landed.get("summary"), None, "{landed}");
+    }
+
+    /// A client without the protocol's entry is never sent one; the compaction is a card under the
+    /// same id, opened when it begins and titled by the record's headline once it lands, or opened
+    /// already landed on a replay, which has no record of the start.
+    #[test]
+    fn a_client_without_the_compaction_entry_gets_a_card() {
+        use crate::conversation::{CompactionRecord, CompactionSource, CompactionTrigger};
+        let state = SharedClientState::default();
+        let said = |update: SessionUpdate| serde_json::to_value(update).expect("serializes");
+        let started = said(frontend::compaction_started_update(
+            &state,
+            "c1".to_string(),
+            CompactionTrigger::Requested,
+        ));
+        assert_eq!(started["sessionUpdate"], "tool_call", "{started}");
+        assert_eq!(started["toolCallId"], "c1");
+        assert_eq!(started["title"], "Compacting the conversation");
+        assert_eq!(started["kind"], "think");
+        assert_eq!(started["status"], "in_progress");
+        let record = CompactionRecord {
+            trigger: CompactionTrigger::Requested,
+            source: CompactionSource::Summarizer,
+            written_summary: "the summary".to_string(),
+            ..CompactionRecord::for_test()
+        };
+        let landed = said(frontend::compacted_update(
+            &state,
+            "c1".to_string(),
+            &record,
+            4,
+            1,
+            true,
+        ));
+        assert_eq!(landed["sessionUpdate"], "tool_call_update", "{landed}");
+        assert_eq!(landed["toolCallId"], "c1");
+        assert_eq!(landed["status"], "completed");
+        assert_eq!(landed["title"], "The agent compacted the conversation.");
+        assert_eq!(
+            landed["content"][0]["content"]["text"],
+            "Written by the standalone summarizer."
+        );
+        assert_eq!(landed["content"][1]["content"]["text"], "the summary");
+        assert_eq!(landed["rawOutput"]["trigger"], "requested", "{landed}");
+        assert_eq!(landed["rawOutput"]["generation"], 1);
+        let replayed = said(frontend::compacted_update(
+            &state,
+            "replayed-1".to_string(),
+            &record,
+            4,
+            1,
+            false,
+        ));
+        assert_eq!(replayed["sessionUpdate"], "tool_call", "{replayed}");
+        assert_eq!(replayed["kind"], "think");
+        assert_eq!(replayed["status"], "completed");
+        assert_eq!(replayed["title"], landed["title"]);
+        assert_eq!(replayed["content"], landed["content"]);
+        let quiet = said(frontend::compacted_update(
+            &state,
+            "c1".to_string(),
+            &CompactionRecord::for_test(),
+            4,
+            1,
+            true,
+        ));
+        assert_eq!(quiet.get("content"), None, "{quiet}");
+        let canceled = said(frontend::compaction_failed_update(
+            &state,
+            "c1".to_string(),
+            CompactionTrigger::Requested,
+            "turn was canceled".to_string(),
+            true,
+        ));
+        assert_eq!(canceled["sessionUpdate"], "tool_call_update", "{canceled}");
+        assert_eq!(canceled["status"], "failed");
+        assert_eq!(canceled["content"][0]["content"]["text"], "Interrupted");
+        let failed = said(frontend::compaction_failed_update(
+            &state,
+            "c1".to_string(),
+            CompactionTrigger::Requested,
+            "the provider refused".to_string(),
+            false,
+        ));
+        assert_eq!(
+            failed["content"][0]["content"]["text"],
+            "Compaction failed: the provider refused"
+        );
+    }
+
+    /// A checkpoint's calls follow its compaction in the order it made them, each under the
+    /// compaction's id and its place, and each with its own result, so a provider that gives one id
+    /// to every call still gets a card per call; what the checkpoint thought or said is left out.
+    #[test]
+    fn a_checkpoint_s_calls_are_cards_of_their_own_in_the_order_made() {
+        use crate::conversation::{Message, ToolResultContent};
+        let call = |name: &str, key: &str| MekaContentBlock::ToolUse {
+            id: "call_0".to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({ key: "notes" }),
+        };
+        let result = |text: &str, is_error: bool| MekaContentBlock::ToolResult {
+            tool_use_id: "call_0".to_string(),
+            content: vec![ToolResultContent::Text {
+                text: text.to_string(),
+            }],
+            is_error,
+            display: None,
+        };
+        let rounds = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    MekaContentBlock::Thinking {
+                        thinking: "saving".to_string(),
+                        opaque: None,
+                    },
+                    MekaContentBlock::Text {
+                        text: "noting it".to_string(),
+                    },
+                    call("memory_read", "name"),
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![result("the note", false)],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![call("memory_write", "name")],
+            },
+            Message {
+                role: Role::User,
+                content: vec![result("refused", true)],
+            },
+            // Two calls of one round under one id, paired with their results by place.
+            Message {
+                role: Role::Assistant,
+                content: vec![call("memory_write", "name"), call("memory_read", "name")],
+            },
+            Message {
+                role: Role::User,
+                content: vec![result("first", false), result("second", false)],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![call("memory_write", "name")],
+            },
+        ];
+        let cwd = SharedCwd::new(PathBuf::from("/"));
+        let calls: Vec<serde_json::Value> = frontend::checkpoint_calls("c1", &rounds, &cwd)
+            .into_iter()
+            .map(|call| serde_json::to_value(call).expect("serializes"))
+            .collect();
+        let said: Vec<(&str, &str, &str)> = calls
+            .iter()
+            .map(|call| {
+                (
+                    call["toolCallId"].as_str().unwrap_or_default(),
+                    call["title"].as_str().unwrap_or_default(),
+                    call["status"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("c1/1", "memory_read notes", "completed"),
+                ("c1/2", "memory_write notes", "failed"),
+                ("c1/3", "memory_write notes", "completed"),
+                ("c1/4", "memory_read notes", "completed"),
+                ("c1/5", "memory_write notes", "failed"),
+            ],
+            "{calls:?}"
+        );
+        assert_eq!(calls[0]["content"][0]["content"]["text"], "the note");
+        assert_eq!(calls[1]["content"][0]["content"]["text"], "refused");
+        assert_eq!(calls[2]["content"][0]["content"]["text"], "first");
+        assert_eq!(calls[3]["content"][0]["content"]["text"], "second");
+        assert_eq!(calls[4].get("content"), None, "{calls:?}");
+    }
+
+    /// A call goes under the provider's id the first time it is seen and under one of its own
+    /// after, an empty id included; a report goes to the oldest call still running under the id,
+    /// and once none is, to the newest; a session whose thread the editor already holds never
+    /// sends a bare provider id, since a card may hold any.
+    #[test]
+    fn a_call_is_sent_under_an_id_no_other_card_holds() {
+        let mut ids = frontend::CallIds::new(frontend::EditorThread::Empty);
+        assert_eq!(ids.open("call_0"), "call_0");
+        let second = ids.open("call_0");
+        assert!(second.starts_with("call_0#"), "{second}");
+        assert_eq!(ids.running("call_0").as_deref(), Some("call_0"));
+        assert_eq!(ids.close("call_0"), "call_0");
+        assert_eq!(ids.running("call_0").as_deref(), Some(second.as_str()));
+        assert_eq!(ids.close("call_0"), second);
+        assert_eq!(ids.running("call_0"), None);
+        assert_eq!(ids.current("call_0").as_deref(), Some(second.as_str()));
+        assert_eq!(ids.close("never_started"), "never_started");
+
+        assert_eq!(ids.open(""), "");
+        let blank = ids.open("");
+        assert!(!blank.is_empty(), "{blank}");
+        assert_eq!(ids.abandon_running(), vec!["".to_string(), blank.clone()]);
+        assert_eq!(ids.running(""), None);
+
+        let mut inherited = frontend::CallIds::new(frontend::EditorThread::Inherited);
+        let first = inherited.open("toolu_1");
+        assert_ne!(
+            first, "toolu_1",
+            "the editor may hold a card under it already"
+        );
+        let mut later = frontend::CallIds::new(frontend::EditorThread::Inherited);
+        assert_ne!(
+            later.open("toolu_1"),
+            first,
+            "a later frontend mints its own"
+        );
+    }
+
+    /// A worker reports on the card of the call that started it, even once a later call holds the
+    /// provider's id, as a background spawn's worker starts after its call returned.
+    #[test]
+    fn a_worker_takes_the_card_of_the_call_that_started_it() {
+        let mut ids = frontend::CallIds::new(frontend::EditorThread::Empty);
+        let spawn = ids.open("call_0");
+        ids.await_worker("call_0", &spawn);
+        assert_eq!(ids.close("call_0"), spawn);
+        let later = ids.open("call_0");
+        assert_ne!(later, spawn);
+        assert_eq!(ids.take_worker("call_0").as_deref(), Some(spawn.as_str()));
+        assert_eq!(
+            ids.take_worker("call_0").as_deref(),
+            Some(later.as_str()),
+            "with no card waiting, the call the id names now"
+        );
+        let refused = ids.open("call_1");
+        ids.await_worker("call_1", &refused);
+        ids.forget_workers();
+        assert_eq!(ids.take_worker("call_1").as_deref(), Some(refused.as_str()));
+    }
+
+    /// A recorded change reads as a unified diff whose hunk headers number both sides, the side a
+    /// line was not numbered on worked out from the hunks before it.
+    #[test]
+    fn a_recorded_change_is_a_unified_diff_numbered_on_both_sides() {
+        use crate::conversation::{Change, ChangeKind, ChangeLine};
+        let line = |kind, number, text: &str| ChangeLine {
+            kind,
+            number,
+            text: text.to_string(),
+        };
+        let change = Change {
+            added: 3,
+            removed: 1,
+            hunks: vec![
+                vec![
+                    line(ChangeKind::Kept, 1, "one"),
+                    line(ChangeKind::Added, 2, "one and a half"),
+                    line(ChangeKind::Added, 3, "one and three quarters"),
+                    line(ChangeKind::Kept, 2, "two"),
+                ],
+                vec![
+                    line(ChangeKind::Kept, 9, "nine"),
+                    line(ChangeKind::Removed, 10, "ten"),
+                    line(ChangeKind::Added, 12, "ten, again"),
+                ],
+            ],
+        };
+        let block = serde_json::to_value(frontend::recorded_change_block(&change)).expect("json");
+        assert_eq!(
+            block["content"]["text"],
+            "```diff\n@@ -1,2 +1,4 @@\n one\n+one and a half\n+one and three quarters\n two\n\
+             @@ -9,2 +11,2 @@\n nine\n-ten\n+ten, again\n```"
+        );
+        let cut = Change {
+            added: 5,
+            ..change.clone()
+        };
+        let block = serde_json::to_value(frontend::recorded_change_block(&cut)).expect("json");
+        assert!(
+            block["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.ends_with("```\n… +2 lines")),
+            "the lines the record left out are counted, in the screen's words: {block}"
+        );
+        let created = Change {
+            added: 1,
+            removed: 0,
+            hunks: vec![vec![line(ChangeKind::Added, 1, "new")]],
+        };
+        let block = serde_json::to_value(frontend::recorded_change_block(&created)).expect("json");
+        assert_eq!(
+            block["content"]["text"],
+            "```diff\n@@ -0,0 +1,1 @@\n+new\n```"
+        );
     }
 
     /// An ACP prompt of `text` alone, as the slash tests send one.

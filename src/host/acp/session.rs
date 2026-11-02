@@ -294,6 +294,7 @@ async fn reopen_released(
         permission,
         summary.approvals,
         crate::host::Opening::Hydrate,
+        super::frontend::EditorThread::Inherited,
         session_lock,
     )
     .await
@@ -426,6 +427,7 @@ pub(super) async fn handle_load_session(
         permission,
         summary.approvals,
         crate::host::Opening::Hydrate,
+        super::frontend::EditorThread::Empty,
         session_lock,
     )
     .await
@@ -512,6 +514,7 @@ pub(super) async fn handle_load_session(
         &runtime.resident.cells().cwd,
         &replay_entries(&events, first_generation),
         &tasks,
+        &runtime.frontend.call_ids,
     );
 
     let permission = runtime.resident.cells().permission.clone();
@@ -665,6 +668,7 @@ pub(super) async fn handle_resume_session(
         permission,
         summary.approvals,
         crate::host::Opening::Hydrate,
+        super::frontend::EditorThread::Inherited,
         session_lock,
     )
     .await
@@ -929,6 +933,7 @@ pub(super) async fn handle_fork_session(
         permission,
         approvals,
         crate::host::Opening::Hydrate,
+        super::frontend::EditorThread::Inherited,
         session_lock,
     )
     .await
@@ -1386,6 +1391,9 @@ pub(super) async fn build_session_runtime(
     permission: Permission,
     approvals: bool,
     opening: crate::host::Opening,
+    // What the editor already shows of the session, which decides the ids its tool calls go
+    // under.
+    thread: super::frontend::EditorThread,
     session_lock: crate::fs::FileLock,
 ) -> anyhow::Result<BuiltSession> {
     let cwd = SharedCwd::new(cwd_path);
@@ -1413,7 +1421,7 @@ pub(super) async fn build_session_runtime(
     // Created here rather than beside the `SessionEntry` so the frontend and the entry share one
     // cell: the entry's cancel handler writes it, the frontend's client round-trips read it.
     let cancel = crate::host::CancelCell::default();
-    let acp_frontend = Arc::new(AcpFrontend::new(link, cwd.clone(), cancel.clone()));
+    let acp_frontend = Arc::new(AcpFrontend::new(link, cwd.clone(), cancel.clone(), thread));
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 
     let resident = crate::host::open_session(

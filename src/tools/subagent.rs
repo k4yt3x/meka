@@ -255,6 +255,12 @@ impl SubagentSpec {
     }
 }
 
+/// Whether a call to the tool named `tool_name` runs a worker of its own, and so builds a
+/// frontend for it through [`crate::frontend::Frontend::for_subagent`].
+pub(crate) fn runs_a_worker(tool_name: &str) -> bool {
+    matches!(tool_name, "agent_spawn" | "agent_followup")
+}
+
 pub(crate) struct AgentSpawnTool {
     pub(crate) parent_permission: SharedPermission,
     pub(crate) tool_builder_params: ToolBuilderParams,

@@ -3466,7 +3466,8 @@ enabled = ["read", "unrestricted"]
 /// a sub-agent's approval prompt must forward through `PermissionForwardingFrontend` to the
 /// parent's ACP connection. The parent triggers `agent_spawn`; the sub-agent runs in `ask` mode
 /// (inherited) and attempts `file_write`, which fires a `session/request_permission` on the
-/// *parent's* connection. Test answers `allow_once` and asserts the request was observed.
+/// *parent's* connection. The editor is never shown the sub-agent's call, so the prompt opens a
+/// card of its own and closes it with the answer, leaving the `agent_spawn` card as it was.
 #[test]
 fn acp_subagent_permission_forwards_to_parent_client() {
     let config_toml = r#"
@@ -3527,11 +3528,13 @@ enabled = ["read", "unrestricted"]
     let session_id = harness.new_session();
     let id = harness.prompt(&session_id, "delegate the write");
 
-    let mut saw_permission_request = false;
-    let (_updates, _response) = harness.collect_updates_with_dispatch(&session_id, id, |value| {
+    let mut prompted: Option<String> = None;
+    let (updates, _response) = harness.collect_updates_with_dispatch(&session_id, id, |value| {
         match value["method"].as_str() {
             Some("session/request_permission") => {
-                saw_permission_request = true;
+                prompted = value["params"]["toolCall"]["toolCallId"]
+                    .as_str()
+                    .map(str::to_string);
                 Some(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": value["id"].clone(),
@@ -3544,10 +3547,43 @@ enabled = ["read", "unrestricted"]
         }
     });
 
+    let card = prompted.unwrap_or_else(|| {
+        panic!(
+            "sub-agent's file_write must forward a session/request_permission through the parent \
+             connection: {updates:?}"
+        )
+    });
+    let updates: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .collect();
+    let reports: Vec<&&serde_json::Value> = updates
+        .iter()
+        .filter(|update| update["toolCallId"] == card.as_str())
+        .collect();
+    let [opened, closed] = reports.as_slice() else {
+        panic!("the prompt's card is opened and closed: {updates:?}");
+    };
+    assert_eq!(opened["sessionUpdate"], "tool_call", "{opened}");
     assert!(
-        saw_permission_request,
-        "sub-agent's file_write must forward a session/request_permission \
-         through the parent connection",
+        opened["title"]
+            .as_str()
+            .is_some_and(|title| title.starts_with("file_write ")),
+        "{opened}"
+    );
+    assert_eq!(closed["status"], "completed", "{closed}");
+    assert_eq!(
+        closed["content"][0]["content"]["text"], "file_write allowed",
+        "said as the screen says the answer: {closed}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["toolCallId"] == "call_spawn"
+                && update["title"]
+                    .as_str()
+                    .is_some_and(|title| title.starts_with("file_write"))),
+        "the agent_spawn card keeps its own title: {updates:?}"
     );
 }
 
@@ -6537,10 +6573,11 @@ fn acp_withholds_a_failed_fires_upstream_text_when_relaying_is_off() {
 }
 
 /// A compaction is the one thing that changes what the model can see without the editor doing
-/// anything, and the automatic ones fire with nobody asking. It is said as a `[meka]` chunk so a
-/// user whose next reply forgets the morning has been told why.
+/// anything, and the automatic ones fire with nobody asking. A client that did not advertise the
+/// protocol's entry sees it as a card, opened when it begins and titled by the record's headline
+/// when it lands, and a load of the session shows the same card where it happened.
 #[test]
-fn acp_reports_a_compaction_as_a_meka_notice() {
+fn a_client_without_the_compaction_entry_sees_a_compaction_as_a_card() {
     let script = serde_json::json!([
         [
             { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
@@ -6559,36 +6596,82 @@ fn acp_reports_a_compaction_as_a_meka_notice() {
     ]);
     let config = format!("{ACP_INVALID_PARAMS_CONFIG}\n[session]\ncompact_checkpoint = false\n");
     let mut harness = AcpTestHarness::spawn(&config, Some(script));
+    let cwd = harness.work_dir();
     let session_id = harness.new_session();
     let id = harness.prompt(&session_id, "compact yourself");
     let (updates, response) = harness.collect_updates(&session_id, id);
-
-    let chunks: Vec<&str> = updates
-        .iter()
-        .filter(|value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
-        .filter_map(|value| value["params"]["update"]["content"]["text"].as_str())
-        .collect();
-    let notice = chunks
-        .iter()
-        .find(|chunk| chunk.starts_with("[meka] The agent compacted the conversation."))
-        .unwrap_or_else(|| panic!("the compaction must reach the editor: {chunks:?}"));
-    assert!(
-        notice.contains("Written by the standalone summarizer."),
-        "and say the summary was not the agent's own: {notice}"
-    );
-    assert!(
-        !updates
-            .iter()
-            .any(|value| value["params"]["update"]["sessionUpdate"] == "compaction_update"),
-        "a client that did not advertise the entry is never sent one: {updates:?}"
-    );
     assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let opened = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call"
+                && update["title"] == "Compacting the conversation"
+        })
+        .unwrap_or_else(|| panic!("the compaction must open a card: {updates:?}"));
+    assert_eq!(opened["kind"], "think");
+    assert_eq!(opened["status"], "in_progress");
+    let landed = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call_update"
+                && update["toolCallId"] == opened["toolCallId"]
+        })
+        .unwrap_or_else(|| panic!("the card must close: {updates:?}"));
+    assert_eq!(landed["status"], "completed");
+    assert_eq!(landed["title"], "The agent compacted the conversation.");
+    assert!(
+        landed["content"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Written by the standalone summarizer.")),
+        "and say the summary was not the agent's own: {landed}"
+    );
+    assert_eq!(landed["content"][1]["content"]["text"], "a summary");
+    assert_eq!(landed["rawOutput"]["trigger"], "requested", "{landed}");
+    assert!(
+        !updates.iter().any(|value| {
+            value["params"]["update"]["sessionUpdate"] == "compaction_update"
+                || value["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("[meka]"))
+        }),
+        "a client that did not advertise the entry is never sent one, and the card is all it is \
+         told: {updates:?}"
+    );
+
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
+    );
+    assert!(closed["result"].is_object(), "close must succeed: {closed}");
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(
+        response["result"].is_object(),
+        "load must succeed: {response}"
+    );
+    let replayed = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .find(|update| update["title"] == landed["title"])
+        .unwrap_or_else(|| panic!("the load must show the card: {updates:?}"));
+    assert_eq!(
+        replayed["sessionUpdate"], "tool_call",
+        "the card's first report on a load is the card: {replayed}"
+    );
+    assert_eq!(replayed["status"], "completed");
+    assert_eq!(replayed["content"], landed["content"]);
 }
 
 /// A client that advertised `session.compaction` gets the compaction as an entry of its own: an
 /// `in_progress` update when it begins and a `completed` one carrying the summary when it lands,
-/// under one id, with meka's facts in `_meta`. The `[meka]` chunk is for clients without the
-/// entry, so it is not sent beside it.
+/// under one id, with meka's facts in `_meta`. The card is for clients without the entry, so it is
+/// not sent beside it.
 #[test]
 fn acp_renders_a_compaction_entry_for_a_client_that_advertises_it() {
     let script = serde_json::json!([
@@ -6639,14 +6722,580 @@ fn acp_renders_a_compaction_entry_for_a_client_that_advertises_it() {
     assert_eq!(facts["generation"], 1);
     assert!(
         !updates.iter().any(|value| {
-            value["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
-                && value["params"]["update"]["content"]["text"]
-                    .as_str()
-                    .is_some_and(|text| text.starts_with("[meka] The agent compacted"))
+            value["params"]["update"]["sessionUpdate"] == "tool_call"
+                && value["params"]["update"]["title"] == "Compacting the conversation"
         }),
-        "the entry replaces the chunk rather than doubling it: {updates:?}"
+        "the entry replaces the card rather than doubling it: {updates:?}"
     );
     assert_eq!(response["result"]["stopReason"], "end_turn");
+}
+
+/// What a compaction's checkpoint does reaches an editor: each call it makes is told as it
+/// finishes, a finished tool call under the compaction's id, and a load shows the same after the
+/// compaction. A call it puts to the user is the first the editor hears of it, so the prompt opens
+/// the call's card, and the call's end completes that card rather than drawing a second.
+#[test]
+fn a_compaction_s_checkpoint_calls_are_told_as_they_finish_on_one_card_each() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        // A submission refused for its blank summary is no call the compaction tells, so the
+        // write after it is still the first.
+        [
+            { "type": "tool_use_start", "id": "tu_blank", "name": "context_replace" },
+            { "type": "tool_use_end", "input": { "summary": "" } },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "memory_write" },
+            {
+                "type": "tool_use_end",
+                "input": { "name": "release-notes", "description": "what shipped", "body": "0.88" }
+            },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_2", "name": "context_replace" },
+            { "type": "tool_use_end", "input": { "summary": "## Goal\nShip 0.88." } },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "the reply" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    // `none` with approvals on: the checkpoint's write is above the level, so it is put to the
+    // editor.
+    let config = format!(
+        "{ACP_INVALID_PARAMS_CONFIG}\n[permissions]\ndefault = \"none\"\napprovals = true\nenabled \
+         = [\"none\", \"workspace\"]\n"
+    );
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        &config,
+        Some(script),
+        serde_json::json!({"session": {"compaction": {}}}),
+    );
+    let cwd = harness.work_dir();
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "compact yourself");
+    let mut prompted: Vec<String> = Vec::new();
+    let (updates, response) = harness.collect_updates_with_dispatch(&session_id, id, |value| {
+        (value["method"] == "session/request_permission").then(|| {
+            let tool_call = &value["params"]["toolCall"];
+            if tool_call["title"] == "memory_write release-notes" {
+                prompted.push(
+                    tool_call["toolCallId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": value["id"].clone(),
+                "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } }
+            })
+        })
+    });
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let updates: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .collect();
+
+    let compaction = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "compaction_update")
+        .unwrap_or_else(|| panic!("the compaction must reach the editor: {updates:?}"));
+    let card = format!(
+        "{}/1",
+        compaction["compactionId"].as_str().unwrap_or_default()
+    );
+    assert_eq!(
+        prompted,
+        std::slice::from_ref(&card),
+        "the prompt names the card the compaction's report completes: {updates:?}"
+    );
+    let reports: Vec<usize> = updates
+        .iter()
+        .enumerate()
+        .filter(|(_, update)| update["toolCallId"] == card.as_str())
+        .map(|(place, _)| place)
+        .collect();
+    let [opened, completed] = reports.as_slice() else {
+        panic!("one card, opened by the prompt and completed when the call ends: {updates:?}");
+    };
+    assert_eq!(updates[*opened]["sessionUpdate"], "tool_call");
+    assert_eq!(updates[*opened]["title"], "memory_write release-notes");
+    let landed = updates
+        .iter()
+        .position(|update| {
+            update["sessionUpdate"] == "compaction_update" && update["status"] == "completed"
+        })
+        .unwrap_or_else(|| panic!("the compaction must land: {updates:?}"));
+    assert!(
+        *completed < landed,
+        "completed as the call ends, ahead of the compaction's end: {updates:?}"
+    );
+    let call = updates[*completed];
+    assert_eq!(call["sessionUpdate"], "tool_call_update");
+    assert_eq!(call["title"], "memory_write release-notes");
+    assert_eq!(call["status"], "completed");
+    assert!(
+        call["content"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("```diff\n") && text.contains("\n+0.88\n")),
+        "with the change it made, as a write shows one live: {call}"
+    );
+    assert!(
+        !updates.iter().any(|update| update["toolCallId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("permission-"))),
+        "no card of the prompt's own beside the call's: {updates:?}"
+    );
+    assert!(
+        !updates.iter().any(|update| update["toolCallId"] == "tu_1"
+            && update["title"] == "memory_write release-notes"),
+        "a checkpoint call reusing a turn's call id never lands on that call's card: {updates:?}"
+    );
+
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
+    );
+    assert!(closed["result"].is_object(), "close must succeed: {closed}");
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(
+        response["result"].is_object(),
+        "load must succeed: {response}"
+    );
+    let replayed = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .find(|update| update["title"] == "memory_write release-notes")
+        .unwrap_or_else(|| panic!("the load must show the checkpoint's write: {updates:?}"));
+    assert_eq!(replayed["toolCallId"], "replayed-1/1", "{replayed}");
+    assert_eq!(replayed["status"], "completed");
+    assert_eq!(replayed["content"], call["content"]);
+}
+
+/// A compaction that fails after its checkpoint wrote a memory still shows the write: what the
+/// checkpoint did stays done, and is told as it finishes, inside the compaction that then fails.
+#[test]
+fn a_failed_compaction_still_shows_what_its_checkpoint_wrote() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_2", "name": "memory_write" },
+            {
+                "type": "tool_use_end",
+                "input": { "name": "release-notes", "description": "what shipped", "body": "0.88" }
+            },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        // The checkpoint ends without a summary, so the summarizer is asked, and it fails.
+        [
+            { "type": "text", "text": "noted" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [{ "type": "fail", "message": "the summarizer failed" }],
+        [
+            { "type": "text", "text": "the reply" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let config = format!(
+        "{ACP_INVALID_PARAMS_CONFIG}\n[permissions]\ndefault = \"workspace\"\nenabled = \
+         [\"workspace\"]\n"
+    );
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        &config,
+        Some(script),
+        serde_json::json!({"session": {"compaction": {}}}),
+    );
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "compact yourself");
+    let (updates, _) = harness.collect_updates(&session_id, id);
+    let updates: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .collect();
+    let failed = updates
+        .iter()
+        .position(|update| {
+            update["sessionUpdate"] == "compaction_update" && update["status"] == "failed"
+        })
+        .unwrap_or_else(|| panic!("the compaction must fail: {updates:?}"));
+    let compaction_id = updates[failed]["compactionId"].as_str().unwrap_or_default();
+    let opened = updates
+        .iter()
+        .position(|update| update["compactionId"] == compaction_id)
+        .unwrap_or_else(|| panic!("the compaction must open: {updates:?}"));
+    let call = updates
+        .iter()
+        .position(|update| update["toolCallId"] == format!("{compaction_id}/1"))
+        .unwrap_or_else(|| panic!("the checkpoint's write must be shown: {updates:?}"));
+    assert!(
+        opened < call && call < failed,
+        "inside the compaction: {updates:?}"
+    );
+    assert_eq!(updates[call]["sessionUpdate"], "tool_call");
+    assert_eq!(updates[call]["title"], "memory_write release-notes");
+    assert_eq!(updates[call]["status"], "completed");
+}
+
+/// A provider that reuses its call ids from round to round still gets a card per call: the
+/// protocol wants a call's id unique within the session, and an editor fills in the newest card it
+/// holds under an id, so the second call is sent under an id of its own, live and on a load.
+#[test]
+fn a_reused_call_id_gets_a_card_of_its_own() {
+    let round = || {
+        serde_json::json!([
+            { "type": "tool_use_start", "id": "call_0", "name": "checklist_read" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ])
+    };
+    let script = serde_json::json!([
+        round(),
+        round(),
+        [
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let cwd = harness.work_dir();
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "read the list twice");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let cards = |updates: &[serde_json::Value]| -> Vec<(String, String)> {
+        updates
+            .iter()
+            .map(|value| &value["params"]["update"])
+            .filter(|update| {
+                update["sessionUpdate"] == "tool_call"
+                    || update["sessionUpdate"] == "tool_call_update"
+            })
+            .map(|update| {
+                (
+                    update["sessionUpdate"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    update["toolCallId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    };
+    let assert_one_card_each = |said: &[(String, String)]| {
+        let opened: Vec<&str> = said
+            .iter()
+            .filter(|(kind, _)| kind == "tool_call")
+            .map(|(_, id)| id.as_str())
+            .collect();
+        let [first, second] = opened.as_slice() else {
+            panic!("two calls, two cards: {said:?}");
+        };
+        assert_eq!(
+            *first, "call_0",
+            "the first goes under the provider's id: {said:?}"
+        );
+        assert_ne!(first, second, "{said:?}");
+        for id in [first, second] {
+            assert!(
+                said.iter()
+                    .any(|(kind, closed)| kind == "tool_call_update" && closed == id),
+                "each card closes under its own id: {said:?}"
+            );
+        }
+    };
+    assert_one_card_each(&cards(&updates));
+    assert!(
+        !updates
+            .iter()
+            .any(|value| value["params"]["update"]["status"] == "failed"),
+        "every call ran, and none is closed as one that did not: {updates:?}"
+    );
+
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
+    );
+    assert!(closed["result"].is_object(), "close must succeed: {closed}");
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(
+        response["result"].is_object(),
+        "load must succeed: {response}"
+    );
+    assert_one_card_each(&cards(&updates));
+}
+
+/// A resumed session's editor still holds the thread it showed, whose cards may carry any id the
+/// provider gave, so a call after the resume never goes under a bare provider id.
+#[test]
+fn a_resumed_session_sends_no_id_the_editor_may_hold() {
+    let round = || {
+        serde_json::json!([
+            { "type": "tool_use_start", "id": "call_0", "name": "checklist_read" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ])
+    };
+    let reply = || {
+        serde_json::json!([
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ])
+    };
+    let script = serde_json::json!([round(), reply(), round(), reply()]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let cwd = harness.work_dir();
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "read the list");
+    let (updates, _) = harness.collect_updates(&session_id, id);
+    assert!(
+        updates
+            .iter()
+            .any(|value| value["params"]["update"]["toolCallId"] == "call_0"),
+        "{updates:?}"
+    );
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
+    );
+    assert!(closed["result"].is_object(), "close must succeed: {closed}");
+    let resumed = harness.request(
+        "session/resume",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert!(
+        resumed["result"].is_object(),
+        "resume must succeed: {resumed}"
+    );
+
+    let id = harness.prompt(&session_id, "read it again");
+    let (updates, _) = harness.collect_updates(&session_id, id);
+    let opened: Vec<&str> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "tool_call")
+        .filter_map(|update| update["toolCallId"].as_str())
+        .collect();
+    let [opened] = opened.as_slice() else {
+        panic!("one call after the resume: {updates:?}");
+    };
+    assert_ne!(*opened, "call_0", "{updates:?}");
+}
+
+/// A call whose round was cut after the call arrived never runs, and when the turn goes on, here
+/// past a context overflow its compaction answered, the call's card closes before the next round,
+/// not at the turn's end.
+#[test]
+fn a_call_its_round_dropped_closes_before_the_turn_goes_on() {
+    let script = serde_json::json!([
+        [
+            { "type": "text", "text": "hello" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "call_cut", "name": "checklist_read" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "fail_context_overflow", "message": "prompt is too long" }
+        ],
+        [
+            { "type": "text", "text": "the summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "hi");
+    let (_, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let id = harness.prompt(&session_id, "read the list");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let updates: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .collect();
+    let reports: Vec<usize> = updates
+        .iter()
+        .enumerate()
+        .filter(|(_, update)| update["toolCallId"] == "call_cut")
+        .map(|(place, _)| place)
+        .collect();
+    let [opened, closed] = reports.as_slice() else {
+        panic!("the dropped call's card opens and closes: {updates:?}");
+    };
+    assert_eq!(updates[*opened]["sessionUpdate"], "tool_call");
+    assert_eq!(updates[*closed]["status"], "failed", "{updates:?}");
+    let reply = updates
+        .iter()
+        .position(|update| update["content"]["text"] == "done")
+        .unwrap_or_else(|| panic!("the turn goes on: {updates:?}"));
+    assert!(*closed < reply, "closed before the next round: {updates:?}");
+}
+
+/// A call whose stream was cut after its arguments never runs, so nothing reports its end; the
+/// turn's end closes its card rather than leaving it running in the editor.
+#[test]
+fn a_call_cut_off_with_its_stream_is_closed_when_the_turn_ends() {
+    let script = serde_json::json!([[
+        { "type": "tool_use_start", "id": "call_cut", "name": "shell_execute" },
+        { "type": "tool_use_end", "input": { "command": "true" } },
+        { "type": "fail", "message": "the stream broke" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        ACP_INVALID_PARAMS_CONFIG,
+        Some(script),
+        serde_json::json!({"_meta": {"terminal_output": true}}),
+    );
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "run it");
+    let (updates, _) = harness.collect_updates(&session_id, id);
+    let reports: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .filter(|update| update["toolCallId"] == "call_cut")
+        .collect();
+    let [opened, closed] = reports.as_slice() else {
+        panic!("the cut call's card opens and closes: {updates:?}");
+    };
+    assert_eq!(opened["sessionUpdate"], "tool_call");
+    assert!(opened["_meta"]["terminal_info"].is_object(), "{opened}");
+    assert_eq!(closed["sessionUpdate"], "tool_call_update");
+    assert_eq!(closed["status"], "failed", "{closed}");
+    assert_eq!(
+        closed["_meta"]["terminal_exit"]["terminal_id"], "call_cut",
+        "the terminal it opened is ended, so an editor stops its clock: {closed}"
+    );
+}
+
+/// A call a `session/cancel` stopped is the client's to mark, as the protocol has it mark every
+/// call unfinished at a cancel; a report of its own would overwrite the client's.
+#[test]
+fn a_call_a_cancel_stopped_is_left_for_the_client_to_mark() {
+    let script = serde_json::json!([[
+        { "type": "tool_use_start", "id": "call_stopped", "name": "checklist_read" },
+        { "type": "tool_use_end", "input": {} },
+        { "type": "sleep", "ms": 5000 },
+        { "type": "message_end", "stop_reason": "tool_use" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "read the list");
+    let started = read_until(&mut harness.reader, window(10), |line| {
+        line.contains("\"call_stopped\"")
+    });
+    assert!(
+        started
+            .last()
+            .is_some_and(|line| line.contains("\"tool_call\"")),
+        "the call must start: {started:?}"
+    );
+    harness.cancel(&session_id);
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "cancelled", "{response}");
+    assert!(
+        !updates
+            .iter()
+            .any(|value| value["params"]["update"]["toolCallId"] == "call_stopped"),
+        "{updates:?}"
+    );
+}
+
+/// A reopened session reports a result as the live run did: the change a write recorded, and the
+/// result itself as `rawOutput`.
+#[test]
+fn a_replayed_result_carries_its_change_and_raw_output() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "call_note", "name": "memory_write" },
+            {
+                "type": "tool_use_end",
+                "input": { "name": "release-notes", "description": "what shipped", "body": "0.88" }
+            },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "noted" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let config = format!(
+        "{ACP_INVALID_PARAMS_CONFIG}\n[permissions]\ndefault = \"workspace\"\nenabled = \
+         [\"workspace\"]\n"
+    );
+    let mut harness = AcpTestHarness::spawn(&config, Some(script));
+    let cwd = harness.work_dir();
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "note it");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let completion = |updates: &[serde_json::Value]| -> serde_json::Value {
+        updates
+            .iter()
+            .map(|value| &value["params"]["update"])
+            .find(|update| {
+                update["sessionUpdate"] == "tool_call_update" && update["toolCallId"] == "call_note"
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("the write must complete: {updates:?}"))
+    };
+    let live = completion(&updates);
+
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
+    );
+    assert!(closed["result"].is_object(), "close must succeed: {closed}");
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(
+        response["result"].is_object(),
+        "load must succeed: {response}"
+    );
+    let replayed = completion(&updates);
+    assert!(
+        replayed["content"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("```diff\n") && text.contains("\n+0.88\n")),
+        "the change, as live showed it: {replayed}"
+    );
+    assert_eq!(replayed["content"], live["content"], "{live}\n{replayed}");
+    assert_eq!(
+        replayed["rawOutput"], live["rawOutput"],
+        "{live}\n{replayed}"
+    );
+    assert!(replayed["rawOutput"].is_array(), "{replayed}");
 }
 
 /// A session compacted before it was closed is titled by its first prompt when it is loaded
@@ -6679,12 +7328,8 @@ fn loading_a_compacted_session_titles_it_by_its_first_prompt() {
     assert!(
         updates
             .iter()
-            .any(
-                |value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
-                    && value["params"]["update"]["content"]["text"]
-                        .as_str()
-                        .is_some_and(|text| text.starts_with("[meka] The agent compacted"))
-            ),
+            .any(|value| value["params"]["update"]["title"]
+                == "The agent compacted the conversation."),
         "the turn must have compacted: {updates:?}"
     );
 

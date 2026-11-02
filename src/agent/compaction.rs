@@ -407,43 +407,49 @@ fn round_for_display(message: &Message) -> Message {
     let content = message
         .content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Thinking { thinking, .. } => {
-                (!thinking.trim().is_empty()).then(|| ContentBlock::Thinking {
-                    thinking: thinking.clone(),
-                    opaque: None,
-                })
-            }
-            ContentBlock::RedactedThinking { .. } => None,
-            ContentBlock::ToolUse { name, .. } if name == "context_replace" => None,
-            ContentBlock::ToolUse { id, name, input } => Some(ContentBlock::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: bounded_argument(input),
-            }),
-            ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-                display,
-            } => Some(ContentBlock::ToolResult {
-                tool_use_id: tool_use_id.clone(),
-                content: content
-                    .iter()
-                    .filter(|part| {
-                        !matches!(part, crate::conversation::ToolResultContent::Image { .. })
-                    })
-                    .cloned()
-                    .collect(),
-                is_error: *is_error,
-                display: display.clone(),
-            }),
-            other => Some(other.clone()),
-        })
+        .filter_map(block_for_display)
         .collect();
     Message {
         role: message.role,
         content,
+    }
+}
+
+/// One block of a checkpoint round as [`round_for_display`] keeps it, or `None` for one it leaves
+/// out.
+fn block_for_display(block: &ContentBlock) -> Option<ContentBlock> {
+    match block {
+        ContentBlock::Thinking { thinking, .. } => {
+            (!thinking.trim().is_empty()).then(|| ContentBlock::Thinking {
+                thinking: thinking.clone(),
+                opaque: None,
+            })
+        }
+        ContentBlock::RedactedThinking { .. } => None,
+        ContentBlock::ToolUse { name, .. } if name == "context_replace" => None,
+        ContentBlock::ToolUse { id, name, input } => Some(ContentBlock::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input: bounded_argument(input),
+        }),
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            display,
+        } => Some(ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content
+                .iter()
+                .filter(|part| {
+                    !matches!(part, crate::conversation::ToolResultContent::Image { .. })
+                })
+                .cloned()
+                .collect(),
+            is_error: *is_error,
+            display: display.clone(),
+        }),
+        other => Some(other.clone()),
     }
 }
 
@@ -593,6 +599,7 @@ impl Agent {
                     &request,
                     messages,
                     cancellation.clone(),
+                    compaction_id,
                     &mut memories_written,
                     &mut checkpoint_rounds,
                 )
@@ -984,6 +991,8 @@ impl Agent {
         request: &CompactRequest,
         messages: &Conversation,
         cancellation: CancellationToken,
+        // The compaction the checkpoint is for, which names each call a frontend is shown.
+        compaction_id: &str,
         // Accumulated in the caller's buffer rather than returned, so a checkpoint that writes a
         // memory and *then* fails or is canceled still reports what landed on disk.
         memories_written: &mut Vec<String>,
@@ -1033,6 +1042,7 @@ impl Agent {
         }
 
         let mut thinking_removed = false;
+        let mut place = 0;
         for _ in 0..CHECKPOINT_MAX_ITERATIONS {
             // Checked per round as well as inside the tools, so an interrupt ends the checkpoint at
             // the next boundary instead of running out the whole iteration budget. Returning `None`
@@ -1126,6 +1136,14 @@ impl Agent {
             let mut recorded = Vec::with_capacity(tool_uses.len());
             for (tool_use_id, name, input) in tool_uses {
                 recorded.push(name != "context_replace");
+                // The id a frontend shows the call under, counted over the calls the record keeps,
+                // in the order it keeps them.
+                let shown_as = if name == "context_replace" {
+                    tool_use_id.clone()
+                } else {
+                    place += 1;
+                    crate::frontend::checkpoint_call_id(compaction_id, place)
+                };
                 let output = match admitted.get(&name) {
                     // Approvals put a call above the level to the user, and a checkpoint's writes
                     // are actions: `memory_write` overwrites an existing note in place, durably and
@@ -1146,7 +1164,7 @@ impl Agent {
                         self.run_admitted_call(
                             tool,
                             super::dispatch::ResolvedCall {
-                                tool_call_id: &tool_use_id,
+                                tool_call_id: &shown_as,
                                 name: &name,
                                 input: &input,
                             },
@@ -1177,12 +1195,33 @@ impl Agent {
                     memories_written.push(memory.to_string());
                 }
                 let display = self.result_display(&name, &output).await;
-                results.push(ContentBlock::ToolResult {
+                let result = ContentBlock::ToolResult {
                     tool_use_id,
                     content: bound_checkpoint_result(output.content),
                     is_error: output.is_error,
                     display,
-                });
+                };
+                if name != "context_replace"
+                    && let Some(ContentBlock::ToolResult {
+                        content,
+                        is_error,
+                        display,
+                        ..
+                    }) = block_for_display(&result)
+                {
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::CheckpointCallCompleted {
+                            id: shown_as,
+                            name: name.clone(),
+                            input: bounded_argument(&input),
+                            content,
+                            is_error,
+                            display,
+                        })
+                        .await;
+                }
+                results.push(result);
             }
             let results = Message {
                 role: Role::User,
@@ -4008,6 +4047,83 @@ mod tests {
             frontend.permission_requests().is_empty(),
             "nobody is asked about a call the level refuses anyway: {:?}",
             frontend.permission_requests()
+        );
+    }
+
+    /// Each checkpoint call is told as it finishes, under the compaction's id and its place, ahead
+    /// of the compaction's own end: what it wrote stays written whether or not the compaction
+    /// lands, as here, where the summarizer the checkpoint fell back to fails.
+    #[tokio::test]
+    async fn a_checkpoint_tells_each_call_as_it_finishes() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "memory_write".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"name": "note"}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("noted"),
+            vec![MockEvent::Fail {
+                message: "the summarizer failed".to_string(),
+            }],
+        ]));
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(StubTool {
+                name: "memory_write".to_string(),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .expect("register stub");
+        let (mut agent, store) = agent_with_registry_and_checkpoint(provider, registry).await;
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        let mut messages = conversation();
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session"),
+        );
+
+        let result = agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Requested),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_err(), "{result:?}");
+
+        let events = frontend.events();
+        let compaction = events
+            .iter()
+            .find_map(|event| match event {
+                FrontendEvent::CompactionStarted { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("the compaction opens");
+        let told = events
+            .iter()
+            .position(|event| {
+                matches!(event, FrontendEvent::CheckpointCallCompleted { id, name, is_error, .. }
+                    if *id == crate::frontend::checkpoint_call_id(&compaction, 1)
+                        && name == "memory_write"
+                        && !is_error)
+            })
+            .unwrap_or_else(|| panic!("the write is told: {events:?}"));
+        let failed = events
+            .iter()
+            .position(|event| matches!(event, FrontendEvent::CompactionFailed { .. }))
+            .expect("the failure is announced");
+        assert!(
+            told < failed,
+            "as it finishes, not when the compaction ends: {events:?}"
         );
     }
 

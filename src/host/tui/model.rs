@@ -1712,6 +1712,26 @@ impl Transcript {
                 self.flush_turn_end();
             }
             FrontendEvent::CompactionStarted { .. } | FrontendEvent::CompactionFailed { .. } => {}
+            // The compaction's row shows its checkpoint once it lands, from the record.
+            FrontendEvent::CheckpointCallCompleted { .. } => {}
+            // A call its round ended without running goes now, as one the turn's end finds does:
+            // the log holds none of it.
+            //
+            // By its state too, since a stream tried again can bring a call under the same id while
+            // the attempt before left one composing.
+            FrontendEvent::ToolCallDropped { id, started } => {
+                let state = if started {
+                    ToolState::Running
+                } else {
+                    ToolState::Composing
+                };
+                if let Some(index) = self.tail.iter().rposition(|entry| {
+                    matches!(&entry.item, Item::ToolCall { id: call, state: drawn, .. }
+                        if *call == id && *drawn == state)
+                }) {
+                    self.remove_entry(index);
+                }
+            }
         }
     }
 
@@ -4695,6 +4715,67 @@ mod tests {
             })
             .collect();
         assert_eq!(calls, ["ran"]);
+    }
+
+    /// A call its round dropped goes at once, while the turn goes on, and a later call under the
+    /// same id keeps its row: the log holds none of the dropped one.
+    #[test]
+    fn a_call_its_round_dropped_goes_while_the_turn_goes_on() {
+        let mut transcript = transcript();
+        let started = |path: &str| FrontendEvent::ToolCallStarted {
+            id: "call_0".into(),
+            name: "file_read".into(),
+            input: serde_json::json!({ "path": path }),
+            display_summary: Some(path.to_string()),
+        };
+        transcript.apply(started("a.txt"));
+        transcript.apply(FrontendEvent::ToolCallDropped {
+            id: "call_0".into(),
+            started: true,
+        });
+        transcript.apply(started("b.txt"));
+        let calls: Vec<String> = items(&transcript)
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::ToolCall { summary, .. } => Some(format!("{summary:?}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].contains("b.txt"), "{calls:?}");
+    }
+
+    /// A drop names the call by its state as well as its id: one whose arguments never finished
+    /// goes, while a running call under another drop's id stays.
+    #[test]
+    fn a_dropped_call_goes_by_its_state() {
+        let mut transcript = transcript();
+        transcript.apply(FrontendEvent::ToolCallComposing {
+            id: "a".into(),
+            name: "file_write".into(),
+        });
+        transcript.apply(FrontendEvent::ToolCallDropped {
+            id: "a".into(),
+            started: false,
+        });
+        transcript.apply(FrontendEvent::ToolCallStarted {
+            id: "b".into(),
+            name: "file_read".into(),
+            input: serde_json::json!({"path": "b.txt"}),
+            display_summary: Some("b.txt".into()),
+        });
+        transcript.apply(FrontendEvent::ToolCallDropped {
+            id: "b".into(),
+            started: false,
+        });
+        let calls: Vec<&str> = items(&transcript)
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, ["b"]);
     }
 
     /// A followup typed while a turn ran is drawn again at the end once it is sent, where the

@@ -1615,7 +1615,7 @@ mod tests {
             primary_param: None,
             input: serde_json::Value::Null,
             cancellation: tokio_util::sync::CancellationToken::new(),
-            tool_call_id: None,
+            tool_call: None,
             subagent_id: None,
         };
 
@@ -1685,7 +1685,7 @@ mod tests {
                         primary_param: None,
                         input: serde_json::Value::Null,
                         cancellation: tokio_util::sync::CancellationToken::new(),
-                        tool_call_id: None,
+                        tool_call: None,
                         subagent_id: None,
                     })
                     .await
@@ -2093,7 +2093,7 @@ mod tests {
             primary_param: None,
             input: serde_json::Value::Null,
             cancellation: tokio_util::sync::CancellationToken::new(),
-            tool_call_id: None,
+            tool_call: None,
             subagent_id: None,
         }
     }
@@ -2239,7 +2239,7 @@ mod tests {
                 primary_param: Some("rm /tmp/x".into()),
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             })
             .await;
@@ -2286,7 +2286,7 @@ mod tests {
                 primary_param: Some("rm /tmp/x".into()),
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             }),
         )
@@ -2335,7 +2335,7 @@ mod tests {
                 primary_param: None,
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             })
             .await;
@@ -2365,7 +2365,7 @@ mod tests {
                 primary_param: None,
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             })
             .await;
@@ -2391,7 +2391,7 @@ mod tests {
                 primary_param: Some("/tmp/x".into()),
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                tool_call_id: None,
+                tool_call: None,
                 subagent_id: None,
             };
             let join =
@@ -2514,7 +2514,7 @@ mod tests {
                     primary_param: Some("rm -rf /".into()),
                     input: serde_json::Value::Null,
                     cancellation: waiter,
-                    tool_call_id: None,
+                    tool_call: None,
                     subagent_id: None,
                 })
                 .await
@@ -2579,7 +2579,7 @@ mod tests {
                         primary_param: Some("/tmp/x".into()),
                         input: serde_json::json!({"path": "/tmp/x", "content": "the payload"}),
                         cancellation,
-                        tool_call_id: None,
+                        tool_call: None,
                         subagent_id: None,
                     })
                     .await
@@ -2636,7 +2636,7 @@ mod tests {
                     primary_param: Some("echo hi".into()),
                     input: serde_json::Value::Null,
                     cancellation: tokio_util::sync::CancellationToken::new(),
-                    tool_call_id: None,
+                    tool_call: None,
                     subagent_id: None,
                 })
                 .await
@@ -2867,7 +2867,7 @@ mod tests {
                     primary_param: Some("echo hi".into()),
                     input: serde_json::Value::Null,
                     cancellation: tokio_util::sync::CancellationToken::new(),
-                    tool_call_id: None,
+                    tool_call: None,
                     subagent_id: None,
                 })
                 .await

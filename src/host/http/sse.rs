@@ -246,6 +246,12 @@ pub(crate) fn translate(
         }
         // The level is a fact of the turn, which its record carries.
         FrontendEvent::TurnOpened { .. } => return None,
+        // A dropped call is settled by the turn's terminal, as one the turn's last round left is,
+        // and a compaction's checkpoint is the record `context.compacted` and `GET /messages`
+        // carry.
+        FrontendEvent::ToolCallDropped { .. } | FrontendEvent::CheckpointCallCompleted { .. } => {
+            return None;
+        }
         // The HTTP host writes its own terminal from the turn's result; a sub-agent's feed is the
         // one reader of this, and it is not built from `translate`.
         FrontendEvent::TurnEnded { .. } => return None,
