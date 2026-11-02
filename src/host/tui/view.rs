@@ -2703,6 +2703,11 @@ mod tests {
     /// a relative path as written.
     #[test]
     fn a_path_is_shown_against_the_working_directory() {
+        let working_directory = if cfg!(windows) {
+            Path::new(r"C:\w")
+        } else {
+            Path::new("/w")
+        };
         let read = |path: &str| {
             let item = Item::ToolCall {
                 id: "1".into(),
@@ -2718,10 +2723,17 @@ mod tests {
                 change: None,
                 exit_code: None,
             };
-            plain(&lines_at(&entry(item, false), 80)).remove(0)
+            plain(&entry_lines(&entry(item, false), 80, working_directory)).remove(0)
         };
-        assert_eq!(read("/w/src/main.rs"), "• file_read src/main.rs");
-        assert_eq!(read("/w"), "• file_read .");
+        let under = working_directory.join("src/main.rs");
+        assert_eq!(
+            read(&under.display().to_string()),
+            "• file_read src/main.rs"
+        );
+        assert_eq!(
+            read(&working_directory.display().to_string()),
+            "• file_read ."
+        );
         assert_eq!(
             read("/elsewhere/notes.md"),
             "• file_read /elsewhere/notes.md"

@@ -2896,7 +2896,7 @@ mod tests {
         let calls: Vec<(&str, serde_json::Value, bool, Option<ToolOutputMetadata>)> = vec![
             (
                 "file_edit",
-                serde_json::json!({"path": "/w/a.txt", "old_string": "b\n", "new_string": "B\n"}),
+                serde_json::json!({"path": "a.txt", "old_string": "b\n", "new_string": "B\n"}),
                 false,
                 Some(ToolOutputMetadata::Diff {
                     path: None,
@@ -2906,7 +2906,7 @@ mod tests {
             ),
             (
                 "file_write",
-                serde_json::json!({"path": "/w/new.txt", "content": "one\n"}),
+                serde_json::json!({"path": "new.txt", "content": "one\n"}),
                 false,
                 Some(ToolOutputMetadata::Diff {
                     path: None,
