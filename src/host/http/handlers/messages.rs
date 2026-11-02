@@ -16,7 +16,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    conversation::{ContentBlock, Message, Role, ToolResultContent},
+    conversation::{ContentBlock, Message, ToolResultContent},
     host::http::{
         errors::{ErrorKind, ProblemDetail},
         scope,
@@ -200,10 +200,7 @@ pub(crate) enum ToolResultContentView {
 /// them, with no row of its own yet. The feed stamps the turn.
 pub(crate) fn message_view(message: &Message) -> MessageView {
     MessageView {
-        role: match message.role {
-            Role::User => "user".to_string(),
-            Role::Assistant => "assistant".to_string(),
-        },
+        role: message.role.name().to_string(),
         content: message.content.iter().map(view_for_block).collect(),
         created_at: None,
         turn_id: None,
@@ -296,10 +293,7 @@ pub(crate) async fn list_messages(
         .zip(turn_indexes.iter().skip(offset))
         .zip(markers.iter().skip(offset))
         .map(|(((message, stamp), turn_label), marker)| MessageView {
-            role: match message.role {
-                Role::User => "user".to_string(),
-                Role::Assistant => "assistant".to_string(),
-            },
+            role: message.role.name().to_string(),
             content: message.content.iter().map(view_for_block).collect(),
             created_at: Some(stamp.created_at.clone()),
             turn_id: stamp.turn_id,
@@ -457,6 +451,7 @@ fn view_for_block(block: &ContentBlock) -> ContentBlockView {
             tool_use_id,
             content,
             is_error,
+            ..
         } => ContentBlockView::ToolResult {
             tool_use_id: tool_use_id.clone(),
             is_error: *is_error,
@@ -537,6 +532,7 @@ pub(crate) async fn get_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::Role;
 
     fn tool_round() -> (Message, Message) {
         let call = Message {
@@ -555,6 +551,7 @@ mod tests {
                     text: "contents".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         };
         (call, result)

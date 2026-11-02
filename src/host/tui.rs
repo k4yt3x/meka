@@ -106,6 +106,7 @@ pub(crate) async fn run_interactive(
     let mut transcript = model::Transcript::new(model::Settings {
         show_session_id_on_create: config.show_session_id_on_create,
         turn_end_summary: config.turn_end_summary.clone(),
+        fold_steps: config.fold_steps,
     });
     if let Some(id) = session_id {
         match store.turn_store().load_turns(id).await {
@@ -276,6 +277,7 @@ pub(crate) async fn run_interactive(
             class: None,
             inbox_id: None,
             delivered: true,
+            ran_under: model::RanUnder::Pending,
         });
     }
     // The resumed log is what the list is; read it before the first prompt rather than at the
@@ -377,6 +379,7 @@ pub(crate) async fn run_interactive(
         cancel: cancel.clone(),
         send_class: inbox_class(config.send_class),
         mouse: config.mouse,
+        wheel_rows: config.wheel_rows,
         busy: initial_turn_pending,
         pick_session: config.request.session_resume == Some(crate::config::SessionResume::Pick),
         pick_project: config.request.requested_project.clone(),
@@ -715,7 +718,7 @@ async fn report_background_survivors_to(agent: &Agent, ui: &Ui) {
     let running = agent.background_tasks().running_count_all().await;
     if running > 0 {
         ui.note(format!(
-            "{running} background task(s) still running; stop them with `/task cancel --all`."
+            "{running} background task(s) still running; stop them with `/task cancel --all`"
         ));
     }
 }

@@ -52,6 +52,8 @@ const HINT_LIFETIME: Duration = Duration::from_secs(6);
 const COMPOSER_SHARE: u16 = 3;
 /// A panel takes up to this share of the screen.
 const PANEL_SHARE: u16 = 2;
+/// Rows of the composer's block above and below its text.
+const COMPOSER_PADDING: u16 = 1;
 /// A drag over the transcript: where it started and where the pointer is, in the frame's
 /// coordinates, and whether it moved at all, which is what tells a drag from a click.
 #[derive(Debug, Clone, Copy)]
@@ -73,7 +75,10 @@ impl Selection {
     }
 }
 /// What the status row says when a question is taken off the screen unanswered.
-const QUESTION_WITHDRAWN_HINT: &str = "the question was withdrawn";
+const QUESTION_WITHDRAWN_HINT: &str = "The question was withdrawn";
+/// What the status row says while Enter waits on an image being read; it goes when the image
+/// lands.
+const IMAGE_READING_HINT: &str = "An image is still being read";
 /// How often the status row's count of running work is read back from the store.
 const WORK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// The sessions the picker offers: the newest, since an older one is reached by `/resume <id>`.
@@ -150,6 +155,8 @@ pub(crate) struct ScreenLaunch {
     pub(crate) cancel: crate::host::CancelCell,
     pub(crate) send_class: InboxClass,
     pub(crate) mouse: bool,
+    /// Resolved `[display].wheel_rows`: rows a wheel event moves the transcript or a panel.
+    pub(crate) wheel_rows: usize,
     /// Whether a turn is already running when the screen opens: a prompt given on the command
     /// line is the first turn's input.
     pub(crate) busy: bool,
@@ -388,6 +395,11 @@ struct Screen {
     selection: Option<Selection>,
     /// Whether the pointer is on the stuck prompt's bar, which lights it.
     sticky_hovered: bool,
+    /// Where the pointer was at the last mouse event: the back-to-bottom pill lights when it is
+    /// drawn under it, wherever the pill has moved to since and whatever brought it out.
+    pointer: Option<(u16, u16)>,
+    /// The id the next image read for the composer answers under.
+    next_attachment: u64,
     /// The last frame as drawn, which is what a selection copies: the text as shown, whatever
     /// item it came from. Kept from every frame, since a press, a drag and a release can all
     /// arrive between two frames.
@@ -400,6 +412,12 @@ struct Screen {
     overlay_area: Option<Rect>,
     /// A page of the log is on its way; one read at a time, so two scrolls do not ask twice.
     history_loading: bool,
+    /// The generation of the reload whose read is on its way, if one is: the command that asked
+    /// for it is not done until it lands, so no turn starts under a transcript about to be
+    /// replaced.
+    reloading: Option<u64>,
+    /// Whether the host said a command was done while its reload was still on its way.
+    done_waiting: bool,
     /// The background tasks and sub-agents running for this session, as last read.
     work: view::RunningWork,
     work_polled: Option<Instant>,
@@ -437,11 +455,15 @@ impl Screen {
             history_generation: 0,
             selection: None,
             sticky_hovered: false,
+            pointer: None,
+            next_attachment: 0,
             drawn: ratatui::buffer::Buffer::default(),
             transcript_area: Rect::default(),
             pill: None,
             overlay_area: None,
             history_loading: false,
+            reloading: None,
+            done_waiting: false,
             work: view::RunningWork::default(),
             work_polled: None,
             wide_cells: Vec::new(),
@@ -504,11 +526,13 @@ impl Screen {
             } else {
                 None
             };
+            let pictures = page_pictures(&store, &page).await;
             ui.send(UiEvent::HistoryPage {
                 above: true,
                 page,
                 tasks,
                 rewound,
+                pictures,
                 generation,
             });
         });
@@ -557,14 +581,42 @@ impl Screen {
                     Vec::new()
                 }
             };
+            let pictures = page_pictures(&store, &page).await;
             ui.send(UiEvent::HistoryPage {
                 above: false,
                 page,
                 tasks,
                 rewound: None,
+                pictures,
                 generation,
             });
         });
+    }
+
+    /// What the host's word that a turn or a command is done does: the screen is free again, and a
+    /// wake or a followup that waited for it is handed over.
+    fn finish(&mut self) {
+        // An invocation the host refused ahead of its turn hands its images back.
+        let refused = std::mem::take(&mut self.invoked_with);
+        if !refused.is_empty() {
+            self.composer.give_back(refused);
+        }
+        self.launch.transcript.flush_turn_end();
+        // Before a followup is handed over, which is sent for the next turn.
+        self.launch.transcript.settle_unopened_prompts();
+        self.busy = None;
+        self.activity = view::Activity::Working;
+        self.compacting = false;
+        if self.wake_pending {
+            self.wake_pending = false;
+            self.ask_host(HostEvent::Wake);
+        } else if let Some((id, text)) = self.followups.pop_front() {
+            self.launch.transcript.send_followup(id, text.clone());
+            self.ask_host(HostEvent::UserInput {
+                parts: vec![crate::conversation::ContentBlock::Text { text }],
+                images: Vec::new(),
+            });
+        }
     }
 
     /// The log changed under the screen: read its end again and show the last page.
@@ -577,6 +629,7 @@ impl Screen {
         self.history_generation += 1;
         self.history_loading = true;
         let generation = self.history_generation;
+        self.reloading = Some(generation);
         let store = self.launch.store.clone();
         let ui = self.launch.ui.clone();
         tokio::spawn(async move {
@@ -612,11 +665,13 @@ impl Screen {
                 tracing::warn!("failed to read what the session's rewinds took: {error}");
                 Vec::new()
             });
+            let pictures = page_pictures(&store, &page).await;
             ui.send(UiEvent::Reloaded {
                 log_end,
                 page,
                 turns,
                 rewound,
+                pictures,
                 generation,
             });
         });
@@ -660,10 +715,26 @@ impl Screen {
         self.composer.suggest(&self.launch.completer);
     }
 
-    /// What a command has to say back that is not a fact of the session: a refusal, a failure,
-    /// an empty list. A panel until Esc, and nothing on the transcript.
+    /// What a command has to say back in meka's voice that is not a fact of the session: a
+    /// refusal, a failure, an empty list. The door every such answer the screen and the host say
+    /// passes, so a sentence another surface shares, an error's above all, takes the screen's
+    /// voice here ([`draw::screen_voice`]); see [`Self::answer`].
     fn reply(&mut self, message: impl Into<String>) {
-        self.open_panel(Panel::with_text(&message.into()), PanelKind::Info);
+        let message: String = message.into();
+        let text: Vec<std::borrow::Cow<'_, str>> =
+            message.lines().map(draw::screen_voice).collect();
+        self.answer(text.join("\n"));
+    }
+
+    /// An answer a command gives: a panel until Esc, and nothing on the transcript. A question on
+    /// the screen is never taken away by it, since closing an approval prompt or a form answers
+    /// it: what is said then goes to the status row.
+    fn answer(&mut self, text: String) {
+        if self.overlay_is_question() {
+            self.show_hint(text.lines().next().unwrap_or_default().to_string());
+            return;
+        }
+        self.open_panel(Panel::with_text(&text), PanelKind::Info);
     }
 
     /// A picker whose every choice is a command line to run: the label and what it is, and the
@@ -765,7 +836,7 @@ impl Screen {
             });
         }
         if choices.is_empty() {
-            self.reply("No sessions to resume.");
+            self.reply("No sessions to resume");
             return;
         }
         self.open_panel(
@@ -826,7 +897,7 @@ impl Screen {
     fn send_host(&mut self, event: HostEvent) {
         if self.launch.host.send(event).is_err() {
             // The host loop is gone, so there is nothing left to answer anything.
-            self.push(Item::Error("the agent stopped; leaving".to_string()));
+            self.push(Item::Error("The agent stopped; leaving".to_string()));
             self.leaving = true;
         }
     }
@@ -949,8 +1020,13 @@ impl Screen {
                     | crate::frontend::FrontendEvent::CompactionFailed { .. } => {
                         self.compacting = false;
                     }
+                    // The turn took the images; its opening draws them as the composer did.
                     crate::frontend::FrontendEvent::TurnStarted { .. } => {
-                        self.invoked_with.clear();
+                        let pictures = std::mem::take(&mut self.invoked_with)
+                            .into_iter()
+                            .map(|attachment| attachment.picture)
+                            .collect();
+                        self.launch.transcript.offer_pictures(pictures);
                     }
                     _ => {}
                 }
@@ -967,6 +1043,28 @@ impl Screen {
                 stopped,
             } => self.finish_shell(run, output, stopped),
             UiEvent::Item(item) => self.push(item),
+            // An image read for the composer takes its chip's place, unless the chip has gone.
+            UiEvent::Attached { id, attached } => {
+                match attached {
+                    Ok(attachment) => {
+                        self.composer.attached(id, attachment);
+                    }
+                    Err(error) => {
+                        if self.composer.drop_reading(id) {
+                            self.reply(error);
+                        }
+                    }
+                }
+                if !self.composer.is_reading()
+                    && self
+                        .hint
+                        .as_ref()
+                        .is_some_and(|(hint, _)| hint == IMAGE_READING_HINT)
+                {
+                    self.hint = None;
+                }
+                self.dirty = true;
+            }
             UiEvent::McpServers(servers) => {
                 let names = servers.iter().map(|server| server.name.clone()).collect();
                 let choices = servers
@@ -982,38 +1080,10 @@ impl Screen {
                     PanelKind::McpServers(names),
                 );
             }
-            UiEvent::Panel(body) => self.open_panel(Panel::with_text(&body), PanelKind::Info),
-            UiEvent::Done => {
-                // An invocation the host refused ahead of its turn hands its images back.
-                let refused = std::mem::take(&mut self.invoked_with);
-                if !refused.is_empty() {
-                    self.composer.give_back(refused);
-                }
-                self.launch.transcript.flush_turn_end();
-                self.busy = None;
-                self.activity = view::Activity::Working;
-                self.compacting = false;
-                if self.wake_pending {
-                    self.wake_pending = false;
-                    self.ask_host(HostEvent::Wake);
-                } else if let Some((id, text)) = self.followups.pop_front() {
-                    // A reload between the typing and the sending (a `/rewind` or `/fork` run
-                    // between them) keeps nothing of the tail but the host's own rows, so the
-                    // prompt is shown again rather than sent under nothing.
-                    if !self.launch.transcript.mark_sent(id) {
-                        self.push(Item::Prompt {
-                            text: text.clone(),
-                            class: None,
-                            inbox_id: None,
-                            delivered: true,
-                        });
-                    }
-                    self.ask_host(HostEvent::UserInput {
-                        parts: vec![crate::conversation::ContentBlock::Text { text }],
-                        images: Vec::new(),
-                    });
-                }
-            }
+            UiEvent::Reply(message) => self.reply(message),
+            UiEvent::Show(text) => self.answer(text),
+            UiEvent::Done if self.reloading.is_some() => self.done_waiting = true,
+            UiEvent::Done => self.finish(),
             UiEvent::Wake => {
                 if self.is_busy() {
                     self.wake_pending = true;
@@ -1023,28 +1093,43 @@ impl Screen {
             }
             UiEvent::Leave => self.leaving = true,
             UiEvent::Reload => self.reload(),
+            // A page read for the session let go of is no page of this one.
+            UiEvent::Switched => {
+                self.history_generation += 1;
+                self.history_loading = false;
+                self.launch.transcript.forget_session();
+            }
             UiEvent::Reloaded {
                 log_end,
                 page,
                 turns,
                 rewound,
+                pictures,
                 generation,
             } => {
-                if generation != self.history_generation {
+                if self.reloading != Some(generation) {
                     return;
                 }
+                self.reloading = None;
+                // What any page read meanwhile holds, this page holds as it is now.
+                self.history_generation += 1;
                 self.history_loading = false;
                 self.launch.transcript.reset(log_end);
                 self.launch.transcript.set_turn_records(turns);
                 self.launch.transcript.set_rewound(rewound);
+                self.launch.transcript.set_pictures(pictures);
                 self.launch.transcript.load_page_above(page);
                 self.viewport.scroll_to_bottom();
+                if std::mem::take(&mut self.done_waiting) {
+                    self.finish();
+                }
             }
             UiEvent::HistoryPage {
                 above,
                 page,
                 tasks,
                 rewound,
+                pictures,
                 generation,
             } => {
                 if generation != self.history_generation {
@@ -1055,6 +1140,7 @@ impl Screen {
                 if let Some(rewound) = rewound {
                     self.launch.transcript.set_rewound(rewound);
                 }
+                self.launch.transcript.set_pictures(pictures);
                 if above {
                     self.launch.transcript.load_page_above(page);
                 } else {
@@ -1064,14 +1150,14 @@ impl Screen {
         }
     }
 
-    /// The approval prompt as a panel: the call's row as its heading, its arguments as a tree
-    /// under it, the four answers below.
+    /// The approval prompt as a panel: the call's row as its heading, its arguments under it, the
+    /// four answers below.
     fn open_approval(&mut self, request: ApprovalRequest) {
-        // The call's own row heads the panel and its arguments stand under it as a tree, the
-        // way the transcript draws the call once it is expanded: with the arguments shown, the
-        // row carries no summary, which would say the same thing twice.
+        // The call's own row heads the panel and its arguments stand under it, the way the
+        // transcript draws the call once it is expanded: with the arguments shown, the row
+        // carries no summary, which would say the same thing twice.
         let width = self.transcript_area.width.max(20) as usize;
-        let title = draw::tool_row(&request.tool_name, None, None, None, width);
+        let title = draw::tool_row(&request.tool_name, Vec::new(), Vec::new(), width);
         let body = draw::approval_rows(&request.tool_name, &request.input, width);
         let choices = APPROVAL_CHOICES
             .iter()
@@ -1313,7 +1399,7 @@ impl Screen {
         // after that is to a question nobody is asking any more. Said rather than swallowed,
         // because the user just typed something and is owed an account of where it went.
         if request.responder.is_closed() {
-            self.show_hint("discarded: the turn had already been stopped");
+            self.show_hint("Discarded: the turn had already been stopped");
             return;
         }
         let word = match decision {
@@ -1577,22 +1663,30 @@ impl Screen {
             },
             Action::CursorPrevious => {
                 let next = self
-                    .launch
-                    .transcript
-                    .collapsible_before(self.viewport.cursor());
+                    .viewport
+                    .cursor_before(&self.launch.transcript, self.viewport.cursor());
                 if next.is_some() {
                     self.viewport.set_cursor(next);
                 }
             }
             Action::CursorNext => {
                 if let Some(current) = self.viewport.cursor() {
-                    let next = self.launch.transcript.collapsible_after(current);
+                    let next = self.viewport.cursor_after(&self.launch.transcript, current);
                     self.viewport.set_cursor(next);
                 }
             }
             Action::ToggleItem => {
-                if let Some(index) = self.viewport.cursor() {
-                    self.launch.transcript.toggle(index);
+                if let Some(stop) = self.viewport.cursor() {
+                    match self.viewport.run_under_cursor() {
+                        Some(run) => self.viewport.toggle_run(run),
+                        None => {
+                            if let Some(id) = self.viewport.id_at(stop.index)
+                                && self.launch.transcript.toggle_item(id)
+                            {
+                                self.viewport.keep_in_place(stop.index);
+                            }
+                        }
+                    }
                 }
             }
             Action::ToggleThinking => {
@@ -1602,6 +1696,7 @@ impl Screen {
             Action::ToggleTools => {
                 let expanded = !self.launch.transcript.tools_expanded();
                 self.launch.transcript.set_tools_expanded(expanded);
+                self.viewport.forget_run_choices();
             }
             Action::CycleSendClass => {
                 self.launch.send_class = match self.launch.send_class {
@@ -1727,6 +1822,12 @@ impl Screen {
 
     /// Enter on the composer.
     async fn submit(&mut self) {
+        // An image pasted a moment ago goes with the prompt it was pasted for, so the prompt
+        // waits for it, kept in the composer.
+        if self.composer.is_reading() {
+            self.show_hint(IMAGE_READING_HINT);
+            return;
+        }
         let text = self.composer.text();
         let trimmed = text.trim().to_string();
         if trimmed.is_empty() && !self.composer.has_attachments() {
@@ -1743,7 +1844,7 @@ impl Screen {
         // An image rides on a prompt that opens a turn; the inbox a busy turn reads carries
         // words alone.
         if self.is_busy() && self.composer.has_attachments() && !leaves && shell.is_none() {
-            self.reply("An image goes with the next prompt; wait for the turn to end.");
+            self.reply("An image goes with the next prompt; wait for the turn to end");
             return;
         }
         // Asked ahead of taking anything, so a command that takes no image leaves the line and the
@@ -1759,7 +1860,7 @@ impl Screen {
                 super::commands::WithImages::TakesNone => {
                     self.reply(
                         "An image goes with a prompt, a skill or an MCP prompt; send this command \
-                         without it.",
+                         without it",
                     );
                     return;
                 }
@@ -1802,10 +1903,11 @@ impl Screen {
                     class: None,
                     inbox_id: None,
                     delivered: true,
+                    ran_under: super::model::RanUnder::Pending,
                 });
             }
-            for _ in &attachments {
-                self.push(Item::Image);
+            for attachment in &attachments {
+                self.push(Item::Image(attachment.picture.clone()));
             }
             self.ask_host(HostEvent::UserInput {
                 parts: if trimmed.is_empty() {
@@ -1834,6 +1936,7 @@ impl Screen {
             class: None,
             inbox_id: None,
             delivered: true,
+            ran_under: super::model::RanUnder::Pending,
         });
         self.ask_host(HostEvent::UserInput {
             parts: vec![crate::conversation::ContentBlock::Text { text: trimmed }],
@@ -1870,12 +1973,13 @@ impl Screen {
                 class: Some(class),
                 inbox_id: None,
                 delivered: false,
+                ran_under: super::model::RanUnder::Pending,
             });
             self.followups.push_back((id, text));
             return;
         }
         let Some(session_id) = self.launch.agent.session_id() else {
-            self.reply("No active session yet.");
+            self.reply("No active session yet");
             return;
         };
         let item = match crate::store::inbox::NewInboxItem::from_parts(
@@ -1897,6 +2001,7 @@ impl Screen {
                     class: Some(class),
                     inbox_id: Some(enqueued.id),
                     delivered: false,
+                    ran_under: super::model::RanUnder::Pending,
                 });
             }
             Err(error) => self.reply(error.to_string()),
@@ -1921,9 +2026,9 @@ impl Screen {
             if !body.is_empty() && !body.ends_with('\n') {
                 body.push('\n');
             }
-            body.push_str(&error.to_string());
+            body.push_str(&draw::screen_voice(&error.to_string()));
         }
-        self.open_panel(Panel::with_text(&body), PanelKind::Info);
+        self.answer(body);
     }
 
     /// The commands the screen answers itself: what it holds the answer to, and the lists the
@@ -1940,7 +2045,7 @@ impl Screen {
             SlashCommand::Session => {
                 self.reply(match session_id {
                     Some(id) => format!("Current session: {id}"),
-                    None => "No active session yet.".to_string(),
+                    None => "No active session yet".to_string(),
                 });
             }
             SlashCommand::Resume(None) => self.open_session_picker(None).await,
@@ -2083,7 +2188,7 @@ impl Screen {
             SlashCommand::SkillList => {
                 let index = crate::skills::discover_skills_in_roots(&self.launch.skill_roots);
                 if index.skills.is_empty() {
-                    self.reply("No skills.");
+                    self.reply("No skills");
                 } else {
                     let rows = index
                         .skills
@@ -2105,7 +2210,7 @@ impl Screen {
                     self.launch.agent.project().as_deref(),
                 );
                 match store.index(&view).await {
-                    Ok(index) if index.is_empty() => self.reply("No memories."),
+                    Ok(index) if index.is_empty() => self.reply("No memories"),
                     Ok(index) => {
                         let rows = index
                             .iter()
@@ -2139,7 +2244,7 @@ impl Screen {
                     .list_scheduled_jobs(id)
                     .await
                 {
-                    Ok(jobs) if jobs.is_empty() => self.reply("No scheduled jobs."),
+                    Ok(jobs) if jobs.is_empty() => self.reply("No scheduled jobs"),
                     Ok(jobs) => {
                         let shown =
                             crate::text::unique_prefix_len(jobs.iter().map(|job| job.id.as_str()));
@@ -2178,7 +2283,7 @@ impl Screen {
                     }
                     Err(error) => self.reply(error.to_string()),
                 },
-                None => self.reply("No active session yet."),
+                None => self.reply("No active session yet"),
             },
             SlashCommand::ScheduleShow { id } => match session_id {
                 Some(session) => {
@@ -2191,7 +2296,7 @@ impl Screen {
                     .await;
                     self.listing_panel(printed, outcome);
                 }
-                None => self.reply("No active session yet."),
+                None => self.reply("No active session yet"),
             },
             SlashCommand::TaskList => match session_id {
                 Some(id) => match self
@@ -2201,7 +2306,7 @@ impl Screen {
                     .list_background_tasks(id)
                     .await
                 {
-                    Ok(tasks) if tasks.is_empty() => self.reply("No background tasks."),
+                    Ok(tasks) if tasks.is_empty() => self.reply("No background tasks"),
                     Ok(tasks) => {
                         let shown = crate::text::unique_prefix_len(
                             tasks.iter().map(|task| task.id.as_str()),
@@ -2226,7 +2331,7 @@ impl Screen {
                     }
                     Err(error) => self.reply(error.to_string()),
                 },
-                None => self.reply("No active session yet."),
+                None => self.reply("No active session yet"),
             },
             SlashCommand::ScheduleCancel { id } => match session_id {
                 Some(session) => {
@@ -2238,14 +2343,14 @@ impl Screen {
                         .await
                     {
                         Ok(Some(canceled)) => self.push(Item::note(format!(
-                            "Canceled job {}.",
+                            "Canceled job {}",
                             &canceled[..8.min(canceled.len())]
                         ))),
-                        Ok(None) => self.reply(format!("No scheduled job matching '{id}'.")),
+                        Ok(None) => self.reply(format!("No scheduled job matching '{id}'")),
                         Err(error) => self.reply(error.to_string()),
                     }
                 }
-                None => self.reply("No active session yet."),
+                None => self.reply("No active session yet"),
             },
             // Recorded first, then signaled: `finish_background_task` only overwrites a `running`
             // row, so a task finishing in the same instant cannot report success after the user
@@ -2256,7 +2361,7 @@ impl Screen {
                         .await
                     {
                         Ok(canceled) if canceled.is_empty() => {
-                            self.reply("No running background tasks.");
+                            self.reply("No running background tasks");
                         }
                         Ok(canceled) => {
                             for task_id in &canceled {
@@ -2274,7 +2379,7 @@ impl Screen {
                         Err(error) => self.reply(error.to_string()),
                     }
                 }
-                None => self.reply("No active session yet."),
+                None => self.reply("No active session yet"),
             },
             SlashCommand::TaskShow { id } => match session_id {
                 Some(session) => {
@@ -2287,7 +2392,7 @@ impl Screen {
                     .await;
                     self.listing_panel(printed, outcome);
                 }
-                None => self.reply("No active session yet."),
+                None => self.reply("No active session yet"),
             },
             other => {
                 debug_assert!(
@@ -2305,7 +2410,7 @@ impl Screen {
     /// spawned.
     fn run_shell(&mut self, command: &str) {
         if self.shell.is_some() {
-            self.reply("A command is still running; Esc stops it.");
+            self.reply("A command is still running; Esc stops it");
             return;
         }
         self.push(Item::Prompt {
@@ -2313,6 +2418,7 @@ impl Screen {
             class: None,
             inbox_id: None,
             delivered: true,
+            ran_under: super::model::RanUnder::Shell,
         });
         let child = match spawn_shell_command(command, &self.launch.cwd.get()) {
             Ok(child) => child,
@@ -2407,26 +2513,31 @@ impl Screen {
             self.sticky_hovered = on_sticky;
             self.dirty = true;
         }
+        let on_pill = view::is_on_pill(self.pill, mouse.column, mouse.row);
+        let was_on_pill = self
+            .pointer
+            .is_some_and(|(column, row)| view::is_on_pill(self.pill, column, row));
+        if on_pill != was_on_pill {
+            self.dirty = true;
+        }
+        self.pointer = Some((mouse.column, mouse.row));
         if matches!(mouse.kind, MouseEventKind::Moved) {
             return;
         }
         self.dirty = true;
+        let wheel = isize::try_from(self.launch.wheel_rows).unwrap_or(isize::MAX);
         match mouse.kind {
             MouseEventKind::ScrollUp => match self.overlay.as_mut() {
-                Some(Overlay::Panel { panel, .. }) if over_overlay => panel.scroll_by(-3),
-                _ => self.viewport.scroll_by(-3),
+                Some(Overlay::Panel { panel, .. }) if over_overlay => panel.scroll_by(-wheel),
+                _ => self.viewport.scroll_by(-wheel),
             },
             MouseEventKind::ScrollDown => match self.overlay.as_mut() {
-                Some(Overlay::Panel { panel, .. }) if over_overlay => panel.scroll_by(3),
-                _ => self.viewport.scroll_by(3),
+                Some(Overlay::Panel { panel, .. }) if over_overlay => panel.scroll_by(wheel),
+                _ => self.viewport.scroll_by(wheel),
             },
             // A press starts a selection; whether it was a click is known at the release.
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(pill) = self.pill
-                    && mouse.row == pill.y
-                    && mouse.column >= pill.x
-                    && mouse.column < pill.x + pill.width
-                {
+                if on_pill {
                     self.back_to_bottom();
                     return;
                 }
@@ -2462,16 +2573,21 @@ impl Screen {
                     if rows > 0 {
                         copy_to_clipboard(&text);
                         self.show_hint(format!(
-                            "copied {rows} row{}",
+                            "Copied {rows} row{}",
                             if rows == 1 { "" } else { "s" }
                         ));
                     }
                 } else {
                     self.selection = None;
-                    if let Some(row) = over_transcript
-                        && let Some(index) = self.viewport.item_at_row(row)
-                    {
-                        self.launch.transcript.toggle(index);
+                    if let Some(row) = over_transcript {
+                        if let Some(run) = self.viewport.run_at_row(row) {
+                            self.viewport.toggle_run(run);
+                        } else if let Some(index) = self.viewport.item_at_row(row)
+                            && let Some(id) = self.viewport.id_at(index)
+                            && self.launch.transcript.toggle_item(id)
+                        {
+                            self.viewport.keep_in_place(index);
+                        }
                     }
                 }
             }
@@ -2479,33 +2595,38 @@ impl Screen {
         }
     }
 
-    /// The text under a selection, from the cells of the last frame: whole rows between the
-    /// ends, the ends cut at their columns, trailing blanks dropped.
+    /// The text under a selection, from the cells of the last frame, each row cut as the
+    /// viewport says it copies: see [`text_between`].
     fn selected_text(&self, selection: Selection) -> String {
         let area = self.transcript_area;
         let (from, to) = selection.ordered();
         let column_of = |column: u16| usize::from(column.saturating_sub(area.x));
-        let cells: Vec<Vec<String>> = (from.1..=to.1)
+        let rows: Vec<(Vec<String>, draw::RowCopy)> = (from.1..=to.1)
             .filter(|&y| y >= area.y && y < area.y + area.height)
             .map(|y| {
-                (area.x..area.x + area.width)
+                // The cells a wide character covers past its first hold a space the terminal
+                // never shows, which a copy leaves out; each still counts as a column.
+                let mut covered = 0;
+                let cells = (area.x..area.x + area.width)
                     .map(|x| {
-                        self.drawn
-                            .cell((x, y))
-                            .map(|cell| cell.symbol().to_string())
-                            .unwrap_or_default()
+                        if covered > 0 {
+                            covered -= 1;
+                            return String::new();
+                        }
+                        let Some(cell) = self.drawn.cell((x, y)) else {
+                            return String::new();
+                        };
+                        // Measured as the frame laid the symbol out, which is how many cells it
+                        // took.
+                        use ratatui::buffer::CellWidth as _;
+                        covered = usize::from(cell.cell_width()).saturating_sub(1);
+                        cell.symbol().to_string()
                     })
-                    .collect()
+                    .collect();
+                (cells, self.viewport.row_copy(usize::from(y - area.y)))
             })
             .collect();
-        if cells.is_empty() {
-            return String::new();
-        }
-        text_between(
-            &cells,
-            (0, column_of(from.0)),
-            (cells.len() - 1, column_of(to.0)),
-        )
+        text_between(&rows, column_of(from.0), column_of(to.0))
     }
 
     /// Keep the frame just drawn, for the selection that may follow.
@@ -2557,31 +2678,59 @@ impl Screen {
     /// own clipboard, since a terminal pastes text alone; over SSH, or without a display, there
     /// is none to read and the reply says so.
     fn attach_clipboard_image(&mut self) {
-        match clipboard_image() {
-            Ok(Some((label, bytes))) => self.attach_image(&bytes, label),
-            Ok(None) => self.reply("No image on the clipboard."),
-            Err(error) => self.reply(format!("Cannot read the clipboard: {error}")),
-        }
+        self.attach_image(ImageOrigin::Clipboard, "clipboard".to_string());
     }
 
-    /// Attach image bytes to the next prompt, through the same door the HTTP API's images take,
-    /// so the limits and the format rules are one set.
-    fn attach_image(&mut self, bytes: &[u8], label: String) {
+    /// Attach the image `origin` holds to the next prompt, through the same door the HTTP API's
+    /// images take, so the limits and the format rules are one set.
+    ///
+    /// Read off the screen's thread, the bytes as much as the decode, since a large image takes
+    /// longer than a frame to read, to encode and to draw; its chip, `label` until the read says
+    /// better, holds its place, marked as being read, until the read answers.
+    fn attach_image(&mut self, origin: ImageOrigin, label: String) {
         if !self.launch.agent.cells().profile.current().vision {
             self.reply(format!(
-                "The profile '{}' does not accept images.",
+                "The profile '{}' does not accept images",
                 crate::sync::read(&self.launch.current_profile)
             ));
             return;
         }
-        match crate::image::prepare_image_source(crate::image::classify_bytes(bytes), bytes) {
-            Ok(source) => {
-                self.composer
-                    .attach(super::input::Attachment { source, label });
-                self.dirty = true;
-            }
-            Err(error) => self.reply(error),
-        }
+        let ui = self.launch.ui.clone();
+        self.next_attachment += 1;
+        let id = self.next_attachment;
+        self.composer.attach_reading(id, label.clone());
+        self.dirty = true;
+        tokio::spawn(async move {
+            let read = tokio::task::spawn_blocking(move || {
+                let (bytes, label) = match origin {
+                    ImageOrigin::File(path) => match std::fs::read(&path) {
+                        Ok(bytes) => (bytes, label),
+                        Err(error) => {
+                            return Err(format!("Cannot read '{}': {error}", path.display()));
+                        }
+                    },
+                    ImageOrigin::Clipboard => match clipboard_image() {
+                        Ok(Some((label, bytes))) => (bytes, label),
+                        Ok(None) => return Err("No image on the clipboard".to_string()),
+                        Err(error) => return Err(format!("Cannot read the clipboard: {error}")),
+                    },
+                };
+                crate::image::prepare_image_source(crate::image::classify_bytes(&bytes), &bytes)
+                    .map(|source| super::input::Attachment {
+                        source,
+                        label,
+                        picture: draw::Picture::from_bytes(&bytes),
+                    })
+                    .map_err(|error| format!("Cannot attach the image: {error}"))
+            })
+            .await;
+            // Answered whatever happened to the read, since its chip stands until it is.
+            let attached = read.unwrap_or_else(|error| {
+                tracing::warn!("failed to read an attached image: {error}");
+                Err("Failed to read the image".to_string())
+            });
+            ui.send(UiEvent::Attached { id, attached });
+        });
     }
 
     /// A paste. A single path to an image file attaches the file, which is how a drag from a
@@ -2618,12 +2767,7 @@ impl Screen {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
-            match std::fs::read(&path) {
-                Ok(bytes) => self.attach_image(&bytes, label),
-                Err(error) => {
-                    self.reply(format!("Cannot read '{}': {error}", path.display()));
-                }
-            }
+            self.attach_image(ImageOrigin::File(path), label);
             return;
         }
         self.composer.insert(&text);
@@ -2633,7 +2777,7 @@ impl Screen {
     /// `/log`: the lines kept, newest last, each with its time, level and target.
     fn open_log_panel(&mut self) {
         if self.log_ring.is_empty() {
-            self.reply("No log lines yet.");
+            self.reply("No log lines yet");
             return;
         }
         let body: String = self
@@ -2745,7 +2889,28 @@ impl Screen {
         // pill lives on the blank row, and the working row has one of its own under it while the
         // agent works.
         let working = self.working_row();
+        // On a screen too short for everything, the composer's padding gives way first, then the
+        // working row's own row, which moves onto the blank one, then the blank row with the
+        // working row and the pill on it, so a row of transcript, the composer's text with its
+        // chips and the status row stay; what still does not fit is the composer's to lose.
+        let least_composer = 1 + self.composer.attachment_rows();
+        let fits = |gap: u16, padding: u16| {
+            1 + gap + least_composer + 2 * padding + status_height <= area.height
+        };
         let gap = 1 + u16::from(working.is_some());
+        let padding = if fits(gap, COMPOSER_PADDING) {
+            COMPOSER_PADDING
+        } else {
+            0
+        };
+        let chrome_rows = 2 * padding;
+        let gap = if fits(gap, padding) {
+            gap
+        } else if fits(1, padding) {
+            1
+        } else {
+            0
+        };
         let most_composer = (area.height / COMPOSER_SHARE).max(1);
         let most_panel = (area.height / PANEL_SHARE).max(2);
         let bottom_height = match &mut self.overlay {
@@ -2755,14 +2920,19 @@ impl Screen {
                 .saturating_add(1)
                 .min(most_panel)
                 .max(2),
-            None if self.composer.search.is_some() => 1 + status_height,
+            None if self.composer.search.is_some() => 1 + chrome_rows + status_height,
             None => {
-                self.composer
-                    .height(area.width.saturating_sub(TEXT_EDGE as u16), most_composer)
+                self.composer.height(
+                    area.width.saturating_sub(TEXT_EDGE as u16),
+                    most_composer
+                        .saturating_sub(chrome_rows)
+                        .max(least_composer),
+                ) + chrome_rows
                     + status_height
             }
         };
-        let transcript_height = area.height.saturating_sub(bottom_height + gap).max(1);
+        let bottom_height = bottom_height.min(area.height.saturating_sub(gap + 1));
+        let transcript_height = area.height.saturating_sub(bottom_height + gap);
         let transcript_area = Rect {
             x: area.x,
             y: area.y,
@@ -2803,13 +2973,20 @@ impl Screen {
             ..gap_area
         };
         let mut taken = 0;
-        if let Some((activity, elapsed)) = &working {
-            pill_row.y = gap_area.y + 1;
+        if let Some((activity, elapsed)) = working.as_ref().filter(|_| gap > 0) {
+            pill_row.y = gap_area.y + gap_area.height.saturating_sub(1);
             taken =
                 view::draw_working_row(frame, pill_row, activity, *elapsed, self.shown_working.1);
         }
-        self.pill = (!self.viewport.is_following())
-            .then(|| view::draw_back_to_bottom(frame, pill_row, taken));
+        let pointer = self.pointer;
+        self.pill = (gap > 0 && !self.viewport.is_following()).then(|| {
+            let pill = view::draw_back_to_bottom(frame, pill_row, taken, false);
+            if pointer.is_some_and(|(column, row)| view::is_on_pill(Some(pill), column, row)) {
+                view::draw_back_to_bottom(frame, pill_row, taken, true)
+            } else {
+                pill
+            }
+        });
 
         match &mut self.overlay {
             Some(Overlay::Panel { panel, .. }) => {
@@ -2837,30 +3014,43 @@ impl Screen {
                     height: status_height,
                     ..bottom_area
                 };
+                let facts = StatusFacts {
+                    shown: &self.launch.status_row,
+                    permission: self.launch.shared_permission.get(),
+                    path: Some(shorten_path_with_tilde(&self.launch.cwd.get())),
+                    project: self.launch.agent.project(),
+                    profile: self.profile_fact(),
+                    model: self.model_fact(),
+                    context: self.context_gauge(),
+                    work: self.work,
+                    hint: self.hint.as_ref().map(|(hint, _)| hint.as_str()),
+                    shell_mode: self.composer.is_shell_mode(),
+                };
+                // The block is the composer's gray across the row, with a row of it above and below
+                // the text, as a sent prompt has; the history search takes the text's place, on one
+                // row. A bar of the permission level's color runs down its left edge.
+                let block = Style::default().bg(super::input::COMPOSER_BACKGROUND);
+                frame.render_widget(ratatui::widgets::Block::new().style(block), composer_area);
+                let lead = TEXT_EDGE as u16;
+                let field = Rect {
+                    x: composer_area.x + lead,
+                    y: composer_area.y + padding,
+                    width: composer_area.width.saturating_sub(lead),
+                    height: composer_area.height.saturating_sub(chrome_rows).max(1),
+                };
                 if let Some(search) = &self.composer.search {
                     let shown = search.picked_match().unwrap_or("");
                     let line = Line::from(vec![
-                        Span::styled(format!("(reverse-i-search) '{}': ", search.query), gray()),
-                        Span::raw(shown.to_string()),
+                        Span::styled(
+                            format!("(reverse-i-search) '{}': ", search.query),
+                            Style::default()
+                                .fg(draw::DIM_ON_SHADE)
+                                .bg(super::input::COMPOSER_BACKGROUND),
+                        ),
+                        Span::styled(shown.to_string(), block),
                     ]);
-                    frame.render_widget(Paragraph::new(Text::from(line)), composer_area);
+                    frame.render_widget(Paragraph::new(Text::from(line)), field);
                 } else {
-                    // The block is the composer's gray across the row; the lead is the prompt
-                    // glyph dimmed so the words outweigh it, and the text sits at the edge so a
-                    // second line starts flush under the first. The permission level is the status
-                    // row's to say, so the lead says nothing twice.
-                    let lead = TEXT_EDGE as u16;
-                    let gutter = Rect {
-                        width: lead.min(composer_area.width),
-                        ..composer_area
-                    };
-                    let field = Rect {
-                        x: composer_area.x + lead,
-                        width: composer_area.width.saturating_sub(lead),
-                        ..composer_area
-                    };
-                    let block = Style::default().bg(super::input::COMPOSER_BACKGROUND);
-                    frame.render_widget(ratatui::widgets::Block::new().style(block), composer_area);
                     // While the agent works, the empty composer says what Enter does with the
                     // next message, which is where a person about to type looks.
                     self.composer.set_placeholder(if self.busy.is_some() {
@@ -2868,27 +3058,6 @@ impl Screen {
                     } else {
                         ""
                     });
-                    // The glyph sits on the text's first row, under the chips when there are any:
-                    // the prompt's `>`, or the shell mode's red `!`.
-                    let glyph_row = self.composer.attachment_rows();
-                    let (glyph, glyph_color) = if self.composer.is_shell_mode() {
-                        (draw::SHELL_GLYPH, ratatui::style::Color::Red)
-                    } else {
-                        (draw::PROMPT_GLYPH, draw::PROMPT_GLYPH_COLOR)
-                    };
-                    let bar: Vec<Line<'static>> = (0..gutter.height)
-                        .map(|row| {
-                            if row == glyph_row {
-                                Line::from(Span::styled(
-                                    format!("{glyph:<TEXT_EDGE$}"),
-                                    block.fg(glyph_color),
-                                ))
-                            } else {
-                                Line::from(Span::styled("  ".to_string(), block))
-                            }
-                        })
-                        .collect();
-                    frame.render_widget(Paragraph::new(Text::from(bar)), gutter);
                     self.composer.draw(frame, field);
                     if let Some(completion) = &self.composer.completion {
                         let rows: Vec<view::ListRow> = completion
@@ -2907,18 +3076,19 @@ impl Screen {
                         view::draw_completions(frame, above, &rows, completion.picked);
                     }
                 }
-                let facts = StatusFacts {
-                    shown: &self.launch.status_row,
-                    permission: self.launch.shared_permission.get(),
-                    path: Some(shorten_path_with_tilde(&self.launch.cwd.get())),
-                    project: self.launch.agent.project(),
-                    profile: self.profile_fact(),
-                    model: self.model_fact(),
-                    context: self.context_gauge(),
-                    work: self.work,
-                    hint: self.hint.as_ref().map(|(hint, _)| hint.as_str()),
-                    shell_mode: self.composer.is_shell_mode(),
-                };
+                // Last, so nothing drawn in the block covers it.
+                let bar: Vec<Line<'static>> = (0..composer_area.height)
+                    .map(|_| {
+                        Line::from(Span::styled(
+                            draw::COMPOSER_BAR.to_string(),
+                            block.fg(view::composer_bar_color(&facts)),
+                        ))
+                    })
+                    .collect();
+                frame.render_widget(Paragraph::new(Text::from(bar)), Rect {
+                    width: 1.min(composer_area.width),
+                    ..composer_area
+                });
                 frame.render_widget(
                     Paragraph::new(Text::from(view::status_line(
                         &facts,
@@ -3022,24 +3192,93 @@ fn send_class_placeholder(class: InboxClass) -> &'static str {
     }
 }
 
-/// The text between two cells of a grid, as (row, column) pairs in reading order: whole rows
-/// between the ends, the end rows cut at their columns, trailing blanks dropped from each row.
-fn text_between(cells: &[Vec<String>], from: (usize, usize), to: (usize, usize)) -> String {
-    let mut rows = Vec::new();
-    for (row, line) in cells.iter().enumerate().take(to.0 + 1).skip(from.0) {
-        let first = if row == from.0 { from.1 } else { 0 };
-        let last = if row == to.0 {
-            to.1.min(line.len().saturating_sub(1))
-        } else {
-            line.len().saturating_sub(1)
+/// The text of selected rows, each with how it copies, from column `from` of the first to column
+/// `to` of the last. A row starts where its text does: at the text edge, past the gutter's marks,
+/// or at a code row's first column, past its margin. A text row loses its trailing blanks; a code
+/// row is its code exactly, glued to the row above when it continues a line folded there, so a
+/// copied line is the line that was written; a code block's padding is nothing.
+fn text_between(rows: &[(Vec<String>, draw::RowCopy)], from: usize, to: usize) -> String {
+    let mut text = String::new();
+    let mut started = false;
+    let last = rows.len().saturating_sub(1);
+    for (index, (cells, copy)) in rows.iter().enumerate() {
+        let (start, end, glued) = match *copy {
+            draw::RowCopy::Padding => continue,
+            draw::RowCopy::Text => (draw::TEXT_EDGE, cells.len(), false),
+            draw::RowCopy::Code {
+                from,
+                columns,
+                continues,
+            } => (from, from + columns, continues),
         };
-        let text: String = line
-            .get(first..=last)
+        let start = if index == 0 { start.max(from) } else { start };
+        let end = if index == last { end.min(to + 1) } else { end };
+        let row: String = cells
+            .get(start.min(cells.len())..end.min(cells.len()).max(start.min(cells.len())))
             .map(|cells| cells.concat())
             .unwrap_or_default();
-        rows.push(text.trim_end().to_string());
+        if started && !glued {
+            text.push('\n');
+        }
+        match copy {
+            draw::RowCopy::Text => text.push_str(row.trim_end()),
+            _ => text.push_str(&row),
+        }
+        started = true;
     }
-    rows.join("\n")
+    text
+}
+
+/// The pictures of the images a page of the log holds, by the hash they rest under: a page holds
+/// an image as a reference into the store, so its bytes are read here, and decoded off the
+/// screen's thread, since a decode takes longer than a frame. One at a time: each decode may take
+/// the whole ceiling an image's decode is held to, and a page can hold hundreds.
+async fn page_pictures(
+    store: &crate::store::Store,
+    page: &crate::store::LogPage,
+) -> std::collections::HashMap<String, draw::Picture> {
+    let hashes: std::collections::BTreeSet<String> = page
+        .rows
+        .iter()
+        .filter_map(|row| match &row.event {
+            crate::conversation::Event::Append(message) => Some(message),
+            _ => None,
+        })
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            crate::conversation::ContentBlock::Image {
+                source: crate::image::ImageSource::Blob { hash, .. },
+            } => Some(hash.clone()),
+            _ => None,
+        })
+        .collect();
+    if hashes.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let blobs = match store.load_blobs(hashes.into_iter().collect()).await {
+        Ok(blobs) => blobs,
+        Err(error) => {
+            tracing::warn!("failed to read the images of the log: {error}");
+            return std::collections::HashMap::new();
+        }
+    };
+    let decoded = tokio::task::spawn_blocking(move || {
+        blobs
+            .into_iter()
+            .map(|blob| {
+                let picture = draw::Picture::from_bytes(&blob.bytes);
+                (blob.hash, picture)
+            })
+            .collect()
+    })
+    .await;
+    match decoded {
+        Ok(pictures) => pictures,
+        Err(error) => {
+            tracing::warn!("failed to decode the images of the log: {error}");
+            std::collections::HashMap::new()
+        }
+    }
 }
 
 /// Put `text` on the clipboard, both ways there are: an OSC 52 sequence, which the terminal
@@ -3059,6 +3298,14 @@ fn copy_to_clipboard(text: &str) {
         Ok(()) => {}
         Err(error) => tracing::debug!("the system clipboard did not take the text: {error}"),
     }
+}
+
+/// Where an image the composer attaches comes from, read off the screen's thread.
+enum ImageOrigin {
+    /// A file a paste named.
+    File(PathBuf),
+    /// The operating system's clipboard.
+    Clipboard,
 }
 
 /// The image on the clipboard as PNG bytes with its pixel size, `None` when the clipboard holds
@@ -3306,6 +3553,9 @@ fn draw_screen(screen: &mut Screen, terminal: &mut DefaultTerminal) {
     // the update opens. At a new size ratatui clears the terminal ahead of the frame, inside the
     // update, and a terminal holds an update only so long before it shows what it has, which
     // would be the cleared screen while the layout ran.
+    screen
+        .viewport
+        .set_working_directory(screen.launch.cwd.get());
     match terminal.size() {
         Ok(size) => screen
             .viewport
@@ -3602,22 +3852,55 @@ mod tests {
         );
     }
 
-    /// A selection copies the rows between its ends, the end rows cut at their columns, without
-    /// the blanks a row was padded with.
+    /// A selection copies the rows between its ends, the end rows cut at their columns, each from
+    /// the text edge, without the gutter's marks or the blanks a row was padded with.
     #[test]
     fn a_selection_is_the_text_between_its_ends() {
-        let grid = |rows: &[&str]| -> Vec<Vec<String>> {
+        let rows = |rows: &[&str]| -> Vec<(Vec<String>, draw::RowCopy)> {
             rows.iter()
-                .map(|row| row.chars().map(String::from).collect())
+                .map(|row| (row.chars().map(String::from).collect(), draw::RowCopy::Text))
                 .collect()
         };
-        let cells = grid(&["> hi      ", "          ", "  First   ", "  answer. "]);
-        assert_eq!(text_between(&cells, (2, 2), (2, 6)), "First");
-        assert_eq!(text_between(&cells, (0, 2), (3, 3)), "hi\n\n  First\n  an");
+        let all = rows(&["> hi      ", "          ", "  First   ", "  answer. "]);
+        assert_eq!(text_between(&all[2..=2], 2, 6), "First");
+        assert_eq!(text_between(&all, 0, 3), "hi\n\nFirst\nan");
         assert_eq!(
-            text_between(&cells, (2, 4), (2, 40)),
+            text_between(&all[2..=2], 4, 40),
             "rst",
             "a column past the row's end"
+        );
+    }
+
+    /// A code row copies its code alone, without the text edge and the shade's margin, and a line
+    /// folded at the width copies as the one line it is; the block's padding copies as nothing.
+    #[test]
+    fn a_folded_code_row_copies_as_the_line_it_was() {
+        let code = |row: &str, columns: usize, continues: bool| {
+            (
+                row.chars().map(String::from).collect::<Vec<_>>(),
+                draw::RowCopy::Code {
+                    from: 3,
+                    columns,
+                    continues,
+                },
+            )
+        };
+        let padding = (vec![" ".to_string(); 12], draw::RowCopy::Padding);
+        let selected = vec![
+            (
+                "  Run:      ".chars().map(String::from).collect(),
+                draw::RowCopy::Text,
+            ),
+            (vec![String::new(); 12], draw::RowCopy::Text),
+            padding.clone(),
+            code("   if x { la ", 9, false),
+            code("   st = y }  ", 8, true),
+            code("     go()    ", 6, false),
+            padding,
+        ];
+        assert_eq!(
+            text_between(&selected, 0, 12),
+            "Run:\n\nif x { last = y }\n  go()"
         );
     }
 
@@ -3664,6 +3947,43 @@ mod tests {
             log_item(line(tracing::Level::INFO, "turn started")),
             Item::note("meka::agent::turn: turn started")
         );
+    }
+
+    /// A page of the log holds its images as references into the store, and the loader reads and
+    /// decodes each, so the screen draws a resumed session's images as the live one did.
+    #[tokio::test]
+    async fn a_page_s_pictures_are_read_from_the_store() {
+        let store = crate::store::Store::for_test().await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("session");
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([9, 9, 9, 255]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode");
+        let message = crate::conversation::Message::user_with_images("look", vec![
+            crate::image::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(&png),
+            },
+        ]);
+        store
+            .save_event(session, &crate::conversation::Event::Append(message), None)
+            .await
+            .expect("save");
+        let page = store
+            .log_page_before(session, None, 10)
+            .await
+            .expect("page");
+        let pictures = page_pictures(&store, &page).await;
+        assert_eq!(pictures.into_values().collect::<Vec<_>>(), vec![
+            draw::Picture::from_bytes(&png)
+        ]);
     }
 
     /// A command that prints without end cannot grow the screen with it: each stream keeps its

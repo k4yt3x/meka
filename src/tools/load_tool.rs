@@ -631,6 +631,7 @@ pub(crate) fn extract_loaded_tool_names_from_events(
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     if *is_error {
                         pending.remove(tool_use_id);

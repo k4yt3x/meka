@@ -877,7 +877,10 @@ async fn run_json_turn(
     let (accepted, ticket_for_task) = if opener.holds {
         (None, idempotency_ticket)
     } else {
-        let Some(record) = entry.frontend.in_flight_turn() else {
+        let Some(record) = entry
+            .frontend
+            .in_flight_turn(entry.agent.cells().permission.get())
+        else {
             // The feed closed under the turn, which only a session leaving the process does; the
             // turn it announced is closed on the feed again, so no reader waits on a terminal.
             entry.frontend.end_turn();
@@ -1029,7 +1032,9 @@ async fn run_streaming_turn(
     // A detached request is answered with its admission whatever the encoding: the key, if any,
     // is committed with the record now, since nothing of this request waits on the turn.
     if !opener.holds
-        && let Some(record) = entry.frontend.in_flight_turn()
+        && let Some(record) = entry
+            .frontend
+            .in_flight_turn(entry.agent.cells().permission.get())
     {
         commit_accepted(idempotency_ticket, &record).await;
     }
@@ -1580,12 +1585,16 @@ impl TurnMessages {
     fn nudge(&mut self, kind: crate::conversation::NudgeKind, text: String) {
         self.close_assistant();
         self.close_results();
-        self.messages.push(turn_message(self.turn_id, "user", vec![
-            crate::host::http::handlers::messages::ContentBlockView::Nudge {
-                kind: kind.name().to_string(),
-                text,
-            },
-        ]));
+        self.messages.push(turn_message(
+            self.turn_id,
+            crate::conversation::Role::User,
+            vec![
+                crate::host::http::handlers::messages::ContentBlockView::Nudge {
+                    kind: kind.name().to_string(),
+                    text,
+                },
+            ],
+        ));
     }
 
     /// A background report meka wrote lands behind the blocks of the user-role message the round
@@ -1613,23 +1622,32 @@ impl TurnMessages {
     ) {
         self.close_assistant();
         self.close_results();
-        self.messages
-            .push(turn_message(self.turn_id, "user", content));
+        self.messages.push(turn_message(
+            self.turn_id,
+            crate::conversation::Role::User,
+            content,
+        ));
     }
 
     fn close_assistant(&mut self) {
         if !self.assistant.is_empty() {
             let content = std::mem::take(&mut self.assistant);
-            self.messages
-                .push(turn_message(self.turn_id, "assistant", content));
+            self.messages.push(turn_message(
+                self.turn_id,
+                crate::conversation::Role::Assistant,
+                content,
+            ));
         }
     }
 
     fn close_results(&mut self) {
         if !self.results.is_empty() {
             let content = std::mem::take(&mut self.results);
-            self.messages
-                .push(turn_message(self.turn_id, "user", content));
+            self.messages.push(turn_message(
+                self.turn_id,
+                crate::conversation::Role::User,
+                content,
+            ));
         }
     }
 
@@ -1642,11 +1660,11 @@ impl TurnMessages {
 
 fn turn_message(
     turn_id: Uuid,
-    role: &str,
+    role: crate::conversation::Role,
     content: Vec<crate::host::http::handlers::messages::ContentBlockView>,
 ) -> crate::host::http::handlers::messages::MessageView {
     crate::host::http::handlers::messages::MessageView {
-        role: role.to_string(),
+        role: role.name().to_string(),
         content,
         // Not available yet: the DB write may still be in progress.
         created_at: None,
@@ -2441,6 +2459,7 @@ mod tests {
                     text: "fn main() {}".into(),
                 }],
                 metadata: None,
+                display: None,
             },
             FrontendEvent::AssistantTextDelta("Done.".into()),
         ];

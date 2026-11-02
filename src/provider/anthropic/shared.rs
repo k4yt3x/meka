@@ -440,6 +440,7 @@ pub(super) fn convert_messages_to_claude_content(
                             tool_use_id,
                             content,
                             is_error,
+                            ..
                         } => {
                             let content: Vec<serde_json::Value> = content
                                 .iter()
@@ -1447,6 +1448,7 @@ mod tests {
                         text: "contents".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 },
                 ContentBlock::Text {
                     text: "[Message from test, arrived now]\nalso, what is 17*3?".to_string(),
@@ -1601,6 +1603,7 @@ mod tests {
                     tool_use_id: "t1".to_string(),
                     content: vec![ToolResultContent::Image { source }],
                     is_error: false,
+                    display: None,
                 },
             ],
         };
@@ -1995,6 +1998,7 @@ mod tests {
                     reference("mcp__gone__other"),
                 ],
                 is_error: false,
+                display: None,
             }],
         };
         let mut body = serde_json::json!({
@@ -2086,6 +2090,7 @@ mod tests {
                     text: "done".to_string(),
                 }],
                 is_error,
+                display: None,
             }],
         };
         let ok = convert_messages_to_claude_content(&[result(false)], None);
@@ -2120,6 +2125,7 @@ mod tests {
                     },
                 ],
                 is_error: false,
+                display: None,
             }],
         };
         let converted = convert_messages_to_claude_content(&[message], None);
@@ -2281,6 +2287,7 @@ mod tests {
                         },
                     ],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];
@@ -2599,6 +2606,7 @@ mod tests {
                 },
             }],
             is_error: false,
+            display: None,
         }
     }
 
@@ -2787,6 +2795,7 @@ mod tests {
                     },
                 }],
                 is_error: false,
+                display: None,
             }],
         }
     }

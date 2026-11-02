@@ -8,10 +8,13 @@
 //! another width.
 //!
 //! Every item on the screen puts a one-glyph gutter in column 0 and its text at [`TEXT_EDGE`]:
-//! `>` for a prompt, `•` for an act of the agent or the host, `!` for a warning, `■` for an
-//! error, nothing for the answer. The palette is the terminal's foreground, gray, red and yellow.
-//! No glyph has an emoji presentation: a terminal that draws U+26A0 as a picture draws it the
-//! size of two cells in a color of its own, and the gutter is meant to be a mark, not a picture.
+//! a bar in its level's color for a prompt, `•` for an act of the agent or the host, `▸` for a
+//! folded run of steps or a closed compaction and `▾` for an open one, `!` for a warning, `■` for
+//! an error, nothing for the answer. The palette is the terminal's own colors, so the screen
+//! follows its theme, but for the shades behind blocks, a diff's tints, the white of a prompt's
+//! words and the gray dimmed text takes on a shade. No glyph has an emoji presentation: a terminal
+//! that draws U+26A0 as a picture draws it the size of two cells in a color of its own, and the
+//! gutter is meant to be a mark, not a picture.
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -23,14 +26,9 @@ use super::*;
 /// The column every item's text starts in, behind its one-glyph gutter. The composer and the
 /// prompt block use the same edge, so the whole screen shares one left margin.
 pub(crate) const TEXT_EDGE: usize = 2;
-/// The gutter glyph of what the user typed: on the composer and on the prompt it becomes. The
-/// angle quotation mark `›` would be smaller, but fonts set it low on the line.
-pub(crate) const PROMPT_GLYPH: &str = ">";
-/// The glyph's color: a mid gray from the fixed palette, lighter than the chrome's gray, which
-/// sinks into the composer's block, and dimmer than the words beside it.
-pub(crate) const PROMPT_GLYPH_COLOR: Color = Color::Indexed(245);
-/// The gutter glyph of the composer in its shell mode, in red: what is typed runs as a command.
-pub(crate) const SHELL_GLYPH: &str = "!";
+/// The bar down the composer's left edge, and a sent prompt's, in the permission level's color,
+/// or red in the shell mode.
+pub(crate) const COMPOSER_BAR: &str = "▎";
 /// The gutter glyph of an act: a tool call, a thinking block, a notice, a stage direction.
 pub(crate) const ACT_GLYPH: &str = "•";
 /// The gutter glyph of a warning.
@@ -39,6 +37,25 @@ pub(crate) const WARNING_GLYPH: &str = "!";
 pub(crate) const ERROR_GLYPH: &str = "■";
 /// The lead of the first row under a tool call: its result, its progress, its sub-agent's record.
 const CONNECTOR: &str = "└ ";
+/// The shade an open run of steps sits on, from its row through its last step, so what the run
+/// holds is told from what stands around it.
+pub(crate) const RUN_BACKGROUND: Color = Color::Indexed(234);
+/// The shade a code block sits on, so it is told from the prose around it: a step darker than an
+/// open run's and a sent prompt's, so a block inside a run reads as an inset and a block is not
+/// taken for a prompt.
+const CODE_BACKGROUND: Color = Color::Indexed(233);
+/// What is dimmed on a shade in place of the terminal's dark gray, which themes set close to their
+/// own background and a shade then swallows: a mid gray from the fixed palette, lighter than the
+/// chrome's gray and dimmer than the words beside it. Also the bar of a prompt nothing says the
+/// level of yet.
+pub(crate) const DIM_ON_SHADE: Color = Color::Indexed(245);
+/// The gutter glyph of a folded run of steps or a closed compaction.
+pub(crate) const FOLDED_GLYPH: &str = "▸";
+/// The gutter glyph of a run of steps opened under its row, or an open compaction.
+pub(crate) const OPENED_GLYPH: &str = "▾";
+/// Lines of a command a collapsed call shows after its first, which its row holds; a single line
+/// past these is shown rather than counted, since the count would take its row.
+pub(crate) const COMMAND_PREVIEW_ROWS: usize = 2;
 /// Rows a collapsed tool call shows of its result: the opening of it, which is where a listing's
 /// header, a file's first lines and an error's first word sit.
 pub(crate) const PREVIEW_ROWS: usize = 3;
@@ -61,24 +78,80 @@ pub(crate) const ACCENT: Color = Color::Cyan;
 /// stands out of nothing.
 pub(crate) const WHITE: Color = Color::Rgb(255, 255, 255);
 
-/// Markdown laid out at `width` in the answer's look.
+/// How a row of the transcript copies when a selection covers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowCopy {
+    /// Its text from the text edge on: what stands in the gutter is the screen's mark, not text.
+    Text,
+    /// A code row: the `columns` from `from`, its code without the margins around it, glued to
+    /// the row above when it `continues` a line folded at the width.
+    Code {
+        from: usize,
+        columns: usize,
+        continues: bool,
+    },
+    /// A row that is the screen's own and no text: a code block's or a prompt's padding, a
+    /// prompt's note, a picture. It copies as nothing.
+    Padding,
+}
+
+impl RowCopy {
+    /// The same row behind `columns` more of prefix: a list's hang, a quote's bar, the text edge.
+    pub(crate) fn behind(self, columns: usize) -> Self {
+        match self {
+            Self::Code {
+                from,
+                columns: shown,
+                continues,
+            } => Self::Code {
+                from: from + columns,
+                columns: shown,
+                continues,
+            },
+            other => other,
+        }
+    }
+}
+
+/// A row as it is drawn and as it copies.
+pub(crate) type Row = (Line<'static>, RowCopy);
+
+/// The lines of `rows`, without how they copy.
+#[cfg(test)]
+fn lines_of(rows: Vec<Row>) -> Vec<Line<'static>> {
+    rows.into_iter().map(|(line, _)| line).collect()
+}
+
+/// [`markdown_rows`] without how the rows copy.
+#[cfg(test)]
 pub(crate) fn markdown_lines(markdown: &str, width: usize) -> Vec<Line<'static>> {
+    lines_of(markdown_rows(markdown, width))
+}
+
+/// Markdown laid out at `width` in the answer's look, each row with how it copies.
+pub(crate) fn markdown_rows(markdown: &str, width: usize) -> Vec<Row> {
     lay_out(markdown, width, &ANSWER)
 }
 
-/// Markdown laid out at `width` in the reasoning's look.
+/// [`thinking_rows`] without how the rows copy.
+#[cfg(test)]
 pub(crate) fn thinking_lines(markdown: &str, width: usize) -> Vec<Line<'static>> {
+    lines_of(thinking_rows(markdown, width))
+}
+
+/// Markdown laid out at `width` in the reasoning's look, each row with how it copies.
+pub(crate) fn thinking_rows(markdown: &str, width: usize) -> Vec<Row> {
     lay_out(markdown, width, &REASONING)
 }
 
-/// An answer still streaming as lines: what has settled laid out as markdown, and the line still
+/// An answer still streaming as rows: what has settled laid out as markdown, and the line still
 /// arriving under it laid out on its own, so a token shows the moment it arrives and nothing the
 /// line says yet reaches back into the rows above: `2` behind an item is not yet the next item's
 /// number, nor a word of the item, and `---` under a paragraph does not make it a heading. A line
 /// inside a code block the settled text has not closed is laid out with it, as the code row it
 /// is; a line that continues a block above it, as an item's second line does, settles into place
 /// when it ends. `reasoning` picks the reasoning's look.
-pub(crate) fn streaming_lines(text: &str, width: usize, reasoning: bool) -> Vec<Line<'static>> {
+pub(crate) fn streaming_rows(text: &str, width: usize, reasoning: bool) -> Vec<Row> {
     let look = if reasoning { &REASONING } else { &ANSWER };
     let (settled, open) = match text.rfind('\n') {
         Some(cut) => text.split_at(cut + 1),
@@ -87,13 +160,13 @@ pub(crate) fn streaming_lines(text: &str, width: usize, reasoning: bool) -> Vec<
     if open.is_empty() || ends_inside_a_fence(settled) {
         return lay_out(text, width, look);
     }
-    let mut lines = lay_out(settled, width, look);
+    let mut rows = lay_out(settled, width, look);
     // A blank line ends the block above, so the line arriving starts one of its own.
-    if settled.ends_with("\n\n") && !lines.is_empty() {
-        lines.push(Line::default());
+    if settled.ends_with("\n\n") && !rows.is_empty() {
+        rows.push((Line::default(), RowCopy::Text));
     }
-    lines.extend(lay_out(open, width, look));
-    lines
+    rows.extend(lay_out(open, width, look));
+    rows
 }
 
 /// The narrowest text a list item or a quote indents its blocks to. Narrower, an item's marker
@@ -179,25 +252,33 @@ const REASONING: Look = Look {
     highlight: false,
 };
 
-fn lay_out(markdown: &str, width: usize, look: &Look) -> Vec<Line<'static>> {
+fn lay_out(markdown: &str, width: usize, look: &Look) -> Vec<Row> {
     let width = width.max(MIN_OUTPUT_WIDTH);
     let markdown = crate::text::expand_tabs(markdown);
     // The blank a table owes the line after it: GFM reads a non-blank line after a table as one
     // more row.
     let markdown = normalize_spacing(&markdown);
-    let mut lines = look.blocks(&markdown::parse(&markdown), width, false);
+    let mut rows = look.blocks(&markdown::parse(&markdown), width, false);
     // A document ends where its last row does; the blank that separates it from the next block is
     // the transcript's to draw.
-    while lines.last().is_some_and(is_blank) {
-        lines.pop();
+    while rows.last().is_some_and(|(line, _)| is_blank(line)) {
+        rows.pop();
     }
+    rows
+}
+
+/// `lines` as rows that copy as text.
+fn text_rows(lines: Vec<Line<'static>>) -> Vec<Row> {
     lines
+        .into_iter()
+        .map(|line| (line, RowCopy::Text))
+        .collect()
 }
 
 impl Look {
     /// `blocks` at `width`, one blank row between two of them unless `tight`, as the blocks of an
     /// item in a tight list are.
-    fn blocks(&self, blocks: &[markdown::Block], width: usize, tight: bool) -> Vec<Line<'static>> {
+    fn blocks(&self, blocks: &[markdown::Block], width: usize, tight: bool) -> Vec<Row> {
         let mut rows = Vec::new();
         for block in blocks {
             let block_rows = self.block(block, width);
@@ -205,23 +286,23 @@ impl Look {
                 continue;
             }
             if !tight && !rows.is_empty() {
-                rows.push(Line::default());
+                rows.push((Line::default(), RowCopy::Text));
             }
             rows.extend(block_rows);
         }
         rows
     }
 
-    fn block(&self, block: &markdown::Block, width: usize) -> Vec<Line<'static>> {
+    fn block(&self, block: &markdown::Block, width: usize) -> Vec<Row> {
         match block {
-            markdown::Block::Paragraph(runs) => self.prose(runs, self.text, width),
+            markdown::Block::Paragraph(runs) => text_rows(self.prose(runs, self.text, width)),
             markdown::Block::Heading { level, runs } => {
                 let heading = self
                     .headings
                     .get(usize::from(*level).saturating_sub(1))
                     .copied()
                     .unwrap_or(self.text);
-                self.prose(runs, heading, width)
+                text_rows(self.prose(runs, heading, width))
             }
             markdown::Block::Code { language, rows } => self.code(rows, language.as_deref(), width),
             markdown::Block::List {
@@ -230,11 +311,11 @@ impl Look {
                 items,
             } => self.list(*start, *loose, items, width),
             markdown::Block::Quote(blocks) => self.quote(blocks, width),
-            markdown::Block::Table(table) => self.table(table, width),
-            markdown::Block::Rule => vec![Line::from(Span::styled(
-                RULE.to_string().repeat(width),
-                self.structure,
-            ))],
+            markdown::Block::Table(table) => text_rows(self.table(table, width)),
+            markdown::Block::Rule => vec![(
+                Line::from(Span::styled(RULE.to_string().repeat(width), self.structure)),
+                RowCopy::Text,
+            )],
         }
     }
 
@@ -278,7 +359,7 @@ impl Look {
             .collect()
     }
 
-    fn code(&self, rows: &[String], language: Option<&str>, width: usize) -> Vec<Line<'static>> {
+    fn code(&self, rows: &[String], language: Option<&str>, width: usize) -> Vec<Row> {
         let lines = if self.highlight {
             code_lines(rows, language)
         } else {
@@ -288,10 +369,34 @@ impl Look {
         };
         // Folded at the edge rather than clipped there, as the terminal folds a one-shot's output:
         // at a column, never at a space, because a code row's spaces are content and its
-        // indentation is where a break at a space would land.
-        lines
-            .iter()
-            .flat_map(|row| wrap_line_at_columns(row, width))
+        // indentation is where a break at a space would land. The shade keeps a column clear on
+        // each side of the code.
+        let folded = width.saturating_sub(2).max(1);
+        let pad = (
+            shaded_row(Line::default(), CODE_BACKGROUND, width),
+            RowCopy::Padding,
+        );
+        std::iter::once(pad.clone())
+            .chain(lines.iter().flat_map(|line| {
+                wrap_line_at_columns(line, folded)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let copy = RowCopy::Code {
+                            from: 1,
+                            columns: row
+                                .spans
+                                .iter()
+                                .map(|span| display_width(&span.content))
+                                .sum(),
+                            continues: index > 0,
+                        };
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(row.spans);
+                        (shaded_row(Line::from(spans), CODE_BACKGROUND, width), copy)
+                    })
+            }))
+            .chain(std::iter::once(pad))
             .collect()
     }
 
@@ -303,7 +408,7 @@ impl Look {
         loose: bool,
         items: &[Vec<markdown::Block>],
         width: usize,
-    ) -> Vec<Line<'static>> {
+    ) -> Vec<Row> {
         let markers: Vec<Span<'static>> = match start {
             Some(first) => {
                 let number = |index: usize| first.saturating_add(index as u64);
@@ -322,27 +427,30 @@ impl Look {
         let mut rows = Vec::new();
         for (item, marker) in items.iter().zip(markers) {
             if loose && !rows.is_empty() {
-                rows.push(Line::default());
+                rows.push((Line::default(), RowCopy::Text));
             }
             let indent = display_width(&marker.content);
             if width < indent + MIN_NESTED_WIDTH {
-                rows.push(Line::from(marker));
+                rows.push((Line::from(marker), RowCopy::Text));
                 rows.extend(self.blocks(item, width, !loose));
                 continue;
             }
             let item_rows = self.blocks(item, width - indent, !loose);
             if item_rows.is_empty() {
-                rows.push(Line::from(marker));
+                rows.push((Line::from(marker), RowCopy::Text));
                 continue;
             }
             let pad = Span::raw(" ".repeat(indent));
-            for (index, mut row) in item_rows.into_iter().enumerate() {
+            for (index, (mut row, copy)) in item_rows.into_iter().enumerate() {
                 if index == 0 {
                     row.spans.insert(0, marker.clone());
                 } else if !is_blank(&row) {
                     row.spans.insert(0, pad.clone());
+                } else {
+                    rows.push((row, copy));
+                    continue;
                 }
-                rows.push(row);
+                rows.push((row, copy.behind(indent)));
             }
         }
         rows
@@ -458,7 +566,7 @@ impl Look {
     }
 
     /// A quote's blocks behind its bar on every row, the blank ones between its blocks included.
-    fn quote(&self, blocks: &[markdown::Block], width: usize) -> Vec<Line<'static>> {
+    fn quote(&self, blocks: &[markdown::Block], width: usize) -> Vec<Row> {
         let bar = Span::styled(QUOTE_BAR.to_string(), self.quote_bar);
         let indent = display_width(&bar.content) + 1;
         if width < indent + MIN_NESTED_WIDTH {
@@ -466,13 +574,13 @@ impl Look {
         }
         self.blocks(blocks, width - indent, false)
             .into_iter()
-            .map(|mut row| {
+            .map(|(mut row, copy)| {
                 if is_blank(&row) {
-                    return Line::from(bar.clone());
+                    return (Line::from(bar.clone()), copy);
                 }
                 row.spans.insert(0, Span::raw(" "));
                 row.spans.insert(0, bar.clone());
-                row
+                (row, copy.behind(indent))
             })
             .collect()
     }
@@ -617,8 +725,12 @@ fn aligned(
     Line::from(spans)
 }
 
+/// Whether `line` draws nothing: no character and no shade, since a shaded row of spaces is part of
+/// the block it shades.
 pub(crate) fn is_blank(line: &Line<'static>) -> bool {
-    line.spans.iter().all(|span| span.content.trim().is_empty())
+    line.spans
+        .iter()
+        .all(|span| span.content.trim().is_empty() && !has_background(span.style))
 }
 
 /// A fenced block's body, highlighted for `language` in the screen's code theme, one row per source
@@ -663,7 +775,9 @@ fn syntect_style(style: syntect::highlighting::Style) -> Style {
 }
 
 /// Text that may carry the escapes a shell wrote, one line per row, keeping its colors, wrapped
-/// to `width`.
+/// to `width`. A reset is kept as no style at all: it asks for the terminal's own colors, which
+/// is what a span without a style has, and kept as a reset it would undo what the screen lays
+/// over a row, the shade of an open run and the reversal of the keyboard's cursor.
 pub(crate) fn ansi_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     use ansi_to_tui::IntoText;
     let lines = match text.into_text() {
@@ -673,9 +787,27 @@ pub(crate) fn ansi_lines(text: &str, width: usize) -> Vec<Line<'static>> {
             .map(|row| Line::from(row.to_string()))
             .collect(),
     };
+    let own = |color: Option<Color>| color.filter(|color| *color != Color::Reset);
     lines
-        .iter()
-        .flat_map(|line| wrap_line(line, width))
+        .into_iter()
+        .map(|line| {
+            Line::from(
+                line.spans
+                    .into_iter()
+                    .map(|span| {
+                        let style = Style {
+                            fg: own(span.style.fg),
+                            bg: own(span.style.bg),
+                            underline_color: own(span.style.underline_color),
+                            sub_modifier: Modifier::empty(),
+                            ..span.style
+                        };
+                        Span::styled(span.content, style)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flat_map(|line| wrap_line(&line, width))
         .collect()
 }
 
@@ -883,6 +1015,15 @@ pub(crate) fn gutter_rows(
         .collect()
 }
 
+/// [`edge_rows`] for rows that say how they copy.
+pub(crate) fn edge_copy_rows(rows: Vec<Row>) -> Vec<Row> {
+    let (lines, copies): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    edge_rows(lines)
+        .into_iter()
+        .zip(copies.into_iter().map(|copy| copy.behind(TEXT_EDGE)))
+        .collect()
+}
+
 /// Rows at the text edge with nothing in the gutter.
 pub(crate) fn edge_rows(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let pad = " ".repeat(TEXT_EDGE);
@@ -894,6 +1035,277 @@ pub(crate) fn edge_rows(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
             line
         })
         .collect()
+}
+
+/// Rows an image is drawn in at most, two pixels to a row.
+const PICTURE_ROWS: u32 = 20;
+/// The widest an image's kept copy is, in pixels: a column each, wider than any screen's text.
+const PICTURE_COLUMNS: u32 = 512;
+
+/// An image as the screen draws it: the pixel size its header states, and a copy small enough to
+/// scale to any width when it is laid out, or none when its pixels would not decode.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Picture {
+    size: Option<(u32, u32)>,
+    pixels: Option<std::sync::Arc<image::RgbaImage>>,
+}
+
+impl std::fmt::Debug for Picture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Picture")
+            .field("size", &self.size)
+            .field("decoded", &self.pixels.is_some())
+            .finish()
+    }
+}
+
+impl Picture {
+    /// `bytes` decoded, and scaled down to the most the screen ever draws of them.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        let (size, decoded) = crate::image::decode_for_display(bytes);
+        let pixels = decoded.map(|decoded| std::sync::Arc::new(kept_copy(decoded)));
+        Self { size, pixels }
+    }
+
+    /// The image `source` holds, when its bytes are here rather than in the store.
+    pub(crate) fn from_source(source: &crate::image::ImageSource) -> Self {
+        use base64::Engine as _;
+        let bytes = source.base64_data().and_then(|data| {
+            base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .ok()
+        });
+        match bytes {
+            Some(bytes) => Self::from_bytes(&bytes),
+            None => Self::unread(),
+        }
+    }
+
+    /// An image whose bytes were not read.
+    pub(crate) fn unread() -> Self {
+        Self {
+            size: None,
+            pixels: None,
+        }
+    }
+
+    /// What stands in for the image when its pixels would not decode, the size its header states
+    /// included when it states one.
+    pub(crate) fn label(&self) -> String {
+        match self.size {
+            Some((width, height)) => format!("[image {width}x{height}]"),
+            None => "[image]".to_string(),
+        }
+    }
+}
+
+/// `decoded` as the copy a [`Picture`] keeps: shrunk to its bounds in its own pixel type, turned
+/// upright and widened to RGBA once small, so no full-size copy is held beside the decode.
+fn kept_copy(decoded: crate::image::Decoded) -> image::RgbaImage {
+    decoded
+        .upright_within(
+            PICTURE_COLUMNS,
+            2 * PICTURE_ROWS,
+            |pixels, width, height| {
+                let size = (pixels.width(), pixels.height());
+                let fit = fitted(size, width, height);
+                if fit == size {
+                    pixels
+                } else {
+                    shrunk(pixels, fit)
+                }
+            },
+        )
+        .into_rgba8()
+}
+
+/// `pixels` shrunk to `size` by the fast sampling of a thumbnail, in their own pixel type, each
+/// color weighed by its opacity while pixels are averaged; see [`weigh_by_opacity`].
+fn shrunk(mut pixels: image::DynamicImage, size: (u32, u32)) -> image::DynamicImage {
+    weigh_by_opacity(&mut pixels, true);
+    let mut small = pixels.thumbnail_exact(size.0, size.1);
+    weigh_by_opacity(&mut small, false);
+    small
+}
+
+/// Each color of `pixels` multiplied by its opacity, or with `weigh` false divided by it again,
+/// for a pixel type that has one: a transparent pixel's color is no color, and averaged in as it
+/// is stored it darkens the edge it borders. Done in the pixels' own type, which a widened copy
+/// would hold beside them.
+fn weigh_by_opacity(pixels: &mut image::DynamicImage, weigh: bool) {
+    use image::DynamicImage;
+    match pixels {
+        DynamicImage::ImageLumaA8(buffer) => weigh_samples::<u8>(buffer, 2, weigh),
+        DynamicImage::ImageRgba8(buffer) => weigh_samples::<u8>(buffer, 4, weigh),
+        DynamicImage::ImageLumaA16(buffer) => weigh_samples::<u16>(buffer, 2, weigh),
+        DynamicImage::ImageRgba16(buffer) => weigh_samples::<u16>(buffer, 4, weigh),
+        DynamicImage::ImageRgba32F(buffer) => weigh_samples::<f32>(buffer, 4, weigh),
+        _ => {}
+    }
+}
+
+/// [`weigh_by_opacity`] over the samples of pixels of `channels` channels each, opacity last.
+fn weigh_samples<S: Sample>(samples: &mut [S], channels: usize, weigh: bool) {
+    for pixel in samples.chunks_exact_mut(channels) {
+        let Some((opacity, colors)) = pixel.split_last_mut() else {
+            continue;
+        };
+        let opacity = opacity.fraction();
+        if !weigh && opacity <= 0.0 {
+            continue;
+        }
+        for color in colors {
+            let value = color.fraction();
+            *color = S::from_fraction(if weigh {
+                value * opacity
+            } else {
+                value / opacity
+            });
+        }
+    }
+}
+
+/// A sample of a pixel as a fraction of its full scale, and back.
+trait Sample: Copy {
+    fn fraction(self) -> f32;
+    fn from_fraction(fraction: f32) -> Self;
+}
+
+impl Sample for u8 {
+    fn fraction(self) -> f32 {
+        f32::from(self) / f32::from(u8::MAX)
+    }
+
+    fn from_fraction(fraction: f32) -> Self {
+        (fraction * f32::from(u8::MAX))
+            .round()
+            .clamp(0.0, f32::from(u8::MAX)) as u8
+    }
+}
+
+impl Sample for u16 {
+    fn fraction(self) -> f32 {
+        f32::from(self) / f32::from(u16::MAX)
+    }
+
+    fn from_fraction(fraction: f32) -> Self {
+        (fraction * f32::from(u16::MAX))
+            .round()
+            .clamp(0.0, f32::from(u16::MAX)) as u16
+    }
+}
+
+impl Sample for f32 {
+    fn fraction(self) -> f32 {
+        self
+    }
+
+    fn from_fraction(fraction: f32) -> Self {
+        fraction
+    }
+}
+
+/// `picture` in half-block cells, two pixels to a row, scaled to fit `width` columns and
+/// [`PICTURE_ROWS`] rows without growing past its kept copy; a pixel more than half transparent
+/// leaves the terminal's own background. `None` when its pixels would not decode, or none of them
+/// is opaque enough to draw, which would be rows of nothing.
+pub(crate) fn picture_rows(picture: &Picture, width: usize) -> Option<Vec<Line<'static>>> {
+    let pixels = picture.pixels.as_deref()?;
+    let columns = u32::try_from(width).unwrap_or(u32::MAX);
+    let (scaled_width, scaled_height) = fitted(pixels.dimensions(), columns, 2 * PICTURE_ROWS);
+    let shown = if (scaled_width, scaled_height) == pixels.dimensions() {
+        pixels.clone()
+    } else {
+        scaled(
+            pixels.clone(),
+            (scaled_width, scaled_height),
+            image::imageops::FilterType::Triangle,
+        )
+    };
+    let color = |x: u32, y: u32| {
+        shown
+            .get_pixel_checked(x, y)
+            .filter(|pixel| pixel.0[3] >= 128)
+            .map(|pixel| Color::Rgb(pixel.0[0], pixel.0[1], pixel.0[2]))
+    };
+    let rows = (0..scaled_height)
+        .step_by(2)
+        .map(|y| {
+            Line::from(
+                (0..scaled_width)
+                    .map(|x| match (color(x, y), color(x, y + 1)) {
+                        (Some(top), Some(bottom)) => {
+                            Span::styled("▀", Style::default().fg(top).bg(bottom))
+                        }
+                        (Some(top), None) => Span::styled("▀", Style::default().fg(top)),
+                        (None, Some(bottom)) => Span::styled("▄", Style::default().fg(bottom)),
+                        (None, None) => Span::raw(" "),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<Line<'static>>>();
+    let drawn = rows
+        .iter()
+        .flat_map(|row| &row.spans)
+        .any(|span| span.style != Style::default());
+    drawn.then_some(rows)
+}
+
+/// `size` scaled down to fit `width` by `height` with its proportions kept, and never up.
+fn fitted(size: (u32, u32), width: u32, height: u32) -> (u32, u32) {
+    let (own_width, own_height) = (size.0.max(1), size.1.max(1));
+    let scale = (f64::from(width.max(1)) / f64::from(own_width))
+        .min(f64::from(height.max(1)) / f64::from(own_height))
+        .min(1.0);
+    let side = |own: u32| ((f64::from(own) * scale).round() as u32).max(1);
+    (side(own_width), side(own_height))
+}
+
+/// `pixels` scaled to `size` smoothly through `filter`, each color weighed by its opacity while
+/// pixels are averaged; see [`weigh_by_opacity`].
+fn scaled(
+    mut weighed: image::RgbaImage,
+    size: (u32, u32),
+    filter: image::imageops::FilterType,
+) -> image::RgbaImage {
+    weigh_samples::<u8>(&mut weighed, 4, true);
+    let mut out = image::imageops::resize(&weighed, size.0, size.1, filter);
+    weigh_samples::<u8>(&mut out, 4, false);
+    out
+}
+
+/// A rule across the text behind `glyph` in the gutter, with `icon` and `words` on it: a boundary
+/// in the conversation rather than something said in it. The words are centered on the whole
+/// row, which is how the eye takes it, and the glyph and the icon stand outside that measure.
+/// Where the rule has no room on either side, the row is the icon and the words, cut at the edge.
+pub(crate) fn boundary_row(glyph: &str, icon: &str, words: &str, width: usize) -> Line<'static> {
+    let gutter = Span::styled(format!("{glyph:<TEXT_EDGE$}"), gray());
+    let words_width = display_width(words);
+    let words_start = width.saturating_sub(words_width) / 2;
+    // A space before the icon and one between it and the words.
+    let left = words_start
+        .checked_sub(display_width(icon) + 2 + TEXT_EDGE)
+        .filter(|&left| left > 0);
+    let right = width
+        .checked_sub(words_start + words_width + 1)
+        .filter(|&right| right > 0);
+    let (Some(left), Some(right)) = (left, right) else {
+        return Line::from(vec![
+            gutter,
+            Span::styled(
+                cut_text(&format!("{icon} {words}"), width.saturating_sub(TEXT_EDGE)),
+                gray(),
+            ),
+        ]);
+    };
+    Line::from(vec![
+        gutter,
+        Span::styled(TABLE_RULE.to_string().repeat(left), gray()),
+        Span::styled(format!(" {icon} {words} "), gray()),
+        Span::styled(TABLE_RULE.to_string().repeat(right), gray()),
+    ])
 }
 
 /// Plain text wrapped under a glyph: a notice, a stage direction, an error.
@@ -914,7 +1326,7 @@ pub(crate) fn glyph_text_rows(
 
 /// Rows under a tool call: the first behind the connector, the rest flush under its text.
 pub(crate) fn connector_rows(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    let lead_width = TEXT_EDGE + display_width(CONNECTOR);
+    let lead_width = connector_indent();
     let pad = " ".repeat(lead_width);
     rows.into_iter()
         .enumerate()
@@ -935,22 +1347,117 @@ pub(crate) fn connector_indent() -> usize {
     TEXT_EDGE + display_width(CONNECTOR)
 }
 
+/// The rows under a call's row as one tree: the arguments on a `│` bar, a program's first row
+/// behind `$`, and what the call produced on the `└` elbow with its continuation rows flush
+/// under it. With nothing produced the last argument takes the elbow, so the tree ends rather
+/// than hangs. Every row's text sits at the same column, [`connector_indent`].
+pub(crate) fn tree_rows(
+    arguments: Vec<Line<'static>>,
+    program_first: bool,
+    body: Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    let edge = " ".repeat(TEXT_EDGE);
+    let lead = |glyph: &str| Span::styled(format!("{edge}{glyph} "), gray());
+    let last_argument = arguments.len().saturating_sub(1);
+    let mut rows = Vec::with_capacity(arguments.len() + body.len());
+    for (index, mut row) in arguments.into_iter().enumerate() {
+        let glyph = if index == 0 && program_first {
+            "$"
+        } else if index == last_argument && body.is_empty() {
+            "└"
+        } else {
+            "│"
+        };
+        row.spans.insert(0, lead(glyph));
+        rows.push(row);
+    }
+    rows.extend(connector_rows(body));
+    rows
+}
+
+/// `line` on `shade` across `width` columns: every cell without a background of its own takes
+/// the shade, the rest of the row is painted with it, since a terminal drops the background of
+/// trailing spaces after a reset, and it is dimmed as [`on_shade`] dims. The line's own style, a
+/// cursor's reversal say, stays the line's.
+pub(crate) fn shaded_row(line: Line<'static>, shade: Color, width: usize) -> Line<'static> {
+    let line = on_shade(line);
+    let mut used = 0;
+    let mut spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            // Measured as the frame draws it, so the shade reaches the edge whatever the row holds.
+            used += span.width();
+            let mut style = span.style;
+            if !has_background(style) {
+                style = style.bg(shade);
+            }
+            Span::styled(span.content, style)
+        })
+        .collect();
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(used)),
+        Style::default().bg(shade),
+    ));
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
+    }
+}
+
+/// `line` as it is drawn on a shade, whichever shade: what is dimmed in the terminal's dark gray
+/// in [`DIM_ON_SHADE`], which the shade does not swallow. Every row a shaded surface draws from
+/// rows laid out elsewhere passes here: the transcript's runs and code blocks, a panel, a
+/// question, the completion list, the status row. The composer, which draws its own few dimmed
+/// words, draws them in [`DIM_ON_SHADE`] itself.
+pub(crate) fn on_shade(line: Line<'static>) -> Line<'static> {
+    // The palette's dark gray by name, or by its slot, as a program's `38;5;8` names it.
+    let dim = |style: Style| {
+        if matches!(style.fg, Some(Color::DarkGray | Color::Indexed(8))) {
+            style.fg(DIM_ON_SHADE)
+        } else {
+            style
+        }
+    };
+    Line {
+        spans: line
+            .spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, dim(span.style)))
+            .collect(),
+        style: dim(line.style),
+        alignment: line.alignment,
+    }
+}
+
+/// Whether `style` paints a background of its own: a reset, which a program's colored output
+/// ends every run with, is the terminal's background, as no background is.
+fn has_background(style: Style) -> bool {
+    !matches!(style.bg, None | Some(Color::Reset))
+}
+
 /// The opening of a result: its first block, the rows up to the first blank one, at most
-/// `most` of them, and a count of everything not shown. A tool writes what it has to say to
-/// the model after its payload, set off by a blank line (a listing's footnote, a read's
-/// `showing lines` marker), so stopping at the blank shows the payload and counts the rest
-/// without knowing either by name. A preview never holds a blank row.
+/// `most` of them, and a count of everything not shown. A tool writes what it has to say to the
+/// model after its payload, set off by a blank line (a listing's footnote, a read's `showing lines`
+/// marker), so stopping at the blank shows the payload and counts the rest without knowing either
+/// by name. A single row past `most` is shown rather than counted, since the count would take its
+/// row. Blank rows ahead of the first block are dropped, and a preview never holds a blank row.
 pub(crate) fn preview_rows(rows: Vec<Line<'static>>, most: usize) -> Vec<Line<'static>> {
-    let block = rows
+    let rows: Vec<Line<'static>> = rows.into_iter().skip_while(is_blank).collect();
+    let mut block = rows
         .iter()
         .position(is_blank)
         .unwrap_or(rows.len())
         .min(most);
-    if block == rows.len() {
-        return rows;
+    if rows.len() == block + 1 && rows.get(block).is_some_and(|row| !is_blank(row)) {
+        block += 1;
     }
     let omitted = rows.len() - block;
-    let mut out: Vec<Line<'static>> = rows.iter().take(block).cloned().collect();
+    if omitted == 0 {
+        return rows;
+    }
+    let mut out: Vec<Line<'static>> = rows.into_iter().take(block).collect();
     out.push(Line::from(Span::styled(
         format!("… +{omitted} line{}", if omitted == 1 { "" } else { "s" }),
         gray(),
@@ -1025,18 +1532,9 @@ pub(crate) fn tool_summary(
 ) -> Option<String> {
     display_summary
         .map(str::to_string)
-        .or_else(|| crate::tools::resolve_primary_param(name, input, None))
+        .or_else(|| crate::tools::resolve_primary_param(name, input))
         .map(|value| sanitize_to_line(value.trim(), usize::MAX))
         .filter(|value| !value.is_empty())
-}
-
-/// One line of `text` highlighted as `language`, in the screen's code theme.
-fn highlight_spans(text: &str, language: &str) -> Vec<Span<'static>> {
-    code_lines(&[text.to_string()], Some(language))
-        .into_iter()
-        .next()
-        .map(|line| line.spans)
-        .unwrap_or_default()
 }
 
 /// The characters of `spans` in order, each with the style it was drawn in.
@@ -1051,41 +1549,118 @@ fn characters_of(spans: &[Span<'static>]) -> Vec<(char, Style)> {
         .collect()
 }
 
-/// As many characters from the front of `characters` as fit in `columns`.
+/// As many characters from the front of `characters` as fit in `columns`; see [`front_text`].
 fn front_columns(characters: &[(char, Style)], columns: usize) -> &[(char, Style)] {
-    let mut used = 0;
-    let mut end = 0;
-    for (index, (character, _)) in characters.iter().enumerate() {
-        let width = crate::text::char_width(*character);
-        if used + width > columns {
-            break;
-        }
-        used += width;
-        end = index + 1;
+    let text: String = characters.iter().map(|(character, _)| *character).collect();
+    let kept = front_text(&text, columns).chars().count();
+    characters.get(..kept).unwrap_or_default()
+}
+
+/// The longest prefix of `text` within `columns`, whole graphemes, so a cut never parts a
+/// character from the marks that shape it, measured as [`crate::text::display_width`] measures
+/// it, which is the measure a fit is judged by: a character's own width can be less than what it
+/// takes beside the one before it, as an emoji's presentation selector widens it.
+fn front_text(text: &str, columns: usize) -> &str {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    let ends: Vec<usize> = text
+        .grapheme_indices(true)
+        .map(|(start, grapheme)| start + grapheme.len())
+        .collect();
+    let prefix = |count: usize| {
+        count
+            .checked_sub(1)
+            .and_then(|last| ends.get(last))
+            .map_or("", |&end| text.get(..end).unwrap_or_default())
+    };
+    prefix(longest_fitting(ends.len(), |count| {
+        crate::text::display_width(prefix(count)) <= columns
+    }))
+}
+
+/// The most of `count` items, taken in order from one end, that `fits`: a search over the
+/// counts, since a measure of the whole is all there is and it is not taken one item at a time.
+/// Zero items always fit.
+fn longest_fitting(count: usize, fits: impl Fn(usize) -> bool) -> usize {
+    if fits(count) {
+        return count;
     }
-    characters.get(..end).unwrap_or_default()
+    let (mut fitting, mut over) = (0, count);
+    while over - fitting > 1 {
+        let middle = fitting + (over - fitting) / 2;
+        if fits(middle) {
+            fitting = middle;
+        } else {
+            over = middle;
+        }
+    }
+    fitting
 }
 
 /// Spans cut to `budget` columns at their end, `…` in the last column when something went, every
 /// character keeping its style; whole when they fit. Always the end and never the middle: a
 /// mark in the middle of a line is easy to miss, and what is shown then passes for the whole.
 pub(crate) fn cut_spans(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
-    let characters = characters_of(&spans);
-    let total: usize = characters
-        .iter()
-        .map(|(character, _)| crate::text::char_width(*character))
-        .sum();
-    if total <= budget {
+    let whole: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    if crate::text::display_width(&whole) <= budget {
         return spans;
     }
+    let characters = characters_of(&spans);
     let mut cut = join_characters(front_columns(&characters, budget.saturating_sub(1))).spans;
-    cut.push(Span::styled("…".to_string(), gray()));
+    // On the background of what it stands in for, so a tinted row stays tinted to its end, in
+    // the gray that reads on one.
+    let background = cut.last().map_or_else(Style::default, |span| span.style);
+    let ellipsis = Style {
+        bg: background.bg,
+        ..if has_background(background) {
+            Style::default().fg(DIM_ON_SHADE)
+        } else {
+            gray()
+        }
+    };
+    cut.push(Span::styled("…".to_string(), ellipsis));
     cut
 }
 
 /// A line cut the way [`cut_spans`] cuts.
 pub(crate) fn cut_line(line: Line<'static>, budget: usize) -> Line<'static> {
     Line::from(cut_spans(line.spans, budget))
+}
+
+/// A line meka says in its own voice as the screen draws it: without a closing period, which no
+/// line on the screen ends in, so a sentence another surface shares reads here as the screen's own
+/// do. An ellipsis is not a period.
+pub(crate) fn without_closing_period(text: &str) -> &str {
+    let text = text.trim_end();
+    match text.strip_suffix('.') {
+        Some(rest) if !rest.ends_with('.') => rest,
+        _ => text,
+    }
+}
+
+/// A line meka says in its own voice as the screen draws it: led by a capital and without a
+/// closing period ([`without_closing_period`]), so a sentence another surface shares, an error's
+/// above all, whose words follow a prefix there, reads here as the screen's own do. A line that
+/// opens with a number, a mark or a name keeps it: a word of anything but lowercase letters, a
+/// tool's name among them, or meka's own, which is written lowercase.
+pub(crate) fn screen_voice(text: &str) -> std::borrow::Cow<'_, str> {
+    let text = without_closing_period(text);
+    let first_word = text
+        .split(|character: char| character.is_whitespace() || character == ':')
+        .next()
+        .unwrap_or_default();
+    if first_word.is_empty() || first_word == "meka" || !first_word.chars().all(char::is_lowercase)
+    {
+        return text.into();
+    }
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) => first
+            .to_uppercase()
+            .chain(characters)
+            .collect::<String>()
+            .into(),
+        None => text.into(),
+    }
 }
 
 /// Plain text cut the way [`cut_spans`] cuts.
@@ -1105,203 +1680,311 @@ pub(crate) fn cut_text_start(text: &str, budget: usize) -> String {
     format!("…{}", back_columns(text, budget.saturating_sub(1)))
 }
 
-/// The longest suffix of `text` within `columns`.
+/// The longest suffix of `text` within `columns`, whole graphemes, measured as
+/// [`front_columns`] measures.
 fn back_columns(text: &str, columns: usize) -> &str {
-    let mut used = 0;
-    let mut start = text.len();
-    for (index, character) in text.char_indices().rev() {
-        let width = crate::text::char_width(character);
-        if used + width > columns {
-            break;
-        }
-        used += width;
-        start = index;
+    use unicode_segmentation::UnicodeSegmentation as _;
+    let starts: Vec<usize> = text
+        .grapheme_indices(true)
+        .map(|(start, _)| start)
+        .collect();
+    let suffix = |count: usize| {
+        starts
+            .len()
+            .checked_sub(count)
+            .and_then(|first| starts.get(first))
+            .map_or("", |&start| text.get(start..).unwrap_or_default())
+    };
+    suffix(longest_fitting(starts.len(), |count| {
+        crate::text::display_width(suffix(count)) <= columns
+    }))
+}
+
+/// A tool's name as its row shows it, in the accent, as a function's name is in a code block, so a
+/// call is told from the prose around it; an MCP tool's `mcp__server__` prefix dimmed, so the
+/// name it is known by stands out while the whole name stays on the row.
+pub(crate) fn tool_name_spans(name: &str, budget: usize) -> Vec<Span<'static>> {
+    let name = cut_text(&sanitize_to_line(name, usize::MAX), budget.max(1));
+    let prefix = crate::tools::server_of_tool(&name)
+        .map_or(0, |server| "mcp__".len() + server.len() + "__".len());
+    let (prefix, own) = name.split_at(prefix.min(name.len()));
+    let mut spans = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix.to_string(), gray()));
     }
-    &text[start..]
+    spans.push(Span::styled(own.to_string(), Style::default().fg(ACCENT)));
+    spans
 }
 
-/// How many lines a call added to a file and took from it, shown on its row as `+3 -1`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DiffStat {
-    pub(crate) added: usize,
-    pub(crate) removed: usize,
+/// How many lines a change put in and took out, shown on its call's row as `+3 -1`.
+pub(crate) fn change_tag(change: &crate::conversation::Change) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!("+{}", change.added),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(
+            format!(" -{}", change.removed),
+            Style::default().fg(Color::Red),
+        ),
+    ]
 }
 
-impl DiffStat {
-    fn spans(self) -> Vec<Span<'static>> {
-        vec![
-            Span::styled(
-                format!("  +{}", self.added),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(
-                format!(" -{}", self.removed),
-                Style::default().fg(Color::Red),
-            ),
-        ]
-    }
+/// What a failed call's row says of it, in red: the code a command exited with, or that it failed.
+pub(crate) fn failure_tag(exit_code: Option<i32>) -> Vec<Span<'static>> {
+    let text = match exit_code {
+        Some(code) => format!("exit {code}"),
+        None => "failed".to_string(),
+    };
+    vec![Span::styled(text, Style::default().fg(Color::Red))]
 }
 
-/// A tool call's row: the name in the accent, as a function's name is in a code block, so a
-/// call is told from the prose around it; its summary after it, dimmed, or highlighted as code
-/// when `language` says the summary is a program, cut at the edge when it does not fit; and the
-/// count of what it changed, when it changed a file.
+/// A tool call's row: its name, then its summary (styled by the caller, cut at the edge when it
+/// does not fit), then `tag`, what the call changed or how it failed, which is never cut.
 pub(crate) fn tool_row(
     name: &str,
-    summary: Option<&str>,
-    language: Option<&str>,
-    stat: Option<DiffStat>,
+    summary: Vec<Span<'static>>,
+    tag: Vec<Span<'static>>,
     width: usize,
 ) -> Line<'static> {
-    let name = cut_text(
-        &sanitize_to_line(name, usize::MAX),
-        width.saturating_sub(TEXT_EDGE).max(1),
-    );
-    let mut spans = vec![
-        Span::styled(format!("{ACT_GLYPH:<TEXT_EDGE$}"), gray()),
-        Span::styled(name.clone(), Style::default().fg(ACCENT)),
-    ];
-    let stat_spans = stat.map(DiffStat::spans).unwrap_or_default();
-    let stat_width: usize = stat_spans
-        .iter()
-        .map(|span| display_width(&span.content))
-        .sum();
-    if let Some(summary) = summary {
-        let budget = width.saturating_sub(TEXT_EDGE + display_width(&name) + 1 + stat_width);
-        if budget >= TOOL_ARGUMENT_FLOOR {
-            let styled = match language {
-                Some(language) => highlight_spans(summary, language),
-                None => vec![Span::styled(summary.to_string(), gray())],
-            };
-            spans.push(Span::raw(" ".to_string()));
-            spans.extend(cut_spans(styled, budget));
-        }
+    let mut spans = vec![Span::styled(format!("{ACT_GLYPH:<TEXT_EDGE$}"), gray())];
+    let budget = summary_room(name, &tag, width);
+    spans.extend(tool_name_spans(
+        name,
+        width.saturating_sub(TEXT_EDGE + tag_room(&tag)),
+    ));
+    if !summary.is_empty() && budget > 0 {
+        spans.push(Span::raw(" ".to_string()));
+        spans.extend(cut_spans(summary, budget));
     }
-    spans.extend(stat_spans);
+    if !tag.is_empty() {
+        spans.push(Span::raw("  ".to_string()));
+        spans.extend(tag);
+    }
     Line::from(spans)
 }
 
-/// Lines of unchanged text shown on either side of a change, so a preview of three rows holds
-/// the line before, the line taken out and the line put in.
-const DIFF_CONTEXT_LINES: usize = 1;
-
-/// A file's change as a diff: every changed line with the line before and after it, numbered
-/// in the old file for what was there and in the new for what is, `-` red and `+` green and the
-/// rest dimmed, hunks apart from each other set off by `…`. A long line wraps under its text
-/// rather than being cut, because this is the expanded form's content too.
-pub(crate) fn diff_rows(
-    old: Option<&str>,
-    new: &str,
-    width: usize,
-) -> (Vec<Line<'static>>, DiffStat) {
-    use similar::{ChangeTag, TextDiff};
-    let old = old.unwrap_or("");
-    let diff = TextDiff::from_lines(old, new);
-    let mut stat = DiffStat {
-        added: 0,
-        removed: 0,
-    };
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Insert => stat.added += 1,
-            ChangeTag::Delete => stat.removed += 1,
-            ChangeTag::Equal => {}
-        }
+/// The columns a [`tool_row`] `width` wide leaves its summary after the name and `tag`, or none
+/// where that is below [`TOOL_ARGUMENT_FLOOR`] and the row shows no summary.
+pub(crate) fn summary_room(name: &str, tag: &[Span<'static>], width: usize) -> usize {
+    let name_width: usize = tool_name_spans(name, width.saturating_sub(TEXT_EDGE + tag_room(tag)))
+        .iter()
+        .map(|span| display_width(&span.content))
+        .sum();
+    let budget = width.saturating_sub(TEXT_EDGE + name_width + 1 + tag_room(tag));
+    if budget >= TOOL_ARGUMENT_FLOOR {
+        budget
+    } else {
+        0
     }
-    let lines = old.lines().count().max(new.lines().count()).max(1);
-    let number_width = lines.to_string().len();
+}
+
+/// The columns a tool row's tag takes with the gap before it.
+fn tag_room(tag: &[Span<'static>]) -> usize {
+    if tag.is_empty() {
+        0
+    } else {
+        tag.iter()
+            .map(|span| display_width(&span.content))
+            .sum::<usize>()
+            + 2
+    }
+}
+
+/// `spans` with their first `columns` dimmed: a part of a command that does nothing, drawn as it
+/// ran but out of the way of the part that does.
+pub(crate) fn dim_front(spans: Vec<Span<'static>>, columns: usize) -> Vec<Span<'static>> {
+    let characters = characters_of(&spans);
+    let front = front_columns(&characters, columns).len();
+    let mut dimmed: Vec<(char, Style)> = characters;
+    for (_, style) in dimmed.iter_mut().take(front) {
+        *style = gray();
+    }
+    join_characters(&dimmed).spans
+}
+
+/// The tint a removed line of a diff sits on, and its number and sign are drawn in.
+const REMOVED_BACKGROUND: Color = Color::Indexed(52);
+const REMOVED_MARK: Color = Color::Indexed(210);
+/// The tint an added line of a diff sits on, and its number and sign are drawn in.
+const ADDED_BACKGROUND: Color = Color::Indexed(22);
+const ADDED_MARK: Color = Color::Indexed(120);
+
+/// A change as its diff: every changed line with the line before and after it, numbered in the
+/// old text for what was there and in the new for what is, a `-` line on a red tint and a `+` line
+/// on a green one across the width, its number and sign in the tint's light shade and its text in
+/// white, which reads on both whatever the terminal's theme, and the rest dimmed, hunks apart from
+/// each other set off by `…`. A long line wraps under its text, as the expanded form shows it.
+pub(crate) fn change_rows(
+    change: &crate::conversation::Change,
+    width: usize,
+) -> Vec<Line<'static>> {
+    diff_rows(change, width, true)
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect()
+}
+
+/// A change as a collapsed call shows it: its first `most` rows, each line one row for the caller
+/// to cut at the edge, and a count of the lines past them, the lines the record left out among
+/// them and the marks between hunks not. A single line past them is shown rather than counted,
+/// as a result's preview shows it, and a mark between hunks never ends the rows shown.
+pub(crate) fn change_preview(
+    change: &crate::conversation::Change,
+    width: usize,
+    most: usize,
+) -> Vec<Line<'static>> {
+    let rows = diff_rows(change, width, false);
+    let left_out = change.lines_left_out();
+    if left_out == 0 && rows.len() <= most + 1 {
+        return rows.into_iter().map(|(row, _)| row).collect();
+    }
+    let past = rows.iter().skip(most).filter(|(_, line)| *line).count() + left_out;
+    let mut shown: Vec<(Line<'static>, bool)> = rows.into_iter().take(most).collect();
+    if shown.last().is_some_and(|(_, line)| !*line) {
+        shown.pop();
+    }
+    let mut shown: Vec<Line<'static>> = shown.into_iter().map(|(row, _)| row).collect();
+    if past > 0 {
+        shown.push(Line::from(Span::styled(
+            format!("… +{past} line{}", if past == 1 { "" } else { "s" }),
+            gray(),
+        )));
+    }
+    shown
+}
+
+/// The rows of [`change_rows`], wrapped or a line to a row, each with whether it is a line of
+/// the change rather than the mark between two hunks.
+fn diff_rows(
+    change: &crate::conversation::Change,
+    width: usize,
+    wraps: bool,
+) -> Vec<(Line<'static>, bool)> {
+    use crate::conversation::ChangeKind;
+    let number_width = change
+        .hunks
+        .iter()
+        .flatten()
+        .map(|line| line.number)
+        .max()
+        .unwrap_or(1)
+        .to_string()
+        .len();
     let lead_width = number_width + 3;
     let inner = width.saturating_sub(lead_width).max(1);
     let mut rows = Vec::new();
-    for (group_index, group) in diff.grouped_ops(DIFF_CONTEXT_LINES).iter().enumerate() {
-        if group_index > 0 {
-            rows.push(Line::from(Span::styled(
-                format!("{:>number_width$} …", ""),
-                gray(),
-            )));
+    for (index, hunk) in change.hunks.iter().enumerate() {
+        if index > 0 {
+            rows.push((
+                Line::from(Span::styled(format!("{:>number_width$} …", ""), gray())),
+                false,
+            ));
         }
-        for op in group {
-            for change in diff.iter_changes(op) {
-                let (sign, number, style) = match change.tag() {
-                    ChangeTag::Equal => (' ', change.old_index(), gray()),
-                    ChangeTag::Delete => ('-', change.old_index(), Style::default().fg(Color::Red)),
-                    ChangeTag::Insert => {
-                        ('+', change.new_index(), Style::default().fg(Color::Green))
-                    }
-                };
-                let number = number.map_or(String::new(), |index| (index + 1).to_string());
-                let text =
-                    sanitize_to_line(change.value().trim_end_matches(['\n', '\r']), usize::MAX);
-                let lead = Span::styled(format!("{number:>number_width$} {sign} "), gray());
-                for (index, row) in wrap_line(&Line::from(Span::styled(text, style)), inner)
-                    .into_iter()
-                    .enumerate()
-                {
-                    let mut row = row;
-                    row.spans.insert(
-                        0,
-                        if index == 0 {
-                            lead.clone()
-                        } else {
-                            Span::raw(" ".repeat(lead_width))
-                        },
-                    );
-                    rows.push(row);
-                }
+        for line in hunk {
+            let (sign, mark, style, tint) = match line.kind {
+                ChangeKind::Kept => (' ', gray(), gray(), None),
+                ChangeKind::Removed => (
+                    '-',
+                    Style::default().fg(REMOVED_MARK),
+                    Style::default().fg(WHITE),
+                    Some(REMOVED_BACKGROUND),
+                ),
+                ChangeKind::Added => (
+                    '+',
+                    Style::default().fg(ADDED_MARK),
+                    Style::default().fg(WHITE),
+                    Some(ADDED_BACKGROUND),
+                ),
+            };
+            let text = sanitize_to_line(&line.text, usize::MAX);
+            let lead = Span::styled(format!("{:>number_width$} {sign} ", line.number), mark);
+            let line = Line::from(Span::styled(text, style));
+            let wrapped = if wraps {
+                wrap_line(&line, inner)
+            } else {
+                vec![line]
+            };
+            for (row_index, row) in wrapped.into_iter().enumerate() {
+                let mut row = row;
+                row.spans.insert(
+                    0,
+                    if row_index == 0 {
+                        lead.clone()
+                    } else {
+                        Span::raw(" ".repeat(lead_width))
+                    },
+                );
+                rows.push((
+                    match tint {
+                        Some(tint) => shaded_row(row, tint, width),
+                        None => row,
+                    },
+                    true,
+                ));
             }
         }
     }
-    (rows, stat)
+    rows
 }
 
-/// A program an expanded call ran, highlighted as `language` and wrapped whole at `width`, for
-/// the tree under the call's row to hang on its bar.
+/// The first `most` lines of a program, each cut to a column past `columns` and highlighted as
+/// `language`, one row per line, for the caller to cut at its edge: what a collapsed call shows
+/// of it. Only what is shown is highlighted, since the highlighter's cost grows faster than a
+/// line's length, a running call's row is laid out again with every line of output, and a session
+/// holds hundreds of calls. The lines are highlighted together, so each reads in the state the one
+/// before leaves, but afresh after a line the cut shortened, whose state its whole line would not
+/// leave: a string the cut opened would color every line under it.
+pub(crate) fn command_lines(
+    command: &str,
+    language: &str,
+    most: usize,
+    columns: usize,
+) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    let mut together: Vec<String> = Vec::new();
+    for line in command.lines().take(most) {
+        let line = sanitize_to_line(line, usize::MAX);
+        let kept = front_text(&line, columns.saturating_add(1));
+        let cut = kept.len() < line.len();
+        together.push(kept.to_string());
+        if cut {
+            rows.extend(code_lines(&std::mem::take(&mut together), Some(language)));
+        }
+    }
+    rows.extend(code_lines(&together, Some(language)));
+    rows
+}
+
+/// A program an expanded call ran, highlighted as `language` and wrapped whole at `width`.
 pub(crate) fn command_rows(command: &str, language: &str, width: usize) -> Vec<Line<'static>> {
-    let source: Vec<String> = command.lines().map(str::to_string).collect();
-    code_lines(&source, Some(language))
+    command_lines(command, language, usize::MAX, usize::MAX)
         .iter()
         .flat_map(|line| wrap_line(line, width.max(1)))
         .collect()
 }
 
-/// The rows under a call's row as one tree: the arguments on a `│` bar, a program's first row
-/// behind `$`, and what the call produced on the `└` elbow with its continuation rows flush
-/// under it. With nothing produced the last argument takes the elbow, so the tree ends rather
-/// than hangs. Every row's text sits at the same column, [`connector_indent`].
-pub(crate) fn tree_rows(
-    arguments: Vec<Line<'static>>,
-    program_first: bool,
-    body: Vec<Line<'static>>,
-) -> Vec<Line<'static>> {
-    let edge = " ".repeat(TEXT_EDGE);
-    let lead = |glyph: &str| Span::styled(format!("{edge}{glyph} "), gray());
-    let last_argument = arguments.len().saturating_sub(1);
-    let mut rows = Vec::with_capacity(arguments.len() + body.len());
-    for (index, mut row) in arguments.into_iter().enumerate() {
-        let glyph = if index == 0 && program_first {
-            "$"
-        } else if index == last_argument && body.is_empty() {
-            "└"
-        } else {
-            "│"
-        };
-        row.spans.insert(0, lead(glyph));
-        rows.push(row);
-    }
-    rows.extend(connector_rows(body));
-    rows
-}
-
-/// The argument block an expanded tool call hangs under its row, dimmed: every argument in
-/// full, wrapped to `width`, because expanded means everything and a cut is what hides a
-/// command's tail. The block's own first level of indent is taken off, since the tree supplies
-/// the column; deeper levels keep theirs.
-pub(crate) fn tool_argument_rows(
+/// A call's arguments as `key: value` rows in `style`, less the keys in `omit`: every argument in
+/// full, wrapped to `width`, because expanded means everything and a cut is what hides a command's
+/// tail. The block's own first level of indent is taken off, since the call's rows supply the
+/// column; deeper levels keep theirs.
+pub(crate) fn argument_rows(
     input: &serde_json::Value,
-    width: usize,
+    omit: &[&str],
     style: Style,
+    width: usize,
 ) -> Vec<Line<'static>> {
-    render_whole_params(input, width.saturating_add(TOOL_PARAM_INDENT.len()))
+    let mut rest = input.clone();
+    if let serde_json::Value::Object(fields) = &mut rest {
+        for key in omit {
+            fields.remove(*key);
+        }
+    }
+    let empty_object = matches!(&rest, serde_json::Value::Object(fields) if fields.is_empty());
+    if empty_object || rest.is_null() {
+        return Vec::new();
+    }
+    render_whole_params(&rest, width.saturating_add(TOOL_PARAM_INDENT.len()))
         .into_iter()
         .map(|row| {
             let row = row
@@ -1312,42 +1995,8 @@ pub(crate) fn tool_argument_rows(
         .collect()
 }
 
-/// A call's arguments as the rows under its row: the code parameter first as highlighted
-/// source, then the rest as `key: value` rows in `style`, less the keys in `omit`. The second
-/// value says whether a code row leads, which the tree marks with `$`.
-pub(crate) fn call_argument_rows(
-    name: &str,
-    input: &serde_json::Value,
-    omit: &[&str],
-    style: Style,
-    width: usize,
-) -> (Vec<Line<'static>>, bool) {
-    let mut rows = Vec::new();
-    let mut program_first = false;
-    let mut rest = input.clone();
-    if let Some((key, language)) = crate::tools::builtin_code_param(name)
-        && let Some(command) = input.get(key).and_then(serde_json::Value::as_str)
-    {
-        rows.extend(command_rows(command, language, width));
-        program_first = true;
-        if let serde_json::Value::Object(fields) = &mut rest {
-            fields.remove(key);
-        }
-    }
-    if let serde_json::Value::Object(fields) = &mut rest {
-        for key in omit {
-            fields.remove(*key);
-        }
-    }
-    let empty_object = matches!(&rest, serde_json::Value::Object(fields) if fields.is_empty());
-    if !empty_object && !rest.is_null() {
-        rows.extend(tool_argument_rows(&rest, width, style));
-    }
-    (rows, program_first)
-}
-
-/// The checklist as rows: the label, then one row per item under the connector, the item in
-/// progress in yellow ahead of the rest in gray. Empty for an empty list.
+/// The checklist as rows: the label, then one row per item under it, the item in progress in
+/// yellow ahead of the rest in gray. Empty for an empty list.
 pub(crate) fn checklist_rows(
     items: &[crate::checklist::ChecklistItem],
     width: usize,
@@ -1401,13 +2050,245 @@ pub(crate) fn approval_rows(
     let width = width
         .saturating_sub(connector_indent())
         .max(MIN_OUTPUT_WIDTH);
-    let (arguments, program_first) = call_argument_rows(name, input, &[], Style::default(), width);
+    let mut arguments = Vec::new();
+    let mut omit = Vec::new();
+    let mut program_first = false;
+    if let Some((key, language)) = crate::tools::builtin_code_param(name)
+        && let Some(command) = input.get(key).and_then(serde_json::Value::as_str)
+    {
+        arguments.extend(command_rows(command, language, width));
+        omit.push(key);
+        program_first = true;
+    }
+    arguments.extend(argument_rows(input, &omit, Style::default(), width));
     tree_rows(arguments, program_first, Vec::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A code row says how it copies: its code's first column, past the shade's margin and the
+    /// hang of the list it sits in, its width, and whether it continues the row above; the
+    /// block's padding copies as nothing and the prose around it as text.
+    #[test]
+    fn a_code_block_s_rows_say_how_they_copy() {
+        let source = format!("- item\n\n  ```\n  {}\n  ```\n", "x".repeat(70));
+        let copies: Vec<RowCopy> = markdown_rows(&source, 40)
+            .into_iter()
+            .map(|(_, copy)| copy)
+            .collect();
+        assert_eq!(copies, vec![
+            RowCopy::Text,
+            RowCopy::Text,
+            RowCopy::Padding,
+            RowCopy::Code {
+                from: 3,
+                columns: 36,
+                continues: false
+            },
+            RowCopy::Code {
+                from: 3,
+                columns: 34,
+                continues: true
+            },
+            RowCopy::Padding,
+        ]);
+    }
+
+    fn png_of(pixels: &image::RgbaImage) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(pixels.clone())
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode");
+        bytes
+    }
+
+    /// An image draws in half-block cells, a top and a bottom pixel to each: two opaque pixels are
+    /// `▀` over the bottom's color, a transparent half leaves the terminal's own background, and an
+    /// image is scaled to the width and the row cap with its proportions kept, and never grown.
+    #[test]
+    fn a_picture_is_drawn_in_half_blocks_scaled_to_fit() {
+        let red = image::Rgba([255, 0, 0, 255]);
+        let blue = image::Rgba([0, 0, 255, 255]);
+        let pixels = image::RgbaImage::from_fn(2, 2, |x, y| match (x, y) {
+            (0, 0) => red,
+            (1, 0) => image::Rgba([0, 0, 0, 0]),
+            _ => blue,
+        });
+        let rows = picture_rows(&Picture::from_bytes(&png_of(&pixels)), 60).expect("decoded");
+        let [row] = rows.as_slice() else {
+            panic!("two pixels tall is one row: {rows:?}");
+        };
+        let cells: Vec<(&str, Option<Color>, Option<Color>)> = row
+            .spans
+            .iter()
+            .map(|span| (span.content.as_ref(), span.style.fg, span.style.bg))
+            .collect();
+        assert_eq!(cells, vec![
+            (
+                "▀",
+                Some(Color::Rgb(255, 0, 0)),
+                Some(Color::Rgb(0, 0, 255))
+            ),
+            ("▄", Some(Color::Rgb(0, 0, 255)), None),
+        ]);
+        let wide = Picture::from_bytes(&png_of(&image::RgbaImage::from_pixel(400, 100, red)));
+        let rows = picture_rows(&wide, 60).expect("decoded");
+        assert_eq!(rows.len(), 8, "60 by 15 pixels");
+        assert!(rows.iter().all(|row| row.spans.len() == 60), "{rows:?}");
+        let tall = Picture::from_bytes(&png_of(&image::RgbaImage::from_pixel(10, 400, red)));
+        assert_eq!(
+            picture_rows(&tall, 60).expect("decoded").len(),
+            PICTURE_ROWS as usize
+        );
+        let mut gray = Vec::new();
+        image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(400, 100, image::Luma([200])))
+            .write_to(
+                &mut std::io::Cursor::new(&mut gray),
+                image::ImageFormat::Png,
+            )
+            .expect("encode");
+        let rows = picture_rows(&Picture::from_bytes(&gray), 60).expect("decoded");
+        assert_eq!(
+            rows.len(),
+            8,
+            "an image with no transparency scales the same"
+        );
+        assert_eq!(
+            rows[0].spans[0].style.fg,
+            Some(Color::Rgb(200, 200, 200)),
+            "{rows:?}"
+        );
+    }
+
+    /// An image that records it was taken turned is drawn the way up it was taken: a red pixel
+    /// left of a blue one, in an image whose orientation turns it a quarter clockwise, is red over
+    /// blue.
+    #[test]
+    fn a_picture_is_drawn_the_way_up_its_image_records() {
+        let red = image::Rgba([255, 0, 0, 255]);
+        let blue = image::Rgba([0, 0, 255, 255]);
+        let png = png_of(&image::RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 { red } else { blue }
+        }));
+        // A big-endian TIFF header and one entry: orientation (0x0112), a short, 6.
+        let exif: [u8; 26] = [
+            0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x01, 0x01, 0x12, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let crc = |bytes: &[u8]| {
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        };
+        let mut chunk = b"eXIf".to_vec();
+        chunk.extend_from_slice(&exif);
+        let mut turned = png[..33].to_vec();
+        turned.extend_from_slice(&(exif.len() as u32).to_be_bytes());
+        turned.extend_from_slice(&chunk);
+        turned.extend_from_slice(&crc(&chunk).to_be_bytes());
+        turned.extend_from_slice(&png[33..]);
+        let rows = picture_rows(&Picture::from_bytes(&turned), 60).expect("decoded");
+        let cells: Vec<(&str, Option<Color>, Option<Color>)> = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .map(|span| (span.content.as_ref(), span.style.fg, span.style.bg))
+            .collect();
+        assert_eq!(cells, vec![(
+            "▀",
+            Some(Color::Rgb(255, 0, 0)),
+            Some(Color::Rgb(0, 0, 255))
+        )]);
+    }
+
+    /// An image with nothing opaque enough to draw stands as its label, as one that will not
+    /// decode does, rather than as rows of nothing.
+    #[test]
+    fn a_picture_with_nothing_to_draw_is_its_label() {
+        let faint = Picture::from_bytes(&png_of(&image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([10, 20, 30, 64]),
+        )));
+        assert!(picture_rows(&faint, 60).is_none());
+        assert_eq!(faint.label(), "[image 4x4]");
+    }
+
+    /// An image whose pixels will not decode stands as its label, with the size its header states
+    /// when it states one.
+    #[test]
+    fn a_picture_that_will_not_decode_is_its_label() {
+        let bytes = png_of(&image::RgbaImage::from_pixel(
+            1280,
+            720,
+            image::Rgba([1, 2, 3, 255]),
+        ));
+        let cut = Picture::from_bytes(&bytes[..bytes.len() / 2]);
+        assert!(picture_rows(&cut, 60).is_none());
+        assert_eq!(cut.label(), "[image 1280x720]");
+        assert_eq!(Picture::from_bytes(b"not an image").label(), "[image]");
+    }
+
+    /// Scaling weighs each color by its opacity: an opaque color averaged with transparent pixels
+    /// keeps its hue, whatever color a transparent pixel stores, black or another, when a picture
+    /// is drawn and when its kept copy is shrunk, in its own pixel type, gray with opacity too.
+    #[test]
+    fn scaling_keeps_an_edge_against_transparency_its_color() {
+        let orange = image::Rgba([250, 180, 135, 255]);
+        let near = |got: &[u8], want: &[u8]| {
+            got.iter()
+                .zip(want)
+                .all(|(got, want)| got.abs_diff(*want) <= 2)
+        };
+        for clear in [image::Rgba([0, 0, 0, 0]), image::Rgba([0, 0, 255, 0])] {
+            let pixels = image::RgbaImage::from_fn(3, 3, |x, _| if x < 2 { orange } else { clear });
+            let drawn = scaled(
+                pixels.clone(),
+                (1, 1),
+                image::imageops::FilterType::Triangle,
+            );
+            let kept = shrunk(image::DynamicImage::ImageRgba8(pixels), (1, 1)).into_rgba8();
+            for (how, out) in [("drawn", drawn), ("kept", kept)] {
+                let pixel = out.get_pixel(0, 0);
+                assert!(pixel.0[3] > 0, "{clear:?} {how}: {pixel:?}");
+                assert!(
+                    near(&pixel.0[..3], &orange.0[..3]),
+                    "{clear:?} {how}: {pixel:?}"
+                );
+            }
+        }
+        let gray = image::LumaA([200u8, 255]);
+        let pixels =
+            image::GrayAlphaImage::from_fn(
+                3,
+                3,
+                |x, _| {
+                    if x < 2 { gray } else { image::LumaA([0, 0]) }
+                },
+            );
+        let kept = shrunk(image::DynamicImage::ImageLumaA8(pixels), (1, 1));
+        let image::DynamicImage::ImageLumaA8(kept) = kept else {
+            panic!("shrunk in its own type: {kept:?}");
+        };
+        let pixel = kept.get_pixel(0, 0);
+        assert!(
+            pixel.0[1] > 0 && near(&pixel.0[..1], &gray.0[..1]),
+            "{pixel:?}"
+        );
+    }
 
     fn plain(lines: &[Line<'static>]) -> Vec<String> {
         lines
@@ -1423,8 +2304,9 @@ mod tests {
             .collect()
     }
 
-    /// The approval's body is the call's arguments as a tree under its row, in the foreground:
-    /// the connectors are what is dimmed, the words the user is authorizing are not.
+    /// The approval's body is the call's arguments as a tree under its row, the program first
+    /// behind `$`, in the foreground: the connectors are what is dimmed, the words the user is
+    /// authorizing are not.
     #[test]
     fn the_approval_body_is_the_call_s_arguments_as_a_tree() {
         let input = serde_json::json!({"path": "a.txt", "content": "a"});
@@ -1442,6 +2324,12 @@ mod tests {
                 "the argument is in the foreground: {row:?}"
             );
         }
+        let command = serde_json::json!({"command": "make\nmake install", "timeout_ms": 5});
+        assert_eq!(plain(&approval_rows("shell_execute", &command, 40)), vec![
+            "  $ make",
+            "  │ make install",
+            "  └ timeout_ms: 5"
+        ]);
     }
 
     /// A loose list, whose items the source separates with blank lines, keeps its bullets and
@@ -1488,17 +2376,17 @@ mod tests {
         assert!(rows.iter().all(|row| display_width(row) <= 30), "{rows:?}");
     }
 
-    /// A code block is drawn as written whatever opens it: a `#` line in a tilde fence or in an
-    /// indented block is code, not a heading owed a blank row.
+    /// A code block is drawn as written whatever opens it, behind its shade's margin: a `#` line
+    /// in a tilde fence or in an indented block is code, not a heading owed a blank row.
     #[test]
     fn a_code_block_s_rows_are_drawn_as_written() {
         assert_eq!(
             plain(&markdown_lines("~~~sh\n# comment\necho hi\n~~~\n", 40)),
-            vec!["# comment", "echo hi"]
+            vec!["", " # comment", " echo hi", ""]
         );
         assert_eq!(
             plain(&markdown_lines("    # indented\n    echo\n", 40)),
-            vec!["# indented", "echo"]
+            vec!["", " # indented", " echo", ""]
         );
     }
 
@@ -1542,7 +2430,9 @@ mod tests {
             "   a later paragraph of the",
             "   item",
             "",
-            "   echo hi",
+            "",
+            "    echo hi",
+            "",
         ]);
     }
 
@@ -1684,18 +2574,26 @@ mod tests {
 
     /// A fenced block is highlighted by its language rather than painted flat, and the fence lines
     /// themselves are not shown as text.
-    /// A fenced row wider than the width folds at the width with every character kept: a code
-    /// line's spaces are content, so the fold is at a column and never at a space, and the
-    /// indentation stays on the first row.
+    /// A fenced row wider than the width folds inside its shade's margins with every character
+    /// kept: a code line's spaces are content, so the fold is at a column and never at a space,
+    /// and the indentation stays on the first row.
     #[test]
     fn a_fenced_row_wider_than_the_width_folds_at_a_column() {
         let source = format!("```bash\n    --flag={}\n```\n", "x".repeat(100));
         for lines in [markdown_lines(&source, 60), thinking_lines(&source, 60)] {
             let rows = plain(&lines);
-            assert_eq!(rows.len(), 2, "{rows:?}");
-            assert_eq!(rows[0].chars().count(), 60, "{rows:?}");
-            assert!(rows[0].starts_with("    --flag=xxx"), "{rows:?}");
-            assert_eq!(rows.concat(), format!("    --flag={}", "x".repeat(100)));
+            let [above, first, second, below] = rows.as_slice() else {
+                panic!("two rows between the shade's padding: {rows:?}");
+            };
+            assert!(above.is_empty() && below.is_empty(), "{rows:?}");
+            assert_eq!(first.chars().count(), 59, "{rows:?}");
+            assert!(first.starts_with("     --flag=xxx"), "{rows:?}");
+            assert_eq!(
+                [first, second]
+                    .map(|row| row.strip_prefix(' ').unwrap_or(row))
+                    .concat(),
+                format!("    --flag={}", "x".repeat(100))
+            );
         }
     }
 
@@ -1705,9 +2603,13 @@ mod tests {
     #[test]
     fn a_tab_is_four_columns_on_every_surface() {
         assert_eq!(plain(&markdown_lines("```go\n\tx := 1\n```\n", 60)), vec![
-            "    x := 1"
+            "",
+            "     x := 1",
+            ""
         ]);
-        assert_eq!(plain(&thinking_lines("```\n\ty\n```\n", 60)), vec!["    y"]);
+        assert_eq!(plain(&thinking_lines("```\n\ty\n```\n", 60)), vec![
+            "", "     y", ""
+        ]);
         let prose = plain(&markdown_lines("a\tb\n", 60));
         assert!(
             prose.iter().all(|row| !row.contains('\t')) && prose[0].contains("a    b"),
@@ -1720,8 +2622,10 @@ mod tests {
             "    p"
         ]);
         assert_eq!(plain(&command_rows("\tmake", "bash", 60)), vec!["    make"]);
-        let (diff, _) = diff_rows(None, "\tnew\n", 60);
-        let diff = plain(&diff);
+        let diff = plain(&change_rows(
+            &crate::conversation::Change::between(None, Some("\tnew\n")),
+            60,
+        ));
         assert!(
             diff.iter().any(|row| row.ends_with("+     new")) && !diff.concat().contains('\t'),
             "{diff:?}"
@@ -1750,13 +2654,39 @@ mod tests {
             .iter()
             .position(|row| row.contains("let x"))
             .expect("the code row");
-        assert_eq!(&rows[code - 2..=code + 2], &[
+        assert_eq!(&rows[code - 3..=code + 3], &[
             "Before.",
             "",
-            "let x = 1;",
+            "",
+            " let x = 1;",
+            "",
             "",
             "After."
         ]);
+        for (index, line) in lines.iter().enumerate() {
+            let shaded = line
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(CODE_BACKGROUND));
+            if (code - 1..=code + 1).contains(&index) {
+                assert!(
+                    shaded
+                        && line
+                            .spans
+                            .iter()
+                            .map(|span| display_width(&span.content))
+                            .sum::<usize>()
+                            == 60,
+                    "the block and a row above and below it are on the shade across the width: \
+                     {line:?}"
+                );
+            } else {
+                assert!(
+                    line.spans.iter().all(|span| span.style.bg.is_none()),
+                    "the prose around it is not: {line:?}"
+                );
+            }
+        }
     }
 
     /// Emphasis is weight, not hue: a bold word is bold in the plain foreground, an italic one
@@ -1833,12 +2763,12 @@ mod tests {
             )
         };
         for glyph in [
-            PROMPT_GLYPH,
-            SHELL_GLYPH,
+            COMPOSER_BAR,
             ACT_GLYPH,
             WARNING_GLYPH,
             ERROR_GLYPH,
-            CONNECTOR,
+            FOLDED_GLYPH,
+            OPENED_GLYPH,
             crate::host::tui::view::BACK_TO_BOTTOM,
         ] {
             assert!(
@@ -1949,7 +2879,7 @@ mod tests {
     }
 
     /// Reasoning is one gray throughout, code included, so it reads as a footnote beside the
-    /// answer.
+    /// answer: the terminal's dark gray, and on a code block's shade the gray it does not swallow.
     #[test]
     fn reasoning_is_gray_throughout() {
         let lines = thinking_lines("Some **thought**.\n\n```rust\nlet x = 1;\n```\n", 60);
@@ -1958,7 +2888,11 @@ mod tests {
                 if span.content.trim().is_empty() {
                     continue;
                 }
-                assert_eq!(span.style.fg, Some(Color::DarkGray), "{line:?}");
+                let gray = match span.style.bg {
+                    Some(CODE_BACKGROUND) => DIM_ON_SHADE,
+                    _ => Color::DarkGray,
+                };
+                assert_eq!(span.style.fg, Some(gray), "{line:?}");
             }
         }
     }
@@ -2041,11 +2975,27 @@ mod tests {
             vec!["one", "two", "three"],
             "three rows show whole"
         );
+        assert_eq!(
+            plain(&preview_rows(
+                rows(&["one", "two", "three", "four"]),
+                PREVIEW_ROWS
+            )),
+            vec!["one", "two", "three", "four"],
+            "a single row past the opening shows rather than taking a row to count"
+        );
         assert!(
             !plain(&preview_rows(rows(&["a", "", "b"]), PREVIEW_ROWS))
                 .iter()
                 .any(String::is_empty),
             "a preview never holds a blank row"
+        );
+        assert_eq!(
+            plain(&preview_rows(
+                rows(&["", " ", "after", "", "rest"]),
+                PREVIEW_ROWS
+            )),
+            vec!["after", "… +2 lines"],
+            "blank rows ahead of the result are not its first block"
         );
     }
 
@@ -2064,11 +3014,15 @@ mod tests {
         assert_eq!(counted, vec!["• Thinking · 820 tokens"]);
     }
 
-    /// A tool row is the name in the accent, then the summary dimmed; the brackets of the
-    /// write-once indicator are not on the screen.
+    /// A tool row is the name in the accent, then the summary as the caller styled it; an MCP
+    /// tool's server prefix is dimmed and its own name keeps the accent.
     #[test]
     fn a_tool_row_is_the_name_and_its_summary() {
-        let row = tool_row("file_read", Some("notes.txt"), None, None, 80);
+        let summary = vec![Span::styled(
+            "notes.txt".to_string(),
+            Style::default().fg(Color::Gray),
+        )];
+        let row = tool_row("file_read", summary, Vec::new(), 80);
         assert_eq!(plain(std::slice::from_ref(&row)), vec![
             "• file_read notes.txt"
         ]);
@@ -2077,49 +3031,53 @@ mod tests {
             Some(ACCENT),
             "the name takes the accent"
         );
+        assert_eq!(row.spans[3].style.fg, Some(Color::Gray));
         assert_eq!(
-            row.spans[3].style.fg,
-            Some(Color::DarkGray),
-            "the summary is dimmed"
+            plain(&[tool_row("schedule_list", Vec::new(), Vec::new(), 80)]),
+            vec!["• schedule_list"]
+        );
+        let mcp = tool_row("mcp__exa__web_search_exa", Vec::new(), Vec::new(), 80);
+        assert_eq!(plain(std::slice::from_ref(&mcp)), vec![
+            "• mcp__exa__web_search_exa"
+        ]);
+        assert_eq!(
+            (mcp.spans[1].content.as_ref(), mcp.spans[1].style.fg),
+            ("mcp__exa__", Some(Color::DarkGray)),
+            "the server prefix is dimmed: {mcp:?}"
         );
         assert_eq!(
-            plain(&[tool_row("schedule_list", None, None, None, 80)]),
-            vec!["• schedule_list"]
+            (mcp.spans[2].content.as_ref(), mcp.spans[2].style.fg),
+            ("web_search_exa", Some(ACCENT))
         );
     }
 
-    /// A shell command on a tool row is highlighted as code and, when it does not fit, elided
-    /// from the middle with both ends still styled; expanded, it is a block of its own behind
-    /// `$ `, wrapped whole.
+    /// A command on a tool row is its first line highlighted as code and, when it does not fit,
+    /// cut at the edge with the tag still whole after it; expanded, it is a block of its own,
+    /// wrapped whole.
     #[test]
     fn a_shell_command_is_highlighted_on_the_row_and_whole_under_it() {
         let command = "seq 1 5000 | grep -o 'survived' | sort | uniq -c | head -1";
-        let row = tool_row("shell_execute", Some(command), Some("bash"), None, 40);
+        let first = command_lines(command, "bash", 1, 48).remove(0).spans;
+        let row = tool_row("shell_execute", first, failure_tag(Some(2)), 48);
         let text = plain(std::slice::from_ref(&row)).remove(0);
         assert!(text.starts_with("• shell_execute seq 1 5000"), "{text:?}");
         assert!(
-            text.ends_with('…'),
-            "cut at the edge, never in the middle: {text:?}"
+            text.ends_with("…  exit 2"),
+            "cut at the edge, the tag after it: {text:?}"
         );
         assert_eq!(text.matches('…').count(), 1, "{text:?}");
-        assert!(
-            command.starts_with(
-                text.trim_start_matches("• shell_execute ")
-                    .trim_end_matches('…')
-            ),
-            "what shows is the opening of the command as written: {text:?}"
-        );
-        assert!(display_width(&text) <= 40, "{text:?}");
+        assert!(display_width(&text) <= 48, "{text:?}");
         assert!(
             row.spans
                 .iter()
                 .any(|span| span.content == "|" && span.style.fg == Some(Color::Indexed(4))),
             "the command is highlighted as code: {row:?}"
         );
-        let whole = tool_row("shell_execute", Some("ls -la"), Some("bash"), None, 80);
-        assert_eq!(plain(std::slice::from_ref(&whole)), vec![
-            "• shell_execute ls -la"
-        ]);
+        assert_eq!(
+            row.spans.last().map(|span| span.style.fg),
+            Some(Some(Color::Red)),
+            "the exit is red: {row:?}"
+        );
 
         let rows = command_rows(command, "bash", 30);
         let shown = plain(&rows);
@@ -2133,6 +3091,44 @@ mod tests {
         assert!(
             joined.contains("uniq -c | head -1"),
             "nothing is cut: {shown:?}"
+        );
+        let shown = plain(&command_lines(
+            "first line\nsecond\nthird\nfourth",
+            "bash",
+            2,
+            3,
+        ));
+        assert_eq!(
+            shown,
+            vec!["firs", "seco"],
+            "only the lines asked for are highlighted, each cut to a column past the width"
+        );
+        let quoted = "echo \"a string that runs past the edge\" ; ls\nls -la";
+        let style_of_second = |columns| -> Vec<Style> {
+            command_lines(quoted, "bash", 2, columns)
+                .remove(1)
+                .spans
+                .iter()
+                .map(|span| span.style)
+                .collect()
+        };
+        assert_eq!(
+            style_of_second(10),
+            style_of_second(usize::MAX),
+            "a line under one cut inside a string reads as it does under the whole line"
+        );
+        let dimmed = dim_front(
+            command_lines("cd /w && ls", "bash", 1, 40).remove(0).spans,
+            9,
+        );
+        let gray_part: String = dimmed
+            .iter()
+            .filter(|span| span.style.fg == Some(Color::DarkGray))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(
+            gray_part, "cd /w && ",
+            "what the front holds is dimmed and nothing after it: {dimmed:?}"
         );
     }
 
@@ -2189,18 +3185,139 @@ mod tests {
         );
     }
 
-    /// A change draws as a diff: the line before, the line taken out in red with its old number,
-    /// the line put in in green with its new number, the line after; two changes apart from each
-    /// other are two hunks set off by `…`; a file the call created is additions alone.
+    /// A row on a shade is shaded to the edge, and what is dimmed in the terminal's dark gray on
+    /// it is drawn in a gray the shade does not swallow.
+    #[test]
+    fn a_shaded_row_reaches_the_edge_in_a_gray_its_shade_does_not_swallow() {
+        let row = shaded_row(
+            Line::from(vec![
+                Span::styled("• ".to_string(), gray()),
+                Span::styled("ls".to_string(), Style::default().fg(ACCENT)),
+            ]),
+            RUN_BACKGROUND,
+            20,
+        );
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(display_width(&text), 20, "{row:?}");
+        assert!(
+            row.spans
+                .iter()
+                .all(|span| span.style.bg == Some(RUN_BACKGROUND)),
+            "{row:?}"
+        );
+        assert_eq!(row.spans[0].style.fg, Some(DIM_ON_SHADE));
+        assert_eq!(
+            row.spans[1].style.fg,
+            Some(ACCENT),
+            "a color of its own stays"
+        );
+        // A program's colored output ends each run with a reset, which is no background.
+        let reset = Style::reset();
+        let after_reset = shaded_row(
+            Line::from(Span::styled("plain".to_string(), reset)),
+            RUN_BACKGROUND,
+            20,
+        );
+        assert_eq!(after_reset.spans[0].style.bg, Some(RUN_BACKGROUND));
+        assert!(
+            is_blank(&Line::from(Span::styled("  ".to_string(), reset))),
+            "spaces after a reset are a blank line"
+        );
+        let picked = shaded_row(
+            Line::from("step").patch_style(Style::default().add_modifier(Modifier::REVERSED)),
+            RUN_BACKGROUND,
+            20,
+        );
+        assert!(
+            picked.style.add_modifier.contains(Modifier::REVERSED),
+            "the line's own style, a cursor's, stays: {picked:?}"
+        );
+        let palette_gray = shaded_row(
+            Line::from(Span::styled("dim", Style::default().fg(Color::Indexed(8)))),
+            RUN_BACKGROUND,
+            20,
+        );
+        assert_eq!(
+            palette_gray.spans[0].style.fg,
+            Some(DIM_ON_SHADE),
+            "a program's `38;5;8` is the same gray"
+        );
+        let emoji = shaded_row(Line::from("ok 👍🏽 👨‍👩‍👧"), RUN_BACKGROUND, 20);
+        assert_eq!(
+            emoji.spans.iter().map(Span::width).sum::<usize>(),
+            20,
+            "the shade reaches the edge as the frame measures the row: {emoji:?}"
+        );
+        let tinted = cut_line(
+            shaded_row(Line::from("x".repeat(30)), ADDED_BACKGROUND, 30),
+            10,
+        );
+        assert_eq!(
+            tinted.spans.last().and_then(|span| span.style.bg),
+            Some(ADDED_BACKGROUND),
+            "the ellipsis of a cut row keeps its tint: {tinted:?}"
+        );
+    }
+
+    /// A program's reset is kept as no style at all, so it undoes neither a shade nor the
+    /// cursor's reversal laid over its row.
+    #[test]
+    fn a_program_s_reset_is_no_style() {
+        let rows = ansi_lines("\x1b[31mred\x1b[0m plain", 40);
+        let plain = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("plain"))
+            .expect("the plain part");
+        assert_eq!(plain.style, Style::default(), "{rows:?}");
+    }
+
+    /// A collapsed change shows its first rows and counts the lines past them, the record's
+    /// left-out lines among them and the marks between hunks not; the rows shown never end on a
+    /// mark, and a single line past them is shown rather than counted.
+    #[test]
+    fn a_collapsed_change_counts_lines_not_marks() {
+        let old: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let new = old
+            .replace("line 2\n", "LINE 2\n")
+            .replace("line 19\n", "LINE 19\n");
+        let change = crate::conversation::Change::between(Some(&old), Some(&new));
+        assert_eq!(change.hunks.len(), 2);
+        let rows = plain(&change_preview(&change, 40, 4));
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert!(
+            !rows[3].ends_with('…'),
+            "no mark ends the rows shown: {rows:?}"
+        );
+        assert_eq!(rows[4], "… +4 lines", "the mark is not a line: {rows:?}");
+        let whole = plain(&change_preview(&change, 40, 8));
+        assert_eq!(
+            whole.len(),
+            9,
+            "a single line past the rows is shown: {whole:?}"
+        );
+        let at_the_mark = plain(&change_preview(&change, 40, 5));
+        assert_eq!(
+            at_the_mark.len(),
+            5,
+            "the rows shown stop short of the mark that would end them: {at_the_mark:?}"
+        );
+        assert_eq!(at_the_mark[4], "… +4 lines");
+    }
+
+    /// A change draws as a diff: the line before, the line taken out on a red tint with its old
+    /// number, the line put in on a green one with its new number, each tint across the width with
+    /// the number and sign in its light shade and the text in white, the line after untinted; two
+    /// changes apart from each other are two hunks set off by `…`; a file the call created is
+    /// additions alone.
     #[test]
     fn a_change_draws_as_a_numbered_diff() {
+        use crate::conversation::Change;
         let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
         let new = "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nTEN\nELEVEN\n";
-        let (rows, stat) = diff_rows(Some(old), new, 40);
-        assert_eq!(stat, DiffStat {
-            added: 3,
-            removed: 2
-        });
+        let change = Change::between(Some(old), Some(new));
+        assert_eq!((change.added, change.removed), (3, 2));
+        let rows = change_rows(&change, 40);
         assert_eq!(plain(&rows), vec![
             " 1   one",
             " 2 - two",
@@ -2212,17 +3329,42 @@ mod tests {
             "10 + TEN",
             "11 + ELEVEN",
         ]);
-        let removed = rows[1].spans.last().expect("the text");
-        assert_eq!(removed.style.fg, Some(Color::Red));
-        let added = rows[2].spans.last().expect("the text");
-        assert_eq!(added.style.fg, Some(Color::Green));
-        let (created, stat) = diff_rows(None, "a\nb\n", 40);
-        assert_eq!(stat, DiffStat {
-            added: 2,
-            removed: 0
-        });
-        assert_eq!(plain(&created), vec!["1 + a", "2 + b"]);
-        let row = tool_row("file_edit", Some("hello.py"), None, Some(stat), 80);
+        let tinted = |row: &Line<'static>, tint: Color, mark: Color| {
+            let [lead, text, rest] = row.spans.as_slice() else {
+                panic!("a lead, the text and the tint's run to the width: {row:?}");
+            };
+            assert_eq!(
+                row.spans
+                    .iter()
+                    .map(|span| display_width(&span.content))
+                    .sum::<usize>(),
+                40,
+                "{row:?}"
+            );
+            assert!(
+                row.spans.iter().all(|span| span.style.bg == Some(tint)),
+                "{row:?}"
+            );
+            assert_eq!(lead.style.fg, Some(mark), "{row:?}");
+            assert_eq!(text.style.fg, Some(WHITE), "{row:?}");
+            assert!(rest.content.trim().is_empty(), "{row:?}");
+        };
+        tinted(&rows[1], REMOVED_BACKGROUND, REMOVED_MARK);
+        tinted(&rows[2], ADDED_BACKGROUND, ADDED_MARK);
+        assert!(
+            rows[0].spans.iter().all(|span| span.style.bg.is_none()),
+            "a kept line is not tinted: {:?}",
+            rows[0]
+        );
+        let created = Change::between(None, Some("a\nb\n"));
+        assert_eq!((created.added, created.removed), (2, 0));
+        assert_eq!(plain(&change_rows(&created, 40)), vec!["1 + a", "2 + b"]);
+        let row = tool_row(
+            "file_edit",
+            vec![Span::raw("hello.py".to_string())],
+            change_tag(&created),
+            80,
+        );
         assert_eq!(plain(std::slice::from_ref(&row)), vec![
             "• file_edit hello.py  +2 -0"
         ]);
@@ -2275,8 +3417,8 @@ mod tests {
     }
 
     /// A call's row shows the one argument that identifies it: a supplied summary first, else
-    /// the primary parameter the built-in declares, joined when it is a list; an MCP tool has no
-    /// declared parameter and stays bare, and a blank summary is no summary.
+    /// the primary parameter the built-in declares, joined when it is a list, or an MCP tool's
+    /// first argument that reads as text; a blank summary is no summary.
     #[test]
     fn a_call_s_summary_is_the_argument_that_identifies_it() {
         let cases: [(&str, serde_json::Value, Option<&str>, Option<&str>); 6] = [
@@ -2302,7 +3444,7 @@ mod tests {
                 "mcp__ida__decompile",
                 serde_json::json!({"address": "0x1400"}),
                 None,
-                None,
+                Some("0x1400"),
             ),
             (
                 "file_read",
@@ -2326,7 +3468,7 @@ mod tests {
     #[test]
     fn a_forged_tool_name_cannot_leave_its_row() {
         let forged = "file_read\u{1b}[2J\u{1b}[1;1H";
-        let rows = plain(&[tool_row(forged, None, None, None, 80)]);
+        let rows = plain(&[tool_row(forged, Vec::new(), Vec::new(), 80)]);
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].contains('\u{1b}'), "{rows:?}");
         assert!(rows[0].contains("file_read"), "{rows:?}");

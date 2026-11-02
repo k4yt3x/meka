@@ -234,6 +234,9 @@ pub(super) struct LiveTurn {
     /// behind it, which is handed the turn's opening after the `turn.started` it is handed;
     /// `None` until it is published.
     pub(super) opening: Option<SseEvent>,
+    /// The permission level the turn opened under, which its row records; `None` until it has
+    /// opened.
+    pub(super) permission: Option<crate::permission::Permission>,
 }
 
 impl SessionFeed {

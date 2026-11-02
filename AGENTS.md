@@ -247,8 +247,14 @@ One word per concept, everywhere it is written or read:
   "Checklist: 2 open items, continuing, nudge 1 of 3", "Interrupted"); a line that opens with a
   number or an acronym keeps that. One that is a full sentence ends in a period ("Connected to
   'exa'."); one that is a fragment, or ends in a value, id, path or time, does not ("Profile set
-  to: work", "Finished at 14:43 after 1m 13s"). One wording per event, live and on a replay of
-  the log, so a resumed session reads as the live one did.
+  to: work", "Finished at 14:43 after 1m 13s"). On the interactive screen none ends in a period,
+  whatever its shape ("Connected to 'exa'", "No skills"): the screen's own strings are written
+  without one, and a row drawn from a sentence another surface shares (a notice, a stage
+  direction, an error, a compaction's headline) loses it through `draw::without_closing_period`.
+  One wording per event, live and on a replay of the log, so a resumed session reads as the live
+  one did. The live screen may say more than the log records, news as it happens such as a
+  checklist nudge's counts or how late a scheduled fire ran; the replay leaves that out and says
+  the rest in the same words, and a reload lets the live row go for the replay's.
 - A message the user reads (error, warning, notice, hint, help) says what happened and, when there
   is exactly one, the remedy: no examples, no alternatives, no explanation of internals, no
   second sentence that restates the first. One sentence where one suffices. A printed line stays

@@ -1266,6 +1266,7 @@ mod tests {
                         text: "file contents here".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];
@@ -1397,6 +1398,7 @@ mod tests {
                         text: "output: cch=00000".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];
@@ -3305,6 +3307,7 @@ mod tests {
                         text: "schema available".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];
@@ -3568,6 +3571,7 @@ mod tests {
                     text: "loaded".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         });
 
@@ -3757,6 +3761,7 @@ mod tests {
                         text: "hello world".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];
@@ -3788,6 +3793,7 @@ mod tests {
                         text: "hello world".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
             Message {
@@ -3806,6 +3812,7 @@ mod tests {
                         text: "1 /tmp/test.txt".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];
@@ -3877,6 +3884,7 @@ mod tests {
                             text: "data".to_string(),
                         }],
                         is_error: false,
+                        display: None,
                     }],
                 },
                 Message::assistant_text("Here's the file."),
@@ -4159,6 +4167,7 @@ mod tests {
                         text: format!("contents of file{i}"),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             });
         }
@@ -4215,6 +4224,7 @@ mod tests {
                         text: "file data".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];

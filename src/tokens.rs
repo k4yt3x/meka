@@ -286,6 +286,7 @@ mod tests {
                     },
                 }],
                 is_error: false,
+                display: None,
             }],
         };
         assert_eq!(

@@ -4929,6 +4929,7 @@ mod tests {
                     text: "ok".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         });
         let steered = Event::Append(Message {
@@ -4940,6 +4941,7 @@ mod tests {
                         text: "ok".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 },
                 ContentBlock::Text {
                     text: "and hurry".to_string(),

@@ -858,6 +858,7 @@ mod tests {
                             text: "giraffes everywhere in this file".to_string(),
                         }],
                         is_error: false,
+                        display: None,
                     }],
                 }),
                 None,
@@ -1165,6 +1166,7 @@ mod tests {
                         text: "a listing".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }]),
             ),
             (

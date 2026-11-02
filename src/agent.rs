@@ -981,6 +981,7 @@ mod tests {
                     text: "file contents".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         }
     }

@@ -31,8 +31,7 @@ pub(crate) fn short_task_id(task: &str) -> &str {
 
 /// A state an item sits in while it is on the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "String", into = "String")]
 pub(crate) enum ChecklistStatus {
     Pending,
     InProgress,
@@ -41,6 +40,9 @@ pub(crate) enum ChecklistStatus {
 }
 
 impl ChecklistStatus {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [ChecklistStatus; 3] = [Self::Pending, Self::InProgress, Self::Deferred];
+
     /// The state's one spelling, on every surface.
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -51,39 +53,101 @@ impl ChecklistStatus {
     }
 }
 
+impl std::fmt::Display for ChecklistStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ChecklistStatus {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|status| status.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a checklist state. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for ChecklistStatus {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ChecklistStatus> for String {
+    fn from(status: ChecklistStatus) -> Self {
+        status.name().to_string()
+    }
+}
+
+/// The HTTP API's schema for a state: a string, one of the spellings [`ChecklistStatus::name`]
+/// gives.
+#[cfg(feature = "serve")]
+impl utoipa::PartialSchema for ChecklistStatus {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .description(Some("A state an item sits in while it is on the list."))
+            .enum_values(Some(Self::ALL.map(Self::name)))
+            .into()
+    }
+}
+
+#[cfg(feature = "serve")]
+impl utoipa::ToSchema for ChecklistStatus {}
+
 /// What a model may set an item to: a state it then sits in, or a disposition that takes it off
 /// the list. The aliases are spellings a model emits for the same word, accepted so a near miss
 /// does not cost a round; meka writes one spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "String", into = "String")]
 pub(crate) enum StatusWord {
     Pending,
-    #[serde(
-        alias = "wip",
-        alias = "in-progress",
-        alias = "in progress",
-        alias = "started"
-    )]
     InProgress,
-    #[serde(
-        alias = "waiting",
-        alias = "blocked",
-        alias = "later",
-        alias = "paused"
-    )]
     Deferred,
-    #[serde(alias = "done", alias = "complete", alias = "finished")]
     Completed,
-    #[serde(
-        alias = "cancelled",
-        alias = "skipped",
-        alias = "dropped",
-        alias = "wontfix"
-    )]
     Canceled,
 }
 
 impl StatusWord {
+    /// The spellings a model emits for a word beside its own, each read as that word.
+    const ALIASES: [(&'static str, StatusWord); 15] = [
+        ("wip", Self::InProgress),
+        ("in-progress", Self::InProgress),
+        ("in progress", Self::InProgress),
+        ("started", Self::InProgress),
+        ("waiting", Self::Deferred),
+        ("blocked", Self::Deferred),
+        ("later", Self::Deferred),
+        ("paused", Self::Deferred),
+        ("done", Self::Completed),
+        ("complete", Self::Completed),
+        ("finished", Self::Completed),
+        ("cancelled", Self::Canceled),
+        ("skipped", Self::Canceled),
+        ("dropped", Self::Canceled),
+        ("wontfix", Self::Canceled),
+    ];
+    /// Every word, in the order a refusal lists them.
+    pub(crate) const ALL: [StatusWord; 5] = [
+        Self::Pending,
+        Self::InProgress,
+        Self::Deferred,
+        Self::Completed,
+        Self::Canceled,
+    ];
+
     /// The word's one spelling.
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -103,6 +167,46 @@ impl StatusWord {
             Self::Deferred => Some(ChecklistStatus::Deferred),
             Self::Completed | Self::Canceled => None,
         }
+    }
+}
+
+impl std::fmt::Display for StatusWord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for StatusWord {
+    type Err = String;
+
+    /// The word by its own spelling or an alias; refuses with the spellings meka writes.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .map(|word| (word.name(), *word))
+            .chain(Self::ALIASES)
+            .find(|(spelling, _)| *spelling == value)
+            .map(|(_, word)| word)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a status. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for StatusWord {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<StatusWord> for String {
+    fn from(word: StatusWord) -> Self {
+        word.name().to_string()
     }
 }
 
@@ -316,10 +420,7 @@ where
     D: serde::Deserializer<'de>,
 {
     crate::text::deserialize_blank_as_none(deserializer)?
-        .map(|word| {
-            StatusWord::deserialize(serde_json::Value::String(word.trim().to_string()))
-                .map_err(serde::de::Error::custom)
-        })
+        .map(|word| word.trim().parse().map_err(serde::de::Error::custom))
         .transpose()
 }
 
@@ -663,6 +764,64 @@ pub(crate) fn format_checklist(state: &ChecklistState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state and a status word each have one spelling, the one meka writes, and a word a model
+    /// emits for the same thing is read as it, never written.
+    #[test]
+    fn a_state_and_a_status_word_have_their_one_spelling() {
+        crate::text::assert_one_spelling(
+            &ChecklistStatus::ALL,
+            &["pending", "in_progress", "deferred"],
+            "done",
+            "pending, in_progress, deferred",
+        );
+        crate::text::assert_one_spelling(
+            &StatusWord::ALL,
+            &[
+                "pending",
+                "in_progress",
+                "deferred",
+                "completed",
+                "canceled",
+            ],
+            "abandoned",
+            "pending, in_progress, deferred, completed, canceled",
+        );
+        #[cfg(feature = "serve")]
+        assert_eq!(
+            serde_json::to_value(<ChecklistStatus as utoipa::PartialSchema>::schema())
+                .expect("schema")["enum"],
+            serde_json::json!(ChecklistStatus::ALL.map(ChecklistStatus::name)),
+            "the schema a client reads lists the spellings"
+        );
+        // Pinned, since a call the log recorded is read again on every replay of it.
+        let aliases = [
+            ("wip", "in_progress"),
+            ("in-progress", "in_progress"),
+            ("in progress", "in_progress"),
+            ("started", "in_progress"),
+            ("waiting", "deferred"),
+            ("blocked", "deferred"),
+            ("later", "deferred"),
+            ("paused", "deferred"),
+            ("done", "completed"),
+            ("complete", "completed"),
+            ("finished", "completed"),
+            ("cancelled", "canceled"),
+            ("skipped", "canceled"),
+            ("dropped", "canceled"),
+            ("wontfix", "canceled"),
+        ];
+        assert_eq!(StatusWord::ALIASES.len(), aliases.len());
+        for (alias, written) in aliases {
+            let word = alias.parse::<StatusWord>().expect("an alias");
+            assert_eq!(
+                serde_json::to_string(&word).expect("serialize"),
+                format!("\"{written}\""),
+                "{alias} is read as {written}, and written as it"
+            );
+        }
+    }
 
     fn items(texts: &[&str]) -> Vec<NewItem> {
         texts

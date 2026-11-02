@@ -518,6 +518,42 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_mark_an_unfinished_copy",
         step: Step::Rust(sessions_mark_an_unfinished_copy),
     },
+    // 0.88 records with a tool result what a screen draws of it beyond its words: how a command
+    // ended, the change a call made and the checklist it left. A build before it does not know
+    // the field and would drop it on a rewrite. Nothing to convert: a result written before
+    // records nothing, which is what a result with nothing more to show records.
+    Migration {
+        name: "tool_results_record_what_screens_draw",
+        step: Step::Sql(""),
+    },
+    // 0.88 records with a compaction boundary the rounds its checkpoint turn ran, which a screen
+    // shows under the compaction's row and a build before it would drop on a rewrite. Nothing to
+    // convert: a boundary written before records none, as one the summarizer wrote does.
+    Migration {
+        name: "compact_boundaries_record_their_checkpoint",
+        step: Step::Sql(""),
+    },
+    // 0.88 requires every boundary to carry the rounds its checkpoint ran. A boundary written
+    // before, the step above included, recorded none, which an empty list says.
+    Migration {
+        name: "compact_boundaries_record_an_empty_checkpoint",
+        step: Step::Rust(compact_boundaries_record_an_empty_checkpoint),
+    },
+    // 0.88 records on every turn the permission level it ran under, which a screen draws its
+    // prompt in. A turn written before is given the level the first of its user messages that
+    // names one told the model, else the level its session is at, else `read`.
+    Migration {
+        name: "turns_record_their_permission_level",
+        step: Step::Rust(turns_record_their_permission_level),
+    },
+    // 0.88 records with a compaction boundary the summary as it was written, which the screen and
+    // an editor show of the compaction in place of the message the boundary carries, where
+    // compaction writes its own sections after the summary. A boundary written before is given its
+    // message's text up to the first of those sections.
+    Migration {
+        name: "compact_boundaries_record_their_written_summary",
+        step: Step::Rust(compact_boundaries_record_their_written_summary),
+    },
 ];
 
 /// The column that marks a session whose copy is unfinished. Safe to replay: the column is added
@@ -1219,7 +1255,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 13_439_582_009_043_392_022;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 10_585_081_824_762_022_888;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2873,6 +2909,299 @@ fn record_compaction_0_84(event: &mut serde_json::Value) -> bool {
     changed
 }
 
+/// Give a `CompactBoundary` event the checkpoint rounds 0.88 records, where it has none, and
+/// report whether anything was added: an empty list, since a boundary written before recorded no
+/// rounds. A boundary already carrying the key keeps it, so a replay and a row in the new shape
+/// find nothing to do. The event is the externally tagged value both the store row and the
+/// archive hold.
+fn record_checkpoint_0_88(event: &mut serde_json::Value) -> bool {
+    let Some(boundary) = event
+        .get_mut("CompactBoundary")
+        .and_then(|boundary| boundary.as_object_mut())
+    else {
+        return false;
+    };
+    if boundary.contains_key("checkpoint") {
+        return false;
+    }
+    boundary.insert(
+        "checkpoint".to_string(),
+        serde_json::Value::Array(Vec::new()),
+    );
+    true
+}
+
+/// Every `compact_boundary` row takes the checkpoint 0.88 records; see
+/// [`record_checkpoint_0_88`].
+fn compact_boundaries_record_an_empty_checkpoint(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement = transaction
+            .prepare("SELECT id, content FROM messages WHERE kind = 'compact_boundary'")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, content) in rows {
+        let Ok(mut event) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if !record_checkpoint_0_88(&mut event) {
+            continue;
+        }
+        let encoded = match serde_json::to_string(&event) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Give a `CompactBoundary` event the summary as written 0.88 records, where it has none, and
+/// report whether anything was added: the text of its message after the prefix compaction writes,
+/// up to the first section compaction writes after the summary, and nothing for a message without
+/// the prefix. A summary that itself held one of those headings is cut there, which is the most a
+/// boundary written before says of it. A boundary already carrying the key keeps it. The event is
+/// the externally tagged value both the store row and the archive hold.
+fn record_written_summary_0_88(event: &mut serde_json::Value) -> bool {
+    let Some(boundary) = event
+        .get_mut("CompactBoundary")
+        .and_then(|boundary| boundary.as_object_mut())
+    else {
+        return false;
+    };
+    if boundary.contains_key("written_summary") {
+        return false;
+    }
+    let text = boundary
+        .get("summary")
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|blocks| {
+            blocks
+                .iter()
+                .find(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        })
+        .and_then(|block| block.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let written = written_summary_0_88(text).to_string();
+    boundary.insert("written_summary".to_string(), written.into());
+    true
+}
+
+/// The summary in the text of a message 0.88's compaction wrote, by the prefix and the section
+/// openings it writes, as they read then.
+fn written_summary_0_88(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("[Conversation summary from session compaction]") else {
+        return "";
+    };
+    let rest = rest.trim_start_matches('\n');
+    let end = [
+        "[Messages received, as written, oldest first]",
+        "[The request this turn is answering, as the user wrote it]",
+        "[Checklist]",
+        "[Post-compaction context]",
+        "[Continue the work directly from the summary above.",
+    ]
+    .iter()
+    .filter_map(|opening| rest.find(&format!("\n\n{opening}")))
+    .min()
+    .unwrap_or(rest.len());
+    rest.get(..end).unwrap_or(rest).trim_end()
+}
+
+/// Every `compact_boundary` row takes the summary as written 0.88 records; see
+/// [`record_written_summary_0_88`].
+fn compact_boundaries_record_their_written_summary(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement = transaction
+            .prepare("SELECT id, content FROM messages WHERE kind = 'compact_boundary'")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, content) in rows {
+        let Ok(mut event) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if !record_written_summary_0_88(&mut event) {
+            continue;
+        }
+        let encoded = match serde_json::to_string(&event) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// The column that records the level each turn ran under, and every turn written before it given
+/// the level [`level_in_blocks_0_88`] reads from the first of its own user messages that names one,
+/// else its session's, else `read`. A copy a compaction kept is not the turn's own: a compaction
+/// that runs before a turn opens writes the turns it keeps under that turn, ahead of its opening.
+/// Safe to replay: the column is added once, and only a turn with no level is given one.
+fn turns_record_their_permission_level(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "turns", "permission")? {
+        transaction.execute_batch("ALTER TABLE turns ADD COLUMN permission TEXT")?;
+    }
+    let turns: Vec<(String, Option<String>)> = {
+        let mut statement = transaction.prepare(
+            "SELECT t.id, s.permission FROM turns t LEFT JOIN sessions s ON s.id = t.session_id
+             WHERE t.permission IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if turns.is_empty() {
+        return Ok(());
+    }
+    // One pass over the messages, oldest first, since nothing indexes `messages.turn_id` and a
+    // lookup per turn reads the whole table once for each.
+    let unleveled: std::collections::HashSet<&str> =
+        turns.iter().map(|(turn, _)| turn.as_str()).collect();
+    let mut told: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT turn_id, content FROM messages
+             WHERE kind = 'user_blocks' AND turn_id IS NOT NULL AND copy_of IS NULL ORDER BY id",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let turn: String = row.get(0)?;
+            if !unleveled.contains(turn.as_str()) || told.contains_key(&turn) {
+                continue;
+            }
+            let content: String = row.get(1)?;
+            if let Some(level) = serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .and_then(|blocks| level_in_blocks_0_88(&blocks))
+            {
+                told.insert(turn, level);
+            }
+        }
+    }
+    let mut update = transaction.prepare("UPDATE turns SET permission = ?1 WHERE id = ?2")?;
+    for (turn, session_level) in &turns {
+        let level = told
+            .get(turn)
+            .copied()
+            .or_else(|| {
+                session_level
+                    .as_deref()
+                    .and_then(|level| LEVELS_0_88.iter().copied().find(|known| *known == level))
+            })
+            .unwrap_or("read");
+        update.execute(rusqlite::params![level, turn])?;
+    }
+    Ok(())
+}
+
+/// Every permission level 0.88 names.
+const LEVELS_0_88: [&str; 4] = ["none", "read", "workspace", "unrestricted"];
+
+/// The level the `[Permission context]` 0.88 writes into a turn's context block names, `read` from
+/// `Level: read.` on the line under the header.
+fn level_in_turn_context_0_88(text: &str) -> Option<&'static str> {
+    let after = text.split_once("[Permission context]\nLevel: ")?.1;
+    let word = after.split(['.', '\n']).next()?;
+    LEVELS_0_88.iter().copied().find(|level| *level == word)
+}
+
+/// The level the first context block among a user message's `blocks` names.
+fn level_in_blocks_0_88(blocks: &serde_json::Value) -> Option<&'static str> {
+    blocks
+        .as_array()?
+        .iter()
+        .filter(|block| {
+            block.get("type").and_then(serde_json::Value::as_str) == Some("turn_context")
+        })
+        .find_map(|block| block.get("text")?.as_str())
+        .and_then(level_in_turn_context_0_88)
+}
+
+/// Every turn of an archive's sessions takes the level 0.88 records, as the store's step gives
+/// it: the one the first of the turn's own user messages that names one told the model, else the
+/// session's, else `read`. Runs after [`link_kept_copies_0_87`], which names the copies a
+/// compaction kept, since those are not the turn's own.
+fn record_turn_levels_0_88(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        let session_level = session
+            .get("permission")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|level| LEVELS_0_88.iter().copied().find(|known| *known == level));
+        let told: std::collections::HashMap<String, &'static str> = session
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|event| {
+                let turn = event.get("turn_id")?.as_str()?;
+                if !event.get("copy_of").is_none_or(serde_json::Value::is_null) {
+                    return None;
+                }
+                let message = event.get("event")?.get("Append")?;
+                // A user message that holds no result, as the store's step reads the
+                // `user_blocks` rows.
+                if message.get("role")?.as_str()? != "user"
+                    || message.get("content")?.as_array()?.iter().any(|block| {
+                        block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+                    })
+                {
+                    return None;
+                }
+                Some((
+                    turn.to_string(),
+                    level_in_blocks_0_88(message.get("content")?)?,
+                ))
+            })
+            .rev()
+            .collect();
+        let Some(turns) = session
+            .get_mut("turns")
+            .and_then(|turns| turns.as_array_mut())
+        else {
+            continue;
+        };
+        for turn in turns {
+            if turn.get("permission").is_some() {
+                continue;
+            }
+            let level = turn
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| told.get(id).copied())
+                .or(session_level)
+                .unwrap_or("read");
+            if let Some(turn) = turn.as_object_mut() {
+                turn.insert("permission".to_string(), level.into());
+            }
+        }
+    }
+}
+
 /// Every `compact_boundary` row takes the record 0.84 writes; see [`record_compaction_0_84`].
 fn compact_boundaries_record_their_compaction(
     transaction: &rusqlite::Transaction<'_>,
@@ -3517,6 +3846,14 @@ const ARCHIVE_FORMAT_0_83: u64 = 15;
 const ARCHIVE_FORMAT_0_85: u64 = 16;
 /// The archive `format_version` 0.86 wrote, whose sealed reasoning names no endpoint.
 const ARCHIVE_FORMAT_0_86: u64 = 17;
+/// The archive `format_version` 0.87 wrote, whose tool results record nothing a screen draws.
+const ARCHIVE_FORMAT_0_87: u64 = 18;
+/// The archive `format_version` 0.88's development builds wrote before its turns recorded the
+/// permission level they ran under.
+const ARCHIVE_FORMAT_0_88_DEVELOPMENT: u64 = 19;
+/// The archive `format_version` 0.88's later development builds wrote, whose boundaries record
+/// their summary only inside the message they carry.
+const ARCHIVE_FORMAT_0_88_DEVELOPMENT_2: u64 = 20;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -4053,9 +4390,15 @@ pub(crate) fn bring_memory_file_forward(
 /// 0.76 gives an inbox item, a scheduled fire and a background report, by
 /// [`type_user_events_0_76`], in a repair's messages too and with a report naming only its
 /// tasks, by [`type_repairs_and_name_report_tasks_0_76`]. Every version before 0.79 then gives a
-/// spec from before 0.76 the two allow-list keys it lacks, by [`name_allow_lists_0_76`]. The three
-/// that recognize an old shape by a text block's opening words are gated on the format, since in a
-/// later archive those words can only be a person's.
+/// spec from before 0.76 the two allow-list keys it lacks, by [`name_allow_lists_0_76`]. Every
+/// version then takes the record 0.84 writes on a compaction's boundary, by
+/// [`record_compactions_0_84`], with the checkpoint and the written summary 0.88 adds to it, by
+/// [`record_checkpoints_0_88`] and [`record_written_summaries_0_88`]; no origin for its sealed
+/// reasoning, by [`name_sealed_origin_0_87`]; the links 0.87 gives the copies a compaction kept, by
+/// [`link_kept_copies_0_87`]; and the level 0.88 records on each turn, by
+/// [`record_turn_levels_0_88`], which reads those links. The three that recognize an old shape by
+/// a text block's opening words are gated on the format, since in a later archive those words
+/// can only be a person's.
 pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
     let from = document
         .get("format_version")
@@ -4091,7 +4434,10 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_78)
         | Some(ARCHIVE_FORMAT_0_83)
         | Some(ARCHIVE_FORMAT_0_85)
-        | Some(ARCHIVE_FORMAT_0_86) => {}
+        | Some(ARCHIVE_FORMAT_0_86)
+        | Some(ARCHIVE_FORMAT_0_87)
+        | Some(ARCHIVE_FORMAT_0_88_DEVELOPMENT)
+        | Some(ARCHIVE_FORMAT_0_88_DEVELOPMENT_2) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -4126,10 +4472,13 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         type_repairs_and_name_report_tasks_0_76(document);
     }
     record_compactions_0_84(document);
+    record_checkpoints_0_88(document);
+    record_written_summaries_0_88(document);
     // Where an archive's reasoning was sealed is not something the archive says, so none is named
     // and the block is sent nowhere.
     name_sealed_origin_0_87(document, &serde_json::Value::Null);
     link_kept_copies_0_87(document);
+    record_turn_levels_0_88(document);
     document["format_version"] = current.into();
     true
 }
@@ -4203,6 +4552,50 @@ fn record_compactions_0_84(document: &mut serde_json::Value) {
             for event in events {
                 if let Some(event) = event.get_mut("event") {
                     record_compaction_0_84(event);
+                }
+            }
+        }
+    }
+}
+
+/// [`record_checkpoint_0_88`] over every event of every session in an archive.
+fn record_checkpoints_0_88(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        {
+            for event in events {
+                if let Some(event) = event.get_mut("event") {
+                    record_checkpoint_0_88(event);
+                }
+            }
+        }
+    }
+}
+
+/// [`record_written_summary_0_88`] over every event of every session in an archive.
+fn record_written_summaries_0_88(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        {
+            for event in events {
+                if let Some(event) = event.get_mut("event") {
+                    record_written_summary_0_88(event);
                 }
             }
         }
@@ -5460,6 +5853,26 @@ mod tests {
                 2056776001206291594_u64,
             ),
             ("sessions_mark_an_unfinished_copy", 8368756446981473698_u64),
+            (
+                "tool_results_record_what_screens_draw",
+                7203346369074214339_u64,
+            ),
+            (
+                "compact_boundaries_record_their_checkpoint",
+                14423921668058135046_u64,
+            ),
+            (
+                "compact_boundaries_record_an_empty_checkpoint",
+                11206217433122002708_u64,
+            ),
+            (
+                "turns_record_their_permission_level",
+                1862092677876982260_u64,
+            ),
+            (
+                "compact_boundaries_record_their_written_summary",
+                17212040837895353316_u64,
+            ),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or
         /// as a constant it reads, whatever its visibility, with its text: an item the digest
@@ -9282,11 +9695,11 @@ mod tests {
         ));
     }
 
-    /// A 0.76 archive holds every shape the current one does but the verbatim reasoning a Chat
-    /// Completions endpoint's thinking block carries, so it is read as it is: nothing to convert,
-    /// and a replay changes nothing.
+    /// A 0.76 archive whose events hold no shape older than the current one takes the version
+    /// stamp and the link 0.87 gives every event, none for an event that copies nothing, and no
+    /// more.
     #[test]
-    fn a_format_11_archive_is_read_as_it_is() {
+    fn a_format_11_archive_takes_only_its_stamp_and_its_links() {
         let mut document = serde_json::json!({
             "format_version": 11,
             "meka_version": "0.76.0",
@@ -9347,10 +9760,10 @@ mod tests {
     }
 
     /// A 0.77 archive's turns carry every column but the cancel reason, which is optional on the
-    /// row too, so it is read as it is: a canceled turn comes back canceled by nobody in
-    /// particular.
+    /// row too, and the level, which a turn no opening names one for takes from its session: a
+    /// canceled turn comes back canceled by nobody in particular.
     #[test]
-    fn a_format_12_archive_is_read_as_it_is() {
+    fn a_format_12_archive_s_turns_take_only_a_level() {
         let mut document = serde_json::json!({
             "format_version": 12,
             "meka_version": "0.77.0",
@@ -9403,8 +9816,13 @@ mod tests {
         let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
         let mut before = document.clone();
         before["format_version"] = current.into();
+        // With no opening message to read a level from, the turn takes its session's.
+        before["sessions"][0]["turns"][0]["permission"] = "read".into();
         assert!(bring_archive_forward(&mut document, current));
-        assert_eq!(document, before, "nothing to convert but the version stamp");
+        assert_eq!(
+            document, before,
+            "nothing to convert but the version stamp and the turn's level"
+        );
         let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
             .expect("a 0.77 archive reads");
         let turn = &export.sessions[0].turns[0];
@@ -9413,9 +9831,10 @@ mod tests {
     }
 
     /// A format 13 archive's turns carry every column but the serving profile, which is optional
-    /// on the row too, so it is read as it is: every turn reads as the session's own profile's.
+    /// on the row too, and the level, which a turn no opening names one for takes from its
+    /// session: every turn reads as the session's own profile's.
     #[test]
-    fn a_format_13_archive_is_read_as_it_is() {
+    fn a_format_13_archive_s_turns_take_only_a_level() {
         let mut document = serde_json::json!({
             "format_version": 13,
             "meka_version": "0.78.0-dev",
@@ -9469,8 +9888,13 @@ mod tests {
         let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
         let mut before = document.clone();
         before["format_version"] = current.into();
+        // With no opening message to read a level from, the turn takes its session's.
+        before["sessions"][0]["turns"][0]["permission"] = "read".into();
         assert!(bring_archive_forward(&mut document, current));
-        assert_eq!(document, before, "nothing to convert but the version stamp");
+        assert_eq!(
+            document, before,
+            "nothing to convert but the version stamp and the turn's level"
+        );
         let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
             .expect("a format 13 archive reads");
         let turn = &export.sessions[0].turns[0];
@@ -9534,8 +9958,12 @@ mod tests {
         let mut connection = rusqlite::Connection::open(&path).expect("reopen");
         let after = stored_messages(&connection);
         assert_eq!(
-            after[1].1, recorded,
-            "a row carrying its record is untouched"
+            after[1].1,
+            recorded.replace(
+                r#""kept_recent":false}}"#,
+                r#""kept_recent":false,"checkpoint":[],"written_summary":""}}"#
+            ),
+            "a row carrying its record keeps it, and takes only what 0.88 records beside it"
         );
         assert_eq!(
             after[0].1,
@@ -9550,6 +9978,470 @@ mod tests {
             after,
             "a replay finds nothing left in the old shape"
         );
+    }
+
+    /// A boundary from before 0.88 takes an empty checkpoint, since it recorded no rounds, a
+    /// boundary that recorded its rounds keeps them, and a replay rewrites nothing. Through
+    /// `Store::open` and `load_events`, because the checkpoint is required at decode.
+    #[tokio::test]
+    async fn a_boundary_from_before_0_88_records_an_empty_checkpoint() {
+        use crate::conversation::Event;
+
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        let bare = r#"{"CompactBoundary":{"summary":{"role":"user","content":[{"type":"text","text":"s"}]},"replaced_count":2,"loaded_tools_snapshot":[],"checklist_snapshot":{"next_id":1,"items":[]},"trigger":"manual","source":"checkpoint","memories_written":["notes"],"kept_recent":true}}"#;
+        let recorded = r#"{"CompactBoundary":{"summary":{"role":"user","content":[{"type":"text","text":"s"}]},"replaced_count":2,"loaded_tools_snapshot":[],"checklist_snapshot":{"next_id":1,"items":[]},"trigger":"manual","source":"checkpoint","memories_written":[],"kept_recent":true,"checkpoint":[{"role":"assistant","content":[{"type":"text","text":"saving"}]}]}}"#;
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(
+                &mut connection,
+                "compact_boundaries_record_an_empty_checkpoint",
+            );
+            plant_session(&connection, &session);
+            plant_message_of_kind(&connection, &session, "compact_boundary", bare);
+            plant_message_of_kind(&connection, &session, "compact_boundary", recorded);
+        }
+
+        let store = crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+        let events = store
+            .load_events(session.parse().expect("a uuid"))
+            .await
+            .expect("load");
+        let rounds: Vec<usize> = events
+            .iter()
+            .map(|event| match event {
+                Event::CompactBoundary { record, .. } => record.checkpoint.len(),
+                other => panic!("every row is a boundary: {other:?}"),
+            })
+            .collect();
+        assert_eq!(rounds, vec![0, 1], "{events:?}");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let after = stored_messages(&connection);
+        let checkpoint = |content: &str| {
+            serde_json::from_str::<serde_json::Value>(content).expect("json")["CompactBoundary"]
+                ["checkpoint"]
+                .clone()
+        };
+        assert_eq!(
+            checkpoint(&after[1].1),
+            checkpoint(recorded),
+            "a recorded checkpoint is untouched"
+        );
+        assert_eq!(
+            after[0].1,
+            serde_json::to_string(&events[0]).expect("encodes"),
+            "the rewritten row is byte for byte what a 0.88 write produces"
+        );
+        let transaction = connection.transaction().expect("transaction");
+        compact_boundaries_record_an_empty_checkpoint(&transaction).expect("replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            after,
+            "a replay finds nothing left in the old shape"
+        );
+    }
+
+    /// A turn from before 0.88 records the level its opening message told the model; one whose
+    /// opening told none takes its session's level, and one on a session at a level meka does not
+    /// know takes `read`. A turn that recorded its level keeps it, and a replay changes nothing.
+    /// Through `Store::open` and `load_turns`, because the level is required at read.
+    #[tokio::test]
+    async fn a_turn_from_before_0_88_records_the_level_its_opening_told_the_model() {
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let sessions = [
+            ("told", "workspace", Some("unrestricted")),
+            ("quiet", "workspace", None),
+            ("unknown", "elevated", None),
+        ]
+        .map(|(name, level, told)| (name, uuid::Uuid::new_v4().to_string(), level, told));
+        let turns: Vec<String> = sessions
+            .iter()
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "turns_record_their_permission_level");
+            for ((_, session, level, told), turn) in sessions.iter().zip(&turns) {
+                plant_session(&connection, session);
+                connection
+                    .execute(
+                        "UPDATE sessions SET permission = ?1 WHERE id = ?2",
+                        rusqlite::params![level, session],
+                    )
+                    .expect("the session's level");
+                connection
+                    .execute(
+                        "INSERT INTO turns (id, session_id, source, started_at) \
+                         VALUES (?1, ?2, 'client', 'now')",
+                        rusqlite::params![turn, session],
+                    )
+                    .expect("a turn");
+                let opening = match told {
+                    Some(level) => serde_json::json!([
+                        {"type": "turn_context", "text": format!(
+                            "<context>\n[Permission context]\nLevel: {level}. Approvals: off.\n"
+                        )},
+                        {"type": "text", "text": "hi"},
+                    ]),
+                    None => serde_json::json!([{"type": "text", "text": "hi"}]),
+                };
+                connection
+                    .execute(
+                        "INSERT INTO messages (session_id, kind, content, created_at, turn_id) \
+                         VALUES (?1, 'user_blocks', ?2, 'now', ?3)",
+                        rusqlite::params![session, opening.to_string(), turn],
+                    )
+                    .expect("the turn's opening");
+                // A later message naming another level, the turn's own or one of no turn, is not
+                // the turn's opening.
+                let later = serde_json::json!([{"type": "turn_context", "text":
+                    "<context>\n[Permission context]\nLevel: none. Approvals: off.\n"}]);
+                connection
+                    .execute(
+                        "INSERT INTO messages (session_id, kind, content, created_at, turn_id) \
+                         VALUES (?1, 'user_blocks', ?2, 'now', ?3)",
+                        rusqlite::params![session, later.to_string(), told.map(|_| turn.as_str())],
+                    )
+                    .expect("a later message");
+            }
+        }
+
+        let store = crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+        let mut levels = Vec::new();
+        for (_, session, ..) in &sessions {
+            let turns = store
+                .turn_store()
+                .load_turns(session.parse().expect("a uuid"))
+                .await
+                .expect("load");
+            levels.extend(turns.into_iter().map(|turn| turn.permission));
+        }
+        use crate::permission::Permission;
+        assert_eq!(levels, vec![
+            Permission::Unrestricted,
+            Permission::Workspace,
+            Permission::Read
+        ]);
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let stored = |connection: &rusqlite::Connection| -> Vec<(String, String)> {
+            let mut statement = connection
+                .prepare("SELECT id, permission FROM turns ORDER BY id")
+                .expect("prepare");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let after = stored(&connection);
+        let transaction = connection.transaction().expect("transaction");
+        transaction
+            .execute("UPDATE sessions SET permission = 'none'", [])
+            .expect("move every session's level");
+        turns_record_their_permission_level(&transaction).expect("replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored(&connection),
+            after,
+            "a turn that records its level keeps it, whatever its session's is now"
+        );
+    }
+
+    /// A turn's level is read from its own messages: the copies of older turns a compaction kept
+    /// under it, ahead of its opening, are passed over, and so is a message of its own that names
+    /// none, for the first of its own that does.
+    #[test]
+    fn a_turn_s_level_is_read_from_its_own_messages_past_the_copies_a_compaction_kept() {
+        let mut connection = rusqlite::Connection::open_in_memory().expect("open");
+        connection
+            .execute_batch(BASELINE_0_42)
+            .expect("the baseline builds");
+        stopped_before(&mut connection, "turns_record_their_permission_level");
+        let session = uuid::Uuid::new_v4().to_string();
+        let (earlier, compacted) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        plant_session(&connection, &session);
+        for turn in [&earlier, &compacted] {
+            connection
+                .execute(
+                    "INSERT INTO turns (id, session_id, source, started_at) \
+                     VALUES (?1, ?2, 'client', 'now')",
+                    rusqlite::params![turn, session],
+                )
+                .expect("a turn");
+        }
+        let context = |level: &str| {
+            serde_json::json!([
+                {"type": "turn_context", "text": format!(
+                    "<context>\n[Permission context]\nLevel: {level}. Approvals: off.\n"
+                )},
+                {"type": "text", "text": "hi"},
+            ])
+            .to_string()
+        };
+        let insert = |turn: &str, content: String, copy_of: Option<i64>| {
+            connection
+                .execute(
+                    "INSERT INTO messages (session_id, kind, content, created_at, turn_id, \
+                     copy_of) VALUES (?1, 'user_blocks', ?2, 'now', ?3, ?4)",
+                    rusqlite::params![session, content, turn, copy_of],
+                )
+                .expect("a message");
+            connection.last_insert_rowid()
+        };
+        let original = insert(&earlier, context("none"), None);
+        insert(&compacted, context("none"), Some(original));
+        insert(
+            &compacted,
+            serde_json::json!([{"type": "image", "source": {"type": "blob", "hash": "h"}}])
+                .to_string(),
+            None,
+        );
+        insert(&compacted, context("workspace"), None);
+        let transaction = connection.transaction().expect("transaction");
+        turns_record_their_permission_level(&transaction).expect("the step runs");
+        let level: String = transaction
+            .query_row(
+                "SELECT permission FROM turns WHERE id = ?1",
+                [&compacted],
+                |row| row.get(0),
+            )
+            .expect("the turn's level");
+        assert_eq!(level, "workspace");
+    }
+
+    /// A boundary from before 0.88 records the summary its message holds, up to the first section
+    /// compaction writes after it; a message without the prefix records none, a boundary that
+    /// records its summary keeps it, and a replay rewrites nothing. Through `Store::open` and
+    /// `load_events`, because the summary is required at decode.
+    #[tokio::test]
+    async fn a_boundary_from_before_0_88_records_the_summary_its_message_holds() {
+        use crate::conversation::Event;
+
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        let boundary = |text: &str, written: Option<&str>| {
+            let mut event = serde_json::json!({"CompactBoundary": {
+                "summary": {"role": "user", "content": [{"type": "text", "text": text}]},
+                "replaced_count": 2,
+                "loaded_tools_snapshot": [],
+                "checklist_snapshot": {"next_id": 1, "items": []},
+                "trigger": "manual",
+                "source": "checkpoint",
+                "memories_written": [],
+                "kept_recent": true,
+                "checkpoint": [],
+            }});
+            if let Some(written) = written {
+                event["CompactBoundary"]["written_summary"] = written.into();
+            }
+            event.to_string()
+        };
+        let composed = "[Conversation summary from session compaction]\n\nWhat was done.\n\n\
+                        [Checklist]\n\n1. [ ] more\n\n[Continue the work directly from the \
+                        summary above. Do not acknowledge or recap this summary.]";
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(
+                &mut connection,
+                "compact_boundaries_record_their_written_summary",
+            );
+            plant_session(&connection, &session);
+            for content in [
+                boundary(composed, None),
+                boundary("a message of another shape", None),
+                boundary(composed, Some("as written\n\n[Checklist]")),
+            ] {
+                plant_message_of_kind(&connection, &session, "compact_boundary", &content);
+            }
+        }
+
+        let store = crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+        let events = store
+            .load_events(session.parse().expect("a uuid"))
+            .await
+            .expect("load");
+        let written: Vec<&str> = events
+            .iter()
+            .map(|event| match event {
+                Event::CompactBoundary { record, .. } => record.written_summary.as_str(),
+                other => panic!("every row is a boundary: {other:?}"),
+            })
+            .collect();
+        assert_eq!(written, vec![
+            "What was done.",
+            "",
+            "as written\n\n[Checklist]"
+        ]);
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let after = stored_messages(&connection);
+        let transaction = connection.transaction().expect("transaction");
+        compact_boundaries_record_their_written_summary(&transaction).expect("replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            after,
+            "a replay finds nothing left in the old shape"
+        );
+    }
+
+    /// A format 20 archive's boundaries record their summary only inside their message, so each
+    /// takes the summary that message holds, and a replay over the converted archive changes
+    /// nothing.
+    #[test]
+    fn a_format_20_archive_gives_each_boundary_the_summary_its_message_holds() {
+        let mut document = serde_json::json!({
+            "format_version": 20,
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "permission": "read",
+                "turns": [],
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "turn_id": null,
+                    "copy_of": null,
+                    "event": {"CompactBoundary": {
+                        "summary": {"role": "user", "content": [{"type": "text", "text":
+                            "[Conversation summary from session compaction]\n\nDone so far.\n\n\
+                             [Post-compaction context]\n\nnow"}]},
+                        "replaced_count": 2,
+                        "loaded_tools_snapshot": [],
+                        "checklist_snapshot": {"next_id": 1, "items": []},
+                        "trigger": "manual",
+                        "source": "checkpoint",
+                        "memories_written": [],
+                        "kept_recent": false,
+                        "checkpoint": [],
+                    }},
+                }],
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(
+            document["sessions"][0]["events"][0]["event"]["CompactBoundary"]["written_summary"],
+            "Done so far."
+        );
+        // A boundary that records its summary keeps it, whatever its message holds.
+        document["sessions"][0]["events"][0]["event"]["CompactBoundary"]["written_summary"] =
+            "as written".into();
+        let converted = document.clone();
+        record_written_summaries_0_88(&mut document);
+        assert_eq!(document, converted, "a replay changes nothing");
+    }
+
+    /// A format 19 archive's turns record no level, so each takes the one its opening event told
+    /// the model, else its session's, and a replay over the converted archive changes nothing. A
+    /// copy a compaction kept under a turn, and a message of results, are not its opening.
+    #[test]
+    fn a_format_19_archive_gives_each_turn_the_level_its_opening_told() {
+        let session = "11111111-1111-4111-8111-111111111111";
+        let told = "22222222-2222-4222-8222-222222222222";
+        let quiet = "33333333-3333-4333-8333-333333333333";
+        let kept = "44444444-4444-4444-8444-444444444444";
+        let turn = |id: &str| {
+            serde_json::json!({
+                "id": id, "source": "client", "started_at": "2020-01-01T00:00:00Z",
+                "ended_at": null, "status": null, "stop_reason": null, "error_type": null,
+                "detail": null, "cancel_reason": null, "profile": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+            })
+        };
+        let mut document = serde_json::json!({
+            "format_version": 19,
+            "sessions": [{
+                "id": session,
+                "permission": "unrestricted",
+                "turns": [turn(told), turn(quiet), turn(kept)],
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "turn_id": told,
+                    "copy_of": null,
+                    "event": {"Append": {"role": "user", "content": [
+                        {"type": "turn_context",
+                         "text": "<context>\n[Permission context]\nLevel: workspace.\n"},
+                        {"type": "text", "text": "hi"},
+                    ]}},
+                }, {
+                    // Not a user message, which is all the store's step reads a level from.
+                    "at": "2020-01-01T00:00:01Z",
+                    "turn_id": quiet,
+                    "copy_of": null,
+                    "event": {"Append": {"role": "assistant", "content": [
+                        {"type": "turn_context",
+                         "text": "<context>\n[Permission context]\nLevel: none.\n"},
+                    ]}},
+                }, {
+                    // Results, which the store keeps as rows of their own.
+                    "at": "2020-01-01T00:00:02Z",
+                    "turn_id": quiet,
+                    "copy_of": null,
+                    "event": {"Append": {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": [], "is_error": false},
+                        {"type": "turn_context",
+                         "text": "<context>\n[Permission context]\nLevel: none.\n"},
+                    ]}},
+                }, {
+                    // The first turn's opening, kept by the compaction that opened the third.
+                    "at": "2020-01-01T00:00:03Z",
+                    "turn_id": kept,
+                    "copy_of": 0,
+                    "event": {"Append": {"role": "user", "content": [
+                        {"type": "turn_context",
+                         "text": "<context>\n[Permission context]\nLevel: workspace.\n"},
+                        {"type": "text", "text": "hi"},
+                    ]}},
+                }, {
+                    "at": "2020-01-01T00:00:04Z",
+                    "turn_id": kept,
+                    "copy_of": null,
+                    "event": {"Append": {"role": "user", "content": [
+                        {"type": "turn_context",
+                         "text": "<context>\n[Permission context]\nLevel: read.\n"},
+                        {"type": "text", "text": "again"},
+                    ]}},
+                }],
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let levels: Vec<&str> = document["sessions"][0]["turns"]
+            .as_array()
+            .expect("turns")
+            .iter()
+            .map(|turn| turn["permission"].as_str().expect("a level"))
+            .collect();
+        assert_eq!(levels, vec!["workspace", "unrestricted", "read"]);
+        // A turn that records its level keeps it, whatever its opening told the model.
+        document["sessions"][0]["turns"][0]["permission"] = "none".into();
+        let converted = document.clone();
+        record_turn_levels_0_88(&mut document);
+        assert_eq!(document, converted, "a replay changes nothing");
     }
 
     /// A format 15 archive's boundaries record nothing about their compaction, so each takes the
@@ -9607,6 +10499,7 @@ mod tests {
         assert_eq!(boundary["source"], "checkpoint");
         assert_eq!(boundary["memories_written"], serde_json::json!([]));
         assert_eq!(boundary["kept_recent"], true);
+        assert_eq!(boundary["checkpoint"], serde_json::json!([]));
         let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
             .expect("a format 15 archive reads");
         assert_eq!(export.sessions[0].events.len(), 1);

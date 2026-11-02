@@ -1268,36 +1268,41 @@ max_redirects = 0
 
 ## `[display]`
 
-Settings for the interactive screen: the two rows it composes, the session id lines, what Enter
-does while a turn runs, the mouse, and `stream`, which also decides how a one-shot run asks the
-provider.
+Settings for the interactive screen: the two rows it composes, whether finished steps fold, the
+session id lines, what Enter does while a turn runs, the mouse, and `stream`, which also decides how
+a one-shot run asks the provider.
 
 ### `display.status_row`
 
-What the status row under the composer shows after the permission level, which always opens it,
-in the order listed:
+Which facts the status row under the composer shows, each in its place and, within it, in the order
+listed. On the left, after the permission level, which always opens the row, the profile and the
+model say what the next prompt goes under, and the path and the project where the session works;
+the context gauge and the running work stand against the right edge.
 
 - `path`: the session's working directory, shortened with `~`
 - `project`: the [project](../usage/projects.md) the session is on, by name, while it is on one
 - `profile`: the profile the session runs on, by name
 - `model`: the model the profile runs, when the config names one; off by default, since a profile
   named for its model would show it twice
-- `context`: the live context-window gauge, e.g. `128.4k/1.0M 13%` (tokens in context / model
-  window / percent used), the same value `/status` shows on its `Context:` line; shown from the
-  start at `0/<window> 0%`, omitted only while the window is unknown
+- `context`: the live context-window gauge, e.g. `128.4k / 1.0M (13%)` (tokens in context / model
+  window, and the share used), the same figures `/status` shows on its `Context:` line; shown from
+  the start at `0 / <window> (0%)`, omitted only while the window is unknown
 - `tasks`: `2 background tasks`, while any run
 - `subagents`: `1 sub-agent`, while any run
 
-A hint (`copied 3 rows`, `the question was withdrawn`) sits at the right edge whatever the
-list says, and an empty list leaves the row to the hints. A word that is not one of these is
-refused by name.
+A hint (`Copied 3 rows`, `The question was withdrawn`) takes the status row's right side while it
+stands, whatever the list says. Where the row is narrow, the level stays whole and the readings give
+way to it, each shown whole or not at all, from the last, since a reading cut short reads as another
+number; the facts after the level give way from the last too: the one that no longer fits is cut
+(a path from its start), or dropped when too little of it would show. A word that is not one of
+these, or one listed twice, is refused by name.
 
 ```toml
 [display]
 status_row = ["profile", "context"]
 ```
 
-Default: `["path", "project", "profile", "context", "tasks", "subagents"]`
+Default: `["profile", "path", "project", "context", "tasks", "subagents"]`
 
 ### `display.turn_end_summary`
 
@@ -1316,7 +1321,7 @@ The row reads as one sentence whose first word says how the turn ended:
 ```
 
 A fact with nothing to say is left out. An empty list draws no row. A word that is not one of
-these is refused by name. On a resumed session every recorded turn closes with the same row, read
+these, or one listed twice, is refused by name. On a resumed session every recorded turn closes with the same row, read
 from the store, so a scrollback says when each turn ended. A one-shot run prints none; `--format
 json` carries the turn's usage.
 
@@ -1331,6 +1336,22 @@ turn_end_summary = ["time", "duration", "usage"]
 
 Default: `["time", "duration"]`
 
+### `display.fold_steps`
+
+Whether the interactive screen folds a run of thinking and tool calls into one row, such as
+`▸ Thought twice, ran 3 commands, read a file`, once the agent writes something after it or its turn
+ends. Changes to files, memories and skills, and `agent_spawn` and `agent_followup` calls, never
+fold. Ctrl+O opens every run, with every call expanded, until it is pressed again. With `false`,
+every run starts open and still folds when you click its row. See
+[Folded steps](../usage/interactive-mode.md#folded-steps).
+
+Default: `true`
+
+```toml
+[display]
+fold_steps = false
+```
+
 ### `display.show_session_id_on_create`
 
 Whether the screen shows the session id when a new session is created.
@@ -1339,9 +1360,9 @@ Default: `false`
 
 ### `display.show_session_id_on_resume`
 
-Whether the screen shows the session id when a session is resumed with `-c` or `-r`.
+Whether the screen shows the session id when a session is resumed with `-c`, `-r` or `/resume`.
 
-Default: `true`
+Default: `false`
 
 ### `display.show_session_id_on_exit`
 
@@ -1355,7 +1376,7 @@ A one-shot run prints no session id whatever these say: `--format json` carries 
 ```toml
 [display]
 show_session_id_on_create = true
-show_session_id_on_resume = false
+show_session_id_on_resume = true
 show_session_id_on_exit = false
 ```
 
@@ -1387,6 +1408,21 @@ Default: `true`
 ```toml
 [display]
 mouse = false
+```
+
+### `display.wheel_rows`
+
+How many rows the transcript, or a panel under the pointer, moves for each wheel event the terminal
+sends. The terminal already decides how many events one notch of the wheel sends: Ghostty sends
+three, a trackpad sends one per few pixels, and VS Code's terminal sends one, so one row per event
+follows what the terminal meant. Raise it if your terminal sends one event per notch and scrolling
+feels slow. `0` is refused at startup.
+
+Default: `1`
+
+```toml
+[display]
+wheel_rows = 3
 ```
 
 ### `display.stream`

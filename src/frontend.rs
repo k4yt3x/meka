@@ -391,6 +391,13 @@ pub(crate) enum FrontendEvent {
     SessionStarted { id: Uuid },
     /// The agent is about to start a turn, under the id its row and every event about it carry.
     TurnStarted { turn_id: Uuid },
+    /// The turn opens, under the permission level its context block tells the model and its row
+    /// records: the level a surface draws the turn's messages in, the ones that join it later
+    /// included. Emitted once the opening is built, whether or not its writes succeeded, since
+    /// the model is told the level either way.
+    TurnOpened {
+        permission: crate::permission::Permission,
+    },
     /// The turn ended, however it ended, with what its row records. Emitted for every turn that
     /// began, after `TurnFinished` on a turn that succeeded; a frontend that renders a turn's
     /// terminal reads it here rather than inferring one.
@@ -407,6 +414,14 @@ pub(crate) enum FrontendEvent {
     /// ahead of the host's terminal event, so a client that resends can be told whether the
     /// conversation still holds the copy it sent.
     PromptWithdrawn,
+    /// Inbox items added to a message the conversation holds already, as the blocks the model
+    /// reads them in, where they land: behind a round's results or a nudge, ahead of the next
+    /// request, or behind the prompt an interrupt cut the answer to. An item that rides a message
+    /// appended whole, a turn's opening or one an interrupt appends, is announced with it
+    /// ([`Self::MessageAppended`]), and every item is reported read by [`Self::InboxDelivered`].
+    InboxAppended {
+        blocks: Vec<crate::conversation::ContentBlock>,
+    },
     /// Inbox items the model has now been shown: the provider accepted a request carrying their
     /// text. Emitted at that request rather than when the text was appended, so whoever enqueued
     /// an item learns when it was read and not merely written down.
@@ -498,8 +513,8 @@ pub(crate) enum FrontendEvent {
     /// frontends use it to correlate this announcement with the matching
     /// [`Self::ToolCallCompleted`]. `display_summary` is the agent-resolved primary argument for
     /// display (e.g. the path for `file_read`, the command for `shell_execute`), pre-computed via
-    /// [`crate::tools::resolve_primary_param`] so frontends don't need the tool's JSON Schema to
-    /// render the indicator. `None` means "no obvious primary arg". Render the bare tool name.
+    /// [`crate::tools::resolve_primary_param`] so every frontend shows the same argument. `None`
+    /// means "no obvious primary arg". Render the bare tool name.
     ToolCallStarted {
         id: String,
         name: String,
@@ -520,6 +535,9 @@ pub(crate) enum FrontendEvent {
         /// entry populate [`ToolOutputMetadata::Diff`] so a frontend can draw the change. `None`
         /// for tools that have nothing extra.
         metadata: Option<ToolOutputMetadata>,
+        /// What the call's result records for a screen to draw, made once where the result is
+        /// recorded, so a screen draws the call live as a replay of the log draws it.
+        display: Option<crate::conversation::ResultDisplay>,
     },
     /// Output a still-running tool has produced so far, as it arrives. `id` matches the
     /// [`Self::ToolCallStarted`] `id`. Only `shell_execute` emits these today: a build or a test
@@ -597,8 +615,6 @@ pub(crate) enum FrontendEvent {
         replaced_count: usize,
         /// Which compaction this was, counting from 1.
         generation: u64,
-        /// The summary as the model wrote it, without the sections meka adds around it.
-        summary: String,
     },
     /// The compaction that began under `id` ended without replacing the window. `interrupted`
     /// when the user stopped it; otherwise `error` says what went wrong.
@@ -633,6 +649,29 @@ pub(crate) enum ToolOutputMetadata {
         exit_code: Option<i32>,
         signal: Option<String>,
     },
+}
+
+impl ToolOutputMetadata {
+    /// What the log records of this for a screen to draw again: a change as its diff, and the code
+    /// a command exited with when it was not 0. A signal or a timeout records no code, since the
+    /// result's words say how the command ended.
+    pub(crate) fn display(&self) -> crate::conversation::ResultDisplay {
+        match self {
+            Self::Diff {
+                old_text, new_text, ..
+            } => crate::conversation::ResultDisplay {
+                change: Some(crate::conversation::Change::between(
+                    old_text.as_deref(),
+                    new_text.as_deref(),
+                )),
+                ..Default::default()
+            },
+            Self::CommandExit { exit_code, .. } => crate::conversation::ResultDisplay {
+                exit_code: exit_code.filter(|code| *code != 0),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 /// Round-trip request for tool-call approval.
@@ -1296,7 +1335,7 @@ mod tests {
     async fn tool_call_started_carries_resolved_display_summary() {
         let recorder = RecordingFrontend::new();
         let input = serde_json::json!({"path": "/etc/hosts"});
-        let display_summary = crate::tools::resolve_primary_param("file_read", &input, None);
+        let display_summary = crate::tools::resolve_primary_param("file_read", &input);
         assert_eq!(display_summary.as_deref(), Some("/etc/hosts"));
         recorder
             .emit(FrontendEvent::ToolCallStarted {

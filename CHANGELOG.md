@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.88.0] - 2026-11-02
+
+### Added
+
+- The screen folds each finished run of thinking and tool calls into one row; `display.fold_steps`.
+- The screen draws an image sent with a prompt as a picture in colored half-block characters.
+- Every turn records the permission level it ran under; HTTP turns carry it as `permission`.
+
+### Changed
+
+- A call's row shows a command's first lines, a path from the working directory and how it failed.
+- An MCP call is shown by its first text argument on screen, in editors and in approval prompts.
+- A compaction on the screen is a `→← Context compacted` rule that opens to its steps and summary.
+- The screen is restyled: shaded code blocks, tinted diffs, and a level-colored bar on prompts.
+- Copying from the screen leaves out the gutter and copies a folded code line as one line.
+- The wheel scrolls one row per event the terminal sends, not three; `display.wheel_rows`.
+- The status row shows the level, profile, path, project and readings; `display.status_row`.
+- The session id is no longer shown on a resume unless `display.show_session_id_on_resume`.
+- **Breaking:** `display.status_row` and `display.turn_end_summary` refuse a fact listed twice.
+- Session archives are `format_version` 21; a 0.87 archive is read as it is.
+
+### Fixed
+
+- A resumed session draws calls, messages, reports and checklists as the live session did.
+- An editor reopening a session sees a compaction's summary, not meka's directions to the model.
+- Another client's message that arrives mid-turn shows on the screen and in editors.
+- `/resume` leaves nothing of the previous session: its rows, scheduled fires or reports.
+- `/rewind` and `/fork` no longer repeat stage directions or drop a `!command` or a followup.
+- A steer or a call cut off by the end of its turn no longer shows as waiting or running.
+- A provider that reuses call ids no longer has one call's result shown on another's row.
+- A phone photo reaches the model upright when meka shrinks or converts it.
+- Pasting a large image or reading the clipboard no longer freezes the screen.
+- Copying wide characters from the screen no longer puts a space after each.
+
 ## [0.87.0] - 2026-10-31
 
 ### Added
@@ -3068,7 +3102,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.87.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.88.0...HEAD
+[0.88.0]: https://github.com/k4yt3x/meka/compare/0.87.0...0.88.0
 [0.87.0]: https://github.com/k4yt3x/meka/compare/0.86.0...0.87.0
 [0.86.0]: https://github.com/k4yt3x/meka/compare/0.85.0...0.86.0
 [0.85.0]: https://github.com/k4yt3x/meka/compare/0.84.0...0.85.0

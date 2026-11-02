@@ -31,7 +31,7 @@ add more later and switch with `meka profile use <name>` or the per-run `--profi
 
 ## 2. Start using meka
 
-After setup, run `meka`. The screen opens on the conversation, with a composer at the bottom and a status row under it that opens with the permission level: **read** by default. The agent can read files, search, and run shell commands in a sandbox that blocks writes. It cannot modify your files.
+After setup, run `meka`. The screen opens on the conversation, with a composer at the bottom, a bar down its left edge in the permission level's color, and a status row under it that opens with the level: **read** by default. The agent can read files, search, and run shell commands in a sandbox that blocks writes. It cannot modify your files.
 
 ## 3. Ask it something
 

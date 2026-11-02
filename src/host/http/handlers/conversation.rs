@@ -896,7 +896,11 @@ pub(crate) async fn turn(
         .read()
         .await
         .get(&id)
-        .and_then(|entry| entry.frontend.in_flight_turn())
+        .and_then(|entry| {
+            entry
+                .frontend
+                .in_flight_turn(entry.agent.cells().permission.get())
+        })
         .filter(|turn| turn.id == turn_id);
     live.map(Json).ok_or_else(|| {
         ProblemDetail::new(

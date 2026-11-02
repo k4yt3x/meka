@@ -102,7 +102,7 @@ pub(crate) fn classify_bytes(bytes: &[u8]) -> ImageHandling {
 /// screenshot or diagram.
 const MAX_DECODE_ALLOC_BYTES: usize = 128 * crate::text::MIB;
 
-/// Decode image bytes under [`MAX_DECODE_ALLOC_BYTES`].
+/// Decode image bytes under [`MAX_DECODE_ALLOC_BYTES`]; see [`decode_under_ceiling`].
 ///
 /// The ceiling gets its own message. Hitting it says the image is *large*, not damaged, and the
 /// conversion path has no choice but to fail either way, but telling somebody their file failed
@@ -110,12 +110,8 @@ const MAX_DECODE_ALLOC_BYTES: usize = 128 * crate::text::MIB;
 /// broken. The pass-through path treats the same condition as a pass (see
 /// [`refuse_if_undecodable`]), so the two only diverge on what they can *do*, never on what they
 /// claim.
-fn decode_with_limits(bytes: &[u8], format: ImageFormat) -> Result<image::DynamicImage, String> {
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES as u64);
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-    reader.limits(limits);
-    reader.decode().map_err(|error| match error {
+fn decode_with_limits(bytes: &[u8], format: ImageFormat) -> Result<Decoded, String> {
+    decode_under_ceiling(bytes, format, MAX_DECODE_ALLOC_BYTES).map_err(|error| match error {
         image::ImageError::Limits(_) => format!(
             "{:?} image is too large to convert: decoding it would need more than {}; downscale \
              it first",
@@ -123,6 +119,97 @@ fn decode_with_limits(bytes: &[u8], format: ImageFormat) -> Result<image::Dynami
             crate::text::format_size(MAX_DECODE_ALLOC_BYTES)
         ),
         error => format!("failed to decode {format:?} image: {error}"),
+    })
+}
+
+/// What a screen can draw of `bytes`: the pixel size its header states, and its pixels decoded
+/// under the ceiling every decode keeps to, each `None` when it does not read.
+pub(crate) fn decode_for_display(bytes: &[u8]) -> (Option<(u32, u32)>, Option<Decoded>) {
+    let Ok(format) = image::guess_format(bytes) else {
+        return (None, None);
+    };
+    let size = read_image_dimensions(bytes, format).ok();
+    let pixels = match decode_with_limits(bytes, format) {
+        Ok(pixels) => Some(pixels),
+        Err(error) => {
+            tracing::debug!("failed to decode an image to draw: {error}");
+            None
+        }
+    };
+    (size, pixels)
+}
+
+/// An image's pixels as decoded, with the turn that sets them the way up the image records it was
+/// taken still to make: a phone's photo states its orientation rather than storing its pixels
+/// upright, and every reader of the pixels wants them upright, a copy re-encoded for a provider,
+/// which keeps no orientation of its own, as much as the screen. The only ways out make the turn,
+/// so no reader can take them sideways.
+pub(crate) struct Decoded {
+    pixels: image::DynamicImage,
+    orientation: image::metadata::Orientation,
+}
+
+impl Decoded {
+    /// The pixels upright at their full size, which a quarter turn copies whole beside the decode.
+    pub(crate) fn upright(self) -> image::DynamicImage {
+        let mut pixels = self.pixels;
+        pixels.apply_orientation(self.orientation);
+        pixels
+    }
+
+    /// The pixels made to fit `width` by `height` as they stand upright, by `shrink`, then turned
+    /// upright, so a quarter turn copies the small image rather than the decode. `shrink` is handed
+    /// the pixels as stored and the bounds as they lie on them, swapped for a quarter turn.
+    pub(crate) fn upright_within(
+        self,
+        width: u32,
+        height: u32,
+        shrink: impl FnOnce(image::DynamicImage, u32, u32) -> image::DynamicImage,
+    ) -> image::DynamicImage {
+        use image::metadata::Orientation;
+        let quarter = matches!(
+            self.orientation,
+            Orientation::Rotate90
+                | Orientation::Rotate270
+                | Orientation::Rotate90FlipH
+                | Orientation::Rotate270FlipH
+        );
+        let (width, height) = if quarter {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        let mut pixels = shrink(self.pixels, width, height);
+        pixels.apply_orientation(self.orientation);
+        pixels
+    }
+}
+
+/// The pixels of `bytes` within `ceiling` bytes, with the orientation the image records, which
+/// [`Decoded`] applies. The buffer the pixels decode into counts against the ceiling as
+/// `ImageReader::decode` counts it, and the decoder works within what is left. An orientation that
+/// does not read leaves the pixels as stored, as an image that states none is: it is metadata, and
+/// the pixels it would turn decoded.
+fn decode_under_ceiling(
+    bytes: &[u8],
+    format: ImageFormat,
+    ceiling: usize,
+) -> image::ImageResult<Decoded> {
+    use image::{ImageDecoder as _, metadata::Orientation};
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(ceiling as u64);
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder()?;
+    let orientation = decoder.orientation().unwrap_or_else(|error| {
+        tracing::debug!("failed to read an image's orientation: {error}");
+        Orientation::NoTransforms
+    });
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    Ok(Decoded {
+        pixels: image::DynamicImage::from_decoder(decoder)?,
+        orientation,
     })
 }
 
@@ -223,7 +310,7 @@ fn refuse_undecodable_jpeg(bytes: &[u8]) -> Result<(), String> {
 
 /// Decode arbitrary supported image bytes and re-encode as PNG.
 pub(crate) fn convert_to_png(bytes: &[u8], source: ImageFormat) -> Result<Vec<u8>, String> {
-    let decoded = decode_with_limits(bytes, source)?;
+    let decoded = decode_with_limits(bytes, source)?.upright();
 
     let mut out = Vec::new();
     decoded
@@ -269,12 +356,17 @@ pub(crate) fn downscale_to_dim_cap(
         return Ok(("image/png", bytes.to_vec()));
     }
 
-    let decoded = decode_with_limits(bytes, source)?;
-    let scaled = if decoded.width() > max_dim || decoded.height() > max_dim {
-        decoded.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
-    } else {
-        decoded
-    };
+    let scaled = decode_with_limits(bytes, source)?.upright_within(
+        max_dim,
+        max_dim,
+        |decoded, width, height| {
+            if decoded.width() > width || decoded.height() > height {
+                decoded.resize(width, height, image::imageops::FilterType::Lanczos3)
+            } else {
+                decoded
+            }
+        },
+    );
     if !matches!(source, ImageFormat::Jpeg | ImageFormat::WebP) {
         let mut png = Vec::new();
         scaled
@@ -842,8 +934,9 @@ mod tests {
         // Also pins what the *conversion* path says about the same bytes. It has no choice but to
         // fail, and reporting a merely-large image as a corrupt one sends somebody to re-export a
         // file that was never broken.
-        let ceiling = decode_with_limits(&huge, ImageFormat::Png)
-            .expect_err("has to exceed the decode ceiling, or it proves nothing");
+        let Err(ceiling) = decode_with_limits(&huge, ImageFormat::Png) else {
+            panic!("has to exceed the decode ceiling, or it proves nothing");
+        };
         assert!(
             ceiling.contains("too large to convert"),
             "a size refusal must not read as a corruption refusal: {ceiling}"
@@ -1022,6 +1115,57 @@ mod tests {
         let png = synthesize_image_bytes_sized(ImageFormat::Png, 1234, 567);
         let (width, height) = read_image_dimensions(&png, ImageFormat::Png).expect("ok");
         assert_eq!((width, height), (1234, 567));
+    }
+
+    /// A photo that records it was taken turned comes out of a re-encode upright, since the copy
+    /// keeps no orientation of its own: a wide image turned a quarter is tall.
+    #[test]
+    fn a_re_encoded_photo_is_upright() {
+        let jpeg = sideways_photo();
+        let (_, out) = downscale_to_dim_cap(&jpeg, ImageFormat::Jpeg, 2000).expect("re-encoded");
+        let decoded = image::load_from_memory(&out).expect("decode");
+        assert_eq!((decoded.width(), decoded.height()), (40, 80));
+        let png = convert_to_png(&jpeg, ImageFormat::Jpeg).expect("converted");
+        let decoded = image::load_from_memory(&png).expect("decode");
+        assert_eq!((decoded.width(), decoded.height()), (40, 80));
+    }
+
+    /// An 80x40 JPEG whose orientation says it was taken a quarter turn round.
+    fn sideways_photo() -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let pixels = image::RgbImage::from_pixel(80, 40, image::Rgb([200, 100, 50]));
+        // A big-endian TIFF header and one entry: orientation (0x0112), a short, 6.
+        let exif = vec![
+            0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x01, 0x01, 0x12, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut jpeg = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut jpeg);
+        encoder.set_exif_metadata(exif).expect("exif");
+        encoder
+            .write_image(pixels.as_raw(), 80, 40, image::ExtendedColorType::Rgb8)
+            .expect("encode");
+        jpeg
+    }
+
+    /// A photo taken a quarter turn round decodes within a ceiling its pixels fit once: the turn
+    /// is made on what the reader keeps of them, so it is no reason to refuse a photo the ceiling
+    /// holds. Shrunk first, the turned copy is the small one, laid the way the bounds ask.
+    #[test]
+    fn a_sideways_photo_decodes_within_a_ceiling_that_holds_its_pixels_once() {
+        let jpeg = sideways_photo();
+        let pixels = 80 * 40 * 3;
+        let decoded = decode_under_ceiling(&jpeg, ImageFormat::Jpeg, pixels + pixels / 2)
+            .expect("one copy of the pixels fits");
+        let shrunk = decoded.upright_within(20, 40, |stored, width, height| {
+            assert_eq!(
+                (width, height),
+                (40, 20),
+                "the bounds as they lie on the stored pixels"
+            );
+            stored.thumbnail_exact(width, height)
+        });
+        assert_eq!((shrunk.width(), shrunk.height()), (20, 40));
     }
 
     #[test]

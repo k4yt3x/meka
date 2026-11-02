@@ -289,17 +289,17 @@ impl Panel {
 
     fn footer(&self) -> String {
         if !self.has_choices() {
-            return "esc to close".to_string();
+            return "Esc to close".to_string();
         }
         match &self.filter {
-            None => "enter to select · esc to close".to_string(),
+            None => "Enter to select · Esc to close".to_string(),
             Some(filter) if self.typing => {
-                format!("enter to select · esc to stop filtering · /{filter}")
+                format!("Enter to select · Esc to stop filtering · /{filter}")
             }
             Some(filter) if filter.is_empty() => {
-                "enter to select · esc to close · / to filter".to_string()
+                "Enter to select · Esc to close · / to filter".to_string()
             }
-            Some(filter) => format!("enter to select · esc to close · /{filter}"),
+            Some(filter) => format!("Enter to select · Esc to close · /{filter}"),
         }
     }
 
@@ -399,6 +399,7 @@ impl Panel {
             height: 1.min(area.height),
             ..area
         };
+        let lines: Vec<Line<'static>> = lines.into_iter().map(draw::on_shade).collect();
         frame.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(Style::default().bg(super::input::COMPOSER_BACKGROUND)),
@@ -408,10 +409,10 @@ impl Panel {
             },
         );
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
+            Paragraph::new(draw::on_shade(Line::from(vec![
                 Span::raw(" ".repeat(TEXT_EDGE)),
                 Span::styled(footer, gray()),
-            ]))
+            ])))
             .style(Style::default().bg(super::view::STATUS_BACKGROUND)),
             footer_row,
         );
@@ -578,7 +579,7 @@ mod tests {
         let shown = rows(&terminal);
         assert_eq!(shown[0], "  choice 21", "{shown:#?}");
         assert_eq!(shown[4], "  choice 25", "{shown:#?}");
-        assert_eq!(shown[5], "  enter to select · esc to close · ↑↓ scroll");
+        assert_eq!(shown[5], "  Enter to select · Esc to close · ↑↓ scroll");
     }
 
     /// A panel is its body under no heading, since the user typed the command, and a footer
@@ -596,7 +597,7 @@ mod tests {
         let shown = rows(&terminal);
         assert_eq!(shown[0], "  row 1");
         assert_eq!(shown[4], "  row 5");
-        assert_eq!(shown[5], "  esc to close · ↑↓ scroll · 5 more below");
+        assert_eq!(shown[5], "  Esc to close · ↑↓ scroll · 5 more below");
         let buffer = terminal.backend().buffer();
         assert_eq!(
             buffer[(buffer.area.width - 1, 2)].style().bg,
@@ -654,7 +655,7 @@ mod tests {
         assert_eq!(shown[0], "file_write notes.txt");
         assert_eq!(shown[2], "  Allow  y");
         assert_eq!(shown[3], "  Deny   n");
-        assert_eq!(shown[5], "  enter to select · esc to close");
+        assert_eq!(shown[5], "  Enter to select · Esc to close");
         let buffer = terminal.backend().buffer();
         assert!(
             buffer[(0, 3)]

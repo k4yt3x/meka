@@ -110,7 +110,7 @@ curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
   -H "Content-Type: application/json" \
   -d '{"message": "refactor the parser", "detach": true}'
 # → 202 Accepted, Location: /v1/sessions/.../turns/...
-# → {"id":"...","source":"client","started_at":"2026-10-17T09:12:03Z","usage":{...}}
+# → {"id":"...","source":"client","started_at":"2026-10-17T09:12:03Z","permission":"workspace","usage":{...}}
 ```
 
 The turn runs whether or not this client stays. Its events are on the [session feed](#the-session-feed), and its ending on the resource `Location` names; see [Holding a turn](#holding-a-turn).
@@ -181,7 +181,8 @@ Create, get, list, fork and `PATCH` all answer with the same session record:
   "title": "list the files in src/",
   "last_turn": {
     "id": "7f3b...", "source": "client", "started_at": "2026-05-26T13:46:40Z",
-    "ended_at": "2026-05-26T13:47:01Z", "status": "succeeded", "stop_reason": "end_turn",
+    "permission": "workspace", "ended_at": "2026-05-26T13:47:01Z", "status": "succeeded",
+    "stop_reason": "end_turn",
     "usage": {"input_tokens": 12340, "output_tokens": 567, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 8000}
   },
   "capabilities": {"supports_reasoning_stream": false, "supports_permission_prompts": true},
@@ -208,7 +209,10 @@ collapsed and cut to 200 characters. A pinned session also carries `pinned_at`.
 /v1/sessions/{id}/turns`](#turns) lists, carried here because a list of sessions is rendered from
 it, one row per session. `id` is the turn's id, the one `turn.started` announced it under and every
 message it added names; `source` is who opened it (`client`, `inbox`, `schedule`, `background`, or
-`parent` for a sub-agent's turn); `started_at` is when. Once the turn has ended, `ended_at` says
+`parent` for a sub-agent's turn); `started_at` is when; `permission` is the level it ran under,
+the one its opening told the model, and for a turn still opening, such as the record a detached
+request's `202` carries, the session's level, which it opens under unless the level moves first.
+Once the turn has ended, `ended_at` says
 when and `status` how: `succeeded`, with its `stop_reason` (`end_turn`, `max_tokens` or `refusal`),
 `failed`, with an `error` carrying the same `type` and `detail` a Problem Detail would (never the
 provider's own text), or `canceled`; `profile` names the fallback that served the turn when the

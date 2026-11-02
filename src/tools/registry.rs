@@ -1897,6 +1897,7 @@ mod tests {
                     text: body.to_string(),
                 }],
                 is_error,
+                display: None,
             }],
         }
     }
@@ -2094,6 +2095,7 @@ mod tests {
                         text: "ok".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "u2".to_string(),
@@ -2101,6 +2103,7 @@ mod tests {
                         text: "ok".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 },
             ],
         };
@@ -2150,6 +2153,7 @@ mod tests {
                             text: "x contents".to_string(),
                         }],
                         is_error: false,
+                        display: None,
                     },
                     ContentBlock::ToolResult {
                         tool_use_id: "u2".to_string(),
@@ -2157,6 +2161,7 @@ mod tests {
                             text: "loaded".to_string(),
                         }],
                         is_error: false,
+                        display: None,
                     },
                 ],
             },

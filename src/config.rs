@@ -403,7 +403,7 @@ pub(crate) struct SubagentsConfig {
 /// future turn then reasons from; the parent, which has the whole conversation, is better placed to
 /// decide what is worth remembering, and can record it after reading the sub-agent's report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "String", into = "String")]
 pub(crate) enum MemoryAccess {
     /// No memory tools at all.
     None,
@@ -414,28 +414,81 @@ pub(crate) enum MemoryAccess {
 }
 
 impl MemoryAccess {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [MemoryAccess; 3] = [Self::None, Self::Read, Self::Write];
+
+    /// The level's one spelling, in a sub-agent's stored spec and in an `agent_spawn` grant.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+
     /// `None`, as a `#[serde(default)]` target for a persisted spec that lost the field: an absent
     /// grant must cost the sub-agent its memory tools rather than hand it the store.
     pub(crate) fn none() -> Self {
         Self::None
     }
 
-    /// Parse a `agent_spawn` grant. `"write"` is refused with its reason rather than clamped, so a
-    /// parent asking for it learns that no sub-agent can have it instead of silently getting
-    /// `read`.
+    /// Parse a `agent_spawn` grant, in whatever case the model wrote it. `"write"` is refused
+    /// with its reason rather than clamped, so a parent asking for it learns that no sub-agent can
+    /// have it instead of silently getting `read`.
     pub(crate) fn parse_grant(text: &str) -> std::result::Result<Self, String> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "none" => Ok(Self::None),
-            "read" => Ok(Self::Read),
-            "write" => Err(
-                "memory = \"write\" is not available to sub-agents; grant \"read\" and record \
-                 anything worth keeping yourself"
-                    .to_string(),
-            ),
-            other => Err(format!(
-                "memory = \"{other}\" is not an access level; use \"none\" or \"read\""
+        let word = text.trim().to_ascii_lowercase();
+        match word.parse() {
+            Ok(Self::Write) => Err(format!(
+                "memory = \"{}\" is not available to sub-agents; grant \"{}\" and record \
+                 anything worth keeping yourself",
+                Self::Write.name(),
+                Self::Read.name()
+            )),
+            Ok(granted) => Ok(granted),
+            Err(_) => Err(format!(
+                "memory = \"{word}\" is not an access level; use \"{}\" or \"{}\"",
+                Self::None.name(),
+                Self::Read.name()
             )),
         }
+    }
+}
+
+impl std::fmt::Display for MemoryAccess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for MemoryAccess {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|access| access.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a memory access level. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for MemoryAccess {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, String> {
+        value.parse()
+    }
+}
+
+impl From<MemoryAccess> for String {
+    fn from(access: MemoryAccess) -> Self {
+        access.name().to_string()
     }
 }
 
@@ -446,7 +499,7 @@ impl MemoryAccess {
 /// the user, what to volunteer), so a sub-agent inherits none of it unless the parent decides this
 /// particular task needs the project's rules.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "String", into = "String")]
 pub(crate) enum InstructionAccess {
     /// A clean slate: the sub-agent's system prompt carries no user instructions.
     #[default]
@@ -456,15 +509,65 @@ pub(crate) enum InstructionAccess {
 }
 
 impl InstructionAccess {
-    /// Parse a `agent_spawn` grant.
-    pub(crate) fn parse_grant(text: &str) -> std::result::Result<Self, String> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "none" => Ok(Self::None),
-            "inherit" => Ok(Self::Inherit),
-            other => Err(format!(
-                "instructions = \"{other}\" is not an instruction grant; use \"none\" or \"inherit\""
-            )),
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [InstructionAccess; 2] = [Self::None, Self::Inherit];
+
+    /// The grant's one spelling, in a sub-agent's stored spec and in an `agent_spawn` grant.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Inherit => "inherit",
         }
+    }
+
+    /// Parse a `agent_spawn` grant, in whatever case the model wrote it.
+    pub(crate) fn parse_grant(text: &str) -> std::result::Result<Self, String> {
+        let word = text.trim().to_ascii_lowercase();
+        word.parse().map_err(|_| {
+            format!(
+                "instructions = \"{word}\" is not an instruction grant; use \"{}\" or \"{}\"",
+                Self::None.name(),
+                Self::Inherit.name()
+            )
+        })
+    }
+}
+
+impl std::fmt::Display for InstructionAccess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for InstructionAccess {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|access| access.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not an instruction grant. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for InstructionAccess {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, String> {
+        value.parse()
+    }
+}
+
+impl From<InstructionAccess> for String {
+    fn from(access: InstructionAccess) -> Self {
+        access.name().to_string()
     }
 }
 
@@ -500,9 +603,10 @@ pub(crate) struct ThinkingConfig {
     pub(crate) budget: Option<u64>,
 }
 
-/// One fact the status row can show after the permission level, which always opens it.
-/// `[display].status_row` lists them in the order the row shows them; a word that is not one
-/// of these is refused by name.
+/// One fact the status row can show beside the permission level, which always opens it: the
+/// profile, the model, the path and the project on the left after the level, the readings on the
+/// right. `[display].status_row` lists them, in the order each side shows its own; a word that is
+/// not one of these is refused by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum StatusFact {
@@ -534,15 +638,12 @@ impl StatusFact {
         Self::Tasks,
         Self::Subagents,
     ];
-    /// What the row shows when the config does not say: every fact but the model, in the order
-    /// above. The project follows the path because both say where the session's work is, where
-    /// the profile and the model say what runs it; the gauge sits after the profile because the
-    /// window is the model's, so the number reads beside what runs it; the model itself is opted
+    /// What the row shows when the config does not say: every fact but the model, which is opted
     /// into, since a profile's name usually says it already.
     pub(crate) const DEFAULT_ROW: [StatusFact; 6] = [
+        Self::Profile,
         Self::Path,
         Self::Project,
-        Self::Profile,
         Self::Context,
         Self::Tasks,
         Self::Subagents,
@@ -675,12 +776,15 @@ impl From<TurnEndFact> for String {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DisplayConfig {
-    /// What the status row under the composer shows, in order. Unset shows
-    /// [`StatusFact::DEFAULT_ROW`].
+    /// What the status row under the composer shows, in the order each side shows its own. Unset
+    /// shows [`StatusFact::DEFAULT_ROW`].
     pub(crate) status_row: Option<Vec<StatusFact>>,
     /// What the row that closes a turn states, in order. Unset shows
     /// [`TurnEndFact::DEFAULT_SUMMARY`]; an empty list draws no row.
     pub(crate) turn_end_summary: Option<Vec<TurnEndFact>>,
+    /// Whether the interactive screen folds a run of thinking and tool calls into one row once
+    /// the agent says something after it or its turn ends. Default `true`.
+    pub(crate) fold_steps: Option<bool>,
     pub(crate) show_session_id_on_create: Option<bool>,
     pub(crate) show_session_id_on_resume: Option<bool>,
     pub(crate) show_session_id_on_exit: Option<bool>,
@@ -692,6 +796,10 @@ pub(crate) struct DisplayConfig {
     /// block, at the cost of the terminal's own click-and-drag selection, which then needs its
     /// modifier key. Default `true`.
     pub(crate) mouse: Option<bool>,
+    /// Rows the transcript and a panel move for each wheel event the terminal sends. Default 1,
+    /// since the terminal already decides how many events one notch of the wheel sends; `0` is
+    /// refused at startup.
+    pub(crate) wheel_rows: Option<usize>,
     /// Whether the provider is asked to stream its reply or to return it whole. `false` is what
     /// `--no-stream` asks for one run; a preference belongs in the file.
     pub(crate) stream: Option<bool>,
@@ -1321,6 +1429,22 @@ pub(crate) fn validate_fallback_names<'a>(
     Ok(())
 }
 
+/// Refuse a `[display]` list of facts that names one twice, which the row it shapes would then say
+/// twice.
+fn refuse_a_fact_named_twice<T: PartialEq + std::fmt::Display>(
+    key: &str,
+    facts: &[T],
+) -> crate::error::Result<()> {
+    for (index, fact) in facts.iter().enumerate() {
+        if facts.iter().take(index).any(|earlier| earlier == fact) {
+            return Err(crate::error::MekaError::Config(format!(
+                "`[display].{key}` names '{fact}' twice; name it once"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A profile's request cap as the chain rule compares it: the profile's own `max_request_bytes`,
 /// else what its backend applies, or unknown when its account is missing or unrecognized, which is
 /// reported on its own and compared to nothing here.
@@ -1824,13 +1948,18 @@ pub(crate) struct ResolvedConfig {
     pub(crate) show_session_id_on_exit: bool,
     /// Resolved `[display].mouse`.
     pub(crate) mouse: bool,
+    /// Resolved `[display].wheel_rows`.
+    pub(crate) wheel_rows: usize,
     /// Resolved `[display].send_class`.
     pub(crate) send_class: SendClass,
-    /// Resolved `[display].status_row`: what the status row shows, in order.
+    /// Resolved `[display].status_row`: what the status row shows, in the order each side shows
+    /// its own.
     pub(crate) status_row: Vec<StatusFact>,
     /// Resolved `[display].turn_end_summary`: the facts the row that closes a turn states, in
     /// order; empty for no row.
     pub(crate) turn_end_summary: Vec<TurnEndFact>,
+    /// Resolved `[display].fold_steps`.
+    pub(crate) fold_steps: bool,
     pub(crate) web_client: WebClientConfig,
     pub(crate) sandbox: bool,
     /// Resolved `[shell].additional_readable_directories`, as written: canonicalized where they
@@ -2931,13 +3060,15 @@ impl ResolvedConfig {
             network: file_permissions.network.unwrap_or(Network::Host),
             streaming: streaming_enabled(overrides.no_stream, file_display.stream),
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
-            show_session_id_on_resume: file_display.show_session_id_on_resume.unwrap_or(true),
+            show_session_id_on_resume: file_display.show_session_id_on_resume.unwrap_or(false),
             show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
             mouse: file_display.mouse.unwrap_or(true),
+            wheel_rows: file_display.wheel_rows.unwrap_or(1),
             send_class: file_display.send_class.unwrap_or_default(),
             turn_end_summary: file_display
                 .turn_end_summary
                 .unwrap_or_else(|| TurnEndFact::DEFAULT_SUMMARY.to_vec()),
+            fold_steps: file_display.fold_steps.unwrap_or(true),
             status_row: file_display
                 .status_row
                 .unwrap_or_else(|| StatusFact::DEFAULT_ROW.to_vec()),
@@ -3161,6 +3292,15 @@ impl ResolvedConfig {
                     .to_string(),
             ));
         }
+        if self.wheel_rows == 0 {
+            return Err(crate::error::MekaError::Config(
+                "`[display].wheel_rows = 0` would keep the wheel from scrolling; remove the key for \
+                 the default of 1"
+                    .to_string(),
+            ));
+        }
+        refuse_a_fact_named_twice("status_row", &self.status_row)?;
+        refuse_a_fact_named_twice("turn_end_summary", &self.turn_end_summary)?;
         if self.schedule.max_jobs == 0 {
             return Err(crate::error::MekaError::Config(
                 "`[schedule].max_jobs = 0` would refuse every job; set `[schedule] enabled = \
@@ -3550,6 +3690,36 @@ pub(crate) static CONFIG_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mut
 mod tests {
     use super::*;
     use crate::{instructions::resolve as resolve_instructions, sandbox::resolve_sandbox_backend};
+
+    /// A sub-agent's grants have one spelling each, the one a stored spec holds, and an
+    /// `agent_spawn` grant reads them in any case, refusing `write` with its reason and a word
+    /// that is none of them naming the ones it takes.
+    #[test]
+    fn a_sub_agent_s_grants_have_their_one_spelling() {
+        crate::text::assert_one_spelling(
+            &MemoryAccess::ALL,
+            &["none", "read", "write"],
+            "full",
+            "none, read, write",
+        );
+        crate::text::assert_one_spelling(
+            &InstructionAccess::ALL,
+            &["none", "inherit"],
+            "copy",
+            "none, inherit",
+        );
+        assert_eq!(MemoryAccess::parse_grant(" Read "), Ok(MemoryAccess::Read));
+        assert_eq!(
+            InstructionAccess::parse_grant("INHERIT"),
+            Ok(InstructionAccess::Inherit)
+        );
+        let write = MemoryAccess::parse_grant("write").expect_err("never granted");
+        assert!(write.contains("not available to sub-agents"), "{write}");
+        let unknown = MemoryAccess::parse_grant("full").expect_err("not a level");
+        assert!(unknown.contains(r#"use "none" or "read""#), "{unknown}");
+        let unknown = InstructionAccess::parse_grant("copy").expect_err("not a grant");
+        assert!(unknown.contains(r#"use "none" or "inherit""#), "{unknown}");
+    }
 
     /// A tilde is expanded whichever separator follows it.
     ///
@@ -4891,14 +5061,14 @@ command = "ida-mcp"
         assert_eq!(
             StatusFact::DEFAULT_ROW,
             [
+                StatusFact::Profile,
                 StatusFact::Path,
                 StatusFact::Project,
-                StatusFact::Profile,
                 StatusFact::Context,
                 StatusFact::Tasks,
                 StatusFact::Subagents
             ],
-            "the default is every fact but the model, the gauge after the profile"
+            "the default is every fact but the model, in the order each side shows them"
         );
         assert_eq!(
             "model".parse::<StatusFact>(),
@@ -5224,6 +5394,68 @@ poll_interval = "0s"
             .validate()
             .expect_err("a zero poll interval must not be accepted");
         assert!(error.to_string().contains("poll_interval"), "{error}");
+    }
+
+    /// The wheel moves one row per event unless the file says otherwise, and a zero, which would
+    /// keep it from scrolling, is refused naming the key.
+    #[test]
+    fn wheel_rows_defaults_to_one_and_refuses_zero() {
+        let profile = r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+"#;
+        assert_eq!(resolve_with_config(profile).wheel_rows, 1);
+        assert_eq!(
+            resolve_with_config(&format!("{profile}\n[display]\nwheel_rows = 3\n")).wheel_rows,
+            3
+        );
+        let error = resolve_with_config(&format!("{profile}\n[display]\nwheel_rows = 0\n"))
+            .validate()
+            .expect_err("a zero must not be accepted");
+        assert!(error.to_string().contains("wheel_rows"), "{error}");
+    }
+
+    /// A list of facts for a row that names one twice is refused naming the key and the fact,
+    /// since the row would say it twice; each list on its own.
+    #[test]
+    fn a_display_list_naming_a_fact_twice_is_refused() {
+        let profile = r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+"#;
+        for (key, list, fact) in [
+            (
+                "status_row",
+                r#"["profile", "context", "profile"]"#,
+                "profile",
+            ),
+            ("turn_end_summary", r#"["time", "usage", "time"]"#, "time"),
+        ] {
+            let error = resolve_with_config(&format!("{profile}\n[display]\n{key} = {list}\n"))
+                .validate()
+                .expect_err("a fact named twice must not be accepted");
+            assert!(
+                error.to_string().contains(key) && error.to_string().contains(&format!("'{fact}'")),
+                "{error}"
+            );
+        }
+        resolve_with_config(&format!(
+            "{profile}\n[display]\nstatus_row = [\"profile\", \"context\"]\n"
+        ))
+        .validate()
+        .expect("each fact once");
     }
 
     #[test]

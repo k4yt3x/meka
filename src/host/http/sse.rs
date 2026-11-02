@@ -244,6 +244,8 @@ pub(crate) fn translate(
             // suppress this bare form to avoid duplicate events.
             return None;
         }
+        // The level is a fact of the turn, which its record carries.
+        FrontendEvent::TurnOpened { .. } => return None,
         // The HTTP host writes its own terminal from the turn's result; a sub-agent's feed is the
         // one reader of this, and it is not built from `translate`.
         FrontendEvent::TurnEnded { .. } => return None,
@@ -258,6 +260,9 @@ pub(crate) fn translate(
             // client reads those.
             return None;
         }
+        // A client learns of an item that reached the conversation by `inbox.delivered`, and
+        // reads its words with the messages.
+        FrontendEvent::InboxAppended { .. } => return None,
         FrontendEvent::InboxDelivered { item_ids } => (
             SseEventType::InboxDelivered,
             serde_json::json!({ "item_ids": item_ids }),
@@ -441,7 +446,6 @@ pub(crate) fn translate(
             record,
             replaced_count,
             generation,
-            summary: _,
         } => (
             SseEventType::ContextCompacted,
             serde_json::json!(ContextCompacted {
@@ -618,10 +622,11 @@ mod tests {
                     source: CompactionSource::Checkpoint,
                     memories_written: vec!["notes".to_string()],
                     kept_recent: false,
+                    written_summary: String::new(),
+                    checkpoint: Vec::new(),
                 },
                 replaced_count: 7,
                 generation: 2,
-                summary: "a summary".to_string(),
             },
             SessionCapabilities::default(),
         )
@@ -752,6 +757,7 @@ mod tests {
                 text: "Saved".into(),
             }],
             metadata,
+            display: None,
         };
         let translated = |metadata| {
             translate(completed(metadata), SessionCapabilities::default()).expect("translates")

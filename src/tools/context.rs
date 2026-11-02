@@ -183,7 +183,7 @@ impl ContextGauge {
             return None;
         }
         let floor =
-            text.floor_char_boundary(super::scratchpad::MAX_INLINE_RESULT_BYTES.min(text.len()));
+            text.floor_char_boundary(crate::conversation::MAX_INLINE_RESULT_BYTES.min(text.len()));
         let mut reserved = self.reserved.load(Ordering::Relaxed);
         loop {
             let headroom = self.headroom_with(reserved);
@@ -595,7 +595,7 @@ mod tests {
         // Spent, so the floor is all that is left, and it is still charged.
         assert_eq!(
             gauge.reserve(&digits),
-            Some(super::super::scratchpad::MAX_INLINE_RESULT_BYTES)
+            Some(crate::conversation::MAX_INLINE_RESULT_BYTES)
         );
         assert_eq!(gauge.reserved.load(Ordering::Relaxed), 90_000);
 

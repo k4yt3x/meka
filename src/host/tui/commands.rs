@@ -70,7 +70,7 @@ async fn attach_session(value: &str, context: AttachContext<'_>) -> anyhow::Resu
     } = context;
     let id = store.resolve_session_id(value).await?;
     if *session_id == Some(id) {
-        ui.reply("Already on this session.");
+        ui.reply("Already on this session");
         return Ok(());
     }
     crate::host::refuse_a_spawned_session(store, Some(id)).await?;
@@ -107,6 +107,8 @@ async fn attach_session(value: &str, context: AttachContext<'_>) -> anyhow::Resu
         launch_cwd,
         Some(id),
     ));
+    // Ahead of the reset below, whose checklist is the resumed session's and waits for its log.
+    ui.switched();
     // The agent's markers against message positions, its read tracker and its world-state
     // delta all describe the conversation being let go of; the one reset every rewrite calls
     // clears them and seeds the gauge with the new conversation's estimate.
@@ -141,7 +143,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
     let mut session_id = *session_id_cell;
     match command {
         SlashCommand::Title(text) => match (&session_id, text) {
-            (None, _) => ui.reply("No active session yet."),
+            (None, _) => ui.reply("No active session yet"),
             (Some(id), Some(text)) => match crate::store::normalize_title(&text) {
                 Ok(title) => {
                     let shown = title.clone().unwrap_or_default();
@@ -166,9 +168,9 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             },
             (Some(id), None) => match store.session_info(*id).await {
                 Ok(Some(info)) if !info.title.is_empty() => {
-                    ui.reply(crate::text::sanitize_to_line(&info.title, usize::MAX));
+                    ui.show(crate::text::sanitize_to_line(&info.title, usize::MAX));
                 }
-                Ok(_) => ui.reply("No title yet."),
+                Ok(_) => ui.reply("No title yet"),
                 Err(error) => ui.reply(format!("Cannot read the title: {error}")),
             },
         },
@@ -233,11 +235,11 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                     ui.reload();
                 }
                 (_, None) if turns == 0 => {
-                    ui.reply("Nothing to rewind: /rewind takes a turn count of 1 or more.");
+                    ui.reply("Nothing to rewind: /rewind takes a turn count of 1 or more");
                 }
                 (_, None) => {
                     ui.reply(format!(
-                        "Nothing to rewind: the conversation has fewer than {turns} turn(s)."
+                        "Nothing to rewind: the conversation has fewer than {turns} turn(s)"
                     ));
                 }
             }
@@ -264,7 +266,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                     Err(error) => ui.reply(error.to_string()),
                 }
             }
-            None => ui.reply("No active session to export."),
+            None => ui.reply("No active session to export"),
         },
         SlashCommand::Fork => match session_id {
             Some(id) => match crate::host::fork_and_lock(store, id).await {
@@ -290,14 +292,14 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 }
                 Err(error) => ui.reply(format!("Failed to fork session: {error}")),
             },
-            None => ui.reply("No active session to fork."),
+            None => ui.reply("No active session to fork"),
         },
         // A picker rather than a table: each server with its state, and the pick offers the
         // three verbs below for it. The credential orphans `meka mcp list` reports are the CLI's.
         SlashCommand::McpList => {
             let served = served_servers(config, mcp_manager.as_deref());
             if served.is_empty() {
-                ui.reply("No MCP servers.");
+                ui.reply("No MCP servers");
             } else {
                 let mut servers = Vec::with_capacity(served.len());
                 for server in &served {
@@ -347,10 +349,10 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                     .await
                 {
                     Ok(mcp::ServerState::Connected { .. }) => {
-                        ui.note(format!("Connected to '{server}'."));
+                        ui.note(format!("Connected to '{server}'"));
                     }
                     Ok(state) => ui.reply(format!(
-                        "MCP server '{server}' {}.",
+                        "MCP server '{server}' {}",
                         state
                             .unavailable_reason()
                             .unwrap_or_else(|| "is unavailable".to_string())
@@ -366,10 +368,10 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 ))
                 .await;
                 if !printed.trim().is_empty() {
-                    ui.reply(printed);
+                    ui.show(printed);
                 }
                 match outcome {
-                    Ok(()) => ui.note(format!("Connected to '{server}'.")),
+                    Ok(()) => ui.note(format!("Connected to '{server}'")),
                     Err(error) => ui.reply(screen_sentence(&error)),
                 }
             }
@@ -384,10 +386,10 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             ))
             .await;
             if !printed.trim().is_empty() {
-                ui.reply(printed);
+                ui.show(printed);
             }
             match outcome {
-                Ok(()) => ui.note(format!("Authorized '{server}'.")),
+                Ok(()) => ui.note(format!("Authorized '{server}'")),
                 Err(error) => ui.reply(error.to_string()),
             }
         }
@@ -410,10 +412,10 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             })
             .await;
             if !printed.trim().is_empty() {
-                ui.reply(printed);
+                ui.show(printed);
             }
             match outcome {
-                Ok(_) => ui.note(format!("Cleared credentials for '{server}'.")),
+                Ok(_) => ui.note(format!("Cleared credentials for '{server}'")),
                 Err(error) => ui.reply(error.to_string()),
             }
         }
@@ -433,7 +435,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             images,
         } => 'prompt: {
             let Some(manager) = mcp_manager.as_ref() else {
-                ui.reply("No MCP servers.");
+                ui.reply("No MCP servers");
                 break 'prompt;
             };
             let Some(entry) = manager.server_entry(&server) else {
@@ -499,9 +501,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                     }
                     let user_input = body.trim().to_string();
                     if user_input.is_empty() {
-                        ui.reply(format!(
-                            "'{server}:{prompt_name}' rendered an empty prompt."
-                        ));
+                        ui.reply(format!("'{server}:{prompt_name}' rendered an empty prompt"));
                     } else {
                         let invocation = crate::conversation::ContentBlock::Invocation {
                             kind: crate::conversation::InvocationKind::McpPrompt,
@@ -511,7 +511,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                         };
                         let Ok(input) = crate::agent::TurnInput::sent(vec![invocation], images)
                         else {
-                            ui.reply("Nothing to send.");
+                            ui.reply("Nothing to send");
                             break 'prompt;
                         };
                         match crate::host::terminal::run_turn_interruptible(
@@ -587,12 +587,13 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             ui.reply("Usage: /project [open <name>|close]");
         }
         SlashCommand::Resume(Some(value)) => {
+            // The local every arm moves, which the end of this function writes back for the loop.
             if let Err(error) = attach_session(&value, AttachContext {
                 store,
                 config,
                 shared,
                 agent,
-                session_id: session_id_cell,
+                session_id: &mut session_id,
                 session_lock,
                 messages,
                 current_profile,
@@ -634,7 +635,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             // message is appended, as a replay does.
             let invocation = skills::invocation(&name, extra, body);
             let Ok(input) = crate::agent::TurnInput::sent(vec![invocation], images) else {
-                ui.reply("Nothing to send.");
+                ui.reply("Nothing to send");
                 break 'invoke;
             };
             match crate::host::terminal::run_turn_interruptible(
@@ -653,16 +654,13 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             }
         }
         SlashCommand::Status => {
-            ui.reply(crate::host::format_status(agent, providers, messages.len()).await);
+            ui.show(crate::host::format_status(agent, providers, messages.len()).await);
         }
-        SlashCommand::Usage => {
-            let body = match agent.fetch_usage().await {
-                Ok(Some(usage)) => render::format_account_usage(&usage),
-                Ok(None) => "Account usage is not available for this backend.".to_string(),
-                Err(error) => error.to_string(),
-            };
-            ui.reply(body);
-        }
+        SlashCommand::Usage => match agent.fetch_usage().await {
+            Ok(Some(usage)) => ui.show(render::format_account_usage(&usage)),
+            Ok(None) => ui.reply("Account usage is not available for this backend"),
+            Err(error) => ui.reply(error.to_string()),
+        },
         // The screen answers these itself, listed rather than swept into a wildcard, so adding a
         // variant fails here until someone has decided which side owns it.
         SlashCommand::Cd(_)
@@ -941,7 +939,7 @@ impl SlashCommand {
     /// since that is what the rule is about.
     pub(crate) fn busy_refusal(line: &str) -> String {
         let command = line.split(char::is_whitespace).next().unwrap_or(line);
-        format!("`{command}` cannot run while a turn is running.")
+        format!("`{command}` cannot run while a turn is running")
     }
 }
 
@@ -1146,7 +1144,7 @@ fn parse_mcp_slash(rest: &str) -> SlashCommand {
 /// `/frob a b` is refused as `/frob`, because the argument was never read.
 pub(crate) fn unknown_command_message(line: &str) -> String {
     let command = line.split(char::is_whitespace).next().unwrap_or(line);
-    format!("Unknown command: {command}. Type /help for available commands.")
+    format!("Unknown command: {command}; type /help for available commands")
 }
 
 /// The `/mcp` subcommands are arguments, not top-level commands, so they are absent from

@@ -776,6 +776,7 @@ mod tests {
                     text: "result".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         }];
         assert_eq!(extract_first_user_message_text(&messages), "");

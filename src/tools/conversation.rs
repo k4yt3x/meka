@@ -24,7 +24,7 @@ use super::{
     },
 };
 use crate::{
-    conversation::{ContentBlock, Event, Message, Role},
+    conversation::{ContentBlock, Event, Message},
     error::{MekaError, Result},
     permission::Permission,
     provider::ToolDefinition,
@@ -133,13 +133,6 @@ async fn resolve_readable_session(
                     .join(", ")
             ),
         }),
-    }
-}
-
-fn role_label(role: &Role) -> &'static str {
-    match role {
-        Role::User => "user",
-        Role::Assistant => "assistant",
     }
 }
 
@@ -284,7 +277,7 @@ fn find_in(events: &[Event], matcher: &Matcher, room: usize) -> Found {
     };
     for (offset, message) in messages.iter().enumerate() {
         let index = offset + 1;
-        let label = role_label(&message.role);
+        let label = message.role.name();
         let text = searchable_text(message);
         for line in text.lines() {
             let line = line.trim();
@@ -461,7 +454,7 @@ fn read_messages(
         .take(end - start + 1)
     {
         let index = position + 1;
-        writeln!(output, "#{index} [{}]", role_label(&message.role)).ok();
+        writeln!(output, "#{index} [{}]", message.role.name()).ok();
         output.push_str(&render_message_full(message));
         output.push_str("\n\n");
     }

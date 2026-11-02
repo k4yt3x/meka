@@ -14,8 +14,8 @@ use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use crate::store::history::{CommandLineMatch, HistoryFilter, HistoryOrder, HistoryStore};
 
 /// The composer's background: a dark block that reads as "type here" on a dark theme and stays
-/// quiet on a light one.
-pub(crate) const COMPOSER_BACKGROUND: Color = Color::Indexed(236);
+/// quiet on a light one, a step lighter than the status row under it so the two do not merge.
+pub(crate) const COMPOSER_BACKGROUND: Color = Color::Indexed(234);
 
 /// Entries loaded into memory when a walk through the history begins.
 const HISTORY_WALK_ENTRIES: usize = 500;
@@ -438,18 +438,37 @@ pub(crate) struct Completion {
     pub(crate) picked: usize,
 }
 
+/// A chip above the composer's text: an image being read off the screen's thread, under the id
+/// its read answers with, or one ready to send.
+enum Chip {
+    Reading { id: u64, label: String },
+    Ready(Attachment),
+}
+
+impl Chip {
+    fn label(&self) -> &str {
+        match self {
+            Chip::Reading { label, .. } => label,
+            Chip::Ready(attachment) => &attachment.label,
+        }
+    }
+}
+
 /// An image attached to the composer, sent with the next prompt.
 pub(crate) struct Attachment {
     pub(crate) source: crate::image::ImageSource,
     /// What the chip says: the file's name, or the pixel size of a clipboard image.
     pub(crate) label: String,
+    /// What the transcript draws of it once it is sent.
+    pub(crate) picture: crate::render::tui::Picture,
 }
 
 /// The text the user is typing, with its history and the lists that open over it.
 pub(crate) struct Composer {
     area: TextArea<'static>,
-    /// Images to send with the next prompt, shown as chips above the text.
-    attachments: Vec<Attachment>,
+    /// Images to send with the next prompt, shown as chips above the text in the order they
+    /// were attached, each held in its place while it is read.
+    chips: Vec<Chip>,
     /// Whether what is typed is a shell command rather than a prompt: entered by typing `!`
     /// into an empty composer, which the mode holds in place of the character, and left by
     /// Backspace on the empty composer. The `!` is the text's again in [`Self::text`], so the
@@ -477,7 +496,7 @@ impl Composer {
         area.set_tab_length(0);
         Self {
             area,
-            attachments: Vec::new(),
+            chips: Vec::new(),
             shell_mode: false,
             history,
             walk: None,
@@ -488,27 +507,86 @@ impl Composer {
         }
     }
 
-    pub(crate) fn attach(&mut self, attachment: Attachment) {
-        self.attachments.push(attachment);
+    /// Hold a chip for an image being read, under `id`, in its place after the chips already
+    /// there.
+    pub(crate) fn attach_reading(&mut self, id: u64, label: String) {
+        self.chips.push(Chip::Reading { id, label });
     }
 
-    /// The images riding above the text, in the order attached, left in place.
-    pub(crate) fn attachments(&self) -> &[Attachment] {
-        &self.attachments
+    /// The image read under `id`, put in its chip's place; `false` when the chip has gone, which
+    /// clearing the composer or dropping the chip does, and the image goes with it.
+    pub(crate) fn attached(&mut self, id: u64, attachment: Attachment) -> bool {
+        match self.chip_reading(id) {
+            Some(index) => {
+                if let Some(chip) = self.chips.get_mut(index) {
+                    *chip = Chip::Ready(attachment);
+                }
+                true
+            }
+            None => false,
+        }
     }
 
+    /// Drop the chip of the image read under `id`, which did not read; `false` when it had gone.
+    pub(crate) fn drop_reading(&mut self, id: u64) -> bool {
+        match self.chip_reading(id) {
+            Some(index) => {
+                self.chips.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn chip_reading(&self, id: u64) -> Option<usize> {
+        self.chips
+            .iter()
+            .position(|chip| matches!(chip, Chip::Reading { id: held, .. } if *held == id))
+    }
+
+    /// Whether an image is still being read.
+    pub(crate) fn is_reading(&self) -> bool {
+        self.chips
+            .iter()
+            .any(|chip| matches!(chip, Chip::Reading { .. }))
+    }
+
+    /// The images ready to send, in the order attached, left in place.
+    pub(crate) fn attachments(&self) -> Vec<&Attachment> {
+        self.chips
+            .iter()
+            .filter_map(|chip| match chip {
+                Chip::Ready(attachment) => Some(attachment),
+                Chip::Reading { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Whether a chip stands above the text, read or being read.
     pub(crate) fn has_attachments(&self) -> bool {
-        !self.attachments.is_empty()
+        !self.chips.is_empty()
     }
 
-    /// The attachments, for the prompt about to be sent; the composer holds none afterward.
+    /// The images ready to send, for the prompt about to be sent; the composer holds none of
+    /// them afterward.
     pub(crate) fn take_attachments(&mut self) -> Vec<Attachment> {
-        std::mem::take(&mut self.attachments)
+        let (ready, reading): (Vec<Chip>, Vec<Chip>) = std::mem::take(&mut self.chips)
+            .into_iter()
+            .partition(|chip| matches!(chip, Chip::Ready(_)));
+        self.chips = reading;
+        ready
+            .into_iter()
+            .filter_map(|chip| match chip {
+                Chip::Ready(attachment) => Some(attachment),
+                Chip::Reading { .. } => None,
+            })
+            .collect()
     }
 
     /// Attachments taken for a prompt that was not sent after all, ahead of any attached since.
     pub(crate) fn give_back(&mut self, attachments: Vec<Attachment>) {
-        self.attachments.splice(0..0, attachments);
+        self.chips
+            .splice(0..0, attachments.into_iter().map(Chip::Ready));
     }
 
     /// The row the chips take above the text, when there are any.
@@ -585,7 +663,7 @@ impl Composer {
 
     pub(crate) fn clear(&mut self) {
         self.set_text("");
-        self.attachments.clear();
+        self.chips.clear();
         self.walk = None;
         self.dismissed = None;
     }
@@ -613,7 +691,7 @@ impl Composer {
                     self.walk = None;
                     return;
                 }
-                if self.attachments.pop().is_some() {
+                if self.chips.pop().is_some() {
                     self.walk = None;
                     return;
                 }
@@ -708,14 +786,21 @@ impl Composer {
             area,
         );
         let area = if self.has_attachments() && area.height > 0 {
-            let dim = Style::default().fg(Color::DarkGray).bg(COMPOSER_BACKGROUND);
+            let dim = Style::default()
+                .fg(crate::render::tui::DIM_ON_SHADE)
+                .bg(COMPOSER_BACKGROUND);
             let chips: Vec<ratatui::text::Span<'static>> = self
-                .attachments
+                .chips
                 .iter()
                 .enumerate()
-                .map(|(index, attachment)| {
+                .map(|(index, chip)| {
+                    let reading = if matches!(chip, Chip::Reading { .. }) {
+                        "  reading"
+                    } else {
+                        ""
+                    };
                     ratatui::text::Span::styled(
-                        format!("[image {}  {}]  ", index + 1, attachment.label),
+                        format!("[image {}  {}{reading}]  ", index + 1, chip.label()),
                         dim,
                     )
                 })
@@ -741,7 +826,9 @@ impl Composer {
             let mut characters = self.placeholder.chars();
             let first = characters.next().map(String::from).unwrap_or_default();
             let rest: String = characters.collect();
-            let dim = Style::default().fg(Color::DarkGray).bg(COMPOSER_BACKGROUND);
+            let dim = Style::default()
+                .fg(crate::render::tui::DIM_ON_SHADE)
+                .bg(COMPOSER_BACKGROUND);
             frame.render_widget(
                 ratatui::widgets::Paragraph::new(ratatui::text::Line::from(vec![
                     ratatui::text::Span::styled(first, dim.add_modifier(Modifier::REVERSED)),
@@ -1090,14 +1177,14 @@ pub(crate) fn handle_cd(
     target: &str,
 ) -> Result<PathBuf, String> {
     let Some(raw) = expand_cd_target(launch_cwd, target) else {
-        return Err("cd: failed to determine the home directory".to_string());
+        return Err("Failed to determine the home directory".to_string());
     };
     // Relative inputs resolve against the session's own directory, so `/cd subdir` lands inside
     // the agent's current view; the acceptor then puts the result in the one spelling every door
     // records.
     let resolved = crate::workspace::resolve_against_cwd(cwd, &raw);
-    let canonical =
-        crate::workspace::accept_cwd(&resolved).map_err(|error| format!("cd: {error}"))?;
+    let canonical = crate::workspace::accept_cwd(&resolved)
+        .map_err(|error| format!("Cannot change the working directory: {error}"))?;
     cwd.set(canonical.clone());
     Ok(canonical)
 }
@@ -1451,6 +1538,7 @@ mod tests {
                 data: String::new(),
             },
             label: label.into(),
+            picture: crate::render::tui::Picture::unread(),
         }
     }
 
@@ -1488,14 +1576,14 @@ mod tests {
     fn attachments_ride_above_the_text_until_sent() {
         let mut composer = Composer::new(None);
         assert_eq!(composer.height(40, 10), 1);
-        composer.attach(attachment("a.png"));
+        composer.give_back(vec![attachment("a.png")]);
         assert_eq!(composer.height(40, 10), 2, "the chips' row");
         composer.edit(key(KeyCode::Backspace, KeyModifiers::NONE));
         assert!(
             !composer.has_attachments(),
             "backspace with nothing typed drops the chip"
         );
-        composer.attach(attachment("b.png"));
+        composer.give_back(vec![attachment("b.png")]);
         composer.set_text("words");
         composer.edit(key(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(composer.text(), "word");
@@ -1504,6 +1592,32 @@ mod tests {
             "with text, backspace edits the text"
         );
         assert_eq!(composer.take_attachments().len(), 1);
+        assert!(!composer.has_attachments());
+    }
+
+    /// An image being read holds its chip's place, so images are sent in the order attached
+    /// however long each takes to read; one cleared away before it is read is let go, and one
+    /// that did not read takes its chip with it.
+    #[test]
+    fn a_chip_holds_its_place_while_its_image_is_read() {
+        let mut composer = Composer::new(None);
+        composer.attach_reading(1, "big.png".into());
+        composer.attach_reading(2, "small.png".into());
+        assert!(composer.attached(2, attachment("small.png")));
+        assert!(composer.is_reading());
+        assert!(composer.attached(1, attachment("big.png")));
+        let labels: Vec<String> = composer
+            .attachments()
+            .iter()
+            .map(|attachment| attachment.label.clone())
+            .collect();
+        assert_eq!(labels, vec!["big.png", "small.png"]);
+        composer.attach_reading(3, "late.png".into());
+        composer.clear();
+        assert!(!composer.attached(3, attachment("late.png")));
+        assert!(!composer.has_attachments());
+        composer.attach_reading(4, "broken.png".into());
+        assert!(composer.drop_reading(4));
         assert!(!composer.has_attachments());
     }
 

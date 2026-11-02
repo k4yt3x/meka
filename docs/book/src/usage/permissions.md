@@ -332,7 +332,7 @@ Or use the `/permission` slash command:
 
 `/permission <level>` against a disabled level prints an error naming the currently enabled set.
 
-The status row updates immediately to reflect the new level. The agent learns the current level via a per-turn `[Permission context]` block prepended to your message (see *How permissions work* below).
+The composer's bar and the status row update immediately to reflect the new level. The agent learns the current level via a per-turn `[Permission context]` block prepended to your message (see *How permissions work* below).
 
 ## Approvals
 
@@ -347,7 +347,7 @@ instead:
   Allow for the session  a
   Deny                   n
   Deny for the session
-  enter to select · esc to close
+  Enter to select · Esc to close
 ```
 
 The call is drawn as the transcript draws it, its arguments under its row. The picked answer is

@@ -197,7 +197,7 @@ impl From<CompactionTrigger> for String {
 /// What a compaction was, as its boundary records it and every surface says it: what set it
 /// going, which strategy wrote the summary, the memories the checkpoint wrote on the way, and
 /// whether the recent turns were kept verbatim after the summary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CompactionRecord {
     pub(crate) trigger: CompactionTrigger,
     pub(crate) source: CompactionSource,
@@ -208,13 +208,24 @@ pub(crate) struct CompactionRecord {
     /// lands below the minimum worth summarizing, which is routine in a session whose user turns
     /// are separated by long tool runs.
     pub(crate) kept_recent: bool,
+    /// The checkpoint turn's rounds as a screen shows them under the compaction's row: what the
+    /// agent thought and called while it saved what must last, with the results. Display only,
+    /// never sent to a provider; empty when no checkpoint round ran, or none is recorded. A
+    /// checkpoint that failed keeps the rounds it ran, beside the summary the summarizer then
+    /// wrote.
+    pub(crate) checkpoint: Vec<Message>,
+    /// The summary as the agent or the summarizer wrote it, without the sections compaction
+    /// writes around it in the message the boundary puts in place of what it replaced: what the
+    /// screen and an editor show of the summary, live and on a replay. Never sent to a provider;
+    /// the message is what the model reads, and what an export records.
+    pub(crate) written_summary: String,
 }
 
 impl CompactionRecord {
     /// What the compaction was, in one line: the sentence for what set it going, then what differs
-    /// from the ordinary case. Said on the screen as the compaction lands and again on a replay of
-    /// the log, in an editor as the `[meka]` chunk, on the export's marker and as the one-shot's
-    /// note, all from this record, so a resumed session reads as the live one did.
+    /// from the ordinary case. Said where a compaction is one line nobody can open: in an editor
+    /// without the protocol's compaction entry, on the export's marker and as the one-shot's note.
+    /// The screen says the [`Self::headline`] and shows the rest when the row is opened.
     ///
     /// The memories are named because they are durable and instance-scoped: notes accumulating
     /// unmentioned under an event whose name suggests it only removes things is the surprise this
@@ -222,30 +233,10 @@ impl CompactionRecord {
     /// one the agent chose to write, so a user comparing results across compactions has an
     /// explanation for the difference.
     pub(crate) fn note(&self) -> String {
-        let mut line = String::from(match self.trigger {
-            CompactionTrigger::Reactive => {
-                "Autocompacted the conversation after context usage crossed the ceiling."
-            }
-            CompactionTrigger::Proactive => {
-                "Autocompacted the conversation ahead of a turn that would have crossed the ceiling."
-            }
-            CompactionTrigger::Manual => "Compacted the conversation on user request.",
-            CompactionTrigger::Requested => "The agent compacted the conversation.",
-            CompactionTrigger::Emergency => {
-                "Compacted the conversation after the provider refused the request as too large."
-            }
-            CompactionTrigger::Retention => {
-                "Autocompacted the conversation to summarize turns older than the retention window."
-            }
-        });
-        if !self.kept_recent {
-            line.push_str(" No recent turns were kept.");
-        }
-        match self.source {
-            CompactionSource::Checkpoint => {}
-            CompactionSource::Summarizer => {
-                line.push_str(" Written by the standalone summarizer.");
-            }
+        let mut line = String::from(self.headline());
+        for departure in self.departures() {
+            line.push(' ');
+            line.push_str(departure);
         }
         if !self.memories_written.is_empty() {
             line.push_str(&format!(
@@ -261,6 +252,40 @@ impl CompactionRecord {
         }
         line
     }
+
+    /// The sentence for what set the compaction going.
+    pub(crate) const fn headline(&self) -> &'static str {
+        match self.trigger {
+            CompactionTrigger::Reactive => {
+                "Autocompacted the conversation after context usage crossed the ceiling."
+            }
+            CompactionTrigger::Proactive => {
+                "Autocompacted the conversation ahead of a turn that would have crossed the ceiling."
+            }
+            CompactionTrigger::Manual => "Compacted the conversation on user request.",
+            CompactionTrigger::Requested => "The agent compacted the conversation.",
+            CompactionTrigger::Emergency => {
+                "Compacted the conversation after the provider refused the request as too large."
+            }
+            CompactionTrigger::Retention => {
+                "Autocompacted the conversation to summarize turns older than the retention window."
+            }
+        }
+    }
+
+    /// What differs from the ordinary compaction, a sentence each: that no recent turns were kept
+    /// verbatim after the summary, so the summary is all the model has of the conversation, and
+    /// that the standalone summarizer wrote it rather than the agent.
+    pub(crate) fn departures(&self) -> Vec<&'static str> {
+        let mut departures = Vec::new();
+        if !self.kept_recent {
+            departures.push("No recent turns were kept.");
+        }
+        if self.source == CompactionSource::Summarizer {
+            departures.push("Written by the standalone summarizer.");
+        }
+        departures
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +297,8 @@ impl CompactionRecord {
             source: CompactionSource::Checkpoint,
             memories_written: Vec::new(),
             kept_recent: true,
+            written_summary: String::new(),
+            checkpoint: Vec::new(),
         }
     }
 }
@@ -865,7 +892,7 @@ struct Replayed {
 }
 
 /// Which compaction a summary stands for, as a view of the log reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CompactionMarker {
     /// How many materialized messages the boundary recorded replacing.
     pub(crate) replaced_count: usize,
@@ -1350,11 +1377,62 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
 }
 
 /// Who a message is from, as every provider's wire spells it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "String", into = "String")]
 pub(crate) enum Role {
     User,
     Assistant,
+}
+
+impl Role {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [Role; 2] = [Self::User, Self::Assistant];
+
+    /// The role's one spelling, in the log, in an archive and on meka's own surfaces.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|role| role.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a role. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for Role {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Role> for String {
+    fn from(role: Role) -> Self {
+        role.name().to_string()
+    }
 }
 /// One item of a tool result: text, an image the tool produced, or a reference to a tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1373,6 +1451,222 @@ pub(crate) enum ToolResultContent {
     ToolReference {
         tool_name: String,
     },
+}
+/// The most text a tool result keeps inline: a text block larger than this is persisted to the
+/// store and replaced with a preview and a handle in the conversation, and a result's recorded
+/// [`Change`] keeps no more of its lines than this in the record.
+pub(crate) const MAX_INLINE_RESULT_BYTES: usize = 30_000;
+
+/// What a screen draws of a tool result beyond its content, recorded with the result so a replay
+/// of the log draws what the live run drew: the log keeps no other trace of how a command ended,
+/// what a file held before a call rewrote it, or the list a checklist call left. Never sent to a
+/// provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ResultDisplay {
+    /// The code a program the call ran exited with, when it was not 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) exit_code: Option<i32>,
+    /// What the call changed in a file, a memory or a skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) change: Option<Change>,
+    /// The checklist as the call's batch left it, every item whatever its status, for a call that
+    /// changes the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) checklist: Option<Vec<crate::checklist::ChecklistItem>>,
+}
+
+impl ResultDisplay {
+    /// `self`, or `None` when it records nothing.
+    pub(crate) fn recorded(self) -> Option<Self> {
+        (self != Self::default()).then_some(self)
+    }
+}
+
+/// A change to a text as its diff: every changed line with [`Change::CONTEXT_LINES`] on either
+/// side of it, numbered in the old text for what was there and in the new for what is, in hunks
+/// apart from each other, up to [`MAX_INLINE_RESULT_BYTES`] of them in the record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Change {
+    /// Lines the change added, every one counted whether or not its hunk keeps it.
+    pub(crate) added: usize,
+    /// Lines the change removed, counted the same way.
+    pub(crate) removed: usize,
+    /// The changed lines with their context, a group of lines near each other to a hunk.
+    pub(crate) hunks: Vec<Vec<ChangeLine>>,
+}
+
+/// One line of a [`Change`]: its 1-based number and its text, without the line break.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ChangeLine {
+    /// Whether the line stayed, went or came.
+    pub(crate) kind: ChangeKind,
+    /// The line's number in the old text for one that stayed or went, in the new for one that
+    /// came; 0 where neither text has it.
+    pub(crate) number: usize,
+    /// The line as it reads, without its line break.
+    pub(crate) text: String,
+}
+
+/// Whether a line of a [`Change`] stayed, went or came.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum ChangeKind {
+    /// A line on either side of a change, as it was and is.
+    Kept,
+    /// A line the change took out, numbered in the old text.
+    Removed,
+    /// A line the change put in, numbered in the new text.
+    Added,
+}
+
+impl ChangeKind {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [ChangeKind; 3] = [Self::Kept, Self::Removed, Self::Added];
+
+    /// The one spelling of this value, in the stored result and in an archive.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Kept => "kept",
+            Self::Removed => "removed",
+            Self::Added => "added",
+        }
+    }
+}
+
+impl std::fmt::Display for ChangeKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ChangeKind {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a change line's kind. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for ChangeKind {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ChangeKind> for String {
+    fn from(kind: ChangeKind) -> Self {
+        kind.name().to_string()
+    }
+}
+
+impl Change {
+    /// Lines of unchanged text kept on either side of a change, so a short preview holds the line
+    /// before, the line taken out and the line put in.
+    pub(crate) const CONTEXT_LINES: usize = 1;
+    /// How long the diff may look for the fewest changed lines before it settles for more: it
+    /// runs as a call's result is recorded, and two large texts that differ throughout would
+    /// otherwise hold the call up for as long as the search takes.
+    const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+    /// What a line costs in the record beside its text: its kind and its number, as the log
+    /// writes them, which a line of a few characters or none is mostly made of.
+    const LINE_FIELDS_BYTES: usize = 40;
+
+    /// The change from `old` to `new`, either of which is absent for an entry the change created
+    /// or deleted.
+    pub(crate) fn between(old: Option<&str>, new: Option<&str>) -> Self {
+        use similar::{ChangeTag, TextDiff};
+        // Lines end at `\n` alone, as `file_read` numbers them; the diff's own splitter also ends
+        // one at a lone `\r`.
+        let old_lines: Vec<&str> = old.unwrap_or("").split_inclusive('\n').collect();
+        let new_lines: Vec<&str> = new.unwrap_or("").split_inclusive('\n').collect();
+        let diff = TextDiff::configure()
+            .timeout(Self::DIFF_TIMEOUT)
+            .diff_slices(&old_lines, &new_lines);
+        let (mut added, mut removed) = (0, 0);
+        for change in diff.iter_all_changes() {
+            match change.tag() {
+                ChangeTag::Insert => added += 1,
+                ChangeTag::Delete => removed += 1,
+                ChangeTag::Equal => {}
+            }
+        }
+        // The hunks keep what a result keeps inline: what a screen shows of a change is recorded
+        // with every result, so a rewrite of a large file puts that file in the log once, in the
+        // call, rather than again in what it replaced. Lines past it are counted.
+        let mut budget = MAX_INLINE_RESULT_BYTES;
+        let mut hunks: Vec<Vec<ChangeLine>> = Vec::new();
+        // A hunk cut short ends on its last change, and one cut before its first is no hunk.
+        let close = |hunk: &mut Vec<ChangeLine>, hunks: &mut Vec<Vec<ChangeLine>>| {
+            while hunk
+                .last()
+                .is_some_and(|line| line.kind == ChangeKind::Kept)
+            {
+                hunk.pop();
+            }
+            if !hunk.is_empty() {
+                hunks.push(std::mem::take(hunk));
+            }
+        };
+        'groups: for group in diff.grouped_ops(Self::CONTEXT_LINES) {
+            let mut hunk: Vec<ChangeLine> = Vec::new();
+            for change in group.iter().flat_map(|op| diff.iter_changes(op)) {
+                let text = change.value().trim_end_matches(['\n', '\r']);
+                let (kind, index) = match change.tag() {
+                    ChangeTag::Equal => (ChangeKind::Kept, change.old_index()),
+                    ChangeTag::Delete => (ChangeKind::Removed, change.old_index()),
+                    ChangeTag::Insert => (ChangeKind::Added, change.new_index()),
+                };
+                let Some(left) = budget.checked_sub(text.len() + Self::LINE_FIELDS_BYTES) else {
+                    // A line around the change is there to place it, so one the room left cannot
+                    // hold is let go and the hunk splits there; a changed line it cannot hold
+                    // ends the record, since what follows would read as following it.
+                    close(&mut hunk, &mut hunks);
+                    if kind == ChangeKind::Kept {
+                        continue;
+                    }
+                    break 'groups;
+                };
+                budget = left;
+                hunk.push(ChangeLine {
+                    kind,
+                    number: index.map_or(0, |index| index + 1),
+                    text: text.to_string(),
+                });
+            }
+            if hunk.iter().any(|line| line.kind != ChangeKind::Kept) {
+                hunks.push(hunk);
+            }
+        }
+        Self {
+            added,
+            removed,
+            hunks,
+        }
+    }
+
+    /// The changed lines the change counts and its hunks do not keep, past the budget
+    /// [`Self::between`] keeps to.
+    pub(crate) fn lines_left_out(&self) -> usize {
+        let kept = self
+            .hunks
+            .iter()
+            .flatten()
+            .filter(|line| line.kind != ChangeKind::Kept)
+            .count();
+        (self.added + self.removed).saturating_sub(kept)
+    }
 }
 /// What a thinking block carries back to the wire that produced it, and which wire that is.
 ///
@@ -1410,19 +1704,60 @@ pub(crate) enum OpaqueReasoning {
 /// Why the loop wrote a nudge: the reply it answers had no visible text, or left checklist items
 /// open. What a surface shows for a replayed nudge depends on it, and the wire carries it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "String", into = "String")]
 pub(crate) enum NudgeKind {
     VisibleReply,
     Checklist,
 }
 
 impl NudgeKind {
-    /// The kind's one spelling, for the wire and the migration that writes it.
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [NudgeKind; 2] = [Self::VisibleReply, Self::Checklist];
+
+    /// The kind's one spelling, in the stored block, on the wire and in an archive.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::VisibleReply => "visible_reply",
             Self::Checklist => "checklist",
         }
+    }
+}
+
+impl std::fmt::Display for NudgeKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for NudgeKind {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a nudge kind. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for NudgeKind {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<NudgeKind> for String {
+    fn from(kind: NudgeKind) -> Self {
+        kind.name().to_string()
     }
 }
 
@@ -1706,6 +2041,8 @@ pub(crate) enum ContentBlock {
         tool_use_id: String,
         content: Vec<ToolResultContent>,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<ResultDisplay>,
     },
 }
 impl ContentBlock {
@@ -1796,7 +2133,7 @@ impl ContentBlock {
     }
 }
 /// One message of the conversation: who sent it and what it carries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Message {
     pub(crate) role: Role,
     pub(crate) content: Vec<ContentBlock>,
@@ -2042,7 +2379,7 @@ impl Message {
     /// them (no matching `tool_result`) and the provider would reject the next request.
     pub(crate) fn without_tool_use(&self) -> Message {
         Message {
-            role: self.role.clone(),
+            role: self.role,
             content: self
                 .content
                 .iter()
@@ -2087,7 +2424,7 @@ impl Message {
             })
             .collect();
         Some(Message {
-            role: self.role.clone(),
+            role: self.role,
             content,
         })
     }
@@ -2396,6 +2733,136 @@ pub(crate) const REDACTED_THINKING: &str = "[redacted thinking]";
 mod tests {
     use super::*;
 
+    /// A result records what a screen draws of it only when there is something to record, so a
+    /// result with nothing more to show is stored with no record at all, and one with a record
+    /// reads back whole.
+    #[test]
+    fn a_tool_result_records_what_it_shows_only_when_it_has_something() {
+        let result = |display: Option<ResultDisplay>| ContentBlock::ToolResult {
+            tool_use_id: "call-1".into(),
+            content: vec![ToolResultContent::Text { text: "ok".into() }],
+            is_error: false,
+            display,
+        };
+        let bare = serde_json::to_value(result(None)).expect("json");
+        assert_eq!(
+            bare,
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": [{"type": "text", "text": "ok"}],
+                "is_error": false
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ContentBlock>(bare).expect("a result"),
+            result(None)
+        );
+        assert_eq!(ResultDisplay::default().recorded(), None);
+        let recorded = result(
+            ResultDisplay {
+                exit_code: Some(2),
+                change: Some(Change::between(Some("a\nb\n"), Some("a\nc\n"))),
+                checklist: Some(Vec::new()),
+            }
+            .recorded(),
+        );
+        let stored = serde_json::to_string(&recorded).expect("json");
+        assert!(stored.contains("\"exit_code\":2"), "{stored}");
+        assert_eq!(
+            serde_json::from_str::<ContentBlock>(&stored).expect("a result"),
+            recorded
+        );
+    }
+
+    /// A change is numbered as a diff reads: what stayed and what went by the old text, what came
+    /// by the new, with one line of what stayed on either side of each change.
+    #[test]
+    fn a_change_numbers_its_lines_in_the_text_each_belongs_to() {
+        let change = Change::between(Some("a\nb\nc\nd\n"), Some("a\nB\nc\nd\ne\n"));
+        assert_eq!((change.added, change.removed), (2, 1));
+        let lines: Vec<(ChangeKind, usize, &str)> = change
+            .hunks
+            .iter()
+            .flatten()
+            .map(|line| (line.kind, line.number, line.text.as_str()))
+            .collect();
+        assert_eq!(lines, vec![
+            (ChangeKind::Kept, 1, "a"),
+            (ChangeKind::Removed, 2, "b"),
+            (ChangeKind::Added, 2, "B"),
+            (ChangeKind::Kept, 3, "c"),
+            (ChangeKind::Kept, 4, "d"),
+            (ChangeKind::Added, 5, "e"),
+        ]);
+        let deleted = Change::between(Some("x\n"), None);
+        assert_eq!((deleted.added, deleted.removed), (0, 1));
+        assert_eq!(deleted.lines_left_out(), 0);
+        // A lone carriage return ends no line, as `file_read` reads it.
+        let returned = Change::between(Some("x\ry\nz\n"), Some("x\ry\nZ\n"));
+        let lines: Vec<(ChangeKind, usize, &str)> = returned
+            .hunks
+            .iter()
+            .flatten()
+            .map(|line| (line.kind, line.number, line.text.as_str()))
+            .collect();
+        assert_eq!(lines, vec![
+            (ChangeKind::Kept, 1, "x\ry"),
+            (ChangeKind::Removed, 2, "z"),
+            (ChangeKind::Added, 2, "Z"),
+        ]);
+    }
+
+    /// A change keeps the lines of its hunks up to its budget, each line costing its text and
+    /// its fields, and counts the rest, so a file written whole is in the log once, however short
+    /// its lines; a hunk cut short ends on its last change, and a line around a change too long
+    /// for what is left is let go without the change.
+    #[test]
+    fn a_change_keeps_what_its_budget_holds_and_counts_the_rest() {
+        let line = "x".repeat(99);
+        let written: String = (0..1_000).map(|_| format!("{line}\n")).collect();
+        let change = Change::between(None, Some(&written));
+        assert_eq!((change.added, change.removed), (1_000, 0));
+        let kept: usize = change.hunks.iter().flatten().count();
+        assert_eq!(
+            kept,
+            MAX_INLINE_RESULT_BYTES / (99 + Change::LINE_FIELDS_BYTES)
+        );
+        assert_eq!(change.lines_left_out(), 1_000 - kept);
+        let blank = "\n".repeat(100_000);
+        let change = Change::between(None, Some(&blank));
+        assert_eq!(
+            change.hunks.iter().flatten().count(),
+            MAX_INLINE_RESULT_BYTES / Change::LINE_FIELDS_BYTES,
+            "a blank line costs its fields"
+        );
+        // Two hunks, the first long enough that the budget runs out just past the second's
+        // opening context line: the second holds no change, and is not kept.
+        let long = "x".repeat(MAX_INLINE_RESULT_BYTES - 200);
+        let old = format!("a\n{long}\ny\nz\nb\n");
+        let new = format!("A\n{long}\ny\nz\nB\n");
+        let change = Change::between(Some(&old), Some(&new));
+        assert_eq!(change.hunks.len(), 1, "{:?}", change.hunks);
+        assert_eq!(change.lines_left_out(), 2);
+        // A line around a change that the budget cannot hold is let go, and the change is kept.
+        let huge = "x".repeat(MAX_INLINE_RESULT_BYTES);
+        let change = Change::between(
+            Some(&format!("{huge}\nb\n{huge}\n")),
+            Some(&format!("{huge}\nc\n{huge}\n")),
+        );
+        let lines: Vec<(ChangeKind, usize, &str)> = change
+            .hunks
+            .iter()
+            .flatten()
+            .map(|line| (line.kind, line.number, line.text.as_str()))
+            .collect();
+        assert_eq!(lines, vec![
+            (ChangeKind::Removed, 2, "b"),
+            (ChangeKind::Added, 2, "c")
+        ]);
+        assert_eq!(change.lines_left_out(), 0);
+    }
+
     /// An image counts wherever it sits, attached or inside a tool result, and a tool reference is
     /// not one.
     #[test]
@@ -2420,6 +2887,7 @@ mod tests {
                         },
                     ],
                     is_error: false,
+                    display: None,
                 }],
             },
             Message::user("plain"),
@@ -2732,6 +3200,7 @@ mod tests {
                     text: "ok".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         }
     }
@@ -2756,6 +3225,7 @@ mod tests {
                     text: "ok".to_string(),
                 }],
                 is_error,
+                display: None,
             }],
         }
     }
@@ -3348,6 +3818,7 @@ mod tests {
                     },
                 }],
                 is_error: false,
+                display: None,
             }],
         });
 
@@ -3357,6 +3828,7 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => {
                 assert_eq!(tool_use_id, "call_1");
                 assert!(is_error);
@@ -3671,6 +4143,7 @@ mod tests {
                     },
                 ],
                 is_error: false,
+                display: None,
             }],
         });
         log.append(Message::assistant_text("seen"));
@@ -4050,6 +4523,7 @@ mod tests {
                     tool_name: "mcp__kv__alpha".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         });
         let before = extract(&log, DeferredToolDelivery::Appended);
@@ -4082,6 +4556,7 @@ mod tests {
                     text: "loaded".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         });
         assert_eq!(extract(&log, DeferredToolDelivery::Appended), vec![
@@ -4170,6 +4645,8 @@ mod tests {
             source,
             memories_written: memories.iter().map(|name| name.to_string()).collect(),
             kept_recent,
+            written_summary: String::new(),
+            checkpoint: Vec::new(),
         }
     }
 
@@ -4250,6 +4727,8 @@ mod tests {
                 source: CompactionSource::Summarizer,
                 memories_written: vec!["notes".to_string()],
                 kept_recent: false,
+                written_summary: "what was done".to_string(),
+                checkpoint: Vec::new(),
             },
         };
         let encoded = serde_json::to_value(&event).expect("encodes");
@@ -4258,6 +4737,11 @@ mod tests {
         assert_eq!(boundary["source"], "summarizer");
         assert_eq!(boundary["memories_written"], serde_json::json!(["notes"]));
         assert_eq!(boundary["kept_recent"], false);
+        assert_eq!(boundary["written_summary"], "what was done");
+        assert_eq!(
+            boundary["summary"]["role"], "user",
+            "the message keeps its own key"
+        );
         let decoded: Event = serde_json::from_value(encoded).expect("decodes");
         let Event::CompactBoundary { record, .. } = decoded else {
             panic!("a boundary decodes as one");
@@ -4357,6 +4841,30 @@ mod tests {
         );
     }
 
+    /// One spelling per change line's kind, per nudge kind and per role, the one the store and
+    /// archives already hold, and no other.
+    #[test]
+    fn every_change_line_kind_nudge_kind_and_role_has_its_one_spelling() {
+        crate::text::assert_one_spelling(
+            &ChangeKind::ALL,
+            &["kept", "removed", "added"],
+            "changed",
+            "kept, removed, added",
+        );
+        crate::text::assert_one_spelling(
+            &NudgeKind::ALL,
+            &["visible_reply", "checklist"],
+            "visibleReply",
+            "visible_reply, checklist",
+        );
+        crate::text::assert_one_spelling(
+            &Role::ALL,
+            &["user", "assistant"],
+            "system",
+            "user, assistant",
+        );
+    }
+
     fn user_msg(text: &str) -> crate::conversation::Message {
         crate::conversation::Message::user(text)
     }
@@ -4385,6 +4893,7 @@ mod tests {
                     text: "ok".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         }
     }

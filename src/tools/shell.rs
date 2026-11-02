@@ -1266,10 +1266,17 @@ fn join_streams(stdout: &str, stderr: &str) -> String {
     text
 }
 
+/// The line a command's output ends with when it exited with a code other than 0, which a screen
+/// stating the code beside the call leaves out of the output.
+pub(crate) fn exit_line(exit_code: i32) -> String {
+    format!("Exit code: {exit_code}")
+}
+
 fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOutput {
     let mut result_text = join_streams(stdout, stderr);
     if exit_code != 0 {
-        result_text.push_str(&format!("\nExit code: {exit_code}"));
+        result_text.push('\n');
+        result_text.push_str(&exit_line(exit_code));
     }
 
     ToolOutput::text(

@@ -68,6 +68,9 @@ pub(crate) enum UiEvent {
     /// The log changed under the screen (a rewind, a fork): what is shown is to be read again
     /// from the log's end.
     Reload,
+    /// The screen now shows another session: what it showed of the last one goes, ahead of the
+    /// reload that reads the new one.
+    Switched,
     /// The log's end and its last page, read for a reload.
     Reloaded {
         log_end: Option<i64>,
@@ -77,6 +80,8 @@ pub(crate) enum UiEvent {
         /// The stretches of the log the session's conversation no longer holds, which the replay
         /// leaves out.
         rewound: Vec<crate::store::Rewound>,
+        /// The pictures of the images the page holds, by the hash they rest under.
+        pictures: std::collections::HashMap<String, crate::render::tui::Picture>,
         /// The window it was read for; the screen drops a read for a window it has let go of.
         generation: u64,
     },
@@ -90,14 +95,26 @@ pub(crate) enum UiEvent {
         /// first page after the window was reset and with no other: they change only by a
         /// reload, which reads them again.
         rewound: Option<Vec<crate::store::Rewound>>,
+        /// The pictures of the images the page holds, as on [`Self::Reloaded`].
+        pictures: std::collections::HashMap<String, crate::render::tui::Picture>,
         /// The window it was read for, as on [`Self::Reloaded`].
         generation: u64,
     },
     /// Each configured MCP server with its state, for the picker a bare `/mcp` opens.
     McpServers(Vec<McpServerRow>),
-    /// What a command the host answered has to say: its answer, a refusal, a failure, an empty
-    /// list. A panel until Esc, and nothing on the transcript.
-    Panel(String),
+    /// What a command the host answered says in meka's voice: a refusal, a failure, an empty
+    /// list. Shown as the screen shows its own answers, nothing on the transcript; see
+    /// [`Ui::reply`].
+    Reply(String),
+    /// What a command the host answered shows as it is: a title, a status, what a command
+    /// printed. Shown where a [`Self::Reply`] is, word for word.
+    Show(String),
+    /// An image read for the composer off the screen's thread, under the id its chip holds, or
+    /// why it would not read.
+    Attached {
+        id: u64,
+        attached: Result<super::input::Attachment, String>,
+    },
     /// A `!command` the screen ran has ended: what it printed and how it ended, or why it could
     /// not be started. `stopped` marks one the user killed.
     ShellFinished {
@@ -191,10 +208,22 @@ impl Ui {
         self.send(UiEvent::Reload);
     }
 
-    /// What a command has to say: its answer, a refusal, a failure, an empty list. A panel until
-    /// Esc, and nothing on the transcript.
+    /// The screen now shows another session; see [`UiEvent::Switched`].
+    pub(crate) fn switched(&self) {
+        self.send(UiEvent::Switched);
+    }
+
+    /// What a command says in meka's voice: a refusal, a failure, an empty list. In a panel until
+    /// Esc, or on the status row while a question is open, and nothing on the transcript; a line
+    /// that ends in a period loses it, as every line on the screen does.
     pub(crate) fn reply(&self, message: impl Into<String>) {
-        self.send(UiEvent::Panel(message.into()));
+        self.send(UiEvent::Reply(message.into()));
+    }
+
+    /// What a command shows as it is: a title, a status, what a command printed. Where a
+    /// [`Self::reply`] goes, word for word.
+    pub(crate) fn show(&self, text: impl Into<String>) {
+        self.send(UiEvent::Show(text.into()));
     }
 
     /// The configured MCP servers with their states, for the picker.

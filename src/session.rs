@@ -1033,6 +1033,7 @@ mod tests {
                         text: "ok".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             }),
             Event::CompactBoundary {
@@ -1058,6 +1059,7 @@ mod tests {
                 root,
                 turn,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 "2026-08-31T00:00:00+00:00",
             )
             .await

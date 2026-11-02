@@ -40,6 +40,36 @@ pub(super) enum CallDoor {
 }
 
 impl Agent {
+    /// What a screen draws of `output` beyond its words, as its result records it and the
+    /// announcement of its end carries it: how a command ended, the change a call made, and the
+    /// list a checklist call left, as the batch left it, since the batch has run by the time a
+    /// result is recorded. The one place a result's display is made, for the turn and the
+    /// checkpoint alike. A change is worked out on a blocking thread, since diffing two large
+    /// texts can take up to the diff's timeout.
+    pub(super) async fn result_display(
+        &self,
+        name: &str,
+        output: &crate::tools::ToolOutput,
+    ) -> Option<crate::conversation::ResultDisplay> {
+        let mut display = match output.frontend_metadata.clone() {
+            Some(metadata @ crate::frontend::ToolOutputMetadata::Diff { .. }) => {
+                match tokio::task::spawn_blocking(move || metadata.display()).await {
+                    Ok(display) => display,
+                    Err(error) => {
+                        tracing::warn!("failed to work out the change a call made: {error}");
+                        crate::conversation::ResultDisplay::default()
+                    }
+                }
+            }
+            Some(metadata) => metadata.display(),
+            None => crate::conversation::ResultDisplay::default(),
+        };
+        if !output.is_error && crate::tools::checklist::changes_the_list(name) {
+            display.checklist = Some(self.cells.checklist.get().items);
+        }
+        display.recorded()
+    }
+
     /// `loaded` is the turn's active-tool set, used only to tell a call made against a schema the
     /// model has actually seen from one made blind; see [`Self::schema_advisory`]. The third value
     /// names the calls whose result is a word about the call rather than the tool's output, which
@@ -62,12 +92,7 @@ impl Agent {
         for block in &assistant_message.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
                 if !self.options.streaming {
-                    let schema = self
-                        .tool_registry
-                        .get(name)
-                        .map(|t| t.definition().parameters);
-                    let display_summary =
-                        crate::tools::resolve_primary_param(name, input, schema.as_ref());
+                    let display_summary = crate::tools::resolve_primary_param(name, input);
                     self.cells
                         .frontend
                         .emit(FrontendEvent::ToolCallStarted {
@@ -140,6 +165,7 @@ impl Agent {
                     .await
                     .insert(id.clone(), output.spill_hint.clone());
             }
+            let display = self.result_display(&name, &output).await;
             // Notify the frontend of completion BEFORE building the ToolResult content block so ACP
             // `tool_call_update` notifications arrive before the next assistant turn's text starts
             // streaming.
@@ -151,12 +177,14 @@ impl Agent {
                     is_error: output.is_error,
                     content: output.content.clone(),
                     metadata: output.frontend_metadata.clone(),
+                    display: display.clone(),
                 })
                 .await;
             results.push(ContentBlock::ToolResult {
                 tool_use_id: id,
                 content: output.content,
                 is_error: output.is_error,
+                display,
             });
         }
         if checklist_fired {
@@ -322,7 +350,7 @@ impl Agent {
             // after the turn that caused it, with nothing on screen to explain it, is worse than
             // the round trip it would save.
             if let Some(denial) = self
-                .request_approval(tool_call_id, name, input, detach, &schema, &cancellation)
+                .request_approval(tool_call_id, name, input, detach, &cancellation)
                 .await
             {
                 return denial;
@@ -394,10 +422,9 @@ impl Agent {
         name: &str,
         input: &serde_json::Value,
         detach: bool,
-        schema: &serde_json::Value,
         cancellation: &CancellationToken,
     ) -> Option<crate::tools::ToolOutput> {
-        let primary_param = crate::tools::resolve_primary_param(name, input, Some(schema));
+        let primary_param = crate::tools::resolve_primary_param(name, input);
         let outcome = self
             .cells
             .frontend
@@ -478,9 +505,8 @@ impl Agent {
             Ok(session_id) => session_id,
             Err(refusal) => return refusal,
         };
-        let schema = tool.definition().parameters;
-        let label = crate::tools::resolve_primary_param(name, input, Some(&schema))
-            .unwrap_or_else(|| name.to_string());
+        let label =
+            crate::tools::resolve_primary_param(name, input).unwrap_or_else(|| name.to_string());
         let task = crate::store::background::BackgroundTask {
             id: Uuid::new_v4().to_string(),
             session_id,
@@ -630,11 +656,7 @@ impl Agent {
         });
         self.cells.background_tasks.attach(&task.id, join).await;
 
-        let mut notice = format!(
-            "Started in the background as task {} ({}).",
-            task.short_id(),
-            task.label,
-        );
+        let mut notice = crate::background::started_notice(task.short_id(), &task.label);
         if self.tool_registry.get("task_list").is_some() {
             notice.push_str(" Use `task_list` for status.");
         }
@@ -1544,6 +1566,144 @@ mod tests {
             "the second edit in the message is the last word, as the replay will read it"
         );
         assert_eq!(item.task, None);
+    }
+
+    /// Every result records with it what a screen draws of the call: the code a command exited
+    /// with, the change a call made, and the list a checklist call's batch left, so a resumed
+    /// session draws the call as the live run did.
+    #[tokio::test]
+    async fn a_result_records_what_a_screen_draws_of_it() {
+        use crate::{conversation::ResultDisplay, provider::mock::MockProvider};
+
+        struct Reporting {
+            name: &'static str,
+            fails: bool,
+            metadata: crate::frontend::ToolOutputMetadata,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Reporting {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: self.name.to_string(),
+                    description: "fixture".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    ..Default::default()
+                }
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: crate::tools::ToolContext,
+            ) -> crate::error::Result<crate::tools::ToolOutput> {
+                Ok(
+                    crate::tools::ToolOutput::text("out".to_string(), self.fails)
+                        .with_metadata(self.metadata.clone()),
+                )
+            }
+        }
+
+        let (agent, _store) = agent_with_registry_for_test(
+            Arc::new(MockProvider::from_rounds(vec![])),
+            crate::tools::ToolRegistry::new(),
+        )
+        .await;
+        agent
+            .tool_registry
+            .register(Arc::new(Reporting {
+                name: "exits",
+                fails: true,
+                metadata: crate::frontend::ToolOutputMetadata::CommandExit {
+                    exit_code: Some(3),
+                    signal: None,
+                },
+            }))
+            .expect("registration");
+        agent
+            .tool_registry
+            .register(Arc::new(Reporting {
+                name: "changes",
+                fails: false,
+                metadata: crate::frontend::ToolOutputMetadata::Diff {
+                    path: None,
+                    old_text: Some("a\n".to_string()),
+                    new_text: Some("b\n".to_string()),
+                },
+            }))
+            .expect("registration");
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
+                checklist: agent.cells.checklist.clone(),
+            }))
+            .expect("registration");
+        let calls = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "exits-1".to_string(),
+                    name: "exits".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "changes-1".to_string(),
+                    name: "changes".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "add-1".to_string(),
+                    name: "checklist_add".to_string(),
+                    input: serde_json::json!({"items": ["first"]}),
+                },
+            ],
+        };
+        let (results, ..) = agent
+            .execute_tool_calls(
+                &calls,
+                &[],
+                &crate::provider::Attribution::default(),
+                CancellationToken::new(),
+            )
+            .await;
+        let displays: Vec<Option<ResultDisplay>> = results
+            .into_iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult { display, .. } => display,
+                other => panic!("a result: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            displays[0],
+            Some(ResultDisplay {
+                exit_code: Some(3),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            displays[1],
+            Some(ResultDisplay {
+                change: Some(crate::conversation::Change::between(
+                    Some("a\n"),
+                    Some("b\n")
+                )),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            displays[2]
+                .as_ref()
+                .and_then(|display| display.checklist.as_ref())
+                .map(|items| items
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<Vec<_>>()),
+            Some(vec!["first"])
+        );
     }
 
     /// One `ChecklistUpdated` per change. A read changes nothing and announces nothing; an edit

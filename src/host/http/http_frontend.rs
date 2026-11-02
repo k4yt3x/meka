@@ -549,6 +549,7 @@ impl HttpFrontend {
             reattach_grace,
             started_id: None,
             opening: None,
+            permission: None,
         });
         let receiver = feed.sender.subscribe();
         let started = feed.publish(SseEventType::TurnStarted, data);
@@ -584,8 +585,13 @@ impl HttpFrontend {
 
     /// The live turn as the record `GET /turns` would show, for the window between its admission
     /// and the row the turn writes for itself: what a detached request's 202 carries, and what
-    /// its `Location` answers until the row exists. `None` between turns.
-    pub(crate) fn in_flight_turn(&self) -> Option<crate::store::turns::TurnRecord> {
+    /// its `Location` answers until the row exists. Its level is the one it opened under once it
+    /// has opened, and until then `permission`, the session's level, which it opens under unless
+    /// the level moves first. `None` between turns.
+    pub(crate) fn in_flight_turn(
+        &self,
+        permission: crate::permission::Permission,
+    ) -> Option<crate::store::turns::TurnRecord> {
         let guard = crate::sync::lock(&self.feed);
         let record = guard
             .as_ref()
@@ -594,6 +600,7 @@ impl HttpFrontend {
                 id: turn.turn_id,
                 source: turn.source.source(),
                 started_at: turn.started_at.clone(),
+                permission: turn.permission.unwrap_or(permission),
                 ended_at: None,
                 status: None,
                 stop_reason: None,
@@ -857,6 +864,13 @@ impl HttpFrontend {
         // there is nothing to clean up.
         if matches!(event, FrontendEvent::TurnStarted { .. }) {
             crate::sync::lock(&self.live_output).clear();
+        }
+        if let FrontendEvent::TurnOpened { permission } = event
+            && let Some(turn) = crate::sync::lock(&self.feed)
+                .as_mut()
+                .and_then(|feed| feed.turn.as_mut())
+        {
+            turn.permission = Some(permission);
         }
         // Push to the broadcast BEFORE recording, so a slow blocking-mode Mutex can't delay live
         // subscribers.
@@ -1725,6 +1739,7 @@ mod tests {
             is_error: false,
             content: Vec::new(),
             metadata: None,
+            display: None,
         };
         frontend.push_event(started("tu_1", "shell_execute"));
         frontend.push_event(output("tu_1", "live\n"));
@@ -2154,6 +2169,7 @@ mod tests {
             is_error: false,
             content: Vec::new(),
             metadata: None,
+            display: None,
         });
         frontend.push_event(FrontendEvent::AssistantTextDelta("done".into()));
 
@@ -3035,7 +3051,8 @@ mod tests {
     }
 
     /// The live turn answers as a record, with the id and source its `turn.started` carried and
-    /// no ending, until the turn ends.
+    /// no ending, until the turn ends; its level is the session's until the turn opens, and the
+    /// one it opened under from then.
     #[tokio::test]
     async fn the_live_turn_is_a_record_until_it_ends() {
         let frontend = HttpFrontend::new();
@@ -3051,12 +3068,29 @@ mod tests {
             Duration::from_secs(30),
             16,
         );
-        let record = frontend.in_flight_turn().expect("a turn is live");
+        let record = frontend
+            .in_flight_turn(crate::permission::Permission::Workspace)
+            .expect("a turn is live");
         assert_eq!(record.id, turn_id);
+        assert_eq!(record.permission, crate::permission::Permission::Workspace);
         assert_eq!(record.source, crate::store::turns::TurnSource::Client);
         assert!(record.status.is_none() && record.ended_at.is_none());
+        frontend.push_event(FrontendEvent::TurnOpened {
+            permission: crate::permission::Permission::Read,
+        });
+        assert_eq!(
+            frontend
+                .in_flight_turn(crate::permission::Permission::Workspace)
+                .map(|record| record.permission),
+            Some(crate::permission::Permission::Read),
+            "a level that moved after the opening is not the turn's"
+        );
         frontend.end_turn();
-        assert!(frontend.in_flight_turn().is_none());
+        assert!(
+            frontend
+                .in_flight_turn(crate::permission::Permission::Workspace)
+                .is_none()
+        );
     }
 
     /// A finished-but-retained stream must not read as rendering, or the next turn on the

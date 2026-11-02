@@ -6,7 +6,7 @@ pub(crate) mod background;
 pub(crate) mod checklist;
 pub(crate) mod context;
 mod conversation;
-mod file;
+pub(crate) mod file;
 mod find;
 mod grep;
 pub(crate) mod load_tool;
@@ -947,18 +947,35 @@ pub(crate) fn builtin_change_params(name: &str) -> &'static [&'static str] {
     }
 }
 
-/// Resolve the summary string shown next to a tool-call indicator and in the approval prompt. Tries
-/// the hardcoded built-in map first; falls back to the tool's JSON schema `required[0]` when
-/// provided (covers MCP tools, whose schemas are authored upstream and can't be enumerated here).
-pub(crate) fn resolve_primary_param(
-    name: &str,
-    input: &serde_json::Value,
-    schema: Option<&serde_json::Value>,
-) -> Option<String> {
-    if let Some(value) = builtin_primary_param(name, input) {
-        return Some(value);
+/// The argument a tool call is shown by beside its name, on every surface and in the approval
+/// prompt: the one the built-in map names for a built-in, and for an MCP tool, whose arguments are
+/// authored upstream, the call's first argument that is text, else its first that reads as text
+/// (a number, a flag, a list), other than meka's own `background` and `scratchpad`: a limit or a
+/// switch written ahead of the query says nothing of what the call is for. Read off the call
+/// alone, so a call replayed from the log, where no tool's schema is at hand, is shown as it was
+/// live; meka's two are told from a tool's own by their type, a flag and a name, which a tool that
+/// owns either name declares otherwise.
+pub(crate) fn resolve_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
+    if registry::server_of_tool(name).is_some() {
+        let meka_s_own = |key: &str, value: &serde_json::Value| match key {
+            // A call whose arguments did not parse holds the reason in their place, which is no
+            // argument of the call's.
+            crate::provider::INVALID_TOOL_ARGS_MARKER => true,
+            BACKGROUND_PARAMETER => value.is_boolean(),
+            SCRATCHPAD_PARAMETER => value.is_string(),
+            _ => false,
+        };
+        let mut arguments = input
+            .as_object()?
+            .iter()
+            .filter(|(key, value)| !meka_s_own(key, value));
+        return arguments
+            .clone()
+            .filter(|(_, value)| value.is_string())
+            .find_map(|(_, value)| coerce_display_value(value))
+            .or_else(|| arguments.find_map(|(_, value)| coerce_display_value(value)));
     }
-    schema.and_then(|s| schema_primary_param(s, input))
+    builtin_primary_param(name, input)
 }
 /// Whether [`builtin_primary_param`] answers for `name` given an input shaped like `parameters`.
 ///
@@ -1008,10 +1025,8 @@ pub(crate) const BUILTINS_WITHOUT_ARGUMENTS: &[&str] = &[
 /// The argument a tool-call indicator shows next to the tool's name.
 ///
 /// One rule per name in [`BUILTIN_TOOL_NAMES`] that takes an argument, the complement of
-/// `BUILTINS_WITHOUT_ARGUMENTS`. Covering every one of them is what the map is for:
-/// [`resolve_primary_param`]'s other half needs the tool's JSON Schema, and replayed history has
-/// none, so a built-in missing from here replays bare on the screen's history pages having
-/// rendered fully live.
+/// `BUILTINS_WITHOUT_ARGUMENTS`. Covering every one of them is what the map is for: a built-in
+/// missing from here is shown bare everywhere.
 fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
     // `image_render` accepts either `from_scratchpad` or inline `base64`. Show the scratchpad name
     // when present; for inline base64 the payload is opaque so there's nothing useful to display.
@@ -1037,9 +1052,8 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         );
     }
 
-    // `task_cancel` takes either an id or `all`, and declares neither as required, so there is no
-    // `required[0]` for the schema fallback to reach for. Without this the indicator would render
-    // the tool name with no argument, which is the one thing a cancellation must be specific about.
+    // `task_cancel` takes either an id or `all`, so neither key alone says what it cancels, and a
+    // cancellation is the one call that must be specific about it.
     if name == "task_cancel" {
         if input
             .get("all")
@@ -1051,12 +1065,25 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         return input.get("id").and_then(|v| v.as_str()).map(str::to_string);
     }
 
-    // Sorted like `BUILTIN_TOOL_NAMES`, so the two can be read against each other. Mostly this
-    // agrees with the schema's own `required[0]`, which is what the live path would have fallen
-    // back to; where it does not, the schema's first required key names the server a call is
-    // addressed to rather than the thing it acts on, and the object is what a reader wants
-    // (`mcp_resource_read` shows the URI, not which server holds it).
-    let key = match name {
+    // Coerced rather than read as a string: `tool_load` takes a name or a list of them,
+    // `memory_search` takes a list of phrasings, and `conversation_read` takes a number, and
+    // `as_str` alone would leave all three shown bare.
+    input
+        .get(builtin_primary_key(name)?)
+        .and_then(coerce_display_value)
+}
+
+/// Whether a built-in's call is shown by a path, which a screen shows as it shows a directory.
+pub(crate) fn builtin_path_param(name: &str) -> bool {
+    builtin_primary_key(name) == Some("path")
+}
+
+/// The argument [`builtin_primary_param`] shows for the built-ins whose rule is one key.
+fn builtin_primary_key(name: &str) -> Option<&'static str> {
+    // Sorted like `BUILTIN_TOOL_NAMES`, so the two can be read against each other. Where a call
+    // names both the server it is addressed to and the thing it acts on, the object is what a
+    // reader wants (`mcp_resource_read` shows the URI, not which server holds it).
+    Some(match name {
         "agent_delete" | "agent_followup" | "agent_steer" => "id",
         "agent_spawn" => "prompt",
         "checklist_add" => "items",
@@ -1090,27 +1117,14 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "tool_search" => "query",
         "web_fetch" => "url",
         _ => return None,
-    };
-    // Coerced rather than read as a string: `tool_load` takes a name or a list of them,
-    // `memory_search` takes a list of phrasings, and `conversation_read` takes a number, and
-    // `as_str` alone would leave all three replaying bare.
-    input.get(key).and_then(coerce_display_value)
+    })
 }
-/// Fallback for tools not covered by the built-in map (MCP tools, dynamically-registered tools,
-/// etc.). Uses the first entry of `inputSchema.required` as the key into `input` and coerces the
-/// value to a short display string. Returns `None` when the schema offers no `required` field, the
-/// required key is missing from `input`, or the value type has no sensible string form (e.g. nested
-/// objects / binary blobs).
-fn schema_primary_param(schema: &serde_json::Value, input: &serde_json::Value) -> Option<String> {
-    let required = schema.get("required")?.as_array()?;
-    let key = required.iter().find_map(|v| v.as_str())?;
-    let value = input.get(key)?;
-    coerce_display_value(value)
-}
+/// A value as the short text a call is shown by: a string that is not blank, a number, a
+/// boolean, or a list of those joined; `None` for anything else, an object included.
 fn coerce_display_value(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(s) => {
-            if s.is_empty() {
+            if crate::text::is_blank(s) {
                 None
             } else {
                 Some(s.clone())
@@ -1122,7 +1136,7 @@ fn coerce_display_value(value: &serde_json::Value) -> Option<String> {
             let parts: Vec<String> = arr
                 .iter()
                 .filter_map(|v| match v {
-                    serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+                    serde_json::Value::String(s) if !crate::text::is_blank(s) => Some(s.clone()),
                     serde_json::Value::Number(n) => Some(n.to_string()),
                     serde_json::Value::Bool(b) => Some(b.to_string()),
                     _ => None,
@@ -1182,7 +1196,7 @@ impl Tool for FixtureDeferredTool {
 mod tests {
     use super::{
         BUILTINS_WITHOUT_ARGUMENTS, builtin_primary_param, primary_param_answers_for_schema,
-        resolve_primary_param, schema_primary_param,
+        resolve_primary_param,
     };
     use crate::store::Store;
 
@@ -2514,8 +2528,8 @@ mod tests {
         );
     }
 
-    /// `context_compact` declares no `required`, so like `task_cancel` the schema fallback has
-    /// nothing to reach for and the call would render bare on every surface, not just replay.
+    /// `context_compact` declares no `required`, so its rule names the argument it is shown by, or
+    /// the call would render bare on every surface.
     #[test]
     fn builtin_primary_param_context_compact() {
         assert_eq!(
@@ -2538,17 +2552,8 @@ mod tests {
     /// The whole path the indicator actually uses, not just the built-in map.
     #[test]
     fn resolve_primary_param_renders_a_task_cancellation() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {"id": {"type": "string"}, "all": {"type": "boolean"}}
-        });
         assert_eq!(
-            resolve_primary_param(
-                "task_cancel",
-                &serde_json::json!({"id": "7f3a1c22"}),
-                Some(&schema)
-            )
-            .as_deref(),
+            resolve_primary_param("task_cancel", &serde_json::json!({"id": "7f3a1c22"})).as_deref(),
             Some("7f3a1c22")
         );
     }
@@ -2606,105 +2611,80 @@ mod tests {
         assert_eq!(builtin_primary_param("image_render", &input), None);
     }
 
+    /// An MCP tool is shown by the call's first argument that is text, else its first that reads
+    /// as text, in the order the model wrote them, whatever its schema says, so a call replayed
+    /// from the log, where no schema is at hand, reads as it did live.
     #[test]
-    fn schema_primary_param_string_value() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-        });
-        let input = serde_json::json!({"query": "best keyboards 2026"});
+    fn an_mcp_call_is_shown_by_its_first_argument_that_reads_as_text() {
+        let shown =
+            |input: serde_json::Value| resolve_primary_param("mcp__exa__web_search_exa", &input);
         assert_eq!(
-            schema_primary_param(&schema, &input).as_deref(),
-            Some("best keyboards 2026")
+            shown(serde_json::json!({"query": "ratatui", "numResults": 5})).as_deref(),
+            Some("ratatui")
+        );
+        assert_eq!(
+            shown(serde_json::json!({"limit": 10, "recursive": true, "query": "rust"})).as_deref(),
+            Some("rust"),
+            "a number or a flag ahead of the text is not what the call is for"
+        );
+        assert_eq!(
+            shown(serde_json::json!({"options": {"deep": true}, "query": "ratatui"})).as_deref(),
+            Some("ratatui"),
+            "an object has no short form, so the next argument is taken"
+        );
+        assert_eq!(
+            shown(
+                serde_json::json!({"query": "", "urls": ["https://a.example", "https://b.example"]})
+            )
+            .as_deref(),
+            Some("https://a.example, https://b.example")
+        );
+        assert_eq!(
+            shown(serde_json::json!({"count": 42})).as_deref(),
+            Some("42")
+        );
+        assert_eq!(shown(serde_json::json!({"config": {"nested": 1}})), None);
+        assert_eq!(shown(serde_json::json!({})), None);
+        assert_eq!(
+            shown(serde_json::json!({
+                crate::provider::INVALID_TOOL_ARGS_MARKER: "expected value at line 1"
+            })),
+            None,
+            "a call whose arguments did not parse holds the reason, which is no argument"
+        );
+        assert_eq!(
+            shown(serde_json::json!({
+                "background": true,
+                "scratchpad": "results",
+                "query": "  ",
+                "topic": "ratatui"
+            }))
+            .as_deref(),
+            Some("ratatui"),
+            "meka's own arguments and a blank one are not the call's to be shown by"
+        );
+        assert_eq!(
+            shown(serde_json::json!({"background": "#fff"})).as_deref(),
+            Some("#fff"),
+            "a tool's own `background`, which is no flag, is its argument"
         );
     }
 
+    /// A built-in is shown by the argument its rule names, never by whichever came first: the map
+    /// is the whole rule for the names meka owns.
     #[test]
-    fn schema_primary_param_array_of_strings() {
-        let schema = serde_json::json!({
-            "required": ["urls"],
-        });
-        let input = serde_json::json!({
-            "urls": ["https://example.com", "https://other.example"],
-        });
+    fn a_built_in_is_shown_by_its_rule_alone() {
+        let input = serde_json::json!({"path": "/ignored", "command": "ls -la"});
         assert_eq!(
-            schema_primary_param(&schema, &input).as_deref(),
-            Some("https://example.com, https://other.example")
-        );
-    }
-
-    #[test]
-    fn schema_primary_param_number_and_bool() {
-        let schema = serde_json::json!({"required": ["count"]});
-        let input = serde_json::json!({"count": 42});
-        assert_eq!(schema_primary_param(&schema, &input).as_deref(), Some("42"));
-        let schema = serde_json::json!({"required": ["enabled"]});
-        let input = serde_json::json!({"enabled": true});
-        assert_eq!(
-            schema_primary_param(&schema, &input).as_deref(),
-            Some("true")
-        );
-    }
-
-    #[test]
-    fn schema_primary_param_no_required_field() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-        });
-        let input = serde_json::json!({"query": "hello"});
-        assert_eq!(schema_primary_param(&schema, &input), None);
-    }
-
-    #[test]
-    fn schema_primary_param_required_key_absent_from_input() {
-        let schema = serde_json::json!({"required": ["query"]});
-        let input = serde_json::json!({"other_field": "value"});
-        assert_eq!(schema_primary_param(&schema, &input), None);
-    }
-
-    #[test]
-    fn schema_primary_param_empty_required_array() {
-        let schema = serde_json::json!({"required": []});
-        let input = serde_json::json!({"query": "hello"});
-        assert_eq!(schema_primary_param(&schema, &input), None);
-    }
-
-    #[test]
-    fn schema_primary_param_nested_object_skipped() {
-        let schema = serde_json::json!({"required": ["config"]});
-        let input = serde_json::json!({"config": {"nested": 1}});
-        assert_eq!(schema_primary_param(&schema, &input), None);
-    }
-
-    #[test]
-    fn resolve_primary_param_builtin_takes_precedence_over_schema() {
-        // A tool that happens to share a built-in name: hardcoded map wins so the display stays
-        // consistent with what users know.
-        let schema = serde_json::json!({"required": ["path"]});
-        let input = serde_json::json!({"command": "ls -la", "path": "/ignored"});
-        assert_eq!(
-            resolve_primary_param("shell_execute", &input, Some(&schema)).as_deref(),
+            resolve_primary_param("shell_execute", &input).as_deref(),
             Some("ls -la")
         );
-    }
-
-    #[test]
-    fn resolve_primary_param_falls_back_to_schema_for_unknown_tool() {
-        let schema = serde_json::json!({"required": ["query"]});
-        let input = serde_json::json!({"query": "claude code"});
         assert_eq!(
-            resolve_primary_param("exa__web_search_exa", &input, Some(&schema)).as_deref(),
-            Some("claude code")
+            resolve_primary_param("file_read", &serde_json::json!({"start": 3})),
+            None
         );
-    }
-
-    #[test]
-    fn resolve_primary_param_no_schema_no_builtin() {
-        let input = serde_json::json!({"anything": "here"});
         assert_eq!(
-            resolve_primary_param("unknown__mcp_tool", &input, None),
+            resolve_primary_param("not_a_tool", &serde_json::json!({"anything": "here"})),
             None
         );
     }

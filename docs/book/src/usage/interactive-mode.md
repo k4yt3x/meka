@@ -15,15 +15,17 @@ standing instructions in effect on the next, each file counted once and a flag o
 one. It stands while nothing but a warning
 stands with it, and goes with the first prompt. The
 conversation fills the screen from the top;
-the composer sits at the bottom, a gray block behind a `>`; and a status row under the composer
-opens with the permission level, a cell of the level's color and its name in the same color, then
-names the session's working directory (shortened with `~`), the [project](./projects.md) it is on
-while it is on one, the profile the session runs on, the context gauge (`128.4k/1.0M 13%`: tokens
-in context, the model's window, the share used), and `2 background tasks` and `1 sub-agent` while
-any run.
-[`display.status_row`](../configuration/config-file.md#displaystatus_row) picks the
-facts after the level and their order, and can add the profile's model. Type and press **Enter**. What you sent stays on the transcript behind the same `>` in the same gray
-block, in white, and the answer streams in under it as it arrives, word by word, as rendered
+the composer sits at the bottom, a gray block with a bar of the permission level's color down its
+left edge and a row of the gray above and below the text. The status row under the composer says,
+on the left, what the next prompt goes under, the permission level in its color and the profile the
+session runs on, then the session's working directory (shortened with `~`) and the
+[project](./projects.md) it is on, while it is on one; against the right edge it shows the context
+gauge (`128.4k / 1.0M (13%)`: tokens in context, the model's window, the share used) and
+`2 background tasks` and `1 sub-agent` while any run.
+[`display.status_row`](../configuration/config-file.md#displaystatus_row) picks the facts and
+their order on each side, and can add the profile's model. Type and press **Enter**. What you sent stays on the transcript in the same gray
+block, in white, behind the composer's bar in the color of the permission level its turn ran under
+(red for a `!command`, gray while it waits for its turn to open, and for a prompt the log holds no turn for), and the answer streams in under it as it arrives, word by word, as rendered
 markdown: a list item hangs under its marker, and a table's columns fit the window.
 
 While the agent works, a row of its own appears above the composer, under the blank line that
@@ -33,30 +35,44 @@ always keeps the conversation off it: a spinner in column 0, then what the agent
 question, and the row goes when the turn ends. A `!command` has the same row, as `Running command`.
 
 Everything on the transcript shares one left edge. Column 0 holds a glyph that says what a row is:
-`>` what you sent, `•` something the agent or meka did (a tool call, a thinking block, a notice, a
-command's outcome), `!` a warning, `■` an error, and nothing for the answer itself. No glyph is
-an emoji, so none is drawn as a picture. The text of
-every row starts in column 2. Color is spent sparingly: an answer's emphasis is weight (bold is
-bold, headings are bold), the terminal's cyan names things (inline code, a tool call, the
-checklist), structure (bullets, rules, the quote bar) is gray, and red and yellow mean an error
-and a warning, nothing else. Fenced code is
-highlighted from the same palette: comments gray, keywords blue, strings green, numbers yellow,
-names of functions and types cyan. A code line wider than the screen folds at the edge, and a tab
-is drawn as four columns. Every color is the terminal's own, so the screen follows your
-terminal's theme.
+`▎` a bar down what you sent, in the color of the permission level it ran under (red for a
+`!command`, gray while it waits for its turn), `•` something the agent or meka did (a tool call, a
+thinking block, a notice, a command's outcome), `▸` a folded run of steps or a closed compaction
+and `▾` an open one, `!` a warning, `■` an error, and nothing for the answer itself. No glyph is
+an emoji, so none is drawn as a picture. The text of every row starts in column 2. Color is spent
+sparingly: an answer's emphasis is weight (bold is bold, headings are bold), the terminal's cyan
+names things (inline code, a tool call, the checklist), structure (bullets, rules, the quote bar)
+is gray, red and yellow mean an error and a warning, and the permission level's color marks what
+runs under it. A diff tints the lines it removes red and the lines it adds green. A code block
+sits on a gray shade of its own, and fenced code is highlighted from the same palette: comments
+gray, keywords blue, strings green, numbers yellow, names of functions and types cyan. A code line
+wider than the block folds at its edge, and a tab is drawn as four columns. The text is drawn in
+the terminal's own colors, so the screen follows your terminal's theme. Fixed are the shades behind
+the composer, a prompt, an open run and a code block, a diff's tints and the marks on its lines, the
+white of a prompt's words and of the profile on the status row, the gray of dimmed text on a shade,
+and a picture's pixels.
+
+A turn, its finished run of steps opened:
 
 ```text
-> summarize the project
+▎
+▎ summarize the project
+▎
+
+▾ Thought once, ran a command, read a file, used a tool  1 failed
 
 • Thinking · The user wants a summary of the project state. I should look at…
 
 • shell_execute ls -la && cat notes.txt
   └ total 12
     drwxr-xr-x 2 k4yt3x k4yt3x 4096 Oct 11 09:55 .
+    drwxr-xr-x 9 k4yt3x k4yt3x 4096 Oct 11 09:41 ..
     … +3 lines
-    gamma
-• file_read missing.txt
-  └ failed: failed to resolve path 'missing.txt'
+
+• file_read missing.txt  failed
+  └ failed to resolve path 'missing.txt'
+
+• checklist_add Review the conflict section, Write the summary
 
 • Checklist
   └ › Review the conflict section
@@ -107,36 +123,82 @@ turn the same way, so the scrollback says when each one ended.
 
 Reasoning shows as one dimmed `• Thinking · …` row: the first words of the block once it has
 ended, its latest line while it still streams, or the token count when the provider reports only
-that. A tool call is its name with the one argument that identifies it, `• file_read notes.txt`,
-and under a `└` the opening of what it produced: the lines up to the first blank one, at most
-three, each cut at the edge, and a count of the rest, so a listing shows its header and first row
-and a file its first lines, while what a tool wrote for the model after its payload is counted
-rather than shown. A
-call that failed says `failed:` in red there. A shell command is highlighted as code on the row.
+that.
+
+A tool call is its name and the one argument that identifies it, `• file_read notes.txt`. A path
+is shown as the status row shows the directory: relative to the working directory under it, with
+`~` for your home directory. An MCP tool's `mcp__server__` prefix is dimmed, and it is shown by the
+first of the call's arguments that is text, else the first that has a short form (a number, a
+flag). A shell command is highlighted as code: its first line on the row, the
+next two on a `│` bar under it, then a count of the rest, or the one line left where only one is. A leading `cd` into the working directory, which does
+nothing there, is dimmed. A call that failed says so on its row in red: `exit 2` for a command, with
+the code it exited with, `failed` for anything else, a command stopped before it exited among them.
+
+Under the call, behind a `└`, is the opening of what it produced: the lines up to the first blank
+one, at most three, each cut at the edge, and a count of the rest, or the one line left where only
+one is. A listing shows its header and
+first row, and a file its first lines; what a tool wrote for the model after its payload is counted
+rather than shown, and the directions meka writes into a result for the model are left out. What a
+tool said of a failure is red; a command's output is its output, however it exited, unless it was
+stopped before it exited.
+
 A call that changed a file, a memory or a skill (`file_write`, `file_edit`, `memory_write`,
 `memory_edit`, `skill_write`, `skill_edit` and the two deletes) draws the change as a diff in place
-of the words the tool wrote: the line before, the line taken out in red with its old number, the
-line put in in green with its new number, the line after, and `…` between hunks; its row counts the
-change, `+1 -1`, and the arguments the diff already shows are left out of its expanded block. A
-memory's diff is over the text `meka memory export` writes, so a reworded description is one changed
-line of frontmatter, and a delete is every line in red. Collapsed, a change gets twenty rows rather
-than the three of plain output, so a small edit shows whole and a rewrite shows its first rows and a
-count. Either expands to the whole thing: the full reasoning, or every argument of the call wrapped
-in full and all of its output. The row drops its summary once the arguments are under it; they hang
-on a `│` bar from the row down to the `└` of the result, a shell command first, behind `$`,
-highlighted and wrapped whole. Nothing in an expanded block is cut.
+of the words the tool wrote. The line before, the line taken out on a red tint with its old
+number, the line put in on a green tint with its new number, the line after, and `…` between
+hunks; a tinted line's number and sign are in the tint's light shade. Its row
+counts the change, `+1 -1`, and the arguments the diff already shows are left out of its expanded
+block. A memory's diff is over the text `meka memory export` writes, so a reworded description is
+one changed line of frontmatter, and a delete is every line on red. Collapsed, a change gets
+twenty lines rather than the three of plain output, so a small edit shows whole and a rewrite shows
+its first lines and a count. A result keeps about 30 KB of a change's lines, and counts the rest.
+
+Either expands to the whole thing: the full reasoning, or every argument of the call wrapped in full
+and all of its output. The row drops its summary once the arguments are under it; they hang on a
+`│` bar from the row down to the `└` of the result, a shell command first, behind `$`, highlighted
+and wrapped whole. Nothing in an expanded block is cut.
+
+A resumed session draws every call as it was drawn live: the diff, the code a command exited with
+and the checklist are recorded with each result.
 
 - **Click** a block to toggle it. A block lights up under the mouse, which is the hint that it
   opens.
 - **Ctrl+T** shows or hides every thinking block at once; **Ctrl+O** expands or collapses every
-  tool call.
+  tool call, and opens or folds every run of steps with them.
 - **Alt+Up** and **Alt+Down** pick a block out from the keyboard, newest first; **Enter** or
   **Space** toggles the picked one, and **Esc** lets go of it.
 
 Everything else on the transcript is what it was when it happened: the prompts, the checklist as
 it stood (the item in progress marked `›`, the rest `□`, a deferred one `»` with its reason),
-the notices, the stage directions, and `! interrupted` where a turn was stopped. A slash command's
+the notices, the stage directions, and `! Interrupted` where a turn was stopped. A slash command's
 answer is not on the transcript at all; see [Slash commands](#slash-commands).
+
+## Folded steps
+
+The thinking and tool calls the agent works through show as they happen. Once it writes something
+after them, or its turn ends, each run of them folds into one row that says what it did, in the
+order it first did each:
+
+```text
+▸ Thought 3 times, ran 5 commands, read 2 files  1 failed
+
+  Everything works from the new location. Now a top-level README so the layout is self-explanatory.
+
+▸ Ran 2 commands, used a tool
+```
+
+How many of its calls failed follows in red. A run of one step stays as it is, and a change to a
+file, a memory or a skill, or an `agent_spawn` or `agent_followup` call, never folds: it stands
+between the runs around it. A change that failed changed nothing, and folds. A run whose call is
+still at work stays open, and a run that finishes while you are scrolled up is left as it is until
+you are back at the bottom, so what you are reading does not move.
+
+Click a run's row, or pick it with **Alt+Up** and press **Enter**, to open it under its row, and
+again to fold it. A folded run's row starts with `▸`, an open one's with `▾`, and an open run sits
+on a shade of its own from its row through its last step, so what it holds is told from what
+stands around it. A resumed session opens with every finished run folded.
+[`display.fold_steps`](../configuration/config-file.md#displayfold_steps) `= false` leaves every
+run open until you fold it.
 
 ## Images
 
@@ -144,19 +206,31 @@ An image goes with the next prompt. Paste or drag a path to an image file (`png`
 `webp` or `bmp`) onto the composer and the file is attached, or press **Ctrl+V** to attach the image
 on the clipboard. meka reads that from the operating system, since a terminal pastes text alone, so
 it needs a display on the machine meka runs on and does not work over SSH; a path does. Each
-attachment is a chip above the text, **Backspace** on an empty composer drops the last one, and
-**Enter** sends them with the words, shown as `• image` rows on the transcript. A skill or an MCP
-prompt typed with them takes them, and gives them back when it cannot run; any other command is
-refused while they are attached. The profile has to accept images (`[profiles.<name>].vision`), the
-limits are the HTTP API's, and an image waits for the turn to end rather than riding on a steer.
+attachment is a chip above the text, in the order attached, marked `reading` while the image is
+read beside the screen; **Backspace** on an empty composer drops the last one. **Enter** sends them
+with the words once every one is read; pressed before then, it sends nothing and the status row
+says an image is still being read. A photo is drawn the way up it was taken, and so is a copy meka
+makes of it for the model, shrunk or converted; one sent as it is keeps the orientation it records,
+for the provider to read. A skill or an MCP prompt typed with them takes them, and gives
+them back when it cannot run; any other command is refused while they are attached. The profile has
+to accept images (`[profiles.<name>].vision`), the limits are the HTTP API's, and an image waits for
+the turn to end rather than riding on a steer.
+
+The transcript draws each image sent, live and on a resume, in colored half-block characters, two
+pixels to a row: scaled down to the text width and at most 20 rows, its proportions kept, and
+transparent pixels left as the terminal's background. It works in any terminal with 24-bit color,
+over SSH and inside tmux, at the resolution the cells allow, which shows an image's layout and
+colors but not its small text. An image whose pixels do not decode, or with nothing in it opaque
+enough to draw, is the row `[image 1280x720]`, with the size its header states, or `[image]`.
 
 ## Scrolling and the mouse
 
-The wheel scrolls the transcript; **PgUp** and **PgDn** scroll it half a screen, **Ctrl+Home** jumps
+The wheel scrolls the transcript, a row for each event your terminal sends
+([`display.wheel_rows`](../configuration/config-file.md#displaywheel_rows) moves it more); **PgUp** and **PgDn** scroll it half a screen, **Ctrl+Home** jumps
 to the top of what is loaded and **Ctrl+End** to the end. The view follows new output while it is
 at the bottom. Scrolling up pauses that, and `↓ back to bottom` appears in the row above the
-composer, on the working row while the agent works, until you return: click it, press **Esc**, or
-send a prompt.
+composer, on the working row while the agent works, until you return: click it (it turns white
+under the mouse), press **Esc**, or send a prompt.
 
 Once an answer has pushed your prompt off the top, the prompt's first line sticks there as a bar.
 Click it and the prompt comes to the top of the view, with the prompt before it stuck in the bar's
@@ -167,14 +241,16 @@ scroll near the top, so a resumed session shows its last turns at once and the f
 reaches the ones before, however far back the session goes. What is held is bounded: scrolling far
 up lets the newest pages go, and scrolling back down reads them again; returning to the bottom
 always shows the end of the log with this run's rows after it. Older history shows the
-conversation the log records, with a row for each compaction, in the words it was announced with;
+conversation the log records, with a row for each compaction that opens to what it did;
 the turns a [rewind](#rewind) dropped are left out, and one row in their place says how many went.
 
 The screen captures the mouse so that the wheel, a click and a drag reach it. Dragging over the
 transcript selects the text it covers, and releasing copies it: to the terminal's own clipboard
 through the OSC 52 sequence, which works over SSH and inside tmux where they allow it, and to the
-system clipboard where meka can reach one. The status row says how many rows went. The terminal's
-own selection still works with its modifier held (**Shift**; **Option** in iTerm2, **Fn** in
+system clipboard where meka can reach one. The status row says how many rows went. What is copied
+is the text, not the screen: each row from the text edge, without the gutter's marks, and a code
+block's code as it was written, a line folded at the edge coming back as one line, its indentation
+its own, and the block's shading adding nothing. The terminal's own selection still works with its modifier held (**Shift**; **Option** in iTerm2, **Fn** in
 Terminal.app). Set [`display.mouse = false`](../configuration/config-file.md#displaymouse) to
 leave the mouse to the terminal entirely; the keyboard still scrolls and toggles.
 
@@ -192,7 +268,7 @@ Inside tmux, the wheel needs tmux's own mouse mode (`set -g mouse on`).
 | Up, Down | Move the pick while the completion list is open; otherwise recall what you sent before, at the first and last line of the composer |
 | Ctrl+R | Search what you sent before; Ctrl+R again steps to the next match |
 | Ctrl+V | Attach the image on the clipboard to the next prompt |
-| Ctrl+T, Ctrl+O | Show or hide every thinking block; expand or collapse every tool call |
+| Ctrl+T, Ctrl+O | Show or hide every thinking block; expand or collapse every tool call and run |
 | Alt+Up, Alt+Down | Pick a block; Enter or Space toggles it, Esc lets go |
 | PgUp, PgDn, Ctrl+Home, Ctrl+End | Scroll the transcript; older turns load as you reach the top |
 | Esc | Close the completion list or a panel (`q` closes a panel too); stop the turn, then the background tasks, then leave (see [Interrupting the agent](#interrupting-the-agent)); when nothing runs, back to the bottom, let go of a picked block |
@@ -274,8 +350,8 @@ server's live state (`pending` / `connected` / `failed` / `disabled`); `/task ca
 accepted for `--all`; `/schedule cancel`, `/task cancel` and the two `show`s take an id or any
 unique prefix; `/cd ~` still goes home; `/export` writes `session-<id>.md` in the working directory
 and prints where it landed; `/skill <name>` prepends anything typed after the name to the skill body,
-and the transcript shows `Running skill '<name>'.` with those words under it, live and on a resume,
-as it does `Running prompt '<server>:<prompt>'.` for an MCP prompt;
+and the transcript shows `Running skill '<name>'` with those words under it, live and on a resume,
+as it does `Running prompt '<server>:<prompt>'` for an MCP prompt;
 `/memory` lists memories most important first; `/mcp login <server>` puts the authorization URL
 as a question in the composer's place, with one field for the callback URL pasted from the
 browser's address bar when the browser cannot reach meka, and Esc on it ends the login.
@@ -316,7 +392,7 @@ fields, so the two can be read side by side: the `Profile` with its account and 
 provider applies its own default; `claude-subscription` sends `high` when the profile sets none),
 and the `Thinking` mode. The rest are cumulative counters for the session.
 
-`Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `agent_spawn` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). It is shown from the start, at `0 / <window>` before the first turn, since the window is your `context_window` setting (or the documented default) and this is where you confirm it took effect; it is omitted only when the window is unknown. The status row shows the same gauge after the profile; [`display.status_row`](../configuration/config-file.md#displaystatus_row) drops or moves it.
+`Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `agent_spawn` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). It is shown from the start, at `0 / <window>` before the first turn, since the window is your `context_window` setting (or the documented default) and this is where you confirm it took effect; it is omitted only when the window is unknown. The status row shows the same gauge at its right edge; [`display.status_row`](../configuration/config-file.md#displaystatus_row) drops it or moves it among the readings there.
 
 `Input tokens` (and the other cumulative counters) is the total billed across every turn of the whole session. These totals are persisted, so resuming a session with `meka -c` continues them rather than restarting at zero.
 
@@ -344,7 +420,7 @@ The `/compact` command asks the LLM to summarize the entire conversation, then r
 
 After compacting, the session continues with the summary as context. The pre-compaction messages are never deleted: they stay in the underlying event log on disk (the model just no longer sees them). `meka session export` walks that full log, so an export always contains the entire conversation including the compacted-away turns, with a marker at each compaction point.
 
-Every compaction, this command's and the automatic ones, leaves a dim row saying what set it going (`Compacted the conversation on user request.`, `Autocompacted the conversation after context usage crossed the ceiling.`, `The agent compacted the conversation.`), followed by what departed from the ordinary case: that no recent turns were kept, that the standalone summarizer wrote the summary rather than the agent, and the memories the checkpoint turn wrote. While one runs, the working row reads `Compacting the conversation`. A resumed session shows the same rows, read back from the log.
+Every compaction, this command's and the automatic ones, leaves a boundary on the transcript: a dim rule across the screen labeled `→← Context compacted`. While one runs, the working row reads `Compacting the conversation`. The rule starts with `▸`: click it, or pick it with **Alt+Up** and press **Enter**, to open what the compaction did on a shade under it. First comes what set it going (`Compacted the conversation on user request`, `Autocompacted the conversation after context usage crossed the ceiling`, `The agent compacted the conversation`), then what departed from the ordinary case, when anything did: that no recent turns were kept after the summary, so the summary is all the agent has of the conversation, or that the standalone summarizer wrote it rather than the agent. Then the checkpoint turn's thinking and calls (the memories it wrote, with their changes), each of which opens on its own as any call does, and last the summary the agent now reads in place of the conversation. A compaction before 0.88 recorded only the names of the memories its checkpoint wrote, so it opens to those and its summary. A resumed session shows the same rows, read back from the log.
 
 ### `/rewind`
 
@@ -384,22 +460,25 @@ here.) See [Forking a session](./sessions.md#forking-a-session) for exactly what
 
 ## Shell escape
 
-Type `!` into the empty composer and it enters **shell mode**: the `>` becomes a red `!`, the
-status row drops its facts for a red `Run command in shell`, and what you type runs as a shell
+Type `!` into the empty composer and it enters **shell mode**: the composer's bar turns red, the
+status row reads `Run command in shell` in red in place of the level and the facts after it, and what you type runs as a shell
 command on **Enter**, bypassing the model entirely. **Backspace** on the empty composer leaves the mode, and a recalled
 `!cmd` comes back in it. On the transcript the command keeps its `!`:
 
 ```text
-> !ls -la
-total 32
-drwxr-xr-x  5 user user 4096 Mar  4 10:00 .
-...
+▎
+▎ !ls -la
+▎
+
+  total 32
+  drwxr-xr-x  5 user user 4096 Mar  4 10:00 .
+  ...
 ```
 
 The command runs in the session's working directory, so it follows `/cd`. Its output is captured
 and shown in the transcript, colors included, with a line naming the exit status when it failed.
-It runs beside the screen, which keeps drawing and counts the seconds in the status row; **Esc** or
-**Ctrl+C** kills it, with everything it started, and marks it `! interrupted`; so does leaving
+It runs beside the screen, which keeps drawing and counts the seconds on the working row; **Esc** or
+**Ctrl+C** kills it, with everything it started, and marks it `! Interrupted`; so does leaving
 meka, a hangup or SIGTERM included. (On Windows the shell alone is killed.) Its output keeps its
 last 1 MiB and 10,000 lines, and a row says when more was let go. It reads nothing from the keyboard, and a command that needs the terminal itself (an editor, a pager) belongs in a
 shell beside meka.

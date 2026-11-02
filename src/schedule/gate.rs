@@ -73,7 +73,7 @@ impl GateProbe {
 }
 /// Which value a [`GatePredicate::At`] test is applied to, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "String", into = "String")]
 pub(crate) enum PointerTest {
     /// A non-empty array, object or string, or any non-null scalar.
     NotEmpty,
@@ -81,6 +81,58 @@ pub(crate) enum PointerTest {
     Empty,
     /// The pointed-at value differs from the previous evaluation's.
     Changed,
+}
+
+impl PointerTest {
+    /// Every test, in the order a refusal lists them.
+    pub(crate) const ALL: [PointerTest; 3] = [Self::NotEmpty, Self::Empty, Self::Changed];
+
+    /// The test's one spelling: `when.is`, the stored gate and the listing.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::NotEmpty => "not_empty",
+            Self::Empty => "empty",
+            Self::Changed => "changed",
+        }
+    }
+}
+
+impl std::fmt::Display for PointerTest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for PointerTest {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|test| test.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a pointer test. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for PointerTest {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<PointerTest> for String {
+    fn from(test: PointerTest) -> Self {
+        test.name().to_string()
+    }
 }
 /// What the probe's result has to look like for the job to fire.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -170,8 +222,13 @@ impl GatePredicate {
     pub(crate) fn parse_request(
         value: Option<&serde_json::Value>,
     ) -> std::result::Result<Self, String> {
-        const EXPECTED: &str = "expected \"changed\", \"succeeded\", {\"matches\": \"<regex>\"} or \
-                                {\"at\": \"<json pointer>\", \"is\": \"not_empty\"|\"empty\"|\"changed\"}";
+        let tests = PointerTest::ALL
+            .map(|test| format!("\"{}\"", test.name()))
+            .join("|");
+        let expected = format!(
+            "expected \"changed\", \"succeeded\", {{\"matches\": \"<regex>\"}} or {{\"at\": \
+             \"<json pointer>\", \"is\": {tests}}}"
+        );
 
         let Some(value) = value
             .filter(|value| !value.is_null() && !value.as_str().is_some_and(crate::text::is_blank))
@@ -183,13 +240,13 @@ impl GatePredicate {
                 "changed" => Ok(Self::Changed),
                 "succeeded" => Ok(Self::Succeeded),
                 other => Err(format!(
-                    "{}; {EXPECTED}",
+                    "{}; {expected}",
                     crate::text::unknown_name("gate condition", other, ["changed", "succeeded"])
                 )),
             };
         }
         let Some(object) = value.as_object() else {
-            return Err(format!("`when` is not a condition; {EXPECTED}"));
+            return Err(format!("`when` is not a condition; {expected}"));
         };
         // Refused rather than resolved, exactly as `check` refuses naming both `command` and
         // `tool`. Taking `matches` and ignoring `at` would give the model a gate watching something
@@ -201,7 +258,7 @@ impl GatePredicate {
         let at = object.get("at").filter(|value| !value.is_null());
         if matches.is_some() && at.is_some() {
             return Err(format!(
-                "`when` names both `matches` and `at`; give exactly one. {EXPECTED}"
+                "`when` names both `matches` and `at`; give exactly one. {expected}"
             ));
         }
         if let Some(pattern) = matches {
@@ -223,21 +280,17 @@ impl GatePredicate {
                 ));
             }
             let is = match request_string(object, "when.is", "is")?.map(str::trim) {
-                Some("not_empty") | None => PointerTest::NotEmpty,
-                Some("empty") => PointerTest::Empty,
-                Some("changed") => PointerTest::Changed,
-                Some(other) => {
-                    return Err(format!(
-                        "unknown `when.is` '{other}'; expected 'not_empty', 'empty' or 'changed'"
-                    ));
-                }
+                None => PointerTest::NotEmpty,
+                Some(word) => word
+                    .parse()
+                    .map_err(|error| format!("`when.is`: {error}"))?,
             };
             return Ok(Self::At {
                 pointer: pointer.to_string(),
                 is,
             });
         }
-        Err(format!("`when` is not a condition; {EXPECTED}"))
+        Err(format!("`when` is not a condition; {expected}"))
     }
 
     /// How the predicate reads in a listing.
@@ -246,11 +299,7 @@ impl GatePredicate {
             Self::Changed => "changed".to_string(),
             Self::Succeeded => "succeeded".to_string(),
             Self::Matches { pattern } => format!("matches /{pattern}/"),
-            Self::At { pointer, is } => format!("{} {}", pointer, match is {
-                PointerTest::NotEmpty => "not_empty",
-                PointerTest::Empty => "empty",
-                PointerTest::Changed => "changed",
-            }),
+            Self::At { pointer, is } => format!("{pointer} {is}"),
         }
     }
 }
@@ -608,6 +657,32 @@ mod tests {
         let refused = GatePredicate::parse_request(Some(&serde_json::json!({"at": "/x", "is": 5})))
             .expect_err("a number is not a test");
         assert!(refused.contains("`when.is`"), "{refused}");
+    }
+
+    /// A pointer test has one spelling, the one `when.is` takes, a stored gate holds and a
+    /// listing says; a word that is none of them is refused naming them.
+    #[test]
+    fn a_pointer_test_has_its_one_spelling() {
+        crate::text::assert_one_spelling(
+            &PointerTest::ALL,
+            &["not_empty", "empty", "changed"],
+            "present",
+            "not_empty, empty, changed",
+        );
+        for test in PointerTest::ALL {
+            let parsed = GatePredicate::parse_request(Some(
+                &serde_json::json!({"at": "/x", "is": test.name()}),
+            ))
+            .expect("a test by its name");
+            assert_eq!(parsed.summary(), format!("/x {}", test.name()));
+        }
+        let refused =
+            GatePredicate::parse_request(Some(&serde_json::json!({"at": "/x", "is": "present"})))
+                .expect_err("not a test");
+        assert!(
+            refused.contains("`when.is`") && refused.contains("not_empty, empty, changed"),
+            "{refused}"
+        );
     }
 
     /// A pointer into something that is not a JSON document is an error, not an answer.

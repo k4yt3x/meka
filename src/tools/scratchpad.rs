@@ -18,17 +18,13 @@ use super::{
     },
 };
 use crate::{
-    conversation::{ContentBlock, Message, ToolResultContent},
+    conversation::{ContentBlock, MAX_INLINE_RESULT_BYTES, Message, ToolResultContent},
     error::{MekaError, Result},
     permission::Permission,
     provider::ToolDefinition,
     store::{ScratchpadEntry, Store},
     text::format_size,
 };
-
-/// Tool result text blocks larger than this (in bytes) are persisted to the database and replaced
-/// with a preview + handle in the conversation context.
-pub(crate) const MAX_INLINE_RESULT_BYTES: usize = 30_000;
 
 /// Number of bytes included in the inline preview.
 const PREVIEW_BYTES: usize = 2_000;
@@ -77,6 +73,16 @@ fn build_large_output_preview(name: &str, text: &str) -> String {
     }
     replacement.push_str("\n</large-output>");
     replacement
+}
+
+/// The opening a `<large-output>` reference [`build_large_output_preview`] wrote in place of a
+/// result shows of the output, when `text` is one: what a screen shows of the result, without the
+/// directions written for the model or the marker that says the opening stops short.
+pub(crate) fn large_output_preview(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("<large-output name=\"")?;
+    let body = rest.strip_suffix("\n</large-output>")?;
+    let (_, preview) = body.split_once(" bytes):\n")?;
+    Some(preview.strip_suffix("\n...").unwrap_or(preview))
 }
 
 /// Save tool results to the scratchpad when the agent explicitly requested it via the `scratchpad`
@@ -1406,6 +1412,21 @@ mod tests {
     use super::*;
     use crate::conversation::{ContentBlock, Role};
 
+    /// A screen reads back the opening the spill wrote of an output, without the marker that
+    /// says the opening stops short of the whole.
+    #[test]
+    fn a_large_output_reference_reads_back_its_opening() {
+        let output = format!("{}\nlast line\n", "x".repeat(PREVIEW_BYTES));
+        let written = build_large_output_preview("shell_execute_abc_1", &output);
+        assert_eq!(
+            large_output_preview(&written),
+            Some(&output[..PREVIEW_BYTES])
+        );
+        let short = build_large_output_preview("entry", "whole");
+        assert_eq!(large_output_preview(&short), Some("whole"));
+        assert_eq!(large_output_preview("plain output"), None);
+    }
+
     fn session_id_for_test(uuid: Uuid) -> crate::session::SharedSessionId {
         crate::session::SharedSessionId::new(Some(uuid))
     }
@@ -1526,6 +1547,7 @@ mod tests {
                 text: large_text.clone(),
             }],
             is_error: false,
+            display: None,
         }];
 
         persist_oversized_results(
@@ -1598,6 +1620,7 @@ mod tests {
                 text: large_text.clone(),
             }],
             is_error: false,
+            display: None,
         }];
         persist_oversized_results(
             &manager,
@@ -1689,6 +1712,7 @@ mod tests {
                 text: reply.clone(),
             }],
             is_error: false,
+            display: None,
         }];
         let hints = std::collections::HashMap::from([(
             "call-1".to_string(),
@@ -1912,6 +1936,7 @@ mod tests {
                 tool_use_id: call_id.to_string(),
                 content: vec![ToolResultContent::Text { text: text.clone() }],
                 is_error: false,
+                display: None,
             }];
             persist_oversized_results(
                 &manager,
@@ -1955,6 +1980,7 @@ mod tests {
                 text: small_text.clone(),
             }],
             is_error: false,
+            display: None,
         }];
 
         persist_oversized_results(
@@ -1994,6 +2020,7 @@ mod tests {
                 text: "hi\n".to_string(),
             }],
             is_error: false,
+            display: None,
         }];
 
         save_explicit_scratchpad_results(
@@ -2043,6 +2070,7 @@ mod tests {
                 text: "the worker's own output".to_string(),
             }],
             is_error: false,
+            display: None,
         }];
 
         save_explicit_scratchpad_results(
@@ -2099,6 +2127,7 @@ mod tests {
                 text: text.to_string(),
             }],
             is_error: true,
+            display: None,
         };
         let mut results = vec![
             failed(
@@ -2170,6 +2199,7 @@ mod tests {
                 text: "hi\n".to_string(),
             }],
             is_error: false,
+            display: None,
         }];
 
         save_explicit_scratchpad_results(
@@ -2217,6 +2247,7 @@ mod tests {
                 text: "[Image rendered from scratchpad \"img\"]".to_string(),
             }],
             is_error: false,
+            display: None,
         }];
 
         save_explicit_scratchpad_results(

@@ -403,6 +403,7 @@ impl Frontend for AcpFrontend {
                 is_error,
                 content,
                 metadata,
+                ..
             } => {
                 let live = {
                     // The completion update carries the authoritative output, so the live view has
@@ -491,21 +492,13 @@ impl Frontend for AcpFrontend {
             // An editor holds a transcript, not a mirror of the model's window, so nothing on
             // screen is invalidated; but the automatic compactions happen with nobody asking, and
             // a user whose next reply forgets the morning deserves to know why. A client without
-            // the entry is told in the words the screen uses.
+            // the entry is told in the record's own sentence.
             FrontendEvent::Compacted {
                 id,
                 record,
                 replaced_count,
                 generation,
-                summary,
-            } => compacted_update(
-                &self.client_state,
-                id,
-                &record,
-                replaced_count,
-                generation,
-                summary,
-            ),
+            } => compacted_update(&self.client_state, id, &record, replaced_count, generation),
             FrontendEvent::CompactionFailed {
                 id,
                 trigger,
@@ -579,9 +572,21 @@ impl Frontend for AcpFrontend {
                 self.live_output().clear();
                 return;
             }
+            // The protocol has no place for the level a turn opened under.
+            FrontendEvent::TurnOpened { .. } => return,
             // What reported is said as the screen says it; the report is the model's to read.
             FrontendEvent::BackgroundReported { tasks, .. } => {
                 background_report_update(&tasks, self.client_state.renders_notices())
+            }
+            // Inbox items added behind a round, a nudge or a cut prompt: the editor did not type
+            // them, so they are shown as the user turn they are, as an opening's are.
+            FrontendEvent::InboxAppended { blocks } => {
+                for block in &blocks {
+                    if let crate::conversation::ContentBlock::Inbox { text, .. } = block {
+                        self.send_update(super::schedule::out_of_band_prompt_update(text));
+                    }
+                }
+                return;
             }
             // The message a turn opens with, or one an interrupt appends. What the editor did not
             // type is shown as the user turn it is, so the reply has its question above it; the
@@ -1338,7 +1343,6 @@ pub(super) enum Replayed<'a> {
         record: &'a crate::conversation::CompactionRecord,
         replaced_count: usize,
         generation: u64,
-        summary: String,
     },
 }
 
@@ -1356,7 +1360,6 @@ pub(super) fn replay_entries(
         match event {
             Event::Append(message) => entries.push(Replayed::Message(message)),
             Event::CompactBoundary {
-                summary,
                 replaced_count,
                 record,
                 ..
@@ -1366,7 +1369,6 @@ pub(super) fn replay_entries(
                     record,
                     replaced_count: *replaced_count,
                     generation,
-                    summary: summary.text_content(),
                 });
                 generation += 1;
             }
@@ -1378,14 +1380,13 @@ pub(super) fn replay_entries(
 }
 
 /// The update a finished compaction is, live and on a replay alike: the protocol's compaction
-/// entry for a client that advertised `session.compaction`, else the note the screen shows.
+/// entry for a client that advertised `session.compaction`, else the record's note as a notice.
 fn compacted_update(
     client_state: &SharedClientState,
     id: String,
     record: &crate::conversation::CompactionRecord,
     replaced_count: usize,
     generation: u64,
-    summary: String,
 ) -> SessionUpdate {
     if !client_state.renders_compactions() {
         return notice_update(
@@ -1401,7 +1402,7 @@ fn compacted_update(
     SessionUpdate::CompactionUpdate(
         CompactionUpdate::new(id, CompactionStatus::Completed)
             .summary(vec![ContentBlock::Text(
-                agent_client_protocol::schema::v1::TextContent::new(summary),
+                agent_client_protocol::schema::v1::TextContent::new(record.written_summary.clone()),
             )])
             .meta(terminal_meta(META_COMPACTION, facts)),
     )
@@ -1441,7 +1442,6 @@ pub(super) fn replay_session_updates(
                 record,
                 replaced_count,
                 generation,
-                summary,
             } => {
                 send_session_update(
                     connection,
@@ -1452,7 +1452,6 @@ pub(super) fn replay_session_updates(
                         record,
                         *replaced_count,
                         *generation,
-                        summary.clone(),
                     ),
                 );
                 continue;
@@ -1588,6 +1587,7 @@ pub(super) fn replay_session_updates(
                             tool_use_id,
                             content,
                             is_error,
+                            ..
                         } => {
                             let status = if *is_error {
                                 ToolCallStatus::Failed
@@ -1677,11 +1677,8 @@ pub(super) fn replay_session_updates(
                         }
                         MekaContentBlock::ToolUse { id, name, input } => {
                             let locations = tool_locations(name, input, cwd);
-                            // Match the live path's rich title. No tool schema is available on
-                            // replay, so only built-in tools resolve a primary argument; MCP tools
-                            // fall back to the bare name.
-                            let display_summary =
-                                crate::tools::resolve_primary_param(name, input, None);
+                            // Match the live path's rich title, which is read off the call alone.
+                            let display_summary = crate::tools::resolve_primary_param(name, input);
                             let title = tool_call_title(name, display_summary.as_deref());
                             let call = ToolCall::new(id.clone(), title)
                                 .kind(tool_kind_for(name))

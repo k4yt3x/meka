@@ -622,6 +622,7 @@ mod tests {
                 session,
                 turn,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 &long_ago,
             )
             .await

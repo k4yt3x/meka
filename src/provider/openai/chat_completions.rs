@@ -146,7 +146,7 @@ impl OpenAiChatCompletionsProvider {
                             if let ContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
-                                is_error: _,
+                                ..
                             } = block
                             {
                                 // Chat Completions restricts the `tool` role's content to text: the
@@ -1690,6 +1690,7 @@ mod tests {
                         text: "file contents here".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];
@@ -1745,6 +1746,7 @@ mod tests {
                             text: "file contents here".to_string(),
                         }],
                         is_error: false,
+                        display: None,
                     },
                     ContentBlock::Text {
                         text: "[Message from test, arrived now]\nalso, what is 17*3?".to_string(),
@@ -2260,6 +2262,7 @@ mod tests {
                         text: "Error: no such file".to_string(),
                     }],
                     is_error: true,
+                    display: None,
                 }],
             },
         ];

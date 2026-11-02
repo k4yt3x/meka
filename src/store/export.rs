@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 18;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 21;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -183,6 +183,8 @@ pub(crate) struct ExportedTurn {
     pub(crate) cancel_reason: Option<String>,
     /// The profile that served the turn when it was not the session's own.
     pub(crate) profile: Option<String>,
+    /// The permission level the turn ran under.
+    pub(crate) permission: String,
     pub(crate) usage: crate::store::turns::TurnUsage,
 }
 impl From<crate::store::turns::TurnRecord> for ExportedTurn {
@@ -202,6 +204,7 @@ impl From<crate::store::turns::TurnRecord> for ExportedTurn {
             detail,
             cancel_reason: turn.reason.map(|reason| reason.name().to_string()),
             profile: turn.profile,
+            permission: turn.permission.name().to_string(),
             usage: turn.usage,
         }
     }
@@ -458,6 +461,17 @@ pub(crate) fn plan_import(
                 return Err(crate::error::MekaError::Usage(format!(
                     "session {} in the archive records a turn source meka does not know: '{}'",
                     session.id, turn.source
+                )));
+            }
+            if turn
+                .permission
+                .parse::<crate::permission::Permission>()
+                .is_err()
+            {
+                return Err(crate::error::MekaError::Usage(format!(
+                    "session {} in the archive records a permission level meka does not know: \
+                     '{}'",
+                    session.id, turn.permission
                 )));
             }
             if let Some(reason) = &turn.cancel_reason
@@ -923,6 +937,73 @@ mod tests {
         assert!(message.contains("'text/html'"), "{message}");
     }
 
+    /// A current archive states every field its turns and boundaries record, so one that leaves a
+    /// turn's level, a boundary's checkpoint or its written summary out is refused by the name of
+    /// what it lacks, never read with a default in its place.
+    #[test]
+    fn a_current_archive_missing_a_recorded_field_is_refused_by_its_name() {
+        let mut archive = archive_on("work");
+        archive.sessions[0].turns.push(ExportedTurn {
+            id: "22222222-2222-4222-8222-222222222222".to_string(),
+            source: "client".to_string(),
+            started_at: "2020-01-01T00:00:00+00:00".to_string(),
+            ended_at: None,
+            status: None,
+            stop_reason: None,
+            error_type: None,
+            detail: None,
+            cancel_reason: None,
+            profile: None,
+            permission: "workspace".to_string(),
+            usage: crate::store::turns::TurnUsage::default(),
+        });
+        archive.sessions[0].events.push(ExportedEvent {
+            at: "2020-01-01T00:00:00Z".to_string(),
+            event: crate::conversation::Event::CompactBoundary {
+                summary: crate::conversation::Message::user("summary"),
+                replaced_count: 0,
+                loaded_tools_snapshot: std::collections::HashSet::new(),
+                checklist_snapshot: crate::checklist::ChecklistState::default(),
+                record: crate::conversation::CompactionRecord::for_test(),
+            },
+            turn_id: None,
+            copy_of: None,
+        });
+        let whole = serde_json::to_value(&archive).expect("json");
+        parse_session_export(whole.to_string().as_bytes()).expect("the whole archive reads");
+        for (field, remove) in [
+            (
+                "permission",
+                (|document: &mut serde_json::Value| {
+                    document["sessions"][0]["turns"][0]
+                        .as_object_mut()
+                        .and_then(|turn| turn.remove("permission"))
+                }) as fn(&mut serde_json::Value) -> Option<serde_json::Value>,
+            ),
+            ("checkpoint", |document| {
+                document["sessions"][0]["events"][0]["event"]["CompactBoundary"]
+                    .as_object_mut()
+                    .and_then(|boundary| boundary.remove("checkpoint"))
+            }),
+            ("written_summary", |document| {
+                document["sessions"][0]["events"][0]["event"]["CompactBoundary"]
+                    .as_object_mut()
+                    .and_then(|boundary| boundary.remove("written_summary"))
+            }),
+        ] {
+            let mut document = whole.clone();
+            assert!(
+                remove(&mut document).is_some(),
+                "the archive states {field}"
+            );
+            let refusal = match parse_session_export(document.to_string().as_bytes()) {
+                Ok(_) => panic!("an archive without {field} must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(refusal.contains(field), "{refusal}");
+        }
+    }
+
     /// A turn's source is read back typed, so an archive naming one meka does not know is refused
     /// at the door rather than written into a row every listing of the session then fails on.
     #[test]
@@ -940,6 +1021,7 @@ mod tests {
             detail: None,
             cancel_reason: None,
             profile: None,
+            permission: "read".to_string(),
             usage: crate::store::turns::TurnUsage::default(),
         });
         let message = refusal(plan_import(

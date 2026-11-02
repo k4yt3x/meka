@@ -308,6 +308,20 @@ pub(crate) async fn claim_outcomes_now(
     only_what_was_won(ready, &claimed)
 }
 
+/// How a call that went to the background is answered: the task it became and what it runs. The
+/// directions the dispatcher adds after it are the model's.
+pub(crate) fn started_notice(short_id: &str, label: &str) -> String {
+    format!("{STARTED_AS_TASK}{short_id} ({label}).")
+}
+
+/// The task a [`started_notice`] names, when `text` opens with one.
+pub(crate) fn started_task(text: &str) -> Option<&str> {
+    let (id, _) = text.strip_prefix(STARTED_AS_TASK)?.split_once(" (")?;
+    Some(id)
+}
+
+const STARTED_AS_TASK: &str = "Started in the background as task ";
+
 /// A task's label as a person or the model is shown it. Sanitized like an outcome: the label is
 /// derived from the tool's primary argument, which for `shell_execute` is a shell command line the
 /// *model* wrote, so it is no more trusted than the output it names.
@@ -520,6 +534,19 @@ pub(crate) const TASK_INDEX_TOOL: &str = "task_list";
 mod tests {
     use super::*;
     use crate::store::background::TaskStatus;
+
+    /// A screen reads the task back out of the notice the call was answered with, whatever the
+    /// label holds, and nothing out of words that only resemble it.
+    #[test]
+    fn the_started_notice_names_its_task_back() {
+        let notice = started_notice("7f3a1c22", "cargo build (release) && echo done");
+        assert_eq!(started_task(&notice), Some("7f3a1c22"));
+        assert_eq!(
+            started_task(&format!("{notice} Use `task_list` for status.")),
+            Some("7f3a1c22")
+        );
+        assert_eq!(started_task("Started the build."), None);
+    }
 
     fn task(status: TaskStatus, outcome: Option<&str>) -> BackgroundTask {
         BackgroundTask {

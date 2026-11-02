@@ -75,6 +75,8 @@ struct Run {
     enhanced: bool,
     /// The last text the child put on the terminal's clipboard, through OSC 52.
     clipboard: Option<String>,
+    /// The terminal as the child left it, its screen given back: what it printed on the way out.
+    left: Vec<String>,
 }
 
 /// [`drive`], with the terminal answering the child's keyboard protocol query as one that speaks
@@ -123,7 +125,7 @@ fn drive_run_sized(
         unsafe { prepared.exec() }
     }
     keep_master_here(master);
-    let (screens, enhanced, clipboard) = pump(master, inputs, kitty, columns);
+    let (screens, enhanced, clipboard, left) = pump(master, inputs, kitty, columns);
     // SAFETY: `master` is the fd `forkpty` handed back and is still open here, and `pid` is the
     // child it forked, reaped here and nowhere else.
     let exit = unsafe {
@@ -146,6 +148,7 @@ fn drive_run_sized(
         exit,
         enhanced,
         clipboard,
+        left,
     }
 }
 
@@ -270,7 +273,7 @@ fn pump(
     inputs: &[&str],
     kitty: bool,
     columns: u16,
-) -> (Screens, bool, Option<String>) {
+) -> (Screens, bool, Option<String>, Vec<String>) {
     let mut parser = vt100::Parser::new(ROWS, columns, 0);
     let mut screens = Vec::new();
     let mut enhanced = false;
@@ -333,8 +336,9 @@ fn pump(
                 Some(line) => {
                     screens.push(rows_of(&parser));
                     write_all(master, line.as_bytes());
-                    // A lone control byte is a keystroke, not a line.
-                    if line.len() > 1 || !line.starts_with(|c: char| c.is_control()) {
+                    // A lone control byte is a keystroke, not a line, and a paste is no Enter.
+                    let pasted = line.starts_with("\x1b[200~") && line.ends_with("\x1b[201~");
+                    if !pasted && (line.len() > 1 || !line.starts_with(|c: char| c.is_control())) {
                         write_all(master, b"\r");
                     }
                     last_activity = Instant::now();
@@ -347,7 +351,12 @@ fn pump(
             }
         }
     }
-    (screens, enhanced, last_clipboard_write(&raw))
+    (
+        screens,
+        enhanced,
+        last_clipboard_write(&raw),
+        rows_of(&parser),
+    )
 }
 
 /// The text of the last OSC 52 clipboard write in `output`, as a terminal would have taken it.
@@ -469,7 +478,7 @@ fn a_turn_draws_the_prompt_and_its_answer_above_the_composer() {
     );
     let prompt = rows
         .iter()
-        .position(|row| row == "> hi")
+        .position(|row| row == "▎ hi")
         .unwrap_or_else(|| panic!("the prompt in its block: {rows:#?}"));
     let answer = rows
         .iter()
@@ -488,8 +497,9 @@ fn a_turn_draws_the_prompt_and_its_answer_above_the_composer() {
         "the turn closes under its answer: {rows:#?}"
     );
     assert!(
-        rows.last().is_some_and(|row| row.starts_with("  read ")),
-        "the status row under the composer names the permission level: {rows:#?}"
+        rows.last()
+            .is_some_and(|row| row.starts_with("  read · default · ~/")),
+        "the status row under the composer names the level, the profile and the path: {rows:#?}"
     );
     let connection = rusqlite::Connection::open(install.database()).expect("open the store");
     let recorded: i64 = connection
@@ -571,12 +581,15 @@ fn an_always_answer_does_not_survive_a_fork() {
         rows.iter().any(|row| row.contains("Forked session")),
         "the fork has to have happened for the rest to mean anything: {rows:#?}"
     );
+    // Counted from the fork on: the first answer's row was said while its turn ran, and the
+    // reload into the copy lets it go for the replay of the log, which records none.
     let recorded = rows
         .iter()
+        .skip_while(|row| !row.contains("Forked session"))
         .filter(|row| row.contains("file_write allowed"))
         .count();
     assert_eq!(
-        recorded, 2,
+        recorded, 1,
         "the write in the copy is put to the user again, since `always` was given in the \
          original: {rows:#?}"
     );
@@ -650,14 +663,14 @@ fn a_rewind_takes_its_turns_off_the_screen() {
         "the rewound turn is gone: {rows:#?}"
     );
     assert!(
-        rows.iter().any(|row| row == "• Rewound 1 turn."),
+        rows.iter().any(|row| row == "• Rewound 1 turn"),
         "{rows:#?}"
     );
     let resumed = run_screen(&install, TWO_TURNS, &["/exit"]);
     let rows = final_screen(&resumed);
     assert!(
         rows.iter().any(|row| row.contains("First answer."))
-            && rows.iter().any(|row| row == "• Rewound 1 turn.")
+            && rows.iter().any(|row| row == "• Rewound 1 turn")
             && !rows.iter().any(|row| row.contains("Second answer.")),
         "a resume shows what the rewind left: {rows:#?}"
     );
@@ -675,7 +688,7 @@ fn a_rewind_with_a_bad_count_is_refused_in_a_panel() {
             .any(|row| row == "  /rewind takes a turn count of 1 or more, not 'all'"),
         "the refusal is the panel's body: {open:#?}"
     );
-    assert_eq!(open.last().map(String::as_str), Some("  esc to close"));
+    assert_eq!(open.last().map(String::as_str), Some("  Esc to close"));
     let rows = final_screen(&screens);
     assert!(
         !rows
@@ -694,10 +707,10 @@ fn a_command_s_refusal_is_a_panel_that_leaves_no_row() {
     let open = &screens[1];
     assert!(
         open.iter()
-            .any(|row| row == "  No active session to export."),
+            .any(|row| row == "  No active session to export"),
         "the refusal is the panel's body: {open:#?}"
     );
-    assert_eq!(open.last().map(String::as_str), Some("  esc to close"));
+    assert_eq!(open.last().map(String::as_str), Some("  Esc to close"));
     let rows = final_screen(&screens);
     assert!(
         !rows.iter().any(|row| row.contains("No active session")),
@@ -799,10 +812,41 @@ fn a_resumed_session_replays_the_reasoning_it_recorded() {
         "and shows it rendered, not as source: {rows:#?}"
     );
     assert!(
-        rows.iter()
+        !rows
+            .iter()
             .any(|row| row.starts_with("• Resuming session ")),
-        "the resume is announced first: {rows:#?}"
+        "a resume is not announced unless asked for: {rows:#?}"
     );
+}
+
+/// A run of tool calls the agent says something after folds into one row that says what it did,
+/// on the live screen and on a resume of the session alike.
+#[test]
+fn a_finished_run_of_calls_folds_into_one_row() {
+    const SCRIPT: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"checklist_read"},
+  {"type":"tool_use_end","input":{}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"tool_use_start","id":"t2","name":"checklist_read"},
+  {"type":"tool_use_end","input":{}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"Nothing is open."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = screen_install("read", "", "");
+    let live = run_screen(&install, SCRIPT, &["check the list", "/exit"]);
+    let resumed = drive(&install, &["/exit"]);
+    for rows in [final_screen(&live), final_screen(&resumed)] {
+        assert!(
+            rows.iter().any(|row| row == "▸ Used 2 tools")
+                && !rows.iter().any(|row| row.starts_with("• checklist_read")),
+            "the run is one row: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "  Nothing is open."),
+            "the words after it stand: {rows:#?}"
+        );
+    }
 }
 
 /// A resumed session holds the checklist it was left with: the item's id is the one the next
@@ -826,7 +870,8 @@ fn a_resumed_session_holds_the_checklist_it_was_left_with() {
  [{"type":"text","text":"On it."},
   {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = screen_install("read", "", "");
+    // Unfolded, so the list each call left stays on the screen to be read.
+    let install = screen_install("read", "fold_steps = false", "");
     let first = run_screen(&install, FIRST, &["plan it", "/exit"]);
     let rows = final_screen(&first);
     let row = rows
@@ -967,7 +1012,7 @@ fn an_outcome_turn_is_held_by_the_item_deferred_on_its_task() {
     let rows = final_screen(&screens);
     let body = &rows[rows
         .iter()
-        .position(|row| row == "> build and read")
+        .position(|row| row == "▎ build and read")
         .unwrap_or_else(|| panic!("the prompt: {rows:#?}"))..];
     let position = |needle: &str| {
         body.iter()
@@ -1024,13 +1069,13 @@ fn a_message_typed_during_a_turn_is_a_steer_the_turn_reads() {
     let screens = run_screen(&install, SLOW, &["go", "also check the logs", "/exit"]);
     let typed = &screens[2];
     assert!(
-        typed.iter().any(|row| row == "> also check the logs"),
+        typed.iter().any(|row| row == "▎ also check the logs"),
         "the steer is on screen the moment it is typed: {typed:#?}"
     );
     let rows = final_screen(&screens);
     let steer = rows
         .iter()
-        .position(|row| row == "  (steer)")
+        .position(|row| row == "▎ (steer)")
         .unwrap_or_else(|| panic!("the steer is marked read once the loop took it: {rows:#?}"));
     let done = rows
         .iter()
@@ -1110,7 +1155,7 @@ fn shift_enter_is_a_newline_under_the_kitty_keyboard_protocol() {
     assert!(run.enhanced, "the screen asked for the protocol");
     let rows = final_screen(&run.screens);
     assert!(
-        rows.iter().any(|row| row == "> one") && rows.iter().any(|row| row == "  two"),
+        rows.iter().any(|row| row == "▎ one") && rows.iter().any(|row| row == "▎ two"),
         "the prompt is two lines: {rows:#?}"
     );
     let plain = drive_run(&install, &["/exit"], false);
@@ -1121,15 +1166,16 @@ fn shift_enter_is_a_newline_under_the_kitty_keyboard_protocol() {
 }
 
 /// A paste that is one path to an image file attaches the file, and Enter sends it with the
-/// prompt: the transcript shows the image row, and the path is never typed.
+/// prompt: the transcript draws the picture, a 2x2 image as one row of two half-blocks at the
+/// text edge, and the path is never typed.
 #[test]
 fn a_pasted_image_path_is_attached_and_sent() {
     let install = screen_install("read", "", "");
     let paste = pasted_png(&install);
-    let screens = run_screen(&install, TWO_TURNS, &[&paste, "/exit"]);
+    let screens = run_screen(&install, TWO_TURNS, &[&paste, "", "/exit"]);
     let rows = final_screen(&screens);
     assert!(
-        rows.iter().any(|row| row == "• image"),
+        rows.iter().any(|row| row == "  ▀▀"),
         "the image went with the prompt: {rows:#?}"
     );
     assert!(
@@ -1163,14 +1209,14 @@ fn pasted_png(install: &Install) -> String {
 #[test]
 fn an_unknown_command_typed_with_an_image_is_refused() {
     let install = screen_install("read", "", "");
-    let typed = format!("{}/nosuch x", pasted_png(&install));
-    let screens = run_screen(&install, TWO_TURNS, &[&typed, "\x1b", "/exit"]);
+    let paste = pasted_png(&install);
+    let screens = run_screen(&install, TWO_TURNS, &[&paste, "/nosuch x", "\x1b", "/exit"]);
     assert!(
-        screens[1]
+        screens[2]
             .iter()
-            .any(|row| row.contains("Unknown command: /nosuch.")),
+            .any(|row| row.contains("Unknown command: /nosuch;")),
         "refused as unknown: {:#?}",
-        screens[1]
+        screens[2]
     );
     let rows = final_screen(&screens);
     assert!(
@@ -1188,10 +1234,10 @@ fn an_unknown_command_typed_with_an_image_is_refused() {
 #[test]
 fn a_shell_command_typed_with_an_image_runs_and_leaves_it_attached() {
     let install = screen_install("read", "", "");
-    let armed = format!("{}!", pasted_png(&install));
+    let paste = pasted_png(&install);
     let screens = run_screen(&install, TWO_TURNS, &[
-        &armed,
-        "echo shell-with-image",
+        &paste,
+        "!echo shell-with-image",
         "/exit",
     ]);
     let rows = final_screen(&screens);
@@ -1219,11 +1265,11 @@ fn a_shell_command_typed_with_an_image_runs_while_a_turn_does() {
   {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
     let install = screen_install("read", "", "");
-    let armed = format!("{}!", pasted_png(&install));
+    let paste = pasted_png(&install);
     let screens = run_screen(&install, LONG_ANSWER, &[
         "hi",
-        &armed,
-        "echo busy-shell",
+        &paste,
+        "!echo busy-shell",
         "/exit",
     ]);
     let rows = final_screen(&screens);
@@ -1246,12 +1292,17 @@ fn a_shell_command_typed_with_an_image_runs_while_a_turn_does() {
 #[test]
 fn a_refused_invocation_gives_its_image_back() {
     let install = screen_install("read", "", "");
-    let typed = format!("{}/skill nosuch", pasted_png(&install));
-    let screens = run_screen(&install, TWO_TURNS, &[&typed, "\x1b", "/exit"]);
+    let paste = pasted_png(&install);
+    let screens = run_screen(&install, TWO_TURNS, &[
+        &paste,
+        "/skill nosuch",
+        "\x1b",
+        "/exit",
+    ]);
     assert!(
-        screens[1].iter().any(|row| row.contains("nosuch")),
+        screens[2].iter().any(|row| row.contains("nosuch")),
         "the skill is refused: {:#?}",
-        screens[1]
+        screens[2]
     );
     let rows = final_screen(&screens);
     assert!(
@@ -1278,37 +1329,29 @@ fn a_reconnect_with_no_mcp_server_leaves_the_screen_ready() {
     );
 }
 
-/// `!` into the empty composer is the shell mode: the glyph turns to `!`, the status row says so,
+/// `!` into the empty composer is the shell mode: the status row says so in place of the level,
 /// and what is typed next runs as a command.
 #[test]
 fn a_bang_enters_the_shell_mode_and_enter_runs_the_command() {
     let install = screen_install("read", "", "");
     let screens = run_screen(&install, TWO_TURNS, &["!", "echo shell-mode-ran", "/exit"]);
     let armed = &screens[1];
-    let composer = armed
-        .iter()
-        .rposition(|row| row.starts_with("! "))
-        .or_else(|| armed.iter().rposition(|row| row == "!"));
-    assert!(
-        composer.is_some(),
-        "the composer's glyph is the shell's: {armed:#?}"
-    );
     assert!(
         armed
             .last()
-            .is_some_and(|row| row == "  Run command in shell"),
-        "the status row says what Enter will do, and nothing else: {armed:#?}"
+            .is_some_and(|row| row.starts_with("  Run command in shell") && !row.contains("read")),
+        "the status row says what Enter will do in place of the level: {armed:#?}"
     );
     let rows = final_screen(&screens);
     assert!(
-        rows.iter().any(|row| row == "> !echo shell-mode-ran")
+        rows.iter().any(|row| row == "▎ !echo shell-mode-ran")
             && rows.iter().any(|row| row == "  shell-mode-ran"),
         "the command ran and its output is on the transcript: {rows:#?}"
     );
 }
 
 /// A `!command` runs beside the screen rather than holding it, and Esc kills it with what it
-/// started: the command's own prompt row stays, `! interrupted` marks the stop, and nothing it
+/// started: the command's own prompt row stays, `! Interrupted` marks the stop, and nothing it
 /// would have printed after arrives.
 #[test]
 fn esc_stops_a_running_shell_command() {
@@ -1322,7 +1365,7 @@ fn esc_stops_a_running_shell_command() {
     );
     let rows = final_screen(&run.screens);
     assert!(
-        rows.iter().any(|row| row == "> !sleep 30; echo survived"),
+        rows.iter().any(|row| row == "▎ !sleep 30; echo survived"),
         "the command is on the transcript: {rows:#?}"
     );
     assert!(
@@ -1681,8 +1724,10 @@ fn the_row_above_the_composer_says_what_the_agent_is_doing() {
         .unwrap_or_else(|| panic!("the row says what runs and for how long: {words:?}"));
     assert!(seconds.parse::<u64>().is_ok(), "{words:?}");
     assert!(
-        working[at + 1].starts_with('>') && working[at + 1].contains("Steer the agent"),
-        "the row stands right above the composer: {working:#?}"
+        working[at + 1] == "▎"
+            && working[at + 2].starts_with('▎')
+            && working[at + 2].contains("Steer the agent"),
+        "the row stands right above the composer, whose padding row comes first: {working:#?}"
     );
     assert!(
         at > 0 && working[at - 1].is_empty(),
@@ -1711,11 +1756,11 @@ fn a_pasted_carriage_return_is_a_line_break() {
     let rows = final_screen(&screens);
     let at = rows
         .iter()
-        .position(|row| row == "> one")
+        .position(|row| row == "▎ one")
         .unwrap_or_else(|| panic!("the first pasted line is the prompt row: {rows:#?}"));
     assert_eq!(
         rows.get(at + 1).map(String::as_str),
-        Some("  two"),
+        Some("▎ two"),
         "the second line follows it: {rows:#?}"
     );
 }
@@ -1724,7 +1769,7 @@ fn a_pasted_carriage_return_is_a_line_break() {
 /// attach the older one, whose conversation then fills the screen.
 #[test]
 fn a_bare_resume_opens_the_picker_and_enter_attaches_the_pick() {
-    let install = screen_install("read", "", "");
+    let install = screen_install("read", "show_session_id_on_resume = true", "");
     install.write_script(TWO_TURNS);
     for topic in ["first topic", "second topic"] {
         let status = install
@@ -1751,7 +1796,7 @@ fn a_bare_resume_opens_the_picker_and_enter_attaches_the_pick() {
     );
     let rows = final_screen(&run.screens);
     assert!(
-        rows.iter().any(|row| row == "> first topic"),
+        rows.iter().any(|row| row == "▎ first topic"),
         "the picked session's conversation is on the screen: {rows:#?}"
     );
     assert!(
@@ -1874,14 +1919,34 @@ fn resume_switches_the_running_screen_to_the_pick() {
     );
     let rows = final_screen(&run.screens);
     assert!(
-        rows.iter().any(|row| row == "> older topic"),
+        rows.iter().any(|row| row == "▎ older topic"),
         "the screen is on the picked session: {rows:#?}"
     );
     assert!(
-        !rows.iter().any(|row| row == "> hello"),
+        !rows.iter().any(|row| row == "▎ hello"),
         "the session left behind is off the screen: {rows:#?}"
     );
     assert_eq!(run.exit, Some(0), "{rows:#?}");
+    // The run is on the pick from then on, so it leaves the pick, and the lock and the watchers
+    // it keeps are the pick's.
+    let listed = install
+        .meka(&["session", "list"])
+        .current_dir(install.work_dir())
+        .output()
+        .expect("a listing");
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    let picked = listing
+        .lines()
+        .find(|line| line.contains("older topic"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("the picked session is listed: {listing}"));
+    assert!(
+        run.left
+            .iter()
+            .any(|row| row.starts_with("Leaving session: ") && row.contains(picked)),
+        "the run leaves the session it moved to, {picked}: {:#?}",
+        run.left
+    );
 }
 
 /// A command the host answers is refused while a turn runs, in a panel naming the command, and
@@ -1895,7 +1960,7 @@ fn a_host_command_typed_during_a_turn_is_refused() {
     assert!(
         refused
             .iter()
-            .any(|row| row == "  `/compact` cannot run while a turn is running."),
+            .any(|row| row == "  `/compact` cannot run while a turn is running"),
         "the refusal names the command: {refused:#?}"
     );
     let rows = final_screen(&screens);
@@ -1904,9 +1969,7 @@ fn a_host_command_typed_during_a_turn_is_refused() {
         "the turn ended on its own: {rows:#?}"
     );
     assert!(
-        !rows
-            .iter()
-            .any(|row| row.starts_with("• ") && row.to_lowercase().contains("compact")),
+        !rows.iter().any(|row| row.contains("Context compacted")),
         "nothing was compacted once the turn ended: {rows:#?}"
     );
 }
@@ -1936,7 +1999,7 @@ fn a_new_session_opens_on_the_banner() {
     assert!(opening[0].is_empty(), "the blank row above: {opening:#?}");
     let rows = final_screen(&screens);
     assert!(
-        rows.iter().any(|row| row == "> hi"),
+        rows.iter().any(|row| row == "▎ hi"),
         "the prompt is on the transcript: {rows:#?}"
     );
     assert!(
@@ -1958,7 +2021,7 @@ fn the_prompt_that_scrolled_off_sticks_at_the_top_and_a_click_brings_it_back() {
     let screens = run_screen(&install, &script, &["hi", click, "/exit"]);
     let flowing = &screens[1];
     assert_eq!(
-        flowing[0], "> hi",
+        flowing[0], "▎ hi",
         "the prompt sticks at the top: {flowing:#?}"
     );
     assert!(
@@ -1969,11 +2032,12 @@ fn the_prompt_that_scrolled_off_sticks_at_the_top_and_a_click_brings_it_back() {
     // banner has gone with it, so there is no bar to leave a row for and the view is at its top.
     let jumped = &screens[2];
     assert_eq!(
-        jumped[0], "> hi",
-        "the prompt itself is at the top now: {jumped:#?}"
+        jumped[..2],
+        ["▎", "▎ hi"],
+        "the prompt itself is at the top now, its padding row first: {jumped:#?}"
     );
     assert_eq!(
-        jumped[2], "  line 1",
+        jumped[4], "  line 1",
         "with its answer under it: {jumped:#?}"
     );
     assert!(
@@ -1999,22 +2063,24 @@ fn clicking_the_bar_walks_back_one_prompt_at_a_time() {
         "one", "two", click, "\x0c", click, "\x0c", "/exit",
     ]);
     let at_end = &screens[2];
-    assert_eq!(at_end[0], "> two", "the last prompt sticks: {at_end:#?}");
+    assert_eq!(at_end[0], "▎ two", "the last prompt sticks: {at_end:#?}");
     let first_jump = &screens[4];
     assert_eq!(
-        first_jump[0], "> one",
+        first_jump[0], "▎ one",
         "the prompt before takes the bar: {first_jump:#?}"
     );
     assert_eq!(
-        first_jump[1], "> two",
+        first_jump[1..3],
+        ["▎", "▎ two"],
         "with the last prompt under it: {first_jump:#?}"
     );
     let second_jump = &screens[6];
     assert_eq!(
-        second_jump[0], "> one",
+        second_jump[..2],
+        ["▎", "▎ one"],
         "the first prompt is at the top, with nothing left to stick: {second_jump:#?}"
     );
-    assert_eq!(second_jump[2], "  line 1", "{second_jump:#?}");
+    assert_eq!(second_jump[4], "  line 1", "{second_jump:#?}");
 }
 
 /// A drag over the transcript selects what it covers, and the release copies it to the
@@ -2023,9 +2089,10 @@ fn clicking_the_bar_walks_back_one_prompt_at_a_time() {
 fn a_drag_over_the_transcript_copies_what_it_covers() {
     let install = screen_install("read", "", "");
     install.write_script(TWO_TURNS);
-    // SGR mouse: press at column 3 of row 3, drag to column 15, release there. The answer's row
-    // is the third: the prompt, a blank, then `  First answer.`; the banner went with the prompt.
-    let drag = "\x1b[<0;3;3M\x1b[<32;9;3M\x1b[<32;15;3M\x1b[<0;15;3m";
+    // SGR mouse: press at column 3 of row 5, drag to column 15, release there. The answer's row
+    // is the fifth: the prompt's block of three rows, a blank, then `  First answer.`; the banner
+    // went with the prompt.
+    let drag = "\x1b[<0;3;5M\x1b[<32;9;5M\x1b[<32;15;5M\x1b[<0;15;5m";
     let run = drive_run(&install, &["hi", drag, "/exit"], false);
     assert_eq!(
         run.clipboard.as_deref(),
@@ -2035,8 +2102,55 @@ fn a_drag_over_the_transcript_copies_what_it_covers() {
     );
     let lit = &run.screens[2];
     assert!(
-        lit.last().is_some_and(|row| row.contains("copied 1 row")),
+        lit.last().is_some_and(|row| row.contains("Copied 1 row")),
         "the status row says what was copied: {lit:#?}"
+    );
+}
+
+/// A drag over a code block copies its code as it was written: a line folded at the screen's
+/// edge comes back as one line, its indentation is its own rather than the screen's margins, a
+/// wide character is one character rather than one and the cell it covers, and the block's
+/// shaded padding adds nothing.
+#[test]
+fn a_dragged_code_block_copies_as_it_was_written() {
+    let install = screen_install("read", "", "");
+    let line = format!("let total = {}1;", "1 + ".repeat(30));
+    let answer = format!("Run:\n\n```js\n{line}\n  go(\"中文\")\n```\n");
+    let script = serde_json::json!([[
+        {"type": "text", "text": answer},
+        {"type": "message_end", "stop_reason": "end_turn"}
+    ]]);
+    install.write_script(script.to_string());
+    // The answer starts on the fifth row, under the prompt's block and a blank: `Run:`, a blank,
+    // the shade's padding, the folded line on two rows, `go("中文")`, and the padding again on the
+    // eleventh. The drag runs from its first column to the last column of the eleventh row.
+    let drag = format!("\x1b[<0;1;5M\x1b[<32;50;8M\x1b[<32;{COLUMNS};11M\x1b[<0;{COLUMNS};11m");
+    let run = drive_run(&install, &["hi", &drag, "/exit"], false);
+    assert_eq!(
+        run.clipboard.as_deref(),
+        Some(format!("Run:\n\n{line}\n  go(\"中文\")").as_str()),
+        "{:#?}",
+        run.screens
+    );
+}
+
+/// The history search takes the place of the composer's text inside its block, so the composer
+/// keeps its height and the transcript above it does not move.
+#[test]
+fn the_history_search_keeps_the_composer_s_height() {
+    let install = screen_install("read", "", "");
+    let screens = run_screen(&install, TWO_TURNS, &["hi", "\x12", "\x1b", "/exit"]);
+    let (idle, searching) = (&screens[1], &screens[2]);
+    // The composer's text row, above its bottom padding row and the status row.
+    let field = idle.len() - 3;
+    assert!(
+        searching[field].starts_with("▎ (reverse-i-search)"),
+        "the search line takes the text's row: {searching:#?}"
+    );
+    assert_eq!(
+        idle[..field],
+        searching[..field],
+        "the transcript stays where it was"
     );
 }
 
@@ -2105,7 +2219,7 @@ fn a_status_panel_opens_under_the_transcript_and_leaves_no_row() {
     let open = &screens[2];
     assert_eq!(
         open.last().map(String::as_str),
-        Some("  esc to close"),
+        Some("  Esc to close"),
         "the panel's footer takes the status row's place: {open:#?}"
     );
     assert!(
@@ -2124,7 +2238,7 @@ fn a_status_panel_opens_under_the_transcript_and_leaves_no_row() {
         "nothing of it stays on the transcript: {rows:#?}"
     );
     assert!(
-        rows.last().is_some_and(|row| row.starts_with("  read ")),
+        rows.last().is_some_and(|row| row.starts_with("  read · ")),
         "the composer and the status row are back: {rows:#?}"
     );
 }
@@ -2155,7 +2269,7 @@ fn the_permission_picker_sets_the_level() {
     );
     assert!(
         rows.last()
-            .is_some_and(|row| row.starts_with("  workspace ")),
+            .is_some_and(|row| row.starts_with("  workspace · ")),
         "and the status row names the new level: {rows:#?}"
     );
 }
@@ -2191,6 +2305,36 @@ fn the_skill_picker_runs_the_picked_skill() {
     );
 }
 
+/// One wheel event moves the transcript one row, since the terminal decides how many events a
+/// notch sends, and `display.wheel_rows` moves it more for a terminal that sends one.
+#[test]
+fn a_wheel_event_moves_the_transcript_the_rows_it_is_set_to() {
+    let long: String = (1..=60)
+        .map(|n| format!("line {n}\\n\\n"))
+        .collect::<String>();
+    let script = format!(
+        r#"[[{{"type":"text","text":"{long}"}},{{"type":"message_end","stop_reason":"end_turn"}}]]"#
+    );
+    // SGR mouse: the wheel turned up once, over the transcript.
+    let wheel_up = "\x1b[<64;10;5M";
+    for (display, rows) in [("", 1), ("wheel_rows = 3", 3)] {
+        let install = screen_install("read", display, "");
+        let screens = run_screen(&install, &script, &["hi", wheel_up, "/exit"]);
+        let row_of = |screen: &[String]| {
+            screen
+                .iter()
+                .position(|row| row == "  line 55")
+                .unwrap_or_else(|| panic!("line 55 is in view: {screen:#?}"))
+        };
+        assert_eq!(
+            row_of(&screens[2]) - row_of(&screens[1]),
+            rows,
+            "{display:?}: {:#?}",
+            screens[2]
+        );
+    }
+}
+
 /// Scrolling up shows the way back in the gap above the composer, and Esc takes it.
 #[test]
 fn scrolling_up_shows_the_pill_and_esc_returns_to_the_bottom() {
@@ -2208,8 +2352,8 @@ fn scrolling_up_shows_the_pill_and_esc_returns_to_the_bottom() {
         .position(|row| row.contains("↓ back to bottom"))
         .unwrap_or_else(|| panic!("the pill is shown while scrolled up: {scrolled:#?}"));
     assert!(
-        scrolled[pill + 1].starts_with(">"),
-        "it sits in the gap right above the composer: {scrolled:#?}"
+        scrolled[pill + 1] == "▎" && scrolled[pill + 2].starts_with('▎'),
+        "it sits in the gap right above the composer and its padding row: {scrolled:#?}"
     );
     assert!(
         !scrolled.iter().any(|row| row.contains("line 60")),
@@ -2231,7 +2375,7 @@ fn scrolling_up_shows_the_pill_and_esc_returns_to_the_bottom() {
 /// is shown, and Ctrl+End returns to the end with this run's rows after it.
 #[test]
 fn history_loads_as_the_view_scrolls_up() {
-    let install = screen_install("read", "", "");
+    let install = screen_install("read", "show_session_id_on_resume = true", "");
     let first = run_screen(&install, TWO_TURNS, &["first", "/exit"]);
     assert!(
         final_screen(&first)
@@ -2274,13 +2418,13 @@ fn history_loads_as_the_view_scrolls_up() {
         "the end of the log, then this run's banner: {opened:#?}"
     );
     assert!(
-        !opened.iter().any(|row| row == "> first"),
+        !opened.iter().any(|row| row == "▎ first"),
         "the first turn is a page away: {opened:#?}"
     );
     let top = &resumed[1];
     assert_eq!(
         top.first().map(String::as_str),
-        Some("> first"),
+        Some("▎ first"),
         "Ctrl+Home reaches the top of the page the screen opened on, the page read above it \
          puts the first prompt above the view, and the bar shows it: {top:#?}"
     );
@@ -2291,9 +2435,9 @@ fn history_loads_as_the_view_scrolls_up() {
     );
     let older = &resumed[2];
     assert_eq!(
-        older.first().map(String::as_str),
-        Some("> first"),
-        "Ctrl+Home again reaches the first turn: {older:#?}"
+        older.get(..2),
+        Some(&["▎".to_string(), "▎ first".to_string()][..]),
+        "Ctrl+Home again reaches the first turn, its padding row first: {older:#?}"
     );
     let rows = final_screen(&resumed);
     assert!(
@@ -2322,9 +2466,9 @@ fn a_run_without_a_terminal_is_refused_and_names_oneshot() {
     );
 }
 
-/// A code row wider than the screen folds at the edge, the way the terminal folds a one-shot's
-/// output, rather than being clipped there with its tail unreachable: every character of a fenced
-/// block is on screen, and a row's indentation stays on its first row.
+/// A code row wider than the screen folds at the edge of its shade, the way the terminal folds a
+/// one-shot's output, rather than being clipped there with its tail unreachable: every character
+/// of a fenced block is on screen, and a row's indentation stays on its first row.
 #[test]
 fn a_code_row_wider_than_the_screen_folds_at_the_edge() {
     let install = screen_install("read", "", "");
@@ -2336,25 +2480,25 @@ fn a_code_row_wider_than_the_screen_folds_at_the_edge() {
     let rows = final_screen(&screens);
     let head = rows
         .iter()
-        .position(|row| row.starts_with("      --oidc-issuer-url=https://example.invalid/"))
+        .position(|row| row.starts_with("       --oidc-issuer-url=https://example.invalid/"))
         .unwrap_or_else(|| panic!("the long row starts where its indentation puts it: {rows:#?}"));
     assert_eq!(
         rows[head].chars().count(),
-        usize::from(COLUMNS),
-        "the first row is full to the edge: {rows:#?}"
+        usize::from(COLUMNS) - 1,
+        "the first row is full to the shade's right margin: {rows:#?}"
     );
     assert!(
-        rows[head + 1].starts_with("  x") && rows[head + 1].contains("TAIL_OF_THE_ROW \\"),
-        "the rest of the row follows on the next row, at the text edge: {rows:#?}"
+        rows[head + 1].starts_with("   x") && rows[head + 1].contains("TAIL_OF_THE_ROW \\"),
+        "the rest of the row follows on the next row, at the code's edge: {rows:#?}"
     );
     assert_eq!(
         rows.get(head + 2).map(String::as_str),
-        Some("      --oidc-extra-scope=email"),
+        Some("       --oidc-extra-scope=email"),
         "the next code line keeps its own indentation: {rows:#?}"
     );
     assert_eq!(
         rows.get(head + 3).map(String::as_str),
-        Some("      indented"),
+        Some("       indented"),
         "a tab is drawn as columns, not dropped: {rows:#?}"
     );
 }

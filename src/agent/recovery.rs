@@ -563,6 +563,7 @@ impl TurnRecovery {
             assistant_message,
             crate::conversation::NudgeKind::VisibleReply,
             crate::conversation::THINKING_ONLY_NUDGE.to_string(),
+            None,
         )
         .await?;
         self.thinking_only_nudged = true;
@@ -572,7 +573,7 @@ impl TurnRecovery {
         Ok(())
     }
 
-    /// Answer a reply that stopped with checklist items open by appending `nudge` after it, as
+    /// Answer a reply that stopped with `open` checklist items by appending `nudge` after it, as
     /// one unit with the reply for the reason [`Self::nudge_thinking_only`] gives. Counted here,
     /// against the cap, so a caller cannot nudge without counting.
     pub(super) async fn nudge_checklist(
@@ -582,7 +583,13 @@ impl TurnRecovery {
         messages: &mut Conversation,
         assistant_message: &Message,
         nudge: String,
+        open: usize,
     ) -> Result<()> {
+        let said = crate::frontend::Notice::checklist_nudged(
+            open,
+            self.checklist_nudges.saturating_add(1),
+            super::CHECKLIST_NUDGE_LIMIT,
+        );
         self.append_nudge(
             agent,
             session_id,
@@ -590,6 +597,7 @@ impl TurnRecovery {
             assistant_message,
             crate::conversation::NudgeKind::Checklist,
             nudge,
+            Some(said),
         )
         .await?;
         self.checklist_nudges = self.checklist_nudges.saturating_add(1);
@@ -608,7 +616,9 @@ impl TurnRecovery {
     /// while the reply was written riding behind the nudge: a nudge round is a round boundary like
     /// a tool round's results, and reads what arrived the same way. Memory moves only once the
     /// pair is on disk, for the reason the thinking-only nudge gives, and the nudge is announced
-    /// after.
+    /// after, with `said`, the line a frontend says of it, ahead of what rode behind it, in the
+    /// order the message holds them.
+    #[allow(clippy::too_many_arguments)]
     async fn append_nudge(
         &mut self,
         agent: &Agent,
@@ -617,6 +627,7 @@ impl TurnRecovery {
         assistant_message: &Message,
         kind: crate::conversation::NudgeKind,
         text: String,
+        said: Option<crate::frontend::Notice>,
     ) -> Result<()> {
         let mut nudge = Message::nudge_message(kind, text.clone());
         let arrivals = agent.take_arrivals(session_id, &self.inbox_ids).await;
@@ -638,6 +649,13 @@ impl TurnRecovery {
             .frontend
             .emit(crate::frontend::FrontendEvent::Nudged { kind, text })
             .await;
+        if let Some(said) = said {
+            agent
+                .cells
+                .frontend
+                .emit(crate::frontend::FrontendEvent::Notice(said))
+                .await;
+        }
         arrivals.announce(&agent.cells.frontend).await;
         Ok(())
     }
@@ -756,6 +774,7 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
                         tool_use_id,
                         content,
                         is_error,
+                        display,
                     } if content
                         .iter()
                         .any(|item| !matches!(item, ToolResultContent::Text { .. })) =>
@@ -786,6 +805,8 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
                             // failed result as a success. Tier 2 sets it unconditionally: there
                             // the call and its result are both gone.
                             is_error: *is_error,
+                            // What a screen draws of the call stands, as its outcome does.
+                            display: display.clone(),
                         }
                     }
                     ContentBlock::Image { .. } => {
@@ -801,7 +822,7 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
                 })
                 .collect();
             Message {
-                role: message.role.clone(),
+                role: message.role,
                 content,
             }
         })
@@ -896,13 +917,14 @@ pub(super) fn neutralize_tool_exchanges(
                                 ),
                             }],
                             is_error: true,
+                            display: None,
                         }
                     }
                     other => other.clone(),
                 })
                 .collect();
             Message {
-                role: message.role.clone(),
+                role: message.role,
                 content,
             }
         })
@@ -1065,6 +1087,7 @@ mod tests {
                     },
                 ],
                 is_error: false,
+                display: None,
             }],
         }
     }
@@ -1089,6 +1112,7 @@ mod tests {
                     text: text.to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         }
     }
@@ -1594,6 +1618,7 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => {
                 assert_eq!(tool_use_id, "call_1", "the pairing must survive");
                 assert!(
@@ -1700,6 +1725,7 @@ mod tests {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 },
             ) => {
                 assert_eq!(id, tool_use_id, "the pairing must survive");
@@ -1775,6 +1801,7 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => {
                 assert_eq!(tool_use_id, "call_from_before", "the pairing must survive");
                 assert!(is_error);

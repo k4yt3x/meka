@@ -788,8 +788,9 @@ impl Arrivals {
             .collect()
     }
 
-    /// Tell the frontend what reported, once the blocks are in the conversation. Nothing for a
-    /// boundary that read no outcome: the items are announced when the provider reads them
+    /// Tell the frontend what arrived, once the blocks are in the conversation, in the order
+    /// [`Self::blocks`] puts them there: what reported, then the items where they landed. That the
+    /// items were read is announced when the provider reads them
     /// ([`FrontendEvent::InboxDelivered`]).
     pub(super) async fn announce(self, frontend: &Arc<dyn crate::frontend::Frontend>) {
         if let Some(text) = self.report {
@@ -797,6 +798,17 @@ impl Arrivals {
                 .emit(FrontendEvent::BackgroundReported {
                     tasks: self.outcomes,
                     text,
+                })
+                .await;
+        }
+        if !self.items.is_empty() {
+            frontend
+                .emit(FrontendEvent::InboxAppended {
+                    blocks: self
+                        .items
+                        .iter()
+                        .map(|item| inbox_block(item, true))
+                        .collect(),
                 })
                 .await;
         }
@@ -909,8 +921,12 @@ pub(super) struct StreamProgress {
 
 impl Agent {
     /// Collect current facts for both turn openings and compaction, without claiming they were
-    /// delivered.
-    pub(super) async fn read_world_snapshot(&self, session_id: Uuid) -> prompt::WorldSnapshot {
+    /// delivered, under `permission`, the level the block they land in states.
+    pub(super) async fn read_world_snapshot(
+        &self,
+        session_id: Uuid,
+        permission: crate::permission::Permission,
+    ) -> prompt::WorldSnapshot {
         let catalog = self.tool_registry.tool_catalog();
         let skills = self.skills.current().await;
         let (memories, memories_readable) = match prompt::memory_index_is_live(&catalog) {
@@ -962,7 +978,7 @@ impl Agent {
                 .with_gate_authority(
                     self.store.scheduler_memory(),
                     &scheduled,
-                    self.cells.permission.get(),
+                    permission,
                     self.options.gate_tools.as_deref(),
                 )
                 .loading_by_search(
@@ -987,6 +1003,7 @@ impl Agent {
         world_state: &str,
         budget: Option<prompt::ContextBudget>,
         resumed: bool,
+        permission: crate::permission::Permission,
     ) -> String {
         let catalog = self.tool_registry.tool_catalog();
         // Running tasks are state; completed outcomes belong to the turn that delivers them and
@@ -1006,7 +1023,6 @@ impl Agent {
         };
         let cwd = self.cells.cwd.get();
         let roots = self.cells.roots.get();
-        let permission = self.cells.permission.get();
         let readable = self
             .cells
             .site()
@@ -1446,9 +1462,13 @@ impl Agent {
             turn_id,
             source,
         } = materials;
+        // Read once, so the level the context block tells the model, the one the world state's
+        // gates are judged at and the one the turn's row records are one, whatever moves the
+        // level while the block is built.
+        let permission = self.cells.permission.get();
         // The snapshot rolls back with a withdrawn opening; compaction publishes its own snapshot
         // only after saving the replacement context.
-        let current = self.read_world_snapshot(session_id).await;
+        let current = self.read_world_snapshot(session_id, permission).await;
         let (world_state, world_state_rollback) = {
             let mut last = self.last_rendered_world.write().await;
             let rendered = prompt::render_world_state(&current, last.as_ref());
@@ -1469,6 +1489,7 @@ impl Agent {
                 &world_state,
                 Some(self.context_budget(session_id).await),
                 resumed,
+                permission,
             )
             .await;
         // What arrived for the session since its last turn rides this one's opening, whoever
@@ -1537,6 +1558,7 @@ impl Agent {
                 session_id,
                 turn_id,
                 source,
+                permission,
                 &chrono::Utc::now().to_rfc3339(),
             )
             .await
@@ -1556,6 +1578,10 @@ impl Agent {
                 false
             }
         };
+        self.cells
+            .frontend
+            .emit(FrontendEvent::TurnOpened { permission })
+            .await;
         // Announced here, where every door's opening passes, and after the save, so an attached
         // image's bytes are usually already where a reader of the announcement fetches them; a
         // save that failed files them with the first provider response instead.
@@ -1920,18 +1946,15 @@ impl Agent {
                 ) {
                     let nudge = prompt::render_checklist_nudge(&state, &reported);
                     run.recovery
-                        .nudge_checklist(self, session_id, messages, &assistant_message, nudge)
+                        .nudge_checklist(
+                            self,
+                            session_id,
+                            messages,
+                            &assistant_message,
+                            nudge,
+                            open,
+                        )
                         .await?;
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::Notice(
-                            crate::frontend::Notice::checklist_nudged(
-                                open,
-                                run.recovery.checklist_nudges,
-                                CHECKLIST_NUDGE_LIMIT,
-                            ),
-                        ))
-                        .await;
                     continue;
                 }
                 if open > 0 && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_)) {
@@ -2786,8 +2809,8 @@ impl Agent {
     }
 
     /// Announce the message an interrupt appended whole, as the opening is announced. Items that
-    /// joined the cut opening instead are not: that message was announced already, and the items
-    /// are announced when the provider reads them.
+    /// joined the cut opening instead are blocks added to a message announced already, which
+    /// [`Arrivals::announce`] announces as such.
     async fn announce_arrived(&self, arrived: Message, arrivals: &Arrivals) {
         self.cells
             .frontend
@@ -3179,12 +3202,7 @@ impl Agent {
                 StreamEvent::ToolUseEnd { input } => {
                     progress.content_started = true;
                     let (id, name) = accumulator.pending_tool();
-                    let schema = self
-                        .tool_registry
-                        .get(name)
-                        .map(|t| t.definition().parameters);
-                    let display_summary =
-                        crate::tools::resolve_primary_param(name, input, schema.as_ref());
+                    let display_summary = crate::tools::resolve_primary_param(name, input);
                     self.cells
                         .frontend
                         .emit(FrontendEvent::ToolCallStarted {
@@ -3205,12 +3223,7 @@ impl Agent {
                     let marker_input = serde_json::json!({
                         crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
                     });
-                    let schema = self
-                        .tool_registry
-                        .get(name)
-                        .map(|t| t.definition().parameters);
-                    let display_summary =
-                        crate::tools::resolve_primary_param(name, &marker_input, schema.as_ref());
+                    let display_summary = crate::tools::resolve_primary_param(name, &marker_input);
                     self.cells
                         .frontend
                         .emit(FrontendEvent::ToolCallStarted {
@@ -3758,6 +3771,13 @@ mod tests {
         );
         assert_eq!(message.text_content(), "hello");
         assert!(outcomes.is_empty() && late.is_none());
+        // The level the opening told the model is announced ahead of it, and is the row's.
+        let opened = position(|event| matches!(event, FrontendEvent::TurnOpened { .. }));
+        assert!(started < opened && opened < announced, "opened at {opened}");
+        let FrontendEvent::TurnOpened { permission } = &events[opened] else {
+            unreachable!()
+        };
+        assert_eq!(*permission, agent.cells().permission.get());
     }
 
     /// A turn whose frontend reports its client gone stops at the next round boundary, and the
@@ -7049,6 +7069,7 @@ mod tests {
                 session_id,
                 old,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 &a_hundred_days_ago,
             )
             .await
@@ -10004,6 +10025,69 @@ mod tests {
         );
     }
 
+    /// What arrived at a boundary is announced in the order the boundary's blocks hold it, the
+    /// report and then the items, so a screen draws them as a replay of the log will.
+    #[tokio::test]
+    async fn arrivals_are_announced_in_the_order_their_blocks_are_stored() {
+        let session_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let arrivals = Arrivals::new(
+            vec![crate::store::inbox::InboxItem {
+                id: Uuid::new_v4(),
+                session_id,
+                class: crate::conversation::InboxClass::Steer,
+                source: None,
+                body: "look here".to_string(),
+                created_at: now,
+                attempts: 0,
+                not_before: None,
+                last_error: None,
+                appended_at: None,
+                delivered_at: None,
+                withdrawn_at: None,
+                failure: None,
+            }],
+            vec![crate::store::background::BackgroundTask {
+                id: "7f3a1c22-0000-4000-8000-000000000000".to_string(),
+                session_id,
+                tool: "shell_execute".to_string(),
+                label: "make".to_string(),
+                status: crate::store::background::TaskStatus::Completed,
+                outcome: Some("ok\n".to_string()),
+                scratchpad_entry: None,
+                started_at: now,
+                finished_at: Some(now),
+                announced_at: None,
+                delivered_at: None,
+                subagent_id: None,
+            }],
+        );
+        let stored: Vec<&str> = arrivals
+            .blocks()
+            .iter()
+            .map(|block| match block {
+                ContentBlock::BackgroundReport { .. } => "report",
+                ContentBlock::Inbox { .. } => "item",
+                _ => "other",
+            })
+            .collect();
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        arrivals
+            .announce(&(frontend.clone() as Arc<dyn crate::frontend::Frontend>))
+            .await;
+        let announced: Vec<&str> = frontend
+            .events()
+            .iter()
+            .map(|event| match event {
+                FrontendEvent::BackgroundReported { .. } => "report",
+                FrontendEvent::InboxAppended { .. } => "item",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(stored, ["report", "item"]);
+        assert_eq!(announced, stored);
+    }
+
     fn background_round(command: &str) -> Vec<crate::provider::mock::MockEvent> {
         use crate::provider::mock::{MockEvent, MockStopReason};
         vec![
@@ -12093,6 +12177,7 @@ mod tests {
                     text: "ok".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         });
         emptied.append(Message {
@@ -12111,6 +12196,7 @@ mod tests {
                     text: "ok".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         });
         agent.hydrate_checklist(&emptied).await;
@@ -12209,6 +12295,7 @@ mod tests {
                         text: "Added with ids 1.".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             }),
             Event::Append(Message::assistant_text("Planned.")),
@@ -12230,5 +12317,766 @@ mod tests {
 
         assert_eq!(nudges_in(&messages), 1, "the recovered item held the turn");
         assert!(agent.cells.checklist.get().items.is_empty());
+    }
+
+    // ---- The screen, live and on a replay of the log ----
+    //
+    // Every round of review found the screen drawing a session one way live and another once it
+    // was resumed. These run real turns, draw each event on the screen's transcript as it arrives,
+    // then read the session's log back as the screen does when it opens one, and set the two side
+    // by side.
+
+    use crate::host::tui::model::{Item, RanUnder, Transcript};
+
+    /// The screen's transcript, as a frontend: every event applied as the screen applies it.
+    struct LiveScreen(Arc<std::sync::Mutex<Transcript>>);
+
+    #[async_trait::async_trait]
+    impl crate::frontend::Frontend for LiveScreen {
+        async fn emit(&self, event: FrontendEvent) {
+            self.0.lock().expect("the transcript").apply(event);
+        }
+
+        async fn request_permission(
+            &self,
+            _request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            crate::frontend::PermissionOutcome::Allow
+        }
+    }
+
+    fn screen_settings() -> crate::host::tui::model::Settings {
+        crate::host::tui::model::Settings {
+            show_session_id_on_create: false,
+            turn_end_summary: crate::config::TurnEndFact::DEFAULT_SUMMARY.to_vec(),
+            fold_steps: true,
+        }
+    }
+
+    /// The screen's prompt for words typed while nothing runs, drawn as Enter draws it.
+    fn typed(text: &str) -> Item {
+        Item::Prompt {
+            text: text.to_string(),
+            class: None,
+            inbox_id: None,
+            delivered: true,
+            ran_under: RanUnder::Pending,
+        }
+    }
+
+    /// What a transcript shows, an item to a line, in the terms the live screen and a replay must
+    /// agree on: what was said and by whom, how each call ended and what it recorded, and what
+    /// runs under what. Left out is what the host says on its own account, a call's streamed
+    /// output, a closing row's clock, and the counts a nudge's row carries, which the log does not
+    /// record and the replay says in the words it can; see [`without_live_news`] for the rest.
+    fn drawn_shape(transcript: &Transcript) -> Vec<String> {
+        transcript
+            .drawn()
+            .filter_map(|entry| {
+                let within = if entry.compaction.is_some() { "  " } else { "" };
+                let line = match &entry.item {
+                    Item::Prompt {
+                        text,
+                        class,
+                        delivered,
+                        ran_under,
+                        ..
+                    } => format!("prompt {text:?} {class:?} delivered={delivered} {ran_under:?}"),
+                    Item::Text { text, .. } => format!("text {text:?}"),
+                    Item::Thinking { text, ended, .. } => {
+                        format!("thinking {text:?} ended={ended}")
+                    }
+                    Item::ToolCall {
+                        name,
+                        input,
+                        state,
+                        result,
+                        result_images,
+                        change,
+                        exit_code,
+                        ..
+                    } => format!(
+                        "call {name} {input:?} {state:?} {result:?} images={result_images} \
+                         {change:?} exit={exit_code:?}"
+                    ),
+                    Item::Notice { text, .. }
+                        if text.starts_with("Checklist: ") && text.contains("continuing") =>
+                    {
+                        "nudge".to_string()
+                    }
+                    Item::Notice { level, text } => format!("notice {level:?} {text}"),
+                    Item::Checklist { items } => format!("checklist {items:?}"),
+                    Item::Compaction {
+                        headline,
+                        departures,
+                    } => format!("compaction {headline} {departures:?}"),
+                    Item::CompactionSummary { text } => format!("summary {text:?}"),
+                    Item::TurnEnd(text) => format!(
+                        "turn end {}",
+                        text.split_whitespace().next().unwrap_or_default()
+                    ),
+                    Item::Image(_) => "image".to_string(),
+                    Item::Banner { .. }
+                    | Item::SessionId { .. }
+                    | Item::Error(_)
+                    | Item::ShellOutput(_) => return None,
+                };
+                Some(format!("{within}{line}"))
+            })
+            .collect()
+    }
+
+    /// `shape` without the rows only the live screen says, news as it happens that the log does
+    /// not record: the cut of an answer an interrupt made.
+    fn without_live_news(shape: Vec<String>) -> Vec<String> {
+        shape
+            .into_iter()
+            .filter(|line| !line.starts_with("notice Info Interrupted the answer"))
+            .collect()
+    }
+
+    /// The session's log read back as the screen reads it when it opens the session: its turns,
+    /// its tasks, what its rewinds took, then its last page.
+    async fn replayed(store: &Store, session_id: Uuid) -> Transcript {
+        let mut transcript = Transcript::new(screen_settings());
+        transcript.set_turn_records(
+            store
+                .turn_store()
+                .load_turns(session_id)
+                .await
+                .expect("turns"),
+        );
+        let log_end = store.last_log_row(session_id).await.expect("the log's end");
+        transcript.set_log_end(log_end);
+        transcript.remember_background_tasks(
+            store
+                .background_store()
+                .list_background_tasks(session_id)
+                .await
+                .expect("tasks"),
+        );
+        transcript.set_rewound(store.rewound(session_id).await.expect("rewinds"));
+        let page = store
+            .log_page_before(
+                session_id,
+                log_end.map(|end| end + 1),
+                crate::host::tui::model::HISTORY_PAGE_ROWS,
+            )
+            .await
+            .expect("the last page");
+        transcript.load_page_above(page);
+        transcript
+    }
+
+    /// The live screen `agent` draws on, and the step that closes a turn as the host's word that
+    /// it is done does.
+    fn watch(agent: &mut Agent) -> Arc<std::sync::Mutex<Transcript>> {
+        let live = Arc::new(std::sync::Mutex::new(Transcript::new(screen_settings())));
+        agent.cells.frontend = Arc::new(LiveScreen(Arc::clone(&live)));
+        live
+    }
+
+    fn done(live: &std::sync::Mutex<Transcript>) {
+        let mut screen = live.lock().expect("the transcript");
+        screen.flush_turn_end();
+        screen.settle_unopened_prompts();
+    }
+
+    /// Run each prompt as a turn the screen sends, typed while nothing runs.
+    async fn typed_turns(
+        agent: &Agent,
+        live: &std::sync::Mutex<Transcript>,
+        messages: &mut Conversation,
+        prompts: &[&str],
+    ) {
+        for prompt in prompts {
+            live.lock().expect("the transcript").push(typed(prompt));
+            agent
+                .run_turn(
+                    messages,
+                    crate::agent::TurnInput::from_parts(prompt.to_string(), Vec::new())
+                        .expect("a prompt"),
+                    crate::agent::TurnCancellation::new(),
+                )
+                .await
+                .expect("the turn runs");
+            done(live);
+        }
+    }
+
+    /// Assert that what the live screen drew is what a replay of the log draws, but for the news
+    /// only the live screen says, and that the live screen reloaded in place, as a rewind or a
+    /// fork reloads it, draws exactly what a replay does, that news let go.
+    async fn assert_replays_as_drawn(
+        agent: &Agent,
+        store: &Store,
+        live: &std::sync::Mutex<Transcript>,
+    ) {
+        let session_id = agent.session_id().expect("a session");
+        let drawn = without_live_news(drawn_shape(&live.lock().expect("the transcript")));
+        let replay = drawn_shape(&replayed(store, session_id).await);
+        assert!(!drawn.is_empty(), "the run drew nothing");
+        assert_eq!(
+            drawn, replay,
+            "a resumed session reads as the live one did\nlive: {drawn:#?}\nreplay: {replay:#?}"
+        );
+        let log_end = store.last_log_row(session_id).await.expect("the log's end");
+        let turns = store
+            .turn_store()
+            .load_turns(session_id)
+            .await
+            .expect("turns");
+        let rewound = store.rewound(session_id).await.expect("rewinds");
+        let page = store
+            .log_page_before(
+                session_id,
+                log_end.map(|end| end + 1),
+                crate::host::tui::model::HISTORY_PAGE_ROWS,
+            )
+            .await
+            .expect("the last page");
+        let reloaded = {
+            let mut screen = live.lock().expect("the transcript");
+            screen.reset(log_end);
+            screen.set_turn_records(turns);
+            screen.set_rewound(rewound);
+            screen.load_page_above(page);
+            drawn_shape(&screen)
+        };
+        assert_eq!(
+            reloaded, replay,
+            "a reload draws the log once, as a replay does\nreloaded: {reloaded:#?}"
+        );
+    }
+
+    /// A tool that returns what it was given, for a round that only has to complete.
+    struct Echo;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for Echo {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "echo".to_string(),
+                description: "test".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}}
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _context: crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolOutput> {
+            Ok(crate::tools::ToolOutput::text(
+                format!("echoed {}", input["text"]),
+                false,
+            ))
+        }
+    }
+
+    /// A tool that stands in for the person typing a steer on the screen while it runs: it
+    /// enqueues the item and draws it as the screen does when it enqueues one.
+    struct ScreenSteer {
+        store: Store,
+        live: Arc<std::sync::Mutex<Transcript>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ScreenSteer {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "screen_steer".to_string(),
+                description: "test".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            context: crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolOutput> {
+            let session_id = context.session_id.expect("a tool runs inside a session");
+            let enqueued = self
+                .store
+                .inbox_store()
+                .enqueue(NewInboxItem::from_parts(
+                    session_id,
+                    InboxClass::Steer,
+                    None,
+                    "and the tests",
+                )?)
+                .await?;
+            self.live
+                .lock()
+                .expect("the transcript")
+                .push(Item::Prompt {
+                    text: "and the tests".to_string(),
+                    class: Some(InboxClass::Steer),
+                    inbox_id: Some(enqueued.id),
+                    delivered: false,
+                    ran_under: RanUnder::Pending,
+                });
+            Ok(crate::tools::ToolOutput::text("ran".to_string(), false))
+        }
+    }
+
+    fn call(id: &str, name: &str, input: serde_json::Value) -> Vec<MockEvent> {
+        vec![
+            MockEvent::ToolUseStart {
+                id: id.to_string(),
+                name: name.to_string(),
+            },
+            MockEvent::ToolUseEnd { input },
+        ]
+    }
+
+    fn tool_round(calls: Vec<Vec<MockEvent>>) -> Vec<MockEvent> {
+        let mut round: Vec<MockEvent> = calls.into_iter().flatten().collect();
+        round.push(MockEvent::MessageEnd {
+            stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+        });
+        round
+    }
+
+    /// Thinking, a round of calls, an answer, over two turns: drawn live as a replay draws them.
+    #[tokio::test]
+    async fn thinking_calls_and_answers_replay_as_drawn() {
+        let mut thinking_round = vec![
+            MockEvent::ThinkingDelta {
+                text: "Looking first.".to_string(),
+            },
+            MockEvent::ThinkingComplete { opaque: None },
+            MockEvent::Text {
+                text: "Let me look.".to_string(),
+            },
+        ];
+        thinking_round.extend(tool_round(vec![
+            call("c1", "echo", serde_json::json!({"text": "one"})),
+            call("c2", "echo", serde_json::json!({"text": "two"})),
+        ]));
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            thinking_round,
+            text_round("Both said."),
+            text_round("Second answer."),
+        ]));
+        let registry = crate::tools::ToolRegistry::new();
+        registry.register(Arc::new(Echo)).expect("register");
+        let (mut agent, store) = agent_with_registry_for_test(provider, registry).await;
+        let live = watch(&mut agent);
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["look at both", "and again"]).await;
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// What arrives at a round boundary, a background task's report and a steer another client
+    /// posted, is drawn where it lands and in the order it is stored.
+    #[tokio::test]
+    async fn a_report_and_a_steer_at_a_boundary_replay_as_drawn() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let store = Store::for_test().await;
+        let registry = crate::tools::ToolRegistry::new();
+        registry.enable_background();
+        registry
+            .register(Arc::new(GatedFixture(gate.clone())))
+            .expect("register");
+        registry
+            .register(Arc::new(AwaitFinished {
+                gate,
+                store: store.clone(),
+            }))
+            .expect("register");
+        registry
+            .register(Arc::new(EnqueueWhileRunning {
+                store: store.clone(),
+                class: InboxClass::Steer,
+                body: "also this",
+            }))
+            .expect("register");
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("cargo test"),
+            tool_round(vec![
+                call("c2", "enqueue_while_running", serde_json::json!({})),
+                call("c3", "await_finished", serde_json::json!({})),
+            ]),
+            text_round("Both in."),
+        ]));
+        let mut agent = build_test_agent(provider, registry, &store);
+        agent.enable_background_for_test(2);
+        let live = watch(&mut agent);
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["run the suite"]).await;
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// A steer the screen drew when it was typed is the turn's once the turn takes it, and reads
+    /// as the replay draws it, delivered under the turn's level.
+    #[tokio::test]
+    async fn a_steer_typed_on_the_screen_replays_as_drawn() {
+        let store = Store::for_test().await;
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            tool_round(vec![call("c1", "screen_steer", serde_json::json!({}))]),
+            text_round("With the tests."),
+        ]));
+        let registry = crate::tools::ToolRegistry::new();
+        let mut agent = build_test_agent(provider, registry, &store);
+        let live = watch(&mut agent);
+        agent
+            .tool_registry
+            .register(Arc::new(ScreenSteer {
+                store: store.clone(),
+                live: Arc::clone(&live),
+            }))
+            .expect("register");
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["write it"]).await;
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// A checklist built, a reply that leaves it open, the nudge, the edit that closes it: the
+    /// lists and the nudge are drawn where a replay draws them.
+    #[tokio::test]
+    async fn a_checklist_and_its_nudge_replay_as_drawn() {
+        use crate::provider::mock::MockStopReason;
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["write the tests"]}),
+            ),
+            answer_round("I have planned it.", MockStopReason::EndTurn),
+            checklist_call_round(
+                "edit-1",
+                "checklist_edit",
+                serde_json::json!({"id": 1, "status": "completed"}),
+            ),
+            answer_round("Done.", MockStopReason::EndTurn),
+        ]));
+        let (mut agent, store) = agent_for_test(provider).await;
+        register_checklist_tools(&agent, &store);
+        let live = watch(&mut agent);
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["plan and do it"]).await;
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// A followup typed while a turn runs waits on the screen, and once sent opens the next turn
+    /// where a replay draws that turn's prompt.
+    #[tokio::test]
+    async fn a_followup_replays_as_drawn() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            tool_round(vec![call("c1", "echo", serde_json::json!({"text": "one"}))]),
+            text_round("First."),
+            text_round("Second."),
+        ]));
+        let registry = crate::tools::ToolRegistry::new();
+        registry.register(Arc::new(Echo)).expect("register");
+        let (mut agent, store) = agent_with_registry_for_test(provider, registry).await;
+        let live = watch(&mut agent);
+        let mut messages = Conversation::new();
+        // Typed during the first turn: the screen holds it, drawn waiting where it was typed.
+        live.lock().expect("the transcript").push(typed("first"));
+        let waiting = live.lock().expect("the transcript").push(Item::Prompt {
+            text: "then this".to_string(),
+            class: Some(InboxClass::Followup),
+            inbox_id: None,
+            delivered: false,
+            ran_under: RanUnder::Pending,
+        });
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the first turn runs");
+        done(&live);
+        live.lock()
+            .expect("the transcript")
+            .send_followup(waiting, "then this".to_string());
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("then this".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the second turn runs");
+        done(&live);
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// A compaction between turns is drawn where a replay draws its boundary, in the same words,
+    /// with the turns it replaced still above it.
+    #[tokio::test]
+    async fn a_compaction_between_turns_replays_as_drawn() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("First answer."),
+            text_round("Second answer."),
+            text_round("A summary of both."),
+            text_round("After it."),
+        ]));
+        let (mut agent, store) = agent_that_compacts_for_test(provider).await;
+        let live = watch(&mut agent);
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["one", "two"]).await;
+        agent
+            .compact_session(
+                &mut messages,
+                crate::session::CompactRequest::new(crate::conversation::CompactionTrigger::Manual),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the compaction");
+        done(&live);
+        typed_turns(&agent, &live, &mut messages, &["three"]).await;
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// A scheduled fire and an invocation open turns nobody typed: each is said as the stage
+    /// direction a replay says, the invocation's words under it.
+    #[tokio::test]
+    async fn a_fire_and_an_invocation_replay_as_drawn() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("Checked."),
+            text_round("Ran the skill."),
+        ]));
+        let (mut agent, store) = agent_for_test(provider).await;
+        let live = watch(&mut agent);
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::scheduled(
+                    "7f3a1c22-0000-4000-8000-000000000000".to_string(),
+                    "check the build".to_string(),
+                    "[Scheduled job 7f3a1c22 fired]\ncheck the build".to_string(),
+                    None,
+                )
+                .expect("a fire"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the fire runs");
+        done(&live);
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::sent(
+                    vec![ContentBlock::Invocation {
+                        kind: crate::conversation::InvocationKind::Skill,
+                        name: "release".to_string(),
+                        directive: "for 0.88".to_string(),
+                        text: "[Skill: release]\nsteps\n\nfor 0.88".to_string(),
+                    }],
+                    Vec::new(),
+                )
+                .expect("an invocation"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the invocation runs");
+        done(&live);
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// A checklist call and a steer in one batch: the list the batch left is drawn after its
+    /// results and ahead of the steer that rode them, as a replay draws the message.
+    #[tokio::test]
+    async fn a_batch_s_checklist_and_a_steer_behind_it_replay_as_drawn() {
+        let store = Store::for_test().await;
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(EnqueueWhileRunning {
+                store: store.clone(),
+                class: InboxClass::Steer,
+                body: "and the docs",
+            }))
+            .expect("register");
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            tool_round(vec![
+                call(
+                    "add-1",
+                    "checklist_add",
+                    serde_json::json!({"items": ["write the tests"]}),
+                ),
+                call("c2", "enqueue_while_running", serde_json::json!({})),
+            ]),
+            complete_round("edit-1", 1),
+            text_round("Done, docs too."),
+        ]));
+        let mut agent = build_test_agent(provider, registry, &store);
+        register_checklist_tools(&agent, &store);
+        let live = watch(&mut agent);
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["plan it"]).await;
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// A steer that arrives while the nudged reply is written rides the nudge: the nudge is said,
+    /// then the steer, as a replay of the nudge's message draws them.
+    #[tokio::test]
+    async fn a_steer_riding_a_nudge_replays_as_drawn() {
+        use crate::provider::mock::MockStopReason;
+        let (mut agent, _provider, store, session_id, _frontend) = agent_with_session(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["write the tests"]}),
+            ),
+            vec![
+                MockEvent::Sleep { ms: 400 },
+                MockEvent::Text {
+                    text: "I have planned it.".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            complete_round("edit-1", 1),
+            answer_round("done", MockStopReason::EndTurn),
+        ])
+        .await;
+        register_checklist_tools(&agent, &store);
+        let live = watch(&mut agent);
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Steer,
+            "and name the file",
+            std::time::Duration::from_millis(150),
+        );
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["work"]).await;
+        enqueued.await.expect("enqueued");
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// An interrupt that cuts an answer mid-stream: what had streamed stays as the answer so far,
+    /// the message follows it, and the turn answers it, live as on a replay.
+    #[tokio::test]
+    async fn an_interrupt_that_cuts_an_answer_replays_as_drawn() {
+        let (mut agent, _provider, store, session_id, _frontend) = agent_with_session(vec![
+            a_stalled_answer("the first half", " and the rest, never sent"),
+            text_round("carrying on with your message"),
+        ])
+        .await;
+        let live = watch(&mut agent);
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "stop, do this instead",
+            std::time::Duration::from_millis(300),
+        );
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["work"]).await;
+        enqueued.await.expect("enqueued");
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// An interrupt that lands before anything streamed joins the prompt it cut, which the log
+    /// then holds once, with the message behind it.
+    #[tokio::test]
+    async fn an_interrupt_that_joins_its_prompt_replays_as_drawn() {
+        let (mut agent, _provider, store, session_id, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::Sleep { ms: 5000 },
+                MockEvent::Text {
+                    text: "late".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::EndTurn,
+                },
+            ],
+            text_round("carrying on"),
+        ])
+        .await;
+        let live = watch(&mut agent);
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "actually, this",
+            std::time::Duration::from_millis(300),
+        );
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["work"]).await;
+        enqueued.await.expect("enqueued");
+        assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// A steer typed on the screen while the model still writes the reply before a round of
+    /// calls lands after the round's results: drawn where it was typed while it waits, then where
+    /// it landed, as a replay of the log draws it.
+    #[tokio::test]
+    async fn a_steer_typed_during_a_reply_replays_where_it_landed() {
+        let mut reply = vec![
+            MockEvent::Text {
+                text: "Let me look.".to_string(),
+            },
+            MockEvent::Sleep { ms: 400 },
+        ];
+        reply.extend(tool_round(vec![call(
+            "c1",
+            "echo",
+            serde_json::json!({"text": "one"}),
+        )]));
+        let (mut agent, _provider, store, session_id, _frontend) =
+            agent_with_session(vec![reply, text_round("With the tests.")]).await;
+        agent
+            .tool_registry
+            .register(Arc::new(Echo))
+            .expect("register");
+        let live = watch(&mut agent);
+        // Typed while the reply streams, before the call is drawn: the screen enqueues it and
+        // draws it where the transcript then ends.
+        let typed_later = {
+            let store = store.clone();
+            let live = Arc::clone(&live);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let enqueued = store
+                    .inbox_store()
+                    .enqueue(
+                        NewInboxItem::from_parts(
+                            session_id,
+                            InboxClass::Steer,
+                            None,
+                            "and the tests",
+                        )
+                        .expect("item"),
+                    )
+                    .await
+                    .expect("enqueue");
+                live.lock().expect("the transcript").push(Item::Prompt {
+                    text: "and the tests".to_string(),
+                    class: Some(InboxClass::Steer),
+                    inbox_id: Some(enqueued.id),
+                    delivered: false,
+                    ran_under: RanUnder::Pending,
+                });
+            })
+        };
+        let mut messages = Conversation::new();
+        typed_turns(&agent, &live, &mut messages, &["write it"]).await;
+        typed_later.await.expect("typed");
+        assert_replays_as_drawn(&agent, &store, &live).await;
     }
 }

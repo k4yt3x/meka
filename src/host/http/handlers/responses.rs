@@ -35,8 +35,8 @@ pub(crate) struct ResponseBody {
 
 /// The answers a parked prompt takes: the four an approval takes, and the three an elicitation
 /// takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
 pub(crate) enum ResponseOutcome {
     Allow,
     Deny,
@@ -46,6 +46,80 @@ pub(crate) enum ResponseOutcome {
     Decline,
     Cancel,
 }
+
+impl ResponseOutcome {
+    /// Every answer, in the order a refusal and the schema list them.
+    pub(crate) const ALL: [ResponseOutcome; 7] = [
+        Self::Allow,
+        Self::Deny,
+        Self::AllowAlways,
+        Self::DenyAlways,
+        Self::Accept,
+        Self::Decline,
+        Self::Cancel,
+    ];
+
+    /// The answer's one spelling in a request body.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::AllowAlways => "allow_always",
+            Self::DenyAlways => "deny_always",
+            Self::Accept => "accept",
+            Self::Decline => "decline",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+
+impl std::fmt::Display for ResponseOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ResponseOutcome {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|outcome| outcome.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not an outcome. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for ResponseOutcome {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+/// The schema of an answer: a string, one of the spellings [`ResponseOutcome::name`] gives.
+impl utoipa::PartialSchema for ResponseOutcome {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .description(Some(
+                "The answers a parked prompt takes: the four an approval takes, and the three an \
+                 elicitation takes.",
+            ))
+            .enum_values(Some(Self::ALL.map(Self::name)))
+            .into()
+    }
+}
+
+impl ToSchema for ResponseOutcome {}
 
 #[utoipa::path(
     post,
@@ -218,4 +292,46 @@ fn request_not_found(session_id: Uuid, request_id: &str) -> ProblemDetail {
     )
     .with("session_id", session_id.to_string())
     .with("request_id", request_id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An answer has one spelling, in a request body and in the schema a client reads; a word
+    /// that is none of them is refused naming them.
+    #[test]
+    fn an_answer_has_its_one_spelling_in_the_body_and_the_schema() {
+        let names = ResponseOutcome::ALL.map(ResponseOutcome::name);
+        assert_eq!(names, [
+            "allow",
+            "deny",
+            "allow_always",
+            "deny_always",
+            "accept",
+            "decline",
+            "cancel"
+        ]);
+        for outcome in ResponseOutcome::ALL {
+            let body: ResponseBody =
+                serde_json::from_value(serde_json::json!({"outcome": outcome.name()}))
+                    .expect("an answer by its name");
+            assert_eq!(body.outcome, outcome);
+            assert!(
+                outcome
+                    .name()
+                    .to_uppercase()
+                    .parse::<ResponseOutcome>()
+                    .is_err()
+            );
+        }
+        let refused =
+            serde_json::from_value::<ResponseBody>(serde_json::json!({"outcome": "maybe"}))
+                .expect_err("not an answer")
+                .to_string();
+        assert!(refused.contains("allow, deny, allow_always"), "{refused}");
+        let schema = serde_json::to_value(<ResponseOutcome as utoipa::PartialSchema>::schema())
+            .expect("schema");
+        assert_eq!(schema["enum"], serde_json::json!(names));
+    }
 }

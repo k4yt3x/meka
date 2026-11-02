@@ -362,6 +362,7 @@ mod tests {
                     source: image("aGVsbG8="),
                 }],
                 is_error: false,
+                display: None,
             }],
         });
         store.save_event(session, &first, None).await.expect("save");

@@ -136,8 +136,8 @@ This is the shell's contract, where Ctrl+C signals the foreground process group 
 meka prints what survived so nothing is hidden:
 
 ```text
-(interrupted)
-2 background task(s) still running; stop them with `/task cancel --all`.
+! Interrupted
+• 2 background task(s) still running; stop them with `/task cancel --all`
 ```
 
 A **second** press during the same turn stops them. Between turns, `/task cancel --all` is the route.

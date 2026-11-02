@@ -10,6 +10,28 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.87 to 0.88
+
+Nothing in `config.toml` is renamed, but `display.status_row` and `display.turn_end_summary`
+refuse a fact listed twice: name it once. The store moves forward on its first open, and 0.87
+refuses a store 0.88 has opened; downgrading means restoring the backup the upgrade took. The
+conversions need nothing from you:
+
+- Every turn records the permission level it ran under. A turn written before takes the level
+  the first of its own messages that names one told the model, its opening in a turn meka wrote;
+  one where none does takes its session's level, or `read` on a session at a level meka does not
+  know.
+- A tool result written before records nothing of how the screen draws it, so a resumed session
+  draws those calls as 0.87 did: an edit's diff from its arguments, a write with none, and a
+  failed command as `failed`, its exit code in its output.
+- A compaction written before records no checkpoint turn, so its row opens to the memories its
+  checkpoint wrote, by name, and its summary. The summary is read out of the message the
+  compaction wrote, up to the first section meka adds after it, so a summary that held one of
+  those headings itself shows only what came before it.
+
+Session archives are `format_version` 21. A 0.87 archive imports as it is, its turns and
+compactions converted the same way.
+
 ## 0.86 to 0.87
 
 Nothing in `config.toml` is renamed. The store moves forward on its first open, and 0.86 refuses a

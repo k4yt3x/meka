@@ -1134,6 +1134,44 @@ pub(crate) fn redact_urls(text: &str) -> String {
     out
 }
 
+/// Check a value enum's one spelling per value, `spellings` in the order of `values`: each
+/// round-trips through `FromStr`, `Display` and serde, no other casing of it is read, and
+/// `refused` is refused naming `accepted`, what would have been. Pinned to the spellings a store
+/// or a client already holds, so a renamed variant or name fails here rather than in their data.
+#[cfg(test)]
+pub(crate) fn assert_one_spelling<T>(
+    values: &[T],
+    spellings: &[&str],
+    refused: &str,
+    accepted: &str,
+) where
+    T: Copy
+        + PartialEq
+        + std::fmt::Debug
+        + std::fmt::Display
+        + std::str::FromStr<Err = String>
+        + serde::Serialize
+        + serde::de::DeserializeOwned,
+{
+    assert_eq!(values.len(), spellings.len(), "a spelling for each value");
+    for (value, spelling) in values.iter().zip(spellings) {
+        assert_eq!(spelling.parse::<T>(), Ok(*value));
+        assert_eq!(value.to_string(), *spelling);
+        let json = serde_json::to_string(value).expect("serialize");
+        assert_eq!(json, format!("\"{spelling}\""));
+        assert_eq!(
+            serde_json::from_str::<T>(&json).expect("deserialize"),
+            *value
+        );
+        assert!(
+            spelling.to_uppercase().parse::<T>().is_err(),
+            "{spelling} must be the only spelling of {value:?}"
+        );
+    }
+    let refusal = refused.parse::<T>().expect_err("not a value");
+    assert!(refusal.contains(accepted), "{refusal}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

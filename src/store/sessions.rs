@@ -2051,11 +2051,11 @@ impl Store {
                             "INSERT INTO turns (id, session_id, source, started_at, ended_at, \
                              status, stop_reason, error_type, detail, input_tokens, \
                              output_tokens, cache_creation_input_tokens, \
-                             cache_read_input_tokens, cancel_reason, profile)
+                             cache_read_input_tokens, cancel_reason, profile, permission)
                              SELECT ?1, ?2, source, started_at, ended_at, status, stop_reason, \
                              error_type, detail, input_tokens, output_tokens, \
                              cache_creation_input_tokens, cache_read_input_tokens, cancel_reason, \
-                             profile
+                             profile, permission
                              FROM turns WHERE id = ?3",
                             rusqlite::params![new, new_id_string, old],
                         )?;
@@ -4858,6 +4858,7 @@ mod tests {
                 id,
                 first,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 "2026-10-06T10:00:00+00:00",
             )
             .await
@@ -4916,6 +4917,7 @@ mod tests {
                 id,
                 second,
                 crate::store::turns::TurnSource::Schedule,
+                crate::permission::Permission::Read,
                 "2026-10-06T11:00:00+00:00",
             )
             .await
@@ -5005,6 +5007,7 @@ mod tests {
                 id,
                 turn,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 "2026-10-17T10:00:00+00:00",
             )
             .await
@@ -5059,6 +5062,7 @@ mod tests {
                 id,
                 turn,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 "2026-10-06T10:00:00+00:00",
             )
             .await
@@ -5110,6 +5114,7 @@ mod tests {
                 id,
                 turn,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 "2026-10-17T10:00:00+00:00",
             )
             .await
@@ -5137,6 +5142,77 @@ mod tests {
         assert_eq!(copied[0].reason, Some(CancelReason::Abandoned));
     }
 
+    /// A turn's level travels with it through every door that copies a turn: a fork, an export
+    /// and an import. Opened at a level other than `read`, which a backfill falls back to.
+    #[tokio::test]
+    async fn a_turn_s_level_travels_through_a_fork_an_export_and_an_import() {
+        use crate::permission::Permission;
+        let store = Store::for_test().await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        store
+            .turn_store()
+            .open_turn(
+                id,
+                Uuid::new_v4(),
+                crate::store::turns::TurnSource::Client,
+                Permission::Workspace,
+                "2026-10-17T10:00:00+00:00",
+            )
+            .await
+            .expect("open");
+        let levels = |turns: Vec<crate::store::turns::TurnRecord>| -> Vec<Permission> {
+            turns.into_iter().map(|turn| turn.permission).collect()
+        };
+        let (forked, _lock) = store
+            .fork_session_locked(id, ForkOverrides::default(), SourceLock::Probe)
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        assert_eq!(
+            levels(
+                store
+                    .turn_store()
+                    .load_turns(forked.id)
+                    .await
+                    .expect("turns")
+            ),
+            [Permission::Workspace]
+        );
+        let archive = crate::store::export::build_session_export(&store, id)
+            .await
+            .expect("export");
+        assert_eq!(archive.sessions[0].turns[0].permission, "workspace");
+        let plan = crate::store::export::plan_import(
+            archive,
+            crate::store::export::ImportInstallation {
+                selected: None,
+                default: None,
+                configured: None,
+                projects: Vec::new(),
+            },
+            Some(Permission::Read),
+        )
+        .expect("plans");
+        let imported = plan.root_new_id;
+        store
+            .import_sessions(plan.records, plan.blobs)
+            .await
+            .expect("import");
+        assert_eq!(
+            levels(
+                store
+                    .turn_store()
+                    .load_turns(imported)
+                    .await
+                    .expect("turns")
+            ),
+            [Permission::Workspace]
+        );
+    }
+
     /// A turn a fallback served says so on its row, in its archive form, and on a fork's copy;
     /// one the session's own profile served says nothing.
     #[tokio::test]
@@ -5150,6 +5226,7 @@ mod tests {
                 id,
                 turn,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 "2026-10-17T10:00:00+00:00",
             )
             .await
@@ -5170,6 +5247,7 @@ mod tests {
                 id,
                 own,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 "2026-10-17T10:01:00+00:00",
             )
             .await
@@ -5677,6 +5755,7 @@ mod tests {
                     id,
                     turn,
                     crate::store::turns::TurnSource::Client,
+                    crate::permission::Permission::Read,
                     "2026-10-29T00:00:00+00:00",
                 )
                 .await
@@ -5817,6 +5896,7 @@ mod tests {
                 refused,
                 turn,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 "2026-10-29T00:00:00+00:00",
             )
             .await
@@ -7373,6 +7453,7 @@ mod tests {
                     text: "ok".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         });
         let snapshot: HashSet<String> = ["mcp__notion__fetch".to_string()].into_iter().collect();
@@ -10429,6 +10510,7 @@ mod tests {
                 session,
                 turn,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 &ended_at,
             )
             .await
@@ -10767,6 +10849,7 @@ mod tests {
                 session,
                 crashed,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 &days_ago(100),
             )
             .await
@@ -11007,6 +11090,7 @@ mod tests {
                 session,
                 turn,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 &days_ago(100),
             )
             .await
@@ -11113,6 +11197,7 @@ mod tests {
                 compacted,
                 open,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 &chrono::Utc::now().to_rfc3339(),
             )
             .await
@@ -11134,6 +11219,7 @@ mod tests {
                 crashed_in_view,
                 crashed,
                 crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
                 &days_ago(100),
             )
             .await

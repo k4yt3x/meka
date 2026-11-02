@@ -328,7 +328,7 @@ By default the summary is written by **the agent itself**, in a *checkpoint turn
 
 This matters because compaction is the one moment information is destroyed, and before this it was also the one moment the agent could not act. The alternative, a separate summarizer call, knows nothing about who the agent is or what it is for.
 
-A checkpoint can **save, but not act**. It may call the memory, scratchpad, conversation-history and read-only search tools and `checklist_read`, and nothing else; the rest of the catalog rides along for the cache's sake, and a call to any of it is refused: no shell, no file writes, no sub-agents, no scheduling, no MCP. The delete tools are excluded too, since deleting is not saving and a mistaken delete in an unattended checkpoint is unrecoverable, and so are the checklist edits, since a checkpoint's calls are not recorded and the list is what the recorded calls add up to. A tool disabled in `[tools]` stays disabled here.
+A checkpoint can **save, but not act**. It may call the memory, scratchpad, conversation-history and read-only search tools and `checklist_read`, and nothing else; the rest of the catalog rides along for the cache's sake, and a call to any of it is refused: no shell, no file writes, no sub-agents, no scheduling, no MCP. The delete tools are excluded too, since deleting is not saving and a mistaken delete in an unattended checkpoint is unrecoverable, and so are the checklist edits, since a checkpoint's calls are not part of the conversation and the list is what the conversation's calls add up to. A tool disabled in `[tools]` stays disabled here.
 
 You can say what to keep:
 
@@ -336,7 +336,7 @@ You can say what to keep:
 /compact keep the auth refactor decisions, drop the debugging
 ```
 
-The row it leaves reports what was written, because memories are durable and instance-scoped:
+The screen marks it with a rule, `→← Context compacted`, which opens to what set it going, the checkpoint's calls (each memory it wrote among them) and the summary the agent now reads. An editor without compaction support says it in one line, which names what was written, because memories are durable and instance-scoped; a one-shot run logs the same line, shown with `-v`:
 
 ```text
 Compacted the conversation on user request. Wrote 2 memories: deploy-pipeline-quirks, api-rate-limits.
@@ -606,7 +606,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 18`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 17), which is brought forward as it is read. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 21`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 20), which is brought forward as it is read. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 

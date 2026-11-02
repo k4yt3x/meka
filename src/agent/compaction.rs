@@ -199,7 +199,7 @@ fn carries_the_request(message: &Message, words: &str) -> bool {
 /// single tool result may carry inline: a pasted document with the question at either end keeps
 /// both ends, and the archive keeps all of it.
 fn quote_request(words: &str) -> String {
-    let limit = crate::tools::scratchpad::MAX_INLINE_RESULT_BYTES;
+    let limit = crate::conversation::MAX_INLINE_RESULT_BYTES;
     if words.len() <= limit {
         return words.to_string();
     }
@@ -396,6 +396,77 @@ fn summarize_all_but_a_trailing_prompt(view: &[Message]) -> (Vec<Message>, Vec<M
         _ => (view.to_vec(), Vec::new()),
     }
 }
+/// A checkpoint round as a boundary records it for a screen: its reasoning as text alone, without
+/// what a provider needs back to carry it on, and its results without their images, since the
+/// record is never sent and only what is sent keeps its images in the blob store. Every
+/// `context_replace` call, which hands the summary in or tries to, is left out, since the record
+/// holds the summary as written (the round's results leave out its result, by place, as the
+/// caller builds them); and an argument longer than a result keeps inline is cut there, so a
+/// call refused with a whole file in it does not put the file in the record.
+fn round_for_display(message: &Message) -> Message {
+    let content = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } => {
+                (!thinking.trim().is_empty()).then(|| ContentBlock::Thinking {
+                    thinking: thinking.clone(),
+                    opaque: None,
+                })
+            }
+            ContentBlock::RedactedThinking { .. } => None,
+            ContentBlock::ToolUse { name, .. } if name == "context_replace" => None,
+            ContentBlock::ToolUse { id, name, input } => Some(ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: bounded_argument(input),
+            }),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                display,
+            } => Some(ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content
+                    .iter()
+                    .filter(|part| {
+                        !matches!(part, crate::conversation::ToolResultContent::Image { .. })
+                    })
+                    .cloned()
+                    .collect(),
+                is_error: *is_error,
+                display: display.clone(),
+            }),
+            other => Some(other.clone()),
+        })
+        .collect();
+    Message {
+        role: message.role,
+        content,
+    }
+}
+
+/// `value` with every string in it cut at what a result keeps inline.
+fn bounded_argument(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let limit = crate::conversation::MAX_INLINE_RESULT_BYTES;
+    match value {
+        Value::String(text) if text.len() > limit => {
+            let kept = text.get(..text.floor_char_boundary(limit)).unwrap_or("");
+            Value::String(format!("{kept}…"))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(bounded_argument).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), bounded_argument(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Cap a checkpoint tool result at the size a normal turn would allow inline.
 ///
 /// A normal turn spills anything larger to the scratchpad
@@ -414,7 +485,7 @@ pub(super) fn bound_checkpoint_result(
 ) -> Vec<crate::conversation::ToolResultContent> {
     use crate::conversation::ToolResultContent;
 
-    let limit = crate::tools::scratchpad::MAX_INLINE_RESULT_BYTES;
+    let limit = crate::conversation::MAX_INLINE_RESULT_BYTES;
     content
         .into_iter()
         .map(|item| match item {
@@ -503,6 +574,7 @@ impl Agent {
         // the moment it runs and the turn can still fail or be canceled afterwards; returned by
         // value it would be dropped on exactly those paths, and the caller told none were written.
         let mut memories_written: Vec<String> = Vec::new();
+        let mut checkpoint_rounds: Vec<Message> = Vec::new();
         // The checkpoint's own reads reserve on the session's gauge, and nothing they return enters
         // the conversation, so the charge is put back whatever the checkpoint's outcome; a failure
         // below would otherwise leave it counting against the next turn's headroom until the next
@@ -522,6 +594,7 @@ impl Agent {
                     messages,
                     cancellation.clone(),
                     &mut memories_written,
+                    &mut checkpoint_rounds,
                 )
                 .await
             {
@@ -619,14 +692,18 @@ impl Agent {
             ),
         };
 
-        let world = self.read_world_snapshot(session_id).await;
-        let post_context = self.build_post_compact_context(session_id, &world).await;
+        // Read once, so the world state's gates, the block and the guidance after it speak of
+        // the same level.
+        let permission = self.cells.permission.get();
+        let world = self.read_world_snapshot(session_id, permission).await;
+        let post_context = self
+            .build_post_compact_context(session_id, &world, permission)
+            .await;
         // The summary shows the list as it stands, from the cell; the boundary above carries it
         // as it stood before the tail.
         let live_checklist = self.cells.checklist.get();
 
         let mut context_message = format!("{COMPACTION_SUMMARY_PREFIX}\n\n{summary_text}");
-        let summary_as_written = summary_text;
         // Before the request section, so the message reads in the order things happened: what was
         // received and handled, then the request still being answered.
         if !retained.is_empty() {
@@ -731,6 +808,8 @@ impl Agent {
             source,
             memories_written: memories_written.clone(),
             kept_recent: !to_keep.is_empty(),
+            written_summary: summary_text,
+            checkpoint: checkpoint_rounds,
         };
         messages.replace_for_compaction(
             summary_user_message,
@@ -823,7 +902,6 @@ impl Agent {
                 record: record.clone(),
                 replaced_count,
                 generation: reported_generation,
-                summary: summary_as_written,
             })
             .await;
         if self.role.is_root() {
@@ -909,6 +987,9 @@ impl Agent {
         // Accumulated in the caller's buffer rather than returned, so a checkpoint that writes a
         // memory and *then* fails or is canceled still reports what landed on disk.
         memories_written: &mut Vec<String>,
+        // Accumulated the same way, so the rounds a checkpoint ran before it failed are shown
+        // with the compaction the summarizer then completed.
+        rounds: &mut Vec<Message>,
     ) -> Result<Option<Checkpoint>> {
         let attribution = self.compaction_attribution(request);
         // The request carries what the turn's own builder sends from the same loaded set, so its
@@ -1022,6 +1103,7 @@ impl Agent {
             for notice in notices {
                 self.forward_notice(notice).await;
             }
+            rounds.push(round_for_display(&assistant_message));
 
             let tool_uses: Vec<(String, String, serde_json::Value)> = assistant_message
                 .content
@@ -1039,7 +1121,11 @@ impl Agent {
 
             checkpoint_messages.push(assistant_message);
             let mut results = Vec::with_capacity(tool_uses.len());
+            // Whether each result goes into the record, by its place: every result but a
+            // `context_replace`'s, whose call the record leaves out.
+            let mut recorded = Vec::with_capacity(tool_uses.len());
             for (tool_use_id, name, input) in tool_uses {
+                recorded.push(name != "context_replace");
                 let output = match admitted.get(&name) {
                     // Approvals put a call above the level to the user, and a checkpoint's writes
                     // are actions: `memory_write` overwrites an existing note in place, durably and
@@ -1090,16 +1176,29 @@ impl Agent {
                 {
                     memories_written.push(memory.to_string());
                 }
+                let display = self.result_display(&name, &output).await;
                 results.push(ContentBlock::ToolResult {
                     tool_use_id,
                     content: bound_checkpoint_result(output.content),
                     is_error: output.is_error,
+                    display,
                 });
             }
-            checkpoint_messages.push(Message {
+            let results = Message {
                 role: Role::User,
                 content: results,
-            });
+            };
+            rounds.push(round_for_display(&Message {
+                role: Role::User,
+                content: results
+                    .content
+                    .iter()
+                    .zip(&recorded)
+                    .filter(|(_, recorded)| **recorded)
+                    .map(|(block, _)| block.clone())
+                    .collect(),
+            }));
+            checkpoint_messages.push(results);
 
             if armed.is_submitted() {
                 break;
@@ -1257,17 +1356,19 @@ impl Agent {
         counted
     }
 
-    /// Restore current guidance before a continuing request, without replaying delivered outcomes.
+    /// Restore current guidance before a continuing request, without replaying delivered outcomes:
+    /// the block and the guidance after it at `permission`, the level `world` was read at.
     pub(super) async fn build_post_compact_context(
         &self,
         session_id: Uuid,
         world: &prompt::WorldSnapshot,
+        permission: crate::permission::Permission,
     ) -> String {
         let world_state = prompt::render_world_state(world, None);
         // Occupancy is remeasured after the replacement is assembled; the pre-compaction gauge
         // would describe the window being discarded.
         let live = self
-            .build_live_context(session_id, &world_state, None, false)
+            .build_live_context(session_id, &world_state, None, false, permission)
             .await;
         // Degrades rather than fails, since the summary is what keeps the session alive, but not
         // silently: an empty inventory tells the model it saved nothing, and it re-derives work it
@@ -1283,7 +1384,7 @@ impl Agent {
         };
         prompt::build_post_compact_context(
             &live,
-            self.cells.permission.get(),
+            permission,
             &entries,
             &prompt::AvailableTools::new(self.tool_registry.registered_tool_names()),
         )
@@ -1688,6 +1789,188 @@ mod tests {
         );
     }
 
+    /// A compaction records the rounds its checkpoint ran, without what a provider needs back to
+    /// carry reasoning on, so a screen can show them under the compaction's row, and the summary
+    /// as written; the boundary records what the announcement carried, so a resumed session shows
+    /// what the live one did.
+    #[tokio::test]
+    async fn a_compaction_records_its_checkpoint_and_its_summary_as_announced() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ThinkingDelta {
+                    text: "saving the note first".to_string(),
+                },
+                MockEvent::ThinkingComplete {
+                    opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                        signature: "sealed".to_string(),
+                    }),
+                },
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "memory_write".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"name": "note"}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            replace_round("what I was doing", None),
+        ]));
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(StubTool {
+                name: "memory_write".to_string(),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .expect("register stub");
+        let (mut agent, store) = agent_with_registry_and_checkpoint(provider, registry).await;
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        let mut messages = conversation();
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session"),
+        );
+
+        agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Manual),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("compaction");
+
+        let announced = frontend
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                FrontendEvent::Compacted { record, .. } => Some(record),
+                _ => None,
+            })
+            .expect("the compaction was announced");
+        let Some(crate::conversation::Event::CompactBoundary { record, .. }) = messages
+            .events()
+            .iter()
+            .find(|event| matches!(event, crate::conversation::Event::CompactBoundary { .. }))
+        else {
+            panic!("a boundary");
+        };
+        assert_eq!(
+            *record, announced,
+            "the boundary records what was announced"
+        );
+        assert_eq!(record.written_summary, "what I was doing");
+        let blocks: Vec<&ContentBlock> = record
+            .checkpoint
+            .iter()
+            .flat_map(|round| &round.content)
+            .collect();
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::Thinking { thinking, opaque: None } if thinking == "saving the note first"
+            )),
+            "the reasoning is kept as text alone: {blocks:?}"
+        );
+        assert!(
+            blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolUse { name, .. } if name == "memory_write")
+            ) && blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call-1")),
+            "the call and its result are recorded: {blocks:?}"
+        );
+    }
+
+    /// The record leaves out the call that hands the summary in, and its result by its place, so
+    /// a provider that numbers the calls of a round alike keeps the other call's result.
+    #[tokio::test]
+    async fn a_checkpoint_record_leaves_out_the_submission_by_its_place() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: "memory_write".to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({"name": "note"}),
+            },
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: "context_replace".to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({"summary": "done"}),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::ToolUse,
+            },
+        ]]));
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(StubTool {
+                name: "memory_write".to_string(),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .expect("register stub");
+        let (agent, store) = agent_with_registry_and_checkpoint(provider, registry).await;
+        let mut messages = conversation();
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session"),
+        );
+        agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Manual),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("compaction");
+        let Some(crate::conversation::Event::CompactBoundary { record, .. }) = messages
+            .events()
+            .iter()
+            .find(|event| matches!(event, crate::conversation::Event::CompactBoundary { .. }))
+        else {
+            panic!("a boundary");
+        };
+        let blocks: Vec<&ContentBlock> = record
+            .checkpoint
+            .iter()
+            .flat_map(|round| &round.content)
+            .collect();
+        let calls: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let results: Vec<String> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(
+                    content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ToolResultContent::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, vec!["memory_write"], "{blocks:?}");
+        assert_eq!(results, vec!["stub ran".to_string()], "{blocks:?}");
+    }
+
     /// The checkpoint's request is the turn's: the whole catalog, tools outside its allow-list
     /// included, and the images the conversation holds. That is what lets the provider answer it
     /// from the turn's cached prefix rather than re-read the conversation; what the checkpoint may
@@ -1870,6 +2153,7 @@ mod tests {
                         text: "x".repeat(5_000),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             });
         }
@@ -1948,6 +2232,7 @@ mod tests {
                         text: "x".repeat(10_000),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             });
         }
@@ -2041,6 +2326,7 @@ mod tests {
                     text: "ok".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         };
         messages.append(call(
@@ -2139,6 +2425,7 @@ mod tests {
                     text: "ok".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         };
         messages.append(call(
@@ -2255,7 +2542,7 @@ mod tests {
             "{quoted}"
         );
         assert!(
-            quoted.len() < crate::tools::scratchpad::MAX_INLINE_RESULT_BYTES + 200,
+            quoted.len() < crate::conversation::MAX_INLINE_RESULT_BYTES + 200,
             "{}",
             quoted.len()
         );
@@ -2984,7 +3271,7 @@ mod tests {
     fn checkpoint_tool_results_are_bounded_like_a_normal_turn() {
         use crate::conversation::ToolResultContent;
 
-        let limit = crate::tools::scratchpad::MAX_INLINE_RESULT_BYTES;
+        let limit = crate::conversation::MAX_INLINE_RESULT_BYTES;
         let bounded = bound_checkpoint_result(vec![ToolResultContent::Text {
             text: "x".repeat(limit * 3),
         }]);
@@ -3184,6 +3471,7 @@ mod tests {
                         text: "x".repeat(6_000),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             });
         }
@@ -3261,6 +3549,7 @@ mod tests {
                         tool_use_id: "t1".to_string(),
                         content: Vec::new(),
                         is_error: false,
+                        display: None,
                     },
                     ContentBlock::Text {
                         text: relayed.clone(),
@@ -3402,6 +3691,7 @@ mod tests {
                         text: format!("result {round} {}", "x".repeat(300)),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             });
         }
@@ -4115,7 +4405,9 @@ mod tests {
                 !summary.contains("[Context budget]"),
                 "the old occupancy is not current"
             );
-            let restored_world = agent.read_world_snapshot(session_id).await;
+            let restored_world = agent
+                .read_world_snapshot(session_id, agent.cells.permission.get())
+                .await;
             assert_eq!(
                 *agent.last_rendered_world.read().await,
                 Some(restored_world)

@@ -739,6 +739,7 @@ mod tests {
                 text: "ok".to_string(),
             }],
             is_error,
+            display: None,
         }
     }
 

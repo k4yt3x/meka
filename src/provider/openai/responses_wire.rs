@@ -1209,6 +1209,7 @@ mod tests {
                             text: "contents".to_string(),
                         }],
                         is_error: false,
+                        display: None,
                     },
                     ContentBlock::Text {
                         text: "[Message from test, arrived now]\nalso, what is 17*3?".to_string(),
@@ -1251,6 +1252,7 @@ mod tests {
                         text: "contents".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];
@@ -1374,6 +1376,7 @@ mod tests {
                     text: "result".to_string(),
                 }],
                 is_error: false,
+                display: None,
             }],
         }];
         let body = build_request_body("gpt-5", "", &messages, &[], None, None, true);
@@ -1984,6 +1987,7 @@ mod tests {
                         },
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
             Message::user("and now this"),
@@ -2284,6 +2288,7 @@ mod tests {
                 tool_use_id: "call_1".to_string(),
                 content: vec![image_content("image/png", "QkFTRTY0")],
                 is_error: false,
+                display: None,
             }],
         });
         let body = build_request_body("gpt-5", "", &messages, &[], None, None, true);
@@ -2427,6 +2432,7 @@ mod tests {
                         tool_name: "mcp__kv__probe".to_string(),
                     }],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];
@@ -2477,6 +2483,7 @@ mod tests {
                         },
                     ],
                     is_error: false,
+                    display: None,
                 }],
             },
         ];

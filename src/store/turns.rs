@@ -28,6 +28,9 @@ pub(crate) struct TurnRecord {
     pub(crate) source: TurnSource,
     /// RFC 3339, when the turn began.
     pub(crate) started_at: String,
+    /// The permission level the turn ran under, as its opening told the model.
+    #[cfg_attr(feature = "serve", schema(value_type = String))]
+    pub(crate) permission: crate::permission::Permission,
     /// RFC 3339, when the turn ended.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ended_at: Option<String>,
@@ -376,7 +379,8 @@ impl TurnEnding {
 /// The columns of one turn, aliased `t`, in the order [`turn_from_row`] reads them.
 pub(super) const TURN_COLUMNS: &str = "t.id, t.source, t.started_at, t.ended_at, t.status, \
      t.stop_reason, t.error_type, t.detail, t.input_tokens, t.output_tokens, \
-     t.cache_creation_input_tokens, t.cache_read_input_tokens, t.cancel_reason, t.profile";
+     t.cache_creation_input_tokens, t.cache_read_input_tokens, t.cancel_reason, t.profile, \
+     t.permission";
 
 /// The join that puts a session's latest turn beside its row as `t`, every column NULL for a
 /// session no turn has begun on. The latest by when it began, whatever its state: a turn the
@@ -443,6 +447,16 @@ pub(super) fn turn_from_row(
                 )
             })?,
         started_at: row.get(offset + 2)?,
+        permission: row
+            .get::<_, String>(offset + 14)?
+            .parse()
+            .map_err(|error: String| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    offset + 14,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?,
         ended_at: row.get(offset + 3)?,
         status,
         stop_reason: row.get(offset + 5)?,
@@ -471,6 +485,7 @@ impl TurnStore {
         session_id: Uuid,
         turn_id: Uuid,
         source: TurnSource,
+        permission: crate::permission::Permission,
         started_at: &str,
     ) -> Result<()> {
         let source = source.name();
@@ -478,11 +493,13 @@ impl TurnStore {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO turns (id, session_id, source, started_at) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO turns (id, session_id, source, permission, started_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     rusqlite::params![
                         turn_id.to_string(),
                         session_id.to_string(),
                         source,
+                        permission.name(),
                         started_at
                     ],
                 )?;
@@ -633,8 +650,8 @@ pub(super) fn insert_turn_row(
     transaction.execute(
         "INSERT INTO turns (id, session_id, source, started_at, ended_at, status, stop_reason, \
          error_type, detail, input_tokens, output_tokens, cache_creation_input_tokens, \
-         cache_read_input_tokens, cancel_reason, profile)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         cache_read_input_tokens, cancel_reason, profile, permission)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             turn.id,
             session_id,
@@ -651,6 +668,7 @@ pub(super) fn insert_turn_row(
             turn.usage.cache_read_input_tokens as i64,
             turn.cancel_reason,
             turn.profile,
+            turn.permission,
         ],
     )?;
     Ok(())
