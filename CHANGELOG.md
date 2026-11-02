@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ACP: an approved call from a compaction's checkpoint no longer leaves a card running.
 - ACP: a sub-agent's approval prompt has a card of its own and leaves the `agent_spawn` card alone.
 
+### Security
+
+- RUSTSEC-2026-0433: `pulldown-cmark` moves to 0.13.6.
+
 ## [0.87.0] - 2026-10-31
 
 ### Added
