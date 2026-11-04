@@ -408,8 +408,8 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
 ///
 /// An allow-list, because the guiding rule is that **a checkpoint can save, but not act**: the turn
 /// exists to preserve what already happened, not to do more work while the window is about to be
-/// rewritten. So no `shell_execute`, no `file_write` / `file_edit`, no `agent_spawn`, no
-/// `schedule_*`, and no MCP tools.
+/// rewritten. So no `shell_execute`, no `file_write` / `file_edit` / `scratchpad_save_file`, no
+/// `agent_spawn`, no `schedule_*`, and no MCP tools.
 ///
 /// The read tools *are* here, because deciding what is worth keeping sometimes means checking
 /// something first. The two delete tools are not: deleting is not saving, and a mistaken
@@ -426,12 +426,16 @@ pub(crate) const CHECKPOINT_TOOL_NAMES: &[&str] = &[
     "file_find",
     "file_read",
     "file_search",
+    "memory_edit",
     "memory_read",
     "memory_search",
     "memory_write",
     "scratchpad_edit",
     "scratchpad_list",
+    "scratchpad_load_file",
+    "scratchpad_merge",
     "scratchpad_read",
+    "scratchpad_rename",
     "scratchpad_write",
 ];
 /// Warn (never fail) on `[tools]` entries that don't match any known built-in. Mirrors MCP's
@@ -2874,6 +2878,7 @@ mod tests {
             "shell_execute",
             "file_write",
             "file_edit",
+            "scratchpad_save_file",
             "agent_spawn",
             "schedule_create",
             "web_fetch",
@@ -2888,6 +2893,23 @@ mod tests {
             );
         }
         assert!(CHECKPOINT_TOOL_NAMES.contains(&"checklist_read"));
+    }
+
+    /// Saving is what a checkpoint is for, so every memory and scratchpad tool is on the list but
+    /// the deletes and `scratchpad_save_file`, which writes a file, and a tool added to either
+    /// family is placed by a decision rather than left off by default.
+    #[test]
+    fn checkpoint_tool_names_include_every_memory_and_scratchpad_tool_that_saves() {
+        for name in BUILTIN_TOOL_NAMES.iter().filter(|name| {
+            (name.starts_with("memory_") || name.starts_with("scratchpad_"))
+                && !name.ends_with("_delete")
+                && **name != "scratchpad_save_file"
+        }) {
+            assert!(
+                CHECKPOINT_TOOL_NAMES.contains(name),
+                "{name} saves, so a checkpoint turn must reach it"
+            );
+        }
     }
 
     /// `context_replace` is always supplied, even against a registry holding nothing else, because

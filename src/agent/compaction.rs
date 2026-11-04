@@ -43,8 +43,9 @@ pub(super) fn report_checkpoint_memories(memories_written: &[String]) {
 #[derive(Debug, Clone)]
 pub(crate) struct CompactOutcome {
     pub(crate) source: CompactionSource,
-    /// Memories the checkpoint turn wrote, observed from its `memory_write` calls rather than
-    /// self-reported, so this cannot disagree with what actually landed on disk.
+    /// Memories the checkpoint turn wrote, each once, observed from its `memory_write` and
+    /// `memory_edit` calls rather than self-reported, so this cannot disagree with what actually
+    /// landed on disk.
     pub(crate) memories_written: Vec<String>,
     pub(crate) kept_recent: bool,
 }
@@ -1188,9 +1189,10 @@ impl Agent {
                 };
                 // Observed, never self-reported: a derived list cannot disagree with what landed on
                 // disk. Only successful writes count.
-                if name == "memory_write"
+                if (name == "memory_write" || name == "memory_edit")
                     && !output.is_error
                     && let Some(memory) = input.get("name").and_then(serde_json::Value::as_str)
+                    && !memories_written.iter().any(|written| written == memory)
                 {
                     memories_written.push(memory.to_string());
                 }
@@ -3833,6 +3835,54 @@ mod tests {
             conversation_alone + 12_000,
             "the seed must carry the overhead the measurement it replaces carried"
         );
+    }
+
+    /// An edit changes a memory as durably as a write does, so a checkpoint's report names the
+    /// memories it edited with the ones it wrote, each once however many calls touched it.
+    #[tokio::test]
+    async fn a_checkpoint_reports_each_memory_it_wrote_or_edited_once() {
+        let call = |id: &str, name: &str, memory: &str| {
+            vec![
+                MockEvent::ToolUseStart {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"name": memory}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            call("call-1", "memory_write", "a"),
+            call("call-2", "memory_edit", "a"),
+            call("call-3", "memory_edit", "b"),
+            replace_round("summary", None),
+        ]));
+        let registry = crate::tools::ToolRegistry::new();
+        for name in ["memory_write", "memory_edit"] {
+            registry
+                .register(Arc::new(StubTool {
+                    name: name.to_string(),
+                    calls: Default::default(),
+                }))
+                .expect("register stub");
+        }
+        let (agent, store) = agent_with_registry_and_checkpoint(provider, registry).await;
+        let mut messages = conversation();
+
+        let outcome = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Manual),
+        )
+        .await;
+
+        assert_eq!(outcome.source, CompactionSource::Checkpoint);
+        assert_eq!(outcome.memories_written, ["a", "b"]);
     }
 
     /// A checkpoint runs unattended and can call `memory_write`, which overwrites a note in

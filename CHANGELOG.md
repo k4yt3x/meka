@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.88.1] - 2026-11-04
+
+### Fixed
+
+- A compaction's checkpoint can call `memory_edit`, and its report names each changed memory once.
+- A compaction's checkpoint can merge, rename and load files into scratchpad entries.
+
 ## [0.88.0] - 2026-11-02
 
 ### Added
@@ -3112,7 +3119,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.88.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.88.1...HEAD
+[0.88.1]: https://github.com/k4yt3x/meka/compare/0.88.0...0.88.1
 [0.88.0]: https://github.com/k4yt3x/meka/compare/0.87.0...0.88.0
 [0.87.0]: https://github.com/k4yt3x/meka/compare/0.86.0...0.87.0
 [0.86.0]: https://github.com/k4yt3x/meka/compare/0.85.0...0.86.0

@@ -328,7 +328,7 @@ By default the summary is written by **the agent itself**, in a *checkpoint turn
 
 This matters because compaction is the one moment information is destroyed, and before this it was also the one moment the agent could not act. The alternative, a separate summarizer call, knows nothing about who the agent is or what it is for.
 
-A checkpoint can **save, but not act**. It may call the memory, scratchpad, conversation-history and read-only search tools and `checklist_read`, and nothing else; the rest of the catalog rides along for the cache's sake, and a call to any of it is refused: no shell, no file writes, no sub-agents, no scheduling, no MCP. The delete tools are excluded too, since deleting is not saving and a mistaken delete in an unattended checkpoint is unrecoverable, and so are the checklist edits, since a checkpoint's calls are not part of the conversation and the list is what the conversation's calls add up to. A tool disabled in `[tools]` stays disabled here.
+A checkpoint can **save, but not act**. It may call the memory, scratchpad, conversation-history and read-only search tools and `checklist_read`, and nothing else; the rest of the catalog rides along for the cache's sake, and a call to any of it is refused: no shell, no file writes (`scratchpad_save_file` included), no sub-agents, no scheduling, no MCP. The delete tools are excluded too, since deleting is not saving and a mistaken delete in an unattended checkpoint is unrecoverable, and so are the checklist edits, since a checkpoint's calls are not part of the conversation and the list is what the conversation's calls add up to. A tool disabled in `[tools]` stays disabled here.
 
 You can say what to keep:
 
