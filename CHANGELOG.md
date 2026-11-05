@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.88.3] - 2026-11-05
+
+### Fixed
+
+- A failed turn's message no longer says the provider's response is in the meka log.
+
 ## [0.88.2] - 2026-11-05
 
 ### Changed
@@ -3125,7 +3131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.88.2...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.88.3...HEAD
+[0.88.3]: https://github.com/k4yt3x/meka/compare/0.88.2...0.88.3
 [0.88.2]: https://github.com/k4yt3x/meka/compare/0.88.1...0.88.2
 [0.88.1]: https://github.com/k4yt3x/meka/compare/0.88.0...0.88.1
 [0.88.0]: https://github.com/k4yt3x/meka/compare/0.87.0...0.88.0

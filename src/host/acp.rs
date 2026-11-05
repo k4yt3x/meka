@@ -140,15 +140,7 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
         | crate::error::ErrorKind::ProviderUnavailable
         | crate::error::ErrorKind::ProviderExhausted
         | crate::error::ErrorKind::ContextOverflow => {
-            // The quota sentence says what happened and when it ends, not where the response
-            // went, which the editor is owed with the response withheld.
-            let sentence = match error {
-                MekaError::ProviderExhausted { .. } => {
-                    format!("{}; its response is in the meka log", error.sentence())
-                }
-                _ => error.sentence(),
-            };
-            withhold_or_relay(&sentence, error.upstream_body().unwrap_or_default())
+            withhold_or_relay(&error.sentence(), error.upstream_body().unwrap_or_default())
         }
         // The names travel and the reasons do not: a connector's reason has carried a spawn
         // failure complete with the command line and its path.
@@ -809,9 +801,10 @@ mod tests {
             let withheld = acp_error_for(&error, false);
             let data = serde_json::to_string(&withheld.data).unwrap_or_default();
             assert!(!data.contains("acct-0f3c"), "{error}: {data}");
-            assert!(
-                data.contains("meka log") || data.contains("compact it"),
-                "and the client must be told where the detail went, or what to do: {data}"
+            assert_eq!(
+                withheld.data,
+                Some(serde_json::Value::from(error.sentence())),
+                "withheld, the client gets meka's sentence alone"
             );
 
             let relayed = acp_error_for(&error, true);

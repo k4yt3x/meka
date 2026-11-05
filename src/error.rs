@@ -836,8 +836,7 @@ pub(crate) const INTERNAL_SENTENCE: &str = "internal server error; consult serve
 /// The sentence for a transient upstream failure, the same whether or not the failure carried a
 /// `Retry-After` to relay. Named rather than written twice because a caller matching on `type`
 /// gets one answer and a human reading `detail` must not get two.
-const PROVIDER_UNAVAILABLE_SENTENCE: &str =
-    "the provider did not complete this turn; its response is in the meka log";
+const PROVIDER_UNAVAILABLE_SENTENCE: &str = "the provider did not complete this turn";
 
 impl MekaError {
     /// Where this error sits in the catalog. The one classification, so the HTTP surface and the
@@ -947,8 +946,7 @@ impl MekaError {
             | Self::SessionNotFound(_)
             | Self::TurnInFlight { .. } => self.to_string(),
             Self::Provider(_) | Self::InvalidRequest(_) => {
-                "the provider rejected or failed this turn; its response is in the meka log"
-                    .to_string()
+                "the provider rejected or failed this turn".to_string()
             }
             Self::StreamError(_) | Self::RetryableProvider { .. } => {
                 PROVIDER_UNAVAILABLE_SENTENCE.to_string()

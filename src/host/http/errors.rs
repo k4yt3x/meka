@@ -479,16 +479,7 @@ mod tests {
                 !body.contains("acct-0f3c") && !body.contains("exceeded its quota"),
                 "the upstream body reached the caller: {body}",
             );
-            // The three provider arms point at the log; the overflow arm spends its `detail` on the
-            // remedy instead ("compact it before retrying") and names no log, which is right and is
-            // why this is not asserted across the loop.
             let detail = withheld.detail.as_deref().unwrap_or_default().to_string();
-            if !matches!(error, MekaError::ContextOverflow(_)) {
-                assert!(
-                    detail.contains("the meka log"),
-                    "and the caller must be told where the detail went: {error}",
-                );
-            }
             assert!(
                 !detail.is_empty(),
                 "every arm owes the caller a sentence of meka's own: {error}",
@@ -763,10 +754,7 @@ mod tests {
             "the detail has to name the remedy, since the type alone is opaque: {detail}"
         );
         // Built from a provider response like every other arm, so it carries that body and must not
-        // relay it. Unlike the 502 arm it does not point at the log, because what the caller needs
-        // to know is stated outright rather than withheld -- which is why this lives here rather
-        // than in `a_provider_failure_does_not_relay_the_upstream_body`, whose loop asserts that
-        // pointer for every entry.
+        // relay it.
         assert!(
             !detail.contains("250000"),
             "the upstream body reached the caller: {detail}"
