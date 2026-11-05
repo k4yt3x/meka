@@ -1983,17 +1983,17 @@ fn a_new_session_opens_on_the_banner() {
     let opening = &screens[0];
     // The binary under test is an unoptimized build from this checkout, so the build follows the
     // version; its commit is whatever the checkout is at.
-    let version = format!("  █▄ ▄█  meka v{} (", env!("CARGO_PKG_VERSION"));
+    let version = format!("   ██▖ ▗██▌  meka v{} (", env!("CARGO_PKG_VERSION"));
     assert!(
         opening[1].starts_with(&version) && opening[1].ends_with("debug)"),
         "{opening:#?}"
     );
     assert_eq!(
-        opening[2], "  █ ▀ █  0 MCP servers · 0 skills",
+        opening[2], "  ▐█▝▙▟▘█▌   0 MCP servers · 0 skills",
         "{opening:#?}"
     );
     assert_eq!(
-        opening[3], "  █   █  0 memories · 0 instructions",
+        opening[3], "  █▌ ▀▘▐█▌   0 memories · 0 instructions",
         "{opening:#?}"
     );
     assert!(opening[0].is_empty(), "the blank row above: {opening:#?}");

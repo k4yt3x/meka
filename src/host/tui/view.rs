@@ -39,9 +39,53 @@ const COMPACTION_ICON: &str = "→←";
 const COMPACTION_LABEL: &str = "Context compacted";
 /// What the gap row says while the view is scrolled up from the bottom.
 pub(crate) const BACK_TO_BOTTOM: &str = "↓ back to bottom";
-/// meka's mark, the `M` of its icon, in half-block pixels: three rows, one beside each of the
-/// banner's lines.
-const BANNER_MARK: [&str; 3] = ["█▄ ▄█", "█ ▀ █", "█   █"];
+/// meka's mark, the slanted `M` of its icon in quadrant-block pixels with a shadow one pixel to
+/// its right: three rows of runs, one beside each of the banner's lines.
+const BANNER_MARK: [&[(&str, MarkTone)]; 3] = [
+    &[
+        (" ██", MarkTone::Face),
+        ("▖", MarkTone::FaceOnShadow),
+        (" ▗██", MarkTone::Face),
+        ("▌", MarkTone::Shadow),
+    ],
+    &[
+        ("▐█", MarkTone::Face),
+        ("▝▙", MarkTone::FaceOnShadow),
+        ("▟", MarkTone::Face),
+        ("▘", MarkTone::FaceOnShadow),
+        ("█", MarkTone::Face),
+        ("▌", MarkTone::FaceOnShadow),
+    ],
+    &[
+        ("█", MarkTone::Face),
+        ("▌", MarkTone::FaceOnShadow),
+        (" ▀", MarkTone::Face),
+        ("▘", MarkTone::Shadow),
+        ("▐█", MarkTone::Face),
+        ("▌", MarkTone::Shadow),
+    ],
+];
+/// The mark's shadow, a deep blue that reads as depth beside the terminal's cyan.
+const BANNER_SHADOW: Color = Color::Indexed(24);
+
+/// How a run of the banner's mark is drawn: the letter's face, its shadow, or the face over the
+/// shadow where one cell holds both, since a cell has one foreground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkTone {
+    Face,
+    Shadow,
+    FaceOnShadow,
+}
+
+impl MarkTone {
+    fn style(self) -> Style {
+        match self {
+            Self::Face => Style::default().fg(Color::Cyan),
+            Self::Shadow => Style::default().fg(BANNER_SHADOW),
+            Self::FaceOnShadow => Style::default().fg(Color::Cyan).bg(BANNER_SHADOW),
+        }
+    }
+}
 /// The columns between the banner and the left edge of the screen; one row stands above it.
 const BANNER_GAP: usize = 2;
 
@@ -598,9 +642,10 @@ pub(crate) fn entry_lines(
             Some(rows) => draw::edge_rows(rows),
             None => draw::glyph_text_rows(ACT_GLYPH, gray(), &picture.label(), gray(), width),
         },
-        // The mark in the terminal's cyan beside three lines, on no background: a box of the
-        // composer's gray was painted short by tmux under Alacritty, which drops the background
-        // of the spaces after a foreground reset, and a box with no padding is no box.
+        // The mark beside three lines, in no box: a box of the composer's gray was painted short
+        // by tmux under Alacritty, which drops the background of the spaces after a foreground
+        // reset, and a box with no padding is no box. For the same reason the shadow's
+        // background lies under a glyph only, never a space.
         Item::Banner {
             version,
             revision,
@@ -610,7 +655,12 @@ pub(crate) fn entry_lines(
             memories,
             instructions,
         } => {
-            let lead = BANNER_GAP + display_width(BANNER_MARK[0]) + 2;
+            let mark_width = BANNER_MARK
+                .iter()
+                .map(|row| row.iter().map(|(run, _)| display_width(run)).sum::<usize>())
+                .max()
+                .unwrap_or(0);
+            let lead = BANNER_GAP + mark_width + 2;
             let room = width.saturating_sub(lead).max(1);
             // The name bold and white, so it is what the eye lands on, the version dimmed beside
             // it; the facts a step down from the name, in the palette's plain white, which most
@@ -658,11 +708,13 @@ pub(crate) fn entry_lines(
             ];
             let mut lines = vec![Line::default()];
             lines.extend(BANNER_MARK.iter().zip(rows).map(|(mark, text)| {
-                let mut spans = vec![
-                    Span::raw(" ".repeat(BANNER_GAP)),
-                    Span::styled((*mark).to_string(), Style::default().fg(Color::Cyan)),
-                    Span::raw("  ".to_string()),
-                ];
+                let mut spans = vec![Span::raw(" ".repeat(BANNER_GAP))];
+                let mut drawn = 0;
+                for (run, tone) in mark.iter() {
+                    drawn += display_width(run);
+                    spans.push(Span::styled((*run).to_string(), tone.style()));
+                }
+                spans.push(Span::raw(" ".repeat(mark_width.saturating_sub(drawn) + 2)));
                 spans.extend(text);
                 Line::from(spans)
             }));
@@ -3941,10 +3993,11 @@ mod tests {
         );
     }
 
-    /// The banner is meka's mark in cyan beside three lines on no background, two columns in
-    /// from the edge under a blank row: the name bold and white with the version and the build
-    /// dimmed beside it, then what the agent can do and what it knows a step down in the
-    /// palette's plain white. A release built from its tag shows the version alone.
+    /// The banner is meka's mark beside three lines, two columns in from the edge under a blank
+    /// row: the letter in cyan with its shadow in a deep blue, which lies under a glyph where the
+    /// two share a cell and never under a space; then the name bold and white with the version
+    /// and the build dimmed beside it, then what the agent can do and what it knows a step down
+    /// in the palette's plain white. A release built from its tag shows the version alone.
     #[test]
     fn the_banner_is_the_mark_beside_three_lines() {
         let item = Item::Banner {
@@ -3959,31 +4012,50 @@ mod tests {
         let lines = lines_at(&entry(item, false), 80);
         assert_eq!(plain(&lines), vec![
             "",
-            "  █▄ ▄█  meka v0.72.0 (a1b2c3d-dirty, debug)",
-            "  █ ▀ █  2 MCP servers · 1 skill",
-            "  █   █  48 memories · 3 instructions",
+            "   ██▖ ▗██▌  meka v0.72.0 (a1b2c3d-dirty, debug)",
+            "  ▐█▝▙▟▘█▌   2 MCP servers · 1 skill",
+            "  █▌ ▀▘▐█▌   48 memories · 3 instructions",
         ]);
         assert!(
             lines
                 .iter()
                 .flat_map(|line| line.spans.iter())
-                .all(|span| span.style.bg.is_none()),
-            "nothing has a background: {lines:?}"
+                .all(|span| span.style.bg.is_none() || !span.content.contains(' ')),
+            "no space has a background: {lines:?}"
         );
-        assert!(
-            lines[1..]
-                .iter()
-                .all(|line| line.spans[1].style.fg == Some(Color::Cyan)),
-            "the mark is cyan: {lines:?}"
+        let style_at = |line: &Line<'static>, column: usize| {
+            let mut start = 0;
+            line.spans.iter().find_map(|span| {
+                let width = display_width(&span.content);
+                let found = (column < start + width).then_some(span.style);
+                start += width;
+                found
+            })
+        };
+        let face = Style::default().fg(Color::Cyan);
+        assert_eq!(style_at(&lines[1], 3), Some(face), "the letter is cyan");
+        assert_eq!(
+            style_at(&lines[1], 10),
+            Some(Style::default().fg(BANNER_SHADOW)),
+            "a cell of shadow alone is drawn in the shadow's color"
         );
-        let name = &lines[1].spans[3];
-        assert_eq!(name.content.as_ref(), "meka");
+        assert_eq!(
+            style_at(&lines[1], 5),
+            Some(face.bg(BANNER_SHADOW)),
+            "a cell of both is the letter over the shadow"
+        );
+        let spans = &lines[1].spans;
+        let at = spans
+            .iter()
+            .position(|span| span.content == "meka")
+            .expect("the name");
+        let name = &spans[at];
         assert_eq!(name.style.fg, Some(draw::WHITE));
         assert!(
             name.style.add_modifier.contains(Modifier::BOLD),
             "the name is bold: {name:?}"
         );
-        let version = &lines[1].spans[4];
+        let version = &spans[at + 1];
         assert_eq!(version.content.as_ref(), " v0.72.0 (a1b2c3d-dirty, debug)");
         assert_eq!(
             version.style.fg,
@@ -3991,8 +4063,8 @@ mod tests {
             "the version and the build are dimmed"
         );
         assert_eq!(
-            lines[2].spans[3].style.fg,
-            Some(Color::Gray),
+            lines[2].spans.last().map(|span| span.style.fg),
+            Some(Some(Color::Gray)),
             "the facts are the palette's plain white, a step down from the name"
         );
         let release = lines_at(
@@ -4011,9 +4083,9 @@ mod tests {
             60,
         );
         assert_eq!(plain(&release)[1..], [
-            "  █▄ ▄█  meka v0.72.0",
-            "  █ ▀ █  0 MCP servers · 0 skills",
-            "  █   █  1 memory · 0 instructions",
+            "   ██▖ ▗██▌  meka v0.72.0",
+            "  ▐█▝▙▟▘█▌   0 MCP servers · 0 skills",
+            "  █▌ ▀▘▐█▌   1 memory · 0 instructions",
         ]);
     }
 

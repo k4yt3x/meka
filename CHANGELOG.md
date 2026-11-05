@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.88.2] - 2026-11-05
+
+### Changed
+
+- The startup banner draws the slanted `M` of meka's icon, with a shadow.
+
 ## [0.88.1] - 2026-11-04
 
 ### Fixed
@@ -3119,7 +3125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.88.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.88.2...HEAD
+[0.88.2]: https://github.com/k4yt3x/meka/compare/0.88.1...0.88.2
 [0.88.1]: https://github.com/k4yt3x/meka/compare/0.88.0...0.88.1
 [0.88.0]: https://github.com/k4yt3x/meka/compare/0.87.0...0.88.0
 [0.87.0]: https://github.com/k4yt3x/meka/compare/0.86.0...0.87.0
