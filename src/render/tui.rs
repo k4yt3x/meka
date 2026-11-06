@@ -7,14 +7,15 @@
 //! lines the UI owns rather than bytes on a stream, which is what lets it draw them again at
 //! another width.
 //!
-//! Every item on the screen puts a one-glyph gutter in column 0 and its text at [`TEXT_EDGE`]:
-//! a bar in its level's color for a prompt, `•` for an act of the agent or the host, `▸` for a
-//! folded run of steps or a closed compaction and `▾` for an open one, `!` for a warning, `■` for
-//! an error, nothing for the answer. The palette is the terminal's own colors, so the screen
-//! follows its theme, but for the shades behind blocks, a diff's tints, the white of a prompt's
-//! words and the gray dimmed text takes on a shade. No glyph has an emoji presentation: a terminal
-//! that draws U+26A0 as a picture draws it the size of two cells in a color of its own, and the
-//! gutter is meant to be a mark, not a picture.
+//! Every item on the screen puts a one-glyph gutter in column 0 and its text at [`TEXT_EDGE`], and
+//! stops it a column short of the right edge ([`RIGHT_MARGIN`]). The gutter holds a bar in its
+//! level's color for a prompt, `•` for an act of the agent or the host, `▸` for a folded run of
+//! steps or a closed compaction and `▾` for an open one, `!` for a warning, `■` for an error,
+//! nothing for the answer. The palette is the terminal's own colors, so the screen follows its
+//! theme, but for the shades behind blocks, a diff's tints, the white of a prompt's words and the
+//! gray dimmed text takes on a shade. No glyph has an emoji presentation: a terminal that draws
+//! U+26A0 as a picture draws it the size of two cells in a color of its own, and the gutter is
+//! meant to be a mark, not a picture.
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -26,6 +27,11 @@ use super::*;
 /// The column every item's text starts in, behind its one-glyph gutter. The composer and the
 /// prompt block use the same edge, so the whole screen shares one left margin.
 pub(crate) const TEXT_EDGE: usize = 2;
+/// The column at the screen's right edge no words reach, as the gutter keeps the left: the
+/// transcript, the composer, a panel, a question, the completion list and the status row all stop
+/// a column short, while a shade behind them (a prompt's, an open run's, a panel's) runs to the
+/// edge.
+pub(crate) const RIGHT_MARGIN: usize = 1;
 /// The bar down the composer's left edge, and a sent prompt's, in the permission level's color,
 /// or red in the shell mode.
 pub(crate) const COMPOSER_BAR: &str = "▎";
@@ -854,9 +860,76 @@ enum Breaks {
     Words,
 }
 
-fn fold_line(line: &Line<'static>, width: usize, breaks: Breaks) -> Vec<Line<'static>> {
-    let characters: Vec<(char, Style)> = line
+/// A row of a listing wrapped to `width` as [`wrap_line`] wraps it, the rows after the first set
+/// in under the column the first break falls in, so a description wraps under its own column. A
+/// column starts after a gap of two spaces or more, the gap meka's listings put between columns
+/// ([`crate::text::format_columns_row`]); a row with no gap ahead of the break hangs at its own
+/// indentation, and one whose hang would leave fewer than [`MIN_NESTED_WIDTH`] columns hangs at its
+/// indentation, then not at all.
+pub(crate) fn wrap_listing_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let characters = line_characters(line);
+    let rows = fold_characters(&characters, width, Breaks::Spaces);
+    let [first, _, ..] = rows.as_slice() else {
+        return rows;
+    };
+    let is_space = |index: usize| {
+        characters
+            .get(index)
+            .is_some_and(|(character, _)| *character == ' ')
+    };
+    // Where the second row starts: past the first row's characters and the spaces at the break.
+    let mut next: usize = first
         .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    while is_space(next) {
+        next += 1;
+    }
+    if next >= characters.len() {
+        return rows;
+    }
+    let indentation = (0..characters.len())
+        .take_while(|&index| is_space(index))
+        .count();
+    let column = (indentation + 2..=next)
+        .rev()
+        .find(|&index| !is_space(index) && is_space(index - 1) && is_space(index - 2));
+    let columns = character_columns(&characters);
+    let column_of = |index: usize| columns.iter().take(index).sum::<usize>();
+    let fits = |hang: usize| hang + MIN_NESTED_WIDTH <= width;
+    let hang = match column.map(column_of) {
+        Some(hang) if fits(hang) => hang,
+        _ if fits(indentation) => indentation,
+        _ => 0,
+    };
+    if hang == 0 {
+        return rows;
+    }
+    let mut hung = vec![first.clone()];
+    hung.extend(
+        fold_characters(
+            characters.get(next..).unwrap_or_default(),
+            width - hang,
+            Breaks::Spaces,
+        )
+        .into_iter()
+        .map(|mut row| {
+            row.spans.insert(0, Span::raw(" ".repeat(hang)));
+            row
+        }),
+    );
+    hung
+}
+
+fn fold_line(line: &Line<'static>, width: usize, breaks: Breaks) -> Vec<Line<'static>> {
+    fold_characters(&line_characters(line), width, breaks)
+}
+
+/// The characters of `line`, each with its span's style, its tabs expanded to spaces.
+fn line_characters(line: &Line<'static>) -> Vec<(char, Style)> {
+    line.spans
         .iter()
         .flat_map(|span| {
             crate::text::expand_tabs(&span.content)
@@ -864,8 +937,7 @@ fn fold_line(line: &Line<'static>, width: usize, breaks: Breaks) -> Vec<Line<'st
                 .map(|character| (character, span.style))
                 .collect::<Vec<_>>()
         })
-        .collect();
-    fold_characters(&characters, width, breaks)
+        .collect()
 }
 
 /// The rows of `characters` within `width`, broken where `breaks` allows, and inside a word where
@@ -2936,6 +3008,48 @@ mod tests {
                 .iter()
                 .all(|span| span.style.fg == Some(Color::Green))),
             "every row keeps the style: {long:?}"
+        );
+    }
+
+    /// A listing's row wraps under the column the break falls in, a row with no column under its
+    /// own indentation, and a hang that would leave too little room under the indentation.
+    #[test]
+    fn a_listing_row_wraps_under_its_own_column() {
+        let wrapped = |text: &str, width: usize| {
+            plain(&wrap_listing_line(
+                &Line::from(Span::styled(
+                    text.to_string(),
+                    Style::default().fg(Color::Red),
+                )),
+                width,
+            ))
+        };
+        let row =
+            "  /approvals [on|off]  Pick or set whether calls above the level are asked about";
+        assert_eq!(wrapped(row, 50), vec![
+            "  /approvals [on|off]  Pick or set whether calls",
+            "                       above the level are asked",
+            "                       about",
+        ]);
+        assert_eq!(
+            wrapped("  a row of prose with no columns in it at all", 20),
+            vec!["  a row of prose", "  with no columns in", "  it at all"]
+        );
+        assert_eq!(wrapped(row, 30), vec![
+            "  /approvals [on|off]  Pick or",
+            "  set whether calls above the",
+            "  level are asked about",
+        ]);
+        let styled = wrap_listing_line(
+            &Line::from(Span::styled(row, Style::default().fg(Color::Red))),
+            50,
+        );
+        assert!(
+            styled
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.content.trim().is_empty() || span.style.fg == Some(Color::Red)),
+            "the words keep their style: {styled:?}"
         );
     }
 

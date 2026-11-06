@@ -2523,8 +2523,9 @@ fn a_code_row_wider_than_the_screen_folds_at_the_edge() {
         .unwrap_or_else(|| panic!("the long row starts where its indentation puts it: {rows:#?}"));
     assert_eq!(
         rows[head].chars().count(),
-        usize::from(COLUMNS) - 1,
-        "the first row is full to the shade's right margin: {rows:#?}"
+        usize::from(COLUMNS) - 2,
+        "the first row is full to the shade's margin, the shade a column short of the screen's \
+         edge: {rows:#?}"
     );
     assert!(
         rows[head + 1].starts_with("   x") && rows[head + 1].contains("TAIL_OF_THE_ROW \\"),

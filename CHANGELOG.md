@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Text stops a column short of the right edge in the transcript, composer, panels and questions.
+- A wrapped row in `/help` or another panel's listing continues under its own column.
+- The approval prompt no longer splits a long argument's rows away from their tree.
+
 ## [0.89.0] - 2026-11-06
 
 ### Added

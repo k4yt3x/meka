@@ -1155,8 +1155,10 @@ impl Screen {
     fn open_approval(&mut self, request: ApprovalRequest) {
         // The call's own row heads the panel and its arguments stand under it, the way the
         // transcript draws the call once it is expanded: with the arguments shown, the row
-        // carries no summary, which would say the same thing twice.
-        let width = self.transcript_area.width.max(20) as usize;
+        // carries no summary, which would say the same thing twice. Laid out a column short of the
+        // right edge, where the panel's body stops, so the panel draws the rows as they are.
+        let width =
+            (self.transcript_area.width.max(20) as usize).saturating_sub(draw::RIGHT_MARGIN);
         let title = draw::tool_row(&request.tool_name, Vec::new(), Vec::new(), width);
         let body = draw::approval_rows(&request.tool_name, &request.input, width);
         let choices = APPROVAL_CHOICES
@@ -1180,7 +1182,10 @@ impl Screen {
     ) {
         // Server-controlled strings are flattened to one line before they wrap: a newline in the
         // message could paint rows that look like meka's own, enough to forge an approval block.
-        let width = self.transcript_area.width.max(20) as usize;
+        // Laid out a column short of the right edge, where the panel's body and the question's
+        // stop, so both draw the rows as they are.
+        let width =
+            (self.transcript_area.width.max(20) as usize).saturating_sub(draw::RIGHT_MARGIN);
         let mut body = draw::glyph_text_rows(
             draw::ACT_GLYPH,
             gray(),
@@ -2782,8 +2787,10 @@ impl Screen {
             .log_ring
             .iter()
             .map(|line| {
+                // Two spaces after the level, a listing's gap between columns, so a long line of
+                // any level wraps under its target.
                 format!(
-                    "{} {:<5} {}: {}\n",
+                    "{} {:<5}  {}: {}\n",
                     crate::text::format_timestamp(line.at, crate::text::Precision::Seconds),
                     line.level,
                     line.target,
@@ -2910,6 +2917,10 @@ impl Screen {
             0
         };
         let most_composer = (area.height / COMPOSER_SHARE).max(1);
+        // The width the composer is asked its height at and the field it is drawn in, one value
+        // so its words wrap where its height counted them.
+        let lead = TEXT_EDGE as u16;
+        let composer_width = area.width.saturating_sub(lead + draw::RIGHT_MARGIN as u16);
         let most_panel = (area.height / PANEL_SHARE).max(2);
         let bottom_height = match &mut self.overlay {
             Some(Overlay::Panel { panel, .. }) => panel.height(area.width as usize, most_panel),
@@ -2921,7 +2932,7 @@ impl Screen {
             None if self.composer.search.is_some() => 1 + chrome_rows + status_height,
             None => {
                 self.composer.height(
-                    area.width.saturating_sub(TEXT_EDGE as u16),
+                    composer_width,
                     most_composer
                         .saturating_sub(chrome_rows)
                         .max(least_composer),
@@ -3029,11 +3040,10 @@ impl Screen {
                 // color runs down its left edge.
                 let block = Style::default().bg(super::input::COMPOSER_BACKGROUND);
                 frame.render_widget(ratatui::widgets::Block::new().style(block), composer_area);
-                let lead = TEXT_EDGE as u16;
                 let field = Rect {
                     x: composer_area.x + lead,
                     y: composer_area.y + padding,
-                    width: composer_area.width.saturating_sub(lead),
+                    width: composer_width,
                     height: composer_area.height.saturating_sub(chrome_rows).max(1),
                 };
                 if let Some(search) = &self.composer.search {
@@ -3149,7 +3159,7 @@ impl SessionColumns {
     /// What the title has on a row `width` wide: the rest after the text edge, the two columns
     /// the facts stand off by, and the one they keep clear of the right edge.
     fn title_room(&self, width: usize) -> usize {
-        width.saturating_sub(TEXT_EDGE + 2 + self.facts_width() + 1)
+        width.saturating_sub(TEXT_EDGE + 2 + self.facts_width() + draw::RIGHT_MARGIN)
     }
 
     /// The columns the facts take together: the ones present, two apart.

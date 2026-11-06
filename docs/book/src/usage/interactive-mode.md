@@ -39,18 +39,19 @@ question, and the row goes when the turn ends. A `!command` has the same row, as
 Everything on the transcript shares one left edge. Column 0 holds a glyph that says what a row is:
 `▎` a bar down what you sent, in the color of the permission level it ran under (red for a
 `!command`, gray while it waits for its turn), `•` something the agent or meka did (a tool call, a
-thinking block, a notice, a command's outcome), `▸` a folded run of steps or a closed compaction
-and `▾` an open one, `!` a warning, `■` an error, and nothing for the answer itself. No glyph is
-an emoji, so none is drawn as a picture. The text of every row starts in column 2. Color is spent
-sparingly: an answer's emphasis is weight (bold is bold, headings are bold), the terminal's cyan
-names things (inline code, a tool call, the checklist), structure (bullets, rules, the quote bar)
-is gray, red and yellow mean an error and a warning, and the permission level's color marks what
-runs under it. A diff tints the lines it removes red and the lines it adds green. A code block
+thinking block, a notice, a command's outcome), `▸` a folded run of steps or a closed compaction and
+`▾` an open one, `!` a warning, `■` an error, and nothing for the answer itself. No glyph is an
+emoji, so none is drawn as a picture. The text of every row starts in column 2 and stops a column
+short of the right edge, which only the shade behind a prompt, an open run or a panel reaches. Color
+is spent sparingly: an answer's emphasis is weight (bold is bold, headings are bold), the terminal's
+cyan names things (inline code, a tool call, the checklist), structure (bullets, rules, the quote
+bar) is gray, red and yellow mean an error and a warning, and the permission level's color marks
+what runs under it. A diff tints the lines it removes red and the lines it adds green. A code block
 sits on a gray shade of its own, and fenced code is highlighted from the same palette: comments
 gray, keywords blue, strings green, numbers yellow, names of functions and types cyan. A code line
-wider than the block folds at its edge, and a tab is drawn as four columns. The text is drawn in
-the terminal's own colors, so the screen follows your terminal's theme. Fixed are the shades behind
-the composer, a prompt, an open run and a code block, a diff's tints and the marks on its lines, the
+wider than the block folds at its edge, and a tab is drawn as four columns. The text is drawn in the
+terminal's own colors, so the screen follows your terminal's theme. Fixed are the shades behind the
+composer, a prompt, an open run and a code block, a diff's tints and the marks on its lines, the
 white of a prompt's words and of the profile on the status row, the gray of dimmed text on a shade,
 and a picture's pixels.
 

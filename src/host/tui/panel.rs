@@ -303,13 +303,24 @@ impl Panel {
         }
     }
 
+    /// The body wrapped to stop a column short of the right edge: a text panel's under its rows'
+    /// own columns, since what a command printed is a listing, and a picker's body, laid out
+    /// that far already with its own edge, only where the width has narrowed since.
     fn wrapped_body(&mut self, width: usize) -> &[Line<'static>] {
-        let inner = width.saturating_sub(TEXT_EDGE).max(1);
+        let edge = if self.body_at_edge { TEXT_EDGE } else { 0 };
+        let inner = width.saturating_sub(edge + draw::RIGHT_MARGIN).max(1);
         if self.wrapped.as_ref().is_none_or(|(at, _)| *at != inner) {
+            let at_edge = self.body_at_edge;
             let rows = self
                 .body
                 .iter()
-                .flat_map(|line| draw::wrap_line(line, inner))
+                .flat_map(|line| {
+                    if at_edge {
+                        draw::wrap_listing_line(line, inner)
+                    } else {
+                        draw::wrap_line(line, inner)
+                    }
+                })
                 .collect();
             self.wrapped = Some((inner, rows));
         }
@@ -338,7 +349,10 @@ impl Panel {
         let width = area.width as usize;
         let mut lines = Vec::new();
         if let Some(heading) = &self.heading {
-            lines.push(heading.clone());
+            lines.push(draw::cut_line(
+                heading.clone(),
+                width.saturating_sub(draw::RIGHT_MARGIN),
+            ));
         }
         // The choices come first and scroll to keep the pick in view; the body takes the rest.
         let frame_rows = usize::from(self.heading.is_some()) + 1;
@@ -393,7 +407,10 @@ impl Panel {
                 footer.push_str(&format!(" · {hidden_below} more below"));
             }
         }
-        let footer = draw::cut_text(&footer, width.saturating_sub(TEXT_EDGE));
+        let footer = draw::cut_text(
+            &footer,
+            width.saturating_sub(TEXT_EDGE + draw::RIGHT_MARGIN),
+        );
         let footer_row = Rect {
             y: area.y + area.height.saturating_sub(1),
             height: 1.min(area.height),
@@ -539,7 +556,7 @@ mod tests {
             Some(2),
             "a digit counts the choices shown"
         );
-        let backend = ratatui::backend::TestBackend::new(40, 5);
+        let backend = ratatui::backend::TestBackend::new(50, 5);
         let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
         terminal
             .draw(|frame| panel.draw(frame, frame.area()))
@@ -614,6 +631,41 @@ mod tests {
             "the scroll clamps at the end: {shown:?}"
         );
         assert_eq!(panel.height(50, 30), 11, "the footer and ten rows of body");
+    }
+
+    /// A text panel's words stop a column short of the right edge, a listing's description
+    /// wrapping under its own column; a picker's body, laid out that far already, is drawn as it
+    /// came rather than wrapped again.
+    #[test]
+    fn a_panel_s_words_stop_a_column_short_of_the_edge() {
+        let draw = |panel: &mut Panel| {
+            let backend = ratatui::backend::TestBackend::new(40, 6);
+            let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+            terminal
+                .draw(|frame| panel.draw(frame, frame.area()))
+                .expect("a frame");
+            rows(&terminal)
+        };
+        let shown = draw(&mut Panel::with_text(
+            "Commands:\n  /a      Pick or set whether calls above the level are asked about\n",
+        ));
+        assert_eq!(shown[..4], [
+            "  Commands:",
+            "    /a      Pick or set whether calls",
+            "            above the level are asked",
+            "            about",
+        ]);
+        let row = format!("  │ {}", "x".repeat(35));
+        let shown = draw(&mut Panel::with_choices(
+            vec![Line::from(row.clone())],
+            vec![Choice {
+                label: "Allow".to_string(),
+                key: Some('y'),
+                description: None,
+            }],
+            0,
+        ));
+        assert_eq!(shown[0], row, "{shown:#?}");
     }
 
     /// Choices take a cursor, a letter and a digit; a heading names what the choices are about,

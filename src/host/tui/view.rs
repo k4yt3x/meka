@@ -172,7 +172,7 @@ fn prompt_rows(
     width: usize,
     padded: bool,
 ) -> Vec<draw::Row> {
-    let inner = width.saturating_sub(TEXT_EDGE).max(1);
+    let inner = width.saturating_sub(TEXT_EDGE + draw::RIGHT_MARGIN).max(1);
     // The same gray across the whole row, so a prompt is told from the answer under it at a
     // glance, the words in white rather than the terminal's foreground so they stand out of
     // the gray.
@@ -945,6 +945,17 @@ enum Placement {
     Heading { run: u64, open: bool },
 }
 
+/// The width `entry` is laid out at on a transcript `width` wide: a column short of the right
+/// edge, which no words reach, so an open run's shade runs past them as a prompt's gray does; a
+/// prompt itself takes the whole width, its gray running to the edge with the column kept inside.
+fn item_width(entry: &Entry, width: usize) -> usize {
+    if matches!(entry.item, Item::Prompt { .. }) {
+        width
+    } else {
+        width.saturating_sub(draw::RIGHT_MARGIN)
+    }
+}
+
 /// What one item was last drawn as.
 struct Cached {
     revision: u64,
@@ -1183,9 +1194,10 @@ impl Viewport {
             .position(|&(start, len)| line >= start && line < start + len)
     }
 
-    /// Lay `entry` out at `width` unless the cache already has it, and say how many rows it is.
-    /// `prompt_padding` is the transcript's, which never changes under the cache.
+    /// Lay `entry` out on a transcript `width` wide unless the cache already has it, and say how
+    /// many rows it is. `prompt_padding` is the transcript's, which never changes under the cache.
     fn lay_out(&mut self, entry: &Entry, width: usize, prompt_padding: bool) -> usize {
+        let width = item_width(entry, width);
         let stale = self
             .cache
             .get(&entry.id)
@@ -1271,7 +1283,14 @@ impl Viewport {
             let foldable = foldable && state.settled;
             if foldable {
                 state.open = state.choice.unwrap_or(!folds);
-                run_rows.insert(first.id, run_row(members, state.open, width));
+                run_rows.insert(
+                    first.id,
+                    run_row(
+                        members,
+                        state.open,
+                        width.saturating_sub(draw::RIGHT_MARGIN),
+                    ),
+                );
                 if state.open {
                     open_runs.push((run.from, run.to));
                 }
@@ -1939,7 +1958,7 @@ pub(crate) fn status_line(facts: &StatusFacts<'_>, width: usize) -> Line<'static
     // readings that fit whole, in order, up to the first that does not, since a reading cut
     // short reads as another number.
     let level_width = TEXT_EDGE + display_width(&level.content);
-    let room = width.saturating_sub(level_width + 3);
+    let room = width.saturating_sub(level_width + 2 + draw::RIGHT_MARGIN);
     let right = match facts.hint {
         Some(hint) if display_width(hint) <= room || room >= LEAST_CUT_COLUMNS => Span::styled(
             draw::cut_text(hint, room),
@@ -1962,7 +1981,11 @@ pub(crate) fn status_line(facts: &StatusFacts<'_>, width: usize) -> Line<'static
     };
     let right_width = display_width(&right.content);
     // The gap between the sides only when there is a right side to keep apart.
-    let reserved = if right_width == 0 { 1 } else { right_width + 3 };
+    let reserved = if right_width == 0 {
+        draw::RIGHT_MARGIN
+    } else {
+        right_width + 2 + draw::RIGHT_MARGIN
+    };
     let mut budget = width.saturating_sub(reserved + level_width);
     let mut left = vec![Span::raw(" ".repeat(TEXT_EDGE)), level];
     for (fact, from_start) in after {
@@ -2175,12 +2198,14 @@ pub(crate) fn draw_question(
     let shown: Vec<Line<'static>> = lines.into_iter().skip(skip).map(draw::on_shade).collect();
     let cursor_row = shown.len().saturating_sub(1);
     let cursor_column = TEXT_EDGE + display_width(prompt) + display_width(answer);
-    // The composer's background: the question stands where the composer stood.
-    frame.render_widget(
-        Paragraph::new(Text::from(shown))
-            .style(Style::default().bg(super::input::COMPOSER_BACKGROUND)),
-        area,
-    );
+    // The composer's background, words a column short of its edge: the question stands where the
+    // composer stood.
+    let block = Style::default().bg(super::input::COMPOSER_BACKGROUND);
+    frame.render_widget(ratatui::widgets::Block::new().style(block), area);
+    frame.render_widget(Paragraph::new(Text::from(shown)).style(block), Rect {
+        width: area.width.saturating_sub(draw::RIGHT_MARGIN as u16),
+        ..area
+    });
     frame.set_cursor_position((
         area.x
             .saturating_add(cursor_column.min(area.width.saturating_sub(1) as usize) as u16),
@@ -2210,7 +2235,8 @@ pub(crate) enum ListLayout {
 }
 
 /// The rows of a list `width` wide: values at the text edge, descriptions dim in a column after
-/// the longest value, the picked row one reversed bar from edge to edge, nothing on it dimmed.
+/// the longest value, a row too long cut a column short of the right edge, the picked row one
+/// reversed bar from edge to edge, nothing on it dimmed.
 pub(crate) fn list_lines(
     rows: &[ListRow],
     picked: usize,
@@ -2237,18 +2263,24 @@ pub(crate) fn list_lines(
                     // One column short of the edge, and never closer than two to the value.
                     ListLayout::Edge => width
                         .saturating_sub(
-                            TEXT_EDGE + display_width(&row.value) + display_width(description) + 1,
+                            TEXT_EDGE
+                                + display_width(&row.value)
+                                + display_width(description)
+                                + draw::RIGHT_MARGIN,
                         )
                         .max(2),
                 };
                 spans.push(Span::styled(format!("{:pad$}{description}", ""), dim));
             }
+            let mut line =
+                draw::cut_line(Line::from(spans), width.saturating_sub(draw::RIGHT_MARGIN));
             if index == picked {
-                let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
-                spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-                Line::from(spans).patch_style(Style::default().add_modifier(Modifier::REVERSED))
+                let used = line.width();
+                line.spans
+                    .push(Span::raw(" ".repeat(width.saturating_sub(used))));
+                line.patch_style(Style::default().add_modifier(Modifier::REVERSED))
             } else {
-                Line::from(spans)
+                line
             }
         })
         .collect()
@@ -3230,6 +3262,49 @@ mod tests {
             .collect()
     }
 
+    /// No item's words reach the last column, a prompt's included, while the prompt's gray does:
+    /// an answer wraps a column short of the edge, as the prompt above it does.
+    #[test]
+    fn the_transcript_keeps_the_last_column_clear_of_words() {
+        let mut transcript = Transcript::new(settings());
+        transcript.push(Item::Prompt {
+            text: "x".repeat(58),
+            class: None,
+            inbox_id: None,
+            delivered: true,
+            ran_under: RanUnder::Level(crate::permission::Permission::Read),
+        });
+        transcript.push(said(&"y".repeat(58)));
+        let backend = ratatui::backend::TestBackend::new(60, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        let mut viewport = Viewport::new();
+        terminal
+            .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+            .expect("a frame");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..60)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        let rows: Vec<String> = (0..10).map(row).filter(|row| !row.is_empty()).collect();
+        assert_eq!(rows, vec![
+            "▎".to_string(),
+            format!("▎ {}", "x".repeat(57)),
+            "▎ x".to_string(),
+            "▎".to_string(),
+            format!("  {}", "y".repeat(57)),
+            "  y".to_string(),
+        ]);
+        assert_eq!(
+            buffer[(59, 1)].bg,
+            COMPOSER_BACKGROUND,
+            "the prompt's gray runs to the edge"
+        );
+    }
+
     /// A finished run of two or more steps folds into one row that says what it did, in the
     /// order it first did each, with its failures in red; a single step, a change and the words
     /// around them stand as they are.
@@ -3791,12 +3866,13 @@ mod tests {
                 .filter(|text| !text.is_empty())
                 .collect()
         };
-        // The words are centered on the 60 columns, starting at column 21, the icon to their left.
+        // The words are centered on the 59 columns a row of the transcript takes, a column short of
+        // the edge, starting at column 21, the icon to their left.
         let rule = |glyph: &str| {
             format!(
                 "{glyph} {} →← Context compacted {}",
                 "─".repeat(15),
-                "─".repeat(21)
+                "─".repeat(20)
             )
         };
         let folded = draw(&mut viewport, &transcript);
@@ -4231,6 +4307,70 @@ mod tests {
                     .all(|span| span.style.bg == Some(COMPOSER_BACKGROUND))),
             "every row is the composer's block across the whole width: {lines:?}"
         );
+    }
+
+    /// A prompt's words stop a column short of the right edge, as the space after the bar keeps
+    /// one at the left, while its gray still runs to the edge.
+    #[test]
+    fn a_prompt_s_words_keep_a_column_clear_at_the_right_edge() {
+        let sent = entry(
+            Item::Prompt {
+                text: "x".repeat(58),
+                class: None,
+                inbox_id: None,
+                delivered: true,
+                ran_under: RanUnder::Level(crate::permission::Permission::Read),
+            },
+            false,
+        );
+        let lines = lines_at(&sent, 60);
+        assert_eq!(plain(&lines), vec![
+            "▎".to_string(),
+            format!("▎ {}", "x".repeat(57)),
+            "▎ x".to_string(),
+            "▎".to_string()
+        ]);
+        assert!(
+            lines.iter().all(|line| line.width() == 60),
+            "every row is the block across the whole width: {lines:?}"
+        );
+    }
+
+    /// A list row too long for the width is cut a column short of the right edge, the picked
+    /// row's bar still reaching it; a question's words stop there too.
+    #[test]
+    fn a_list_row_and_a_question_stop_a_column_short_of_the_edge() {
+        let rows = vec![ListRow {
+            value: "/x".to_string(),
+            description: Some("y".repeat(40)),
+        }];
+        let lines = list_lines(&rows, 0, 30, ListLayout::Column);
+        assert_eq!(plain(&lines), vec![format!("  /x  {}…", "y".repeat(22))]);
+        assert_eq!(lines[0].width(), 30, "the bar runs to the edge: {lines:?}");
+
+        let backend = ratatui::backend::TestBackend::new(30, 3);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                draw_question(
+                    frame,
+                    frame.area(),
+                    &[Line::from(format!("  {}", "b".repeat(40)))],
+                    "name: ",
+                    &"a".repeat(40),
+                );
+            })
+            .expect("a frame");
+        let buffer = terminal.backend().buffer();
+        for y in 0..2 {
+            assert_eq!(buffer[(28, y)].symbol(), if y == 0 { "b" } else { "a" });
+            assert_eq!(
+                buffer[(29, y)].symbol(),
+                " ",
+                "row {y} keeps the last column clear"
+            );
+            assert_eq!(buffer[(29, y)].style().bg, Some(COMPOSER_BACKGROUND));
+        }
     }
 
     /// The list shows at most `COMPLETION_ROWS`, keeps the pick on screen, and lines the
