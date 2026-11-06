@@ -101,8 +101,8 @@ fn text_rows(text: &str, streaming: bool, width: usize, reasoning: bool) -> Vec<
 /// The rows of an item some of whose rows do not copy as text, with how each copies: an answer,
 /// an opened thinking block and a compaction's summary, drawn as markdown, a prompt, whose
 /// padding copies as nothing, and a picture, whose half blocks are no text. `None` for any other
-/// item, whose rows all copy as text.
-fn copied_rows_of(entry: &Entry, width: usize) -> Option<Vec<draw::Row>> {
+/// item, whose rows all copy as text. `prompt_padding` is `[display].prompt_padding`.
+fn copied_rows_of(entry: &Entry, width: usize, prompt_padding: bool) -> Option<Vec<draw::Row>> {
     let inner = width.max(1).saturating_sub(TEXT_EDGE).max(1);
     match &entry.item {
         Item::Prompt {
@@ -117,6 +117,7 @@ fn copied_rows_of(entry: &Entry, width: usize) -> Option<Vec<draw::Row>> {
             *delivered,
             *ran_under,
             width.max(1),
+            prompt_padding,
         )),
         Item::Text { text, streaming } => Some(draw::edge_copy_rows(text_rows(
             text, *streaming, inner, false,
@@ -161,14 +162,15 @@ fn ran_under_color(ran_under: RanUnder) -> Color {
 }
 
 /// A prompt as the block the composer is, kept once sent: the composer's bar down its left edge
-/// in the color of what it ran under, a row of its gray above and below the words, which copy as
-/// nothing, and the words between them.
+/// in the color of what it ran under, and the words, with a row of its gray above and below them
+/// when `padded`, which copies as nothing.
 fn prompt_rows(
     text: &str,
     class: Option<InboxClass>,
     delivered: bool,
     ran_under: RanUnder,
     width: usize,
+    padded: bool,
 ) -> Vec<draw::Row> {
     let inner = width.saturating_sub(TEXT_EDGE).max(1);
     // The same gray across the whole row, so a prompt is told from the answer under it at a
@@ -179,7 +181,7 @@ fn prompt_rows(
         format!("{:<TEXT_EDGE$}", draw::COMPOSER_BAR),
         block.fg(ran_under_color(ran_under)),
     );
-    let padded = |row: String, style: Style| {
+    let block_row = |row: String, style: Style| {
         let fill = width.saturating_sub(TEXT_EDGE + display_width(&row));
         Line::from(vec![
             bar.clone(),
@@ -194,7 +196,7 @@ fn prompt_rows(
         // would drop them.
         let source = crate::text::expand_tabs(&crate::text::sanitize_stream_text(source));
         for row in wrap_to_width(&source, inner, usize::MAX) {
-            lines.push((padded(row, block), draw::RowCopy::Text));
+            lines.push((block_row(row, block), draw::RowCopy::Text));
         }
     }
     if let Some(class) = class {
@@ -210,7 +212,7 @@ fn prompt_rows(
         };
         // The screen's word on the prompt, not part of it, so it copies as nothing.
         lines.push((
-            padded(
+            block_row(
                 note,
                 Style::default()
                     .fg(draw::DIM_ON_SHADE)
@@ -219,7 +221,10 @@ fn prompt_rows(
             draw::RowCopy::Padding,
         ));
     }
-    let pad = padded(String::new(), block);
+    if !padded {
+        return lines;
+    }
+    let pad = block_row(String::new(), block);
     std::iter::once((pad.clone(), draw::RowCopy::Padding))
         .chain(lines)
         .chain(std::iter::once((pad, draw::RowCopy::Padding)))
@@ -228,15 +233,20 @@ fn prompt_rows(
 
 /// One item as the lines it occupies at `width` and how each copies, its paths shown against
 /// `working_directory`. How a row copies is said only where it differs from text.
+/// `prompt_padding` is `[display].prompt_padding`.
 pub(crate) fn entry_rows(
     entry: &Entry,
     width: usize,
     working_directory: &Path,
+    prompt_padding: bool,
 ) -> (Vec<Line<'static>>, Vec<draw::RowCopy>) {
     let (lines, copies): (Vec<Line<'static>>, Vec<draw::RowCopy>) =
-        match copied_rows_of(entry, width) {
+        match copied_rows_of(entry, width, prompt_padding) {
             Some(rows) => rows.into_iter().unzip(),
-            None => (entry_lines(entry, width, working_directory), Vec::new()),
+            None => (
+                entry_lines(entry, width, working_directory, prompt_padding),
+                Vec::new(),
+            ),
         };
     // A row an item cannot lay out within a width too narrow for its fixed words (a note, a
     // count, a lead) is cut at the edge, as every other row is, rather than left to the terminal
@@ -493,29 +503,33 @@ fn tool_body(item: &Item, expanded: bool, width: usize) -> Vec<Line<'static>> {
 }
 
 /// One item as the lines it occupies at `width`, its paths shown against `working_directory`.
+/// `prompt_padding` is `[display].prompt_padding`.
 pub(crate) fn entry_lines(
     entry: &Entry,
     width: usize,
     working_directory: &Path,
+    prompt_padding: bool,
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     let inner = width.saturating_sub(TEXT_EDGE).max(1);
     match &entry.item {
-        Item::Prompt { .. } => copied_rows_of(entry, width)
+        Item::Prompt { .. } => copied_rows_of(entry, width, prompt_padding)
             .unwrap_or_default()
             .into_iter()
             .map(|(line, _)| line)
             .collect(),
-        Item::Text { .. } | Item::CompactionSummary { .. } => copied_rows_of(entry, width)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(line, _)| line)
-            .collect(),
+        Item::Text { .. } | Item::CompactionSummary { .. } => {
+            copied_rows_of(entry, width, prompt_padding)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect()
+        }
         Item::Thinking {
             text,
             estimate,
             ended,
-        } => match copied_rows_of(entry, width) {
+        } => match copied_rows_of(entry, width, prompt_padding) {
             Some(rows) => rows.into_iter().map(|(line, _)| line).collect(),
             None => vec![draw::thinking_row(text, *estimate, !*ended, width)],
         },
@@ -1170,13 +1184,14 @@ impl Viewport {
     }
 
     /// Lay `entry` out at `width` unless the cache already has it, and say how many rows it is.
-    fn lay_out(&mut self, entry: &Entry, width: usize) -> usize {
+    /// `prompt_padding` is the transcript's, which never changes under the cache.
+    fn lay_out(&mut self, entry: &Entry, width: usize, prompt_padding: bool) -> usize {
         let stale = self
             .cache
             .get(&entry.id)
             .is_none_or(|cached| cached.revision != entry.revision || cached.width != width);
         if stale {
-            let (lines, copies) = entry_rows(entry, width, &self.working_directory);
+            let (lines, copies) = entry_rows(entry, width, &self.working_directory, prompt_padding);
             self.cache.insert(entry.id, Cached {
                 revision: entry.revision,
                 width,
@@ -1196,7 +1211,7 @@ impl Viewport {
         self.place(transcript, width);
         for (index, entry) in transcript.drawn().enumerate() {
             if self.placements.get(index) != Some(&Placement::Hidden) {
-                self.lay_out(entry, width);
+                self.lay_out(entry, width, transcript.prompt_padding());
             }
         }
     }
@@ -1320,7 +1335,7 @@ impl Viewport {
             let own = if hidden {
                 0
             } else {
-                self.lay_out(entry, width)
+                self.lay_out(entry, width, transcript.prompt_padding())
             };
             let len = match self.placements.get(index) {
                 Some(Placement::Hidden) => 0,
@@ -2296,12 +2311,13 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: crate::config::TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
+            prompt_padding: true,
         }
     }
 
     /// An item's lines at `width`, its paths shown against `/w`.
     fn lines_at(entry: &Entry, width: usize) -> Vec<Line<'static>> {
-        entry_lines(entry, width, Path::new("/w"))
+        entry_lines(entry, width, Path::new("/w"), true)
     }
 
     fn entry(item: Item, expanded: bool) -> Entry {
@@ -2605,7 +2621,7 @@ mod tests {
             for (index, item) in items.iter().enumerate() {
                 for expanded in [false, true] {
                     let lines =
-                        entry_rows(&entry(item.clone(), expanded), width, Path::new("/w")).0;
+                        entry_rows(&entry(item.clone(), expanded), width, Path::new("/w"), true).0;
                     for line in &lines {
                         let text: String = line
                             .spans
@@ -2775,7 +2791,13 @@ mod tests {
                 change: None,
                 exit_code: None,
             };
-            plain(&entry_lines(&entry(item, false), 80, working_directory)).remove(0)
+            plain(&entry_lines(
+                &entry(item, false),
+                80,
+                working_directory,
+                true,
+            ))
+            .remove(0)
         };
         let under = working_directory.join("src/main.rs");
         assert_eq!(
@@ -4161,7 +4183,7 @@ mod tests {
                     .all(|span| span.style.bg == Some(COMPOSER_BACKGROUND))),
             "every row is the composer's block across the whole width: {lines:?}"
         );
-        let (_, copies) = entry_rows(&waiting, 60, Path::new("/w"));
+        let (_, copies) = entry_rows(&waiting, 60, Path::new("/w"), true);
         assert_eq!(
             copies,
             vec![
@@ -4178,6 +4200,36 @@ mod tests {
             words.style.fg == Some(draw::WHITE)
                 && !words.style.add_modifier.contains(Modifier::BOLD),
             "the words are white, not bold: {words:?}"
+        );
+    }
+
+    /// Without padding a prompt is its words and the screen's note on them, still the composer's
+    /// block across the width, and the note still copies as nothing.
+    #[test]
+    fn a_prompt_without_padding_is_its_words_and_its_note() {
+        let waiting = entry(
+            Item::Prompt {
+                text: "also check the logs".into(),
+                class: Some(InboxClass::Steer),
+                inbox_id: None,
+                delivered: false,
+                ran_under: RanUnder::Level(crate::permission::Permission::Read),
+            },
+            false,
+        );
+        let (lines, copies) = entry_rows(&waiting, 60, Path::new("/w"), false);
+        assert_eq!(plain(&lines), vec![
+            "▎ also check the logs",
+            "▎ (steer, waiting)"
+        ]);
+        assert_eq!(copies, vec![draw::RowCopy::Text, draw::RowCopy::Padding]);
+        assert!(
+            lines.iter().all(|line| line.width() == 60
+                && line
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg == Some(COMPOSER_BACKGROUND))),
+            "every row is the composer's block across the whole width: {lines:?}"
         );
     }
 

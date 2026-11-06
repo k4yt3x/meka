@@ -508,6 +508,45 @@ fn a_turn_draws_the_prompt_and_its_answer_above_the_composer() {
     assert_eq!(recorded, 1, "the row carries the switch");
 }
 
+/// `[display].prompt_padding = false` drops the row of gray above and below the words, on the
+/// composer and on a sent prompt alike; the default keeps both.
+#[test]
+fn prompt_padding_off_leaves_the_composer_and_a_sent_prompt_their_words_alone() {
+    // The rows of the bar alone around the prompt, and the composer's rows over the status row.
+    let shape = |extra_display: &str| {
+        let install = screen_install("read", extra_display, "");
+        let screens = run_screen(&install, TWO_TURNS, &["hi", "/exit"]);
+        let rows = final_screen(&screens).to_vec();
+        let prompt = rows
+            .iter()
+            .position(|row| row == "▎ hi")
+            .unwrap_or_else(|| panic!("the prompt in its block: {rows:#?}"));
+        let around = [rows.get(prompt.wrapping_sub(1)), rows.get(prompt + 1)]
+            .into_iter()
+            .filter(|row| row.is_some_and(|row| row == "▎"))
+            .count();
+        let composer = rows
+            .iter()
+            .rev()
+            .skip(1)
+            .take_while(|row| row.as_str() == "▎")
+            .count();
+        (around, composer, rows)
+    };
+    let (around, composer, rows) = shape("");
+    assert_eq!(
+        (around, composer),
+        (2, 3),
+        "by default a row of the block above and below the words: {rows:#?}"
+    );
+    let (around, composer, rows) = shape("prompt_padding = false");
+    assert_eq!(
+        (around, composer),
+        (0, 1),
+        "off, the words alone, the composer one row: {rows:#?}"
+    );
+}
+
 /// `a` at the approval prompt allows the tool until the session ends: the second call to it is
 /// not put to the user, and both writes land. Driven through the terminal because the answer
 /// travels from the screen back to the frontend, and only the real channel proves it gets there

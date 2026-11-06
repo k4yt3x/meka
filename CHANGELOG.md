@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET /v1/sessions/{id}/history` and `/context/messages`: what a session said, what the model sees.
 - `POST /v1/sessions/{id}/fork` takes `turn_id` to branch the conversation before that turn.
 - A session search hit carries `excerpt_position`, its place in the session's history.
+- `[display] prompt_padding = false` drops the gray row above and below the composer and prompts.
 
 ### Changed
 

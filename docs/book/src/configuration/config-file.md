@@ -1352,6 +1352,19 @@ Default: `true`
 fold_steps = false
 ```
 
+### `display.prompt_padding`
+
+Whether the interactive screen draws a row of gray above and below the words of the composer and
+of every prompt you sent. With `false`, the block keeps no blank rows; the bar down its left edge
+stays.
+
+Default: `true`
+
+```toml
+[display]
+prompt_padding = false
+```
+
 ### `display.show_session_id_on_create`
 
 Whether the screen shows the session id when a new session is created.

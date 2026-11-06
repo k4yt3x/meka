@@ -16,7 +16,9 @@ one. It stands while nothing but a warning
 stands with it, and goes with the first prompt. The
 conversation fills the screen from the top;
 the composer sits at the bottom, a gray block with a bar of the permission level's color down its
-left edge and a row of the gray above and below the text. The status row under the composer says,
+left edge and a row of the gray above and below the text, which
+[`display.prompt_padding`](../configuration/config-file.md#displayprompt_padding) `= false` drops
+here and on every prompt sent. The status row under the composer says,
 on the left, what the next prompt goes under, the permission level in its color and the profile the
 session runs on, then the session's working directory (shortened with `~`) and the
 [project](./projects.md) it is on, while it is on one; against the right edge it shows the context

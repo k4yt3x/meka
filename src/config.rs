@@ -785,6 +785,9 @@ pub(crate) struct DisplayConfig {
     /// Whether the interactive screen folds a run of thinking and tool calls into one row once
     /// the agent says something after it or its turn ends. Default `true`.
     pub(crate) fold_steps: Option<bool>,
+    /// Whether the interactive screen draws a row of the composer's gray above and below the words
+    /// of the composer and of every sent prompt. Default `true`.
+    pub(crate) prompt_padding: Option<bool>,
     pub(crate) show_session_id_on_create: Option<bool>,
     pub(crate) show_session_id_on_resume: Option<bool>,
     pub(crate) show_session_id_on_exit: Option<bool>,
@@ -1960,6 +1963,8 @@ pub(crate) struct ResolvedConfig {
     pub(crate) turn_end_summary: Vec<TurnEndFact>,
     /// Resolved `[display].fold_steps`.
     pub(crate) fold_steps: bool,
+    /// Resolved `[display].prompt_padding`.
+    pub(crate) prompt_padding: bool,
     pub(crate) web_client: WebClientConfig,
     pub(crate) sandbox: bool,
     /// Resolved `[shell].additional_readable_directories`, as written: canonicalized where they
@@ -3069,6 +3074,7 @@ impl ResolvedConfig {
                 .turn_end_summary
                 .unwrap_or_else(|| TurnEndFact::DEFAULT_SUMMARY.to_vec()),
             fold_steps: file_display.fold_steps.unwrap_or(true),
+            prompt_padding: file_display.prompt_padding.unwrap_or(true),
             status_row: file_display
                 .status_row
                 .unwrap_or_else(|| StatusFact::DEFAULT_ROW.to_vec()),

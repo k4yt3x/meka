@@ -107,6 +107,7 @@ pub(crate) async fn run_interactive(
         show_session_id_on_create: config.show_session_id_on_create,
         turn_end_summary: config.turn_end_summary.clone(),
         fold_steps: config.fold_steps,
+        prompt_padding: config.prompt_padding,
     });
     if let Some(id) = session_id {
         match store.turn_store().load_turns(id).await {

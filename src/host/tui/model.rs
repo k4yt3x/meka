@@ -36,6 +36,9 @@ pub(crate) struct Settings {
     pub(crate) turn_end_summary: Vec<TurnEndFact>,
     /// `[display].fold_steps`: whether a finished run of steps folds into one row.
     pub(crate) fold_steps: bool,
+    /// `[display].prompt_padding`: whether the composer and every sent prompt have a row of
+    /// their gray above and below the words.
+    pub(crate) prompt_padding: bool,
 }
 
 /// Where a tool call is in its life.
@@ -396,6 +399,12 @@ impl Transcript {
     /// call expanded suspends.
     pub(crate) fn folds_steps(&self) -> bool {
         self.settings.fold_steps && !self.tools_expanded
+    }
+
+    /// Whether the composer and every sent prompt have a row of their gray above and below the
+    /// words.
+    pub(crate) fn prompt_padding(&self) -> bool {
+        self.settings.prompt_padding
     }
 
     /// Whether a turn is running, whose steps may still grow.
@@ -2431,6 +2440,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
+            prompt_padding: true,
         })
     }
 
@@ -3015,7 +3025,7 @@ mod tests {
             transcript
                 .drawn()
                 .flat_map(|entry| {
-                    super::super::view::entry_lines(entry, 80, std::path::Path::new("/w"))
+                    super::super::view::entry_lines(entry, 80, std::path::Path::new("/w"), true)
                 })
                 .map(|line| {
                     line.spans
@@ -3469,6 +3479,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
+            prompt_padding: true,
         });
         older.load_page_above(page(
             vec![Event::CompactBoundary {
@@ -3546,6 +3557,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: facts,
             fold_steps: true,
+            prompt_padding: true,
         })
     }
 

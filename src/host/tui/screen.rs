@@ -2896,7 +2896,7 @@ impl Screen {
             1 + gap + least_composer + 2 * padding + status_height <= area.height
         };
         let gap = 1 + u16::from(working.is_some());
-        let padding = if fits(gap, COMPOSER_PADDING) {
+        let padding = if self.launch.transcript.prompt_padding() && fits(gap, COMPOSER_PADDING) {
             COMPOSER_PADDING
         } else {
             0
@@ -3024,9 +3024,9 @@ impl Screen {
                     hint: self.hint.as_ref().map(|(hint, _)| hint.as_str()),
                     shell_mode: self.composer.is_shell_mode(),
                 };
-                // The block is the composer's gray across the row, with a row of it above and below
-                // the text, as a sent prompt has; the recall search takes the text's place, on one
-                // row. A bar of the permission level's color runs down its left edge.
+                // The block is the composer's gray across the row, padded as a sent prompt is; the
+                // recall search takes the text's place, on one row. A bar of the permission level's
+                // color runs down its left edge.
                 let block = Style::default().bg(super::input::COMPOSER_BACKGROUND);
                 frame.render_widget(ratatui::widgets::Block::new().style(block), composer_area);
                 let lead = TEXT_EDGE as u16;
