@@ -499,8 +499,11 @@ impl TurnRecovery {
     /// message ahead of it, so this runs after the prompt is guaranteed on disk and before
     /// anything else is appended, or a row written in between would be swallowed or stripped
     /// instead. A failed write still leaves the in-memory conversation repaired, so the turn
-    /// completes; the cost is that a resume re-reads the rejected content and pays one more
-    /// round trip to heal it again.
+    /// completes and later turns send it repaired, since a repair changes no message count and is
+    /// no reason to reload. A reload a later failed save forces reads the rejected content back,
+    /// and the turns after it may degrade it again from where it differs (`unaccepted_from`); a
+    /// resume reads it back outside every turn's window, and the session then needs a rewind past
+    /// it.
     ///
     /// [`Self::tiers_tried`] resets, because a vindicated tier was not spent, it was right:
     /// leaving it counted would make a second refusal in the same turn (over an image a later
@@ -668,14 +671,16 @@ impl TurnRecovery {
     /// append-only, and the materialized view (what a later turn sends) loses the orphan.
     /// Unpersisted, it has to be dropped from memory instead, because a `Repair` is
     /// position-relative and writing one for an `Append` that never reached disk would, on reload,
-    /// delete whatever message does sit at the end of the stored log. Either way the withdrawal is
-    /// announced, for a host whose client has to be told whether its prompt is still there.
+    /// delete whatever message does sit at the end of the stored log. A withdrawal that is
+    /// announced has happened, for a host whose client has to be told whether its prompt is still
+    /// there; one whose save fails is undone in memory too, so memory and the store keep the prompt
+    /// alike, and is not announced. Whether the prompt was withdrawn.
     pub(super) async fn withdraw_unanswered_prompt(
         &self,
         agent: &Agent,
         session_id: Uuid,
         messages: &mut Conversation,
-    ) {
+    ) -> bool {
         // The items rode the message that is leaving, so they are owed to the next turn. Offered
         // at once, in the same write as the withdrawal where there is one, so the two facts cannot
         // come apart; the driver that opened this turn on them decides how long to wait before it.
@@ -686,13 +691,14 @@ impl TurnRecovery {
                 .save_event_resetting_inbox(session_id, &withdrawal, &self.inbox_ids, not_before)
                 .await
             {
+                messages.pop_repair();
                 tracing::warn!(
-                    "failed to persist the withdrawal of an unanswered prompt; it will reappear \
-                     if this session is resumed: {error}"
+                    "failed to withdraw an unanswered prompt; it stays in the conversation: {error}"
                 );
+                return false;
             }
         } else {
-            // Reached only when a database write failed, which no test here can provoke.
+            // Reached only when a database write failed.
             messages.pop_unsaved();
             if let Err(error) = agent
                 .store
@@ -708,6 +714,7 @@ impl TurnRecovery {
             .frontend
             .emit(FrontendEvent::PromptWithdrawn)
             .await;
+        true
     }
 }
 /// How much of the provider's rejection text is carried into the conversation. Long enough to keep

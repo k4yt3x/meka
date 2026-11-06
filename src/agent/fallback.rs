@@ -23,21 +23,6 @@ use crate::{
     provider::{CompletionRequest, ResolvedProfile, resolved_profile, retry::fallback_cooldown},
 };
 
-/// Puts the named profile back when a compaction run outside a turn ends, however it ends. Inside
-/// a turn it does nothing: the turn restores at its own end, and a compaction's fallback is the
-/// turn's to keep.
-pub(super) struct RestoreWhenIdle<'a> {
-    pub(super) agent: &'a Agent,
-}
-
-impl Drop for RestoreWhenIdle<'_> {
-    fn drop(&mut self) {
-        if self.agent.current_turn().is_none() {
-            self.agent.restore_named_profile();
-        }
-    }
-}
-
 impl Agent {
     /// The fallback serving now, when one is: `Some` while the published profile is not the
     /// session's own.
@@ -703,10 +688,10 @@ mod tests {
         assert_eq!(family.agent.profile(), "main");
     }
 
-    /// The non-streaming door falls back too, and a compaction run between turns puts the named
-    /// profile back when it ends, while one inside a turn leaves the turn's fallback in place.
+    /// The non-streaming door falls back too, and the end of the turn it served, a compaction run
+    /// between turns being one, puts the named profile back.
     #[tokio::test]
-    async fn a_completion_falls_back_and_an_idle_compaction_restores() {
+    async fn a_completion_falls_back_and_the_end_of_its_turn_restores() {
         let family = family(vec![exhausted()], vec![answer("from backup")]).await;
         let token = CancellationToken::new();
         let request = CompletionRequest::new("system", &[], &[]);
@@ -720,18 +705,10 @@ mod tests {
         assert_eq!(family.backup.completions().len(), 1);
 
         *crate::sync::lock(&family.agent.current_turn) = Some(uuid::Uuid::new_v4());
-        drop(RestoreWhenIdle {
+        drop(super::super::turn::TurnScope {
             agent: &family.agent,
         });
-        assert_eq!(
-            family.agent.serving_fallback().as_deref(),
-            Some("backup"),
-            "inside a turn the compaction's fallback is the turn's to keep"
-        );
-        *crate::sync::lock(&family.agent.current_turn) = None;
-        drop(RestoreWhenIdle {
-            agent: &family.agent,
-        });
+        assert_eq!(family.agent.current_turn(), None);
         assert_eq!(family.agent.serving_fallback(), None);
         assert_eq!(family.agent.profile(), "main");
     }

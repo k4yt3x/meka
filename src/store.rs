@@ -7,9 +7,9 @@
 //! `initialize_schema` runs it, then hands the memory search index to
 //! `crate::store::memory::reconcile_index`.
 //!
-//! `prompt_history` is in the ledger like every other table, but it is read and written on a
-//! separate synchronous connection ([`history::HistoryStore`]) because the composer that
-//! consumes it walks it on a key press, synchronously.
+//! `recall_entries` is in the ledger like every other table, but it is read and written on a
+//! separate synchronous connection ([`recall::RecallStore`]) because the composer that consumes
+//! it walks it on a key press, synchronously.
 //!
 //! Per-session mutual exclusion is provided by an OS-level file lock ([`FileLock`]) so the
 //! kernel reclaims it whenever the holder dies: no PID-aliveness check, no risk of stale locks.
@@ -25,12 +25,12 @@ mod backup;
 mod blobs;
 mod credentials;
 pub(crate) mod export;
-pub(crate) mod history;
 pub(crate) mod inbox;
 mod locks;
 pub(crate) mod memory;
 pub(crate) mod migrations;
 pub(crate) mod projects;
+pub(crate) mod recall;
 pub(crate) mod schedule;
 mod scratchpad;
 mod search;
@@ -60,9 +60,10 @@ pub(crate) use self::{
     scratchpad::{RenameOutcome, ScratchpadEntry},
     search::SessionMatch,
     sessions::{
-        ForkOverrides, ImportSessionRecord, ImportedEvent, LogPage, LogRow, Rewound, SessionFilter,
-        SessionMetaRow, SessionPatch, SessionReach, SessionSummary, SessionSweep, SourceLock,
-        SpawnTerms, normalize_title,
+        ForkOverrides, HistoryEdge, HistoryEntry, HistoryKind, ImportSessionRecord, ImportedEvent,
+        LogPage, LogRow, Rewound, Said, SaidStamp, SessionFilter, SessionMetaRow, SessionPatch,
+        SessionReach, SessionSummary, SessionSweep, SourceLock, SpawnTerms, is_rewound,
+        normalize_title,
     },
 };
 use crate::error::{MekaError, Result};
@@ -72,7 +73,7 @@ pub(crate) struct Store {
     connection: Arc<Connection>,
     lock_dir: PathBuf,
     /// Resolved path to the on-disk database (or `:memory:`). Exposed via [`Self::database_path`]
-    /// so the screen can open a second connection for persistent input history.
+    /// so the screen can open a second connection for its recall.
     database_path: PathBuf,
     /// Set only for an in-memory database, whose lock dir is a fresh temp directory nothing else
     /// would ever clean up. Held behind an `Arc` so the removal happens when the *last* clone of
@@ -86,6 +87,10 @@ pub(crate) struct Store {
     /// The rows this build could not read and has said so about. Shared by every clone, since a
     /// resume's hydration and the screen's page read meet the same rows.
     warned_rows: Arc<sessions::WarnedRows>,
+    /// Each session's rewound stretches as last computed, under the shape of its log they were
+    /// computed from; see [`sessions::RewoundCache`]. Shared by every clone, since every reader of
+    /// a session's history needs them and computing them decodes the whole log.
+    rewound_cache: Arc<sessions::RewoundCache>,
     /// Serializes the forks that probe their source within this process, so two concurrent forks
     /// of one dormant session do not refuse each other. `flock` cannot tell a sibling fork
     /// mid-copy from another process mid-turn, and the two deserve opposite answers: a copy is
@@ -260,6 +265,7 @@ impl Store {
             database_path,
             scheduler_memory: Arc::default(),
             warned_rows: Arc::default(),
+            rewound_cache: Arc::default(),
             in_use: Arc::default(),
         };
         store.initialize_schema(context).await?;
@@ -268,8 +274,7 @@ impl Store {
     }
 
     /// Resolved path to the on-disk database (or `:memory:`). The screen opens a second synchronous
-    /// connection here for persistent input history (see
-    /// [`crate::store::history::HistoryStore`]).
+    /// connection here for its recall (see [`crate::store::recall::RecallStore`]).
     pub(crate) fn database_path(&self) -> &Path {
         &self.database_path
     }

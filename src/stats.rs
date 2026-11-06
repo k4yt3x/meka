@@ -104,8 +104,8 @@ impl SessionStats {
             .fetch_add(usage.cache_read_input_tokens, Relaxed);
     }
 
-    /// Record tokens spent outside any turn: the compaction calls, both the checkpoint turn and
-    /// the standalone summarizer.
+    /// Record tokens spent without counting a turn: the compaction calls, both the checkpoint turn
+    /// and the standalone summarizer, and a turn that did not finish.
     ///
     /// Separate from [`Self::record_turn`] only because that also increments the turn counter, and
     /// a compaction is not a turn the user asked for. The tokens are real spend and belong in the
@@ -220,6 +220,18 @@ impl TokenUsage {
             && self.output_tokens == 0
             && self.cache_creation_input_tokens == 0
             && self.cache_read_input_tokens == 0
+    }
+
+    /// Add `other` to this, tier by tier.
+    pub(crate) fn add(&mut self, other: &TokenUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(other.cache_read_input_tokens);
     }
 
     /// Fold a streamed usage update into the running per-round total, taking each field from

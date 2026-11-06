@@ -241,10 +241,6 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
     let authenticated = Router::new()
         .route("/v1/sessions", post(handlers::sessions::create_session))
         .route("/v1/sessions", get(handlers::sessions::list_sessions))
-        .route(
-            "/v1/sessions/search",
-            get(handlers::sessions::search_sessions),
-        )
         .route("/v1/sessions/{id}", get(handlers::sessions::get_session))
         .route(
             "/v1/sessions/{id}",
@@ -255,8 +251,12 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             delete(handlers::sessions::delete_session),
         )
         .route(
-            "/v1/sessions/{id}/messages",
-            get(handlers::messages::list_messages),
+            "/v1/sessions/{id}/history",
+            get(handlers::messages::list_history),
+        )
+        .route(
+            "/v1/sessions/{id}/context/messages",
+            get(handlers::messages::list_context_messages),
         )
         .route(
             "/v1/sessions/{id}/blobs/{hash}",
@@ -266,7 +266,6 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             "/v1/sessions/{id}/fork",
             post(handlers::sessions::fork_session),
         )
-        .route("/v1/sessions/{id}/turn", post(handlers::turn::submit_turn))
         .route("/v1/sessions/{id}/inbox", post(handlers::inbox::enqueue))
         .route("/v1/sessions/{id}/inbox", get(handlers::inbox::list))
         .route(
@@ -277,8 +276,8 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             "/v1/sessions/{id}/cancel",
             post(handlers::turn::cancel_turn),
         )
-        .route("/v1/sessions/{id}/stream", get(handlers::turn::stream_turn))
-        .route("/v1/stream", get(handlers::turn::stream_server))
+        .route("/v1/sessions/{id}/feed", get(handlers::turn::session_feed))
+        .route("/v1/feed", get(handlers::turn::server_feed))
         .route(
             "/v1/sessions/{id}/responses/{request_id}",
             post(handlers::responses::respond),
@@ -304,31 +303,32 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         )
         .route(
             "/v1/sessions/{id}/turns",
-            get(handlers::conversation::turns),
+            get(handlers::conversation::turns).post(handlers::turn::submit_turn),
         )
         .route(
             "/v1/sessions/{id}/turns/{turn_id}",
             get(handlers::conversation::turn),
         )
-        .route("/v1/sessions/{id}/tasks", get(handlers::jobs::list_tasks))
         .route("/v1/tasks", get(handlers::jobs::list_all_tasks))
+        .route("/v1/tasks/{task_id}", delete(handlers::jobs::cancel_task))
         .route(
-            "/v1/sessions/{id}/tasks/{task_id}",
-            delete(handlers::jobs::cancel_task),
+            "/v1/jobs",
+            get(handlers::jobs::list_all).post(handlers::jobs::create),
         )
-        .route("/v1/schedule", get(handlers::jobs::list_all))
-        .route("/v1/schedule/{job_id}", delete(handlers::jobs::cancel))
-        .route("/v1/sessions/{id}/schedule", post(handlers::jobs::create))
+        .route("/v1/jobs/{job_id}", delete(handlers::jobs::cancel))
         .route("/v1/sessions/{id}/tools", get(handlers::stores::list_tools))
         .route("/v1/info", get(handlers::info::info))
         .route("/v1/skills", get(handlers::info::skills))
         .route("/v1/skills/{name}", get(handlers::stores::get_skill))
         .route("/v1/skills/{name}", put(handlers::stores::put_skill))
         .route("/v1/skills/{name}", delete(handlers::stores::delete_skill))
-        .route("/v1/memory", get(handlers::stores::list_memories))
-        .route("/v1/memory/{name}", get(handlers::stores::get_memory))
-        .route("/v1/memory/{name}", put(handlers::stores::put_memory))
-        .route("/v1/memory/{name}", delete(handlers::stores::delete_memory))
+        .route("/v1/memories", get(handlers::stores::list_memories))
+        .route("/v1/memories/{name}", get(handlers::stores::get_memory))
+        .route("/v1/memories/{name}", put(handlers::stores::put_memory))
+        .route(
+            "/v1/memories/{name}",
+            delete(handlers::stores::delete_memory),
+        )
         .route("/v1/instructions", get(handlers::stores::instructions))
         .route("/v1/instructions", put(handlers::stores::put_instructions))
         .route("/v1/config", get(handlers::installation::config))

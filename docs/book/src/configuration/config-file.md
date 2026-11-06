@@ -368,7 +368,7 @@ effort  = "xhigh"
 
 Whether this profile's model accepts image input. Defaults to `true`. Set `false` for a text-only model so attachments are refused rather than sent to a model that cannot read them. A turn on such a profile is refused, before anything is sent, while the session's history holds an image: switch the session to a profile with vision. A profile's [`fallbacks`](#fallbacks) share its `vision`, so a fallback never meets that refusal.
 
-Refusal is per session, from the profile that session recorded, on both ACP and `POST /v1/sessions/{id}/turn`. What ACP *advertises* in `promptCapabilities.image` is necessarily per connection: `initialize` is answered before any session exists, so it reports the default profile's flag. A client on a vision-capable connection can still have its attachment refused by a session pinned to a text-only profile. See [ACP](../usage/acp.md).
+Refusal is per session, from the profile that session recorded, on both ACP and `POST /v1/sessions/{id}/turns`. What ACP *advertises* in `promptCapabilities.image` is necessarily per connection: `initialize` is answered before any session exists, so it reports the default profile's flag. A client on a vision-capable connection can still have its attachment refused by a session pinned to a text-only profile. See [ACP](../usage/acp.md).
 
 ```toml
 [profiles.local]
@@ -1126,9 +1126,9 @@ Settings for session history retention and context window management.
 
 Delete sessions not updated for longer than this, at startup and then hourly for as long as `meka serve`, `meka acp` or the screen stays up. A duration string like `"30d"` or `"12h"`. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.
 
-The screen's input history, the lines Up and Ctrl+R recall, is swept with it: an entry older than this window, or than [`turn_retention`](#sessionturn_retention) when that is the shorter, is deleted, since what a person typed must not outlive the conversation it went into.
+The screen's recall entries, the lines Up and Ctrl+R bring back, are swept with it: an entry older than this window, or than [`turn_retention`](#sessionturn_retention) when that is the shorter, is deleted, since what a person typed must not outlive the conversation it went into.
 
-Three kinds of session are spared whatever their timestamp says. A session another meka process has open is skipped, and the sweep reports how many: only turns bump `updated_at`, and resuming does not, so an interactive session left open past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
+Three kinds of session are spared whatever their timestamp says. A session another meka process has open is skipped, and the sweep reports how many: `updated_at` moves when the conversation changes, not when a session is opened, so an interactive session left open past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
 
 **Default: unset, meaning nothing is deleted.** `"0s"` is refused at startup, since it would delete everything on every launch. Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session remove --older-than-days <DAYS>` to prune manually instead.
 
@@ -1141,7 +1141,7 @@ retention = "30d"
 
 Delete the turns of every session that ended longer ago than this, once a compaction has summarized them. A duration string like `"90d"` or `"36h"`. The sweep runs at startup, at the start of each turn for that turn's session, and hourly for as long as `meka serve`, `meka acp` or the screen stays up.
 
-Only turns before a session's latest compaction can go, since the summary is what stands in for them: the turns the model still works from are never deleted out from under it. When one of those is older than the window, the next turn compacts first, keeping no rounds verbatim and quoting none, and the sweep takes it afterward. Needs `auto_compact = true` for that reason. A turn goes whole: its messages, its record, its words in the search index and the images only it carried. Inbox items and background outcomes go once they have been delivered or withdrawn for longer than the window. Scratchpad entries and memories are the agent's own and stay.
+Only turns before a session's latest compaction can go, since the summary is what stands in for them: the turns the model still works from are never deleted out from under it, and a turn a compaction cut into keeps only the rounds it kept. When one of those is older than the window, the next turn compacts first, keeping no rounds verbatim and quoting none, and the sweep takes it afterward. Needs `auto_compact = true` for that reason. A turn goes whole: its messages, its record, and with it its place in the session's `turn_count` and `usage`, its words in the search index and the images only it carried. Inbox items and background outcomes go once they have been delivered or withdrawn for longer than the window. Scratchpad entries and memories are the agent's own and stay.
 
 The model is told the window in its system prompt, and every turn's context block names the date nothing precedes, so it knows how far back `conversation_search` reaches and to keep in memory what must outlive the window. See [What the agent sees](../usage/sessions.md#what-the-agent-sees).
 
@@ -1503,7 +1503,7 @@ you. Not always, though. The member carries the failing call's error message, an
 that is meka's own sentence about the call rather than anything the provider sent.
 
 **It reaches `sessions:r`, not only `sessions:w`.** Submitting a turn takes the write scope, but the
-failure also rides the terminal `turn.failed` event, and `GET /v1/sessions/{id}/stream` replays that
+failure also rides the terminal `turn.failed` event, and `GET /v1/sessions/{id}/feed` replays that
 to any reader. Turn this off where read-only tokens go to people who may watch a session but are not
 entitled to the account behind it.
 
@@ -1552,7 +1552,7 @@ Process-wide cap on in-flight turns across all sessions, counting every turn: on
 
 ### `serve.stream_replay_events`
 
-How many of a session feed's latest SSE events to retain, across its turns, so a client reconnecting to `GET /v1/sessions/{id}/stream` with `Last-Event-ID` can replay what it missed. The events retained also stay within 16 MiB of payload, the oldest leaving first, since one file edit's event carries the file before and after.
+How many of a session feed's latest SSE events to retain, across its turns, so a client reconnecting to `GET /v1/sessions/{id}/feed` with `Last-Event-ID` can replay what it missed. The events retained also stay within 16 MiB of payload, the oldest leaving first, since one file edit's event carries the file before and after.
 
 | Type | Default |
 |------|---------|

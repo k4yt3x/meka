@@ -141,7 +141,7 @@ pub(crate) async fn sweep_expired(windows: RetentionWindows, store: &Store) -> a
     sweep_unfinished_copies(store).await;
     sweep_expired_sessions(windows.sessions, store).await?;
     sweep_expired_turns(windows.turns, store).await?;
-    sweep_expired_history(windows, store).await
+    sweep_expired_recall(windows, store).await
 }
 
 /// Delete the sessions a fork or an import left half copied when its process died, sparing any
@@ -159,9 +159,9 @@ async fn sweep_unfinished_copies(store: &Store) {
     }
 }
 
-/// Delete the screen's input history older than the shorter of the two windows: what a person
+/// Delete the screen's recall entries older than the shorter of the two windows: what a person
 /// typed is in a turn and a session, and must not outlive either where the store keeps it apart.
-async fn sweep_expired_history(windows: RetentionWindows, store: &Store) -> anyhow::Result<()> {
+async fn sweep_expired_recall(windows: RetentionWindows, store: &Store) -> anyhow::Result<()> {
     let Some(window) = [windows.sessions, windows.turns]
         .into_iter()
         .flatten()
@@ -170,15 +170,11 @@ async fn sweep_expired_history(windows: RetentionWindows, store: &Store) -> anyh
         return Ok(());
     };
     let cutoff = crate::text::horizon_before(chrono::Utc::now(), window);
-    let deleted = store.delete_prompt_history_before(cutoff).await?;
+    let deleted = store.delete_recall_entries_before(cutoff).await?;
     if deleted > 0 {
         tracing::info!(
             "deleted {entries} older than the retention window",
-            entries = crate::text::counted(
-                deleted as u64,
-                "input history entry",
-                "input history entries"
-            )
+            entries = crate::text::counted(deleted as u64, "recall entry", "recall entries")
         );
     }
     Ok(())
@@ -561,19 +557,19 @@ mod tests {
     /// What a person typed is swept by the shorter of the two windows: an entry older than the
     /// turn window goes, one younger stays, and with neither window set nothing is swept.
     #[tokio::test]
-    async fn the_input_history_is_swept_by_the_shorter_window() {
+    async fn recall_is_swept_by_the_shorter_window() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("meka.db");
         let store = Store::open(Some(&path), &Default::default())
             .await
             .expect("a migrated store");
-        let history = crate::store::history::HistoryStore::open(&path, 100).expect("history");
-        history.append("ten days ago").expect("append");
-        history.append("three days ago").expect("append");
+        let recall = crate::store::recall::RecallStore::open(&path, 100).expect("recall");
+        recall.append("ten days ago").expect("append");
+        recall.append("three days ago").expect("append");
         let raw = rusqlite::Connection::open(&path).expect("open");
         for (line, days) in [("ten days ago", 10), ("three days ago", 3)] {
             raw.execute(
-                "UPDATE prompt_history SET created_at = ?1 WHERE command_line = ?2",
+                "UPDATE recall_entries SET created_at = ?1 WHERE command_line = ?2",
                 rusqlite::params![
                     (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339(),
                     line
@@ -586,7 +582,7 @@ mod tests {
         sweep_expired(RetentionWindows::default(), &store)
             .await
             .expect("sweep");
-        assert_eq!(history.recent(0).expect("read").len(), 2);
+        assert_eq!(recall.recent(0).expect("read").len(), 2);
 
         sweep_expired(
             RetentionWindows {
@@ -597,7 +593,7 @@ mod tests {
         )
         .await
         .expect("sweep");
-        assert_eq!(history.recent(0).expect("read"), ["three days ago"]);
+        assert_eq!(recall.recent(0).expect("read"), ["three days ago"]);
     }
 
     /// A host that stays up re-applies the windows on the hour; what aged since startup goes at

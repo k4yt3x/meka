@@ -315,7 +315,7 @@ Only call `image_render` when the current model supports vision input.
 
 ## `conversation_search` / `conversation_read`
 
-Search and read a session's **full** conversation, including earlier turns that [compaction](../usage/interactive-mode.md#compact) summarized and removed from the model's context. Compaction never deletes turns (it appends a boundary and hides the older ones); these tools read straight from the on-disk event log, so a detail the compaction summary dropped is still recoverable, within [`[session].turn_retention`](../configuration/config-file.md#sessionturn_retention) when that is set.
+Search and read a session's **full** conversation, including earlier turns that [compaction](../usage/interactive-mode.md#compact) summarized and removed from the model's context. Compaction never deletes turns (it appends a boundary and hides the older ones); these tools read the session's history from the store, as the screen and `GET /v1/sessions/{id}/history` show it, so a detail the compaction summary dropped is still recoverable, within [`[session].turn_retention`](../configuration/config-file.md#sessionturn_retention) when that is set.
 
 `conversation_search` searches and returns matching lines, each tagged with a message index (`#N`) and role:
 

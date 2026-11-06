@@ -1,4 +1,4 @@
-//! The composer and the keys: the text area the user types into, its history, slash completion,
+//! The composer and the keys: the text area the user types into, its recall, slash completion,
 //! and the one table that says what a key does.
 
 use std::{path::PathBuf, sync::Arc};
@@ -11,17 +11,17 @@ use ratatui::{
 };
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
-use crate::store::history::{CommandLineMatch, HistoryFilter, HistoryOrder, HistoryStore};
+use crate::store::recall::{CommandLineMatch, RecallFilter, RecallOrder, RecallStore};
 
 /// The composer's background: a dark block that reads as "type here" on a dark theme and stays
 /// quiet on a light one, a step lighter than the status row under it so the two do not merge.
 pub(crate) const COMPOSER_BACKGROUND: Color = Color::Indexed(234);
 
-/// Entries loaded into memory when a walk through the history begins.
-const HISTORY_WALK_ENTRIES: usize = 500;
+/// Entries loaded into memory when a walk through the recall entries begins.
+const RECALL_WALK_ENTRIES: usize = 500;
 
-/// Matches shown for a history search.
-const HISTORY_SEARCH_MATCHES: i64 = 50;
+/// Matches shown for a recall search.
+const RECALL_SEARCH_MATCHES: i64 = 50;
 
 /// Where a key lands, which decides what it means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +33,7 @@ pub(crate) enum Focus {
     Composer,
     /// The composer with the completion list open.
     Completion,
-    /// The history search.
+    /// The recall search.
     Search,
     /// A panel in place of the composer: a command's answer, a picker, the approval prompt.
     Panel,
@@ -57,10 +57,10 @@ pub(crate) enum Action {
     /// Esc when nothing runs: close whatever is open, let go of the item cursor, or return to the
     /// bottom.
     Escape,
-    HistoryPrevious,
-    HistoryNext,
-    /// Ctrl+R: open the history search, or step to its next match.
-    HistorySearch,
+    RecallPrevious,
+    RecallNext,
+    /// Ctrl+R: open the recall search, or step to its next match.
+    RecallSearch,
     /// Tab: fill in the picked completion, or open the list again after Esc.
     Complete,
     /// Ctrl+V: attach the image on the clipboard to the next prompt.
@@ -143,7 +143,7 @@ pub(crate) fn action_for(key: &KeyEvent, focus: Focus, composer: ComposerState) 
         Focus::Search => match key.code {
             KeyCode::Enter => Action::Submit,
             KeyCode::Esc => Action::Escape,
-            KeyCode::Char('r') if ctrl => Action::HistorySearch,
+            KeyCode::Char('r') if ctrl => Action::RecallSearch,
             KeyCode::Char('c') if ctrl => Action::Escape,
             KeyCode::Up => Action::PickPrevious,
             KeyCode::Down => Action::PickNext,
@@ -172,9 +172,9 @@ pub(crate) fn action_for(key: &KeyEvent, focus: Focus, composer: ComposerState) 
             KeyCode::Esc => Action::Escape,
             KeyCode::Up if alt => Action::CursorPrevious,
             KeyCode::Down if alt => Action::CursorNext,
-            KeyCode::Up if composer.at_first_line => Action::HistoryPrevious,
-            KeyCode::Down if composer.at_last_line => Action::HistoryNext,
-            KeyCode::Char('r') if ctrl => Action::HistorySearch,
+            KeyCode::Up if composer.at_first_line => Action::RecallPrevious,
+            KeyCode::Down if composer.at_last_line => Action::RecallNext,
+            KeyCode::Char('r') if ctrl => Action::RecallSearch,
             KeyCode::Tab => Action::Complete,
             KeyCode::PageUp => Action::ScrollUp,
             KeyCode::PageDown => Action::ScrollDown,
@@ -408,8 +408,8 @@ fn complete_cd_path(
     suggestions
 }
 
-/// A walk through the history with Up and Down: what was being typed when it began, and where it
-/// is.
+/// A walk through the recall entries with Up and Down: what was being typed when it began, and
+/// where it is.
 struct Walk {
     draft: String,
     /// Oldest first, as the store hands them back.
@@ -418,7 +418,7 @@ struct Walk {
     index: usize,
 }
 
-/// The history search Ctrl+R opens.
+/// The recall search Ctrl+R opens.
 pub(crate) struct Search {
     pub(crate) query: String,
     /// Newest first.
@@ -463,7 +463,7 @@ pub(crate) struct Attachment {
     pub(crate) picture: crate::render::tui::Picture,
 }
 
-/// The text the user is typing, with its history and the lists that open over it.
+/// The text the user is typing, with its recall and the lists that open over it.
 pub(crate) struct Composer {
     area: TextArea<'static>,
     /// Images to send with the next prompt, shown as chips above the text in the order they
@@ -474,7 +474,7 @@ pub(crate) struct Composer {
     /// Backspace on the empty composer. The `!` is the text's again in [`Self::text`], so the
     /// command runs, is remembered and is recalled as `!cmd`.
     shell_mode: bool,
-    history: Option<HistoryStore>,
+    recall: Option<RecallStore>,
     walk: Option<Walk>,
     pub(crate) search: Option<Search>,
     pub(crate) completion: Option<Completion>,
@@ -487,7 +487,7 @@ pub(crate) struct Composer {
 }
 
 impl Composer {
-    pub(crate) fn new(history: Option<HistoryStore>) -> Self {
+    pub(crate) fn new(recall: Option<RecallStore>) -> Self {
         let mut area = TextArea::default();
         area.set_wrap_mode(WrapMode::WordOrGlyph);
         area.set_cursor_line_style(Style::default());
@@ -498,7 +498,7 @@ impl Composer {
             area,
             chips: Vec::new(),
             shell_mode: false,
-            history,
+            recall,
             walk: None,
             search: None,
             completion: None,
@@ -844,15 +844,15 @@ impl Composer {
     /// Store what was sent, so Up recalls it next time.
     pub(crate) fn remember(&mut self, text: &str) {
         self.walk = None;
-        let Some(history) = &self.history else {
+        let Some(recall) = &self.recall else {
             return;
         };
         // The newest entry is not repeated, so an answer sent twice is one row to walk past.
-        if history.latest().ok().flatten().as_deref() == Some(text) {
+        if recall.latest().ok().flatten().as_deref() == Some(text) {
             return;
         }
-        if let Err(error) = history.append(text) {
-            tracing::warn!("failed to record the prompt in the input history: {error}");
+        if let Err(error) = recall.append(text) {
+            tracing::warn!("failed to record the prompt for recall: {error}");
         }
     }
 
@@ -860,13 +860,13 @@ impl Composer {
         if self.walk.is_some() {
             return true;
         }
-        let Some(history) = &self.history else {
+        let Some(recall) = &self.recall else {
             return false;
         };
-        let entries = match history.recent(HISTORY_WALK_ENTRIES) {
+        let entries = match recall.recent(RECALL_WALK_ENTRIES) {
             Ok(entries) => entries,
             Err(error) => {
-                tracing::warn!("failed to read the input history: {error}");
+                tracing::warn!("failed to read the recall entries: {error}");
                 return false;
             }
         };
@@ -883,7 +883,7 @@ impl Composer {
     }
 
     /// Up at the top of the composer: the entry before the one shown.
-    pub(crate) fn history_previous(&mut self) {
+    pub(crate) fn recall_previous(&mut self) {
         if !self.begin_walk() {
             return;
         }
@@ -899,7 +899,7 @@ impl Composer {
     }
 
     /// Down at the bottom of the composer: the entry after the one shown, or the draft.
-    pub(crate) fn history_next(&mut self) {
+    pub(crate) fn recall_next(&mut self) {
         let Some(walk) = self.walk.as_mut() else {
             return;
         };
@@ -920,7 +920,7 @@ impl Composer {
     }
 
     /// Ctrl+R: open the search, or step to the next match of the query.
-    pub(crate) fn history_search(&mut self) {
+    pub(crate) fn recall_search(&mut self) {
         match self.search.as_mut() {
             Some(search) => {
                 if !search.matches.is_empty() {
@@ -959,23 +959,23 @@ impl Composer {
         let Some(search) = self.search.as_mut() else {
             return;
         };
-        let Some(history) = &self.history else {
+        let Some(recall) = &self.recall else {
             search.matches.clear();
             return;
         };
-        let filter = HistoryFilter {
+        let filter = RecallFilter {
             command_line: (!search.query.is_empty())
                 .then(|| CommandLineMatch::Substring(search.query.clone())),
-            ..HistoryFilter::default()
+            ..RecallFilter::default()
         };
-        search.matches = match history.search(
+        search.matches = match recall.search(
             &filter,
-            HistoryOrder::NewestFirst,
-            Some(HISTORY_SEARCH_MATCHES),
+            RecallOrder::NewestFirst,
+            Some(RECALL_SEARCH_MATCHES),
         ) {
             Ok(rows) => rows.into_iter().map(|(_, line)| line).collect(),
             Err(error) => {
-                tracing::warn!("failed to search the input history: {error}");
+                tracing::warn!("failed to search the recall entries: {error}");
                 Vec::new()
             }
         };
@@ -1297,7 +1297,7 @@ mod tests {
             (
                 KeyCode::Char('r'),
                 KeyModifiers::CONTROL,
-                Action::HistorySearch,
+                Action::RecallSearch,
             ),
             (KeyCode::Tab, KeyModifiers::NONE, Action::Complete),
             (KeyCode::PageUp, KeyModifiers::NONE, Action::ScrollUp),
@@ -1306,8 +1306,8 @@ mod tests {
             (KeyCode::End, KeyModifiers::CONTROL, Action::ScrollBottom),
             (KeyCode::Up, KeyModifiers::ALT, Action::CursorPrevious),
             (KeyCode::Down, KeyModifiers::ALT, Action::CursorNext),
-            (KeyCode::Up, KeyModifiers::NONE, Action::HistoryPrevious),
-            (KeyCode::Down, KeyModifiers::NONE, Action::HistoryNext),
+            (KeyCode::Up, KeyModifiers::NONE, Action::RecallPrevious),
+            (KeyCode::Down, KeyModifiers::NONE, Action::RecallNext),
             (
                 KeyCode::Char('t'),
                 KeyModifiers::CONTROL,
@@ -1336,7 +1336,7 @@ mod tests {
     }
 
     /// Ctrl+D leaves only on an empty composer; with text it is the editing key it always was.
-    /// Up and Down recall history only at the composer's edges.
+    /// Up and Down recall entries only at the composer's edges.
     #[test]
     fn the_keys_that_depend_on_the_composer_read_it() {
         let typing = ComposerState {
@@ -1633,14 +1633,14 @@ mod tests {
         assert_eq!(composer.text(), "/permission workspace ");
     }
 
-    /// The history table is the store's, so a migrated store has to exist before the history can
+    /// The recall table is the store's, so a migrated store has to exist before the recall can
     /// be opened on it.
-    async fn history_in(temp: &tempfile::TempDir) -> HistoryStore {
+    async fn recall_in(temp: &tempfile::TempDir) -> RecallStore {
         let path = temp.path().join("meka.db");
         crate::store::Store::open(Some(&path), &Default::default())
             .await
             .expect("a migrated store");
-        HistoryStore::open(&path, 100).expect("history")
+        RecallStore::open(&path, 100).expect("recall")
     }
 
     /// The editing keys are Emacs's: Ctrl+U kills to the start of the line, Ctrl+K to its end,
@@ -1666,25 +1666,25 @@ mod tests {
     /// Moving the cursor inside a recalled entry of several lines does not end the walk: the Up
     /// that reaches its first line goes on to the entry before it.
     #[tokio::test]
-    async fn the_history_walk_survives_a_cursor_move_inside_a_recalled_entry() {
+    async fn the_recall_walk_survives_a_cursor_move_inside_a_recalled_entry() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = history_in(&temp).await;
+        let store = recall_in(&temp).await;
         let mut composer = Composer::new(Some(store));
         composer.remember("first");
         composer.remember("a\nb");
-        composer.history_previous();
+        composer.recall_previous();
         assert_eq!(composer.text(), "a\nb");
         assert!(!composer.state().at_first_line, "recalled at its end");
         composer.edit(key(KeyCode::Up, KeyModifiers::NONE));
         assert!(composer.state().at_first_line);
-        composer.history_previous();
+        composer.recall_previous();
         assert_eq!(
             composer.text(),
             "first",
             "the walk went on to the entry before"
         );
         composer.edit(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        composer.history_previous();
+        composer.recall_previous();
         assert_eq!(
             composer.text(),
             "a\nb",
@@ -1694,39 +1694,39 @@ mod tests {
 
     /// Up walks back through what was sent and Down returns to the draft.
     #[tokio::test]
-    async fn the_history_walk_returns_to_the_draft() {
+    async fn the_recall_walk_returns_to_the_draft() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = history_in(&temp).await;
+        let store = recall_in(&temp).await;
         let mut composer = Composer::new(Some(store));
         composer.remember("first");
         composer.remember("second");
         composer.set_text("draft");
-        composer.history_previous();
+        composer.recall_previous();
         assert_eq!(composer.text(), "second");
-        composer.history_previous();
+        composer.recall_previous();
         assert_eq!(composer.text(), "first");
-        composer.history_previous();
+        composer.recall_previous();
         assert_eq!(composer.text(), "first", "the oldest entry holds");
-        composer.history_next();
-        composer.history_next();
+        composer.recall_next();
+        composer.recall_next();
         assert_eq!(composer.text(), "draft");
     }
 
     #[tokio::test]
     async fn the_search_finds_by_substring_newest_first() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = history_in(&temp).await;
+        let store = recall_in(&temp).await;
         let mut composer = Composer::new(Some(store));
         composer.remember("list the files");
         composer.remember("count the lines");
         composer.remember("list the users");
-        composer.history_search();
+        composer.recall_search();
         for character in "list".chars() {
             composer.edit_search(key(KeyCode::Char(character), KeyModifiers::NONE));
         }
         let search = composer.search.as_ref().expect("open");
         assert_eq!(search.matches, vec!["list the users", "list the files"]);
-        composer.history_search();
+        composer.recall_search();
         composer.accept_search();
         assert_eq!(composer.text(), "list the files");
     }

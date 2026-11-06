@@ -236,11 +236,11 @@ Once an answer has pushed your prompt off the top, the prompt's first line stick
 Click it and the prompt comes to the top of the view, with the prompt before it stuck in the bar's
 place, so clicking on walks back through the conversation one prompt at a time.
 
-The screen opens on the last page of the session's log and reads the page above it whenever you
+The screen opens on the last page of the session's history and reads the page above it whenever you
 scroll near the top, so a resumed session shows its last turns at once and the first scroll up
 reaches the ones before, however far back the session goes. What is held is bounded: scrolling far
 up lets the newest pages go, and scrolling back down reads them again; returning to the bottom
-always shows the end of the log with this run's rows after it. Older history shows the
+always shows the end of the history with this run's rows after it. Older history shows the
 conversation the log records, with a row for each compaction that opens to what it did;
 the turns a [rewind](#rewind) dropped are left out, and one row in their place says how many went.
 
@@ -280,12 +280,13 @@ The composer takes the usual editing keys: Ctrl+A and Ctrl+E for the ends of the
 Ctrl+U to kill to either end, Ctrl+W to kill a word, Alt+F and Alt+B to move by word, and the arrow
 keys. It grows as you type, up to a third of the screen, and scrolls inside after that.
 
-### Input history
+### Recall
 
-What you send is saved to the store, so Up, Down and Ctrl+R recall what you typed in **any
-previous run**. A brand-new `meka`, a resumed `meka -c`, and the current session all share one
-history. Multi-line prompts are kept whole, and only the most recent entries are kept (older ones
-are pruned). This input history is separate from the conversation itself.
+What you send is saved to the store as a recall entry, so Up, Down and Ctrl+R recall what you typed
+in **any previous run**. A brand-new `meka`, a resumed `meka -c`, and the current session all share
+one recall. Multi-line prompts are kept whole, and only the most recent entries are kept (older ones
+are pruned). Recall is separate from the conversation itself; [`meka recall`](sessions.md#recall)
+lists and clears it.
 
 ## Slash commands
 
@@ -424,7 +425,7 @@ Every compaction, this command's and the automatic ones, leaves a boundary on th
 
 ### `/rewind`
 
-`/rewind` drops the most recent turn from the conversation, so the model no longer sees it or your prompt that started it. `/rewind N` drops the last `N`. The cut always lands on a turn boundary, so a tool call is never separated from its result. A compaction summary opens a turn of its own, so rewinding past everything after a compaction takes the summary with it and leaves the conversation empty; the turns it replaced stay behind the boundary on disk, and leave the screen with the summary that stood for them.
+`/rewind` drops the most recent turn from the conversation, so the model no longer sees it or your prompt that started it. `/rewind N` drops the last `N`. The cut always lands on a turn boundary, so a tool call is never separated from its result. A compaction summary is never taken: it stands for the turns before it, which no rewind can give back, so `/rewind` reaches back as far as the first turn after the summary and no further. The rounds a compaction kept from the middle of a turn count as that turn.
 
 The dropped turns leave the screen too, now and whenever the session is resumed, and one row in their place says how many went. Nothing is deleted, though: like `/compact`, the turns stay in the event log on disk, and `meka session export` still shows them with a marker where the rewind happened.
 

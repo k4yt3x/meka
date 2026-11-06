@@ -1,4 +1,4 @@
-//! `POST /v1/sessions/{id}/turn`: submit a turn. Two independent choices shape the response:
+//! `POST /v1/sessions/{id}/turns`: submit a turn. Two independent choices shape the response:
 //!
 //! - `stream`: how it is encoded. `false` is `application/json`; `true` is `text/event-stream`
 //!   carrying live `turn.started` / `assistant_text.delta` / `tool_call.*` / `turn.finished` events
@@ -13,7 +13,7 @@
 //! `(token_id, session_id, key)`. A held JSON turn commits its envelope when the turn ends; a
 //! detached request commits its `202` at admission, in either encoding; a held stream ignores the
 //! key. Mid-turn permission gates are handled out-of-band via `POST /v1/responses/{request_id}`
-//! on a side channel; a client that renders the turn sees a `permission_required` event and
+//! on a side channel; a client that renders the turn sees a `approval.requested` event and
 //! resolves it there without interrupting the SSE response.
 
 use std::{convert::Infallible, sync::Arc};
@@ -36,7 +36,6 @@ use uuid::Uuid;
 
 use crate::{
     agent::TurnOutcome,
-    conversation::ToolResultContent,
     frontend::{FrontendEvent, NoticeView},
     host::{
         TurnGuard,
@@ -86,7 +85,7 @@ pub(crate) struct TurnRequest {
 /// holds. Bytes are base64 rather than a path or URL because the API is a network surface:
 /// `[serve].bind` may be non-loopback, so the caller generally shares no filesystem with the agent
 /// and cannot name a file for it to read. A reference is the `hash` an image block of
-/// `GET /v1/sessions/{id}/messages` carries, so a client sends an image again, after an edit or a
+/// `GET /v1/sessions/{id}/history` carries, so a client sends an image again, after an edit or a
 /// rewind, without fetching and uploading its bytes.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -124,22 +123,20 @@ pub(crate) struct TurnOptions {
     pub(crate) unanswered_message: crate::conversation::PromptRetention,
 }
 
+/// A turn a request held to its end: its record, what it wrote, and what meka said about it.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct TurnResponse {
-    pub(crate) turn_id: Uuid,
-    pub(crate) session_id: Uuid,
-    pub(crate) stop_reason: String,
-    /// Refusal explanation when `stop_reason == "refusal"`; `None` otherwise. Mirrors the
-    /// `refusal_text` field on the streaming `turn.finished` SSE event, so blocking and
-    /// streaming clients share the same shape.
+    #[serde(flatten)]
+    pub(crate) record: crate::store::turns::TurnRecord,
+    /// Refusal explanation when `stop_reason == "refusal"`; omitted otherwise. Mirrors the
+    /// `refusal_text` field on the streaming `turn.finished` event, so blocking and streaming
+    /// clients share the same shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) refusal_text: Option<String>,
-    /// The messages this turn added to the conversation, in order and in the shape
-    /// `GET /v1/sessions/{id}/messages` reads them back: the assistant's messages with their
-    /// text, their thinking when the session streams reasoning, and their tool calls, and the
-    /// tool-result messages that answered those calls. The user's own message is not repeated.
-    pub(crate) messages: Vec<crate::host::http::handlers::messages::MessageView>,
-    pub(crate) usage: UsageView,
+    /// What the turn wrote, as `GET /v1/sessions/{id}/history` lists it: the message it opened
+    /// with, the assistant's messages and the tool results that answered their calls, and a
+    /// compaction where one ran.
+    pub(crate) messages: Vec<crate::host::http::handlers::messages::HistoryItem>,
     pub(crate) notices: Vec<NoticeView>,
 }
 
@@ -153,7 +150,7 @@ pub(crate) struct UsageView {
 
 #[utoipa::path(
     post,
-    path = "/v1/sessions/{id}/turn",
+    path = "/v1/sessions/{id}/turns",
     tag = "turn",
     params(
         ("id" = Uuid, Path, description = "Session UUID"),
@@ -522,7 +519,7 @@ fn lag_terminal_parts(
              canceled; retry it"
         ),
     )
-    .instance(format!("/v1/sessions/{session_id}/turn"));
+    .instance(format!("/v1/sessions/{session_id}/turns"));
     (
         crate::host::http::sse::SseEventType::TurnFailed,
         serde_json::json!({
@@ -874,13 +871,13 @@ async fn run_json_turn(
     // A detached request is answered with the turn as the feed knows it, and its key is committed
     // with that answer now: nothing of this request waits on the turn. Taken ahead of the spawn,
     // so a record that cannot be built refuses the request before the turn has run anything.
+    let opened = entry
+        .frontend
+        .in_flight_turn(entry.agent.cells().permission.get());
     let (accepted, ticket_for_task) = if opener.holds {
         (None, idempotency_ticket)
     } else {
-        let Some(record) = entry
-            .frontend
-            .in_flight_turn(entry.agent.cells().permission.get())
-        else {
+        let Some(record) = opened.clone() else {
             // The feed closed under the turn, which only a session leaving the process does; the
             // turn it announced is closed on the feed again, so no reader waits on a terminal.
             entry.frontend.end_turn();
@@ -915,7 +912,7 @@ async fn run_json_turn(
             session_id,
             state.config.relay_provider_errors,
             message_withdrawn(&recorder),
-            revision_for_terminal(&state.shared.store, session_id).await,
+            position_for_terminal(&state.shared.store, session_id).await,
             served_by_for_terminal(&state.shared.store, session_id, turn_id).await,
         );
         entry.frontend.record_terminal(event_type, data);
@@ -932,13 +929,16 @@ async fn run_json_turn(
                     turn_id,
                     session_id,
                 );
-                Ok(Json(assemble_response(
-                    turn_id,
+                turn_response(
+                    &state.shared.store,
                     session_id,
-                    turn_outcome,
-                    recorder,
-                    entry.capabilities,
-                )))
+                    turn_id,
+                    opened,
+                    &turn_outcome,
+                    &recorder,
+                )
+                .await
+                .map(Json)
             }
             Err(error) => {
                 // `Interrupted` is a cancellation, and `notify_turn_end` drops those on the floor;
@@ -1078,7 +1078,7 @@ async fn run_streaming_turn(
             session_id,
             relay_for_task,
             message_withdrawn(&recorder),
-            revision_for_terminal(&store_for_task, session_id).await,
+            position_for_terminal(&store_for_task, session_id).await,
             served_by_for_terminal(&store_for_task, session_id, turn_id).await,
         );
         notify_turn_end(&webhooks_for_task, event_type, turn_id, session_id);
@@ -1243,7 +1243,7 @@ pub(crate) fn terminal_event_parts(
     session_id: Uuid,
     relay_provider_errors: bool,
     message_withdrawn: Option<bool>,
-    revision: Option<u64>,
+    position: Option<i64>,
     served_by: Option<String>,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
     let (event_type, mut data) = match turn_result {
@@ -1254,7 +1254,7 @@ pub(crate) fn terminal_event_parts(
             canceled_parts(cancel_reason.name(), message_withdrawn, turn_id, session_id)
         }
         Ok(Err(error)) => {
-            let instance = format!("/v1/sessions/{session_id}/turn");
+            let instance = format!("/v1/sessions/{session_id}/turns");
             let problem =
                 crate::host::http::errors::ProblemDetail::for_error(error, relay_provider_errors)
                     .instance(instance);
@@ -1289,7 +1289,7 @@ pub(crate) fn terminal_event_parts(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "turn task panicked",
             )
-            .instance(format!("/v1/sessions/{session_id}/turn"));
+            .instance(format!("/v1/sessions/{session_id}/turns"));
             (
                 crate::host::http::sse::SseEventType::TurnFailed,
                 serde_json::json!({
@@ -1301,11 +1301,11 @@ pub(crate) fn terminal_event_parts(
         }
     };
     if let Some(fields) = data.as_object_mut() {
-        // On every terminal, because a repair, a redaction or a withdrawal rewrites the view
-        // inside the turn and has no event of its own: the terminal is where a client decides
-        // what to re-read. Omitted, like every optional field, when the store could not say.
-        if let Some(revision) = revision {
-            fields.insert("revision".into(), serde_json::Value::from(revision));
+        // On every terminal: what the turn wrote is in the history up to here, so a client that
+        // rendered the turn live reads `after` its last position to hold it as stored. Omitted,
+        // like every optional field, when the store could not say.
+        if let Some(position) = position {
+            fields.insert("position".into(), serde_json::Value::from(position));
         }
         // The fallback that served the turn, when one did: the row's fact, carried so a client
         // need not fetch the record to learn what the turn cost and whom it billed.
@@ -1332,17 +1332,17 @@ pub(crate) async fn served_by_for_terminal(
     }
 }
 
-/// The conversation's revision for a terminal event, or `None` when the store could not say; a
+/// The conversation's position for a terminal event, or `None` when the store could not say; a
 /// client then re-reads as it does for any event that lacks it. Never fails the turn: the terminal
 /// still has to be recorded.
-pub(crate) async fn revision_for_terminal(
+pub(crate) async fn position_for_terminal(
     store: &crate::store::Store,
     session_id: Uuid,
-) -> Option<u64> {
-    match store.count_rewrites(session_id).await {
-        Ok(revision) => Some(revision),
+) -> Option<i64> {
+    match store.last_log_row(session_id).await {
+        Ok(position) => Some(position.unwrap_or(0)),
         Err(error) => {
-            tracing::warn!("failed to count rewrites for session {session_id}: {error}");
+            tracing::warn!("failed to read session {session_id}'s position: {error}");
             None
         }
     }
@@ -1351,7 +1351,7 @@ pub(crate) async fn revision_for_terminal(
 /// Announce a finished turn to any configured webhook endpoint.
 ///
 /// Only the terminal *outcome* travels: ids, and whether it ended or failed. A subscriber that
-/// wants the reply reads `GET /v1/sessions/{id}/messages` with its own token, over the API it
+/// wants the reply reads `GET /v1/sessions/{id}/history` with its own token, over the API it
 /// already authenticates against. A webhook URL is a config-file string that can be mistyped or
 /// outlive whatever owned it, so it is told that something happened, not what was said.
 ///
@@ -1523,239 +1523,79 @@ pub(crate) fn message_withdrawn(recorder: &Recorder) -> Option<bool> {
         })
 }
 
-/// The messages a turn adds to the conversation, built from the recorder in the order the agent
-/// emitted them. An assistant message gathers text, thinking and tool calls until a tool result
-/// arrives, which closes it and opens the user-role message that carries the round's results;
-/// the next assistant output closes that one in turn.
-struct TurnMessages {
-    turn_id: Uuid,
-    messages: Vec<crate::host::http::handlers::messages::MessageView>,
-    assistant: Vec<crate::host::http::handlers::messages::ContentBlockView>,
-    results: Vec<crate::host::http::handlers::messages::ContentBlockView>,
-}
-
-impl TurnMessages {
-    fn new(turn_id: Uuid) -> Self {
-        Self {
-            turn_id,
-            messages: Vec::new(),
-            assistant: Vec::new(),
-            results: Vec::new(),
-        }
-    }
-
-    fn text(&mut self, text: &str) {
-        use crate::host::http::handlers::messages::ContentBlockView;
-        self.close_results();
-        if let Some(ContentBlockView::Text { text: last }) = self.assistant.last_mut() {
-            last.push_str(text);
-        } else {
-            self.assistant.push(ContentBlockView::Text {
-                text: text.to_string(),
-            });
-        }
-    }
-
-    fn thinking(&mut self, thinking: String) {
-        self.close_results();
-        self.assistant
-            .push(crate::host::http::handlers::messages::ContentBlockView::Thinking { thinking });
-    }
-
-    fn tool_use(&mut self, id: String, name: String, input: serde_json::Value) {
-        self.close_results();
-        self.assistant.push(
-            crate::host::http::handlers::messages::ContentBlockView::ToolUse { id, name, input },
-        );
-    }
-
-    fn tool_result(&mut self, tool_use_id: String, is_error: bool, content: &[ToolResultContent]) {
-        self.close_assistant();
-        self.results.push(
-            crate::host::http::handlers::messages::ContentBlockView::ToolResult {
-                tool_use_id,
-                is_error,
-                content: crate::host::http::handlers::messages::tool_result_views(content),
-            },
-        );
-    }
-
-    /// A nudge meka wrote closes the assistant message it answers and is a user-role message of
-    /// its own, as `GET /messages` shows it; the reply after it opens a new assistant message.
-    fn nudge(&mut self, kind: crate::conversation::NudgeKind, text: String) {
-        self.close_assistant();
-        self.close_results();
-        self.messages.push(turn_message(
-            self.turn_id,
-            crate::conversation::Role::User,
-            vec![
-                crate::host::http::handlers::messages::ContentBlockView::Nudge {
-                    kind: kind.name().to_string(),
-                    text,
-                },
-            ],
-        ));
-    }
-
-    /// A background report meka wrote lands behind the blocks of the user-role message the round
-    /// is building, a tool round's results or a nudge, and opens one of its own after an
-    /// interrupt, as `GET /messages` shows it.
-    fn background_report(&mut self, task_ids: Vec<String>, text: String) {
-        use crate::host::http::handlers::messages::ContentBlockView;
-        self.close_assistant();
-        let block = ContentBlockView::BackgroundReport { task_ids, text };
-        if self.results.is_empty()
-            && let Some(last) = self.messages.last_mut()
-            && last.role == "user"
-        {
-            last.content.push(block);
-        } else {
-            self.results.push(block);
-        }
-    }
-
-    /// A user-role message the turn appended whole: its opening, or the message an interrupt
-    /// adds after a cut answer. Closes whatever was open, since it is a message of its own.
-    fn user_message(
-        &mut self,
-        content: Vec<crate::host::http::handlers::messages::ContentBlockView>,
-    ) {
-        self.close_assistant();
-        self.close_results();
-        self.messages.push(turn_message(
-            self.turn_id,
-            crate::conversation::Role::User,
-            content,
-        ));
-    }
-
-    fn close_assistant(&mut self) {
-        if !self.assistant.is_empty() {
-            let content = std::mem::take(&mut self.assistant);
-            self.messages.push(turn_message(
-                self.turn_id,
-                crate::conversation::Role::Assistant,
-                content,
-            ));
-        }
-    }
-
-    fn close_results(&mut self) {
-        if !self.results.is_empty() {
-            let content = std::mem::take(&mut self.results);
-            self.messages.push(turn_message(
-                self.turn_id,
-                crate::conversation::Role::User,
-                content,
-            ));
-        }
-    }
-
-    fn finish(mut self) -> Vec<crate::host::http::handlers::messages::MessageView> {
-        self.close_assistant();
-        self.close_results();
-        self.messages
-    }
-}
-
-fn turn_message(
-    turn_id: Uuid,
-    role: crate::conversation::Role,
-    content: Vec<crate::host::http::handlers::messages::ContentBlockView>,
-) -> crate::host::http::handlers::messages::MessageView {
-    crate::host::http::handlers::messages::MessageView {
-        role: role.name().to_string(),
-        content,
-        // Not available yet: the DB write may still be in progress.
-        created_at: None,
-        turn_id: Some(turn_id),
-        // Only this turn is in hand; the label counts in the view `GET /v1/sessions/{id}/messages`
-        // serves.
-        turn_label: None,
-        // The turn's own output, never a compaction summary. A compaction that fired during this
-        // turn is reported by the `context.compacted` SSE event and by the marker on the summary
-        // when the history is read back.
-        compaction: None,
-    }
-}
-
-fn assemble_response(
-    turn_id: Uuid,
+/// What a held turn answers with once it has ended: its record and what it wrote, read back from
+/// the store, beside what only the run knows, the refusal's words and the notices meka said.
+async fn turn_response(
+    store: &crate::store::Store,
     session_id: Uuid,
-    outcome: TurnOutcome,
-    recorder: Recorder,
-    capabilities: crate::host::http::http_frontend::SessionCapabilities,
-) -> TurnResponse {
-    let stop_reason = outcome.stop_reason().to_string();
-
-    let mut messages = TurnMessages::new(turn_id);
-    let mut usage = UsageView::default();
-    let mut notices: Vec<NoticeView> = Vec::new();
-
-    for event in recorder {
-        match event {
-            FrontendEvent::AssistantTextDelta(text) => messages.text(&text),
-            FrontendEvent::ThinkingBlock { content } if capabilities.supports_reasoning_stream => {
-                messages.thinking(content);
-            }
-            // The block above already carries this text whole. Accumulating the deltas as well
-            // would report every segment twice.
-            FrontendEvent::ThinkingDelta(_) => {}
-            FrontendEvent::ToolCallStarted {
-                id, name, input, ..
-            } => messages.tool_use(id, name, input),
-            FrontendEvent::ToolCallCompleted {
-                id,
-                is_error,
-                content,
-                ..
-            } => messages.tool_result(id, is_error, &content),
-            FrontendEvent::Nudged { kind, text } => messages.nudge(kind, text),
-            FrontendEvent::BackgroundReported { tasks, text } => {
-                messages
-                    .background_report(tasks.iter().map(|task| task.id.clone()).collect(), text);
-            }
-            FrontendEvent::MessageAppended { message, .. } => messages.user_message(
-                crate::host::http::handlers::messages::message_view(&message).content,
-            ),
-            FrontendEvent::TokenUsage(token_usage) => {
-                // Last-wins assignment: the agent emits exactly one `TokenUsage` per turn
-                // (accumulated total). If that ever changes, switch to `saturating_add`.
-                usage.input_tokens = token_usage.input_tokens;
-                usage.output_tokens = token_usage.output_tokens;
-                usage.cache_creation_input_tokens = token_usage.cache_creation_input_tokens;
-                usage.cache_read_input_tokens = token_usage.cache_read_input_tokens;
-            }
-            FrontendEvent::Notice(notice) => {
-                notices.push(NoticeView::from(notice));
-            }
-            // Remaining lifecycle / UI-chrome variants (TurnStarted/Finished, ChecklistUpdated,
-            // McpProgress, SessionStarted, ToolCallOutputDelta, SubAgentActivity) aren't part of
-            // the blocking JSON envelope.
-            // ToolCallComposing does reach here -- `stream: false` picks the response shape, not
-            // whether meka streams from the provider -- and is dropped: a body assembled after the
-            // turn is over has nothing to mark the beginning of a wait on.
-            // The compaction events are dropped too: the summary message on `GET /messages`
-            // carries the same `compaction` object, so a blocking client already has the fact
-            // where it will look for it, and a streaming one gets the `context.*` events.
-            _ => {}
+    turn_id: Uuid,
+    opened: Option<crate::store::turns::TurnRecord>,
+    outcome: &TurnOutcome,
+    recorder: &Recorder,
+) -> Result<TurnResponse, ProblemDetail> {
+    let row = store
+        .turn_store()
+        .get_turn(session_id, turn_id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to read the turn back", error)
+        })?;
+    // The row is best-effort, so a turn whose row could not be written, or closed, answers from
+    // what its run said: the opening the feed recorded and the ending the turn emitted.
+    let ended = recorder.iter().rev().find_map(|event| match event {
+        FrontendEvent::TurnEnded {
+            turn_id: ended,
+            ending,
+        } if *ended == turn_id => Some(ending),
+        _ => None,
+    });
+    let record = match (row, opened, ended) {
+        (Some(row), _, Some(ending)) if row.ended_at.is_none() => {
+            row.ended(ending, chrono::Utc::now().to_rfc3339())
         }
-    }
+        (Some(row), ..) => row,
+        (None, Some(opened), Some(ending)) => opened.ended(ending, chrono::Utc::now().to_rfc3339()),
+        (None, ..) => {
+            return Err(ProblemDetail::new(
+                ErrorKind::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the turn ended but its record is gone",
+            )
+            .with("session_id", session_id.to_string()));
+        }
+    };
+    let messages = store
+        .turn_entries(session_id, turn_id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to read the turn's history back", error)
+        })?
+        .into_iter()
+        .map(crate::host::http::handlers::messages::history_item)
+        .collect();
+    let (refusal_text, notices) = reply_parts(outcome, recorder);
+    Ok(TurnResponse {
+        record,
+        refusal_text,
+        messages,
+        notices,
+    })
+}
 
-    let refusal_text = match &outcome {
+/// The refusal's words, on a refusal that gave any, and the notices meka said during the turn.
+fn reply_parts(outcome: &TurnOutcome, recorder: &Recorder) -> (Option<String>, Vec<NoticeView>) {
+    let refusal_text = match outcome {
         TurnOutcome::Refusal(text) if !text.is_empty() => Some(text.clone()),
         _ => None,
     };
-
-    TurnResponse {
-        turn_id,
-        session_id,
-        stop_reason,
-        refusal_text,
-        messages: messages.finish(),
-        usage,
-        notices,
-    }
+    let notices = recorder
+        .iter()
+        .filter_map(|event| match event {
+            FrontendEvent::Notice(notice) => Some(NoticeView::from(notice.clone())),
+            _ => None,
+        })
+        .collect();
+    (refusal_text, notices)
 }
 
 /// `POST /v1/sessions/{id}/cancel`: interrupt the in-flight turn (if any) by firing the
@@ -1840,14 +1680,14 @@ pub(crate) struct StreamQuery {
     /// The header wins when both are present.
     #[serde(default)]
     pub(crate) last_event_id: Option<u64>,
-    /// Attend the session: show `permission_required` events and answer them. While an attending
+    /// Attend the session: show `approval.requested` events and answer them. While an attending
     /// reader is connected, a gated call on any turn parks for an answer instead of being refused
     /// without asking. Needs `sessions:w`, the scope that answers.
     #[serde(default)]
     pub(crate) attend: bool,
 }
 
-/// `GET /v1/sessions/{id}/stream`: the session's feed, every event of every turn.
+/// `GET /v1/sessions/{id}/feed`: the session's feed, every event of every turn.
 ///
 /// Replays the events after `Last-Event-ID` from the feed's bounded ring, which spans turns, then
 /// follows the live feed for as long as the connection is held. A client that rejoins after a turn
@@ -1862,7 +1702,7 @@ pub(crate) struct StreamQuery {
 /// call. Its prompts park on the parent's feed, so `attend` is refused here.
 #[utoipa::path(
     get,
-    path = "/v1/sessions/{id}/stream",
+    path = "/v1/sessions/{id}/feed",
     tag = "turn",
     params(
         ("id" = Uuid, Path, description = "Session UUID"),
@@ -1880,7 +1720,7 @@ pub(crate) struct StreamQuery {
     ),
     security(("bearerAuth" = ["sessions:r"]))
 )]
-pub(crate) async fn stream_turn(
+pub(crate) async fn session_feed(
     State(state): State<ServerState>,
     scoped: scope::Scoped<scope::SessionsRead>,
     Path(id): Path<Uuid>,
@@ -2047,11 +1887,11 @@ pub(crate) struct ServerStreamQuery {
     pub(crate) last_event_id: Option<u64>,
 }
 
-/// `GET /v1/stream`: the server feed, the listing's change feed across every session this process
+/// `GET /v1/feed`: the server feed, the listing's change feed across every session this process
 /// holds; see [`crate::host::http::feed::ServerFeed`] for what it carries.
 #[utoipa::path(
     get,
-    path = "/v1/stream",
+    path = "/v1/feed",
     tag = "sessions",
     params(
         ServerStreamQuery,
@@ -2065,7 +1905,7 @@ pub(crate) struct ServerStreamQuery {
     ),
     security(("bearerAuth" = ["sessions:r"]))
 )]
-pub(crate) async fn stream_server(
+pub(crate) async fn server_feed(
     State(state): State<ServerState>,
     scoped: scope::Scoped<scope::SessionsRead>,
     Query(query): Query<ServerStreamQuery>,
@@ -2147,7 +1987,7 @@ fn build_reattach_stream(
                 .unwrap_or_else(|_| Event::default().comment("resumed turn.started serialize-failed")));
             // The opening as it was announced, marked as the `turn.started` above is: a client
             // that joins mid-turn would otherwise read the reply under nothing. Synthesized like
-            // it, so it carries no id; what the turn appended since is read from `GET /messages`.
+            // it, so it carries no id; what the turn appended since is read from `GET /history`.
             if let Some(mut opening) = attachment.turn_opening {
                 if let Some(object) = opening.as_object_mut() {
                     object.insert("resumed".to_string(), serde_json::Value::Bool(true));
@@ -2162,7 +2002,7 @@ fn build_reattach_stream(
         if let Some(gap) = attachment.gap {
             // Said out loud rather than papered over. A transcript with a silent hole in it is
             // worse than one the client knows is incomplete, because only the second can be
-            // repaired by reading `GET /messages`.
+            // repaired by reading `GET /history`.
             yield Ok(gap.event(Some(session_id)).into_axum());
         }
 
@@ -2247,7 +2087,7 @@ fn build_reattach_stream(
                                 "title": crate::host::http::errors::ErrorKind::StreamDetached.title(),
                                 "status": 500,
                                 "detail": "the turn's stream closed without recording an outcome; \
-                                           read `GET /v1/sessions/{id}/messages` for what completed",
+                                           read `GET /v1/sessions/{id}/history` for what completed",
                             },
                         }))
                         .unwrap_or_else(|_| Event::default().comment("detached serialize-failed")));
@@ -2354,185 +2194,107 @@ mod tests {
         assert_eq!(data["session_id"], session_id.to_string());
     }
 
-    fn text_of(message: &crate::host::http::handlers::messages::MessageView) -> String {
-        message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                crate::host::http::handlers::messages::ContentBlockView::Text { text } => {
-                    Some(text.as_str())
-                }
-                _ => None,
-            })
-            .collect()
+    /// The notices meka said reach the response, and a refusal's words are kept apart from the
+    /// reply and said only on a refusal.
+    #[test]
+    fn a_reply_carries_its_notices_and_only_a_refusal_its_words() {
+        let recorder: Recorder = vec![
+            FrontendEvent::AssistantTextDelta("I cannot help with that.".into()),
+            FrontendEvent::Notice(Notice::warn("auto-denied tool")),
+        ];
+        let (refusal, notices) =
+            reply_parts(&TurnOutcome::Refusal("policy violation".into()), &recorder);
+        assert_eq!(refusal.as_deref(), Some("policy violation"));
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].level, "warn");
+        assert_eq!(notices[0].text, "auto-denied tool");
+        let (refusal, _) = reply_parts(&TurnOutcome::EndTurn, &recorder);
+        assert_eq!(refusal, None);
     }
 
-    /// The response lays the turn out as the history does, so it begins with the message the
-    /// turn opened with, the context block and the words, and the reply follows it; a message an
-    /// interrupt appends mid-turn closes the reply it cut.
-    #[test]
-    fn assemble_response_begins_with_the_opening_message() {
-        use crate::host::http::handlers::messages::ContentBlockView;
-        let user = |text: &str| {
-            crate::conversation::Message::turn_opening(
-                "[Context]",
-                vec![crate::conversation::ContentBlock::Text {
-                    text: text.to_string(),
-                }],
-                Vec::new(),
-            )
+    /// A turn whose row could not be written answers from what its run said, the opening the feed
+    /// recorded and the ending the turn emitted, rather than failing a turn that ran, and so does
+    /// one whose row could not be closed; with nothing to stand in for the row it is the server's
+    /// error.
+    #[tokio::test]
+    async fn a_turn_whose_row_is_missing_answers_from_its_run() {
+        use crate::store::turns::{TurnEnding, TurnRecord, TurnSource, TurnStatus, TurnUsage};
+        let store = crate::store::Store::for_test().await;
+        let (session, turn) = (Uuid::new_v4(), Uuid::new_v4());
+        let opened = TurnRecord {
+            id: turn,
+            source: TurnSource::Client,
+            started_at: "2026-11-06T00:00:00Z".to_string(),
+            permission: crate::permission::Permission::Read,
+            ended_at: None,
+            status: None,
+            stop_reason: None,
+            error: None,
+            reason: None,
+            profile: None,
+            usage: TurnUsage::default(),
         };
-        let appended = |message| FrontendEvent::MessageAppended {
-            message,
-            outcomes: Vec::new(),
-            late: None,
-        };
-        let recorder: Recorder = vec![
-            appended(user("hi")),
-            FrontendEvent::AssistantTextDelta("the first half".into()),
-            appended(user("stop")),
-            FrontendEvent::AssistantTextDelta("carrying on".into()),
-        ];
-        let response = assemble_response(
-            Uuid::nil(),
-            Uuid::nil(),
-            TurnOutcome::EndTurn,
-            recorder,
-            crate::host::http::http_frontend::SessionCapabilities::default(),
-        );
-        let roles: Vec<&str> = response
-            .messages
-            .iter()
-            .map(|message| message.role.as_str())
-            .collect();
-        assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+        let recorder: Recorder = vec![FrontendEvent::TurnEnded {
+            turn_id: turn,
+            ending: TurnEnding::succeeded("end_turn", TurnUsage {
+                input_tokens: 7,
+                ..Default::default()
+            }),
+        }];
+        let answered = turn_response(
+            &store,
+            session,
+            turn,
+            Some(opened),
+            &TurnOutcome::EndTurn,
+            &recorder,
+        )
+        .await
+        .expect("the run stands in for the row");
+        assert_eq!(answered.record.status, Some(TurnStatus::Succeeded));
+        assert_eq!(answered.record.usage.input_tokens, 7);
+        assert!(answered.record.ended_at.is_some());
         assert!(
-            matches!(
-                response.messages[0].content.as_slice(),
-                [ContentBlockView::TurnContext { .. }, ContentBlockView::Text { text }] if text == "hi"
-            ),
-            "{:?}",
-            response.messages[0].content
+            turn_response(
+                &store,
+                session,
+                turn,
+                None,
+                &TurnOutcome::EndTurn,
+                &recorder
+            )
+            .await
+            .is_err(),
+            "without the opening there is no record to answer with"
         );
-        assert_eq!(text_of(&response.messages[1]), "the first half");
-        assert_eq!(text_of(&response.messages[3]), "carrying on");
-    }
 
-    #[test]
-    fn assemble_response_concatenates_text_deltas() {
-        let recorder: Recorder = vec![
-            FrontendEvent::AssistantTextDelta("Hello ".into()),
-            FrontendEvent::AssistantTextDelta("world".into()),
-        ];
-        let response = assemble_response(
-            Uuid::nil(),
-            Uuid::nil(),
-            TurnOutcome::EndTurn,
-            recorder,
-            crate::host::http::http_frontend::SessionCapabilities::default(),
-        );
-        assert_eq!(response.stop_reason, "end_turn");
-        assert_eq!(response.messages.len(), 1);
-        assert_eq!(response.messages[0].role, "assistant");
-        assert_eq!(text_of(&response.messages[0]), "Hello world");
-    }
-
-    /// A tool round reads back as the history does: the call on the assistant's message, its
-    /// result on the user-role message after it, and the next reply on a message of its own, so a
-    /// client renders one shape for a turn it ran and for a turn it reads back.
-    #[test]
-    fn assemble_response_lays_a_tool_round_out_as_the_history_does() {
-        let input = serde_json::json!({"path": "src/main.rs"});
-        let recorder: Recorder = vec![
-            FrontendEvent::AssistantTextDelta("Reading.".into()),
-            FrontendEvent::ToolCallStarted {
-                id: "tu_1".into(),
-                name: "file_read".into(),
-                input: input.clone(),
-                display_summary: Some("src/main.rs".into()),
-            },
-            FrontendEvent::ToolCallCompleted {
-                id: "tu_1".into(),
-                name: "file_read".into(),
-                is_error: false,
-                content: vec![ToolResultContent::Text {
-                    text: "fn main() {}".into(),
-                }],
-                metadata: None,
-                display: None,
-            },
-            FrontendEvent::AssistantTextDelta("Done.".into()),
-        ];
-        let response = assemble_response(
-            Uuid::nil(),
-            Uuid::nil(),
-            TurnOutcome::EndTurn,
-            recorder,
-            crate::host::http::http_frontend::SessionCapabilities::default(),
-        );
-        let document = serde_json::to_value(&response).expect("serializes");
-        let nil = Uuid::nil().to_string();
-        assert_eq!(
-            document["messages"],
-            serde_json::json!([
-                {"role": "assistant", "turn_id": nil, "content": [
-                    {"type": "text", "text": "Reading."},
-                    {"type": "tool_use", "id": "tu_1", "name": "file_read", "input": input},
-                ]},
-                {"role": "user", "turn_id": nil, "content": [
-                    {"type": "tool_result", "tool_use_id": "tu_1", "is_error": false,
-                     "content": [{"type": "text", "text": "fn main() {}"}]},
-                ]},
-                {"role": "assistant", "turn_id": nil, "content": [{"type": "text", "text": "Done."}]},
-            ]),
-            "{document}"
-        );
-    }
-
-    #[test]
-    fn assemble_response_surfaces_notices() {
-        let recorder: Recorder = vec![FrontendEvent::Notice(Notice::warn("auto-denied tool"))];
-        let response = assemble_response(
-            Uuid::nil(),
-            Uuid::nil(),
-            TurnOutcome::EndTurn,
-            recorder,
-            crate::host::http::http_frontend::SessionCapabilities::default(),
-        );
-        assert_eq!(response.notices.len(), 1);
-        assert_eq!(response.notices[0].level, "warn");
-        assert_eq!(response.notices[0].text, "auto-denied tool");
-    }
-
-    #[test]
-    fn assemble_response_separates_refusal_text_from_the_reply() {
-        let recorder: Recorder = vec![FrontendEvent::AssistantTextDelta(
-            "I cannot help with that.".into(),
-        )];
-        let response = assemble_response(
-            Uuid::nil(),
-            Uuid::nil(),
-            TurnOutcome::Refusal("policy violation".into()),
-            recorder,
-            crate::host::http::http_frontend::SessionCapabilities::default(),
-        );
-        assert_eq!(response.stop_reason, "refusal");
-        assert_eq!(text_of(&response.messages[0]), "I cannot help with that.");
-        assert_eq!(response.refusal_text.as_deref(), Some("policy violation"));
-    }
-
-    #[test]
-    fn assemble_response_omits_refusal_text_on_normal_stop() {
-        let recorder: Recorder = vec![FrontendEvent::AssistantTextDelta("hello".into())];
-        let response = assemble_response(
-            Uuid::nil(),
-            Uuid::nil(),
-            TurnOutcome::EndTurn,
-            recorder,
-            crate::host::http::http_frontend::SessionCapabilities::default(),
-        );
-        assert_eq!(response.refusal_text, None);
-        assert_eq!(text_of(&response.messages[0]), "hello");
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("session");
+        store
+            .turn_store()
+            .open_turn(
+                session,
+                turn,
+                TurnSource::Client,
+                crate::permission::Permission::Read,
+                "2026-11-06T00:00:00Z",
+            )
+            .await
+            .expect("the row, opened and never closed");
+        let answered = turn_response(
+            &store,
+            session,
+            turn,
+            None,
+            &TurnOutcome::EndTurn,
+            &recorder,
+        )
+        .await
+        .expect("the row with the run's ending");
+        assert_eq!(answered.record.status, Some(TurnStatus::Succeeded));
+        assert_eq!(answered.record.usage.input_tokens, 7);
     }
 
     /// [`resolve_turn_images`] over a store with nothing in it, which is all an upload needs.

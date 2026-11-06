@@ -14,7 +14,7 @@ use crate::{
     conversation::{ContentBlock, Message, OpaqueReasoning, Role, ToolResultContent},
     error::{MekaError, Result},
     provider::{
-        CompletionRequest, StopReason, StreamEvent, ThinkingOverride, ToolDefinition,
+        CompletionRequest, StopReason, StreamEvent, ToolDefinition,
         sse::{End, Step},
     },
     stats::TokenUsage,
@@ -77,19 +77,6 @@ pub(super) fn parse_usage_object(usage: &serde_json::Value) -> TokenUsage {
         output_tokens: field("output_tokens"),
         cache_creation_input_tokens: field("cache_creation_input_tokens"),
         cache_read_input_tokens: field("cache_read_input_tokens"),
-    }
-}
-
-/// The mode a request actually uses: the profile's, unless the request turned thinking off for
-/// this call (the compaction summary does, so it doesn't pay for reasoning). An override only ever
-/// turns thinking *off*, never on, so it cannot resurrect a mode the profile disabled.
-pub(super) fn effective_thinking(
-    thinking: ThinkingOverride,
-    configured: ThinkingMode,
-) -> ThinkingMode {
-    match thinking {
-        ThinkingOverride::Off => ThinkingMode::Off,
-        ThinkingOverride::Inherit => configured,
     }
 }
 
@@ -695,7 +682,6 @@ pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync 
         tools: &[ToolDefinition],
         deferred_tools: &[ToolDefinition],
         stream: bool,
-        thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
     ) -> serde_json::Value;
     /// The serialized body after any decoration that needs the whole of it.
@@ -710,7 +696,6 @@ pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync 
         has_tools: bool,
         declares_deferred: bool,
         stream: bool,
-        thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder>;
     /// Record the response's request id where the next request can name it; a no-op for a backend
@@ -770,7 +755,6 @@ pub(super) async fn stream<B: ClaudeBackend>(
         messages,
         tools,
         deferred_tools,
-        thinking,
         attribution,
         ..
     } = request;
@@ -782,7 +766,6 @@ pub(super) async fn stream<B: ClaudeBackend>(
                 tools,
                 deferred_tools,
                 true,
-                thinking,
                 &attribution,
             ))
         })?;
@@ -806,7 +789,6 @@ pub(super) async fn stream<B: ClaudeBackend>(
                     !tools.is_empty(),
                     !deferred_tools.is_empty(),
                     true,
-                    thinking,
                     &attribution,
                 )
                 .await?
@@ -2398,29 +2380,6 @@ mod tests {
         );
         assert_eq!(clamped["max_tokens"], 20_001);
         assert_eq!(clamped["thinking"]["budget_tokens"], 20_000);
-    }
-
-    #[test]
-    fn an_override_turns_thinking_off_and_never_on() {
-        assert_eq!(
-            effective_thinking(ThinkingOverride::Inherit, ThinkingMode::Adaptive),
-            ThinkingMode::Adaptive
-        );
-        // The compaction summary sends `Off` so it doesn't pay for reasoning.
-        assert_eq!(
-            effective_thinking(ThinkingOverride::Off, ThinkingMode::Adaptive),
-            ThinkingMode::Off
-        );
-        assert_eq!(
-            effective_thinking(ThinkingOverride::Off, ThinkingMode::Budgeted),
-            ThinkingMode::Off
-        );
-        // It cannot resurrect thinking for a profile that asked for none, so the two settings can
-        // never disagree about whether a request asks for thinking.
-        assert_eq!(
-            effective_thinking(ThinkingOverride::Inherit, ThinkingMode::Off),
-            ThinkingMode::Off
-        );
     }
 
     #[test]

@@ -23,7 +23,8 @@ pub(crate) struct TurnStore {
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct TurnRecord {
     pub(crate) id: Uuid,
-    /// Who opened it: `client`, `inbox`, `schedule`, `background`, or `parent` for a sub-agent's.
+    /// Who opened it: `client`, `inbox`, `schedule`, `background`, `compaction` for a compaction
+    /// run between turns, or `parent` for a sub-agent's.
     #[cfg_attr(feature = "serve", schema(value_type = String))]
     pub(crate) source: TurnSource,
     /// RFC 3339, when the turn began.
@@ -137,8 +138,9 @@ pub(crate) enum TurnSource {
     Schedule,
     /// Finished background work delivered as a turn of its own.
     Background,
-    /// The checkpoint turn `POST /compact` runs. Announced on the feed alone: a compaction
-    /// records its boundary, never a turn row.
+    /// A compaction run between turns, `/compact` or `POST /compact`, under its compaction's id:
+    /// its row is what the compaction spent, and its boundary names it. One run inside a turn is
+    /// that turn's.
     Compaction,
     /// A sub-agent's turn, opened by its parent's spawn or follow-up.
     Parent,
@@ -326,6 +328,24 @@ pub(crate) struct TurnEnding {
     /// See [`TurnRecord::profile`].
     pub(crate) profile: Option<String>,
     pub(crate) usage: TurnUsage,
+}
+
+impl TurnRecord {
+    /// This record of a turn's opening with `ending`, as its row reads once closed at `ended_at`:
+    /// for a door that answers a turn whose row could not be read back, the row being
+    /// best-effort.
+    pub(crate) fn ended(self, ending: &TurnEnding, ended_at: String) -> Self {
+        Self {
+            ended_at: Some(ended_at),
+            status: Some(ending.status),
+            stop_reason: ending.stop_reason.clone(),
+            error: ending.error.clone(),
+            reason: ending.reason,
+            profile: ending.profile.clone(),
+            usage: ending.usage,
+            ..self
+        }
+    }
 }
 
 impl TurnEnding {

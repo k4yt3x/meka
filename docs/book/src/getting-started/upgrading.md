@@ -10,6 +10,98 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.88 to 0.89
+
+Nothing in `config.toml` is renamed. The store moves forward on its first open: the table of the
+screen's recall entries, `prompt_history`, becomes `recall_entries`, and every copy a compaction
+kept records the turn and the time it was said, read from the row it copies, behind the automatic
+backup. A copy 0.88's turn retention already left standing alone has no row left to read, and stays
+under the turn and time of the compaction that wrote it. 0.88 refuses a store
+0.89 has opened; downgrading means restoring the backup the upgrade took. Session archives are
+`format_version` 22, since a compaction run between turns is now a turn of its own and a copy a
+compaction kept records where it was said; a 0.88 archive (21) imports as it is, and 0.88 refuses a
+22.
+
+**`meka history` is `meka recall`.** `meka recall list` and `meka recall clear` do what the old
+pair did, and `meka history` is no command at all. The JSON listing is `{"recall": [...]}`, and an
+empty one says `No recall entries.`
+
+**The HTTP API tells a conversation two ways.** Its history is what was said: every turn, the ones a
+compaction summarized included, each once where it was said, without what a rewind took back. It is
+`GET /v1/sessions/{id}/history`, paged by `before` and `after` a position, the place of a row in the
+session's log. Its context is what the model sees now, `GET /v1/sessions/{id}/context/messages`. A
+transcript reads the history and follows the feed; the context is what the model sees, and a
+transcript drawn from both shows the turns a compaction kept twice. See
+[History](../usage/http-api.md#history) and [Context](../usage/http-api.md#context).
+
+| 0.88 | 0.89 |
+|------|------|
+| `POST /v1/sessions/{id}/turn` | `POST /v1/sessions/{id}/turns`, same body; a detached turn's `Location` is unchanged |
+| `GET /v1/sessions/{id}/messages` | `GET /v1/sessions/{id}/history` for a transcript, `GET /v1/sessions/{id}/context/messages` for what the model sees |
+| `GET /v1/sessions/{id}/stream` | `GET /v1/sessions/{id}/feed` |
+| `GET /v1/stream` | `GET /v1/feed` |
+| `GET /v1/sessions/search?q=` | `GET /v1/sessions?q=`, beside any listing filter |
+| `GET /v1/sessions/{id}/tasks` | `GET /v1/tasks?session=<id>` |
+| `DELETE /v1/sessions/{id}/tasks/{task_id}` | `DELETE /v1/tasks/{task_id}` |
+| `GET /v1/schedule` | `GET /v1/jobs` |
+| `POST /v1/sessions/{id}/schedule` | `POST /v1/jobs`, with the session as `session_id` in the body |
+| `DELETE /v1/schedule/{job_id}` | `DELETE /v1/jobs/{job_id}` |
+| `/v1/memory`, `/v1/memory/{name}` | `/v1/memories`, `/v1/memories/{name}` |
+| `GET /v1/sessions/{id}/export?format=markdown` | gone: render the history, or run `meka session export` |
+
+`GET /v1/sessions/{id}/export` answers the JSON archive alone; a `format` parameter is ignored, so a
+client that asked for Markdown, or took it as the default, is handed the archive.
+
+| Where | 0.88 | 0.89 |
+|-------|------|------|
+| The conversation's `ETag`, a `412`, `turn.finished`, `turn.failed`, `turn.canceled` | `revision`, `total` | `position`; the `ETag` is `"<position>"` |
+| A message of the conversation | `turn_label`, paged by `offset` | gone: `turn_id` and `position`, paged by `before` and `after` |
+| `POST /rewind` body | `turns`, optional | `turn_id`, required |
+| `POST /rewind` answer | `turns_removed`, `messages_before`, `messages_after` | the `rewind` history item |
+| `POST /compact` answer | `source`, `memories_written`, `kept_recent`, `messages_before`, `messages_after` | the `compaction` history item |
+| `conversation.rewound` | `revision`, `total`, `turns_removed` | `session_id` and the `rewind` item's fields |
+| `context.compacted`, a summary's `compaction` | `replaced_count` | gone |
+| Blocking `POST /turns` answer | `turn_id`, `session_id`, `stop_reason`, `usage`, `messages` | the turn record (`id`, `source`, `started_at`, `permission`, `ended_at`, `status`, `stop_reason`, `error`, `reason`, `profile`, `usage`), `refusal_text`, `messages` as history items, `notices` |
+| `GET /v1/sessions/{id}/context` | `message_count`, `totals` | gone: `position`; a session's spend is `turn_count` and `usage` on its record, its turns summed, a sub-agent's on its own |
+| Session record | `approvals_pending` | `requests_pending`, and `turn_count` and `usage` beside it |
+| A session search hit | `excerpt` | `excerpt` and `excerpt_position` |
+| A memory search hit | `snippet` | `excerpt` |
+| `GET /v1/profiles`, `GET /v1/profiles/{name}`, `meka profile list --format json` | `active` | `default` |
+| `tool_call.progress` | `server_name`, `tool_name`, `tool_use_id` | `id`, the call's |
+
+`meka session show --format json` prints the session record's new fields too.
+
+| 0.88 event | 0.89 event |
+|------------|------------|
+| `permission_required` | `approval.requested` |
+| `permission_resolved` | `approval.resolved` |
+| `elicitation_required` | `elicitation.requested` |
+| `elicitation_resolved` | `elicitation.resolved` |
+| `progress` | `tool_call.progress` |
+
+**A rewind names the first turn to drop.** Send `{"turn_id": "<id>"}` to `POST /rewind`, the id of
+the first turn to take back, read from `GET /v1/sessions/{id}/turns` or a history item's `turn_id`:
+the conversation goes back to how it stood before it. A body with `turns` is a `422`, and so is a
+turn the context does not hold, one a compaction summarized say. A retried rewind names a turn that
+is gone and is refused, rather than taking another. `If-Match` takes the `ETag` of whichever listing
+was read. The screen's `/rewind` and `meka session rewind` still count turns back from the end.
+
+**A branch is one fork.** `POST /v1/sessions/{id}/fork` with `turn_id` copies the conversation as
+it stood before that turn, where 0.88 forked and then rewound the copy; a fork gives the turns it
+copies ids of their own, so a turn id of the source names nothing on the copy.
+
+**A blocking turn's `messages` carry thinking whenever it was recorded.** `supports_reasoning_stream`
+governs only the `thinking.delta` events. A bot that joins the text blocks of the assistant
+messages needs no change.
+
+**A withdrawn prompt stays in the history.** `message_withdrawn` on a terminal says the prompt left
+the context, so a client that resends still reads it; one that dropped the prompt from a transcript
+keeps it there, as the screen does.
+
+**The one-shot JSON report and ACP lose `replaced_count` too.** A compaction in the one-shot
+report's `compactions` and in ACP's `_meta.compaction` carries the same fields `context.compacted`
+does, without it.
+
 ## 0.87 to 0.88
 
 Nothing in `config.toml` is renamed, but `display.status_row` and `display.turn_end_summary`

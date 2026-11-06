@@ -1,4 +1,4 @@
-//! Stripe-style `Idempotency-Key` cache for blocking `POST /turn` responses.
+//! Stripe-style `Idempotency-Key` cache for blocking `POST /turns` responses.
 //!
 //! Key scope: `(token_id, scope, key)`, `scope` being what the request acts on. Tokens get
 //! independent dedup namespaces. Body mismatch on

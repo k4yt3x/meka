@@ -24,7 +24,7 @@ pub(crate) struct ServerState {
     pub(crate) sessions: Sessions<Uuid, SessionEntry>,
     /// Configured serve settings, post-resolve (defaults filled, env vars substituted).
     pub(crate) config: Arc<crate::host::http::config::ResolvedServeConfig>,
-    /// Stripe-style `Idempotency-Key` cache; spans the whole process. `POST /turn` consults it
+    /// Stripe-style `Idempotency-Key` cache; spans the whole process. `POST /turns` consults it
     /// before doing any real work.
     pub(crate) idempotency: IdempotencyCache,
     /// Process-wide count of in-flight turns. Inspected by `submit_turn` for the

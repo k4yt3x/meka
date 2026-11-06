@@ -50,11 +50,11 @@ pub(crate) enum SseEventType {
     ToolCallExecuting,
     ToolCallCompleted,
     ToolCallOutputDelta,
-    Progress,
+    ToolCallProgress,
     Notice,
     FeedGap,
-    PermissionRequired,
-    ElicitationRequired,
+    ApprovalRequested,
+    ElicitationRequested,
     ContextCompacting,
     ContextCompacted,
     ContextCompactionFailed,
@@ -72,7 +72,7 @@ pub(crate) enum SseEventType {
     InboxWithdrawn,
     ConversationRewound,
     ChecklistUpdated,
-    PermissionResolved,
+    ApprovalResolved,
     ElicitationResolved,
     SessionCreated,
     SessionUpdated,
@@ -108,11 +108,11 @@ impl SseEventType {
             Self::ToolCallExecuting => "tool_call.executing",
             Self::ToolCallCompleted => "tool_call.completed",
             Self::ToolCallOutputDelta => "tool_call.output_delta",
-            Self::Progress => "progress",
+            Self::ToolCallProgress => "tool_call.progress",
             Self::Notice => "notice",
             Self::FeedGap => "feed.gap",
-            Self::PermissionRequired => "permission_required",
-            Self::ElicitationRequired => "elicitation_required",
+            Self::ApprovalRequested => "approval.requested",
+            Self::ElicitationRequested => "elicitation.requested",
             Self::ContextCompacting => "context.compacting",
             Self::ContextCompacted => "context.compacted",
             Self::ContextCompactionFailed => "context.compaction_failed",
@@ -130,8 +130,8 @@ impl SseEventType {
             Self::InboxWithdrawn => "inbox.withdrawn",
             Self::ConversationRewound => "conversation.rewound",
             Self::ChecklistUpdated => "checklist.updated",
-            Self::PermissionResolved => "permission_resolved",
-            Self::ElicitationResolved => "elicitation_resolved",
+            Self::ApprovalResolved => "approval.resolved",
+            Self::ElicitationResolved => "elicitation.resolved",
             Self::SessionCreated => "session.created",
             Self::SessionUpdated => "session.updated",
             Self::SessionDeleted => "session.deleted",
@@ -247,8 +247,7 @@ pub(crate) fn translate(
         // The level is a fact of the turn, which its record carries.
         FrontendEvent::TurnOpened { .. } => return None,
         // A dropped call is settled by the turn's terminal, as one the turn's last round left is,
-        // and a compaction's checkpoint is the record `context.compacted` and `GET /messages`
-        // carry.
+        // and a compaction's checkpoint is the record `GET /history` carries.
         FrontendEvent::ToolCallDropped { .. } | FrontendEvent::CheckpointCallCompleted { .. } => {
             return None;
         }
@@ -284,11 +283,11 @@ pub(crate) fn translate(
                 "text": text,
             }),
         ),
-        // The one shape a user message has on this API: what `GET /messages` reads back, so a
-        // client renders a message it watched arrive and one it read later the same way.
+        // The one shape a message has on this API: what `GET /history` reads back, so a client
+        // renders a message it watched arrive and one it read later the same way.
         FrontendEvent::MessageAppended { message, .. } => (
             SseEventType::MessageAppended,
-            serde_json::json!(crate::host::http::handlers::messages::message_view(
+            serde_json::json!(crate::host::http::handlers::messages::message_body(
                 &message
             )),
         ),
@@ -429,7 +428,7 @@ pub(crate) fn translate(
         // did not have, and an MCP call can be minutes long with `tool_call.completed` the only
         // other sign of life. Dropped by the blocking recorder, which has no live reader.
         FrontendEvent::McpProgress(update) => (
-            SseEventType::Progress,
+            SseEventType::ToolCallProgress,
             serde_json::json!(ProgressView::from(update)),
         ),
         FrontendEvent::Notice(notice) => (
@@ -443,20 +442,17 @@ pub(crate) fn translate(
                 "trigger": trigger.name(),
             }),
         ),
-        // The one event a streaming client cannot infer. Everything else on this stream is
-        // additive, so a client that misses one still holds a prefix of the truth; a compaction
-        // *removes* messages it has already rendered, and without this it would only find out by
-        // noticing `total` went down on the next `GET /messages`.
+        // The one event that rewrites the context rather than adding to it, said so a client
+        // showing what the model sees knows to read it again.
         FrontendEvent::Compacted {
             id,
             record,
-            replaced_count,
             generation,
         } => (
             SseEventType::ContextCompacted,
             serde_json::json!(ContextCompacted {
                 compaction_id: id,
-                compaction: crate::view::CompactionView::new(&record, replaced_count, generation),
+                compaction: crate::view::CompactionView::new(&record, generation),
             }),
         ),
         FrontendEvent::CompactionFailed {
@@ -499,15 +495,14 @@ fn tool_result_content_view(
         .collect()
 }
 
-/// The `progress` event's payload. The three optional fields are omitted rather than `null`, like
-/// every optional field on this API.
+/// The `tool_call.progress` event's payload. The three optional fields are omitted rather than
+/// `null`, like every optional field on this API.
 #[derive(Debug, Serialize)]
 struct ProgressView {
-    server_name: String,
-    tool_name: String,
-    /// The `tool_call.executing` this belongs to, when the call carried a provider id.
+    /// The call this belongs to, as its `tool_call.executing` named it, when the call carried a
+    /// provider id.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_use_id: Option<String>,
+    id: Option<String>,
     progress: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<f64>,
@@ -518,9 +513,7 @@ struct ProgressView {
 impl From<ProgressUpdate> for ProgressView {
     fn from(update: ProgressUpdate) -> Self {
         Self {
-            server_name: update.server_name,
-            tool_name: update.tool_name,
-            tool_use_id: update.tool_use_id,
+            id: update.tool_use_id,
             progress: update.progress,
             total: update.total,
             message: update.message,
@@ -560,7 +553,7 @@ enum TextOrImage {
 mod tests {
     use super::*;
 
-    /// The opening is one shape on this API, the one `GET /messages` reads back, and an image
+    /// The opening is one shape on this API, the one `GET /history` reads back, and an image
     /// attached to it is named by the hash the store files its bytes under, though the message in
     /// hand still holds them inline.
     #[test]
@@ -631,7 +624,6 @@ mod tests {
                     written_summary: String::new(),
                     checkpoint: Vec::new(),
                 },
-                replaced_count: 7,
                 generation: 2,
             },
             SessionCapabilities::default(),
@@ -643,11 +635,11 @@ mod tests {
         assert_eq!(data["source"], "checkpoint");
         assert_eq!(data["memories_written"], serde_json::json!(["notes"]));
         assert_eq!(data["kept_recent"], false);
-        assert_eq!(data["replaced_count"], 7);
+        assert!(data.get("replaced_count").is_none());
         assert_eq!(data["generation"], 2);
         assert!(
             data.get("summary").is_none(),
-            "the summary is on `GET /messages`: {data}"
+            "the summary is on `GET /history`: {data}"
         );
 
         let (kind, data) = translate(
@@ -800,7 +792,7 @@ mod tests {
     /// An MCP call's progress reaches a streaming client as its own event, keyed to the call, with
     /// the fields a server did not send left out rather than sent as `null`.
     #[test]
-    fn translate_mcp_progress_as_a_progress_event() {
+    fn translate_mcp_progress_as_a_tool_call_progress_event() {
         let event = FrontendEvent::McpProgress(ProgressUpdate {
             server_name: "exa".into(),
             tool_name: "web_search_exa".into(),
@@ -811,14 +803,12 @@ mod tests {
         });
         let (event_type, data) =
             translate(event, SessionCapabilities::default()).expect("translates");
-        assert_eq!(event_type, SseEventType::Progress);
-        assert_eq!(event_type.as_str(), "progress");
+        assert_eq!(event_type, SseEventType::ToolCallProgress);
+        assert_eq!(event_type.as_str(), "tool_call.progress");
         assert_eq!(
             data,
             serde_json::json!({
-                "server_name": "exa",
-                "tool_name": "web_search_exa",
-                "tool_use_id": "tu_1",
+                "id": "tu_1",
                 "progress": 3.0,
                 "message": "fetching",
             })

@@ -628,20 +628,20 @@ impl Transcript {
     /// a rewound turn closes nowhere either, at a page's edge included. The page's span is the
     /// page as read, which is what the next read starts from.
     fn without_rewound(&self, mut page: crate::store::LogPage) -> crate::store::LogPage {
-        page.rows.retain(|row| {
-            !self
-                .rewound
-                .iter()
-                .flatten()
-                .any(|stretch| stretch.rows.contains(&row.id))
-        });
+        let rewound = self.rewound.as_deref().unwrap_or_default();
+        page.rows
+            .retain(|row| !crate::store::is_rewound(rewound, row.id));
         page
     }
 
     /// The row that closes the recorded turn `turn`, or `None` while the turn is still open, when
     /// its record is unknown, or when the summary is switched off.
     fn turn_end_entry(&mut self, turn: Uuid) -> Option<Entry> {
-        let record = self.turn_records.get(&turn)?;
+        let record = self
+            .turn_records
+            .get(&turn)
+            // A compaction's turn is said by its divider, as the live screen says it.
+            .filter(|record| record.source != crate::store::turns::TurnSource::Compaction)?;
         let status = record.status?;
         let ended_at = DateTime::parse_from_rfc3339(record.ended_at.as_deref()?)
             .ok()?
@@ -1771,9 +1771,12 @@ impl Transcript {
         window_holds_older: bool,
         closes_log: bool,
     ) -> (Vec<Entry>, bool) {
-        use crate::conversation::Event;
+        use crate::store::Said;
         let mut out: Vec<Entry> = Vec::new();
         let mut shown_checklist: Option<Vec<ChecklistItem>> = None;
+        // Without the stretches, which a failed read leaves the screen, every row says what it
+        // holds and a rewind says nothing.
+        let rewound = self.rewound.clone().unwrap_or_default();
         // The turn of the last row: a turn ends where the next row names another or none, and the
         // last turn of the log ends with the log.
         let mut turn: Option<Uuid> = None;
@@ -1789,46 +1792,27 @@ impl Transcript {
             {
                 out.push(entry);
             }
-            // A row naming no turn was written between turns, as a rewind or a `/compact` is, so
-            // the turn before it has ended; in a log written before turns were recorded, no row
-            // names one.
+            // A row naming no turn was written between turns, as a rewind is, so the turn before it
+            // has ended; in a log written before turns were recorded, no row names one.
             turn = row.turn_id;
-            let ran_under = self.ran_under(turn);
-            let event = &row.event;
-            let message = match event {
-                Event::Append(message) => message,
-                Event::CompactBoundary { record, .. } => {
+            // A copy standing alone marks where the turn that wrote it ends, and is drawn as the
+            // turn that said it.
+            let ran_under = self.ran_under(row.said.as_ref().map_or(turn, |said| said.turn_id));
+            let message = match row.said(&rewound) {
+                Said::Message(message) => message,
+                Said::Compaction { record } => {
                     let entries = self.compaction_entries(record);
                     out.extend(entries);
                     continue;
                 }
-                // A rewind is written between turns. One in a turn is the turn taking its prompt
-                // back, to join a message to it or to offer its items again, which the live run
-                // said nothing about either.
-                Event::Repair {
-                    replaced_count,
-                    messages,
-                } if messages.is_empty() && row.turn_id.is_none() => {
-                    // Without the session's rewound stretches, which a failed read leaves the
-                    // screen, the rows stay and the note counts what the row itself records.
-                    let rewind = self
-                        .rewound
-                        .iter()
-                        .flatten()
-                        .find(|stretch| stretch.said_at == Some(row.id));
-                    let note = match rewind {
-                        Some(rewind) => rewound_note(rewind.turns),
-                        None => format!(
-                            "Rewound {replaced_count} message{}",
-                            if *replaced_count == 1 { "" } else { "s" }
-                        ),
-                    };
-                    let entry = self.entry(Item::note(note));
+                Said::Rewind { turns, .. } => {
+                    let entry = self.entry(Item::note(rewound_note(turns)));
                     out.push(entry);
                     continue;
                 }
-                // A repair rewrites rows the log keeps; the log is what is shown.
-                Event::Repair { .. } | Event::Redact { .. } | Event::Unsign => continue,
+                // The live run said nothing of a prompt it took back to join a message to it.
+                Said::Join { .. } => continue,
+                Said::Nothing => continue,
             };
             if let Some(note) = crate::render::nudge_direction(message) {
                 let entry = self.entry(Item::note(note));
@@ -2361,11 +2345,15 @@ mod tests {
                 LogRow {
                     id: 1,
                     turn_id: Some(recorded),
+                    created_at: String::new(),
+                    said: None,
                     event: Event::Append(Message::user("in a recorded turn")),
                 },
                 LogRow {
                     id: 2,
                     turn_id: None,
+                    created_at: String::new(),
+                    said: None,
                     event: Event::Append(Message::user("before turns were recorded")),
                 },
             ],
@@ -2458,6 +2446,8 @@ mod tests {
                 .map(|(offset, event)| LogRow {
                     id: first_row + offset as i64,
                     turn_id: None,
+                    created_at: String::new(),
+                    said: None,
                     event,
                 })
                 .collect(),
@@ -2701,7 +2691,6 @@ mod tests {
         live.apply(FrontendEvent::Compacted {
             id: "c1".to_string(),
             record: record.clone(),
-            replaced_count: 3,
             generation: 1,
         });
         let mut resumed = transcript();
@@ -3435,13 +3424,12 @@ mod tests {
         assert!(transcript.is_attached() && transcript.has_more_above());
     }
 
-    /// A compaction and a rewind show as rows of their own, a rewind the screen has not read the
-    /// session's rewinds for counting the messages its row records; a repair shows nothing.
+    /// A compaction and a rewind show as rows of their own, the rewind counting the turns its
+    /// stretch took; a repair shows nothing, and so does a rewind on a screen that could not read
+    /// the session's stretches, since its row alone cannot say what it took.
     #[test]
     fn a_boundary_and_a_rewind_are_rows_and_a_repair_is_not() {
-        let mut transcript = transcript();
-        transcript.set_log_end(Some(3));
-        transcript.load_page_above(page(
+        let rows = || {
             vec![
                 Event::CompactBoundary {
                     summary: Message::user("summary"),
@@ -3458,10 +3446,17 @@ mod tests {
                     replaced_count: 1,
                     messages: vec![Message::user("fixed")],
                 },
-            ],
-            1,
-            false,
-        ));
+            ]
+        };
+        let mut transcript = transcript();
+        transcript.set_log_end(Some(3));
+        transcript.set_rewound(vec![crate::store::Rewound {
+            rows: Vec::new(),
+            at: 2,
+            joined: false,
+            turns: 1,
+        }]);
+        transcript.load_page_above(page(rows(), 1, false));
         let shown = items(&transcript);
         assert_eq!(shown.len(), 2, "{shown:?}");
         assert!(
@@ -3497,7 +3492,11 @@ mod tests {
             "a boundary that recorded no rounds shows the memories its record names: {:?}",
             items(&older)
         );
-        assert!(matches!(shown[1], Item::Notice { text, .. } if text == "Rewound 2 messages"));
+        assert!(matches!(shown[1], Item::Notice { text, .. } if text == "Rewound 1 turn"));
+        let mut unread = self::transcript();
+        unread.set_log_end(Some(3));
+        unread.load_page_above(page(rows(), 1, false));
+        assert_eq!(items(&unread).len(), 1, "{:?}", items(&unread));
     }
 
     /// The banner stands only while nothing but notices stand with it: the first prompt takes it
@@ -3568,6 +3567,8 @@ mod tests {
                 .map(|((turn, event), id)| LogRow {
                     id: *id,
                     turn_id: Some(turn),
+                    created_at: String::new(),
+                    said: None,
                     event,
                 })
                 .collect(),
@@ -3803,8 +3804,13 @@ mod tests {
     /// the rewind how many turns went from there. The turn before it closes ahead of that note,
     /// since a rewind is written between turns, and once, wherever a page's edge falls. A turn
     /// taking its prompt back to join a message to it is no rewind: the prompt shows once, in the
-    /// message it joined, with no note. A prompt withdrawn because the provider refused it stays,
-    /// as it did live, with no note either.
+    /// message it joined, with no note, in a log that names its turns or one written before turns
+    /// were recorded. A prompt withdrawn because the provider refused it stays, as it did live,
+    /// with no note either.
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "a stretch's rows are a list of runs, and these hold one run"
+    )]
     #[test]
     fn a_replay_leaves_out_what_a_rewind_took() {
         use crate::store::Rewound;
@@ -3835,20 +3841,23 @@ mod tests {
         // Turn two joined a message to its prompt at row 4; turn three was rewound at row 9, then
         // turn two at row 10, which took from the prompt the joined message stands for.
         let joined = Rewound {
-            rows: 3..=4,
-            said_at: None,
+            rows: vec![3..=3],
+            at: 4,
+            joined: true,
             turns: 0,
         };
         let rewound = vec![
             joined.clone(),
             Rewound {
-                rows: 7..=8,
-                said_at: Some(9),
+                rows: vec![7..=8],
+                at: 9,
+                joined: false,
                 turns: 1,
             },
             Rewound {
-                rows: 3..=9,
-                said_at: Some(10),
+                rows: vec![3..=9],
+                at: 10,
+                joined: false,
                 turns: 2,
             },
         ];
@@ -3860,6 +3869,8 @@ mod tests {
                 .map(|(offset, (turn_id, event))| LogRow {
                     id: first + offset as i64,
                     turn_id,
+                    created_at: String::new(),
+                    said: None,
                     event,
                 })
                 .collect(),
@@ -3898,6 +3909,19 @@ mod tests {
             );
             assert_eq!(kinds(&split), kinds(&whole), "split after row {edge}");
         }
+        // A log written before turns were recorded names none, and a join in it is no rewind
+        // either: its repair row says nothing.
+        let unturned: Vec<(Option<Uuid>, Event)> = log[..6]
+            .iter()
+            .map(|(_, event)| (None, event.clone()))
+            .collect();
+        let joined_unturned = replayed(vec![page(&unturned, 1, false)], vec![joined.clone()]);
+        assert_eq!(
+            kinds(&joined_unturned),
+            vec!["prompt", "text", "prompt", "text"],
+            "{:?}",
+            items(&joined_unturned)
+        );
         let joined_only = replayed(vec![page(&log[..6], 1, false)], vec![joined]);
         assert_eq!(kinds(&joined_only), vec![
             "prompt", "text", "end", "prompt", "text", "end"
@@ -3911,6 +3935,44 @@ mod tests {
         assert_eq!(kinds(&withdrawn), vec![
             "prompt", "text", "end", "prompt", "end"
         ]);
+    }
+
+    /// A prompt a compaction kept, standing alone once turn retention took the row it was said
+    /// in, is drawn in the level of the turn that said it, as it was live, not that of the turn
+    /// whose compaction wrote the copy.
+    #[test]
+    fn a_kept_prompt_standing_alone_shows_the_level_it_was_said_under() {
+        use crate::permission::Permission;
+        let (said_in, compacting) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut transcript = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        let mut said_record = closed_turn(said_in, TurnStatus::Succeeded);
+        said_record.permission = Permission::Workspace;
+        transcript.set_turn_records(vec![
+            said_record,
+            closed_turn(compacting, TurnStatus::Succeeded),
+        ]);
+        let said = crate::store::SaidStamp {
+            turn_id: Some(said_in),
+            created_at: "2026-10-12T12:00:00+00:00".to_string(),
+        };
+        transcript.load_page_above(LogPage {
+            rows: vec![LogRow {
+                id: 7,
+                turn_id: Some(compacting),
+                created_at: String::new(),
+                said: Some(said),
+                event: asked("kept?"),
+            }],
+            more: false,
+        });
+        assert!(
+            matches!(items(&transcript)[0], Item::Prompt {
+                ran_under: RanUnder::Level(Permission::Workspace),
+                ..
+            }),
+            "{:?}",
+            items(&transcript)
+        );
     }
 
     /// On a replay each recorded turn closes where its rows end: inside a page where the next
@@ -4438,7 +4500,6 @@ mod tests {
         compacted.apply(FrontendEvent::Compacted {
             id: "c1".into(),
             record: crate::conversation::CompactionRecord::for_test(),
-            replaced_count: 2,
             generation: 1,
         });
         assert_eq!(shape(&compacted), vec!["compaction", "prompt"]);

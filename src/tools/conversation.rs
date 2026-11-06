@@ -2,10 +2,11 @@
 //! over the full log of one or more sessions, and `session_list` / `session_search` over the
 //! sessions themselves.
 //!
-//! The conversation tools read a session's whole log, including turns that compaction summarized
-//! away and removed from the model's context. Compaction never deletes (it appends a boundary,
-//! [`crate::conversation`]), so every turn is still on disk in the `messages` table; these tools
-//! give the model a way back to detail the summary may have dropped. Which sessions a call may
+//! The conversation tools read a session's history as every surface shows it
+//! ([`crate::store::Said`]), including turns that compaction summarized away and removed from the
+//! model's context. Compaction never deletes (it appends a boundary, [`crate::conversation`]), so
+//! every turn is still on disk in the `messages` table; these tools give the model a way back to
+//! detail the summary may have dropped. Which sessions a call may
 //! reach is one rule, [`readable_sessions`]: the caller's own and its direct children, or every
 //! session at `unrestricted`.
 //!
@@ -24,7 +25,7 @@ use super::{
     },
 };
 use crate::{
-    conversation::{ContentBlock, Event, Message},
+    conversation::{ContentBlock, Message},
     error::{MekaError, Result},
     permission::Permission,
     provider::ToolDefinition,
@@ -63,7 +64,10 @@ fn readable_sessions(
     // The level itself, not `allows`: `workspace` admits a tool that requires `unrestricted` to
     // the gate, and this is a boundary question, which only the top level disclaims.
     Ok(if site.permission.get() == Permission::Unrestricted {
-        SessionReach::Store { include_children }
+        SessionReach::Store(crate::store::SessionFilter {
+            include_children,
+            ..Default::default()
+        })
     } else {
         SessionReach::Tree(own)
     })
@@ -76,13 +80,13 @@ fn readable_sessions(
 /// learns nothing about the sessions it may not read.
 async fn resolve_readable_session(
     store: &Store,
-    reach: SessionReach,
+    reach: &SessionReach,
     wanted: &str,
     tool_name: &str,
 ) -> Result<Uuid> {
     let wanted = wanted.trim();
     let root = match reach {
-        SessionReach::Store { .. } => {
+        SessionReach::Store(_) => {
             return store.resolve_session_id(wanted).await.map_err(|error| {
                 MekaError::ToolExecution {
                     tool_name: tool_name.to_string(),
@@ -90,7 +94,7 @@ async fn resolve_readable_session(
                 }
             });
         }
-        SessionReach::Tree(root) => root,
+        SessionReach::Tree(root) => *root,
     };
     let candidates: Vec<Uuid> = store
         .load_session_tree(root)
@@ -134,36 +138,6 @@ async fn resolve_readable_session(
             ),
         }),
     }
-}
-
-/// The `Append` messages in log order. `CompactBoundary` events are skipped: their synthetic
-/// summary is already in the model's context, and skipping them keeps message indices stable across
-/// compactions (the log only ever grows).
-fn append_messages(events: &[Event]) -> Vec<&Message> {
-    let mut messages: Vec<&Message> = Vec::new();
-    for event in events {
-        match event {
-            Event::Append(message) => messages.push(message),
-            Event::CompactBoundary { .. } => {}
-            // Skipped: it changes an image into a note, and images are not searchable either way.
-            Event::Redact { .. } => {}
-            // Skipped: it takes signatures and redacted blocks, and neither holds a word.
-            Event::Unsign => {}
-            // Applied rather than skipped: a repaired message is what the model actually saw, so
-            // searching the superseded original would surface content that is no longer in the
-            // conversation. Unlike a boundary this can shift indices, but only across a repair,
-            // which is rare and confined to a single run of trailing messages.
-            Event::Repair {
-                replaced_count,
-                messages: replacements,
-            } => {
-                let truncate_to = messages.len().saturating_sub(*replaced_count);
-                messages.truncate(truncate_to);
-                messages.extend(replacements.iter());
-            }
-        }
-    }
-    messages
 }
 
 /// Flatten a message into searchable lines: every block's [`ContentBlock::search_text`], which
@@ -266,9 +240,8 @@ struct Found {
     messages: usize,
 }
 
-/// Scan one log for `matcher`, showing at most `room` lines.
-fn find_in(events: &[Event], matcher: &Matcher, room: usize) -> Found {
-    let messages = append_messages(events);
+/// Scan one history's `messages` for `matcher`, showing at most `room` lines.
+fn find_in(messages: &[Message], matcher: &Matcher, room: usize) -> Found {
     let mut found = Found {
         shown: Vec::new(),
         total: 0,
@@ -297,12 +270,17 @@ fn find_in(events: &[Event], matcher: &Matcher, room: usize) -> Found {
     found
 }
 
-fn search_events(events: &[Event], query: &str, use_regex: bool, limit: usize) -> Result<String> {
+fn search_messages(
+    messages: &[Message],
+    query: &str,
+    use_regex: bool,
+    limit: usize,
+) -> Result<String> {
     use std::fmt::Write;
 
     let matcher = Matcher::build(query, use_regex)?;
     let cap = limit.clamp(1, MAX_SEARCH_MATCHES);
-    let found = find_in(events, &matcher, cap);
+    let found = find_in(messages, &matcher, cap);
     let total_messages = found.messages;
 
     if found.total == 0 {
@@ -341,11 +319,11 @@ fn search_events(events: &[Event], query: &str, use_regex: bool, limit: usize) -
     Ok(output)
 }
 
-/// [`search_events`] over the logs a call named, one group per session that holds a match, under
-/// one shared cap. The hint names the session beside the index, because an index means something
-/// only within its log.
+/// [`search_messages`] over the histories a call named, one group per session that holds a match,
+/// under one shared cap. The hint names the session beside the index, because an index means
+/// something only within its history.
 fn search_named(
-    logs: &[(Uuid, Vec<Event>)],
+    logs: &[(Uuid, Vec<Message>)],
     query: &str,
     use_regex: bool,
     limit: usize,
@@ -358,8 +336,8 @@ fn search_named(
     let mut total_found = 0usize;
     let mut shown = 0usize;
     let mut total_messages = 0usize;
-    for (session, events) in logs {
-        let found = find_in(events, &matcher, cap - shown);
+    for (session, messages) in logs {
+        let found = find_in(messages, &matcher, cap - shown);
         total_messages += found.messages;
         total_found += found.total;
         shown += found.shown.len();
@@ -420,14 +398,13 @@ fn search_named(
 
 /// `count` messages from `start`, headed by which session they are from when the call named one.
 fn read_messages(
-    events: &[Event],
+    messages: &[Message],
     start: usize,
     count: usize,
     session: Option<Uuid>,
 ) -> Result<String> {
     use std::fmt::Write;
 
-    let messages = append_messages(events);
     let total = messages.len();
     if start == 0 || start > total {
         return Err(MekaError::ToolExecution {
@@ -549,9 +526,9 @@ impl Tool for ConversationSearchTool {
 
         let Some(named) = named_sessions(&input)? else {
             let session_id = resolve_session_id(&self.site.session_id, "conversation_search")?;
-            let events = self.store.load_history(session_id).await?;
+            let messages = self.store.history_messages(session_id).await?;
             return Ok(ToolOutput::text(
-                search_events(&events, &query, use_regex, limit)?,
+                search_messages(&messages, &query, use_regex, limit)?,
                 false,
             ));
         };
@@ -560,15 +537,15 @@ impl Tool for ConversationSearchTool {
         let reach = readable_sessions(&self.site, true, "conversation_search")?;
         let mut sessions: Vec<Uuid> = Vec::new();
         for wanted in &named {
-            let id =
-                resolve_readable_session(&self.store, reach, wanted, "conversation_search").await?;
+            let id = resolve_readable_session(&self.store, &reach, wanted, "conversation_search")
+                .await?;
             if !sessions.contains(&id) {
                 sessions.push(id);
             }
         }
-        let mut logs: Vec<(Uuid, Vec<Event>)> = Vec::with_capacity(sessions.len());
+        let mut logs: Vec<(Uuid, Vec<Message>)> = Vec::with_capacity(sessions.len());
         for session in sessions {
-            logs.push((session, self.store.load_history(session).await?));
+            logs.push((session, self.store.history_messages(session).await?));
         }
         Ok(ToolOutput::text(
             search_named(&logs, &query, use_regex, limit)?,
@@ -643,7 +620,7 @@ impl Tool for ConversationReadTool {
             Some(wanted) => {
                 let reach = readable_sessions(&self.site, true, "conversation_read")?;
                 Some(
-                    resolve_readable_session(&self.store, reach, wanted, "conversation_read")
+                    resolve_readable_session(&self.store, &reach, wanted, "conversation_read")
                         .await?,
                 )
             }
@@ -653,9 +630,9 @@ impl Tool for ConversationReadTool {
             Some(session) => session,
             None => resolve_session_id(&self.site.session_id, "conversation_read")?,
         };
-        let events = self.store.load_history(session_id).await?;
+        let messages = self.store.history_messages(session_id).await?;
         Ok(ToolOutput::text(
-            read_messages(&events, start, limit, named)?,
+            read_messages(&messages, start, limit, named)?,
             false,
         ))
     }
@@ -713,7 +690,7 @@ impl Tool for SessionListTool {
                 sessions.extend(children);
                 (sessions, more)
             }
-            SessionReach::Store { .. } => {
+            SessionReach::Store(_) => {
                 self.store
                     .list_sessions(SESSION_LIST_ROWS, None, &SessionFilter::default())
                     .await?
@@ -845,6 +822,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::conversation::Event;
 
     fn boundary(replaced: usize) -> Event {
         Event::CompactBoundary {
@@ -856,23 +834,20 @@ mod tests {
         }
     }
 
-    /// A log where the first two turns were compacted away (a boundary sits after them) and one
-    /// turn follows. `conversation_search` must still see the pre-boundary turns.
-    fn compacted_log() -> Vec<Event> {
+    /// The history of a session whose first turn a compaction summarized, with one turn after it.
+    /// `conversation_search` must still see the summarized turn.
+    fn compacted_history() -> Vec<Message> {
         vec![
-            Event::Append(Message::user("the auth token expired unexpectedly")),
-            Event::Append(Message::assistant_text(
-                "I'll investigate the token refresh path",
-            )),
-            boundary(2),
-            Event::Append(Message::user("now let's talk about something unrelated")),
+            Message::user("the auth token expired unexpectedly"),
+            Message::assistant_text("I'll investigate the token refresh path"),
+            Message::user("now let's talk about something unrelated"),
         ]
     }
 
     #[test]
     fn search_finds_pre_compaction_turn_case_insensitively() {
-        let events = compacted_log();
-        let out = search_events(&events, "AUTH Token", false, 20).expect("search");
+        let messages = compacted_history();
+        let out = search_messages(&messages, "AUTH Token", false, 20).expect("search");
         // Message #1 is before the boundary (hidden from the model) but still searchable.
         assert!(out.contains("#1 [user]"), "expected a hit on #1: {out}");
         assert!(out.contains("auth token expired"), "{out}");
@@ -880,30 +855,75 @@ mod tests {
 
     #[test]
     fn search_regex_mode_matches() {
-        let events = compacted_log();
-        let out = search_events(&events, "tok.n refresh", true, 20).expect("search");
+        let messages = compacted_history();
+        let out = search_messages(&messages, "tok.n refresh", true, 20).expect("search");
         assert!(out.contains("#2 [assistant]"), "{out}");
     }
 
     #[test]
     fn search_no_match_reports_zero() {
-        let events = compacted_log();
-        let out = search_events(&events, "nonexistent phrase", false, 20).expect("search");
+        let messages = compacted_history();
+        let out = search_messages(&messages, "nonexistent phrase", false, 20).expect("search");
         assert!(out.starts_with("No matches"), "{out}");
     }
 
-    #[test]
-    fn boundary_summary_is_not_indexed() {
-        // The synthetic summary message must not get an index; #3 is the post-boundary user turn.
-        let events = compacted_log();
-        let out = search_events(&events, "unrelated", false, 20).expect("search");
-        assert!(out.contains("#3 [user]"), "{out}");
+    /// The tools read the history every surface shows, so the drop of a call a crash cut, which
+    /// starts at the summary when the call came straight after one, moves no message: the summary
+    /// is no message of it, and the call stays where it was said.
+    #[tokio::test]
+    async fn a_dropped_call_right_after_a_summary_moves_no_message() {
+        use crate::conversation::Role;
+        let store = Store::for_test().await;
+        let session = store
+            .create_session(None, "test-profile")
+            .await
+            .expect("session");
+        for message in [
+            Message::user("first prompt"),
+            Message::assistant_text("first answer"),
+        ] {
+            store
+                .save_event(session, &Event::Append(message), None)
+                .await
+                .expect("save");
+        }
+        store
+            .save_compaction(session, &boundary(2), &[], None)
+            .await
+            .expect("compact");
+        let cut = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: "shell_execute".to_string(),
+                input: serde_json::json!({"command": "true"}),
+            }],
+        };
+        store
+            .save_event(session, &Event::Append(cut), None)
+            .await
+            .expect("save");
+        store.load_conversation(session).await.expect("resume");
+
+        let read = ConversationReadTool {
+            store: store.clone(),
+            site: site(Permission::Read, session),
+        };
+        let out = run(&read, serde_json::json!({"start": 1, "limit": 3}))
+            .await
+            .expect("read");
+        assert!(out.starts_with("Messages #1..#3 of 3:"), "{out}");
+        assert!(out.contains("#2 [assistant]\nfirst answer"), "{out}");
+        assert!(
+            out.contains("#3 [assistant]\n[tool call: shell_execute]"),
+            "{out}"
+        );
     }
 
     #[test]
     fn read_messages_returns_full_turns_by_index() {
-        let events = compacted_log();
-        let out = read_messages(&events, 1, 2, None).expect("read");
+        let messages = compacted_history();
+        let out = read_messages(&messages, 1, 2, None).expect("read");
         assert!(
             out.contains("#1 [user]") && out.contains("auth token expired"),
             "{out}"
@@ -916,9 +936,9 @@ mod tests {
 
     #[test]
     fn read_messages_out_of_range_errors() {
-        let events = compacted_log();
-        assert!(read_messages(&events, 0, 1, None).is_err());
-        assert!(read_messages(&events, 99, 1, None).is_err());
+        let messages = compacted_history();
+        assert!(read_messages(&messages, 0, 1, None).is_err());
+        assert!(read_messages(&messages, 99, 1, None).is_err());
     }
 
     /// A parent, its child, the child's child, and an unrelated root, each saying the same word so
@@ -1017,12 +1037,10 @@ mod tests {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let logs = vec![
-            (first, vec![Event::Append(Message::user(
-                "pelicans at dawn",
-            ))]),
+            (first, vec![Message::user("pelicans at dawn")]),
             (second, vec![
-                Event::Append(Message::user("nothing here")),
-                Event::Append(Message::assistant_text("pelicans at dusk")),
+                Message::user("nothing here"),
+                Message::assistant_text("pelicans at dusk"),
             ]),
         ];
         let out = search_named(&logs, "pelicans", false, 20).expect("search");

@@ -589,8 +589,8 @@ pub(crate) enum ErrorKind {
     SubagentNotRunning,
     InvalidBody,
     /// `If-Match` named a conversation that has since changed: a rewind or a fork decided on a
-    /// view that is no longer the one the server holds. The remedy is to read `GET /messages`
-    /// again and decide again, which `revision` and `total` on the detail support.
+    /// conversation that is no longer the one the server holds. The remedy is to read it again and
+    /// decide again, which `position` on the detail supports.
     PreconditionFailed,
     /// The conversation meka assembled still exceeds the profile's `max_request_bytes` after every
     /// older image was redacted, so meka refused to send it.

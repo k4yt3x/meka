@@ -334,11 +334,11 @@ fn memory_failure(error: crate::error::MekaError) -> ProblemDetail {
     ProblemDetail::internal_sanitized("memory store unavailable", error)
 }
 
-/// `GET /v1/memory`: the memory index, most important first.
+/// `GET /v1/memories`: the memory index, most important first.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub(crate) struct MemoryListQuery {
     /// Words to search for. The memories the agent's own `memory_search` would find for them,
-    /// best first, each with the `snippet` it was found on; absent, the whole index.
+    /// best first, each with the `excerpt` it was found on; absent, the whole index.
     #[serde(default)]
     pub(crate) q: Option<String>,
     /// How many a search answers with at most. Default 10, clamped to 1..25. Ignored without
@@ -380,7 +380,7 @@ fn memory_refusal(error: crate::error::MekaError) -> ProblemDetail {
 
 #[utoipa::path(
     get,
-    path = "/v1/memory",
+    path = "/v1/memories",
     tag = "memory",
     params(MemoryListQuery),
     responses(
@@ -439,17 +439,17 @@ pub(crate) async fn list_memories(
             .map_err(memory_failure)?
         {
             let mut detail = MemoryDetail::new(&memory, None);
-            detail.snippet = Some(hit.snippet);
+            detail.excerpt = Some(hit.excerpt);
             listed.push(detail);
         }
     }
     Ok(Json(MemoryListResponse { memories: listed }))
 }
 
-/// `GET /v1/memory/{name}`: one memory, body included.
+/// `GET /v1/memories/{name}`: one memory, body included.
 #[utoipa::path(
     get,
-    path = "/v1/memory/{name}",
+    path = "/v1/memories/{name}",
     tag = "memory",
     params(("name" = String, Path, description = "Memory name"), MemoryLookupQuery),
     responses(
@@ -541,10 +541,10 @@ pub(crate) struct WriteMemoryRequest {
     pub(crate) project: Option<String>,
 }
 
-/// `PUT /v1/memory/{name}`: create or update a memory.
+/// `PUT /v1/memories/{name}`: create or update a memory.
 #[utoipa::path(
     put,
-    path = "/v1/memory/{name}",
+    path = "/v1/memories/{name}",
     tag = "memory",
     params(("name" = String, Path, description = "Memory name, [A-Za-z0-9_-]")),
     request_body = WriteMemoryRequest,
@@ -648,10 +648,10 @@ pub(crate) async fn put_memory(
     Ok(Json(MemoryDetail::new(&written, None)))
 }
 
-/// `DELETE /v1/memory/{name}`: remove a memory.
+/// `DELETE /v1/memories/{name}`: remove a memory.
 #[utoipa::path(
     delete,
-    path = "/v1/memory/{name}",
+    path = "/v1/memories/{name}",
     tag = "memory",
     params(("name" = String, Path, description = "Memory name"), MemoryLookupQuery),
     responses(

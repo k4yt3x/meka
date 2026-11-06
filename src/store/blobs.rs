@@ -3,7 +3,7 @@
 //! An image enters meka as bytes and leaves for a provider as bytes, but it rests here once: a
 //! message row holds a reference, and the same screenshot read twice costs one row. The store makes
 //! the exchange at its own two doors, so nothing above it handles the reference form except the
-//! readers that want it, `GET /v1/sessions/{id}/messages` and an export.
+//! readers that want it, the HTTP API's conversation reads and an export.
 
 use base64::Engine;
 use sha2::Digest;

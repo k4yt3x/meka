@@ -25,7 +25,6 @@ use uuid::Uuid;
 use crate::{
     host::http::{
         errors::{ErrorKind, ProblemDetail},
-        reattach::require_session_exists,
         scope,
         state::ServerState,
     },
@@ -40,7 +39,7 @@ pub(crate) struct ScheduledJobsResponse {
     pub(crate) jobs: Vec<ScheduledJobView>,
 }
 
-/// `GET /v1/schedule`: every scheduled job in the database, across all sessions.
+/// `GET /v1/jobs`: every scheduled job in the database, across all sessions.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub(crate) struct ListJobsQuery {
     /// Only the jobs planted on this session. A session with none, or an id no session has,
@@ -51,7 +50,7 @@ pub(crate) struct ListJobsQuery {
 
 #[utoipa::path(
     get,
-    path = "/v1/schedule",
+    path = "/v1/jobs",
     tag = "schedule",
     params(ListJobsQuery),
     responses(
@@ -83,6 +82,8 @@ pub(crate) async fn list_all(
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateJobRequest {
+    /// The session the job fires in.
+    pub(crate) session_id: Uuid,
     /// What the agent is asked to do when the job fires.
     pub(crate) prompt: String,
     /// One-shot time: an RFC 3339 instant, or a duration from now (`"20m"`, `"1h 30m"`).
@@ -124,12 +125,11 @@ pub(crate) struct CreateGate {
     pub(crate) when: Option<serde_json::Value>,
 }
 
-/// `POST /v1/sessions/{id}/schedule`: plant a job on a session.
+/// `POST /v1/jobs`: plant a job on a session.
 #[utoipa::path(
     post,
-    path = "/v1/sessions/{id}/schedule",
+    path = "/v1/jobs",
     tag = "schedule",
-    params(("id" = Uuid, Path, description = "Session UUID")),
     request_body = CreateJobRequest,
     responses(
         (status = 201, description = "Job created", body = ScheduledJobView),
@@ -145,7 +145,6 @@ pub(crate) struct CreateGate {
 pub(crate) async fn create(
     State(state): State<ServerState>,
     scope::Scoped { principal, .. }: scope::Scoped<scope::ScheduleWrite>,
-    Path(id): Path<Uuid>,
     raw_body: Bytes,
 ) -> Result<(StatusCode, Json<ScheduledJobView>), ProblemDetail> {
     // Refused rather than accepted-and-ignored. With `[schedule] enabled = false` the scheduler
@@ -163,12 +162,12 @@ pub(crate) async fn create(
             ErrorKind::NotFound,
             StatusCode::NOT_FOUND,
             "scheduling is disabled on this server (`[schedule] enabled = false`)",
-        )
-        .with("session_id", id.to_string()));
+        ));
     }
 
     let body: CreateJobRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("schedule", error))?;
+    let id = body.session_id;
     if body.prompt.trim().is_empty() {
         return Err(ProblemDetail::new(
             ErrorKind::InvalidBody,
@@ -245,7 +244,7 @@ pub(crate) async fn create(
             // feature: the command runs on a timer, before the turn, as the server's user, and it
             // runs whether or not the turn works at all -- so a job whose gate is the payload
             // needs no provider, no credit and no model. `schedule:w` alone is meant to say "may
-            // plant work on a session", and `GET /v1/schedule` already hands out every session id
+            // plant work on a session", and `GET /v1/jobs` already hands out every session id
             // in the database, so without this an operator who scoped a calendar bridge to
             // `schedule:*` and nothing else has in fact granted it unattended arbitrary shell.
             //
@@ -565,17 +564,16 @@ fn parse_schedule(
     })
 }
 
-/// `DELETE /v1/schedule/{job_id}`: cancel a job.
+/// `DELETE /v1/jobs/{job_id}`: cancel a job.
 ///
-/// Keyed on the job id alone rather than nested under its session, because that is how a client
-/// that read `GET /v1/schedule` holds it.
+/// Keyed on the job id alone, as the collection names every job.
 ///
 /// Takes the full id and 404s when nothing matches: a client holds the id whole from the listing,
 /// and answering 204 to an id that matched nothing would report a still-firing job as canceled. A
 /// gated job kept alive that way goes on running a shell command unattended.
 #[utoipa::path(
     delete,
-    path = "/v1/schedule/{job_id}",
+    path = "/v1/jobs/{job_id}",
     tag = "schedule",
     params(("job_id" = String, Path, description = "Scheduled job id")),
     responses(
@@ -624,20 +622,24 @@ pub(crate) struct BackgroundTasksResponse {
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub(crate) struct TasksQuery {
+    /// Only the tasks of this session. A session with none, or an id no session has, answers an
+    /// empty list, as every listing filter does.
+    #[serde(default)]
+    pub(crate) session: Option<Uuid>,
     /// Only the tasks in this status: `running`, `completed`, `failed`, `canceled` or
     /// `interrupted`.
     #[serde(default)]
     pub(crate) status: Option<String>,
 }
 
-/// `GET /v1/tasks`: every session's background tasks, newest first.
+/// `GET /v1/tasks`: the background tasks, newest first.
 #[utoipa::path(
     get,
     path = "/v1/tasks",
     tag = "tasks",
     params(TasksQuery),
     responses(
-        (status = 200, description = "Background tasks across every session", body = BackgroundTasksResponse),
+        (status = 200, description = "Background tasks: every session's, or one session's with `session`", body = BackgroundTasksResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 422, description = "`status` is not a task status", body = ProblemDetail),
@@ -662,70 +664,33 @@ pub(crate) async fn list_all_tasks(
                 error,
             )
         })?;
-    let tasks = state
-        .shared
-        .store
-        .background_store()
-        .list_all_background_tasks(status)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to list background tasks", error)
-        })?;
+    let background = state.shared.store.background_store();
+    let tasks = match query.session {
+        Some(id) => background.list_background_tasks(id).await.map(|tasks| {
+            tasks
+                .into_iter()
+                .filter(|task| status.is_none_or(|status| task.status == status))
+                .collect()
+        }),
+        None => background.list_all_background_tasks(status).await,
+    }
+    .map_err(|error| ProblemDetail::internal_sanitized("failed to list background tasks", error))?;
     Ok(Json(BackgroundTasksResponse {
         tasks: tasks.into_iter().map(BackgroundTaskView::from).collect(),
     }))
 }
 
-/// `GET /v1/sessions/{id}/tasks`: this session's background tasks, newest first.
-#[utoipa::path(
-    get,
-    path = "/v1/sessions/{id}/tasks",
-    tag = "tasks",
-    params(("id" = Uuid, Path, description = "Session UUID")),
-    responses(
-        (status = 200, description = "Background tasks", body = BackgroundTasksResponse),
-        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
-        (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 500, description = "Internal server error", body = ProblemDetail),
-    ),
-    security(("bearerAuth" = ["sessions:r"]))
-)]
-pub(crate) async fn list_tasks(
-    State(state): State<ServerState>,
-    _scoped: scope::Scoped<scope::SessionsRead>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<BackgroundTasksResponse>, ProblemDetail> {
-    require_session_exists(&state, id).await?;
-    let tasks = state
-        .shared
-        .store
-        .background_store()
-        .list_background_tasks(id)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to list background tasks", error)
-                .with("session_id", id.to_string())
-        })?;
-    Ok(Json(BackgroundTasksResponse {
-        tasks: tasks.into_iter().map(BackgroundTaskView::from).collect(),
-    }))
-}
-
-/// `DELETE /v1/sessions/{id}/tasks/{task_id}`: stop a running background task.
+/// `DELETE /v1/tasks/{task_id}`: stop a running background task.
 #[utoipa::path(
     delete,
-    path = "/v1/sessions/{id}/tasks/{task_id}",
+    path = "/v1/tasks/{task_id}",
     tag = "tasks",
-    params(
-        ("id" = Uuid, Path, description = "Session UUID"),
-        ("task_id" = String, Path, description = "Background task id"),
-    ),
+    params(("task_id" = String, Path, description = "Background task id")),
     responses(
         (status = 204, description = "Task canceled, or already terminal"),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 404, description = "Session or task not found", body = ProblemDetail),
+        (status = 404, description = "No task has that id", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:w"]))
@@ -733,27 +698,27 @@ pub(crate) async fn list_tasks(
 pub(crate) async fn cancel_task(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::SessionsWrite>,
-    Path((id, task_id)): Path<(Uuid, String)>,
+    Path(task_id): Path<String>,
 ) -> Result<StatusCode, ProblemDetail> {
     let Some(task) = state
         .shared
         .store
         .background_store()
-        .background_task(id, &task_id)
+        .background_task_by_id(&task_id)
         .await
         .map_err(|error| {
             ProblemDetail::internal_sanitized("failed to look up background task", error)
-                .with("session_id", id.to_string())
+                .with("task_id", task_id.clone())
         })?
     else {
         return Err(ProblemDetail::new(
             ErrorKind::NotFound,
             StatusCode::NOT_FOUND,
-            format!("session {id} has no background task '{task_id}'"),
+            format!("no background task has id '{task_id}'"),
         )
-        .with("session_id", id.to_string())
         .with("task_id", task_id.clone()));
     };
+    let id = task.session_id;
     if task.status.is_terminal() {
         return Ok(StatusCode::NO_CONTENT);
     }

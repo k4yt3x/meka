@@ -423,7 +423,7 @@ mod tests {
             StatusCode::NOT_FOUND,
             "session 's_abc' does not exist",
         )
-        .instance("/v1/sessions/s_abc/turn")
+        .instance("/v1/sessions/s_abc/turns")
         .with("session_id", "s_abc");
         let body = serde_json::to_value(&problem).expect("serializable");
         assert_eq!(
@@ -431,7 +431,7 @@ mod tests {
             "type URI must match the catalog entry exactly",
         );
         assert_eq!(body["status"], 404);
-        assert_eq!(body["instance"], "/v1/sessions/s_abc/turn");
+        assert_eq!(body["instance"], "/v1/sessions/s_abc/turns");
         assert_eq!(
             body["session_id"], "s_abc",
             "extension members flatten to the top level"

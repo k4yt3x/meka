@@ -370,7 +370,7 @@ pub(crate) struct StreamAttachment {
 }
 
 /// A feed reader's declaration that it shows approval prompts and answers them, alive for as long
-/// as its stream is. While one exists, a gated call on any turn parks as `permission_required`
+/// as its stream is. While one exists, a gated call on any turn parks as `approval.requested`
 /// rather than being refused without asking; when the last one drops, a parked prompt is canceled
 /// the way a streaming client's disconnect cancels it.
 pub(crate) struct Attendance {
@@ -418,7 +418,7 @@ impl Drop for KeepsLoaded {
 /// current and opens a session's own feed only for the one it is looking at. Carries exactly what
 /// a record is rendered from: a session's creation, change and deletion, the four turn lifecycle
 /// events without their deltas, and the parking and closing of a prompt, which move
-/// `approvals_pending`. Ids of its own, and a ring of its own for `Last-Event-ID`.
+/// `requests_pending`. Ids of its own, and a ring of its own for `Last-Event-ID`.
 pub(crate) struct ServerFeed {
     ids: EventIdGenerator,
     sender: broadcast::Sender<SseEvent>,
@@ -460,9 +460,9 @@ impl ServerFeed {
                 | SseEventType::TurnFinished
                 | SseEventType::TurnFailed
                 | SseEventType::TurnCanceled
-                | SseEventType::PermissionRequired
-                | SseEventType::PermissionResolved
-                | SseEventType::ElicitationRequired
+                | SseEventType::ApprovalRequested
+                | SseEventType::ApprovalResolved
+                | SseEventType::ElicitationRequested
                 | SseEventType::ElicitationResolved
         )
     }

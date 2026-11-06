@@ -589,9 +589,9 @@ struct TurnMaterials {
 }
 
 /// Clears the agent's current turn on every exit of the run that set it, so a row written after
-/// the turn, by a checkpoint or the next host door, names no turn that has ended.
-struct TurnScope<'a> {
-    agent: &'a Agent,
+/// the turn, by the next host door, names no turn that has ended.
+pub(super) struct TurnScope<'a> {
+    pub(super) agent: &'a Agent,
 }
 
 impl Drop for TurnScope<'_> {
@@ -641,9 +641,11 @@ impl Agent {
         session_id: Uuid,
         event: &crate::conversation::Event,
     ) -> Result<()> {
-        self.store
-            .save_event(session_id, event, self.current_turn())
-            .await
+        self.note_save(
+            self.store
+                .save_event(session_id, event, self.current_turn())
+                .await,
+        )
     }
 
     /// [`Store::save_event_marking_inbox`] naming the turn this agent is running.
@@ -653,9 +655,11 @@ impl Agent {
         event: &crate::conversation::Event,
         inbox_items: &[Uuid],
     ) -> Result<()> {
-        self.store
-            .save_event_marking_inbox(session_id, event, inbox_items, self.current_turn())
-            .await
+        self.note_save(
+            self.store
+                .save_event_marking_inbox(session_id, event, inbox_items, self.current_turn())
+                .await,
+        )
     }
 
     /// [`Store::save_event_resetting_inbox`] naming the turn this agent is running.
@@ -666,15 +670,17 @@ impl Agent {
         inbox_items: &[Uuid],
         not_before: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
-        self.store
-            .save_event_resetting_inbox(
-                session_id,
-                event,
-                inbox_items,
-                not_before,
-                self.current_turn(),
-            )
-            .await
+        self.note_save(
+            self.store
+                .save_event_resetting_inbox(
+                    session_id,
+                    event,
+                    inbox_items,
+                    not_before,
+                    self.current_turn(),
+                )
+                .await,
+        )
     }
 
     /// [`Store::save_events_atomic`] naming the turn this agent is running.
@@ -683,9 +689,11 @@ impl Agent {
         session_id: Uuid,
         events: Vec<crate::conversation::Event>,
     ) -> Result<()> {
-        self.store
-            .save_events_atomic(session_id, events, self.current_turn())
-            .await
+        self.note_save(
+            self.store
+                .save_events_atomic(session_id, events, self.current_turn())
+                .await,
+        )
     }
 
     /// Save a round that carries `arrivals`, its items stamped with the round: the one door for
@@ -700,15 +708,16 @@ impl Agent {
         events: Vec<crate::conversation::Event>,
         arrivals: &Arrivals,
     ) -> Result<()> {
-        let saved = self
-            .store
-            .save_events_atomic_marking_inbox(
-                session_id,
-                events,
-                &arrivals.item_ids(),
-                self.current_turn(),
-            )
-            .await;
+        let saved = self.note_save(
+            self.store
+                .save_events_atomic_marking_inbox(
+                    session_id,
+                    events,
+                    &arrivals.item_ids(),
+                    self.current_turn(),
+                )
+                .await,
+        );
         if saved.is_err() {
             self.put_back(arrivals.outcomes()).await;
         }
@@ -1206,6 +1215,19 @@ impl Agent {
         } = input;
         *crate::sync::lock(&self.current_turn) = Some(turn_id);
         let _turn_scope = TurnScope { agent: self };
+        // A compaction that ran in a turn no row closed belongs to no turn.
+        *crate::sync::lock(&self.compaction_spend) = crate::stats::TokenUsage::default();
+        // Every repair and redaction this turn records is counted on memory and replayed on the
+        // store, so a turn after a failed save starts from what the store holds, and the gates
+        // below judge that.
+        if let Some(session_id) = self.cells.session_id.get()
+            && let Err(error) = self
+                .match_the_store_after_a_failed_save(session_id, messages)
+                .await
+        {
+            self.put_back(&outcomes).await;
+            return Err(error);
+        }
         // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
         // leaves no trace in the conversation, and the outcomes it was to carry go back for a turn
         // that can.
@@ -1236,12 +1258,22 @@ impl Agent {
         let mut compacted_before_the_loop = self
             .compact_before_the_loop(messages, cancellation.token())
             .await;
-        compacted_before_the_loop |= self
-            .compact_for_retention(messages, session_id, cancellation.token())
-            .await;
+        // A ceiling compaction that ran re-dates what it kept under this turn, and one that failed
+        // would fail here the same way again.
+        if !compacted_before_the_loop {
+            compacted_before_the_loop = self
+                .compact_for_retention(messages, session_id, cancellation.token())
+                .await;
+        }
         self.sweep_expired_turns(session_id).await;
 
-        let mut opening = self
+        // A worker's turns are opened by its parent, through a spawn or a follow-up.
+        let source = if self.role.is_worker() {
+            crate::store::turns::TurnSource::Parent
+        } else {
+            origin.source()
+        };
+        let mut opening = match self
             .open_turn(messages, session_id, TurnMaterials {
                 spoken,
                 images,
@@ -1250,14 +1282,27 @@ impl Agent {
                 outcomes,
                 late,
                 turn_id,
-                // A worker's turns are opened by its parent, through a spawn or a follow-up.
-                source: if self.role.is_worker() {
-                    crate::store::turns::TurnSource::Parent
-                } else {
-                    origin.source()
-                },
+                source,
             })
-            .await?;
+            .await
+        {
+            Ok(opening) => opening,
+            Err(error) => {
+                self.settle_unopened_turn(
+                    session_id,
+                    turn_id,
+                    source,
+                    &error,
+                    compacted_before_the_loop,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        // What a reload brought back is not known accepted, wherever the reload ran.
+        if let Some(from) = *crate::sync::lock(&self.unaccepted_from) {
+            opening.suspect_floor = opening.suspect_floor.min(from);
+        }
         let system_prompt: Arc<str> = match &self.options.system_prompt_override {
             Some(prompt) => Arc::from(prompt.as_str()),
             None => Arc::from(prompt::build_system_prompt(self.system_prompt_inputs())),
@@ -1392,8 +1437,8 @@ impl Agent {
 
     /// Compact first when a turn in the model's view ended longer ago than
     /// `[session].turn_retention`, so the sweep that follows has a summary to leave in the turn's
-    /// place; whether a compaction was attempted. Runs after the ceiling check, whose compaction
-    /// re-dates what it keeps under this turn, so the two cannot both fire on one start.
+    /// place; whether a compaction was attempted. Runs only when the ceiling check attempted none,
+    /// so the two never both run on one start.
     async fn compact_for_retention(
         &self,
         messages: &mut Conversation,
@@ -1708,10 +1753,9 @@ impl Agent {
             // the two ways out of the round that skip the error arm entirely: a repair fires,
             // `continue` returns here, and the turn ends before the provider ever judged it.
             // Leaving it applied would have the model reasoning from a conversation the store has
-            // never heard of, while `GET /messages` still serves the original with its revision
-            // unmoved. Under ACP `client_disconnected` becomes true precisely while a turn is
-            // stalled on a failing provider, which is when a repair is most likely to be in
-            // flight.
+            // never heard of, while the store still holds the original. Under ACP
+            // `client_disconnected` becomes true precisely while a turn is stalled on a failing
+            // provider, which is when a repair is most likely to be in flight.
             if run.cancellation.is_canceled() {
                 run.recovery.undo_rejected_repair(messages);
                 return Err(MekaError::Interrupted);
@@ -1872,7 +1916,8 @@ impl Agent {
                 let redaction = messages.redact_images(redacted);
                 // Its own write rather than part of the round's, which the exits below never
                 // reach. A failed write leaves the view redacted in memory, so the turn goes on;
-                // the cost is one more redaction after a resume.
+                // the cost is one more redaction once the store's view is loaded again, on a
+                // resume or the reload a later failed save forces.
                 if let Err(error) = self.save_event(session_id, &redaction).await {
                     tracing::warn!("failed to persist the image redaction: {error}");
                 }
@@ -2307,9 +2352,11 @@ impl Agent {
         usage: &crate::stats::TokenUsage,
         cut: bool,
     ) {
-        // Only what comes after the accepted body can be blamed for a later rejection.
+        // Only what comes after the accepted body can be blamed for a later rejection, what a
+        // reload brought back included.
         self.last_accepted_len
             .store(sent_len, std::sync::atomic::Ordering::Relaxed);
+        *crate::sync::lock(&self.unaccepted_from) = None;
         run.recovery.note_request_accepted();
 
         // Total of all tiers including output = everything in context as of this exchange, which
@@ -2334,15 +2381,7 @@ impl Agent {
             )
             .await;
         }
-        let turn_usage = &mut run.turn_usage;
-        turn_usage.input_tokens = turn_usage.input_tokens.saturating_add(usage.input_tokens);
-        turn_usage.output_tokens = turn_usage.output_tokens.saturating_add(usage.output_tokens);
-        turn_usage.cache_creation_input_tokens = turn_usage
-            .cache_creation_input_tokens
-            .saturating_add(usage.cache_creation_input_tokens);
-        turn_usage.cache_read_input_tokens = turn_usage
-            .cache_read_input_tokens
-            .saturating_add(usage.cache_read_input_tokens);
+        run.turn_usage.add(usage);
         tracing::debug!(
             "round usage: input={input} cache_creation={cache_creation} cache_read={cache_read} \
              output={output} messages={sent_len} subagent={subagent}",
@@ -2488,13 +2527,13 @@ impl Agent {
         // does: no dangling assistant-with-tool_use that the provider would reject on the next
         // iteration.
         //
-        // The results reach memory *before* the save is judged, for the same reason. The tools
-        // have run, so the only conversation that describes what happened is one that ends on
-        // their results; breaking out with the assistant's calls still unanswered left the
-        // session refused by the provider on every later turn until a `/rewind`. A store that
-        // cannot take the round leaves disk one round behind memory, which a resume reads as a
-        // prompt with no reply and never as a half round, since the pair is written as one unit
-        // or not at all.
+        // The results reach memory *before* the save is judged, for the same reason. The tools have
+        // run, so the only conversation that describes what happened is one that ends on their
+        // results; breaking out with the assistant's calls still unanswered left the session
+        // refused by the provider on every later turn until a `/rewind`. A store that cannot take
+        // the round leaves disk one round behind memory until the next turn, which starts from what
+        // the store holds, as a resume does: a prompt with no reply, never a half round, since the
+        // pair is written as one unit or not at all.
         round_events.push(crate::conversation::Event::Append(result_message.clone()));
         let tool_calls = result_message.content.len();
         messages.append(result_message);
@@ -2618,6 +2657,55 @@ impl Agent {
         }
     }
 
+    /// Record a turn that ended before its row was written, when the compactions it ran on its
+    /// way in spent something or may have written rows that name it: the row they name, closed
+    /// with how the turn ended and what they spent, so the session's turns account for both.
+    async fn settle_unopened_turn(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        source: crate::store::turns::TurnSource,
+        error: &MekaError,
+        compacted: bool,
+    ) {
+        let spent = std::mem::take(&mut *crate::sync::lock(&self.compaction_spend));
+        if spent.is_empty() && !compacted {
+            return;
+        }
+        if !spent.is_empty()
+            && self.role.is_root()
+            && let Err(error) = self
+                .store
+                .save_session_stats(session_id, &self.session_stats.snapshot())
+                .await
+        {
+            tracing::warn!("failed to persist session stats: {error}");
+        }
+        if let Err(error) = self
+            .store
+            .turn_store()
+            .open_turn(
+                session_id,
+                turn_id,
+                source,
+                self.cells.permission.get(),
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+        {
+            tracing::warn!("failed to record the turn: {error}");
+            return;
+        }
+        let ending = crate::store::turns::TurnEnding::failed(
+            error,
+            crate::store::turns::TurnUsage::from(&spent),
+        )
+        .served_by(self.serving_fallback());
+        if let Err(error) = self.store.turn_store().close_turn(turn_id, &ending).await {
+            tracing::warn!("failed to record the turn's ending: {error}");
+        }
+    }
+
     /// Settle the turn whatever its result: the counters, the usage event, what becomes of a
     /// prompt the turn could not answer, and a compaction request the loop's own drain never
     /// reached.
@@ -2647,12 +2735,17 @@ impl Agent {
         } else {
             self.session_stats.record_untracked_tokens(&turn_usage);
         }
+        // Its rounds and the compactions it ran, whose spend the counters took as each ran.
+        let mut spent = turn_usage;
+        spent.add(&std::mem::take(&mut *crate::sync::lock(
+            &self.compaction_spend,
+        )));
         // Persist the cumulative counters onto the session row so `/status` survives resume.
         // Best-effort: a DB hiccup must not fail the turn. Only the root agent writes; a
         // sub-agent shares the parent's `SessionStats` (rolling its usage into the parent's
         // totals) but owns a child session row, so letting it write would stamp the
         // parent-inclusive totals onto the child.
-        if (result.is_ok() || !turn_usage.is_empty())
+        if (result.is_ok() || !spent.is_empty())
             && self.role.is_root()
             && let Err(error) = self
                 .store
@@ -2665,7 +2758,7 @@ impl Agent {
         // it ended and what it spent. Closed for a sub-agent's turn as well: the counter write
         // skips a sub-agent to keep the parent's totals off the child, and a turn is the child's
         // own.
-        let usage = crate::store::turns::TurnUsage::from(&turn_usage);
+        let usage = crate::store::turns::TurnUsage::from(&spent);
         let ending = match result {
             Ok(outcome) => crate::store::turns::TurnEnding::succeeded(outcome.stop_reason(), usage),
             // Every stop goes through the signal and names itself; a bare one, which nothing
@@ -2686,7 +2779,7 @@ impl Agent {
             // carries it); a failed turn answers with its error, and `/status` reads the stats.
             self.cells
                 .frontend
-                .emit(FrontendEvent::TokenUsage(turn_usage))
+                .emit(FrontendEvent::TokenUsage(spent))
                 .await;
             self.cells.frontend.emit(FrontendEvent::TurnFinished).await;
         }
@@ -2709,12 +2802,16 @@ impl Agent {
                     && messages.events_len() == recovery.prompt_only_events
                     && messages.ends_on_a_turn_opening() =>
             {
-                recovery
+                // A prompt that stays carries its world state and its resumed notice into the next
+                // request, so neither is owed again.
+                if recovery
                     .withdraw_unanswered_prompt(self, session_id, messages)
-                    .await;
-                *self.last_rendered_world.write().await = opening.world_state_rollback.clone();
-                if opening.resumed {
-                    messages.restore_resumed_notice();
+                    .await
+                {
+                    *self.last_rendered_world.write().await = opening.world_state_rollback.clone();
+                    if opening.resumed {
+                        messages.restore_resumed_notice();
+                    }
                 }
             }
             Err(MekaError::Interrupted) if !recovery.user_saved => {
@@ -6232,6 +6329,394 @@ mod tests {
             )
             .await
             .expect("the next turn is not refused for an unanswered tool call");
+    }
+
+    /// The turn after a save failed starts from what the store holds, as a resume would: the round
+    /// memory kept and the store lacks is left out of what the model is sent, so every repair the
+    /// turn records counts on one view.
+    #[tokio::test]
+    async fn the_turn_after_a_failed_save_starts_from_what_the_store_holds() {
+        use crate::provider::mock::MockStopReason;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Sleep { ms: 300 },
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "does_not_exist".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("carrying on"),
+        ]));
+        let (agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let mut messages = Conversation::new();
+        let hide = tokio::spawn({
+            let path = path.clone();
+            let provider = Arc::clone(&provider);
+            async move {
+                provider_asked(&provider, 1).await;
+                hide_messages_table(&path, true);
+            }
+        });
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("the round's save fails");
+        hide.await.expect("the table was hidden");
+        hide_messages_table(&path, false);
+        assert!(agent.is_store_behind(), "the failed save is noted");
+
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("more".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the next turn runs");
+        let sent = provider.streams().last().expect("asked").messages.clone();
+        assert!(
+            !sent.iter().any(|message| message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }))),
+            "the unsaved round is not sent: {sent:?}"
+        );
+        assert!(!agent.is_store_behind());
+        let stored = store.load_view_events(session_id).await.expect("view");
+        assert_eq!(
+            messages.as_slice(),
+            Conversation::from_events(stored).as_slice(),
+            "memory is the store's view"
+        );
+    }
+
+    /// A prompt whose turn produced nothing is withdrawn only once the withdrawal is saved: one the
+    /// store could not take stays in memory as it stays in the store, and no client is told it
+    /// went.
+    #[tokio::test]
+    async fn a_withdrawal_that_cannot_be_saved_leaves_the_prompt_where_it_was() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::Sleep { ms: 300 },
+            MockEvent::Fail {
+                message: "provider down".to_string(),
+            },
+        ]]));
+        let (mut agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = frontend.clone();
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let mut messages = Conversation::new();
+        // After the eager prompt save, so the withdrawal is the write that fails.
+        let hide = tokio::spawn({
+            let path = path.clone();
+            let provider = Arc::clone(&provider);
+            async move {
+                provider_asked(&provider, 1).await;
+                hide_messages_table(&path, true);
+            }
+        });
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt")
+                    .retaining(PromptRetention::Withdraw),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("the provider is down");
+        hide.await.expect("the table was hidden");
+        hide_messages_table(&path, false);
+
+        assert_eq!(messages.len(), 1, "the prompt stays in memory");
+        let stored = store.load_view_events(session_id).await.expect("view");
+        assert_eq!(
+            Conversation::from_events(stored).len(),
+            1,
+            "as it stays in the store"
+        );
+        assert!(
+            !frontend
+                .events()
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::PromptWithdrawn)),
+            "nobody is told it went"
+        );
+    }
+
+    /// A repair the provider vindicated and the store failed to take, with the reply after it, is
+    /// lost to the reload the next turn starts with, and the refused content comes back; a refusal
+    /// of it is degraded again rather than failing every turn after.
+    #[tokio::test]
+    async fn a_refusal_of_what_a_reload_brought_back_is_degraded_again() {
+        use crate::provider::mock::MockStopReason;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let refused = || {
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            refused(),
+            vec![
+                MockEvent::Sleep { ms: 300 },
+                MockEvent::Text {
+                    text: "ok".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            refused(),
+            text_round("and now"),
+        ]));
+        let (agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let mut messages = Conversation::new();
+        // Once the degraded retry is asked for, so the repair and the reply are the writes that
+        // fail.
+        let hide = tokio::spawn({
+            let path = path.clone();
+            let provider = Arc::clone(&provider);
+            async move {
+                provider_asked(&provider, 2).await;
+                hide_messages_table(&path, true);
+            }
+        });
+        let first = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("look at this".to_string(), vec![
+                    image_source(),
+                ])
+                .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        hide.await.expect("hidden");
+        hide_messages_table(&path, false);
+        let images_in = |sent: &[crate::conversation::Message]| {
+            sent.iter()
+                .flat_map(|message| &message.content)
+                .filter(|block| matches!(block, ContentBlock::Image { .. }))
+                .count()
+        };
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("and now?".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the next turn runs (the first: {first:?}): {error}"));
+        let sent = provider.streams().last().expect("asked").messages.clone();
+        assert_eq!(
+            images_in(&sent),
+            0,
+            "the retry that answered sent it degraded"
+        );
+    }
+
+    /// The reload a door outside any turn makes, as the background poller's, leaves the next turn
+    /// as able to degrade what came back as a reload of its own would.
+    #[tokio::test]
+    async fn a_reload_outside_a_turn_still_lets_the_next_turn_degrade_what_came_back() {
+        use crate::provider::mock::MockStopReason;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let refused = || {
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            refused(),
+            vec![
+                MockEvent::Sleep { ms: 300 },
+                MockEvent::Text {
+                    text: "ok".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            refused(),
+            text_round("and now"),
+        ]));
+        let (agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let mut messages = Conversation::new();
+        let hide = tokio::spawn({
+            let path = path.clone();
+            let provider = Arc::clone(&provider);
+            async move {
+                provider_asked(&provider, 2).await;
+                hide_messages_table(&path, true);
+            }
+        });
+        let first = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("look at this".to_string(), vec![
+                    image_source(),
+                ])
+                .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        hide.await.expect("hidden");
+        hide_messages_table(&path, false);
+        assert!(
+            agent
+                .match_the_store_after_a_failed_save(session_id, &mut messages)
+                .await
+                .expect("read"),
+            "the door reloads"
+        );
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("and now?".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the next turn runs (the first: {first:?}): {error}"));
+    }
+
+    /// A degrade after a reload reaches what the reload brought back and nothing the provider had
+    /// accepted before it: an image an earlier turn sent survives a repair aimed at a later one's.
+    #[tokio::test]
+    async fn a_degrade_after_a_reload_spares_what_was_accepted_before_it() {
+        use crate::provider::mock::MockStopReason;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let refused = || {
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("seen"),
+            refused(),
+            vec![
+                MockEvent::Sleep { ms: 300 },
+                MockEvent::Text {
+                    text: "ok".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            refused(),
+            text_round("and now"),
+        ]));
+        let (agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let mut messages = Conversation::new();
+        let images_in = |sent: &[crate::conversation::Message]| {
+            sent.iter()
+                .flat_map(|message| &message.content)
+                .filter(|block| matches!(block, ContentBlock::Image { .. }))
+                .count()
+        };
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("an accepted picture".to_string(), vec![
+                    image_source(),
+                ])
+                .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("accepted");
+        let hide = tokio::spawn({
+            let path = path.clone();
+            let provider = Arc::clone(&provider);
+            async move {
+                provider_asked(&provider, 3).await;
+                hide_messages_table(&path, true);
+            }
+        });
+        let second = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("look at this".to_string(), vec![
+                    image_source(),
+                ])
+                .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        hide.await.expect("hidden");
+        hide_messages_table(&path, false);
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("and now?".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the third turn runs (the second: {second:?}): {error}")
+            });
+        let stored = store.load_conversation(session_id).await.expect("load");
+        assert_eq!(
+            images_in(stored.as_slice()),
+            1,
+            "the first turn's accepted image survives a repair aimed at the second turn's"
+        );
+        assert_eq!(images_in(messages.as_slice()), 1, "in memory as well");
     }
 
     /// The thinking-only nudge moves memory only once its pair is on disk: appended first, a save
@@ -11507,7 +11992,7 @@ mod tests {
             .expect("the driver stamps the row before the reporting turn");
         let task = store
             .background_store()
-            .background_task(session_id, task_id)
+            .background_task_by_id(task_id)
             .await
             .expect("read")
             .expect("the row");
@@ -11620,7 +12105,7 @@ mod tests {
             .expect("the driver stamps the row before the reporting turn");
         let task = store
             .background_store()
-            .background_task(session_id, task_id)
+            .background_task_by_id(task_id)
             .await
             .expect("read")
             .expect("the row");
@@ -11666,11 +12151,7 @@ mod tests {
 
     /// Stamp `task_id` delivered and read its row back, the way every host does ahead of the turn
     /// that reports it.
-    async fn claim_task(
-        store: &Store,
-        session_id: Uuid,
-        task_id: &str,
-    ) -> crate::store::background::BackgroundTask {
+    async fn claim_task(store: &Store, task_id: &str) -> crate::store::background::BackgroundTask {
         store
             .background_store()
             .mark_background_tasks_delivered(&[task_id.to_string()])
@@ -11678,7 +12159,7 @@ mod tests {
             .expect("the driver stamps the row before the reporting turn");
         store
             .background_store()
-            .background_task(session_id, task_id)
+            .background_task_by_id(task_id)
             .await
             .expect("read")
             .expect("the row")
@@ -11783,7 +12264,7 @@ mod tests {
             .expect("the deferring turn ends");
         let task = store
             .background_store()
-            .background_task(session_id, TASK_A)
+            .background_task_by_id(TASK_A)
             .await
             .expect("read")
             .expect("the row");
@@ -11797,7 +12278,7 @@ mod tests {
         assert_eq!(item.task.as_deref(), Some("1a2b3c4d"));
         assert_eq!(nudges_in(&messages), 0, "{:?}", messages.as_slice());
 
-        let task = claim_task(&store, session_id, TASK_A).await;
+        let task = claim_task(&store, TASK_A).await;
         agent
             .run_turn(
                 &mut messages,
@@ -11875,7 +12356,7 @@ mod tests {
             .expect("the deferring turn ends");
         let task = store
             .background_store()
-            .background_task(session_id, TASK_A)
+            .background_task_by_id(TASK_A)
             .await
             .expect("read")
             .expect("the row");
@@ -11892,7 +12373,7 @@ mod tests {
         );
         assert!(checklist_notices(&frontend).is_empty());
 
-        let task = claim_task(&store, session_id, TASK_A).await;
+        let task = claim_task(&store, TASK_A).await;
         agent
             .run_turn(
                 &mut messages,
@@ -11956,7 +12437,7 @@ mod tests {
             .finish_background_task(TASK_A, TaskStatus::Failed, Some("boom".to_string()), None)
             .await
             .expect("the task fails");
-        let task = claim_task(&store, session_id, TASK_A).await;
+        let task = claim_task(&store, TASK_A).await;
         agent
             .run_turn(
                 &mut messages,
@@ -12055,7 +12536,7 @@ mod tests {
                         .expect("a later process sweeps it");
                 }
             }
-            let task = claim_task(&store, session_id, TASK_A).await;
+            let task = claim_task(&store, TASK_A).await;
             agent
                 .run_turn(
                     &mut messages,
@@ -12122,7 +12603,7 @@ mod tests {
             .finish_background_task(TASK_A, TaskStatus::Completed, None, None)
             .await
             .expect("A ends");
-        let task = claim_task(&store, session_id, TASK_A).await;
+        let task = claim_task(&store, TASK_A).await;
         agent
             .run_turn(
                 &mut messages,
@@ -12195,8 +12676,8 @@ mod tests {
                 .expect("ends");
         }
         let batch = vec![
-            claim_task(&store, session_id, TASK_A).await,
-            claim_task(&store, session_id, TASK_B).await,
+            claim_task(&store, TASK_A).await,
+            claim_task(&store, TASK_B).await,
         ];
         agent
             .run_turn(
@@ -12977,6 +13458,229 @@ mod tests {
         done(&live);
         typed_turns(&agent, &live, &mut messages, &["three"]).await;
         assert_replays_as_drawn(&agent, &store, &live).await;
+    }
+
+    /// A turn that fails after the compaction it ran on its way in spent tokens persists the
+    /// session's counters with that spend, as its row records it, so a resume's `/status` agrees
+    /// with the turn rows.
+    #[tokio::test]
+    async fn a_failed_turn_persists_the_spend_of_its_compaction() {
+        let spent = |input_tokens: u64, text: &str| {
+            let mut round = vec![MockEvent::Usage { input_tokens }];
+            round.extend(text_round(text));
+            round
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            spent(10, "First answer."),
+            spent(500, "A summary on the way in."),
+            vec![MockEvent::Fail {
+                message: "boom".to_string(),
+            }],
+        ]));
+        let (agent, store) = agent_that_compacts_for_test(provider).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("one".to_string(), Vec::new()).expect("prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("first");
+        agent.cells().record_context_tokens(190_000);
+        let failed = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("two".to_string(), Vec::new()).expect("prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        assert!(failed.is_err(), "{failed:?}");
+        let session = agent.session_id().expect("a session");
+        let rows: u64 = store
+            .turn_store()
+            .load_turns(session)
+            .await
+            .expect("rows")
+            .iter()
+            .map(|row| row.usage.input_tokens)
+            .sum();
+        let persisted = store
+            .load_session_stats(session)
+            .await
+            .expect("stats")
+            .input_tokens;
+        assert_eq!((rows, persisted), (510, 510));
+    }
+
+    /// A turn whose items were all withdrawn while it started, after the compaction it ran on its
+    /// way in, still has a row: the one that compaction's boundary names, with its spend.
+    #[tokio::test]
+    async fn a_turn_left_with_nothing_to_say_keeps_the_row_its_compaction_names() {
+        use crate::store::inbox::{InboxClass, NewInboxItem};
+        let spent = |input_tokens: u64, text: &str| {
+            let mut round = vec![MockEvent::Usage { input_tokens }];
+            round.extend(text_round(text));
+            round
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            spent(10, "First answer."),
+            spent(500, "A summary on the way in."),
+        ]));
+        let (agent, store) = agent_that_compacts_for_test(provider).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("one".to_string(), Vec::new()).expect("prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("first");
+        let session = agent.session_id().expect("a session");
+        let inbox = store.inbox_store();
+        let item = inbox
+            .enqueue(
+                NewInboxItem::from_parts(
+                    session,
+                    InboxClass::Steer,
+                    Some("test".to_string()),
+                    "never mind",
+                )
+                .expect("item"),
+            )
+            .await
+            .expect("enqueue")
+            .id;
+        let waiting = inbox
+            .take_pending(session, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        inbox.withdraw(item, None, None).await.expect("withdraw");
+        agent.cells().record_context_tokens(190_000);
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(waiting).expect("items"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(MekaError::EmptyPrompt)),
+            "{outcome:?}"
+        );
+        let rows = store.turn_store().load_turns(session).await.expect("rows");
+        let spent_on_rows: u64 = rows.iter().map(|row| row.usage.input_tokens).sum();
+        assert_eq!(spent_on_rows, 510);
+        let named: Vec<Option<Uuid>> = store
+            .history_page(session, crate::store::HistoryEdge::Before(None), 100)
+            .await
+            .expect("the history")
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, crate::store::HistoryKind::Compaction { .. }))
+            .map(|entry| entry.turn_id)
+            .collect();
+        assert!(
+            named
+                .iter()
+                .all(|turn| turn.is_some_and(|turn| rows.iter().any(|row| row.id == turn))),
+            "every compaction names a turn on record: {named:?}"
+        );
+    }
+
+    /// A turn's row is everything the turn spent, the compaction it ran on its way in included, and
+    /// a compaction between turns is a row of its own that its boundary names; the session's
+    /// record counts and sums the rows.
+    #[tokio::test]
+    async fn every_compaction_is_spent_on_a_turn_row() {
+        use crate::store::turns::{TurnSource, TurnStatus};
+        let spent = |input_tokens: u64, text: &str| {
+            let mut round = vec![MockEvent::Usage { input_tokens }];
+            round.extend(text_round(text));
+            round
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            spent(10, "First answer."),
+            spent(700, "A summary between turns."),
+            spent(20, "Second answer."),
+            spent(500, "A summary on the way in."),
+            spent(30, "Third answer."),
+        ]));
+        let (agent, store) = agent_that_compacts_for_test(provider).await;
+        let mut messages = Conversation::new();
+        let turn = async |agent: &Agent, messages: &mut Conversation, prompt: &str| {
+            agent
+                .run_turn(
+                    messages,
+                    crate::agent::TurnInput::from_parts(prompt.to_string(), Vec::new())
+                        .expect("a prompt"),
+                    crate::agent::TurnCancellation::new(),
+                )
+                .await
+                .expect("the turn runs");
+        };
+        turn(&agent, &mut messages, "one").await;
+        agent
+            .compact_session(
+                &mut messages,
+                crate::session::CompactRequest::new(crate::conversation::CompactionTrigger::Manual),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the compaction");
+        assert_eq!(
+            agent.current_turn(),
+            None,
+            "the compaction's turn has ended"
+        );
+        let session = agent.session_id().expect("a session");
+        assert_eq!(
+            store
+                .load_session_stats(session)
+                .await
+                .expect("the counters")
+                .input_tokens,
+            710,
+            "the compaction's end persists the counters, as a turn's does"
+        );
+        turn(&agent, &mut messages, "two").await;
+        // Past the ceiling, so the next turn compacts on its way in.
+        agent.cells().record_context_tokens(190_000);
+        turn(&agent, &mut messages, "three").await;
+
+        let rows = store.turn_store().load_turns(session).await.expect("rows");
+        let said: Vec<(TurnSource, Option<TurnStatus>, u64)> = rows
+            .iter()
+            .map(|row| (row.source, row.status, row.usage.input_tokens))
+            .collect();
+        assert_eq!(said, [
+            (TurnSource::Client, Some(TurnStatus::Succeeded), 10),
+            (TurnSource::Compaction, Some(TurnStatus::Succeeded), 700),
+            (TurnSource::Client, Some(TurnStatus::Succeeded), 20),
+            (TurnSource::Client, Some(TurnStatus::Succeeded), 530),
+        ]);
+        let history = store
+            .history_page(session, crate::store::HistoryEdge::Before(None), 100)
+            .await
+            .expect("the history");
+        let compactions: Vec<Option<Uuid>> = history
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, crate::store::HistoryKind::Compaction { .. }))
+            .map(|entry| entry.turn_id)
+            .collect();
+        assert_eq!(compactions, [Some(rows[1].id), Some(rows[3].id)]);
+        let record = store
+            .session_info(session)
+            .await
+            .expect("read")
+            .expect("the session");
+        assert_eq!(
+            (record.turn_count, record.usage.input_tokens),
+            (4, 1260),
+            "the record is its rows"
+        );
     }
 
     /// A scheduled fire and an invocation open turns nobody typed: each is said as the stage

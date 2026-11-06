@@ -385,7 +385,7 @@ Four surfaces report it, and each says only what it can establish:
 
   Both apply `[permissions].enabled` when reading a session's recorded level, so neither can report
   a job as able to fire that the host refuses.
-- **`GET /v1/schedule`**, with or without `?session=`, carries a `withheld` field with the same
+- **`GET /v1/jobs`**, with or without `?session=`, carries a `withheld` field with the same
   sentence, absent when the job can fire.
 
 Firing the reminder ungated instead would be the more forgiving-looking choice and the wrong one: it
@@ -396,7 +396,7 @@ once a week would deliver a turn a minute for as long as the session stayed belo
 At `none` nothing fires at all, gated or not. Every tool is refused at dispatch there, so the turn
 would read nothing, change nothing, and be unable to reach `schedule_cancel` to stop itself being
 woken again: tokens spent to produce an agent that can describe its predicament and do nothing
-about it. `POST /v1/sessions/{id}/schedule` refuses to create a job on such a session for the same
+about it. `POST /v1/jobs` refuses to create a job on such a session for the same
 reason; `schedule_create` needs `read` to dispatch at all, so the agent cannot reach it.
 
 Both halves are load-bearing. The recorded level rarely refuses on its own, since a creation door
@@ -415,13 +415,13 @@ meka schedule list                  # every session's jobs
 meka schedule list --session 0b5c   # one session, by id or unique prefix
 meka schedule show 7f3a1b2c         # one job in full, by id or unique prefix
 meka schedule cancel 7f3a1b2c       # by id, or any unique prefix
-meka schedule list --format json    # {"jobs": [...]}, the shape GET /v1/schedule answers with
+meka schedule list --format json    # {"jobs": [...]}, the shape GET /v1/jobs answers with
 ```
 
 `list` is a table to scan: job id, the session it wakes, its schedule, how long until it next fires,
 whether it is gated (`shell`, `tool`, or `-`), and the beginning of its prompt. Every cell is bounded
 so the table stays legible. Under `--format json`, `list` and `show` print each job with the fields
-[`GET /v1/schedule`](http-api.md) uses (`id`, `session_id`, `schedule`, `prompt`, `gate`,
+[`GET /v1/jobs`](http-api.md#scheduled-jobs) uses (`id`, `session_id`, `schedule`, `prompt`, `gate`,
 `created_at`, `last_fired_at`, `next_fire_at`, `withheld`), ids in full and nothing truncated; the
 gate's `check` is always given, since the operator at the terminal can read every job in the store.
 
@@ -468,8 +468,8 @@ one-shot job ages past `missed_grace` and is dropped (with a warning) before its
 once per interval.
 
 Setting `enabled = false` keeps the three `schedule_*` tool schemas out of every request and leaves
-existing jobs on disk without firing. `POST /v1/sessions/{id}/schedule` refuses with a 422 rather
-than accepting a job that could never run; `GET /v1/schedule` and `DELETE /v1/schedule/{job_id}`
+existing jobs on disk without firing. `POST /v1/jobs` refuses with a 404 rather
+than accepting a job that could never run; `GET /v1/jobs` and `DELETE /v1/jobs/{job_id}`
 keep working, so jobs left over from before the flag was flipped can still be listed and cleared.
 
 ## Tips

@@ -55,7 +55,7 @@ The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself,
 
 `memory_write`'s `body`, `tags`, `priority`, `load`, `references`, `source` and `expires` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update (a reworded description, say) a single call that cannot cost the note its contents, its labels, its rank, its dependencies or its deadline. To clear the body or the expiry, pass `""`; to clear a list, pass `[]`. A blank in any other field is the field omitted.
 
-`PUT /v1/memory/{name}` and `meka memory add <name> --force` follow the same rule.
+`PUT /v1/memories/{name}` and `meka memory add <name> --force` follow the same rule.
 
 ## Editing a memory
 
@@ -94,7 +94,7 @@ The index ends with a count of the memories it lists nowhere, the search-only on
 
 Inline bodies share one budget, [`[memory] inline_max_bytes`](../configuration/config-file.md#memory), 32 KiB unless set. It is counted in bytes of body text over the inline memories that are in force: an expired inline memory, an `index` memory however long its body, and an empty body spend nothing. The band is rendered into the opening message once per session and again after each compaction, so what the budget admits costs prefix tokens the cache holds, not tokens on every turn.
 
-A write that would take the tier past the budget is refused at every door alike: `memory_write`, `memory_edit`, `meka memory add`, `meka memory edit` and `PUT /v1/memory/{name}`. The refusal states the total the tier would have reached, names the largest inline memories as they would stand, and gives the remedy: shorten one, or set `load: index` on one that is not a standing rule. Nothing of a refused write lands. A write that shrinks the tier, or leaves its size alone, always goes through, so a store over the budget can be brought back within it one memory at a time.
+A write that would take the tier past the budget is refused at every door alike: `memory_write`, `memory_edit`, `meka memory add`, `meka memory edit` and `PUT /v1/memories/{name}`. The refusal states the total the tier would have reached, names the largest inline memories as they would stand, and gives the remedy: shorten one, or set `load: index` on one that is not a standing rule. Nothing of a refused write lands. A write that shrinks the tier, or leaves its size alone, always goes through, so a store over the budget can be brought back within it one memory at a time.
 
 ```
 inline memories would total 33.4 KiB against the 32.0 KiB inline budget (`[memory]
@@ -157,7 +157,7 @@ Results carry enough to act on without a follow-up read: name, priority, age, re
 
 ### Filters
 
-`memory_search` takes three filters beside `queries`, and so do `meka memory list` and `GET /v1/memory`, so a hygiene pass reads the same rows whoever runs it:
+`memory_search` takes three filters beside `queries`, and so do `meka memory list` and `GET /v1/memories`, so a hygiene pass reads the same rows whoever runs it:
 
 | Filter | Selects |
 |---|---|
@@ -172,7 +172,7 @@ With `queries` a filter narrows the search. Without them it is a listing, in ind
 A memory's `references` say what it depends on: other memories by name, a path, a URL, an external id, one line each and at most twenty. They are structured so the question "what else cites this?" has an exact answer:
 
 - `memory_read` shows what a memory references, with the description of each reference that names a memory, and what references it ("Referenced by: ..."), so a changed fact can be revisited everywhere it is cited.
-- `memory_search` with `referencing`, `meka memory list --referencing` and `GET /v1/memory?referencing=` list the memories pointing at a target.
+- `memory_search` with `referencing`, `meka memory list --referencing` and `GET /v1/memories?referencing=` list the memories pointing at a target.
 - `memory_delete` names the memories that still reference the deleted one and leaves those references in place, as markers of a fact to revisit.
 
 A reference that names no memory is allowed: it is a pointer to something worth writing later, and the read shows it bare where a resolved one carries a description.
@@ -281,7 +281,7 @@ meka memory import ~/backup/memory                  # the reverse, into this sto
 On the screen, `/memory` is a picker of what is saved, by name and description, and Enter (or
 `/memory <name>`) shows one memory in full.
 
-`--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `project`, `description`, `priority`, `load`, `tags`, `references`, `source`, `created_at`, `updated_at`, `verified_at` and `expires_at` as RFC 3339) plus `read_count`; `get` adds `referenced_by`, `show` adds `body` as stored, and `list` leaves both out.
+`--format json` prints each memory with the fields [`GET /v1/memories`](http-api.md) uses (`name`, `project`, `description`, `priority`, `load`, `tags`, `references`, `source`, `created_at`, `updated_at`, `verified_at` and `expires_at` as RFC 3339) plus `read_count`; `get` adds `referenced_by`, `show` adds `body` as stored, and `list` leaves both out.
 
 `meka memory edit` opens the **body** only. Metadata goes through `meka memory add <name> --force --description ...`, which keeps whatever it does not mention.
 
@@ -320,6 +320,6 @@ Memory is on by default. To turn it off:
 enabled = false
 ```
 
-Disabling it keeps the five `memory_*` tool schemas out of every request and renders no memory section, which is worth doing if you run lean sessions that will never use it. Memories already stored are left alone, and both the `meka memory` subcommands and the `/v1/memory` endpoints still reach them: whether an *agent* keeps memories is a different question from whether you can inspect or back up what is already there.
+Disabling it keeps the five `memory_*` tool schemas out of every request and renders no memory section, which is worth doing if you run lean sessions that will never use it. Memories already stored are left alone, and both the `meka memory` subcommands and the `/v1/memories` endpoints still reach them: whether an *agent* keeps memories is a different question from whether you can inspect or back up what is already there.
 
 There is deliberately no environment variable and no CLI flag: whether an agent keeps memories is a property of the installation, not something to vary per run.

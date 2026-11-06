@@ -231,9 +231,9 @@ pub(crate) fn reset_interrupt_escalation() {
 
 /// Run a `/compact` with Ctrl+C wired to a fresh cancellation token.
 ///
-/// Compaction is not a turn, but it makes provider calls and can block on an approval prompt, so
-/// it needs a signal source for the reason [`run_turn_interruptible`] gives: a bare token silently
-/// swallows Ctrl+C.
+/// A compaction runs no `run_turn`, but it makes provider calls and can block on an approval
+/// prompt, so it needs a signal source for the reason [`run_turn_interruptible`] gives: a bare
+/// token silently swallows Ctrl+C.
 pub(crate) async fn compact_interruptible(
     cancel: &crate::host::CancelCell,
     admission: crate::host::Admission,
@@ -241,11 +241,11 @@ pub(crate) async fn compact_interruptible(
     session_id: &mut Option<uuid::Uuid>,
     messages: &mut crate::conversation::Conversation,
     request: crate::session::CompactRequest,
-) -> crate::error::Result<crate::agent::CompactOutcome> {
+) -> crate::error::Result<crate::conversation::CompactionRecord> {
     let cancellation = crate::agent::TurnCancellation::new();
     let _published = publish_for_interrupts(cancel, admission, cancellation.clone());
     let outcome = agent
-        .compact_session(messages, request, cancellation.token().clone())
+        .compact_session_under(messages, request, &cancellation, uuid::Uuid::new_v4())
         .await;
     *session_id = agent.session_id();
     outcome

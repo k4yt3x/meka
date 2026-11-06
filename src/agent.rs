@@ -28,8 +28,8 @@ mod fallback;
 mod recovery;
 mod turn;
 
-use self::recovery::*;
-pub(crate) use self::{compaction::*, turn::*};
+pub(crate) use self::{compaction::compaction_refusal, turn::*};
+use self::{compaction::*, recovery::*};
 use crate::session::{AgentOptions, SessionCells};
 
 /// Driver for a single conversation. One [`Agent`] handles one or more sequential turns against a
@@ -67,10 +67,23 @@ pub(crate) struct Agent {
     /// fresh or rewound conversation. Compaction publishes the snapshot restored into its saved
     /// summary, so the continuing loop has that picture already.
     last_rendered_world: tokio::sync::RwLock<Option<crate::prompt::WorldSnapshot>>,
-    /// The turn this agent is running, for as long as it runs it. Every row the agent writes
-    /// names it, and a row written between turns (the compaction checkpoint's) names none; the
-    /// store is told rather than left to find an open turn, which a dead process can leave behind.
+    /// The turn this agent is running, for as long as it runs it, a compaction run between turns
+    /// included, since that is a turn of its own. Every row the agent writes names it; the store
+    /// is told rather than left to find an open turn, which a dead process can leave behind.
     current_turn: std::sync::Mutex<Option<uuid::Uuid>>,
+    /// What the compactions run since the current turn opened have spent, for the turn's row: a
+    /// turn's spend is its rounds and the compactions it ran. Never shared with a sub-agent, whose
+    /// turns are rows of its own session.
+    compaction_spend: std::sync::Mutex<crate::stats::TokenUsage>,
+    /// Whether a write of the conversation failed since memory last matched the store, so memory
+    /// may hold what the store lacks; see [`Agent::match_the_store`].
+    store_behind: std::sync::atomic::AtomicBool,
+    /// Where the view stops being known accepted after [`Agent::match_the_store`] replaced it:
+    /// the first position at which what the store held differed from what memory had sent, so
+    /// content a provider refused and a repair the store never took had degraded can be degraded
+    /// again. Every turn's degrade reaches from there at the furthest until a request is accepted;
+    /// a compaction, which moves every position, widens it to the whole view.
+    unaccepted_from: std::sync::Mutex<Option<usize>>,
     /// Shared skill cache. Re-checks the on-disk snapshot at the top of each turn and re-discovers
     /// when something changed, so adds / removes / frontmatter edits land without restart.
     /// Body-only edits take effect even sooner; `load_skill_body` re-reads from disk on every
@@ -146,6 +159,22 @@ pub(crate) struct Agent {
     profiles_tried: std::sync::Mutex<Vec<String>>,
 }
 
+/// Where a rewind of a resident conversation cuts: so many turns back from the end, as the
+/// screen's `/rewind` counts, or so many messages, as `POST /rewind` places the cut before a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewindCut {
+    Turns(usize),
+    Messages(usize),
+}
+
+/// What [`Agent::rewind_resident`] did: the rewind it saved, `None` when the conversation held
+/// nothing to cut there, and whether it first replaced the conversation with what the store holds.
+#[derive(Debug)]
+pub(crate) struct ResidentRewind {
+    pub(crate) event: Option<crate::conversation::Event>,
+    pub(crate) matched: bool,
+}
+
 /// What a worker descends from: the prompt its spawning call answered, so its requests bill to
 /// it, and its spawner's agent id when the spawner is itself a worker. The prompt id alone of the
 /// spawning turn's attribution: Claude Code stamps neither an origin nor a position on a
@@ -215,6 +244,9 @@ impl Agent {
             last_rendered_checklist: tokio::sync::RwLock::new(None),
             last_rendered_world: tokio::sync::RwLock::new(None),
             current_turn: std::sync::Mutex::new(None),
+            compaction_spend: std::sync::Mutex::new(crate::stats::TokenUsage::default()),
+            store_behind: std::sync::atomic::AtomicBool::new(false),
+            unaccepted_from: std::sync::Mutex::new(None),
             skills: materials.skills.clone(),
             memories: materials.memories.clone(),
             compaction_generation: std::sync::atomic::AtomicU64::new(GENERATION_UNKNOWN),
@@ -560,6 +592,119 @@ impl Agent {
         self.provider().fetch_usage().await
     }
 
+    /// Replace `conversation` with what the store holds of session `session_id` when the two views
+    /// hold different numbers of messages, ahead of anything counted on one view and applied to the
+    /// other, as a rewind, a repair and a redaction are: a count taken on either would cut the
+    /// other in the wrong place. A view that differs only in what a message says (a repair or
+    /// redaction whose save failed) cuts both in one place, and is left as it is. The store's is
+    /// what a resume would load, so it is the one both keep, and what it lacks is lost here as it
+    /// would be there. Whether it replaced anything.
+    pub(crate) async fn match_the_store(
+        &self,
+        session_id: Uuid,
+        conversation: &mut crate::conversation::Conversation,
+    ) -> Result<bool> {
+        let stored = self.store.load_view_events(session_id).await?;
+        let stored_len = crate::conversation::Conversation::from_events(stored).len();
+        if stored_len == conversation.len() {
+            self.store_behind
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return Ok(false);
+        }
+        let stored = self.store.load_conversation(session_id).await?;
+        let unchanged = stored
+            .as_slice()
+            .iter()
+            .zip(conversation.as_slice())
+            .take_while(|(stored, held)| stored == held)
+            .count();
+        {
+            let mut from = crate::sync::lock(&self.unaccepted_from);
+            *from = Some(from.map_or(unchanged, |earlier| earlier.min(unchanged)));
+        }
+        tracing::warn!(
+            "session {session_id}: a save failed, so the conversation goes on from the {stored} \
+             message(s) the store holds rather than the {held} in memory",
+            stored = stored.len(),
+            held = conversation.len(),
+        );
+        self.cells
+            .frontend
+            .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
+                "A save failed, so the conversation goes on as the session's store holds it."
+                    .to_string(),
+            )))
+            .await;
+        *conversation = stored;
+        self.store_behind
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.reset_conversation_markers(conversation).await;
+        Ok(true)
+    }
+
+    /// [`Self::match_the_store`] when a write of the conversation failed since memory last
+    /// matched the store, and nothing otherwise: the doors that would otherwise read the store on
+    /// every pass, a turn's start, a compaction and the background poller.
+    pub(crate) async fn match_the_store_after_a_failed_save(
+        &self,
+        session_id: Uuid,
+        conversation: &mut crate::conversation::Conversation,
+    ) -> Result<bool> {
+        if !self.store_behind.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(false);
+        }
+        self.match_the_store(session_id, conversation).await
+    }
+
+    /// Rewind the resident `conversation` of session `session_id` by `cut`, in memory and in the
+    /// store alike: matched to the store first, so the cut lands in one place on both, then saved,
+    /// and put back if the save fails, as a rewind left in memory alone would be undone by the
+    /// next resume. The one rewind of a conversation an agent holds, for every host.
+    pub(crate) async fn rewind_resident(
+        &self,
+        session_id: Uuid,
+        conversation: &mut crate::conversation::Conversation,
+        cut: RewindCut,
+    ) -> Result<ResidentRewind> {
+        let matched = self.match_the_store(session_id, conversation).await?;
+        let rewound = match cut {
+            RewindCut::Turns(turns) => conversation.rewind(turns),
+            RewindCut::Messages(count) => conversation.rewind_messages(count),
+        };
+        let Some(event) = rewound else {
+            return Ok(ResidentRewind {
+                event: None,
+                matched,
+            });
+        };
+        if let Err(error) = self.store.save_rewind(session_id, &event).await {
+            conversation.pop_repair();
+            return Err(error);
+        }
+        self.reset_conversation_markers(conversation).await;
+        Ok(ResidentRewind {
+            event: Some(event),
+            matched,
+        })
+    }
+
+    /// Whether a write of the conversation failed since memory last matched the store.
+    #[cfg(test)]
+    pub(crate) fn is_store_behind(&self) -> bool {
+        self.store_behind.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `saved` as it came, noting a failure: memory may now hold what the store lacks. Every save
+    /// helper of the agent passes its result through here; the writes of the conversation that do
+    /// not, a compaction's and a rewind's, put memory back themselves when they fail.
+    fn note_save<T>(&self, saved: Result<T>) -> Result<T> {
+        if saved.is_err() {
+            self.store_behind
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        saved
+    }
+
     /// Tell the agent that the conversation it holds was rewritten out from under it, as `/rewind`
     /// does. Both markers the agent keeps against message *positions* stop meaning anything and are
     /// cleared: the accepted-prefix length a rejection is measured back from, and the index where
@@ -584,8 +729,8 @@ impl Agent {
     /// the item, and a compaction carried the list on its boundary.
     ///
     /// The one reset every door that rewrites the log, or swaps it for another session's, calls:
-    /// compaction, a rewind on every host, and the screen's `/resume`. A door that resets its own
-    /// subset leaves the rest stale.
+    /// compaction, a rewind on every host, the screen's `/resume`, and a reload of what the store
+    /// holds after a failed save. A door that resets its own subset leaves the rest stale.
     pub(crate) async fn reset_conversation_markers(
         &self,
         conversation: &crate::conversation::Conversation,
@@ -730,6 +875,155 @@ mod tests {
 
     pub(super) async fn agent_for_test(provider: Arc<dyn Provider>) -> (Agent, Store) {
         agent_with_registry_for_test(provider, crate::tools::ToolRegistry::new()).await
+    }
+
+    /// A round the store failed to save is in memory alone; before a rewind counts on either
+    /// view, the conversation is brought back to the store's, so the count cuts both in one place.
+    #[tokio::test]
+    async fn a_conversation_ahead_of_the_store_is_brought_back_to_it() {
+        use crate::conversation::{Conversation, Event, Message};
+        let provider: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new()));
+        let (agent, store) = agent_for_test(provider).await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let saved = [
+            Message::user("one?"),
+            Message::assistant_text("One."),
+            Message::user("two?"),
+        ];
+        for message in &saved {
+            store
+                .save_event(id, &Event::Append(message.clone()), None)
+                .await
+                .expect("save");
+        }
+        let mut conversation =
+            Conversation::from_events(saved.iter().cloned().map(Event::Append).collect());
+        assert!(
+            !agent
+                .match_the_store(id, &mut conversation)
+                .await
+                .expect("read"),
+            "the views are one"
+        );
+        conversation.append(Message::assistant_text("Two, never saved."));
+        assert!(
+            agent
+                .match_the_store(id, &mut conversation)
+                .await
+                .expect("read")
+        );
+        assert_eq!(conversation.as_slice(), &saved);
+
+        // A failed save that left the two one length apart in content only, as a repair whose save
+        // failed does, cuts both in one place: memory keeps what it sends, and the check is spent.
+        let mut rewritten = Conversation::from_events(vec![
+            Event::Append(Message::user("one?")),
+            Event::Append(Message::assistant_text("One, rewritten.")),
+            Event::Append(Message::user("two?")),
+        ]);
+        let noted: Result<()> = agent.note_save(Err(MekaError::Database("full".to_string())));
+        assert!(noted.is_err() && agent.is_store_behind());
+        assert!(
+            !agent
+                .match_the_store_after_a_failed_save(id, &mut rewritten)
+                .await
+                .expect("read")
+        );
+        assert_eq!(
+            rewritten.as_slice().get(1),
+            Some(&Message::assistant_text("One, rewritten."))
+        );
+        assert!(!agent.is_store_behind(), "the check is spent");
+    }
+
+    /// A rewind of a conversation ahead of its store cuts both in one place, whichever way it is
+    /// counted: memory is matched to the store first, and the cut is saved.
+    #[tokio::test]
+    async fn a_rewind_of_a_conversation_ahead_of_its_store_cuts_both_in_one_place() {
+        use crate::conversation::{Conversation, Event, Message};
+        let provider: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new()));
+        let (agent, store) = agent_for_test(provider).await;
+        for cut in [RewindCut::Turns(1), RewindCut::Messages(1)] {
+            let id = store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create");
+            let saved = [
+                Message::user("one?"),
+                Message::assistant_text("One."),
+                Message::user("two?"),
+            ];
+            for message in &saved {
+                store
+                    .save_event(id, &Event::Append(message.clone()), None)
+                    .await
+                    .expect("save");
+            }
+            let mut conversation =
+                Conversation::from_events(saved.iter().cloned().map(Event::Append).collect());
+            conversation.append(Message::assistant_text("Two, never saved."));
+            let rewind = agent
+                .rewind_resident(id, &mut conversation, cut)
+                .await
+                .expect("rewind");
+            assert!(rewind.matched && rewind.event.is_some(), "{cut:?}");
+            let stored = Conversation::from_events(store.load_view_events(id).await.expect("view"));
+            assert_eq!(
+                stored.as_slice(),
+                &saved[..2],
+                "{cut:?}: the store keeps the first turn"
+            );
+            assert_eq!(
+                conversation.as_slice(),
+                &saved[..2],
+                "{cut:?}: and so does memory"
+            );
+        }
+    }
+
+    /// A rewind the store cannot take is put back in memory too: left there alone, the next resume
+    /// would bring back the turns the model was no longer shown.
+    #[tokio::test]
+    async fn a_rewind_the_store_cannot_take_is_undone_in_memory() {
+        use crate::conversation::{Conversation, Event, Message};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let provider: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new()));
+        let (agent, store) = agent_at_for_test(provider, &path).await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let saved = [Message::user("one?"), Message::assistant_text("One.")];
+        for message in &saved {
+            store
+                .save_event(id, &Event::Append(message.clone()), None)
+                .await
+                .expect("save");
+        }
+        let mut conversation =
+            Conversation::from_events(saved.iter().cloned().map(Event::Append).collect());
+        // The view reads before the write fails: only the write is refused.
+        rusqlite::Connection::open(&path)
+            .expect("second connection")
+            .execute_batch(
+                "CREATE TRIGGER refuse_writes BEFORE INSERT ON messages \
+                 BEGIN SELECT RAISE(ABORT, 'full'); END;",
+            )
+            .expect("refuse writes");
+        assert!(
+            agent
+                .rewind_resident(id, &mut conversation, RewindCut::Turns(1))
+                .await
+                .is_err()
+        );
+        assert_eq!(conversation.as_slice(), &saved, "memory keeps the turn");
     }
 
     /// The number three separate sites divide by, pinned exactly.

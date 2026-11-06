@@ -226,6 +226,15 @@ One word per concept, everywhere it is written or read:
   trait: "provider temporarily unavailable" is right, "provider profile" is not.
 - **store** for the `Store`: `store` in identifiers, "the store" in prose, `meka.db` for the file.
   `manager` is only `McpClientManager`.
+- A session's **conversation** is told two ways. Its **history** is what was said: every turn, the
+  ones a compaction summarized included, each once where it was said, without what a rewind took
+  back. Its **context** is what the model sees now: the latest summary, the turns it kept, and what
+  came after, which compaction, repair, image redaction and rewind rewrite. The **event log** is
+  the rows on disk, said only where storage is the point; a row's **position** is its place there.
+- A **turn** is a row of `turns`, the one meaning the HTTP API has; what a person typed is a
+  prompt.
+- **recall** for the lines typed on the screen that Up and Ctrl+R bring back, never "history"; one
+  is a recall entry.
 - **sub-agent** as the noun; "worker" only when the orchestration role is the point; never
   "delegate" as a noun. Depth 0 is the **root**, the spawner is the **parent**.
 - **scratchpad entry** in every string and identifier, the table `scratchpad_entries` included.
@@ -266,7 +275,7 @@ One word per concept, everywhere it is written or read:
   `format_columns`.
 - A top-level command whose verbs act on instances names the object in the singular (`account`,
   `profile`, `session`, `skill`, `memory`, `schedule`, `tool`, the screen's `/task`); a command over
-  one thing keeps the concept's own word (`history`, `instructions`). `mcp tools <name>` lists a
+  one thing keeps the concept's own word (`recall`, `instructions`). `mcp tools <name>` lists a
   server's tools and is a verb, not a noun.
 - **`--format`** is the one output-format flag, on the run and on every `list`, `show` and `export`:
   `plain` by default, `json` where a command offers it, value sets documented per command. Never a

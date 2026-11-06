@@ -187,9 +187,9 @@ impl Tool for MemoryWriteTool {
         // description would otherwise strip labels it never mentioned. `[]` still clears them.
         let tags: Option<Vec<String>> = string_or_list(&input, "tags", "memory_write")?;
         // Clamped rather than rejected, because this door's caller is a model rather than a
-        // person: `meka memory add --priority 99` and `PUT /v1/memory` both refuse out of range,
-        // and a human reads the error and retypes, where a model spends a turn on it. Read as
-        // `i64` so a negative clamps to 0 instead of failing the `as_u64` cast outright.
+        // person: `meka memory add --priority 99` and `PUT /v1/memories/{name}` both refuse out of
+        // range, and a human reads the error and retypes, where a model spends a turn on it. Read
+        // as `i64` so a negative clamps to 0 instead of failing the `as_u64` cast outright.
         //
         // `None` means "leave it alone", which the upsert resolves in SQL: reading the absence as
         // the default would demote an inline standing directive every time the agent reworded
@@ -304,8 +304,8 @@ impl Tool for MemoryWriteTool {
                 name: name.to_string(),
                 view: view.clone(),
                 project,
-                // Normalized to one line here rather than only at `PUT /v1/memory`, so all three
-                // write doors store what `meka memory export` writes and a round trip is
+                // Normalized to one line here rather than only at `PUT /v1/memories/{name}`, so all
+                // three write doors store what `meka memory export` writes and a round trip is
                 // byte-exact.
                 description: description
                     .as_deref()
@@ -1385,7 +1385,7 @@ fn render_hits(
                 format!(
                     "… {} …",
                     memory::render_for_model(&crate::prompt::clip_chars(
-                        &hit.snippet,
+                        &hit.excerpt,
                         INLINE_BODY_MAX_CHARS
                     ))
                 )

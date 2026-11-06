@@ -1,5 +1,5 @@
 //! `POST /v1/sessions/{id}/responses/{request_id}`: client responses to the mid-turn
-//! `permission_required` and `elicitation_required` SSE events. One body for both, since the id
+//! `approval.requested` and `elicitation.requested` SSE events. One body for both, since the id
 //! says which prompt it names: an approval takes `allow`, `deny`, `allow_always` or
 //! `deny_always`, an elicitation `accept` with its `content`, `decline` or `cancel`, and an answer
 //! of the other kind is refused naming the kind.
@@ -127,7 +127,7 @@ impl ToSchema for ResponseOutcome {}
     tag = "turn",
     params(
         ("id" = Uuid, Path, description = "Session UUID"),
-        ("request_id" = String, Path, description = "Pending request id emitted by the matching `permission_required` or `elicitation_required` SSE event."),
+        ("request_id" = String, Path, description = "Pending request id emitted by the matching `approval.requested` or `elicitation.requested` SSE event."),
     ),
     request_body = ResponseBody,
     responses(

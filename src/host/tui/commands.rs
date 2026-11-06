@@ -207,41 +207,44 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         }
         SlashCommand::Rewind(turns) => {
             let turns = turns.unwrap_or(1);
-            // `rewind(0)` returns `None` unconditionally; the count is what is wrong, not the
-            // conversation.
-            let rewound = if turns == 0 {
-                None
-            } else {
-                messages.rewind(turns)
-            };
-            match (session_id, rewound) {
-                (Some(id), Some(event)) => {
-                    if let Err(error) = store.save_rewind(id, &event).await {
-                        // Put the turns back rather than leave memory and disk disagreeing, which
-                        // would resurrect them on the next resume.
-                        messages.pop_repair();
+            if turns == 0 {
+                // `rewind(0)` returns `None` unconditionally; the count is what is wrong, not the
+                // conversation.
+                ui.reply("Nothing to rewind: /rewind takes a turn count of 1 or more");
+            } else if let Some(id) = session_id {
+                match agent
+                    .rewind_resident(id, messages, crate::agent::RewindCut::Turns(turns))
+                    .await
+                {
+                    // The log's own rewind row says so once the screen reads it again.
+                    Ok(crate::agent::ResidentRewind { event: Some(_), .. }) => ui.reload(),
+                    Ok(crate::agent::ResidentRewind {
+                        event: None,
+                        matched,
+                    }) => {
+                        // What the screen drew of a round memory let go goes too.
+                        if matched {
+                            ui.reload();
+                        }
+                        ui.reply(format!(
+                            "Nothing to rewind: the conversation has fewer than {turns} turn(s)"
+                        ));
+                    }
+                    Err(error) => {
                         ui.reply(error.to_string());
-                    } else {
-                        agent.reset_conversation_markers(messages).await;
-                        // The log's own rewind row says so once the screen reads it again.
                         ui.reload();
                     }
                 }
+            } else if messages.rewind(turns).is_some() {
                 // No session means nothing was ever persisted, so the in-memory rewind is the
                 // whole story.
-                (None, Some(_)) => {
-                    agent.reset_conversation_markers(messages).await;
-                    ui.note(super::model::rewound_note(turns));
-                    ui.reload();
-                }
-                (_, None) if turns == 0 => {
-                    ui.reply("Nothing to rewind: /rewind takes a turn count of 1 or more");
-                }
-                (_, None) => {
-                    ui.reply(format!(
-                        "Nothing to rewind: the conversation has fewer than {turns} turn(s)"
-                    ));
-                }
+                agent.reset_conversation_markers(messages).await;
+                ui.note(super::model::rewound_note(turns));
+                ui.reload();
+            } else {
+                ui.reply(format!(
+                    "Nothing to rewind: the conversation has fewer than {turns} turn(s)"
+                ));
             }
         }
         SlashCommand::Export => match &session_id {

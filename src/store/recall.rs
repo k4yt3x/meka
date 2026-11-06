@@ -1,13 +1,13 @@
-//! The screen's input history: the `prompt_history` table, one row per entry, global across
-//! sessions and runs so Up-arrow and Ctrl+R recall what the user typed in *any* previous run.
+//! The screen's recall: the `recall_entries` table, one row per entry, global across sessions and
+//! runs so Up-arrow and Ctrl+R recall what the user typed in *any* previous run.
 //! Multi-line entries round-trip intact because each entry is a single TEXT column, not a line in a
 //! newline-delimited file.
 //!
 //! This is the SQL alone. What the composer needs of it is a walk and a search in
 //! `host::tui::input`, because the store must not carry an editor. It runs on its own synchronous
-//! connection: a key press walks the history synchronously, and the store's connection is async.
+//! connection: a key press walks the entries synchronously, and the store's connection is async.
 //! WAL and `busy_timeout` on both sides keep the two safe together. The table is the ledger's
-//! (`prompt_history_is_in_the_ledger`), so the store must have been opened once before this.
+//! (`recall_entries_take_their_name`), so the store must have been opened once before this.
 
 use std::path::Path;
 
@@ -16,9 +16,9 @@ use rusqlite::{Connection, OptionalExtension, ToSql, params};
 use crate::error::{MekaError, Result};
 
 /// Which rows a search covers: an id window, exclusive at both ends, and a text match. Time, cwd,
-/// hostname and exit filters do not exist here because this history never records them.
+/// hostname and exit filters do not exist here because recall never records them.
 #[derive(Default)]
-pub(crate) struct HistoryFilter {
+pub(crate) struct RecallFilter {
     pub(crate) id_below: Option<i64>,
     pub(crate) id_above: Option<i64>,
     pub(crate) command_line: Option<CommandLineMatch>,
@@ -29,17 +29,17 @@ pub(crate) enum CommandLineMatch {
     Substring(String),
 }
 
-/// Which end of the history a search reads from first.
+/// Which end of the entries a search reads from first.
 #[derive(Clone, Copy)]
-pub(crate) enum HistoryOrder {
+pub(crate) enum RecallOrder {
     NewestFirst,
 }
 
 impl super::Store {
-    /// Delete the screen's input history written before `cutoff`, for the retention sweeps:
+    /// Delete the screen's recall entries written before `cutoff`, for the retention sweeps:
     /// nothing a person typed outlives the window the conversation it went into is kept for.
     /// Answers how many entries went.
-    pub(crate) async fn delete_prompt_history_before(
+    pub(crate) async fn delete_recall_entries_before(
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<usize> {
@@ -47,25 +47,25 @@ impl super::Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "DELETE FROM prompt_history WHERE julianday(created_at) < julianday(?1)",
+                    "DELETE FROM recall_entries WHERE julianday(created_at) < julianday(?1)",
                     params![cutoff],
                 )
             })
             .await
             .map_err(|error| {
-                MekaError::Database(format!("failed to delete expired input history: {error}"))
+                MekaError::Database(format!("failed to delete expired recall entries: {error}"))
             })
     }
 }
 
-/// The `prompt_history` table, on its own synchronous connection.
-pub(crate) struct HistoryStore {
+/// The `recall_entries` table, on its own synchronous connection.
+pub(crate) struct RecallStore {
     connection: Connection,
     /// Maximum number of entries retained; older rows are pruned on append. `0` disables storage.
     capacity: usize,
 }
 
-impl HistoryStore {
+impl RecallStore {
     /// Open a second connection to the store at `db_path`, retaining at most `capacity` entries.
     pub(crate) fn open(db_path: &Path, capacity: usize) -> Result<Self> {
         let connection = Connection::open(db_path).map_err(database)?;
@@ -85,7 +85,7 @@ impl HistoryStore {
         let bound: i64 = if limit == 0 { -1 } else { limit as i64 };
         let mut statement = self
             .connection
-            .prepare("SELECT command_line FROM prompt_history ORDER BY id DESC LIMIT ?1")
+            .prepare("SELECT command_line FROM recall_entries ORDER BY id DESC LIMIT ?1")
             .map_err(database)?;
         let mut rows: Vec<String> = statement
             .query_map(params![bound], |row| row.get(0))
@@ -96,10 +96,10 @@ impl HistoryStore {
         Ok(rows)
     }
 
-    /// Delete every input-history row, returning the number removed.
+    /// Delete every recall entry, returning the number removed.
     pub(crate) fn clear_all(&self) -> Result<usize> {
         self.connection
-            .execute("DELETE FROM prompt_history", [])
+            .execute("DELETE FROM recall_entries", [])
             .map_err(database)
     }
 
@@ -107,7 +107,7 @@ impl HistoryStore {
     pub(crate) fn latest(&self) -> Result<Option<String>> {
         self.connection
             .query_row(
-                "SELECT command_line FROM prompt_history ORDER BY id DESC LIMIT 1",
+                "SELECT command_line FROM recall_entries ORDER BY id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -120,15 +120,15 @@ impl HistoryStore {
         let created_at = chrono::Utc::now().to_rfc3339();
         self.connection
             .execute(
-                "INSERT INTO prompt_history (command_line, created_at) VALUES (?1, ?2)",
+                "INSERT INTO recall_entries (command_line, created_at) VALUES (?1, ?2)",
                 params![command_line, created_at],
             )
             .map_err(database)?;
         let id = self.connection.last_insert_rowid();
         self.connection
             .execute(
-                "DELETE FROM prompt_history WHERE id NOT IN \
-                 (SELECT id FROM prompt_history ORDER BY id DESC LIMIT ?1)",
+                "DELETE FROM recall_entries WHERE id NOT IN \
+                 (SELECT id FROM recall_entries ORDER BY id DESC LIMIT ?1)",
                 params![self.capacity as i64],
             )
             .map_err(database)?;
@@ -138,18 +138,18 @@ impl HistoryStore {
     /// Matching rows as `(id, command_line)`, in `order`, at most `limit` of them.
     pub(crate) fn search(
         &self,
-        filter: &HistoryFilter,
-        order: HistoryOrder,
+        filter: &RecallFilter,
+        order: RecallOrder,
         limit: Option<i64>,
     ) -> Result<Vec<(i64, String)>> {
         let (conditions, mut bindings) = where_clause(filter);
-        let mut sql = String::from("SELECT id, command_line FROM prompt_history");
+        let mut sql = String::from("SELECT id, command_line FROM recall_entries");
         if !conditions.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&conditions.join(" AND "));
         }
         sql.push_str(match order {
-            HistoryOrder::NewestFirst => " ORDER BY id DESC",
+            RecallOrder::NewestFirst => " ORDER BY id DESC",
         });
         if let Some(limit) = limit {
             sql.push_str(" LIMIT ?");
@@ -166,7 +166,7 @@ impl HistoryStore {
 }
 
 /// A filter as a SQL `WHERE` clause and its bound parameters.
-fn where_clause(filter: &HistoryFilter) -> (Vec<String>, Vec<Box<dyn ToSql>>) {
+fn where_clause(filter: &RecallFilter) -> (Vec<String>, Vec<Box<dyn ToSql>>) {
     let mut conditions: Vec<String> = Vec::new();
     let mut bindings: Vec<Box<dyn ToSql>> = Vec::new();
     if let Some(below) = filter.id_below {
@@ -188,7 +188,7 @@ fn where_clause(filter: &HistoryFilter) -> (Vec<String>, Vec<Box<dyn ToSql>>) {
 }
 
 fn database(error: rusqlite::Error) -> MekaError {
-    MekaError::Database(format!("prompt history: {error}"))
+    MekaError::Database(format!("recall: {error}"))
 }
 
 /// Escape `LIKE` wildcards so a prompt containing `%` / `_` / `\` is matched literally (paired with

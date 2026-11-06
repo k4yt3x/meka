@@ -200,7 +200,7 @@ impl WebhookDispatcher {
                 // No `label`. It is the tool's primary argument, which for `shell_execute` is
                 // the shell command line -- the highest-entropy field in the system and the one
                 // most likely to carry a credential someone pasted into a `curl`. A subscriber
-                // that wants it reads `GET /v1/sessions/{id}/tasks` with its own token, which is
+                // that wants it reads `GET /v1/tasks` with its own token, which is
                 // the whole reason deliveries carry identifiers rather than content.
                 serde_json::json!({
                     "task_id": task.id,

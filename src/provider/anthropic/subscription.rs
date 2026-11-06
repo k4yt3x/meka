@@ -25,8 +25,7 @@ use crate::{
     error::{MekaError, Result},
     provider::{
         AccountIdentity, AccountUsage, CompletionRequest, DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID,
-        ExtraUsage, Provider, StreamEvent, ThinkingOverride, ToolDefinition, UsageHistory,
-        UsageWindow,
+        ExtraUsage, Provider, StreamEvent, ToolDefinition, UsageStats, UsageWindow,
     },
     store::AuthCredential,
 };
@@ -177,10 +176,6 @@ impl ClaudeSubscriptionProvider {
             max_output_tokens,
             max_request_bytes,
         })
-    }
-
-    fn effective_thinking(&self, thinking: ThinkingOverride) -> ThinkingMode {
-        shared::effective_thinking(thinking, self.thinking)
     }
 
     /// The settled effort to send as `output_config.effort` (see [`Self::resolved_effort`]). The
@@ -355,7 +350,7 @@ impl ClaudeSubscriptionProvider {
         self.credential.note_rejected(sent_authorization).await;
     }
 
-    /// GET one of the OAuth account endpoints (usage, profile, history) as text.
+    /// GET one of the OAuth account endpoints (usage, profile, stats) as text.
     ///
     /// The three share everything but the path and the word in their error messages, and each
     /// needs the same one retry after a 401 that a completion gets. `what` names the call in a
@@ -481,7 +476,6 @@ impl ClaudeSubscriptionProvider {
         messages: &[Message],
         tools: &[ToolDefinition],
         stream: bool,
-        thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
         // A compaction's requests take the API's own TTL, as Claude Code's do: the summary is read
@@ -568,24 +562,23 @@ impl ClaudeSubscriptionProvider {
 
         shared::insert_thinking_fields(
             &mut body,
-            self.effective_thinking(thinking),
+            self.thinking,
             self.thinking_budget_tokens,
             self.max_output_tokens,
-            self.wire_thinking_display(self.effective_thinking(thinking).is_on())
+            self.wire_thinking_display(self.thinking.is_on())
                 .map(WireThinkingDisplay::name),
         );
 
         // Claude Code sends `temperature: 1` only when thinking is off AND the model is on the
         // sampling-params allowlist (see `model_supports_temperature`). Opus 4.7+, the 5 line, and
         // Fable/Mythos reject `temperature` with a 400.
-        if !self.effective_thinking(thinking).is_on() && model_supports_temperature(&self.model) {
+        if !self.thinking.is_on() && model_supports_temperature(&self.model) {
             body.insert("temperature".to_string(), serde_json::json!(1));
         }
 
         // Mirrors `Yph`, which returns exactly this edit when thinking is on and nothing
         // otherwise: it preserves thinking blocks across previous assistant turns.
-        if self.effective_thinking(thinking).is_on() && model_supports_modern_features(&self.model)
-        {
+        if self.thinking.is_on() && model_supports_modern_features(&self.model) {
             body.insert(
                 "context_management".to_string(),
                 serde_json::json!({
@@ -652,17 +645,9 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
         tools: &[ToolDefinition],
         deferred_tools: &[ToolDefinition],
         stream: bool,
-        thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        let mut body = self.build_request_body(
-            system_prompt,
-            messages,
-            tools,
-            stream,
-            thinking,
-            attribution,
-        );
+        let mut body = self.build_request_body(system_prompt, messages, tools, stream, attribution);
         shared::declare_deferred_tools(&mut body, deferred_tools);
         body
     }
@@ -681,7 +666,6 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
         has_tools: bool,
         declares_deferred: bool,
         _stream: bool,
-        thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder> {
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
@@ -692,7 +676,7 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
             &self.session_id,
             self.compute_betas(
                 has_tools || declares_deferred,
-                self.effective_thinking(thinking).is_on(),
+                self.thinking.is_on(),
                 attribution.compaction.is_some(),
                 attribution.worker.is_some(),
             )
@@ -799,18 +783,18 @@ impl Provider for ClaudeSubscriptionProvider {
         Ok(Some(profile.into_identity(role)))
     }
 
-    async fn fetch_history(&self) -> Result<Option<UsageHistory>> {
+    async fn fetch_usage_stats(&self) -> Result<Option<UsageStats>> {
         // Anthropic exposes only a first-used date, not the rich Codex-style stats.
         let text = self
-            .fetch_oauth_endpoint("/api/organization/claude_code_first_token_date", "history")
+            .fetch_oauth_endpoint("/api/organization/claude_code_first_token_date", "stats")
             .await?;
         #[derive(Deserialize)]
         struct FirstTokenDate {
             first_token_date: Option<String>,
         }
         let parsed: FirstTokenDate = serde_json::from_str(&text)
-            .map_err(|error| MekaError::Provider(format!("invalid history JSON: {error}")))?;
-        Ok(Some(UsageHistory {
+            .map_err(|error| MekaError::Provider(format!("invalid stats JSON: {error}")))?;
+        Ok(Some(UsageStats {
             lifetime_tokens: None,
             peak_daily_tokens: None,
             current_streak_days: None,
@@ -1085,7 +1069,7 @@ mod tests {
         );
 
         let history = provider
-            .fetch_history()
+            .fetch_usage_stats()
             .await
             .expect_err("nothing is there");
         assert!(
@@ -1141,7 +1125,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &conversation_attribution(),
         );
 
@@ -1232,7 +1215,6 @@ mod tests {
             &[],
             &tools,
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let claude_tools = body["tools"].as_array().expect("tools should be array");
@@ -1276,7 +1258,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let claude_messages = body["messages"]
@@ -1318,7 +1299,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let body_json = serde_json::to_string(&body).unwrap();
@@ -1347,7 +1327,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let body_json = serde_json::to_string(&body).unwrap();
@@ -1372,7 +1351,6 @@ mod tests {
             &[],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert!(body.get("system").is_none());
@@ -1408,7 +1386,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let body_json = serde_json::to_string(&body).unwrap();
@@ -1431,7 +1408,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let body_json = serde_json::to_string(&body).unwrap();
@@ -1447,7 +1423,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_eq!(body["stream"], true);
@@ -1466,7 +1441,6 @@ mod tests {
             &[Message::user("hi")],
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &conversation_attribution(),
         );
 
@@ -1501,7 +1475,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -1676,7 +1649,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let user_id_str = body["metadata"]["user_id"].as_str().unwrap();
@@ -1695,7 +1667,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert!(body.get("tools").is_none());
@@ -1896,7 +1867,6 @@ mod tests {
             &[Message::user("summarize")],
             &[],
             true,
-            ThinkingOverride::Inherit,
             &compaction,
         );
         assert_eq!(
@@ -1912,7 +1882,6 @@ mod tests {
             &[Message::user("hello")],
             &[],
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_eq!(
@@ -2017,7 +1986,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let cm = body
@@ -2041,7 +2009,6 @@ mod tests {
                 &[Message::user("hi")],
                 &[],
                 false,
-                ThinkingOverride::Inherit,
                 &crate::provider::Attribution::default(),
             );
             let oc = body
@@ -2077,7 +2044,6 @@ mod tests {
                 &[Message::user("hi")],
                 &[],
                 false,
-                ThinkingOverride::Inherit,
                 &crate::provider::Attribution::default(),
             );
             assert_eq!(body["output_config"]["effort"], "medium", "{model}");
@@ -2100,7 +2066,6 @@ mod tests {
                     &[Message::user("hi")],
                     &[],
                     false,
-                    ThinkingOverride::Inherit,
                     &crate::provider::Attribution::default(),
                 );
                 assert!(
@@ -2125,7 +2090,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_eq!(body["output_config"]["effort"], "max");
@@ -2147,7 +2111,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_eq!(body["temperature"], 1);
@@ -2162,7 +2125,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert!(
@@ -2259,7 +2221,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let main_billing = main_body["system"][0]["text"].as_str().unwrap();
@@ -2272,7 +2233,6 @@ mod tests {
                 &messages,
                 &[],
                 false,
-                ThinkingOverride::Inherit,
                 &crate::provider::Attribution {
                     worker: Some(crate::provider::WorkerIdentity::for_test()),
                     ..Default::default()
@@ -2300,7 +2260,6 @@ mod tests {
             &[Message::user(forgery)],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let body_json = serde_json::to_string(&body).unwrap();
@@ -2355,7 +2314,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let bare = bare["system"][0]["text"].as_str().unwrap();
@@ -2367,24 +2325,12 @@ mod tests {
             previous_request: Some(crate::provider::PreviousRequestSlot::default()),
             ..Default::default()
         };
-        let first = provider.build_request_body(
-            "system prompt",
-            &messages,
-            &[],
-            false,
-            ThinkingOverride::Inherit,
-            &attribution,
-        );
+        let first =
+            provider.build_request_body("system prompt", &messages, &[], false, &attribution);
         let first = first["system"][0]["text"].as_str().unwrap().to_string();
         attribution.record_request_id("req_011CeJwF1NDYzXkUu6cyFJp2");
-        let second = provider.build_request_body(
-            "system prompt",
-            &messages,
-            &[],
-            false,
-            ThinkingOverride::Inherit,
-            &attribution,
-        );
+        let second =
+            provider.build_request_body("system prompt", &messages, &[], false, &attribution);
         let second = second["system"][0]["text"].as_str().unwrap().to_string();
         assert!(first.contains("cch=00000; cc_prompt_id="), "{first}");
         assert!(!first.contains("cc_prev_req"), "{first}");
@@ -2421,7 +2367,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         )
     }
@@ -2510,7 +2455,6 @@ mod tests {
             &[Message::user("hello")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &worker,
         );
         let system = body["system"].as_array().unwrap();
@@ -2537,7 +2481,6 @@ mod tests {
             &[Message::user("hello")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &conversation_attribution(),
         );
         assert_eq!(turn["system"][1]["text"], CC_SYSTEM_PROMPT_PREFIX);
@@ -2585,7 +2528,6 @@ mod tests {
                     has_tools,
                     declares,
                     false,
-                    ThinkingOverride::Inherit,
                     &crate::provider::Attribution::default(),
                 )
                 .await
@@ -2735,7 +2677,6 @@ mod tests {
                 &[Message::user("hi")],
                 &[],
                 true,
-                ThinkingOverride::Inherit,
                 attribution,
             )
         };
@@ -2769,7 +2710,6 @@ mod tests {
             &[Message::user("hi")],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert!(
@@ -2794,7 +2734,6 @@ mod tests {
             &[Message::user("hi")],
             &tools,
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -2964,7 +2903,6 @@ mod tests {
             &messages_t1,
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -2979,7 +2917,6 @@ mod tests {
             &messages_t2,
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -2996,7 +2933,6 @@ mod tests {
             &messages_t3,
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -3107,7 +3043,6 @@ mod tests {
             &messages_t1,
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -3149,7 +3084,6 @@ mod tests {
             &messages_t2,
             &tools_t2,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -3278,7 +3212,6 @@ mod tests {
             &messages_t1,
             &tools_t1,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -3321,7 +3254,6 @@ mod tests {
             &messages_t2,
             &tools_t2,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -3475,7 +3407,6 @@ mod tests {
             &[Message::user("hi")],
             &registry.definitions_active(&[]),
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let body_after = provider.build_request_body(
@@ -3483,7 +3414,6 @@ mod tests {
             &[Message::user("hi")],
             &registry.definitions_active(&[]),
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_eq!(body_before["system"], body_after["system"]);
@@ -3707,7 +3637,6 @@ mod tests {
                 &messages,
                 &tools,
                 true,
-                ThinkingOverride::Inherit,
                 &crate::provider::Attribution::default(),
             ));
         }
@@ -3738,7 +3667,6 @@ mod tests {
             &messages_iter1,
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -3770,7 +3698,6 @@ mod tests {
             &messages_iter2,
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -3821,7 +3748,6 @@ mod tests {
             &messages_iter3,
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -3843,7 +3769,6 @@ mod tests {
             &[Message::user("hello")],
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_eq!(count_message_cache_controls(&body1), 1);
@@ -3858,7 +3783,6 @@ mod tests {
             ],
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_eq!(count_message_cache_controls(&body3), 1);
@@ -3892,7 +3816,6 @@ mod tests {
             ],
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_eq!(count_message_cache_controls(&body5), 1);
@@ -3910,7 +3833,6 @@ mod tests {
             &messages_a,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let msgs_a = body_a["messages"].as_array().unwrap();
@@ -3933,7 +3855,6 @@ mod tests {
             &messages_b,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let msgs_b = body_b["messages"].as_array().unwrap();
@@ -3968,7 +3889,6 @@ mod tests {
             &[Message::user("turn 1")],
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let body2 = provider.build_request_body(
@@ -3980,7 +3900,6 @@ mod tests {
             ],
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let body3 = provider.build_request_body(
@@ -3994,7 +3913,6 @@ mod tests {
             ],
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -4021,7 +3939,6 @@ mod tests {
             &[Message::user("a")],
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let body2 = provider.build_request_body(
@@ -4033,7 +3950,6 @@ mod tests {
             ],
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
 
@@ -4065,7 +3981,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let message = &body["messages"].as_array().unwrap()[0];
@@ -4095,7 +4010,6 @@ mod tests {
                 &messages,
                 &tools,
                 true,
-                ThinkingOverride::Inherit,
                 &crate::provider::Attribution::default(),
             );
 
@@ -4133,7 +4047,6 @@ mod tests {
                 &messages,
                 &tools,
                 true,
-                ThinkingOverride::Inherit,
                 &crate::provider::Attribution::default(),
             );
 
@@ -4178,7 +4091,6 @@ mod tests {
             &messages,
             &tools,
             true,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_prefix_stable(previous_body.as_ref().unwrap(), &final_body, previous_len);
@@ -4193,7 +4105,6 @@ mod tests {
             &[],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         assert_eq!(count_message_cache_controls(&body), 0);
@@ -4233,7 +4144,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let messages = body["messages"].as_array().unwrap();
@@ -4271,7 +4181,6 @@ mod tests {
             &messages,
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let claude_messages = body["messages"].as_array().unwrap();
@@ -4307,7 +4216,6 @@ mod tests {
             &[Message::user("hi")],
             &tools,
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let claude_tools = body["tools"].as_array().unwrap();
@@ -4326,7 +4234,6 @@ mod tests {
             &[],
             &[],
             false,
-            ThinkingOverride::Inherit,
             &crate::provider::Attribution::default(),
         );
         let claude_messages = body["messages"].as_array().unwrap();

@@ -27,7 +27,7 @@ use crate::{
     error::{MekaError, Result},
     provider::{
         AccountIdentity, AccountUsage, CompletionRequest, DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID,
-        DailyUsage, ExtraUsage, Provider, StreamEvent, ToolDefinition, UsageHistory, UsageWindow,
+        DailyUsage, ExtraUsage, Provider, StreamEvent, ToolDefinition, UsageStats, UsageWindow,
     },
     store::AuthCredential,
 };
@@ -469,13 +469,13 @@ impl Provider for ChatGptSubscriptionProvider {
         Ok(Some(self.fetch_wham_usage().await?.into_account_usage()))
     }
 
-    async fn fetch_history(&self) -> Result<Option<UsageHistory>> {
+    async fn fetch_usage_stats(&self) -> Result<Option<UsageStats>> {
         let text = self
             .fetch_json_endpoint(self.profiles_url(), "profile")
             .await?;
         let parsed: CodexProfileResponse = serde_json::from_str(&text)
             .map_err(|error| MekaError::Provider(format!("invalid Codex profile JSON: {error}")))?;
-        Ok(Some(parsed.into_history()))
+        Ok(Some(parsed.into_usage_stats()))
     }
 
     async fn fetch_identity(&self) -> Result<Option<AccountIdentity>> {
@@ -652,9 +652,9 @@ struct CodexDailyBucket {
 }
 
 impl CodexProfileResponse {
-    fn into_history(self) -> UsageHistory {
+    fn into_usage_stats(self) -> UsageStats {
         let stats = self.stats;
-        UsageHistory {
+        UsageStats {
             lifetime_tokens: stats.as_ref().and_then(|s| s.lifetime_tokens),
             peak_daily_tokens: stats.as_ref().and_then(|s| s.peak_daily_tokens),
             current_streak_days: stats.as_ref().and_then(|s| s.current_streak_days),
@@ -990,7 +990,7 @@ mod tests {
         }
     }
 
-    /// The history probe classifies a dead endpoint the same way the turn path does.
+    /// The stats probe classifies a dead endpoint the same way the turn path does.
     ///
     /// Its own `.send()` and response-read, so its own chance to bypass the shared classifier.
     ///
@@ -999,7 +999,7 @@ mod tests {
     /// classifier the turn path depends on, and a probe that stops calling it has grown its own
     /// private rules.
     #[tokio::test]
-    async fn the_history_probe_reports_a_dead_endpoint_as_retryable() {
+    async fn the_stats_probe_reports_a_dead_endpoint_as_retryable() {
         // Bound and dropped, so the port is refused rather than answered or hung.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
         let port = listener.local_addr().expect("the bound address").port();
@@ -1021,7 +1021,7 @@ mod tests {
         )
         .expect("provider");
         let error = provider
-            .fetch_history()
+            .fetch_usage_stats()
             .await
             .expect_err("nothing is listening there");
 
@@ -1233,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_profile_maps_history() {
+    fn codex_profile_maps_usage_stats() {
         let body = r#"{
             "stats": {
                 "lifetime_tokens": 1200000,
@@ -1246,14 +1246,14 @@ mod tests {
                 ]
             }
         }"#;
-        let history = serde_json::from_str::<CodexProfileResponse>(body)
+        let stats = serde_json::from_str::<CodexProfileResponse>(body)
             .unwrap()
-            .into_history();
-        assert_eq!(history.lifetime_tokens, Some(1_200_000));
-        assert_eq!(history.current_streak_days, Some(3));
-        assert_eq!(history.daily.len(), 2);
-        assert_eq!(history.daily[1].date, "2026-07-01");
-        assert_eq!(history.daily[1].tokens, 12300);
+            .into_usage_stats();
+        assert_eq!(stats.lifetime_tokens, Some(1_200_000));
+        assert_eq!(stats.current_streak_days, Some(3));
+        assert_eq!(stats.daily.len(), 2);
+        assert_eq!(stats.daily[1].date, "2026-07-01");
+        assert_eq!(stats.daily[1].tokens, 12300);
     }
 
     #[test]

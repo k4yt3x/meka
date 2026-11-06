@@ -1454,7 +1454,7 @@ pub(crate) async fn profiles(
     _scoped: scope::Scoped<scope::AnyRead>,
 ) -> Result<Json<ProfilesResponse>, ProblemDetail> {
     let catalog = state.shared.providers.catalog();
-    let active = catalog.default_profile.as_deref().ok();
+    let default_profile = catalog.default_profile.as_deref().ok();
     let profiles = catalog
         .profiles
         .iter()
@@ -1463,7 +1463,7 @@ pub(crate) async fn profiles(
                 name,
                 profile,
                 &catalog.accounts,
-                Some(name.as_str()) == active,
+                Some(name.as_str()) == default_profile,
             )
         })
         .collect();
@@ -1478,12 +1478,12 @@ fn profile_detail(
     let Some(profile) = catalog.profiles.get(name) else {
         return Err(not_found("profile", name, catalog.profiles.keys()));
     };
-    let active = catalog.default_profile.as_deref().ok() == Some(name);
+    let is_default = catalog.default_profile.as_deref().ok() == Some(name);
     Ok(ProfileDetailView::from_config(
         name,
         profile,
         &catalog.accounts,
-        active,
+        is_default,
     ))
 }
 

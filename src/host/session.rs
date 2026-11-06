@@ -486,7 +486,8 @@ impl ResidentSession {
     }
 
     /// Claim the session for something that must not overlap a turn, or `None` while one is in
-    /// flight. Counted on the session alone: a compaction or a rewind is not a turn.
+    /// flight. Counted on the session alone: the process's cap is on the turns that answer a
+    /// prompt, and a compaction or a rewind answers none.
     pub(crate) fn claim_idle(&self) -> Option<TurnGuard> {
         self.in_flight
             .compare_exchange(

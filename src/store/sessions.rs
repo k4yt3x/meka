@@ -15,7 +15,42 @@ pub(super) struct StoredMessage {
     pub(super) turn_id: Option<String>,
     /// The row this one copies; see [`super::search::NewMessage`].
     pub(super) copy_of: Option<i64>,
+    /// For a copy a compaction kept, the turn that said it; see [`SaidStamp`].
+    pub(super) said_turn_id: Option<String>,
+    /// For a copy a compaction kept, when it was said; see [`SaidStamp`].
+    pub(super) said_at: Option<String>,
 }
+
+impl StoredMessage {
+    /// Where the row was said, for a copy a compaction kept.
+    fn said(&self) -> Option<SaidStamp> {
+        self.said_at.as_ref().map(|at| SaidStamp {
+            turn_id: self.said_turn_id.as_deref().and_then(session_id_in),
+            created_at: at.clone(),
+        })
+    }
+}
+
+/// Where a message a compaction kept was said: the turn that said it and when. A copy carries it
+/// beside its own row's turn and time, which are the turn that wrote it, a compaction's own or the
+/// one the compaction ran inside, and when: the turn sweep dates a row by those, and the screen
+/// marks where turns end by them, while what the conversation said is told by this, so a copy the
+/// turn sweep leaves standing alone still says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SaidStamp {
+    /// The turn that said it; `None` for one said before turns were recorded.
+    pub(crate) turn_id: Option<Uuid>,
+    /// When it was said, RFC 3339.
+    pub(crate) created_at: String,
+}
+
+/// Where a copy a compaction kept was said, as its row stores it: the turn's id and the time.
+type StoredSaid = (Option<String>, String);
+
+/// The columns a reader of `messages` takes into a [`StoredMessage`] with its id, in the order
+/// [`stored_row_with_id`] reads them.
+const STORED_COLUMNS: &str =
+    "id, kind, content, created_at, turn_id, copy_of, said_turn_id, said_at";
 
 /// Which row a stored event is, when it was written, and under which turn, for a reader of the
 /// whole log.
@@ -23,11 +58,12 @@ pub(super) struct StoredMessage {
 pub(crate) struct EventStamp {
     pub(crate) id: i64,
     pub(crate) created_at: String,
-    /// The turn that added the row; `None` for a row no turn added, such as a compaction
-    /// boundary written between turns or a rewind's repair.
+    /// The turn that added the row; `None` for a row no turn added, such as a rewind's repair.
     pub(crate) turn_id: Option<Uuid>,
     /// The row this one copies, for a copy a compaction kept while that row stands.
     pub(crate) copy_of: Option<i64>,
+    /// Where a copy a compaction kept was said, standing alone or not.
+    pub(crate) said: Option<SaidStamp>,
 }
 
 /// One row of the log with its id, for a reader that walks the log in pages.
@@ -37,28 +73,260 @@ pub(crate) struct LogRow {
     /// The turn the row was written in, for a surface that marks where turns end; `None` for a row
     /// written before turns were recorded.
     pub(crate) turn_id: Option<Uuid>,
+    /// When the row was written, RFC 3339.
+    pub(crate) created_at: String,
+    /// Where it was said, for a copy a compaction kept: the turn and time history names it by once
+    /// it stands alone.
+    pub(crate) said: Option<SaidStamp>,
     pub(crate) event: crate::conversation::Event,
 }
 
+/// What a row of the log is in the session's history, the one statement of it for every surface
+/// that shows history: the screen, an editor's reload and the HTTP API.
+pub(crate) enum Said<'a> {
+    /// A message, where it was said.
+    Message(&'a crate::conversation::Message),
+    /// A compaction, where it happened.
+    Compaction {
+        record: &'a crate::conversation::CompactionRecord,
+    },
+    /// A rewind: the runs of history rows it took, and how many turns they held.
+    Rewind {
+        rows: &'a [std::ops::RangeInclusive<i64>],
+        turns: usize,
+    },
+    /// A prompt a turn took back to join a message to it, at the runs of rows it held; the
+    /// message it joined follows. A prompt a turn withdrew stays where it was said, so its repair
+    /// says nothing.
+    Join {
+        rows: &'a [std::ops::RangeInclusive<i64>],
+    },
+    /// A row that rewrites the context and says nothing: any other repair, a redaction, an unsign.
+    Nothing,
+}
+
+impl LogRow {
+    /// What this row is in the session's history, `rewound` being the session's stretches
+    /// ([`Store::rewound`]); see [`Said`]. Without them a rewind and a join say nothing, and the
+    /// rows they took say what they hold.
+    pub(crate) fn said<'a>(&'a self, rewound: &'a [Rewound]) -> Said<'a> {
+        use crate::conversation::Event;
+        if is_rewound(rewound, self.id) {
+            return Said::Nothing;
+        }
+        if let Some(stretch) = rewound.iter().find(|stretch| stretch.at == self.id) {
+            return match (stretch.joined, stretch.rows.is_empty()) {
+                // A summary taken back so leaves its row standing, and the stretch holds nothing.
+                (true, true) => Said::Nothing,
+                (true, false) => Said::Join {
+                    rows: &stretch.rows,
+                },
+                (false, _) => Said::Rewind {
+                    rows: &stretch.rows,
+                    turns: stretch.turns,
+                },
+            };
+        }
+        match &self.event {
+            Event::Append(message) => Said::Message(message),
+            Event::CompactBoundary { record, .. } => Said::Compaction { record },
+            // A rewind that took nothing says nothing, and every other repair, a redaction and an
+            // unsign only rewrite the context.
+            Event::Repair { .. } | Event::Redact { .. } | Event::Unsign => Said::Nothing,
+        }
+    }
+}
+
+/// Whether one of `stretches` took the row at `position` out of the session's history.
+pub(crate) fn is_rewound(stretches: &[Rewound], position: i64) -> bool {
+    stretches
+        .iter()
+        .flat_map(|stretch| &stretch.rows)
+        .any(|rows| rows.contains(&position))
+}
+
+/// One entry of a session's history: a row of the log as [`Said`] says it, with where it sits.
+#[derive(Debug, Clone)]
+pub(crate) struct HistoryEntry {
+    /// The row's position in the log, which never changes and orders the history.
+    pub(crate) position: i64,
+    /// The turn that said the entry: the one that wrote the row, or for a copy standing alone, the
+    /// one its said stamp names; `None` for one said between turns or before turns were recorded.
+    pub(crate) turn_id: Option<Uuid>,
+    /// When the entry was said, RFC 3339: when the row was written, or for a copy standing alone,
+    /// when its said stamp says.
+    pub(crate) created_at: String,
+    pub(crate) kind: HistoryKind,
+}
+
+/// What a [`HistoryEntry`] is.
+#[derive(Debug, Clone)]
+pub(crate) enum HistoryKind {
+    Message(crate::conversation::Message),
+    /// A compaction: its record, and which compaction it was, counting from 1.
+    Compaction {
+        record: crate::conversation::CompactionRecord,
+        generation: u64,
+    },
+    /// A rewind, the runs of positions it took out of the history, and how many turns they held.
+    Rewind {
+        rows: Vec<std::ops::RangeInclusive<i64>>,
+        turns: usize,
+    },
+    /// A prompt the turn took back to join a message to it, at the runs of positions it held; the
+    /// message it joined follows.
+    Join {
+        rows: Vec<std::ops::RangeInclusive<i64>>,
+    },
+}
+
+/// Which way a page of history is read: below a position (from the end when `None`), or above one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryEdge {
+    Before(Option<i64>),
+    After(i64),
+}
+
+/// A page of history, oldest entry first, and whether more lies past it in the direction read.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HistoryPage {
+    pub(crate) entries: Vec<HistoryEntry>,
+    pub(crate) more: bool,
+}
+
+/// `rows` as history entries, oldest first: what a rewind took left out, the row that took a joined
+/// prompt saying so, and each compaction numbered on from `compactions_before`, the compactions
+/// below the first row.
+pub(crate) fn history_entries(
+    rows: Vec<LogRow>,
+    rewound: &[Rewound],
+    compactions_before: u64,
+) -> Vec<HistoryEntry> {
+    let mut generation = compactions_before;
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        if matches!(
+            row.event,
+            crate::conversation::Event::CompactBoundary { .. }
+        ) {
+            generation = generation.saturating_add(1);
+        }
+        let kind = match row.said(rewound) {
+            Said::Message(message) => HistoryKind::Message(message.clone()),
+            Said::Compaction { record } => HistoryKind::Compaction {
+                record: record.clone(),
+                generation,
+            },
+            Said::Rewind { rows, turns } => HistoryKind::Rewind {
+                rows: rows.to_vec(),
+                turns,
+            },
+            Said::Join { rows } => HistoryKind::Join {
+                rows: rows.to_vec(),
+            },
+            Said::Nothing => continue,
+        };
+        // Said where a kept copy was said, which is the turn and time it stands for.
+        let (turn_id, created_at) = match row.said {
+            Some(said) => (said.turn_id, said.created_at),
+            None => (row.turn_id, row.created_at),
+        };
+        entries.push(HistoryEntry {
+            position: row.id,
+            turn_id,
+            created_at,
+            kind,
+        });
+    }
+    entries
+}
+
 /// Where a row sits in the log: its id, and the turn that wrote it, `None` for a row written
-/// between turns.
+/// between turns, and the turn it was said in, which a copy a compaction kept carries apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RowStamp {
     id: i64,
     turn_id: Option<Uuid>,
+    said_in: Option<Uuid>,
 }
 
-/// A stretch of a session's log its conversation no longer holds, which a replay of the session
-/// on the screen leaves out: the rows a rewind took, or a prompt a turn took back to join a message
-/// to it, with the row that took it.
+/// Each session's rewound stretches, under the part of its log they were worked out from: its last
+/// rewind's row, the row after it, which may join the prompt it took straight back, and how many
+/// rows lie up to that one. Nothing past that row moves a stretch, so a turn appending to the
+/// session leaves its entry standing; a new rewind moves the first, and a deletion (the turn
+/// sweep, which also unlinks the copies of what it deletes) the count.
+pub(crate) type RewoundCache =
+    std::sync::Mutex<std::collections::HashMap<Uuid, (RewoundShape, Vec<Rewound>)>>;
+
+/// The part of a session's log its stretches are worked out from; see [`RewoundCache`].
+pub(crate) type RewoundShape = (i64, Option<i64>, i64);
+
+/// How many sessions' stretches [`RewoundCache`] holds before it starts over, so a long-lived
+/// process that reads many sessions, deleted ones included, holds no more than this many.
+const REWOUND_CACHE_SESSIONS: usize = 1_024;
+
+/// What a session's history no longer holds, which every surface that shows it leaves out: the
+/// rows a rewind took, or a prompt a turn took back to join a message to it, with the row that
+/// took them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Rewound {
-    pub(crate) rows: std::ops::RangeInclusive<i64>,
-    /// The row a rewind was written in, which a replay says it in; `None` for a prompt taken back.
-    pub(crate) said_at: Option<i64>,
+    /// The rows taken, as runs of the session's history, oldest first. A copy a compaction kept
+    /// stands for the row its chain of copies starts from, so a kept turn taken leaves the history
+    /// where it was said, before the compaction, as well as the context after it.
+    pub(crate) rows: Vec<std::ops::RangeInclusive<i64>>,
+    /// The row that took them, which the history says it at.
+    pub(crate) at: i64,
+    /// Whether the prompt taken came straight back with a message joined to it; a rewind
+    /// otherwise.
+    pub(crate) joined: bool,
     /// The turns a rewind took: the turns its rows were written in, or where none names one, the
-    /// turns as the rewind counted them.
+    /// turns as the rewind counted them; `0` for a joined prompt.
     pub(crate) turns: usize,
+}
+
+/// The history rows `span` of a session's log `order` took: each row it holds, a copy a compaction
+/// kept standing for the row its chain of copies in `copies` starts from, `copies` mapping a copy
+/// to the row it copies. A link that does not point back down the log ends the chain, so a
+/// hand-edited one cannot loop.
+fn taken_rows(
+    order: &[i64],
+    copies: &std::collections::HashMap<i64, i64>,
+    span: std::ops::Range<i64>,
+) -> std::collections::BTreeSet<i64> {
+    let mut rows = std::collections::BTreeSet::new();
+    for &id in order.iter().filter(|id| span.contains(id)) {
+        let mut at = id;
+        while let Some(&original) = copies.get(&at).filter(|original| **original < at) {
+            at = original;
+        }
+        rows.insert(at);
+    }
+    rows
+}
+
+/// `rows` as runs of `order`, a session's history rows: each the longest stretch of them that
+/// holds `rows` alone.
+fn runs_of(
+    order: &[i64],
+    rows: &std::collections::BTreeSet<i64>,
+) -> Vec<std::ops::RangeInclusive<i64>> {
+    let mut runs = Vec::new();
+    let mut open: Option<(i64, i64)> = None;
+    for &id in order {
+        match (rows.contains(&id), open) {
+            (true, Some((from, _))) => open = Some((from, id)),
+            (true, None) => open = Some((id, id)),
+            (false, Some((from, through))) => {
+                runs.push(from..=through);
+                open = None;
+            }
+            (false, None) => {}
+        }
+    }
+    if let Some((from, through)) = open {
+        runs.push(from..=through);
+    }
+    runs
 }
 
 /// A page of the log, oldest row first, and whether the log goes on past it in the direction
@@ -173,6 +441,8 @@ pub(crate) struct ImportedEvent {
     /// The position among the record's events of the one this copies, for a copy a compaction
     /// kept; always an earlier one.
     pub(crate) copy_of: Option<usize>,
+    /// Where a copy a compaction kept was said, its turn one of the record's `turns`.
+    pub(crate) said: Option<SaidStamp>,
 }
 /// A row's evidence that another session spawned it. See [`Store::spawn_terms`].
 #[derive(Debug, Clone, Copy)]
@@ -316,33 +586,29 @@ pub(crate) fn spawned_session_sql(qualifier: &str) -> String {
 /// A session's own tools read its tree below `unrestricted` and the store at it; the operator's
 /// surfaces read the store. One value for the question, so the SQL that keeps a row within reach is
 /// written once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionReach {
     /// One session and its direct children.
     Tree(Uuid),
-    /// Every session, the sub-agents' too when `include_children`.
-    Store { include_children: bool },
+    /// Every session the listing's filter keeps.
+    Store(SessionFilter),
 }
 
 impl SessionReach {
-    /// The `WHERE` term keeping rows of the `sessions` alias `s` within reach, and the id a tree
-    /// binds as `:root`. The term is `1` when nothing is excluded, so a caller can `AND` it on.
-    pub(super) fn sql_term(self) -> (String, Option<String>) {
+    /// The `WHERE` term keeping rows of the `sessions` alias `s` within reach, and the named
+    /// parameters it binds.
+    pub(super) fn sql_term(&self) -> (String, Vec<(&'static str, String)>) {
         let whole = whole_session_sql("s.");
         match self {
             Self::Tree(root) => (
                 format!("(s.id = :root OR s.parent_session_id = :root) AND {whole}"),
-                Some(root.to_string()),
+                vec![(":root", root.to_string())],
             ),
-            Self::Store {
-                include_children: true,
-            } => (whole, None),
-            Self::Store {
-                include_children: false,
-            } => (
-                format!("NOT {} AND {whole}", spawned_session_sql("s.")),
-                None,
-            ),
+            Self::Store(filter) => {
+                let (mut clauses, parameters) = filter.sql_terms();
+                clauses.insert(0, whole);
+                (clauses.join(" AND "), parameters)
+            }
         }
     }
 }
@@ -399,6 +665,10 @@ pub(crate) struct SessionSummary {
     pub(crate) pinned_at: Option<String>,
     /// The latest turn, however it stands, or `None` for a session no turn has begun on.
     pub(crate) last_turn: Option<super::turns::TurnRecord>,
+    /// How many turns the session has on record, every host's: its rows of `turns`.
+    pub(crate) turn_count: u64,
+    /// What those turns spent, each its rounds and the compactions it ran.
+    pub(crate) usage: super::turns::TurnUsage,
 }
 /// What a sweep over many sessions did, so its caller can say what it left behind.
 ///
@@ -440,9 +710,9 @@ impl TurnSweep {
     }
 }
 /// What [`Store::list_sessions`] keeps. Every field narrows the listing, and none by default.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SessionFilter {
-    /// Sub-agent sessions too; the default lists only root conversations.
+    /// Sub-agent sessions too; the default reads only root conversations.
     pub(crate) include_children: bool,
     /// Only sessions in this working directory, in the canonical spelling every session records.
     pub(crate) cwd: Option<PathBuf>,
@@ -457,6 +727,50 @@ pub(crate) struct SessionFilter {
     pub(crate) pinned: Option<bool>,
     /// Only sessions changed after this instant, by the `updated_at` the row records.
     pub(crate) updated_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl SessionFilter {
+    /// The `WHERE` terms the filter keeps rows of the `sessions` alias `s` by, and the named
+    /// parameters they bind: the one statement of them, for the listing and for a search.
+    pub(super) fn sql_terms(&self) -> (Vec<String>, Vec<(&'static str, String)>) {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut parameters: Vec<(&'static str, String)> = Vec::new();
+        // A parent names sub-agents, so the root-only clause gives way to it. The shared rule, so
+        // `--include-children` covers the same rows the refusal treats as children: keying on the
+        // parent link alone would list an imported sub-agent among the root sessions and then
+        // decline to run it.
+        if let Some(parent) = self.parent {
+            clauses.push("s.parent_session_id = :parent".to_string());
+            parameters.push((":parent", parent.to_string()));
+        } else if !self.include_children {
+            clauses.push(format!("NOT {}", spawned_session_sql("s.")));
+        }
+        if let Some(cwd) = &self.cwd {
+            clauses.push("s.working_directory = :cwd".to_string());
+            parameters.push((":cwd", cwd.display().to_string()));
+        }
+        if let Some(profile) = &self.profile {
+            clauses.push("s.profile = :profile".to_string());
+            parameters.push((":profile", profile.clone()));
+        }
+        if let Some(project) = &self.project {
+            clauses.push("s.project = :project".to_string());
+            parameters.push((":project", project.clone()));
+        }
+        match self.pinned {
+            Some(true) => clauses.push("s.pinned_at IS NOT NULL".to_string()),
+            Some(false) => clauses.push("s.pinned_at IS NULL".to_string()),
+            None => {}
+        }
+        // Compared as text: every writer renders `updated_at` with `to_rfc3339`, whose fixed width
+        // and `+00:00` offset sort as the instants do, so this holds only while no writer renders
+        // the column another way.
+        if let Some(since) = self.updated_since {
+            clauses.push("s.updated_at > :updated_since".to_string());
+            parameters.push((":updated_since", since.to_rfc3339()));
+        }
+        (clauses, parameters)
+    }
 }
 
 /// What a host may move on a session's row once it exists, for [`Store::update_session`]. `None`
@@ -554,14 +868,23 @@ impl std::fmt::Display for SessionPatch {
 /// probe from the very process that holds the source would refuse that process its own session. A
 /// door whose host has the source open says so here instead of probing, and answers for it
 /// standing still.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceLock {
     /// Nothing in this process holds the source: probe it, and refuse [`MekaError::SessionLocked`]
     /// when another process does.
     Probe,
+    /// Nothing in this process holds the source, and the door has probed it already
+    /// ([`Store::probe_fork_source`]), to read it standing still before the copy.
+    Probed(ProbedSource),
     /// This process holds the source: the screen's own session, or one resident in `serve` or
     /// `acp`.
     HeldByCaller,
+}
+
+/// A fork's source a probe holds still: this process's sibling forks queued behind it
+/// (`Store::probed_forks`) and the source's lock taken.
+pub(crate) struct ProbedSource {
+    queued: tokio::sync::OwnedMutexGuard<()>,
+    lock: FileLock,
 }
 /// What the retention sweep may take: a root session whose tree nobody pinned and no schedule
 /// speaks for, as a `WHERE` fragment over `sessions`.
@@ -743,6 +1066,9 @@ pub(super) struct PreparedEvent {
     blobs: Vec<super::blobs::NewBlob>,
     references: Vec<String>,
     copy_of: Option<i64>,
+    /// Where a copy a compaction kept was said: what the row it copies says, as
+    /// [`link_kept_copies`] reads it.
+    said: Option<StoredSaid>,
     /// A copy a compaction kept, whose row [`link_kept_copies`] finds in the transaction that
     /// writes it.
     kept: bool,
@@ -757,6 +1083,7 @@ impl PreparedEvent {
             blobs,
             references,
             copy_of: None,
+            said: None,
             kept: false,
         }
     }
@@ -770,6 +1097,17 @@ impl PreparedEvent {
     /// The row as a copy a compaction kept of row `copy_of`, when it names one.
     pub(super) fn copy_of(mut self, copy_of: Option<i64>) -> Self {
         self.copy_of = copy_of;
+        self
+    }
+
+    /// The row as a message said at `said`, for a copy a compaction kept.
+    pub(super) fn said(mut self, said: Option<&SaidStamp>) -> Self {
+        self.said = said.map(|said| {
+            (
+                said.turn_id.map(|turn| turn.to_string()),
+                said.created_at.clone(),
+            )
+        });
         self
     }
 
@@ -806,42 +1144,77 @@ pub(super) fn insert_event(
             created_at,
             turn_id,
             copy_of: prepared.copy_of,
+            said_turn_id: prepared.said.as_ref().and_then(|(turn, _)| turn.as_deref()),
+            said_at: prepared.said.as_ref().map(|(_, at)| at.as_str()),
         })?;
     super::blobs::link_message_blobs(transaction, message_id, &prepared.references)?;
     Ok(message_id)
 }
 
-/// Name, on each of `prepared`'s copies a compaction kept, the row it copies, among the rows after
-/// the session's latest boundary: the alignment that pairs the most copies with rows holding what
-/// they hold, in order, each with the latest row it can take. Called ahead of the batch's own
-/// boundary. A copy no row holds names none and is a row of its own, so history keeps what it says
-/// (a prompt whose own save failed, or a message the view rewrote on its way to the model). Rows
-/// are told apart by what they hold alone, so where the same words were said earlier, a copy
-/// without a row of its own can pair with the older row and draw the copies before it onto older
-/// rows too. History then shows each row once, so words said again and never saved show only where
-/// they were first said, and a turn sweep that takes the older rows and leaves the newer shows a
-/// kept message twice.
+/// Name, on each of `prepared`'s copies a compaction kept, the row it copies: the alignment that
+/// pairs the most copies with messages of the view the compaction replaces holding what they hold,
+/// in order, each with the latest message it can take, and each message the row it is shown as, so
+/// a message the view rewrote on its way to the model (thinking it took out, an image it replaced,
+/// a retry's degraded copy) pairs with the row it was said in. Called ahead of the batch's own
+/// boundary. A copy the view does not hold names none and is a row of its own, so history keeps
+/// what it says (a message whose own save failed). Messages are told apart by what they hold alone,
+/// so where the same words were said earlier, a copy the view does not hold can pair with the older
+/// message and draw the copies before it onto older rows too. History then shows each row once, so
+/// words said again and never saved show only where they were first said, and a turn sweep that
+/// takes the older rows and leaves the newer shows a kept message twice.
 fn link_kept_copies(
     transaction: &rusqlite::Transaction<'_>,
     session_id: &str,
     prepared: &mut [PreparedEvent],
 ) -> rusqlite::Result<()> {
+    use crate::conversation::Event;
     if !prepared.iter().any(|event| event.kept) {
         return Ok(());
     }
-    let floor: i64 = transaction.query_row(
-        "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1 AND kind = ?2",
-        rusqlite::params![session_id, COMPACT_BOUNDARY_KIND],
-        |row| row.get(0),
-    )?;
-    let view: Vec<(i64, (String, String))> = transaction
-        .prepare(
-            "SELECT id, kind, content FROM messages WHERE session_id = ?1 AND id > ?2 ORDER BY id",
+    // Each row with whether it holds a message, and where it was said: its own turn and time, or
+    // for a copy an earlier compaction kept, where that copy says, so a copy of a copy says what
+    // the first row did. A row this build cannot decode holds nothing a copy could, and every load
+    // of the view warns about it.
+    let events: Vec<((i64, bool, StoredSaid), Event)> = transaction
+        .prepare(&format!(
+            "SELECT {STORED_COLUMNS} FROM messages WHERE session_id = ?1 {VIEW_FLOOR_SQL} \
+             ORDER BY id"
+        ))?
+        .query_map(
+            rusqlite::params![session_id, COMPACT_BOUNDARY_KIND],
+            stored_row_with_id,
         )?
-        .query_map(rusqlite::params![session_id, floor], |row| {
-            Ok((row.get(0)?, (row.get(1)?, row.get(2)?)))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|(id, row)| {
+            let event = match decode_event_from_row(&row) {
+                Ok(Some(event)) => event,
+                Ok(None) | Err(_) => return None,
+            };
+            let said = match row.said_at {
+                Some(at) => (row.said_turn_id, at),
+                None => (row.turn_id, row.created_at),
+            };
+            let holds_a_message = matches!(event, Event::Append(_));
+            Some(((id, holds_a_message, said), event))
+        })
+        .collect();
+    let view = crate::conversation::materialize_annotated(&events);
+    // A summary is its boundary's, and a message a repair put back in place of others is the
+    // repair's: neither is a row a copy could stand for.
+    let shown: Vec<&(i64, bool, StoredSaid)> = view
+        .stamps
+        .iter()
+        .filter(|(_, holds_a_message, _)| *holds_a_message)
+        .collect();
+    let rows: Vec<(String, String)> = view
+        .messages
+        .iter()
+        .zip(&view.stamps)
+        .filter(|(_, (_, holds_a_message, _))| *holds_a_message)
+        .map(|(message, _)| encode_message_for_db(message))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let mut copies: Vec<&mut PreparedEvent> =
         prepared.iter_mut().filter(|event| event.kept).collect();
     let held: Vec<(String, String)> = copies
@@ -849,10 +1222,12 @@ fn link_kept_copies(
         .map(|copy| encode_event_for_db(&copy.event))
         .collect::<std::result::Result<_, _>>()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let rows: Vec<&(String, String)> = view.iter().map(|(_, row)| row).collect();
+    let rows: Vec<&(String, String)> = rows.iter().collect();
     let held: Vec<&(String, String)> = held.iter().collect();
     for (copy, row) in copies.iter_mut().zip(align_in_order(&held, &rows)) {
-        copy.copy_of = row.and_then(|row| view.get(row)).map(|(id, _)| *id);
+        let source = row.and_then(|row| shown.get(row));
+        copy.copy_of = source.map(|(id, ..)| *id);
+        copy.said = source.map(|(_, _, said)| said.clone());
     }
     Ok(())
 }
@@ -903,34 +1278,10 @@ fn align_in_order<T: PartialEq>(copies: &[T], rows: &[T]) -> Vec<Option<usize>> 
 pub(super) fn encode_event_for_db(
     event: &crate::conversation::Event,
 ) -> std::result::Result<(String, String), serde_json::Error> {
-    use crate::conversation::{ContentBlock, Event, Role};
+    use crate::conversation::Event;
 
     match event {
-        Event::Append(message) => {
-            let (kind, content) = match message.role {
-                Role::User => {
-                    if message
-                        .content
-                        .iter()
-                        .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-                    {
-                        ("tool_results", serde_json::to_string(&message.content)?)
-                    } else if message
-                        .content
-                        .iter()
-                        .any(|block| !matches!(block, ContentBlock::Text { .. }))
-                    {
-                        // A user turn carrying non-text blocks (input images) can't be flattened to
-                        // plain text without losing them, so persist the full block list as JSON.
-                        (USER_BLOCKS_KIND, serde_json::to_string(&message.content)?)
-                    } else {
-                        ("user", message.text_content())
-                    }
-                }
-                Role::Assistant => ("assistant", serde_json::to_string(&message.content)?),
-            };
-            Ok((kind.to_string(), content))
-        }
+        Event::Append(message) => encode_message_for_db(message),
         Event::CompactBoundary { .. } => {
             let content = serde_json::to_string(event)?;
             Ok((COMPACT_BOUNDARY_KIND.to_string(), content))
@@ -949,6 +1300,36 @@ pub(super) fn encode_event_for_db(
         }
     }
 }
+/// The kind and content of the row an appended `message` is stored as.
+pub(super) fn encode_message_for_db(
+    message: &crate::conversation::Message,
+) -> std::result::Result<(String, String), serde_json::Error> {
+    use crate::conversation::{ContentBlock, Role};
+    let (kind, content) = match message.role {
+        Role::User => {
+            if message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            {
+                ("tool_results", serde_json::to_string(&message.content)?)
+            } else if message
+                .content
+                .iter()
+                .any(|block| !matches!(block, ContentBlock::Text { .. }))
+            {
+                // A user turn carrying non-text blocks (input images) can't be flattened to plain
+                // text without losing them, so persist the full block list as JSON.
+                (USER_BLOCKS_KIND, serde_json::to_string(&message.content)?)
+            } else {
+                ("user", message.text_content())
+            }
+        }
+        Role::Assistant => ("assistant", serde_json::to_string(&message.content)?),
+    };
+    Ok((kind.to_string(), content))
+}
+
 /// Decode one persisted row back into an [`crate::conversation::Event`]. Returns `Ok(None)` when
 /// the row's kind is unrecognized (forward compatibility for new variants).
 pub(super) fn decode_event_from_row(
@@ -1031,6 +1412,37 @@ fn stored_row_with_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, StoredM
         created_at: row.get(3)?,
         turn_id: row.get(4)?,
         copy_of: row.get(5)?,
+        said_turn_id: row.get(6)?,
+        said_at: row.get(7)?,
+    }))
+}
+
+/// What a session's record says it has run and spent, for a query over `sessions s`: its turn
+/// rows counted and summed, the turns `GET /turns` lists, so the record and the listing never
+/// disagree. The screen's own counters, which a sub-agent's spend and a turn that never finished
+/// also reach, are its `/status` and nobody else's. Read by [`spent_from_row`].
+const SPENT_COLUMNS: &str = "(SELECT COUNT(*) FROM turns t WHERE t.session_id = s.id), \
+     (SELECT COALESCE(SUM(t.input_tokens), 0) FROM turns t WHERE t.session_id = s.id), \
+     (SELECT COALESCE(SUM(t.output_tokens), 0) FROM turns t WHERE t.session_id = s.id), \
+     (SELECT COALESCE(SUM(t.cache_creation_input_tokens), 0) FROM turns t \
+      WHERE t.session_id = s.id), \
+     (SELECT COALESCE(SUM(t.cache_read_input_tokens), 0) FROM turns t \
+      WHERE t.session_id = s.id)";
+
+/// The session's turn count and what its turns spent, from the five [`SPENT_COLUMNS`] at
+/// `offset`.
+fn spent_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<(u64, super::turns::TurnUsage)> {
+    let count = |index: usize| -> rusqlite::Result<u64> {
+        Ok(row.get::<_, i64>(offset + index)?.max(0) as u64)
+    };
+    Ok((count(0)?, super::turns::TurnUsage {
+        input_tokens: count(1)?,
+        output_tokens: count(2)?,
+        cache_creation_input_tokens: count(3)?,
+        cache_read_input_tokens: count(4)?,
     }))
 }
 
@@ -1059,28 +1471,20 @@ fn warn_once_about_row(
     true
 }
 
-/// A page from rows read one past the asked-for count, in either direction, as the oldest-first
-/// page it is and whether the extra row was there.
-fn log_page(
-    mut stored: Vec<(i64, StoredMessage)>,
-    rows: usize,
-    newest_first: bool,
-    warned: &WarnedRows,
-) -> LogPage {
-    let more = stored.len() > rows;
-    stored.truncate(rows);
-    if newest_first {
-        stored.reverse();
-    }
-    let rows = stored
+/// Decode rows as stored into log rows in the same order, skipping with a warning any row this
+/// build cannot read, as every reader of the log does.
+fn decode_log_rows(stored: Vec<(i64, StoredMessage)>, warned: &WarnedRows) -> Vec<LogRow> {
+    stored
         .into_iter()
         .filter_map(|(id, row)| match decode_event_from_row(&row) {
             Ok(Some(event)) => Some(LogRow {
                 id,
+                said: row.said(),
                 turn_id: row
                     .turn_id
                     .as_deref()
                     .and_then(|id| Uuid::parse_str(id).ok()),
+                created_at: row.created_at,
                 event,
             }),
             Ok(None) => {
@@ -1092,8 +1496,7 @@ fn log_page(
                 None
             }
         })
-        .collect();
-    LogPage { rows, more }
+        .collect()
 }
 
 /// Decode rows into `(created_at, event)` pairs in the order they were stored, skipping with a
@@ -1108,6 +1511,7 @@ fn decode_rows(
             Ok(Some(event)) => events.push((
                 EventStamp {
                     id,
+                    said: row.said(),
                     created_at: row.created_at,
                     turn_id: row.turn_id.as_deref().and_then(session_id_in),
                     copy_of: row.copy_of,
@@ -1906,14 +2310,13 @@ impl Store {
         overrides: ForkOverrides,
         source_lock: SourceLock,
     ) -> Result<Option<(CreatedSession, std::result::Result<FileLock, MekaError>)>> {
-        // First, so a refusal costs no claim on a copy that will not be made. Sibling forks in this
-        // process queue behind one another here before probing, since their flock would otherwise
-        // read as another process's; see `Store::probed_forks`.
-        let (_probing, source_held) = match source_lock {
+        // First, so a refusal costs no claim on a copy that will not be made.
+        let (_queued, source_held) = match source_lock {
             SourceLock::Probe => {
-                let probing = self.probed_forks.lock().await;
-                (Some(probing), Some(self.lock_session(source)?))
+                let ProbedSource { queued, lock } = self.probe_fork_source(source).await?;
+                (Some(queued), Some(lock))
             }
+            SourceLock::Probed(ProbedSource { queued, lock }) => (Some(queued), Some(lock)),
             SourceLock::HeldByCaller => (None, None),
         };
         let new_id = Uuid::new_v4();
@@ -1942,6 +2345,17 @@ impl Store {
         // The copy has committed, so the source is free to move again.
         drop(source_held);
         Ok(Some((created, lock)))
+    }
+
+    /// Hold a fork's source still: queue behind this process's sibling forks, whose flock would
+    /// otherwise read as another process's (see `Store::probed_forks`), then take the source's
+    /// lock, refused as [`MekaError::SessionLocked`] while another process holds it. For a door
+    /// that reads the source before the copy, so what it read is what the copy takes; the copy
+    /// releases it once it has committed.
+    pub(crate) async fn probe_fork_source(&self, source: Uuid) -> Result<ProbedSource> {
+        let queued = Arc::clone(&self.probed_forks).lock_owned().await;
+        let lock = self.lock_session(source)?;
+        Ok(ProbedSource { queued, lock })
     }
 
     /// [`Self::fork_session_locked`] with the copy's lock dropped, for tests about the copy rather
@@ -2139,11 +2553,10 @@ impl Store {
                         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     let mut last = None;
                     {
-                        let mut select = transaction.prepare(
-                            "SELECT id, kind, content, created_at, turn_id, copy_of \
-                             FROM messages WHERE session_id = ?1 AND id > ?2 AND id <= ?3 \
-                             ORDER BY id ASC LIMIT ?4",
-                        )?;
+                        let mut select = transaction.prepare(&format!(
+                            "SELECT {STORED_COLUMNS} FROM messages WHERE session_id = ?1 \
+                             AND id > ?2 AND id <= ?3 ORDER BY id ASC LIMIT ?4"
+                        ))?;
                         let mut link = transaction.prepare(
                             "INSERT OR IGNORE INTO message_blobs (message_id, hash) \
                              SELECT ?1, hash FROM message_blobs WHERE message_id = ?2",
@@ -2155,32 +2568,29 @@ impl Store {
                                 ceiling,
                                 COPY_ROWS_PER_TRANSACTION as i64
                             ],
-                            |row| {
-                                Ok((
-                                    row.get::<_, i64>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, String>(2)?,
-                                    row.get::<_, String>(3)?,
-                                    row.get::<_, Option<String>>(4)?,
-                                    row.get::<_, Option<i64>>(5)?,
-                                ))
-                            },
+                            stored_row_with_id,
                         )?;
                         for row in rows {
-                            let (source_message_id, kind, content, created_at, turn_id, copy_of) =
-                                row?;
+                            let (source_message_id, row) = row?;
                             let message_id = super::search::insert_message(
                                 &transaction,
                                 &target_id,
                                 &super::search::NewMessage {
-                                    kind: &kind,
-                                    content: &content,
-                                    created_at: &created_at,
-                                    turn_id: turn_id
+                                    kind: &row.kind,
+                                    content: &row.content,
+                                    created_at: &row.created_at,
+                                    turn_id: row
+                                        .turn_id
                                         .and_then(|old| turn_ids.get(&old))
                                         .map(String::as_str),
-                                    copy_of: copy_of
+                                    copy_of: row
+                                        .copy_of
                                         .and_then(|original| copied.get(&original).copied()),
+                                    said_turn_id: row
+                                        .said_turn_id
+                                        .and_then(|old| turn_ids.get(&old))
+                                        .map(String::as_str),
+                                    said_at: row.said_at.as_deref(),
                                 },
                             )?;
                             link.execute(rusqlite::params![message_id, source_message_id])?;
@@ -2582,7 +2992,8 @@ impl Store {
                 // carry bytes; either way the row gets a reference and the bytes a blob. The
                 // bytes join the archive's, stored ahead of the rows, so the check below sees
                 // them.
-                let mut prepared = PreparedEvent::from_event(&imported.event);
+                let mut prepared =
+                    PreparedEvent::from_event(&imported.event).said(imported.said.as_ref());
                 archive_blobs.append(&mut prepared.take_blobs());
                 events.push((
                     imported.at,
@@ -2778,8 +3189,8 @@ impl Store {
     }
 
     /// The log as history: every event but the copies a compaction kept, so a kept turn is said
-    /// once, where it was first said. For `conversation_search` and `conversation_read`, a
-    /// Markdown export and a count of a sub-agent's turns.
+    /// once, where it was first said. For a Markdown export, which records each repair beside
+    /// what it replaced.
     pub(crate) async fn load_history(
         &self,
         session_id: Uuid,
@@ -2789,6 +3200,27 @@ impl Store {
             .into_iter()
             .map(|(_, event)| event)
             .collect())
+    }
+
+    /// The messages of the session's history, oldest first, as every surface that shows it reads
+    /// its rows ([`LogRow::said`]): a summary, a repair and what a rewind took are none of them.
+    /// For `conversation_search` and `conversation_read`.
+    pub(crate) async fn history_messages(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::conversation::Message>> {
+        let stored = self.load_rows(session_id, RowRange::History).await?;
+        // After the rows, as a page of history reads them.
+        let rewound = self.rewound(session_id).await?;
+        Ok(
+            history_entries(decode_log_rows(stored, &self.warned_rows), &rewound, 0)
+                .into_iter()
+                .filter_map(|entry| match entry.kind {
+                    HistoryKind::Message(message) => Some(message),
+                    _ => None,
+                })
+                .collect(),
+        )
     }
 
     /// The events that produce the model's view: the last `compact_boundary` row and everything
@@ -2834,8 +3266,16 @@ impl Store {
         let mut conversation = crate::conversation::Conversation::from_events(events);
 
         // Anthropic's API rejects an orphaned `tool_use`, so a log a crash cut mid-tool-call is
-        // repaired on the way in.
-        for message in conversation.sanitize_orphans() {
+        // repaired on the way in, and the repair is saved: a view in memory shorter than the
+        // store's would have every count taken on one land wrong on the other, a rewind's
+        // included. Between turns, so it names none; it puts messages back, so it is no rewind.
+        let dropped = conversation.sanitize_orphans();
+        if !dropped.is_empty()
+            && let Some(repair) = conversation.events().last()
+        {
+            self.save_event(session_id, repair, None).await?;
+        }
+        for message in dropped {
             let tool_use_ids: Vec<String> = message
                 .content
                 .iter()
@@ -2865,10 +3305,8 @@ impl Store {
         Ok(conversation)
     }
 
-    /// Variant of [`Self::load_events`] that also returns the persisted `created_at` timestamp for
-    /// each event. Used by the HTTP `GET /v1/sessions/{id}/messages` endpoint to surface
-    /// per-message creation timestamps on `MessageView` per the spec's resource model.
-    /// Order matches `load_events` exactly: chronological by insert id.
+    /// [`Self::load_events`] with each event's row stamp, in the same order: for an export, which
+    /// keeps when each event was written.
     pub(crate) async fn load_events_with_timestamps(
         &self,
         session_id: Uuid,
@@ -2973,6 +3411,8 @@ impl Store {
                         created_at: &now,
                         turn_id: None,
                         copy_of: None,
+                        said_turn_id: None,
+                        said_at: None,
                     },
                 )?;
                 transaction.execute(
@@ -3212,8 +3652,8 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(&format!(
-                    "SELECT id, kind, content, created_at, turn_id, copy_of FROM messages \
-                     WHERE session_id = ?1 {floor} ORDER BY id ASC"
+                    "SELECT {STORED_COLUMNS} FROM messages WHERE session_id = ?1 {floor} \
+                     ORDER BY id ASC"
                 ))?;
                 let rows = statement
                     .query_map(rusqlite::params_from_iter(parameters), stored_row_with_id)?
@@ -3253,75 +3693,123 @@ impl Store {
             .map_err(|error| MekaError::Database(format!("failed to read the log's end: {error}")))
     }
 
-    /// The stretches of the session's log its conversation no longer holds, for the screen, which
-    /// shows a session as the conversation it continues rather than the log it keeps.
+    /// The stretches of the session's log its history no longer holds, for every surface that
+    /// shows the history: the screen, an editor's replay, the HTTP history and session search.
     ///
     /// A rewind is written between turns, and takes what it took and any rewind inside it. A turn
     /// writes the same repair to take its prompt back: to join a message to it, which brings the
     /// prompt straight back in the joined message, or to withdraw it when the provider refused it,
     /// which the live run left on the screen and so does a replay. Only an empty repair takes
-    /// anything, so a session without one answers without decoding its log.
+    /// anything, so a session without one answers without decoding its log, and one with one
+    /// decodes it once for as long as the part of the log its stretches come from holds
+    /// ([`RewoundCache`]).
     pub(crate) async fn rewound(&self, session_id: Uuid) -> Result<Vec<Rewound>> {
-        let taken = self
+        let (taken, following, counted) = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // A row that is not JSON is left to the decode, which skips it with a warning, as
                 // every reader of the log does, rather than failing the question for the session.
                 connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ?1 AND kind = ?2 \
-                     AND CASE WHEN json_valid(content) \
-                     THEN json_array_length(content, '$.Repair.messages') END = 0)",
+                    "WITH taken AS (
+                         SELECT MAX(id) AS id FROM messages WHERE session_id = ?1 AND kind = ?2
+                         AND CASE WHEN json_valid(content)
+                             THEN json_array_length(content, '$.Repair.messages') END = 0
+                     ),
+                     following AS (
+                         SELECT MIN(m.id) AS id FROM messages m, taken
+                         WHERE m.session_id = ?1 AND m.id > taken.id
+                     )
+                     SELECT taken.id, following.id,
+                            (SELECT COUNT(*) FROM messages m WHERE m.session_id = ?1
+                             AND m.id <= COALESCE(following.id, taken.id))
+                     FROM taken, following",
                     rusqlite::params![session_id.to_string(), REPAIR_KIND],
-                    |row| row.get::<_, bool>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
                 )
             })
             .await
             .map_err(|error| {
                 MekaError::Database(format!("failed to look for the log's rewinds: {error}"))
             })?;
-        if !taken {
+        let Some(taken) = taken else {
             return Ok(Vec::new());
+        };
+        let shape = (taken, following, counted);
+        if let Some((cached, stretches)) = crate::sync::lock(&self.rewound_cache).get(&session_id)
+            && *cached == shape
+        {
+            return Ok(stretches.clone());
         }
+        let stretches = self.compute_rewound(session_id).await?;
+        {
+            let mut cache = crate::sync::lock(&self.rewound_cache);
+            if cache.len() >= REWOUND_CACHE_SESSIONS {
+                cache.clear();
+            }
+            cache.insert(session_id, (shape, stretches.clone()));
+        }
+        Ok(stretches)
+    }
+
+    /// [`Self::rewound`] worked out from the whole log.
+    async fn compute_rewound(&self, session_id: Uuid) -> Result<Vec<Rewound>> {
         let stored = self.load_rows(session_id, RowRange::All).await?;
+        let order: Vec<i64> = stored.iter().map(|(id, _)| *id).collect();
+        let copies: std::collections::HashMap<i64, i64> = stored
+            .iter()
+            .filter_map(|(id, row)| row.copy_of.map(|original| (*id, original)))
+            .collect();
+        let history: Vec<i64> = order
+            .iter()
+            .copied()
+            .filter(|id| !copies.contains_key(id))
+            .collect();
         let events: Vec<(RowStamp, crate::conversation::Event)> =
-            log_page(stored, usize::MAX, false, &self.warned_rows)
-                .rows
+            decode_log_rows(stored, &self.warned_rows)
                 .into_iter()
                 .map(|row| {
                     let stamp = RowStamp {
                         id: row.id,
                         turn_id: row.turn_id,
+                        said_in: row.said.map_or(row.turn_id, |said| said.turn_id),
                     };
                     (stamp, row.event)
                 })
                 .collect();
+        let turn_of: std::collections::HashMap<i64, Option<Uuid>> = events
+            .iter()
+            .map(|(stamp, _)| (stamp.id, stamp.said_in))
+            .collect();
         Ok(crate::conversation::rewinds(&events)
             .into_iter()
-            .filter_map(|taken| match (taken.rejoined, taken.at.turn_id) {
+            .filter_map(|taken| {
                 // A prompt that came straight back joined, whatever its row names: in a log
-                // written before turns were recorded, none does.
-                (true, _) => Some(Rewound {
-                    rows: taken.first.id..=taken.at.id,
-                    said_at: None,
-                    turns: 0,
-                }),
-                (false, None) => {
-                    let turns: std::collections::HashSet<Uuid> = events
-                        .iter()
-                        .filter(|(stamp, _)| (taken.first.id..taken.at.id).contains(&stamp.id))
-                        .filter_map(|(stamp, _)| stamp.turn_id)
-                        .collect();
-                    Some(Rewound {
-                        rows: taken.first.id..=taken.at.id - 1,
-                        said_at: Some(taken.at.id),
-                        turns: if turns.is_empty() {
-                            taken.turns
-                        } else {
-                            turns.len()
-                        },
-                    })
+                // written before turns were recorded, none does. A repair a turn wrote for any
+                // other reason withdrew its prompt, which the history keeps as the screen did.
+                if !taken.rejoined && taken.at.turn_id.is_some() {
+                    return None;
                 }
-                (false, Some(_)) => None,
+                let rows = taken_rows(&order, &copies, taken.first.id..taken.at.id);
+                let turns: std::collections::HashSet<Uuid> = rows
+                    .iter()
+                    .filter_map(|id| turn_of.get(id).copied().flatten())
+                    .collect();
+                Some(Rewound {
+                    rows: runs_of(&history, &rows),
+                    at: taken.at.id,
+                    joined: taken.rejoined,
+                    turns: match (taken.rejoined, turns.len()) {
+                        (true, _) => 0,
+                        (false, 0) => taken.turns,
+                        (false, turns) => turns,
+                    },
+                })
             })
             .collect())
     }
@@ -3337,26 +3825,13 @@ impl Store {
         before: Option<i64>,
         rows: usize,
     ) -> Result<LogPage> {
-        let fetch = i64::try_from(rows).unwrap_or(i64::MAX).saturating_add(1);
-        let stored = self
-            .connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(
-                    "SELECT id, kind, content, created_at, turn_id, copy_of FROM messages \
-                     WHERE session_id = ?1 AND (?2 IS NULL OR id < ?2) AND copy_of IS NULL \
-                     ORDER BY id DESC LIMIT ?3",
-                )?;
-                let found = statement
-                    .query_map(
-                        rusqlite::params![session_id.to_string(), before, fetch],
-                        stored_row_with_id,
-                    )?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(found)
-            })
-            .await
-            .map_err(|error| MekaError::Database(format!("failed to read a log page: {error}")))?;
-        Ok(log_page(stored, rows, true, &self.warned_rows))
+        let (stored, more) = self
+            .read_log_rows(session_id, HistoryEdge::Before(before), None, rows)
+            .await?;
+        Ok(LogPage {
+            rows: decode_log_rows(stored, &self.warned_rows),
+            more,
+        })
     }
 
     /// The mirror of [`Self::log_page_before`]: up to `rows` rows above `after` and at or below
@@ -3368,26 +3843,317 @@ impl Store {
         through: i64,
         rows: usize,
     ) -> Result<LogPage> {
-        let fetch = i64::try_from(rows).unwrap_or(i64::MAX).saturating_add(1);
+        let (stored, more) = self
+            .read_log_rows(session_id, HistoryEdge::After(after), Some(through), rows)
+            .await?;
+        Ok(LogPage {
+            rows: decode_log_rows(stored, &self.warned_rows),
+            more,
+        })
+    }
+
+    /// A page of the session's history: up to `limit` entries on the side of `edge` it names,
+    /// oldest first, and whether more lie past them. The rows a rewind took and those history does
+    /// not show are read past rather than counted, so a page is short only at the end of the log.
+    pub(crate) async fn history_page(
+        &self,
+        session_id: Uuid,
+        edge: HistoryEdge,
+        limit: usize,
+    ) -> Result<HistoryPage> {
+        let limit = limit.max(1);
+        // Read after the first rows, so a rewind written between the two reads is known to this
+        // page: its row, if the page holds it, says what it took, and what it took is left out.
+        let mut rewound: Option<Vec<Rewound>> = None;
+        let mut entries: Vec<HistoryEntry> = Vec::new();
+        let mut more;
+        // One entry past the page, so `more` says whether an entry lies beyond it rather than
+        // whether rows do: the rows past a full page may be ones the history leaves out.
+        let wanted = limit.saturating_add(1);
+        match edge {
+            HistoryEdge::Before(mut before) => loop {
+                let (stored, has_more) = self
+                    .read_log_rows(
+                        session_id,
+                        HistoryEdge::Before(before),
+                        None,
+                        wanted - entries.len(),
+                    )
+                    .await?;
+                more = has_more;
+                let Some(&(oldest, _)) = stored.first() else {
+                    break;
+                };
+                before = Some(oldest);
+                let stretches = match &rewound {
+                    Some(stretches) => stretches,
+                    None => rewound.insert(self.rewound(session_id).await?),
+                };
+                let below = self.compactions_before(session_id, oldest).await?;
+                let mut chunk =
+                    history_entries(decode_log_rows(stored, &self.warned_rows), stretches, below);
+                chunk.append(&mut entries);
+                entries = chunk;
+                if entries.len() >= wanted || !more {
+                    break;
+                }
+            },
+            HistoryEdge::After(mut after) => loop {
+                let (stored, has_more) = self
+                    .read_log_rows(
+                        session_id,
+                        HistoryEdge::After(after),
+                        None,
+                        wanted - entries.len(),
+                    )
+                    .await?;
+                more = has_more;
+                let (Some(&(first, _)), Some(&(last, _))) = (stored.first(), stored.last()) else {
+                    break;
+                };
+                after = last;
+                let stretches = match &rewound {
+                    Some(stretches) => stretches,
+                    None => rewound.insert(self.rewound(session_id).await?),
+                };
+                let below = self.compactions_before(session_id, first).await?;
+                entries.extend(history_entries(
+                    decode_log_rows(stored, &self.warned_rows),
+                    stretches,
+                    below,
+                ));
+                if entries.len() >= wanted || !more {
+                    break;
+                }
+            },
+        }
+        if entries.len() > limit {
+            more = true;
+            match edge {
+                HistoryEdge::Before(_) => {
+                    entries.drain(..entries.len() - limit);
+                }
+                HistoryEdge::After(_) => entries.truncate(limit),
+            }
+        }
+        Ok(HistoryPage { entries, more })
+    }
+
+    /// The history entries turn `turn_id` wrote, oldest first.
+    pub(crate) async fn turn_entries(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<Vec<HistoryEntry>> {
         let stored = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(
-                    "SELECT id, kind, content, created_at, turn_id, copy_of FROM messages \
-                     WHERE session_id = ?1 AND id > ?2 AND id <= ?3 AND copy_of IS NULL \
-                     ORDER BY id ASC LIMIT ?4",
-                )?;
+                // The rows the turn said: a copy a compaction kept standing alone is the turn's
+                // that said it, not the one that wrote it.
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {STORED_COLUMNS} FROM messages WHERE session_id = ?1 \
+                     AND (CASE WHEN said_at IS NULL THEN turn_id ELSE said_turn_id END) = ?2 \
+                     AND copy_of IS NULL ORDER BY id ASC"
+                ))?;
                 let found = statement
                     .query_map(
-                        rusqlite::params![session_id.to_string(), after, through, fetch],
+                        rusqlite::params![session_id.to_string(), turn_id.to_string()],
                         stored_row_with_id,
                     )?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 Ok(found)
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to read a log page: {error}")))?;
-        Ok(log_page(stored, rows, false, &self.warned_rows))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to read a turn's rows: {error}"))
+            })?;
+        let Some(&(first, _)) = stored.first() else {
+            return Ok(Vec::new());
+        };
+        let rewound = self.rewound(session_id).await?;
+        let below = self.compactions_before(session_id, first).await?;
+        Ok(history_entries(
+            decode_log_rows(stored, &self.warned_rows),
+            &rewound,
+            below,
+        ))
+    }
+
+    /// The history entry at `position`, or `None` when the history shows nothing there: a copy, a
+    /// row a rewind took, a row that only rewrites the context, a row of another session.
+    pub(crate) async fn history_entry(
+        &self,
+        session_id: Uuid,
+        position: i64,
+    ) -> Result<Option<HistoryEntry>> {
+        let stored = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {STORED_COLUMNS} FROM messages \
+                     WHERE session_id = ?1 AND id = ?2 AND copy_of IS NULL"
+                ))?;
+                let found = statement
+                    .query_map(
+                        rusqlite::params![session_id.to_string(), position],
+                        stored_row_with_id,
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(found)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to read a history entry: {error}"))
+            })?;
+        if stored.is_empty() {
+            return Ok(None);
+        }
+        let rewound = self.rewound(session_id).await?;
+        let below = self.compactions_before(session_id, position).await?;
+        Ok(
+            history_entries(decode_log_rows(stored, &self.warned_rows), &rewound, below)
+                .into_iter()
+                .next(),
+        )
+    }
+
+    /// The position of the session's latest compaction, or `None` when it has had none.
+    pub(crate) async fn last_compaction(&self, session_id: Uuid) -> Result<Option<i64>> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.query_row(
+                    "SELECT MAX(id) FROM messages WHERE session_id = ?1 AND kind = ?2",
+                    rusqlite::params![session_id.to_string(), COMPACT_BOUNDARY_KIND],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to find the latest compaction: {error}"))
+            })
+    }
+
+    /// Up to `rows` rows on the side of `edge` it names, and at or below `through` when it names
+    /// one, copies left out, oldest first and as stored, and whether more lie past them: the one
+    /// read every page of the log takes.
+    async fn read_log_rows(
+        &self,
+        session_id: Uuid,
+        edge: HistoryEdge,
+        through: Option<i64>,
+        rows: usize,
+    ) -> Result<(Vec<(i64, StoredMessage)>, bool)> {
+        let fetch = i64::try_from(rows).unwrap_or(i64::MAX).saturating_add(1);
+        let (sql, bound, newest_first) = match edge {
+            HistoryEdge::Before(before) => (
+                format!(
+                    "SELECT {STORED_COLUMNS} FROM messages WHERE session_id = ?1 \
+                     AND (?2 IS NULL OR id < ?2) AND (?4 IS NULL OR id <= ?4) \
+                     AND copy_of IS NULL ORDER BY id DESC LIMIT ?3"
+                ),
+                before,
+                true,
+            ),
+            HistoryEdge::After(after) => (
+                format!(
+                    "SELECT {STORED_COLUMNS} FROM messages WHERE session_id = ?1 AND id > ?2 \
+                     AND (?4 IS NULL OR id <= ?4) AND copy_of IS NULL ORDER BY id ASC LIMIT ?3"
+                ),
+                Some(after),
+                false,
+            ),
+        };
+        let mut stored = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(&sql)?;
+                let found = statement
+                    .query_map(
+                        rusqlite::params![session_id.to_string(), bound, fetch, through],
+                        stored_row_with_id,
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(found)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to read the log: {error}")))?;
+        let more = stored.len() > rows;
+        stored.truncate(rows);
+        if newest_first {
+            stored.reverse();
+        }
+        Ok((stored, more))
+    }
+
+    /// How many compactions the session's log holds below `position`.
+    pub(crate) async fn compactions_before(&self, session_id: Uuid, position: i64) -> Result<u64> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind = ?2 AND id < ?3",
+                    rusqlite::params![session_id.to_string(), COMPACT_BOUNDARY_KIND, position],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| MekaError::Database(format!("failed to count compactions: {error}")))
+    }
+
+    /// The events that produce the model's view, as [`Self::load_view_events`] reads them, each
+    /// with its row's stamp.
+    pub(crate) async fn load_view_events_with_stamps(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<(EventStamp, crate::conversation::Event)>> {
+        let stored = self
+            .load_rows(session_id, RowRange::FromLastBoundary)
+            .await?;
+        Ok(decode_rows(stored, &self.warned_rows))
+    }
+
+    /// For each of `positions`, the position of the row it stands for in history: the row itself,
+    /// or for a copy a compaction kept, the row its chain of copies starts from, since a turn kept
+    /// by two compactions is a copy of a copy. A position no row of the session holds is absent. A
+    /// link that does not point back down the log ends the chain, so a hand-edited one cannot loop.
+    pub(crate) async fn original_positions(
+        &self,
+        session_id: Uuid,
+        positions: Vec<i64>,
+    ) -> Result<std::collections::HashMap<i64, i64>> {
+        if positions.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let placeholders = vec!["?"; positions.len()].join(",");
+                let mut statement = connection.prepare(&format!(
+                    "WITH RECURSIVE chain(start, id, copy_of) AS ( \
+                         SELECT id, id, copy_of FROM messages \
+                         WHERE session_id = ? AND id IN ({placeholders}) \
+                         UNION ALL \
+                         SELECT chain.start, m.id, m.copy_of FROM chain \
+                         JOIN messages m ON m.id = chain.copy_of AND m.id < chain.id \
+                     ) \
+                     SELECT chain.start, chain.id FROM chain \
+                     WHERE NOT EXISTS (SELECT 1 FROM messages o \
+                                       WHERE o.id = chain.copy_of AND o.id < chain.id)"
+                ))?;
+                let session = session_id.to_string();
+                let parameters: Vec<&dyn rusqlite::ToSql> = std::iter::once(&session as _)
+                    .chain(positions.iter().map(|position| position as _))
+                    .collect();
+                let found = statement
+                    .query_map(parameters.as_slice(), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(found.into_iter().collect())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to read the rows copies stand for: {error}"))
+            })
     }
 
     /// How many times this session has been compacted, i.e. its compaction *generation*.
@@ -3411,31 +4177,6 @@ impl Store {
             .await
             .map(|count| count.max(0) as u64)
             .map_err(|error| MekaError::Database(format!("failed to count compactions: {error}")))
-    }
-
-    /// How many times the conversation has been rewritten rather than appended to: the
-    /// `revision` the materialized view reports, counted from the rows. A resident session's
-    /// in-memory log begins at its last compaction boundary, so replaying it would undercount;
-    /// the rows answer the same number for a resident session and a dormant one.
-    pub(crate) async fn count_rewrites(&self, session_id: Uuid) -> Result<u64> {
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind IN (?2, ?3, ?4, \
-                     ?5)",
-                    rusqlite::params![
-                        session_id.to_string(),
-                        COMPACT_BOUNDARY_KIND,
-                        REPAIR_KIND,
-                        REDACT_KIND,
-                        UNSIGN_KIND
-                    ],
-                    |row| row.get::<_, i64>(0),
-                )
-            })
-            .await
-            .map(|count| count.max(0) as u64)
-            .map_err(|error| MekaError::Database(format!("failed to count rewrites: {error}")))
     }
 
     /// The session `meka -c` resumes: the most recently touched one a host can actually drive.
@@ -3646,50 +4387,13 @@ impl Store {
             Some(token) => Some(decode_list_cursor(token)?),
             None => None,
         };
-        let include_children = filter.include_children;
-        let cwd_filter_string = filter.cwd.as_ref().map(|path| path.display().to_string());
-        let parent_string = filter.parent.map(|parent| parent.to_string());
-        let profile_filter = filter.profile.clone();
-        let project_filter = filter.project.clone();
-        let pinned_filter = filter.pinned;
-        // Compared as text: every writer renders `updated_at` with `to_rfc3339`, whose fixed
-        // width and `+00:00` offset sort as the instants do, so this holds only while no writer
-        // renders the column another way.
-        let updated_since = filter.updated_since.map(|at| at.to_rfc3339());
+        let (filter_clauses, filter_parameters) = filter.sql_terms();
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // The shared rule, so `--include-children` covers the same rows the refusal treats
-                // as children. Keying on the parent link alone would list an imported sub-agent
-                // among the root sessions and then decline to run it, with the refusal's own text
-                // telling the reader to pass `--include-children` to see a row that is already in
-                // front of them.
-                let not_spawned = format!("NOT {}", spawned_session_sql("s."));
                 let whole = whole_session_sql("s.");
                 let mut clauses: Vec<&str> = vec![&whole];
-                // A parent names sub-agents, so the root-only clause gives way to it.
-                if parent_string.is_some() {
-                    clauses.push("s.parent_session_id = :parent");
-                } else if !include_children {
-                    clauses.push(&not_spawned);
-                }
-                if cwd_filter_string.is_some() {
-                    clauses.push("s.working_directory = :cwd");
-                }
-                if profile_filter.is_some() {
-                    clauses.push("s.profile = :profile");
-                }
-                if project_filter.is_some() {
-                    clauses.push("s.project = :project");
-                }
-                match pinned_filter {
-                    Some(true) => clauses.push("s.pinned_at IS NOT NULL"),
-                    Some(false) => clauses.push("s.pinned_at IS NULL"),
-                    None => {}
-                }
-                if updated_since.is_some() {
-                    clauses.push("s.updated_at > :updated_since");
-                }
+                clauses.extend(filter_clauses.iter().map(String::as_str));
                 if cursor_decoded.is_some() {
                     // Keyset on the listing's own order, strictly past the cursor row: the pinned
                     // group first, each group by its time, and the id as the tie-break so two
@@ -3725,6 +4429,7 @@ impl Store {
                                ORDER BY id ASC LIMIT 1),
                               ''
                             ) AS title_kind,
+                            {SPENT_COLUMNS},
                             {turn_columns}
                      FROM sessions s
                      {latest_turn_join}
@@ -3744,20 +4449,8 @@ impl Store {
                 };
                 let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
                 params.push((":limit", &fetch_limit));
-                if let Some(ref cwd) = cwd_filter_string {
-                    params.push((":cwd", cwd));
-                }
-                if let Some(ref parent) = parent_string {
-                    params.push((":parent", parent));
-                }
-                if let Some(ref profile) = profile_filter {
-                    params.push((":profile", profile));
-                }
-                if let Some(ref project) = project_filter {
-                    params.push((":project", project));
-                }
-                if let Some(ref since) = updated_since {
-                    params.push((":updated_since", since));
+                for (name, value) in &filter_parameters {
+                    params.push((name, value));
                 }
                 if let Some(cursor) = &cursor_decoded {
                     params.push((":cursor_pinned", &cursor.pinned));
@@ -3788,7 +4481,8 @@ impl Store {
                         row.get(14)?,
                         title_chars,
                     );
-                    let last_turn = turn_from_row(row, 16)?;
+                    let spent = spent_from_row(row, 16)?;
+                    let last_turn = turn_from_row(row, 21)?;
                     Ok((
                         id_str,
                         created_at,
@@ -3805,6 +4499,7 @@ impl Store {
                         title,
                         pinned_at,
                         last_turn,
+                        spent,
                     ))
                 })?;
 
@@ -3826,6 +4521,7 @@ impl Store {
                         title,
                         pinned_at,
                         last_turn,
+                        spent,
                     ) = row?;
                     let id = Uuid::parse_str(&id_str).map_err(|error| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
@@ -3849,6 +4545,8 @@ impl Store {
                         parent_id: parent_id.as_deref().and_then(session_id_in),
                         pinned_at,
                         last_turn,
+                        turn_count: spent.0,
+                        usage: spent.1,
                     });
                 }
                 Ok(summaries)
@@ -3890,6 +4588,7 @@ impl Store {
                                ORDER BY id ASC LIMIT 1),
                               ''
                             ) AS title_kind,
+                            {SPENT_COLUMNS},
                             {turn_columns}
                      FROM sessions s
                      {latest_turn_join}
@@ -3918,7 +4617,8 @@ impl Store {
                         row.get(14)?,
                         crate::conversation::TITLE_CHARS,
                     );
-                    let last_turn = turn_from_row(row, 16)?;
+                    let spent = spent_from_row(row, 16)?;
+                    let last_turn = turn_from_row(row, 21)?;
                     Ok((
                         id_str,
                         created_at,
@@ -3935,6 +4635,7 @@ impl Store {
                         title,
                         pinned_at,
                         last_turn,
+                        spent,
                     ))
                 })?;
                 match rows.next() {
@@ -3955,6 +4656,7 @@ impl Store {
                             title,
                             pinned_at,
                             last_turn,
+                            spent,
                         ) = row?;
                         let id = Uuid::parse_str(&id_str).map_err(|error| {
                             rusqlite::Error::InvalidParameterName(error.to_string())
@@ -3982,6 +4684,8 @@ impl Store {
                                 .and_then(session_id_in),
                             pinned_at,
                             last_turn,
+                            turn_count: spent.0,
+                            usage: spent.1,
                         }))
                     }
                     None => Ok(None),
@@ -4265,8 +4969,9 @@ impl Store {
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 // A turn's age is its rows' age, so an expired turn in a compacted session has no
-                // rows left below the boundary; one with none above it either is gone whole. The
-                // turns still named above the boundary are gathered once, not once per turn.
+                // rows left below the boundary; one with none above it either is gone whole,
+                // unless a copy a compaction kept still says it, which history names it by. The
+                // turns still named are gathered once, not once per turn.
                 let turns = transaction.execute(
                     &format!(
                         "WITH {latest_boundaries}
@@ -4277,7 +4982,11 @@ impl Store {
                                AND t.id NOT IN (
                                    SELECT m.turn_id FROM messages m
                                    JOIN latest ON latest.session_id = m.session_id
-                                   WHERE m.id >= latest.boundary AND m.turn_id IS NOT NULL))"
+                                   WHERE m.id >= latest.boundary AND m.turn_id IS NOT NULL)
+                               AND t.id NOT IN (
+                                   SELECT m.said_turn_id FROM messages m
+                                   JOIN latest ON latest.session_id = m.session_id
+                                   WHERE m.said_turn_id IS NOT NULL))"
                     ),
                     rusqlite::params_from_iter(parameters.iter()),
                 )?;
@@ -5302,49 +6011,6 @@ mod tests {
         assert_eq!(copied[1].profile, None);
     }
 
-    /// `revision` is defined by the replay, and the rows have to count the same number: a
-    /// resident session's log begins at its last boundary, so the rows are what it answers from.
-    #[tokio::test]
-    async fn the_rewrite_count_agrees_with_the_replays_revision() {
-        use crate::conversation::{Event, Message, RedactedImage, materialize_annotated};
-        let store = Store::for_test().await;
-        let id = store
-            .create_session(None, "test-profile".to_string())
-            .await
-            .expect("create");
-        for event in [
-            Event::Append(Message::user("one")),
-            Event::Append(Message::assistant_text("two")),
-            Event::CompactBoundary {
-                summary: Message::user("summary"),
-                replaced_count: 2,
-                record: crate::conversation::CompactionRecord::for_test(),
-                loaded_tools_snapshot: Default::default(),
-                checklist_snapshot: Default::default(),
-            },
-            Event::Append(Message::user("three")),
-            Event::Append(Message::assistant_text("four")),
-            Event::Repair {
-                replaced_count: 1,
-                messages: Vec::new(),
-            },
-            Event::Redact {
-                images: vec![RedactedImage {
-                    from_end: 1,
-                    block: 0,
-                    item: None,
-                }],
-            },
-            Event::Unsign,
-        ] {
-            store.save_event(id, &event, None).await.expect("save");
-        }
-        let events = store.load_events_with_timestamps(id).await.expect("load");
-        let replayed = materialize_annotated(&events).revision;
-        assert_eq!(replayed, 4, "one of each rewriting kind");
-        assert_eq!(store.count_rewrites(id).await.expect("count"), replayed);
-    }
-
     /// Every filter narrows the one listing, and they compose.
     #[tokio::test]
     async fn the_listing_filters_by_profile_pin_and_time() {
@@ -5735,11 +6401,631 @@ mod tests {
         assert!(!store.session_exists(child).await.expect("exists"));
     }
 
+    /// A resume that drops a call a crash left unanswered saves the drop, so the store replays the
+    /// view memory holds, each message still the row and turn it was said in; the history keeps the
+    /// call where it was said, and a second resume finds nothing to drop.
+    #[tokio::test]
+    async fn a_resume_saves_the_drop_of_a_call_a_crash_left_unanswered() {
+        use crate::conversation::{ContentBlock, Event, Message, Role};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "seed").await;
+        let (crashed, next) = (Uuid::new_v4(), Uuid::new_v4());
+        let orphan = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: "shell_execute".to_string(),
+                input: serde_json::json!({"command": "true"}),
+            }],
+        };
+        for (turn, message) in [
+            (crashed, Message::user("run it")),
+            (crashed, orphan),
+            (next, Message::user("again")),
+            (next, Message::assistant_text("Done.")),
+        ] {
+            store
+                .save_event(id, &Event::Append(message), Some(turn))
+                .await
+                .expect("save");
+        }
+        let resumed = store.load_conversation(id).await.expect("resume");
+        let texts = |messages: &[Message]| -> Vec<String> {
+            messages.iter().map(Message::text_content).collect()
+        };
+        assert_eq!(texts(resumed.as_slice()), [
+            "seed", "run it", "again", "Done."
+        ]);
+
+        let stored = crate::conversation::materialize_annotated(
+            &store
+                .load_view_events_with_stamps(id)
+                .await
+                .expect("the view"),
+        );
+        assert_eq!(
+            stored.messages,
+            resumed.as_slice(),
+            "the store replays memory's view"
+        );
+        let turns: Vec<Option<Uuid>> = stored.stamps.iter().map(|stamp| stamp.turn_id).collect();
+        assert_eq!(turns, [None, Some(crashed), Some(next), Some(next)]);
+
+        let rows = store.load_events(id).await.expect("rows").len();
+        store.load_conversation(id).await.expect("a second resume");
+        assert_eq!(
+            store.load_events(id).await.expect("rows").len(),
+            rows,
+            "nothing more to drop"
+        );
+        let history = store
+            .history_page(id, HistoryEdge::Before(None), 100)
+            .await
+            .expect("the history");
+        assert!(
+            history.entries.iter().any(|entry| matches!(
+                &entry.kind,
+                HistoryKind::Message(message) if message.role == Role::Assistant
+                    && message.text_content().is_empty()
+            )),
+            "the call stays where it was said: {history:?}"
+        );
+    }
+
+    /// A message a rewind took back is no match: a session whose only match it was is no result,
+    /// and one whose best match it was points at its next best instead.
+    #[tokio::test]
+    async fn session_search_passes_over_what_a_rewind_took() {
+        use crate::conversation::{Conversation, Event, Message};
+        let store = Store::for_test().await;
+        let gone = plain_session(&store, "nothing to see").await;
+        let kept = plain_session(&store, "a zephyrine note").await;
+        for id in [gone, kept] {
+            let turn = Uuid::new_v4();
+            for event in [
+                Event::Append(Message::user("zephyrine zephyrine zephyrine")),
+                Event::Append(Message::assistant_text("Noted.")),
+            ] {
+                store
+                    .save_event(id, &event, Some(turn))
+                    .await
+                    .expect("save");
+            }
+            let mut conversation =
+                Conversation::from_events(store.load_events(id).await.expect("load"));
+            let rewind = conversation.rewind(1).expect("a turn to rewind");
+            store.save_rewind(id, &rewind).await.expect("rewind");
+        }
+        let found = store
+            .search_sessions(
+                "zephyrine",
+                10,
+                SessionReach::Store(SessionFilter::default()),
+            )
+            .await
+            .expect("search");
+        let ids: Vec<Uuid> = found.iter().map(|found| found.session.id).collect();
+        assert_eq!(ids, [kept], "only a match the history shows counts");
+        let seed = store
+            .history_page(kept, HistoryEdge::After(0), 1)
+            .await
+            .expect("the history")
+            .entries
+            .first()
+            .map(|entry| entry.position);
+        assert_eq!(found.first().and_then(|found| found.excerpt_position), seed);
+    }
+
+    /// A session ranks by the best match its history shows: one whose best match a rewind took
+    /// ranks by its next best, behind a session whose match it would have beaten.
+    #[tokio::test]
+    async fn a_session_ranks_by_the_best_match_its_history_shows() {
+        use crate::conversation::{Conversation, Event, Message};
+        let store = Store::for_test().await;
+        let save = |id: Uuid, turn: Uuid, words: &'static str| {
+            let store = store.clone();
+            async move {
+                for event in [
+                    Event::Append(Message::user(words)),
+                    Event::Append(Message::assistant_text("Noted.")),
+                ] {
+                    store
+                        .save_event(id, &event, Some(turn))
+                        .await
+                        .expect("save");
+                }
+            }
+        };
+        let rewound = plain_session(&store, "seed").await;
+        save(
+            rewound,
+            Uuid::new_v4(),
+            "zephyrine zephyrine zephyrine zephyrine zephyrine zephyrine",
+        )
+        .await;
+        let mut conversation =
+            Conversation::from_events(store.load_events(rewound).await.expect("load"));
+        let rewind = conversation.rewind(1).expect("a turn to rewind");
+        store.save_rewind(rewound, &rewind).await.expect("rewind");
+        save(
+            rewound,
+            Uuid::new_v4(),
+            "one zephyrine among a good many other words in a long and rambling sentence",
+        )
+        .await;
+        let shown = plain_session(&store, "seed").await;
+        save(shown, Uuid::new_v4(), "zephyrine").await;
+
+        let found = store
+            .search_sessions(
+                "zephyrine",
+                10,
+                SessionReach::Store(SessionFilter::default()),
+            )
+            .await
+            .expect("search");
+        let ids: Vec<Uuid> = found.iter().map(|found| found.session.id).collect();
+        assert_eq!(ids, [shown, rewound]);
+    }
+
+    /// A session's stretches follow every row that can move them, the cache they are kept in
+    /// included: a prompt a turn took back is no stretch until the row after it joins a message to
+    /// it.
+    #[tokio::test]
+    async fn the_stretches_follow_a_prompt_joined_after_they_were_read() {
+        use crate::conversation::{ContentBlock, Event, Message};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "seed").await;
+        let turn = Uuid::new_v4();
+        // A prompt opens with its context block, which is how it is stored: as the blocks it is.
+        let prompt = Message::user_turn("now", "the prompt", Vec::new());
+        let mut joined = prompt.clone();
+        joined.content.push(ContentBlock::Text {
+            text: "and a message joined to it".to_string(),
+        });
+        for event in [Event::Append(prompt), Event::Repair {
+            replaced_count: 1,
+            messages: Vec::new(),
+        }] {
+            store
+                .save_event(id, &event, Some(turn))
+                .await
+                .expect("save");
+        }
+        assert!(
+            store.rewound(id).await.expect("stretches").is_empty(),
+            "a prompt taken back alone is withdrawn, and stays where it was said"
+        );
+        store
+            .save_event(id, &Event::Append(joined), Some(turn))
+            .await
+            .expect("save");
+        let stretches = store.rewound(id).await.expect("stretches");
+        assert!(
+            matches!(stretches.as_slice(), [stretch] if stretch.joined),
+            "{stretches:?}"
+        );
+    }
+
+    /// A page says more lies past it only when an item does: rows past a full page that the history
+    /// leaves out, here a redaction, are no reason for another page.
+    #[tokio::test]
+    async fn a_full_page_with_only_unsaid_rows_past_it_says_nothing_more() {
+        use crate::conversation::Event;
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "seed").await;
+        store
+            .save_event(
+                id,
+                &Event::Append(crate::conversation::Message::assistant_text("One.")),
+                None,
+            )
+            .await
+            .expect("save");
+        store
+            .save_event(id, &Event::Redact { images: Vec::new() }, None)
+            .await
+            .expect("save");
+        let up = store
+            .history_page(id, HistoryEdge::After(0), 2)
+            .await
+            .expect("page");
+        assert_eq!((up.entries.len(), up.more), (2, false), "{up:?}");
+        let down = store
+            .history_page(id, HistoryEdge::Before(None), 2)
+            .await
+            .expect("page");
+        assert_eq!((down.entries.len(), down.more), (2, false), "{down:?}");
+        let one = store
+            .history_page(id, HistoryEdge::Before(None), 1)
+            .await
+            .expect("page");
+        assert_eq!((one.entries.len(), one.more), (1, true), "{one:?}");
+    }
+
+    /// A turn two compactions kept in a row is a copy of a copy: the context stands it for the row
+    /// it was said in, and a rewind that takes it takes that row out of the history too, where it
+    /// was said before the compactions, beside what came after them, as two ranges of history.
+    #[tokio::test]
+    async fn a_turn_kept_twice_is_said_and_rewound_where_it_was_said() {
+        use crate::conversation::{Conversation, Event, Message};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "seed").await;
+        let turns: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for (turn, words) in turns.iter().zip(["one?", "two?"]) {
+            store
+                .save_event(id, &Event::Append(Message::user(words)), Some(*turn))
+                .await
+                .expect("ask");
+            store
+                .save_event(
+                    id,
+                    &Event::Append(Message::assistant_text("Yes.")),
+                    Some(*turn),
+                )
+                .await
+                .expect("answer");
+        }
+        let kept = vec![Message::user("two?"), Message::assistant_text("Yes.")];
+        for _ in 0..2 {
+            let conversation =
+                Conversation::from_events(store.load_events(id).await.expect("load"));
+            let boundary = Event::CompactBoundary {
+                summary: Message::user("the summary"),
+                replaced_count: conversation.len(),
+                record: crate::conversation::CompactionRecord::for_test(),
+                loaded_tools_snapshot: Default::default(),
+                checklist_snapshot: Default::default(),
+            };
+            store
+                .save_compaction(id, &boundary, &kept, None)
+                .await
+                .expect("compact");
+        }
+        for event in [
+            Event::Append(Message::user("three?")),
+            Event::Append(Message::assistant_text("Yes.")),
+        ] {
+            store
+                .save_event(id, &event, Some(turns[2]))
+                .await
+                .expect("save");
+        }
+        let said = |entries: &[HistoryEntry]| -> Vec<String> {
+            entries
+                .iter()
+                .map(|entry| match &entry.kind {
+                    HistoryKind::Message(message) => message.text_content(),
+                    HistoryKind::Compaction { generation, .. } => {
+                        format!("compaction {generation}")
+                    }
+                    HistoryKind::Rewind { turns, .. } => format!("rewind {turns}"),
+                    HistoryKind::Join { .. } => "join".to_string(),
+                })
+                .collect()
+        };
+        let before = store
+            .history_page(id, HistoryEdge::Before(None), 100)
+            .await
+            .expect("read");
+        assert_eq!(said(&before.entries), [
+            "seed",
+            "one?",
+            "Yes.",
+            "two?",
+            "Yes.",
+            "compaction 1",
+            "compaction 2",
+            "three?",
+            "Yes.",
+        ]);
+        let said_at: Vec<i64> = before.entries.iter().map(|entry| entry.position).collect();
+
+        let view = store.load_view_events_with_stamps(id).await.expect("view");
+        let links: Vec<i64> = view.iter().filter_map(|(stamp, _)| stamp.copy_of).collect();
+        assert_eq!(links.len(), 2, "the second compaction's copies: {view:?}");
+        let originals = store
+            .original_positions(id, links.clone())
+            .await
+            .expect("positions");
+        let stood_for: Vec<(i64, Option<Uuid>)> = view
+            .iter()
+            .filter(|(stamp, _)| stamp.copy_of.is_some())
+            .map(|(stamp, _)| {
+                let link = stamp.copy_of.expect("a copy");
+                let said = stamp.said.as_ref().expect("a copy says where it was said");
+                (
+                    *originals.get(&link).expect("each link resolves"),
+                    said.turn_id,
+                )
+            })
+            .collect();
+        assert_eq!(stood_for, [
+            (said_at[3], Some(turns[1])),
+            (said_at[4], Some(turns[1]))
+        ]);
+
+        let mut conversation =
+            Conversation::from_events(store.load_events(id).await.expect("load"));
+        let rewind = conversation.rewind(2).expect("two turns to rewind");
+        store.save_rewind(id, &rewind).await.expect("rewind");
+        let after = store
+            .history_page(id, HistoryEdge::Before(None), 100)
+            .await
+            .expect("read");
+        assert_eq!(said(&after.entries), [
+            "seed",
+            "one?",
+            "Yes.",
+            "compaction 1",
+            "compaction 2",
+            "rewind 2",
+        ]);
+        let Some(HistoryKind::Rewind { rows, .. }) = after.entries.last().map(|entry| &entry.kind)
+        else {
+            panic!("the rewind is said last: {after:?}");
+        };
+        assert_eq!(rows, &vec![
+            said_at[3]..=said_at[4],
+            said_at[7]..=said_at[8]
+        ]);
+    }
+
+    /// The history says each row once, where it was said: a compaction's kept copies are left out
+    /// for the rows they copy, each compaction is numbered across pages, what a rewind took is left
+    /// out with the rewind saying what it took, and a page reads past what it leaves out rather
+    /// than coming back short while more remains.
+    #[tokio::test]
+    async fn the_history_says_each_row_once_and_what_a_rewind_took() {
+        use crate::conversation::{Conversation, Event, Message};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "seed").await;
+        let mut conversation =
+            Conversation::from_events(store.load_events(id).await.expect("the seed"));
+        let save = async |conversation: &mut Conversation, event: Event| {
+            store.save_event(id, &event, None).await.expect("save");
+            *conversation = Conversation::from_events(
+                conversation
+                    .events()
+                    .iter()
+                    .cloned()
+                    .chain([event])
+                    .collect(),
+            );
+        };
+        save(&mut conversation, Event::Append(Message::user("one?"))).await;
+        save(
+            &mut conversation,
+            Event::Append(Message::assistant_text("One.")),
+        )
+        .await;
+        let compact = async |conversation: &mut Conversation, kept: Vec<Message>| {
+            let boundary = Event::CompactBoundary {
+                summary: Message::user("the summary"),
+                replaced_count: conversation.len(),
+                record: crate::conversation::CompactionRecord::for_test(),
+                loaded_tools_snapshot: Default::default(),
+                checklist_snapshot: Default::default(),
+            };
+            store
+                .save_compaction(id, &boundary, &kept, None)
+                .await
+                .expect("compact");
+            *conversation = Conversation::from_events(store.load_events(id).await.expect("load"));
+        };
+        // The first compaction keeps the turn it summarizes, as copies after its boundary.
+        compact(&mut conversation, vec![
+            Message::user("one?"),
+            Message::assistant_text("One."),
+        ])
+        .await;
+        for words in ["two?", "three?", "four?"] {
+            save(&mut conversation, Event::Append(Message::user(words))).await;
+            save(
+                &mut conversation,
+                Event::Append(Message::assistant_text("Yes.")),
+            )
+            .await;
+        }
+        let rewind = conversation.rewind(2).expect("two turns to rewind");
+        store.save_rewind(id, &rewind).await.expect("rewind");
+        compact(&mut conversation, Vec::new()).await;
+
+        let whole = store
+            .history_page(id, HistoryEdge::Before(None), 100)
+            .await
+            .expect("read");
+        assert!(!whole.more);
+        let said: Vec<String> = whole
+            .entries
+            .iter()
+            .map(|entry| match &entry.kind {
+                HistoryKind::Message(message) => message.text_content(),
+                HistoryKind::Compaction { generation, .. } => format!("compaction {generation}"),
+                HistoryKind::Rewind { turns, .. } => format!("rewind {turns}"),
+                HistoryKind::Join { .. } => "join".to_string(),
+            })
+            .collect();
+        assert_eq!(said, [
+            "seed",
+            "one?",
+            "One.",
+            "compaction 1",
+            "two?",
+            "Yes.",
+            "rewind 2",
+            "compaction 2",
+        ]);
+        let Some(HistoryKind::Rewind { rows, .. }) = whole.entries.get(6).map(|entry| &entry.kind)
+        else {
+            panic!(
+                "the rewind is said where it was written: {:?}",
+                whole.entries
+            );
+        };
+        assert!(
+            whole
+                .entries
+                .iter()
+                .all(|entry| !rows.iter().any(|rows| rows.contains(&entry.position))),
+            "what it took is out of the history"
+        );
+
+        // Two at a time from the end: the page past the rewind's stretch is full, and the walk back
+        // meets the whole without a gap or an overlap.
+        let mut walked: Vec<i64> = Vec::new();
+        let mut edge = HistoryEdge::Before(None);
+        loop {
+            let page = store.history_page(id, edge, 2).await.expect("page");
+            assert!(page.entries.len() == 2 || !page.more, "{page:?}");
+            let mut positions: Vec<i64> = page.entries.iter().map(|entry| entry.position).collect();
+            let first = positions.first().copied();
+            positions.append(&mut walked);
+            walked = positions;
+            match (page.more, first) {
+                (true, Some(first)) => edge = HistoryEdge::Before(Some(first)),
+                _ => break,
+            }
+        }
+        let whole_positions: Vec<i64> = whole.entries.iter().map(|entry| entry.position).collect();
+        assert_eq!(walked, whole_positions);
+        // A page read either way numbers its compaction as the whole history does.
+        let last = store
+            .history_page(id, HistoryEdge::Before(None), 1)
+            .await
+            .expect("page");
+        assert!(
+            matches!(last.entries[0].kind, HistoryKind::Compaction {
+                generation: 2,
+                ..
+            }),
+            "{last:?}"
+        );
+        let older = store
+            .history_page(id, HistoryEdge::After(whole_positions[3] - 1), 1)
+            .await
+            .expect("page");
+        assert!(
+            matches!(older.entries[0].kind, HistoryKind::Compaction {
+                generation: 1,
+                ..
+            }),
+            "{older:?}"
+        );
+        let newer = store
+            .history_page(id, HistoryEdge::After(whole_positions[6]), 5)
+            .await
+            .expect("page");
+        assert!(
+            matches!(newer.entries[..], [HistoryEntry {
+                kind: HistoryKind::Compaction { generation: 2, .. },
+                ..
+            }]),
+            "{newer:?}"
+        );
+        assert!(!newer.more);
+    }
+
+    /// A prompt a turn took back to join a message to it is out of the history, and the row that
+    /// took it says which positions it took, ahead of the message it joined; one withdrawn because
+    /// the provider refused it stays, as the screen leaves it.
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "a stretch's rows are a list of runs, and these hold one run"
+    )]
+    #[tokio::test]
+    async fn a_joined_prompt_is_said_once_and_a_withdrawn_one_stays() {
+        use crate::conversation::{ContentBlock, Event, Message};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "seed").await;
+        let prompt = Message::user_turn("then", "old?", Vec::new());
+        let mut joined = prompt.clone();
+        joined.content.push(ContentBlock::Text {
+            text: "and this".to_string(),
+        });
+        for event in [
+            Event::Append(prompt),
+            Event::Repair {
+                replaced_count: 1,
+                messages: Vec::new(),
+            },
+            Event::Append(joined),
+        ] {
+            store.save_event(id, &event, None).await.expect("save");
+        }
+        let page = store
+            .history_page(id, HistoryEdge::Before(None), 10)
+            .await
+            .expect("read");
+        let positions: Vec<i64> = page.entries.iter().map(|entry| entry.position).collect();
+        assert!(
+            matches!(&page.entries[..], [
+                HistoryEntry {
+                    kind: HistoryKind::Message(_),
+                    ..
+                },
+                HistoryEntry {
+                    kind: HistoryKind::Join { .. },
+                    ..
+                },
+                HistoryEntry {
+                    kind: HistoryKind::Message(_),
+                    ..
+                },
+            ]),
+            "{page:?}"
+        );
+        let HistoryKind::Join { rows } = &page.entries[1].kind else {
+            unreachable!("matched above");
+        };
+        assert_eq!(rows, &vec![positions[0] + 1..=positions[1] - 1]);
+
+        let refused = plain_session(&store, "seed").await;
+        let turn = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(
+                refused,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
+                "2026-10-29T00:00:00+00:00",
+            )
+            .await
+            .expect("open");
+        for event in [Event::Append(Message::user("refused?")), Event::Repair {
+            replaced_count: 1,
+            messages: Vec::new(),
+        }] {
+            store
+                .save_event(refused, &event, Some(turn))
+                .await
+                .expect("save");
+        }
+        let page = store
+            .history_page(refused, HistoryEdge::Before(None), 10)
+            .await
+            .expect("read");
+        let said: Vec<String> = page
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                HistoryKind::Message(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said, ["seed", "refused?"], "{page:?}");
+    }
+
     /// What a session's conversation no longer holds is read back by row. A rewind, written
     /// between turns, takes the turns it took and says how many; a turn taking its prompt back to
     /// join a message to it takes the prompt and its own row; a prompt withdrawn because the
     /// provider refused it takes nothing, since the live run left it on the screen. A session with
     /// no empty repair has nothing taken.
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "a stretch's rows are a list of runs, and these hold one run"
+    )]
     #[tokio::test]
     async fn a_rewound_stretch_is_read_back_by_row() {
         use crate::conversation::{ContentBlock, Conversation, Event, Message};
@@ -5811,13 +7097,15 @@ mod tests {
         // The seed row, turn one's two, turn two's four, the rewind.
         assert_eq!(store.rewound(id).await.expect("read"), vec![
             Rewound {
-                rows: rows[3]..=rows[4],
-                said_at: None,
+                rows: vec![rows[3]..=rows[3]],
+                at: rows[4],
+                joined: true,
                 turns: 0,
             },
             Rewound {
-                rows: rows[3]..=rows[6],
-                said_at: Some(rows[7]),
+                rows: vec![rows[3]..=rows[6]],
+                at: rows[7],
+                joined: false,
                 turns: 1,
             },
         ]);
@@ -5836,8 +7124,9 @@ mod tests {
             .expect("rows");
         assert!(
             store.rewound(id).await.expect("read").contains(&Rewound {
-                rows: rows[1]..=last - 1,
-                said_at: Some(last),
+                rows: vec![rows[1]..=rows[7]],
+                at: last,
+                joined: false,
                 turns: 2,
             }),
             "{:?}",
@@ -5884,7 +7173,7 @@ mod tests {
         }
         let taken = store.rewound(unturned).await.expect("read");
         assert!(
-            taken.len() == 1 && taken.iter().all(|stretch| stretch.said_at.is_none()),
+            taken.len() == 1 && taken.iter().all(|stretch| stretch.joined),
             "{taken:?}"
         );
 
@@ -9519,9 +10808,14 @@ mod tests {
                 .is_empty()
         );
         let found = store
-            .search_sessions("herons", 10, SessionReach::Store {
-                include_children: false,
-            })
+            .search_sessions(
+                "herons",
+                10,
+                SessionReach::Store(crate::store::SessionFilter {
+                    include_children: false,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("search");
         assert_eq!(
@@ -9810,6 +11104,286 @@ mod tests {
         );
     }
 
+    /// A copy a compaction kept says which turn said it and when, whoever wrote the copy, and a
+    /// fork and an archive carry that, under the turn ids each gives its turns.
+    #[tokio::test]
+    async fn a_copy_says_where_it_was_said_through_a_fork_and_an_archive() {
+        use crate::conversation::{Event, Message};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "seed").await;
+        let said = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(
+                id,
+                said,
+                crate::store::turns::TurnSource::Client,
+                crate::permission::Permission::Read,
+                "2026-10-06T10:00:00+00:00",
+            )
+            .await
+            .expect("open");
+        let kept = [Message::user("kept?"), Message::assistant_text("Kept.")];
+        for message in &kept {
+            store
+                .save_event(id, &Event::Append(message.clone()), Some(said))
+                .await
+                .expect("save");
+        }
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("summary"),
+            replaced_count: 3,
+            record: crate::conversation::CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        store
+            .save_compaction(id, &boundary, &kept, None)
+            .await
+            .expect("compaction");
+        // Each copy against the row it stands for: the turn that said it and when.
+        let copies_say = |session: Uuid| {
+            let store = store.clone();
+            async move {
+                let rows = store
+                    .load_events_with_timestamps(session)
+                    .await
+                    .expect("load");
+                let at: std::collections::HashMap<i64, EventStamp> = rows
+                    .iter()
+                    .map(|(stamp, _)| (stamp.id, stamp.clone()))
+                    .collect();
+                rows.iter()
+                    .filter_map(|(stamp, _)| {
+                        let original = at.get(&stamp.copy_of?)?;
+                        Some((
+                            stamp.said.clone(),
+                            Some(SaidStamp {
+                                turn_id: original.turn_id,
+                                created_at: original.created_at.clone(),
+                            }),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        let pairs = copies_say(id).await;
+        assert_eq!(pairs.len(), 2, "two copies");
+        assert!(
+            pairs.iter().all(|(says, stands_for)| says == stands_for),
+            "{pairs:?}"
+        );
+
+        let (forked, _lock) = store
+            .fork_session_locked(id, ForkOverrides::default(), SourceLock::Probe)
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        let pairs = copies_say(forked.id).await;
+        assert_eq!(pairs.len(), 2, "the fork's copies");
+        assert!(
+            pairs.iter().all(|(says, stands_for)| says == stands_for),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.iter().all(|(says, _)| says
+                .as_ref()
+                .is_some_and(|said_in| said_in.turn_id != Some(said))),
+            "under the fork's own turn id"
+        );
+
+        let archive = crate::store::export::build_session_export(&store, id)
+            .await
+            .expect("export");
+        let carried: Vec<(Option<String>, Option<String>)> = archive.sessions[0]
+            .events
+            .iter()
+            .filter(|event| event.copy_of.is_some())
+            .map(|event| (event.said_turn_id.clone(), event.said_at.clone()))
+            .collect();
+        assert_eq!(carried.len(), 2);
+        assert!(
+            carried.iter().all(
+                |(turn, at)| turn.as_deref() == Some(said.to_string().as_str()) && at.is_some()
+            ),
+            "{carried:?}"
+        );
+        let plan = crate::store::export::plan_import(
+            archive,
+            crate::store::export::ImportInstallation {
+                selected: None,
+                default: None,
+                configured: None,
+                projects: Vec::new(),
+            },
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plans");
+        let imported = plan.root_new_id;
+        store
+            .import_sessions(plan.records, plan.blobs)
+            .await
+            .expect("import");
+        let pairs = copies_say(imported).await;
+        assert_eq!(pairs.len(), 2, "the import's copies");
+        assert!(
+            pairs.iter().all(|(says, stands_for)| says == stands_for),
+            "{pairs:?}"
+        );
+    }
+
+    /// A kept message the view rewrote on its way to the model, its thinking taken out or a retry
+    /// degrading it in place, is still the message its row holds: the copy stands for that row and
+    /// says the turn that said it, so history shows it once.
+    #[tokio::test]
+    async fn a_kept_message_the_view_rewrote_stands_for_the_row_it_was_said_in() {
+        use crate::conversation::{ContentBlock, Event, Message, Role};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "seed").await;
+        let (said, compacting) = (Uuid::new_v4(), Uuid::new_v4());
+        for turn in [said, compacting] {
+            store
+                .turn_store()
+                .open_turn(
+                    id,
+                    turn,
+                    crate::store::turns::TurnSource::Client,
+                    crate::permission::Permission::Read,
+                    "2026-10-06T10:00:00+00:00",
+                )
+                .await
+                .expect("open");
+        }
+        let answer = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::RedactedThinking {
+                    data: "sealed".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "Seen.".to_string(),
+                },
+            ],
+        };
+        for event in [
+            Event::Append(Message::user("look?")),
+            Event::Append(answer),
+            // Claude refused a signature: the view takes the thinking out of every message.
+            Event::Unsign,
+        ] {
+            store
+                .save_event(id, &event, Some(said))
+                .await
+                .expect("save");
+        }
+        for event in [
+            Event::Append(Message::user("next?")),
+            // The next turn's retry rewrote its prompt in place.
+            Event::Repair {
+                replaced_count: 1,
+                messages: vec![Message::user("next, degraded")],
+            },
+        ] {
+            store
+                .save_event(id, &event, Some(compacting))
+                .await
+                .expect("save");
+        }
+        let kept = [
+            Message::user("look?"),
+            Message::assistant_text("Seen."),
+            Message::user("next, degraded"),
+        ];
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("summary"),
+            replaced_count: 3,
+            record: crate::conversation::CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        store
+            .save_compaction(id, &boundary, &kept, Some(compacting))
+            .await
+            .expect("compaction");
+        let rows = store.load_events_with_timestamps(id).await.expect("load");
+        let appended: Vec<i64> = rows
+            .iter()
+            .filter(|(stamp, event)| {
+                stamp.turn_id.is_some()
+                    && stamp.copy_of.is_none()
+                    && matches!(event, Event::Append(_))
+            })
+            .map(|(stamp, _)| stamp.id)
+            .collect();
+        let copies: Vec<(Option<i64>, Option<Uuid>)> = rows
+            .iter()
+            .skip_while(|(_, event)| !matches!(event, Event::CompactBoundary { .. }))
+            .skip(1)
+            .map(|(stamp, _)| {
+                (
+                    stamp.copy_of,
+                    stamp.said.as_ref().and_then(|said_in| said_in.turn_id),
+                )
+            })
+            .collect();
+        assert_eq!(
+            copies,
+            [
+                (appended.first().copied(), Some(said)),
+                (appended.get(1).copied(), Some(said)),
+                (appended.get(2).copied(), Some(compacting)),
+            ],
+            "each copy stands for the row it was said in"
+        );
+        let history: Vec<String> = store
+            .load_history(id)
+            .await
+            .expect("history")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Append(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            history,
+            ["seed", "look?", "Seen.", "next?"],
+            "each said once"
+        );
+
+        // An archive carries the links, which an import takes as a compaction wrote them.
+        let archive = crate::store::export::build_session_export(&store, id)
+            .await
+            .expect("export");
+        let plan = crate::store::export::plan_import(
+            archive,
+            crate::store::export::ImportInstallation {
+                selected: None,
+                default: None,
+                configured: None,
+                projects: Vec::new(),
+            },
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plans");
+        let imported = plan.root_new_id;
+        store
+            .import_sessions(plan.records, plan.blobs)
+            .await
+            .expect("import");
+        let imported_history: Vec<String> = store
+            .load_history(imported)
+            .await
+            .expect("history")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Append(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imported_history, history);
+    }
+
     /// A kept message no row holds of its own, though an older row holds the same words, links
     /// to nothing and leaves the copies before it on their own rows: history says the repeated
     /// words twice, as they were said, and every other kept turn once.
@@ -9991,6 +11565,7 @@ mod tests {
                 ),
                 turn_id: None,
                 copy_of: None,
+                said: None,
             }],
             scratchpad_entries: Vec::new(),
         };
@@ -11112,9 +12687,14 @@ mod tests {
         boundary(&store, session).await;
         assert_eq!(
             store
-                .search_sessions("xylophone", 10, SessionReach::Store {
-                    include_children: false,
-                })
+                .search_sessions(
+                    "xylophone",
+                    10,
+                    SessionReach::Store(crate::store::SessionFilter {
+                        include_children: false,
+                        ..Default::default()
+                    })
+                )
                 .await
                 .expect("search")
                 .len(),
@@ -11136,9 +12716,14 @@ mod tests {
 
         assert!(
             store
-                .search_sessions("xylophone", 10, SessionReach::Store {
-                    include_children: false,
-                })
+                .search_sessions(
+                    "xylophone",
+                    10,
+                    SessionReach::Store(crate::store::SessionFilter {
+                        include_children: false,
+                        ..Default::default()
+                    })
+                )
                 .await
                 .expect("search")
                 .is_empty()

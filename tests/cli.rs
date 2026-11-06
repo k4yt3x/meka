@@ -66,7 +66,7 @@ fn help_flag_lists_subcommands() {
     let output = meka().arg("--help").output().expect("failed to spawn meka");
     assert!(output.status.success(), "meka --help exited non-zero");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in ["account", "profile", "session", "history", "mcp", "acp"] {
+    for expected in ["account", "profile", "session", "recall", "mcp", "acp"] {
         assert!(
             stdout.contains(expected),
             "--help output missing subcommand '{expected}':\n{stdout}"
@@ -94,20 +94,20 @@ fn session_subcommand_help_lists_actions() {
 }
 
 #[test]
-fn history_subcommand_help_lists_actions() {
+fn recall_subcommand_help_lists_actions() {
     let output = meka()
-        .args(["history", "--help"])
+        .args(["recall", "--help"])
         .output()
         .expect("failed to spawn meka");
     assert!(
         output.status.success(),
-        "meka history --help exited non-zero"
+        "meka recall --help exited non-zero"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     for expected in ["list", "clear"] {
         assert!(
             stdout.contains(expected),
-            "history --help missing action '{expected}':\n{stdout}"
+            "recall --help missing action '{expected}':\n{stdout}"
         );
     }
 }
@@ -3240,7 +3240,7 @@ fn an_empty_listing_in_json_is_an_empty_envelope_and_a_quiet_stderr() {
         (vec!["mcp", "list"], "servers"),
         (vec!["schedule", "list"], "jobs"),
         (vec!["memory", "list"], "memories"),
-        (vec!["history", "list"], "history"),
+        (vec!["recall", "list"], "recall"),
         (vec!["skill", "list"], "skills"),
     ] {
         let mut arguments = command.clone();
@@ -3335,7 +3335,7 @@ fn session_list_and_show_print_the_session_as_json() {
 }
 
 /// `account list` and `profile list` under `--format json`: the config's own fields, the account's
-/// backend on each profile, `active` on the one a session gets by default, and never a secret.
+/// backend on each profile, `default` on the one a session gets by default, and never a secret.
 #[test]
 fn account_and_profile_lists_print_json_under_the_http_names() {
     let install = Install::new();
@@ -3362,9 +3362,9 @@ fn account_and_profile_lists_print_json_under_the_http_names() {
     assert_eq!(alpha["account"], "alpha");
     assert_eq!(alpha["backend"], "openai-chat-completions");
     assert_eq!(alpha["model"], "alpha-model");
-    assert_eq!(alpha["active"], true);
+    assert_eq!(alpha["default"], true);
     let beta = rows.iter().find(|row| row["name"] == "beta").expect("beta");
-    assert_eq!(beta["active"], false);
+    assert_eq!(beta["default"], false);
 }
 
 /// `meka mcp list`, `meka mcp get` and `meka mcp tools` report what a server runs under: an entry
@@ -3792,7 +3792,7 @@ fn skill_list_get_and_show_print_json() {
 }
 
 /// `schedule list` and `schedule show` under `--format json` print each job with the fields
-/// `GET /v1/schedule` uses, ids in full, and the optional fields absent rather than null.
+/// `GET /v1/jobs` uses, ids in full, and the optional fields absent rather than null.
 #[test]
 fn schedule_list_and_show_print_the_job_as_json() {
     let install = Install::new();
@@ -3848,9 +3848,22 @@ fn schedule_list_and_show_print_the_job_as_json() {
     assert_eq!(shown, *row, "show prints the object the listing carries");
 }
 
-/// `history list --format json` is `{"history": [...]}`, oldest first like the plain lines.
+/// `meka history` is no command: the word is the conversation's, and the screen's recall is
+/// `meka recall`.
 #[test]
-fn history_list_prints_json() {
+fn history_is_no_command() {
+    let output = meka()
+        .args(["history", "list"])
+        .output()
+        .expect("failed to spawn meka");
+    assert!(!output.status.success(), "meka history must be refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
+}
+
+/// `recall list --format json` is `{"recall": [...]}`, oldest first like the plain lines.
+#[test]
+fn recall_list_prints_json() {
     let install = Install::new();
     // Any command opens the store, which is what creates the table the rows below go into.
     let opened = run_isolated(&install, &["session", "list"]);
@@ -3862,15 +3875,15 @@ fn history_list_prints_json() {
     ] {
         store
             .execute(
-                "INSERT INTO prompt_history (command_line, created_at) VALUES (?1, ?2)",
+                "INSERT INTO recall_entries (command_line, created_at) VALUES (?1, ?2)",
                 rusqlite::params![entry, at],
             )
-            .expect("plant history");
+            .expect("plant recall entries");
     }
     let listed = json_stdout(run_isolated(&install, &[
-        "history", "list", "--format", "json",
+        "recall", "list", "--format", "json",
     ]));
-    assert_eq!(listed["history"], serde_json::json!(["first", "second"]));
+    assert_eq!(listed["recall"], serde_json::json!(["first", "second"]));
 }
 
 /// `tool list --format json` carries what the table shows: the effective level, where it came

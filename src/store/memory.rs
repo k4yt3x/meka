@@ -117,7 +117,7 @@ const MAX_TERMS: usize = 100;
 
 /// How much of a body [`MemoryStore::substring_search`] carries as its excerpt. FTS5's `snippet()`
 /// is only available under a `MATCH`, and this scan is what runs when there is none.
-const SUBSTRING_SNIPPET_CHARS: usize = 160;
+const SUBSTRING_EXCERPT_CHARS: usize = 160;
 
 /// A window of `chars` characters from `body` containing the first of `terms` that appears in it.
 ///
@@ -673,7 +673,7 @@ pub(crate) struct Hit {
     pub(crate) body: String,
     /// An excerpt of the body around the match, or its opening when the match was in the
     /// description or the name.
-    pub(crate) snippet: String,
+    pub(crate) excerpt: String,
     pub(crate) priority: u8,
     pub(crate) created: SystemTime,
     pub(crate) read_count: u32,
@@ -788,7 +788,7 @@ impl MemoryView {
 }
 
 /// What a listing or a search is narrowed to, the same three questions at every door:
-/// `memory_search`'s filters, `meka memory list`'s flags and `GET /v1/memory`'s query parameters,
+/// `memory_search`'s filters, `meka memory list`'s flags and `GET /v1/memories`'s query parameters,
 /// within the tiers the caller sees.
 ///
 /// One definition so the doors cannot disagree about what "referencing" or "unverified" selects,
@@ -1296,8 +1296,8 @@ impl MemoryStore {
     /// `enabled` is `[memory] enabled`, and it gates *tool registration* only. The connection is
     /// attached either way, because that switch decides whether an agent keeps memories, not
     /// whether the operator can reach what is already stored: `meka memory list` and
-    /// `GET /v1/memory` both work on a disabled installation, and a backup you cannot take because
-    /// you turned the feature off is a trap rather than a safeguard.
+    /// `GET /v1/memories` both work on a disabled installation, and a backup you cannot take
+    /// because you turned the feature off is a trap rather than a safeguard.
     pub(crate) fn new(
         connection: Arc<Connection>,
         enabled: bool,
@@ -1587,7 +1587,7 @@ impl MemoryStore {
                         project: row.get(8)?,
                         description: row.get(1)?,
                         // The opening, since nothing was matched: what a listing's excerpt is.
-                        snippet: body.chars().take(SUBSTRING_SNIPPET_CHARS).collect(),
+                        excerpt: body.chars().take(SUBSTRING_EXCERPT_CHARS).collect(),
                         body,
                         priority: clamp_priority(row.get(3)?),
                         created: stamp_or_epoch(&row.get::<_, String>(4)?),
@@ -2191,7 +2191,7 @@ impl MemoryStore {
                             .get::<_, Option<String>>(7)?
                             .as_deref()
                             .and_then(crate::memory::parse_stamp),
-                        snippet: row.get(8)?,
+                        excerpt: row.get(8)?,
                         score: row.get::<_, f64>(9)?,
                         found_by: 1,
                     })
@@ -2317,10 +2317,10 @@ impl MemoryStore {
                         // one token, so `MATCH` never sees it and the literal scan is the only
                         // thing that finds it), where the match is as likely to be at the end as
                         // anywhere.
-                        snippet: excerpt_around_a_match(
+                        excerpt: excerpt_around_a_match(
                             &body,
                             &excerpt_terms,
-                            SUBSTRING_SNIPPET_CHARS,
+                            SUBSTRING_EXCERPT_CHARS,
                         ),
                         body,
                         priority: clamp_priority(row.get(3)?),
@@ -3319,7 +3319,7 @@ mod tests {
             project: String::new(),
             description: String::new(),
             body: String::new(),
-            snippet: String::new(),
+            excerpt: String::new(),
             priority: 5,
             created: SystemTime::UNIX_EPOCH,
             read_count: 0,
@@ -3935,7 +3935,7 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(names(&results), ["deploy-host"]);
-        assert!(results.hits[0].snippet.contains("Hostname"), "{results:?}");
+        assert!(results.hits[0].excerpt.contains("Hostname"), "{results:?}");
     }
 
     /// A query is prose. `*`, `"` and `NEAR` are FTS5 operators, and an unescaped query containing
@@ -4060,15 +4060,15 @@ mod tests {
             .await
             .expect("scan")
             .hits;
-        let snippet = &hits.first().expect("one hit").snippet;
+        let excerpt = &hits.first().expect("one hit").excerpt;
         assert!(
-            snippet.contains("深圳"),
-            "the excerpt must hold the match, not the body's opening: {snippet:?}"
+            excerpt.contains("深圳"),
+            "the excerpt must hold the match, not the body's opening: {excerpt:?}"
         );
         assert!(
-            snippet.chars().count() <= SUBSTRING_SNIPPET_CHARS,
+            excerpt.chars().count() <= SUBSTRING_EXCERPT_CHARS,
             "and stay inside its window: {} chars",
-            snippet.chars().count()
+            excerpt.chars().count()
         );
 
         // ASCII case-insensitively, matching the `LIKE` that selected the row in the first place.
@@ -4082,7 +4082,7 @@ mod tests {
         assert!(
             hits.first()
                 .expect("one hit")
-                .snippet
+                .excerpt
                 .contains("NEEDLE-HERE"),
             "a case-insensitive match must be excerpted where it actually is"
         );
@@ -4095,7 +4095,7 @@ mod tests {
             .await
             .expect("scan")
             .hits;
-        assert_eq!(hits.first().expect("one hit").snippet, "body text");
+        assert_eq!(hits.first().expect("one hit").excerpt, "body text");
     }
 
     /// The tokenizer's blind spot. `unicode61` splits only on non-alphanumerics, so a contiguous

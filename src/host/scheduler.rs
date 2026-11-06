@@ -22,7 +22,7 @@ use crate::{
 /// `turn.started`, and the hosts that run an out-of-band turn name it to their hooks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TurnStarter {
-    /// `POST /v1/sessions/{id}/turn`.
+    /// `POST /v1/sessions/{id}/turns`.
     Client,
     /// The inbox driver, on these items.
     Inbox { item_ids: Vec<uuid::Uuid> },
@@ -565,6 +565,15 @@ where
                 "holding a background outcome report for session {session_id} until its profile \
                  resolves: {error}"
             );
+            continue;
+        }
+        // Judged on what the store holds, as the turn would judge it.
+        if let Err(error) = entry
+            .agent
+            .match_the_store_after_a_failed_save(session_id, &mut conversation)
+            .await
+        {
+            tracing::warn!("holding a background outcome report for session {session_id}: {error}");
             continue;
         }
         // Asked of the profile just resolved: the turn would refuse it and put the batch back,

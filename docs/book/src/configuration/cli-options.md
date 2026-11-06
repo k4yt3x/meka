@@ -77,14 +77,14 @@ meka session remove --all
 
 See [Sessions](../usage/sessions.md#exporting-a-session) for details.
 
-### `history`
+### `recall`
 
-View or clear the input history that powers Up-arrow / Ctrl+R recall (distinct from saved
+View or clear the screen's recall, the prompts Up-arrow and Ctrl+R bring back (distinct from saved
 sessions).
 
 ```bash
-meka history list [-n <LIMIT>] [--format <FORMAT>]   # default 50; -n 0 shows all
-meka history clear
+meka recall list [-n <LIMIT>] [--format <FORMAT>]   # default 50; -n 0 shows all
+meka recall clear
 ```
 
 ### `mcp`
@@ -430,9 +430,9 @@ meka --oneshot -p "what changed?" --format json | jq -r .text
 
 Every listing and `show` command takes the same `--format plain|json`: `session list|show|search`,
 `account list|usage|whoami|stats`, `profile list`, `project list`, `mcp list|get|tools`,
-`schedule list|show`, `memory list|get|show`, `tool list|show`, `history list` and `skill list|get|show`.
+`schedule list|show`, `memory list|get|show`, `tool list|show`, `recall list` and `skill list|get|show`.
 Under `json`, a `show` prints one object and a listing prints `{"<nouns>": [...]}` (`sessions`,
-`accounts`, `profiles`, `projects`, `servers`, `jobs`, `memories`, `tools`, `history`, `skills`), with the field names the
+`accounts`, `profiles`, `projects`, `servers`, `jobs`, `memories`, `tools`, `recall`, `skills`), with the field names the
 [HTTP API](../usage/http-api.md) uses for the same object where it has one. An empty listing is the envelope around an empty array
 and nothing on stderr; in `plain`, it is a `No <nouns>.` note on stderr and nothing on stdout.
 Warnings and hints stay on stderr under either format, so `meka … --format json 2>/dev/null | jq`

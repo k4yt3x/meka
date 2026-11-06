@@ -2134,10 +2134,10 @@ fn a_dragged_code_block_copies_as_it_was_written() {
     );
 }
 
-/// The history search takes the place of the composer's text inside its block, so the composer
+/// The recall search takes the place of the composer's text inside its block, so the composer
 /// keeps its height and the transcript above it does not move.
 #[test]
-fn the_history_search_keeps_the_composer_s_height() {
+fn the_recall_search_keeps_the_composer_s_height() {
     let install = screen_install("read", "", "");
     let screens = run_screen(&install, TWO_TURNS, &["hi", "\x12", "\x1b", "/exit"]);
     let (idle, searching) = (&screens[1], &screens[2]);

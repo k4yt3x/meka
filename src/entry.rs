@@ -237,7 +237,7 @@ pub(crate) const MAX_ENTRY_NAME_CHARS: usize = 64;
 /// Applied to a lookup it decides something else entirely (what may be *found*), and there it
 /// wedges. A row whose name reached the column past the tools is listed to the model in the
 /// `[Memory]` index and then refused by `memory_read`, `memory_delete`, `meka memory remove` and
-/// `DELETE /v1/memory/{name}` alike, while `meka memory export` refuses the whole run on its
+/// `DELETE /v1/memories/{name}` alike, while `meka memory export` refuses the whole run on its
 /// account. Nothing meka ships could remove it; the only exit was raw `sqlite3`, which is what this
 /// store was built to stop needing.
 ///

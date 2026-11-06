@@ -88,7 +88,8 @@ meka --oneshot -p "how many files are here?" --format json
 gave one) or `interrupted`. `session_id` is omitted, not `null`, for a turn interrupted before the
 session existed, which is the one way a run prints a report without one; every other field is always
 present. `text` is the assistant's text with the rounds joined by a blank line,
-`tool_calls` lists every call in the order it was dispatched, and `usage` sums the rounds. `notices`
+`tool_calls` lists every call in the order it was dispatched, and `usage` sums the rounds and the
+compactions the turn ran. `notices`
 is what meka itself said during the turn (a refused approval, a lost write, a declined MCP
 elicitation), each with
 a `level` of `info` or `warn` and its `text`; it is empty when meka raised none. `compactions` lists

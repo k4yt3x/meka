@@ -19,7 +19,7 @@ use crate::{
     error::Result,
     provider::{
         AccountIdentity, AccountUsage, Completion, CompletionRequest, DeferredToolDelivery,
-        Provider, StreamEvent, ToolDefinition, UsageHistory,
+        Provider, StreamEvent, ToolDefinition, UsageStats,
     },
 };
 
@@ -134,7 +134,6 @@ impl CutRequest {
             messages: &self.messages,
             tools: &self.tools,
             deferred_tools: &self.deferred_tools,
-            thinking: original.thinking,
             attribution: original.attribution.clone(),
         }
     }
@@ -227,8 +226,8 @@ impl Provider for ToolNameCap {
         self.inner.fetch_identity().await
     }
 
-    async fn fetch_history(&self) -> Result<Option<UsageHistory>> {
-        self.inner.fetch_history().await
+    async fn fetch_usage_stats(&self) -> Result<Option<UsageStats>> {
+        self.inner.fetch_usage_stats().await
     }
 
     fn deferred_tool_delivery(&self) -> DeferredToolDelivery {

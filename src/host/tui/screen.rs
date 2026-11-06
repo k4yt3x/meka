@@ -142,7 +142,7 @@ pub(crate) struct ScreenLaunch {
     pub(crate) status_row: Vec<crate::config::StatusFact>,
     /// The context gauge's two cells: tokens used and the window, when the status row shows it.
     pub(crate) context: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
-    pub(crate) history: Option<crate::store::history::HistoryStore>,
+    pub(crate) recall: Option<crate::store::recall::RecallStore>,
     pub(crate) completer: Completer,
     pub(crate) skill_roots: Vec<PathBuf>,
     pub(crate) current_profile: Arc<std::sync::RwLock<String>>,
@@ -431,12 +431,12 @@ struct Screen {
 impl Screen {
     fn new(mut launch: ScreenLaunch) -> Self {
         let skill_watch = crate::skills::SkillNameWatch::new(launch.skill_roots.clone());
-        let history = launch.history.take();
+        let recall = launch.recall.take();
         let busy = launch.busy.then(Instant::now);
         let mut screen = Self {
             launch,
             viewport: Viewport::new(),
-            composer: Composer::new(history),
+            composer: Composer::new(recall),
             overlay: None,
             skill_watch,
             log_ring: std::collections::VecDeque::with_capacity(LOG_RING_LINES),
@@ -1623,9 +1623,9 @@ impl Screen {
                     }
                 }
             },
-            Action::HistoryPrevious => self.composer.history_previous(),
-            Action::HistoryNext => self.composer.history_next(),
-            Action::HistorySearch => self.composer.history_search(),
+            Action::RecallPrevious => self.composer.recall_previous(),
+            Action::RecallNext => self.composer.recall_next(),
+            Action::RecallSearch => self.composer.recall_search(),
             Action::PasteImage => self.attach_clipboard_image(),
             Action::Complete => {
                 self.refresh_skill_names();
@@ -3025,7 +3025,7 @@ impl Screen {
                     shell_mode: self.composer.is_shell_mode(),
                 };
                 // The block is the composer's gray across the row, with a row of it above and below
-                // the text, as a sent prompt has; the history search takes the text's place, on one
+                // the text, as a sent prompt has; the recall search takes the text's place, on one
                 // row. A bar of the permission level's color runs down its left edge.
                 let block = Style::default().bg(super::input::COMPOSER_BACKGROUND);
                 frame.render_widget(ratatui::widgets::Block::new().style(block), composer_area);

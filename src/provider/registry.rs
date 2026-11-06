@@ -77,7 +77,7 @@ impl ProviderBuilder {
     }
 
     /// A builder for the account's own provider, with no model: what the account views ask, since
-    /// `fetch_usage`, `fetch_identity` and `fetch_history` ask the account and never the model.
+    /// `fetch_usage`, `fetch_identity` and `fetch_usage_stats` ask the account and never the model.
     /// Built by [`ProviderRegistry::resolve_account`] alone; a request through it names no model.
     fn for_account(backend: Backend, credential: AuthCredential) -> Self {
         Self::new(backend, credential, "")

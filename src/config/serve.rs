@@ -40,7 +40,7 @@ pub(crate) struct ServeConfig {
     ///
     /// **Who can read it.** `sessions:r`, not just `sessions:w`. Submitting a turn takes the write
     /// scope, but the failure also rides the terminal `turn.failed` event, and `GET
-    /// /v1/sessions/{id}/stream` replays that to any reader.
+    /// /v1/sessions/{id}/feed` replays that to any reader.
     ///
     /// Turn it off where read-only tokens go to people who may watch a session but are not
     /// entitled to the account behind it. `/errors/mcp-unavailable` is not covered either way: it

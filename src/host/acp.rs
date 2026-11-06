@@ -1796,13 +1796,23 @@ mod tests {
             loaded_tools_snapshot: Default::default(),
             checklist_snapshot: Default::default(),
         };
-        let events = vec![
+        let rows: Vec<crate::store::LogRow> = [
             Event::Append(Message::user("first")),
             Event::Append(Message::assistant_text("one")),
             boundary,
             Event::Append(Message::user("third")),
-        ];
-        let said: Vec<String> = replay_entries(&events, 3)
+        ]
+        .into_iter()
+        .zip(1..)
+        .map(|(event, id)| crate::store::LogRow {
+            id,
+            turn_id: None,
+            created_at: String::new(),
+            said: None,
+            event,
+        })
+        .collect();
+        let said: Vec<String> = replay_entries(&rows, &[], 3)
             .iter()
             .map(|entry| match entry {
                 Replayed::Message(message) => message.text_content(),
@@ -1857,7 +1867,6 @@ mod tests {
             &state,
             "c1".to_string(),
             &record,
-            4,
             1,
             true,
         ));
@@ -1893,7 +1902,6 @@ mod tests {
             &state,
             "c1".to_string(),
             &record,
-            4,
             1,
             true,
         ));
@@ -1912,7 +1920,6 @@ mod tests {
             &state,
             "replayed-1".to_string(),
             &record,
-            4,
             1,
             false,
         ));
@@ -1925,7 +1932,6 @@ mod tests {
             &state,
             "c1".to_string(),
             &CompactionRecord::for_test(),
-            4,
             1,
             true,
         ));

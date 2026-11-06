@@ -429,7 +429,7 @@ pub(crate) enum FrontendEvent {
     /// A message meka wrote into the turn in the user's role: the nudge after a reply with no
     /// visible text or with checklist items open. The conversation holds it, so a client that
     /// mirrors the conversation from the feed needs it, and the blocking turn's messages carry it
-    /// where `GET /messages` would; the screen says it as a stage direction and never shows the
+    /// where `GET /history` does; the screen says it as a stage direction and never shows the
     /// words.
     Nudged {
         kind: crate::conversation::NudgeKind,
@@ -594,8 +594,8 @@ pub(crate) enum FrontendEvent {
     /// Incremental progress from an in-flight MCP tool (`notifications/progress`). Routed
     /// per-session via the frontend the MCP call registered with its progress token. See
     /// [`crate::mcp::progress::ProgressRegistry`]. The screen shows it under the running call's
-    /// row; `HttpFrontend` streams it as a `progress` SSE event; `AcpFrontend` logs it at `info!`,
-    /// having no protocol primitive for it; the one-shot and `SilentFrontend` drop it.
+    /// row; `HttpFrontend` streams it as a `tool_call.progress` SSE event; `AcpFrontend` logs it at
+    /// `info!`, having no protocol primitive for it; the one-shot and `SilentFrontend` drop it.
     McpProgress(crate::frontend::ProgressUpdate),
     /// A compaction began: the checkpoint turn or the summarizer is about to run, which can take
     /// a while, and the event that next names `id` says how it ended. Emitted for every
@@ -607,22 +607,14 @@ pub(crate) enum FrontendEvent {
     },
     /// The conversation was just summarized and the window replaced.
     ///
-    /// A frontend holding its own view of the transcript needs this because compaction is the one
-    /// event that makes messages it already rendered stop existing: an HTTP client polling
-    /// `GET /messages` sees `total` shrink with no explanation unless it is told, and a person at
-    /// the screen or in an editor whose next reply forgets the morning deserves to know why.
+    /// Compaction is the one event that takes messages out of what the model sees: a client
+    /// showing the context reads it again, and a person at the screen or in an editor whose next
+    /// reply forgets the morning deserves to know why.
     Compacted {
         /// The id the compaction began under.
         id: String,
         /// What the boundary recorded, which is what every surface says about the compaction.
         record: crate::conversation::CompactionRecord,
-        /// How many materialized messages the boundary removed.
-        ///
-        /// The whole pre-compaction window, including the recent tail that is then re-appended
-        /// verbatim, so this over-counts what the summary actually stands for. It is the figure
-        /// the replay algorithm uses, and the one the `compaction` marker on `GET /messages`
-        /// reports, so the two always agree.
-        replaced_count: usize,
         /// Which compaction this was, counting from 1.
         generation: u64,
     },
@@ -1153,7 +1145,7 @@ pub(crate) enum ElicitationResponse {
 
 impl ElicitationResponse {
     /// The answer's wire word, as `POST /responses/{request_id}` takes it and
-    /// `elicitation_resolved` reports it.
+    /// `elicitation.resolved` reports it.
     pub(crate) const fn name(&self) -> &'static str {
         match self {
             Self::Accept { .. } => "accept",
@@ -1169,8 +1161,8 @@ pub(crate) struct ProgressUpdate {
     pub(crate) server_name: String,
     pub(crate) tool_name: String,
     /// The provider's `tool_use_id` for the in-flight call, when one was supplied, so a client
-    /// holding state per call (the SSE `progress` event's readers) can attach the update to the
-    /// `tool_call.executing` it belongs to.
+    /// holding state per call (the SSE `tool_call.progress` event's readers) can attach the update
+    /// to the `tool_call.executing` it belongs to.
     pub(crate) tool_use_id: Option<String>,
     pub(crate) progress: f64,
     pub(crate) total: Option<f64>,

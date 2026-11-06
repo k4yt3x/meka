@@ -481,10 +481,10 @@ pub(super) async fn handle_load_session(
     // update could race in. From the log, not the resident view, which begins at the last
     // compaction: an editor reopening a thread is owed the turns before it, with each compaction
     // said where it happened.
-    let (events, first_generation) = replay_log(&state.shared.store, session_uuid).await;
+    let (rows, rewound, first_generation) = replay_log(&state.shared.store, session_uuid).await;
     // The rows are read for a log with a report to say, not on every load.
-    let holds_report = events.iter().any(|event| {
-        matches!(event, crate::conversation::Event::Append(message)
+    let holds_report = rows.iter().any(|row| {
+        matches!(&row.event, crate::conversation::Event::Append(message)
         if message.content.iter().any(|block| matches!(
             block,
             crate::conversation::ContentBlock::BackgroundReport { .. }
@@ -512,7 +512,7 @@ pub(super) async fn handle_load_session(
         &runtime.frontend.client_state,
         &session_id,
         &runtime.resident.cells().cwd,
-        &replay_entries(&events, first_generation),
+        &replay_entries(&rows, &rewound, first_generation),
         &tasks,
         &runtime.frontend.call_ids,
     );
@@ -1005,40 +1005,47 @@ pub(super) async fn handle_fork_session(
 /// handed whole, with no paging back for more.
 const REPLAY_ROWS: usize = 2_000;
 
-/// The log `session/load` replays, its newest rows without what a rewind took back and with images
-/// inlined, and the place the first compaction among them has in the session's count of them. A
-/// failed read replays nothing rather than failing the load, which the resident session has
-/// already passed.
+/// The log `session/load` replays: its newest rows with images inlined, the session's stretches
+/// that say what a rewind took back ([`crate::store::Store::rewound`]), and the place the first
+/// compaction among the rows has in the session's count of them. A failed read replays nothing
+/// rather than failing the load, which the resident session has already passed.
 async fn replay_log(
     store: &crate::store::Store,
     session: uuid::Uuid,
-) -> (Vec<crate::conversation::Event>, u64) {
+) -> (Vec<crate::store::LogRow>, Vec<crate::store::Rewound>, u64) {
     let page = match store.log_page_before(session, None, REPLAY_ROWS).await {
         Ok(page) => page,
         Err(error) => {
             tracing::warn!("failed to read the log for the replay: {error}");
-            return (Vec::new(), 1);
+            return (Vec::new(), Vec::new(), 1);
         }
     };
     let rewound = store.rewound(session).await.unwrap_or_else(|error| {
         tracing::warn!("failed to read what rewinds took back, for the replay: {error}");
         Vec::new()
     });
-    let mut events: Vec<crate::conversation::Event> = page
-        .rows
-        .into_iter()
-        .filter(|row| !rewound.iter().any(|stretch| stretch.rows.contains(&row.id)))
-        .map(|row| row.event)
-        .collect();
-    if let Err(error) = store.inline_blobs(&mut events).await {
-        tracing::warn!("failed to read the images for the replay: {error}");
+    let mut rows = page.rows;
+    let mut events: Vec<crate::conversation::Event> =
+        rows.iter().map(|row| row.event.clone()).collect();
+    match store.inline_blobs(&mut events).await {
+        Ok(()) => {
+            for (row, event) in rows.iter_mut().zip(events) {
+                row.event = event;
+            }
+        }
+        Err(error) => tracing::warn!("failed to read the images for the replay: {error}"),
     }
-    let shown = events
+    let shown = rows
         .iter()
-        .filter(|event| matches!(event, crate::conversation::Event::CompactBoundary { .. }))
+        .filter(|row| {
+            matches!(
+                row.event,
+                crate::conversation::Event::CompactBoundary { .. }
+            )
+        })
         .count() as u64;
     let total = store.count_compactions(session).await.unwrap_or(shown);
-    (events, total.saturating_sub(shown).saturating_add(1))
+    (rows, rewound, total.saturating_sub(shown).saturating_add(1))
 }
 
 /// `session/close`: remove a session from the active map. Cancels any in-flight prompt for that

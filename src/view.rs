@@ -30,7 +30,7 @@ use crate::{
 
 /// A session's row: what `meka session list` prints and what `GET /v1/sessions/{id}` answers with,
 /// less the facts only the process holding the session can add (`capabilities`, `turn_in_flight`,
-/// `inbox_pending`, `approvals_pending`, `checklist`), which the HTTP response flattens this
+/// `inbox_pending`, `requests_pending`, `checklist`), which the HTTP response flattens this
 /// under.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
@@ -76,6 +76,11 @@ pub(crate) struct SessionView {
     /// turns is `GET /v1/sessions/{id}/turns`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_turn: Option<crate::store::turns::TurnRecord>,
+    /// How many turns the session has on record, every host's: the turns
+    /// `GET /v1/sessions/{id}/turns` lists, which `[session].turn_retention` thins.
+    pub(crate) turn_count: u64,
+    /// What those turns spent.
+    pub(crate) usage: crate::store::turns::TurnUsage,
 }
 
 impl From<&SessionSummary> for SessionView {
@@ -93,6 +98,8 @@ impl From<&SessionSummary> for SessionView {
             parent_id: session.parent_id,
             pinned_at: session.pinned_at.clone(),
             last_turn: session.last_turn.clone(),
+            turn_count: session.turn_count,
+            usage: session.usage,
         }
     }
 }
@@ -108,6 +115,9 @@ pub(crate) struct SessionMatchView {
     /// found by its title alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) excerpt: Option<String>,
+    /// The position of the message the excerpt was taken from, present beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) excerpt_position: Option<i64>,
 }
 
 impl From<&SessionMatch> for SessionMatchView {
@@ -115,6 +125,7 @@ impl From<&SessionMatch> for SessionMatchView {
         Self {
             session: SessionView::from(&found.session),
             excerpt: found.excerpt.clone(),
+            excerpt_position: found.excerpt_position,
         }
     }
 }
@@ -165,14 +176,14 @@ pub(crate) struct ProfileView {
     pub(crate) fallbacks: Vec<String>,
     /// Whether a session on this profile accepts image attachments, so a client can tell whether
     /// attaching one is worth the base64 payload instead of discovering it from a 422. Per
-    /// profile, because `POST /turn` asks the session's own profile.
+    /// profile, because `POST /turns` asks the session's own profile.
     pub(crate) vision: bool,
     /// Whether this is the profile a session gets when it names none.
     ///
     /// Not "the profile the server is running": a server runs no profile of its own, and each
     /// session runs on the one its row records. This marks only the default a run applies to a
     /// request that names no profile.
-    pub(crate) active: bool,
+    pub(crate) default: bool,
 }
 
 impl ProfileView {
@@ -182,7 +193,7 @@ impl ProfileView {
         name: &str,
         profile: &ProfileConfig,
         accounts: &BTreeMap<String, AccountConfig>,
-        active: bool,
+        default: bool,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -193,7 +204,7 @@ impl ProfileView {
             model: profile.model.clone(),
             fallbacks: profile.fallbacks.clone(),
             vision: profile.vision.unwrap_or(true),
-            active,
+            default,
         }
     }
 }
@@ -265,7 +276,7 @@ pub(crate) struct ProfileDetailView {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) fallbacks: Vec<String>,
     /// Whether this is the profile a session gets when it names none.
-    pub(crate) active: bool,
+    pub(crate) default: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,7 +310,7 @@ impl ProfileDetailView {
         name: &str,
         profile: &ProfileConfig,
         accounts: &BTreeMap<String, AccountConfig>,
-        active: bool,
+        default: bool,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -309,7 +320,7 @@ impl ProfileDetailView {
                 .map(|account| account.backend.clone()),
             model: profile.model.clone(),
             fallbacks: profile.fallbacks.clone(),
-            active,
+            default,
             context_window: profile.context_window,
             max_output_tokens: profile.max_output_tokens,
             max_request_bytes: profile.max_request_bytes,
@@ -474,7 +485,7 @@ pub(crate) struct McpToolsResponse {
     pub(crate) tools: Vec<McpToolView>,
 }
 
-/// A scheduled job: what `meka schedule list` prints and `GET /v1/schedule` answers with.
+/// A scheduled job: what `meka schedule list` prints and `GET /v1/jobs` answers with.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct ScheduledJobView {
@@ -516,7 +527,7 @@ pub(crate) struct GateView {
     /// The HTTP API withholds it from a token that does not also hold `sessions:r`. A gate command
     /// is a `shell_execute` line that runs unattended, the highest-entropy field in the system
     /// and the one most likely to carry a credential someone pasted into a `curl`, and `GET
-    /// /v1/schedule` is server-wide, so a `schedule:r` token would otherwise read every gate on
+    /// /v1/jobs` is server-wide, so a `schedule:r` token would otherwise read every gate on
     /// the box. A tool gate is withheld on the same terms, though it discloses less either
     /// way: this carries the bare tool name, and its arguments reach only `schedule_list`. The
     /// gate's kind and its condition stay visible, so a client can still tell a gated job from
@@ -555,7 +566,7 @@ impl ScheduledJobView {
     }
 }
 
-/// A memory: what `meka memory list` prints and `GET /v1/memory/{name}` answers with. The body
+/// A memory: what `meka memory list` prints and `GET /v1/memories/{name}` answers with. The body
 /// rides only on the single-memory surfaces, so a listing stays small.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
@@ -594,12 +605,12 @@ pub(crate) struct MemoryDetail {
     /// How many times the agent has recalled this memory through `memory_read`. Feeds search
     /// ranking; an operator reading the memory does not move it.
     pub(crate) read_count: u32,
-    /// Present on `GET /v1/memory/{name}` and `meka memory show`, absent from a listing.
+    /// Present on `GET /v1/memories/{name}` and `meka memory show`, absent from a listing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) body: Option<String>,
     /// The line the words of a search were found on, present only on an entry a search found.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) snippet: Option<String>,
+    pub(crate) excerpt: Option<String>,
 }
 
 impl MemoryDetail {
@@ -623,7 +634,7 @@ impl MemoryDetail {
             tags: memory.tags.clone(),
             read_count: memory.read_count,
             body,
-            snippet: None,
+            excerpt: None,
         }
     }
 }
@@ -743,29 +754,19 @@ pub(crate) struct CompactionView {
     pub(crate) memories_written: Vec<String>,
     /// Whether the recent turns were kept verbatim after the summary.
     pub(crate) kept_recent: bool,
-    /// How many materialized messages the boundary removed: the whole pre-compaction window,
-    /// including the tail compaction re-appends verbatim, so it over-counts what the summary
-    /// itself stands for. Use it to detect *that* the view was rewritten, not to compute how much
-    /// was lost.
-    pub(crate) replaced_count: usize,
     /// Which compaction this was, counting from 1. Fidelity degrades with each pass, so a client
     /// rendering a transcript can say how far from the original it is.
     pub(crate) generation: u64,
 }
 
 impl CompactionView {
-    /// The view of a boundary's record, with the two counters the replay adds.
-    pub(crate) fn new(
-        record: &crate::conversation::CompactionRecord,
-        replaced_count: usize,
-        generation: u64,
-    ) -> Self {
+    /// The view of a boundary's record, which compaction of the session's it was.
+    pub(crate) fn new(record: &crate::conversation::CompactionRecord, generation: u64) -> Self {
         Self {
             trigger: record.trigger.name().to_string(),
             source: record.source.name().to_string(),
             memories_written: record.memories_written.clone(),
             kept_recent: record.kept_recent,
-            replaced_count,
             generation,
         }
     }
@@ -960,6 +961,8 @@ mod tests {
             parent_id,
             pinned_at: None,
             last_turn: None,
+            turn_count: 0,
+            usage: Default::default(),
         }
     }
 
@@ -986,7 +989,9 @@ mod tests {
             "profile",
             "project",
             "title",
-            "parent_id"
+            "parent_id",
+            "turn_count",
+            "usage"
         ]);
         assert_eq!(document["working_directory"], "/work");
         assert_eq!(document["permission"], "read");

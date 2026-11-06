@@ -168,7 +168,7 @@ takes.
 A fallback must be able to carry what the session holds: the same `vision`, and a window and a
 request cap no smaller ([`fallbacks`](../configuration/config-file.md#fallbacks)). While a fallback
 serves, the session keeps gauging against its own profile's window. A profile with `vision` off,
-reached by a switch rather than a fallback, refuses a turn while the history holds an image.
+reached by a switch rather than a fallback, refuses a turn while the context holds an image.
 
 ## Storage location
 
@@ -209,8 +209,8 @@ The three tables below are the conversation itself, with `messages_fts`, the ful
 the words of `messages` that [`meka session search`](#searching-sessions) reads. The store holds
 seven more, which the features that own them document: `scheduled_jobs`
 ([scheduling](./scheduling.md)), `background_tasks` ([background work](./background.md)),
-`memories` and its `memories_fts` full-text index ([memory](./memory.md)), `prompt_history` (the
-screen's [input history](./interactive-mode.md#input-history)), and `account_credentials` and
+`memories` and its `memories_fts` full-text index ([memory](./memory.md)), `recall_entries` (the
+screen's [recall](./interactive-mode.md#recall)), and `account_credentials` and
 `mcp_credentials` (secrets, never in `config.toml`).
 
 **sessions**, one row per session:
@@ -302,7 +302,7 @@ turn_retention = "90d"   # delete turns that ended over 90 days ago, once summar
 
 The sweep takes only what a compaction has summarized: the turns before the session's latest compaction, since the summary is what stands in for them, and never the turns the model is still working from. When one of those is older than the window, the next turn compacts first, keeping no rounds verbatim and quoting none, and the sweep takes it afterward; `turn_retention` therefore needs `auto_compact` on. It runs at startup, at the start of each turn for that turn's session, and hourly while a long-lived host stays up, and reports what it took at `warn` level.
 
-A turn goes whole: its messages, its record, its words in the search index and the images only it carried. A turn the latest compaction kept verbatim stays in the model's view as the copy the compaction wrote, and history shows that copy once the turn's own rows are gone. Inbox items and background outcomes go once they have been delivered or withdrawn for longer than the window. Scratchpad entries and memories stay, since they are the agent's own notes rather than the conversation. A fork copies what has survived, and an import brings in turns the next sweep will date like any other. What remains of a deleted turn is whatever the compaction summary said about it, which is the model's memory and the only thing retention cannot take.
+A turn goes whole: its messages, its record, its words in the search index and the images only it carried. A turn the latest compaction kept verbatim stays in the model's view as the copy the compaction wrote, and history shows that copy, under the turn and at the time it was said, once the turn's own rows are gone; a turn a compaction cut into keeps only the rounds the copies hold. Inbox items and background outcomes go once they have been delivered or withdrawn for longer than the window. Scratchpad entries and memories stay, since they are the agent's own notes rather than the conversation. A fork copies what has survived, and an import brings in turns the next sweep will date like any other. What remains of a deleted turn is whatever the compaction summary said about it, which is the model's memory and the only thing retention cannot take.
 
 See [Config file](../configuration/config-file.md#session) for details.
 
@@ -318,7 +318,7 @@ With `auto_compact = false` the conversation grows until the provider rejects a 
 
 When a session becomes too long, `/compact` replaces the older turns with a summary. A token-budgeted tail of recent messages may be kept verbatim, without splitting tool calls from their results. If too little older history remains to summarize, the whole conversation is summarized instead; an unanswered trailing prompt is still kept.
 
-The kept tail is written after the summary as copies the model alone reads. Everything that shows the session's history (the screen on a resume, an editor's reload, `conversation_search` and `conversation_read`, the session search, a Markdown export and the turn count `agent_list` gives) shows each kept turn once, where it was first said, and shows the copy once turn retention has taken the turn's own rows. A kept message the view had rewritten on its way to the model (thinking it stripped, an image it replaced) matches no row of its own and shows twice.
+The kept tail is written after the summary as copies the model alone reads. Everything that shows the session's history (the screen on a resume, an editor's reload, `GET /v1/sessions/{id}/history`, `conversation_search` and `conversation_read`, the session search and a Markdown export) shows each kept turn once, where it was first said, and shows the copy, under the turn and at the time it was said, once turn retention has taken the turn's own rows. A kept message the view had rewritten on its way to the model (thinking it stripped, an image it replaced) is shown as it was said, and once retention has taken that row, as the model last saw it.
 
 Whoever writes the summary, it has four sections: the rules and authorizations the user stated, in their words; each commitment and its state (done, pending, blocked, or superseded) and what must happen before the next; the facts established, each with its source; and the next action. A `/compact <instructions>` focus adds emphasis within those sections and never drops one.
 
@@ -346,7 +346,7 @@ Note that an *automatic* compaction runs a checkpoint too, unattended, and can w
 
 Compaction preserves scratchpad entries, copies the open [checklist](checklist.md) into the summary verbatim, and re-injects environment context so the agent isn't disoriented afterwards. The tool catalog, skill list, and MCP server instructions are restated in full on the next turn, since the messages that carried them may have been summarized away. Tools loaded via `tool_load` stay loaded; the deferred-tool active set is snapshotted into the compaction boundary. If a detail was dropped, the model can `conversation_search` / `conversation_read` the full pre-compaction history, which stays on disk.
 
-Internally, compaction does not delete pre-compaction rows from the store. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only until [turn retention](#turn-retention), if set, takes the rows a boundary has superseded. A resume reads that log from its last `compact_boundary` row: nothing before it can reach the view, so opening a session costs the same however long its history is. `conversation_search`, `conversation_read`, `GET /messages`, a rewind and an export still read the whole log.
+Internally, compaction does not delete pre-compaction rows from the store. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only until [turn retention](#turn-retention), if set, takes the rows a boundary has superseded. A resume reads that log from its last `compact_boundary` row: nothing before it can reach the view, so opening a session costs the same however long its history is. `conversation_search`, `conversation_read`, `GET /history`, a rewind and an export still read the whole log.
 
 #### When the summarizer runs instead
 
@@ -355,6 +355,8 @@ A standalone summarizer, with no tools and none of the standing instructions, is
 - The compaction is an **emergency** one, i.e. the provider has already rejected the request for exceeding the window. A checkpoint turn re-sends that same conversation, so it would be refused identically; the summarizer strips images and truncates long blocks, which is what lets it get through.
 - The checkpoint turn **fails or ends without calling `context_replace`**. `tool_choice` isn't available across meka's backends, so the call can't be forced, and a turn that ends on prose instead is not trusted to have written a summary: that prose is as often an answer to the conversation, or a sentence cut off at the checkpoint's round limit, as a summary, and nothing can tell which. Memories the checkpoint wrote before it ended are kept either way.
 - `compact_checkpoint` is off.
+
+The summarizer runs under the profile's thinking setting, as every request does. A summary that comes back with no text, its whole reply thinking, is asked for once more with the nudge a turn gets; a second empty one fails the compaction.
 
 ```toml
 [session]
@@ -476,12 +478,12 @@ and nothing else, so the model and endpoint it runs on are whatever that profile
 currently say. `meka profile list` shows them.
 
 Both commands take `--format json`. The listing becomes `{"sessions": [...]}` and `show` one object,
-each session carrying `id`, `created_at`, `updated_at`, `profile`, `title`, `approvals`, and, when
-the row records them, `working_directory`, `permission`, `capabilities`, `parent_id`, `pinned_at` and
-`last_turn`: the fields [`GET /v1/sessions`](http-api.md) returns under the same names, less the
-three only a running host can answer (`turn_in_flight`, `inbox_pending`, `approvals_pending`). Ids
-are printed in full, and an empty store is
-`{"sessions": []}`.
+each session carrying `id`, `created_at`, `updated_at`, `profile`, `project`, `title`, `approvals`,
+`turn_count` and `usage` (the turns the session has on record and what they spent, its compactions included), and, when the row records them,
+`working_directory`, `permission`, `parent_id`, `pinned_at` and `last_turn`: the fields
+[`GET /v1/sessions`](http-api.md) returns under the same names, less what only the server holding
+the session can answer (`capabilities`, `turn_in_flight`, `inbox_pending`, `requests_pending`,
+`checklist`). Ids are printed in full, and an empty store is `{"sessions": []}`.
 
 ```bash
 meka session list --format json | jq -r '.sessions[] | "\(.id) \(.profile)"'
@@ -554,23 +556,24 @@ Tool calls, tool results and the model's thinking are not, so a file the agent r
 its session a match for every word in it; `conversation_search`, which the agent runs over the
 sessions it names, still covers those. The agent has this search too, as
 [`session_search`](../tools/overview.md#session_list--session_search), over the sessions it may
-read. A session whose title holds every word is listed first, newest first
-among those; the rest are ranked by how well their best message matches. Every word must appear;
-when nothing holds them all, the words are tried as prefixes, so `zebra okap` still finds the
-session about zebras and okapis; then sessions holding any of the words are listed, then any as a
-prefix. Words are matched by their stem, so `deployed` finds `deploying`, and every diacritic is
-folded, so `viet` finds `Việt`. Chinese, Japanese, Korean and other scripts written without spaces
-are matched character by character, so a word is found inside a sentence and a query of one
-character works. What the matching does not do: an Arabic word is matched as written, article
-prefix included; a German compound is not split into its parts; Thai is matched by its consonants
-alone. A turn a rewind took out of the model's view is still part of the session, and is still
-found.
+read. A session whose title holds every word is listed first, newest first among those; the rest are
+ranked by how well their best message matches. Every word must appear; when nothing holds them all,
+the words are tried as prefixes, so `zebra okap` still finds the session about zebras and okapis;
+then sessions holding any of the words are listed, then any as a prefix. Words are matched by their
+stem, so `deployed` finds `deploying`, and every diacritic is folded, so `viet` finds `Việt`.
+Chinese, Japanese, Korean and other scripts written without spaces are matched character by
+character, so a word is found inside a sentence and a query of one character works. What the
+matching does not do: an Arabic word is matched as written, article prefix included; a German
+compound is not split into its parts; Thai is matched by its consonants alone. A message a rewind
+took back is not found, since the history no longer shows it.
 
 Each row shows the session's title and the line of the best-matching message the words were found
 on, cut to fit; a line taken from a compaction summary is marked `(summary)`. `-n` sets how many
 sessions to show (default 20), `--include-children` adds sub-agent sessions, and `--format json`
-answers `{"sessions": [...]}` with each session's record plus `excerpt`. Over HTTP it is
-[`GET /v1/sessions/search?q=`](http-api.md#titles-pins-and-search).
+answers `{"sessions": [...]}` with each session's record plus `excerpt` and `excerpt_position`, the
+position of the message the excerpt was taken from, which `GET
+/v1/sessions/{id}/history?before=<excerpt_position + 1>` ends a page with. Over HTTP it is [`GET
+/v1/sessions?q=`](http-api.md#titles-pins-and-search).
 
 The search reads an index the store keeps beside the conversation, a few percent of its size, kept
 in step with every message written and checked on every open. The first launch after upgrading
@@ -606,7 +609,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 21`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 20), which is brought forward as it is read. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 22`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 21), which is brought forward as it is read. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 
@@ -657,7 +660,7 @@ its own, and it is continued through `agent_followup` like any other sub-agent.
 
 Forking copies what has been committed to the store, and only between turns. A session another meka process has open is refused rather than copied (see [Session locking](#session-locking)), and so is one with a turn in flight in the process that holds it: `POST /v1/sessions/{id}/fork` answers `409` `turn-in-flight` and ACP `session/fork` answers `InvalidParams`. The user message is persisted before the model is called, so a copy taken mid-turn would end on a prompt with no reply and restore as an unusable session. Cancel the turn or wait for it.
 
-The same operation is available from the screen as `/fork`, which switches you into the copy and leaves the original where you branched (an `always` or `never` given at an approval prompt stays with the original; see [Permissions](permissions.md#approvals)); over HTTP as `POST /v1/sessions/{id}/fork`; and over ACP as `session/fork`.
+The same operation is available from the screen as `/fork`, which switches you into the copy and leaves the original where you branched (an `always` or `never` given at an approval prompt stays with the original; see [Permissions](permissions.md#approvals)); over HTTP as `POST /v1/sessions/{id}/fork`, whose `turn_id` branches the copy before a turn; and over ACP as `session/fork`.
 
 ### Fork or export/import?
 
@@ -674,9 +677,9 @@ meka session rewind 550e8400-e29b-41d4-a716-446655440000
 meka session rewind 550e8400-e29b-41d4-a716-446655440000 -n 3
 ```
 
-The cut lands on a turn boundary, so a tool call is never separated from its result, and a compaction summary counts as a turn, so a rewind that reaches it removes the summary too. Nothing is deleted: the dropped turns stay in the event log and still appear in `meka session export`, marked at the point of the rewind. The model simply stops seeing them.
+The cut lands on a turn boundary, so a tool call is never separated from its result. A compaction summary is never taken, since it stands for turns no rewind can give back: a session whose context holds fewer turns after its summary than `-n` asks for is refused with nothing to rewind. Nothing is deleted: the dropped turns stay in the event log and still appear in `meka session export`, marked at the point of the rewind. The model simply stops seeing them.
 
-The command takes the session lock, so it refuses to run while a screen, `meka serve`, or `meka acp` holds the session; that process has its own copy of the conversation in memory and would write over the rewind on its next turn. On the screen use `/rewind` instead. Under ACP there is no in-session equivalent, so close the session in the editor and run this command; over HTTP, `POST /v1/sessions/{id}/rewind` does the same to a live session.
+The command takes the session lock, so it refuses to run while a screen, `meka serve`, or `meka acp` holds the session; that process has its own copy of the conversation in memory and would write over the rewind on its next turn. On the screen use `/rewind` instead. Under ACP there is no in-session equivalent, so close the session in the editor and run this command; over HTTP, `POST /v1/sessions/{id}/rewind` takes a live session back to before the turn its `turn_id` names.
 
 Its main use is recovering a session a provider has started rejecting. A provider validates the whole conversation on every request, so one piece of content it rejects fails every later turn too.
 
@@ -732,23 +735,23 @@ meka session remove --all
 different requests, and it refuses rather than quietly doing the wider one. It means every session,
 pinned ones included.
 
-## Input history
+## Recall
 
-Separate from your saved conversations, meka keeps a rolling history of the prompts you *type* on the screen, so **Up-arrow** recall and **Ctrl+R** reverse-search work across runs (shell-style). This is distinct from a session (a stored conversation), which the screen reads back as you scroll up.
+Separate from your saved conversations, meka keeps a rolling list of the prompts you *type* on the screen, its recall, so **Up-arrow** recall and **Ctrl+R** reverse-search work across runs (shell-style). This is distinct from a session (a stored conversation), which the screen reads back as you scroll up.
 
-List recent input-history entries (oldest first; `-n 0` shows all), one per line, or as
-`{"history": [...]}` with `--format json`:
+List recent recall entries (oldest first; `-n 0` shows all), one per line, or as
+`{"recall": [...]}` with `--format json`; an empty list says `No recall entries.` on stderr:
 
 ```bash
-meka history list
-meka history list -n 100
-meka history list --format json
+meka recall list
+meka recall list -n 100
+meka recall list --format json
 ```
 
 Clear it entirely:
 
 ```bash
-meka history clear
+meka recall clear
 ```
 
 ## Managing sessions via SQLite

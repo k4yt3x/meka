@@ -1366,8 +1366,8 @@ fn memory_change_line(
 /// names of the rest.
 ///
 /// Budgeted on the entry lines alone, against the index's own ceiling. The entry count is
-/// unbounded (a restore loop through `PUT /v1/memory` moves thousands of rows between two turns),
-/// so without a ceiling one line can outweigh the index it updates. The bodies ride on top
+/// unbounded (a restore loop through `PUT /v1/memories/{name}` moves thousands of rows between two
+/// turns), so without a ceiling one line can outweigh the index it updates. The bodies ride on top
 /// uncounted: the store admits no more of them than the inline budget, the band shows the rest by
 /// description, and a body left out here is a rule the model goes on reading in its superseded
 /// form.
@@ -1407,10 +1407,10 @@ fn budgeted_memory_entries(entries: &[(String, String, usize)]) -> String {
 ///
 /// Names are short, which is why the diff names cut entries at all rather than pointing at an index
 /// that predates the very writes being announced. Short is not the same as free. A restore loop
-/// through `PUT /v1/memory`, a `meka memory` sweep from a second terminal, or a `shell_execute`
-/// shelling out to one (all of which move rows behind a host's back) can put thousands of names on
-/// one line: 5,000 memories appearing between two turns is roughly 85k tokens of names, in the
-/// section whose own index render is held to 8 KB.
+/// through `PUT /v1/memories/{name}`, a `meka memory` sweep from a second terminal, or a
+/// `shell_execute` shelling out to one (all of which move rows behind a host's back) can put
+/// thousands of names on one line: 5,000 memories appearing between two turns is roughly 85k tokens
+/// of names, in the section whose own index render is held to 8 KB.
 ///
 /// Forty is enough to act on and enough to recognize a bulk change for what it is. Past that the
 /// count is the information.

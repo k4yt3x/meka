@@ -61,7 +61,7 @@ pub(crate) struct AddArgs<'a> {
 
 /// `meka memory list` under a chosen format and stream: a table of the memories the filter
 /// selects, every one of them by default, in index order; or under `--format json`
-/// `{"memories": [...]}`, the shape `GET /v1/memory` answers with.
+/// `{"memories": [...]}`, the shape `GET /v1/memories` answers with.
 pub(crate) async fn list(
     store: &MemoryStore,
     filter: &MemoryFilter,
@@ -327,9 +327,9 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
             name: args.name.to_string(),
             view: MemoryView::All,
             project: args.project.map(str::to_string),
-            // As `memory_write` and `PUT /v1/memory` do. A description is a one-line label at every
-            // door, and `meka memory export` writes it normalized, so storing it raw here made the
-            // CLI the one door whose descriptions changed on the way through a backup.
+            // As `memory_write` and `PUT /v1/memories/{name}` do. A description is a one-line label
+            // at every door, and `meka memory export` writes it normalized, so storing it raw here
+            // made the CLI the one door whose descriptions changed on the way through a backup.
             description: Some(memory::normalize_description(args.description)),
             tags,
             body,
@@ -1195,8 +1195,8 @@ mod tests {
 
     /// The CLI stores a one-line description, as the other two write doors do.
     ///
-    /// `PUT /v1/memory` normalized and this did not, so a description written here kept its
-    /// newlines, and `meka memory export` normalizes on the way out, which made the round trip
+    /// `PUT /v1/memories/{name}` normalized and this did not, so a description written here kept
+    /// its newlines, and `meka memory export` normalizes on the way out, which made the round trip
     /// change the stored text for the door most likely to be handed a multi-line shell string.
     #[tokio::test]
     async fn add_stores_a_one_line_description() {

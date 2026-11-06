@@ -455,7 +455,7 @@ impl ProbeOutcome {
 }
 /// Why a gate may not run at a given level.
 ///
-/// One type so the doors that ask (`schedule_create`, `POST /v1/sessions/{id}/schedule`, and the
+/// One type so the doors that ask (`schedule_create`, `POST /v1/jobs`, and the
 /// fire-time re-check in [`crate::scheduler::prepare`]) give the same answer for the same state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GateRefusal {

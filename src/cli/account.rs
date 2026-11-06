@@ -742,11 +742,11 @@ async fn run_introspection(
             }
             written?;
         }
-        View::Stats => match provider.fetch_history().await? {
-            Some(history) => {
+        View::Stats => match provider.fetch_usage_stats().await? {
+            Some(stats) => {
                 let out = StatsOutput {
                     account: &account,
-                    history: &history,
+                    stats: &stats,
                 };
                 match format {
                     crate::cli::OutputFormat::Plain => {
@@ -757,7 +757,7 @@ async fn run_introspection(
             }
             None => {
                 crate::streams::write_stderr_line(format!(
-                    "Account history is not available for account '{account}'."
+                    "Account stats are not available for account '{account}'."
                 ));
                 return Err(crate::error::AlreadyReported.into());
             }
@@ -801,19 +801,19 @@ fn account_to_ask(
 struct StatsOutput<'a> {
     account: &'a str,
     #[serde(flatten)]
-    history: &'a crate::provider::UsageHistory,
+    stats: &'a crate::provider::UsageStats,
 }
 
 /// `meka account stats` as `label: value` lines, the recent days indented under a bare `recent:`
 /// heading the way `schedule show` prints a prompt.
 fn format_stats_plain(out: &StatsOutput<'_>) -> String {
-    let history = out.history;
+    let stats = out.stats;
     let tokens = |value: Option<i64>| {
         value.map(|value| crate::text::format_token_count(value.max(0) as u64))
     };
     let days = |value: Option<i64>| value.map(|value| format!("{value} days"));
     let mut fields = vec![("account", out.account.to_string())];
-    if let Some(first) = &history.first_used {
+    if let Some(first) = &stats.first_used {
         // An RFC 3339 timestamp trimmed to its date: the time of day says nothing here.
         fields.push((
             "first used",
@@ -821,21 +821,21 @@ fn format_stats_plain(out: &StatsOutput<'_>) -> String {
         ));
     }
     for (label, value) in [
-        ("lifetime tokens", tokens(history.lifetime_tokens)),
-        ("peak daily", tokens(history.peak_daily_tokens)),
-        ("current streak", days(history.current_streak_days)),
-        ("longest streak", days(history.longest_streak_days)),
+        ("lifetime tokens", tokens(stats.lifetime_tokens)),
+        ("peak daily", tokens(stats.peak_daily_tokens)),
+        ("current streak", days(stats.current_streak_days)),
+        ("longest streak", days(stats.longest_streak_days)),
     ] {
         if let Some(value) = value {
             fields.push((label, value));
         }
     }
-    if !history.daily.is_empty() {
+    if !stats.daily.is_empty() {
         fields.push(("recent", String::new()));
     }
     let mut text = crate::text::format_fields(&fields);
     // Indented, because a date on its own would read as one more field.
-    for day in history.daily.iter().rev().take(7) {
+    for day in stats.daily.iter().rev().take(7) {
         text.push_str(&format!(
             "  {}  {}\n",
             day.date,
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn stats_indent_the_recent_days_under_a_bare_heading() {
-        let history = crate::provider::UsageHistory {
+        let stats = crate::provider::UsageStats {
             lifetime_tokens: Some(1_200_000),
             peak_daily_tokens: None,
             current_streak_days: Some(3),
@@ -913,7 +913,7 @@ mod tests {
         };
         let text = format_stats_plain(&StatsOutput {
             account: "codex",
-            history: &history,
+            stats: &stats,
         });
         assert_eq!(
             text,

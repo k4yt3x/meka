@@ -20,8 +20,8 @@ use super::{terminal::*, *};
 /// Lines `tracing` can queue for the screen before the oldest falls through to stderr.
 const LOG_QUEUE_LINES: usize = 512;
 
-/// Entries the input history keeps.
-const HISTORY_CAPACITY: usize = 5000;
+/// Entries the recall keeps.
+const RECALL_CAPACITY: usize = 5000;
 
 /// Run the interactive host: resume or create the session, open the screen, and answer what it
 /// sends until the user leaves.
@@ -315,13 +315,13 @@ pub(crate) async fn run_interactive(
         )
     });
 
-    // Persistent, cross-session input history in the store. On failure the composer walks
-    // nothing rather than the run failing.
-    let history =
-        match crate::store::history::HistoryStore::open(store.database_path(), HISTORY_CAPACITY) {
-            Ok(history) => Some(history),
+    // Persistent, cross-session recall in the store. On failure the composer walks nothing rather
+    // than the run failing.
+    let recall =
+        match crate::store::recall::RecallStore::open(store.database_path(), RECALL_CAPACITY) {
+            Ok(recall) => Some(recall),
             Err(error) => {
-                tracing::warn!("failed to open the store for input history: {error}");
+                tracing::warn!("failed to open the store for recall: {error}");
                 None
             }
         };
@@ -353,7 +353,7 @@ pub(crate) async fn run_interactive(
         launch_cwd: launch_cwd.clone(),
         status_row: config.status_row.clone(),
         context: context_indicator,
-        history,
+        recall,
         completer: input::Completer {
             mcp_server_names: config
                 .mcp_servers

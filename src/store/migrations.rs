@@ -214,10 +214,9 @@ const MIGRATIONS: &[Migration] = &[
         name: "background_tasks_announce_before_they_deliver",
         step: Step::Rust(background_tasks_announce_before_they_deliver),
     },
-    // The REPL's history table was created by its own connection on every open, which made
-    // `store/history.rs` a second owner of the schema. Every store that has run the REPL already
-    // has it, hence `IF NOT EXISTS`; one that has not gets it here, and the history code
-    // assumes it.
+    // The screen's recall table was created by its own connection on every open, which made its
+    // module a second owner of the schema. Every store that has run the screen already has it,
+    // hence `IF NOT EXISTS`; one that has not gets it here, and the recall code assumes it.
     Migration {
         name: "prompt_history_is_in_the_ledger",
         step: Step::Sql(PROMPT_HISTORY_0_46),
@@ -553,6 +552,20 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "compact_boundaries_record_their_written_summary",
         step: Step::Rust(compact_boundaries_record_their_written_summary),
+    },
+    // 0.89 calls the lines typed on the screen, which Up and Ctrl+R bring back, its recall, and
+    // the table takes the word. A store that already has the new name keeps it, so a replay is a
+    // no-op; `classify_by_shape` classifies such a store past this step, since
+    // `prompt_history_is_in_the_ledger` names the old one.
+    Migration {
+        name: RECALL_ENTRIES_TAKE_THEIR_NAME,
+        step: Step::Rust(recall_entries_take_their_name),
+    },
+    // 0.89: a copy a compaction kept says which turn said it and when, beside the turn that wrote
+    // it and when, so it says so still once the turn sweep takes the row it copies.
+    Migration {
+        name: "kept_copies_say_where_they_were_said",
+        step: Step::Rust(kept_copies_say_where_they_were_said),
     },
 ];
 
@@ -961,6 +974,65 @@ const MESSAGES_KIND_INDEX: &str = "
 /// [`classify_by_shape`] classifies such a store at the version this entry leaves it.
 const NAMES_FOLLOW_THE_VOCABULARY: &str = "names_follow_the_vocabulary";
 
+/// The step after which a store's recall entries are in `recall_entries`, named once because
+/// [`classify_by_shape`] classifies such a store at the version this entry leaves it.
+const RECALL_ENTRIES_TAKE_THEIR_NAME: &str = "recall_entries_take_their_name";
+
+/// The columns a copy a compaction kept says where it was said in, `said_turn_id` and `said_at`,
+/// the index the turn sweep finds the turns they name by, and every copy written before them, which
+/// says what the row its chain of copies starts from says: that row's own turn and time, or where
+/// it says it was said when it says so. A copy the sweep already left standing alone names no row
+/// to read it from, and says nothing. Safe to replay: a column is added only where it is missing,
+/// and a copy that says something is left as it is.
+fn kept_copies_say_where_they_were_said(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "messages", "said_turn_id")? {
+        transaction.execute_batch("ALTER TABLE messages ADD COLUMN said_turn_id TEXT")?;
+    }
+    if !table_has_column(transaction, "messages", "said_at")? {
+        transaction.execute_batch("ALTER TABLE messages ADD COLUMN said_at TEXT")?;
+    }
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messages_said_turns ON messages(session_id) \
+         WHERE said_turn_id IS NOT NULL",
+    )?;
+    // A link that does not point back down the log ends the chain, so a hand-edited one cannot
+    // loop, and a row that says where it was said ends it too; the row a chain starts from is its
+    // lowest. Joined once, where a lookup in each `SET` would read every chain again per copy.
+    transaction.execute_batch(
+        "WITH RECURSIVE chain(copy, at) AS (
+             SELECT id, copy_of FROM messages
+             WHERE copy_of IS NOT NULL AND copy_of < id AND said_at IS NULL
+             UNION ALL
+             SELECT chain.copy, m.copy_of FROM chain JOIN messages m ON m.id = chain.at
+             WHERE m.copy_of IS NOT NULL AND m.copy_of < m.id AND m.said_at IS NULL
+         ),
+         roots(copy, root) AS (SELECT copy, MIN(at) FROM chain GROUP BY copy)
+         UPDATE messages SET
+             said_turn_id = CASE WHEN r.said_at IS NULL THEN r.turn_id ELSE r.said_turn_id END,
+             said_at = COALESCE(r.said_at, r.created_at)
+         FROM roots JOIN messages r ON r.id = roots.root
+         WHERE roots.copy = messages.id",
+    )
+}
+
+fn recall_entries_take_their_name(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let tables: Vec<String> = transaction
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND name IN ('prompt_history', 'recall_entries')",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if tables.iter().any(|name| name == "prompt_history")
+        && !tables.iter().any(|name| name == "recall_entries")
+    {
+        transaction.execute_batch("ALTER TABLE prompt_history RENAME TO recall_entries")?;
+    }
+    Ok(())
+}
+
 const PROMPT_HISTORY_0_46: &str = "CREATE TABLE IF NOT EXISTS prompt_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     command_line TEXT NOT NULL,
@@ -1246,7 +1318,7 @@ const HEAD_TABLES: &[&str] = &[
     "message_blobs",
     "messages",
     "projects",
-    "prompt_history",
+    "recall_entries",
     "scheduled_jobs",
     "scratchpad_entries",
     "sessions",
@@ -1255,7 +1327,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 10_585_081_824_762_022_888;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 9_688_403_848_242_860_359;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -1614,9 +1686,23 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
             missing.join(", ")
         )));
     }
+    // A store holding `recall_entries` has run the step that renamed `prompt_history` to it, and
+    // `prompt_history_is_in_the_ledger`, frozen, would make the old table again beside it.
+    let recall_entries: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'recall_entries'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            MekaError::Database(format!("failed to inspect the store's objects: {error}"))
+        })?;
+    if recall_entries > 0 {
+        return version_after(RECALL_ENTRIES_TAKE_THEIR_NAME);
+    }
     // A store with no `provider_credentials` object at all, table or view, has run
     // `names_follow_the_vocabulary`, the one step that removes it: the baseline creates the table,
-    // the check above refuses a store without it, and every shape from
+    // the completeness check refuses a store without it, and every shape from
     // `credentials_belong_to_accounts` up to that step carries the view. Such a store is
     // classified there rather than at the baseline, because the steps before it name the columns
     // that step renamed (`sessions_name_their_provider` reads the view, the 0.46 conversions read
@@ -3854,6 +3940,9 @@ const ARCHIVE_FORMAT_0_88_DEVELOPMENT: u64 = 19;
 /// The archive `format_version` 0.88's later development builds wrote, whose boundaries record
 /// their summary only inside the message they carry.
 const ARCHIVE_FORMAT_0_88_DEVELOPMENT_2: u64 = 20;
+/// The archive `format_version` 0.88 wrote, in which a compaction run between turns is no turn: a
+/// build that reads one draws it as the compaction alone, as it always was, so nothing converts.
+const ARCHIVE_FORMAT_0_88: u64 = 21;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -4437,7 +4526,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_86)
         | Some(ARCHIVE_FORMAT_0_87)
         | Some(ARCHIVE_FORMAT_0_88_DEVELOPMENT)
-        | Some(ARCHIVE_FORMAT_0_88_DEVELOPMENT_2) => {}
+        | Some(ARCHIVE_FORMAT_0_88_DEVELOPMENT_2)
+        | Some(ARCHIVE_FORMAT_0_88) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -4478,9 +4568,68 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     // and the block is sent nowhere.
     name_sealed_origin_0_87(document, &serde_json::Value::Null);
     link_kept_copies_0_87(document);
+    say_where_kept_copies_were_said_0_89(document);
     record_turn_levels_0_88(document);
     document["format_version"] = current.into();
     true
+}
+
+/// Each copy a compaction kept, in an archive from before 0.89, says where it was said: the turn
+/// and the time of the event its chain of copies starts from, an earlier position at each link.
+/// A copy that says already is left as it is.
+fn say_where_kept_copies_were_said_0_89(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        else {
+            continue;
+        };
+        let link = |events: &[serde_json::Value], position: usize| {
+            events
+                .get(position)
+                .and_then(|event| event.get("copy_of"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|original| usize::try_from(original).ok())
+                .filter(|original| *original < position)
+        };
+        let said: Vec<(usize, serde_json::Value, serde_json::Value)> = (0..events.len())
+            .filter(|position| {
+                events
+                    .get(*position)
+                    .is_some_and(|event| event.get("said_at").is_none())
+            })
+            .filter_map(|position| {
+                let mut root = link(events, position)?;
+                while let Some(earlier) = link(events, root) {
+                    root = earlier;
+                }
+                let root = events.get(root)?;
+                Some((
+                    position,
+                    root.get("turn_id").cloned().unwrap_or_default(),
+                    root.get("at").cloned().unwrap_or_default(),
+                ))
+            })
+            .collect();
+        for (position, turn, at) in said {
+            if let Some(event) = events
+                .get_mut(position)
+                .and_then(|event| event.as_object_mut())
+            {
+                if !turn.is_null() {
+                    event.insert("said_turn_id".to_string(), turn);
+                }
+                event.insert("said_at".to_string(), at);
+            }
+        }
+    }
 }
 
 /// [`kept_copies_0_87`] over each session of an archive: every event names the position of the one
@@ -5872,6 +6021,11 @@ mod tests {
             (
                 "compact_boundaries_record_their_written_summary",
                 17212040837895353316_u64,
+            ),
+            ("recall_entries_take_their_name", 2132857182174405754_u64),
+            (
+                "kept_copies_say_where_they_were_said",
+                7155948609130484468_u64,
             ),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or
@@ -9001,8 +9155,12 @@ mod tests {
         let mut connection = connection_for_test();
         create_for_test(&mut connection).expect("a store at head");
         let before = fingerprint(&connection);
+        // The shape a store had between the two renames, which the later floor would otherwise
+        // answer for.
         connection
-            .execute_batch("PRAGMA user_version = 0;")
+            .execute_batch(
+                "ALTER TABLE recall_entries RENAME TO prompt_history; PRAGMA user_version = 0;",
+            )
             .expect("lose the version");
 
         let replayed = plan(&connection).expect("classified by shape");
@@ -9020,6 +9178,166 @@ mod tests {
             user_version(&connection).expect("version"),
             MIGRATIONS.len() as u32
         );
+    }
+
+    /// A store holding `recall_entries` that lost its version is classified past the step that
+    /// named the table so, since the frozen step before it would make `prompt_history` again
+    /// beside it; the replay keeps the entries and leaves the head's shape.
+    #[test]
+    fn a_store_with_recall_entries_is_classified_past_their_rename() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        connection
+            .execute(
+                "INSERT INTO recall_entries (command_line, created_at) VALUES ('kept', 'now')",
+                [],
+            )
+            .expect("an entry");
+        let before = fingerprint(&connection);
+        connection
+            .execute_batch("PRAGMA user_version = 0;")
+            .expect("lose the version");
+
+        let replayed = plan(&connection).expect("classified by shape");
+        assert_eq!(
+            replayed.from,
+            version_after(RECALL_ENTRIES_TAKE_THEIR_NAME).expect("the step is in the ledger"),
+        );
+        apply(&mut connection, replayed, &Context::adopting(None)).expect("the replay");
+        assert_eq!(before, fingerprint(&connection));
+        let kept: String = connection
+            .query_row("SELECT command_line FROM recall_entries", [], |row| {
+                row.get(0)
+            })
+            .expect("the entry stays");
+        assert_eq!(kept, "kept");
+    }
+
+    /// The rename carries the entries over, and a replay over the renamed store is a no-op.
+    #[test]
+    fn recall_entries_take_their_name_with_their_rows() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        connection
+            .execute_batch(
+                "ALTER TABLE recall_entries RENAME TO prompt_history; \
+                 INSERT INTO prompt_history (command_line, created_at) VALUES ('typed', 'now');",
+            )
+            .expect("the old shape");
+        let transaction = connection.transaction().expect("transaction");
+        recall_entries_take_their_name(&transaction).expect("the step");
+        recall_entries_take_their_name(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        let typed: String = connection
+            .query_row("SELECT command_line FROM recall_entries", [], |row| {
+                row.get(0)
+            })
+            .expect("the entry moved");
+        assert_eq!(typed, "typed");
+        let old: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'prompt_history'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(old, 0);
+    }
+
+    /// The step gives every copy a compaction kept, a copy of a copy included, the turn and the
+    /// time of the row its chain starts from, or where a row on the chain says it was said; leaves
+    /// a copy that says already as it is, and one linked up the log saying nothing; and a replay
+    /// changes nothing else.
+    #[test]
+    fn kept_copies_say_where_they_were_said_from_the_row_they_stand_for() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        connection
+            .execute_batch(
+                "DROP INDEX idx_messages_said_turns; \
+                 ALTER TABLE messages DROP COLUMN said_turn_id; \
+                 ALTER TABLE messages DROP COLUMN said_at; \
+                 INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'then', 'then'); \
+                 INSERT INTO messages (id, session_id, kind, content, created_at, turn_id) \
+                     VALUES (1, 's', 'user', 'kept', 'when it was said', 'the turn'); \
+                 INSERT INTO messages (id, session_id, kind, content, created_at, turn_id) \
+                     VALUES (2, 's', 'compact_boundary', '{}', 'later', 'compacting'); \
+                 INSERT INTO messages (id, session_id, kind, content, created_at, turn_id, copy_of) \
+                     VALUES (3, 's', 'user', 'kept', 'later', 'compacting', 1); \
+                 INSERT INTO messages (id, session_id, kind, content, created_at, turn_id) \
+                     VALUES (4, 's', 'compact_boundary', '{}', 'later still', 'again'); \
+                 INSERT INTO messages (id, session_id, kind, content, created_at, turn_id, copy_of) \
+                     VALUES (5, 's', 'user', 'kept', 'later still', 'again', 3);",
+            )
+            .expect("the old shape");
+        let said = |connection: &rusqlite::Connection| -> Vec<(Option<String>, Option<String>)> {
+            connection
+                .prepare("SELECT said_turn_id, said_at FROM messages ORDER BY id")
+                .expect("prepare")
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let says = |turn: &str, at: &str| (Some(turn.to_string()), Some(at.to_string()));
+        let transaction = connection.transaction().expect("transaction");
+        kept_copies_say_where_they_were_said(&transaction).expect("the step");
+        assert_eq!(said(&transaction), [
+            (None, None),
+            (None, None),
+            says("the turn", "when it was said"),
+            (None, None),
+            says("the turn", "when it was said"),
+        ]);
+        transaction
+            .execute_batch(
+                "UPDATE messages SET said_turn_id = 'by hand', said_at = 'by hand' WHERE id = 5; \
+                 INSERT INTO messages (id, session_id, kind, content, created_at, turn_id, copy_of) \
+                     VALUES (6, 's', 'user', 'kept', 'last', 'last', 5); \
+                 INSERT INTO messages (id, session_id, kind, content, created_at, turn_id, copy_of) \
+                     VALUES (7, 's', 'user', 'ahead', 'last', 'last', 8); \
+                 INSERT INTO messages (id, session_id, kind, content, created_at, turn_id) \
+                     VALUES (8, 's', 'user', 'ahead', 'last', 'last');",
+            )
+            .expect("a copy that says already, a copy of it, and a link up the log");
+        kept_copies_say_where_they_were_said(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(said(&connection), [
+            (None, None),
+            (None, None),
+            says("the turn", "when it was said"),
+            (None, None),
+            says("by hand", "by hand"),
+            says("by hand", "by hand"),
+            (None, None),
+            (None, None),
+        ]);
+    }
+
+    /// An archive from before 0.89 has each copy a compaction kept, a copy of a copy included,
+    /// say the turn and the time of the event its chain starts from.
+    #[test]
+    fn an_older_archive_s_copies_say_where_they_were_said() {
+        let mut document = serde_json::json!({"sessions": [{"events": [
+            {"at": "when it was said", "turn_id": "the turn", "copy_of": null},
+            {"at": "later", "turn_id": "compacting", "copy_of": 0},
+            {"at": "later still", "turn_id": null, "copy_of": 1},
+            {"at": "unkept", "turn_id": "another", "copy_of": null},
+        ]}]});
+        say_where_kept_copies_were_said_0_89(&mut document);
+        let said: Vec<(serde_json::Value, serde_json::Value)> = document["sessions"][0]["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .map(|event| (event["said_turn_id"].clone(), event["said_at"].clone()))
+            .collect();
+        let null = serde_json::Value::Null;
+        assert_eq!(said, [
+            (null.clone(), null.clone()),
+            ("the turn".into(), "when it was said".into()),
+            ("the turn".into(), "when it was said".into()),
+            (null.clone(), null),
+        ]);
     }
 
     /// 0.76's steps rename the two columns with their data intact, restate every spec in the

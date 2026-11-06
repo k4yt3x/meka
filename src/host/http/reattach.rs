@@ -81,9 +81,9 @@ pub(crate) fn session_not_found(id: Uuid) -> ProblemDetail {
 
 /// Assert a session exists, without building anything.
 ///
-/// **Only a door that will run a turn may revive a dormant session**: `POST /turn`, `POST
+/// **Only a door that will run a turn may revive a dormant session**: `POST /turns`, `POST
 /// /compact`, `POST /rewind` on a resident session, and the inbox enqueue, whose driver runs one.
-/// Every other handler answers from the store through this function, a reader (`GET /messages`,
+/// Every other handler answers from the store through this function, a reader (`GET /history`,
 /// exports, tasks, jobs) and a writer that edits rows alone (a title, a cancel, a response to a
 /// prompt) alike. Reviving costs the session's cross-process file lock for up to the idle
 /// timeout, and a handler that revived on the way to a 404 would hold a session hostage to
@@ -307,7 +307,7 @@ pub(crate) async fn ensure_session_loaded_holding(
     // `Agent::new_subagent` never calls it. The UPDATE matches zero rows.
     //
     // Here rather than at each door, because every write-side session endpoint funnels through this
-    // function: `/turn`, `/compact`, `/rewind`, `/responses`, the fork's read-back and the
+    // function: `/turns`, `/compact`, `/rewind`, `/responses`, the fork's read-back and the
     // scheduler fire. Placing it at the doors is what left `patch_session` needing its own copy for
     // the one branch that never calls this.
     //

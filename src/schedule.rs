@@ -1,7 +1,7 @@
 //! Scheduled wakeups: the agent arranging to be prompted again later.
 //!
 //! Every other turn meka runs originates outside the agent: a human typing, an editor sending
-//! `session/prompt`, a client calling `POST /v1/sessions/{id}/turn`. This module supplies the one
+//! `session/prompt`, a client calling `POST /v1/sessions/{id}/turns`. This module supplies the one
 //! trigger nothing else can, a timer: the agent's ability to say "wake me at 09:00" and have that
 //! survive the process it was said in.
 //!
@@ -4211,7 +4211,7 @@ mod tests {
     /// Driven in one process rather than two. Advancing `last_fired_at` here is exactly what the
     /// other host's `complete_claim` writes, and the counter it has to convince lives in this
     /// process either way, so a second one would add wall-clock and no signal. It would add
-    /// *coverage*, though: `GET /v1/schedule` does put this verdict on a wire
+    /// *coverage*, though: `GET /v1/jobs` does put this verdict on a wire
     /// (`host::http::handlers::jobs` renders it as `withheld`), so a two-host test is constructible
     /// and would exercise the convergence end to end rather than at the predicate.
     #[tokio::test]

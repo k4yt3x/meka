@@ -25,9 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     conversation::{ContentBlock, Message, Role},
     error::Result,
-    provider::{
-        CompletionRequest, Provider, StopReason, StreamEvent, ThinkingOverride, ToolDefinition,
-    },
+    provider::{CompletionRequest, Provider, StopReason, StreamEvent, ToolDefinition},
     stats::TokenUsage,
 };
 
@@ -209,8 +207,6 @@ pub(crate) struct MockProvider {
     /// rebuilds the expected list itself asserts on its own arithmetic and passes even when the
     /// production path is reverted, which is worse than no test at all.
     completions: Mutex<Vec<Vec<Message>>>,
-    /// The thinking override each `complete` call carried, in call order.
-    completion_thinking: Mutex<Vec<ThinkingOverride>>,
     /// The prompt each `complete` call was attributed to, in call order: a sub-agent under
     /// `--no-stream` runs this way, and whether it carried its parent's prompt id is visible
     /// nowhere else.
@@ -250,7 +246,6 @@ pub(crate) struct MockProvider {
 #[derive(Debug, Clone)]
 pub(crate) struct StreamRequest {
     pub(crate) system_prompt: String,
-    pub(crate) thinking: ThinkingOverride,
     pub(crate) messages: Vec<Message>,
     pub(crate) tools: Vec<ToolDefinition>,
     /// The prompt this request was attributed to, read the way a real provider reads it while
@@ -278,11 +273,6 @@ impl MockProvider {
     }
 
     /// The messages behind each `complete` call so far, in order.
-    #[cfg(test)]
-    pub(crate) fn completion_thinking(&self) -> Vec<ThinkingOverride> {
-        crate::sync::lock(&self.completion_thinking).clone()
-    }
-
     #[cfg(test)]
     pub(crate) fn completions(&self) -> Vec<Vec<Message>> {
         crate::sync::lock(&self.completions).clone()
@@ -365,13 +355,11 @@ impl Provider for MockProvider {
             system_prompt,
             messages,
             tools,
-            thinking,
             attribution,
             ..
         } = request;
         crate::sync::lock(&self.completion_tools)
             .push(tools.iter().map(|tool| tool.name.clone()).collect());
-        crate::sync::lock(&self.completion_thinking).push(thinking);
         crate::sync::lock(&self.completions).push(messages.to_vec());
         crate::sync::lock(&self.completion_prompt_ids).push(attribution.prompt_id);
         crate::sync::lock(&self.completion_turn_origins).push(attribution.turn_origin);
@@ -537,12 +525,10 @@ impl Provider for MockProvider {
             system_prompt,
             messages,
             tools,
-            thinking,
             attribution,
             ..
         } = request;
         crate::sync::lock(&self.streams).push(StreamRequest {
-            thinking,
             system_prompt: system_prompt.to_string(),
             messages: messages.to_vec(),
             tools: tools.to_vec(),

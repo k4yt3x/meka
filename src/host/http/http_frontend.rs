@@ -6,8 +6,8 @@
 //!
 //! Every event also goes out on the session's feed: one `broadcast::Sender` per resident session,
 //! installed when the session is loaded and living as long as it does, with a replay ring behind
-//! it. `POST /turn` with `stream: true` is a view of that feed scoped to one turn;
-//! `GET /v1/sessions/{id}/stream` is the feed itself, across turns, and is how a client sees the
+//! it. `POST /turns` with `stream: true` is a view of that feed scoped to one turn;
+//! `GET /v1/sessions/{id}/feed` is the feed itself, across turns, and is how a client sees the
 //! turns nobody asked for over HTTP: a scheduled fire, a background outcome, an inbox item. The
 //! pause primitives park on a `oneshot::Receiver` until the client POSTs to
 //! `/v1/sessions/{id}/responses/{request_id}`, but only for a turn a streaming client attends.
@@ -119,7 +119,7 @@ pub(crate) struct SessionCapabilities {
     /// Defaults to `false`: a session nobody declared this for refuses a gated call with nobody
     /// attending rather than holding the session for the prompt's lifetime.
     pub(crate) answers_prompts_on_return: bool,
-    /// When `true`, an MCP server's elicitation parks as an `elicitation_required` event for an
+    /// When `true`, an MCP server's elicitation parks as an `elicitation.requested` event for an
     /// attending client to answer, under the attendance rule approvals follow; when `false` it
     /// is declined with a notice. Defaults to `false`: a bridge that answers approvals has no
     /// form to render, and a prompt nobody renders holds the call for its lifetime.
@@ -144,7 +144,7 @@ use super::feed::{
 pub(crate) use crate::host::scheduler::TurnStarter;
 
 /// One parked prompt: the channel its answer arrives on. What the prompt is about rides the
-/// `permission_required` or `elicitation_required` event, which the feed replays while the prompt
+/// `approval.requested` or `elicitation.requested` event, which the feed replays while the prompt
 /// is parked.
 pub(crate) enum Pending {
     Permission(oneshot::Sender<PermissionResolution>),
@@ -166,10 +166,10 @@ pub(crate) enum PendingKind {
     },
 }
 
-/// The `elicitation_required` SSE event's payload: what a client needs to show the prompt and
+/// The `elicitation.requested` SSE event's payload: what a client needs to show the prompt and
 /// answer it.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(crate) struct ElicitationRequiredEvent {
+pub(crate) struct ElicitationRequestedEvent {
     /// Names the parked request on `POST /v1/sessions/{id}/responses/{request_id}`.
     pub(crate) request_id: String,
     /// The MCP server asking.
@@ -188,7 +188,7 @@ pub(crate) struct ElicitationRequiredEvent {
     pub(crate) expires_in_seconds: u64,
     /// RFC 3339, when the request is declined unanswered.
     pub(crate) expires_at: String,
-    /// The sub-agent whose MCP server asked, when one did, as `permission_required` names it.
+    /// The sub-agent whose MCP server asked, when one did, as `approval.requested` names it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) subagent_id: Option<uuid::Uuid>,
 }
@@ -225,10 +225,10 @@ impl Drop for ParkedElicitation<'_> {
     }
 }
 
-/// The `permission_required` SSE event's payload: what a client needs to show the prompt and
+/// The `approval.requested` SSE event's payload: what a client needs to show the prompt and
 /// answer it.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(crate) struct PermissionRequiredEvent {
+pub(crate) struct ApprovalRequestedEvent {
     /// Names the parked request on `POST /v1/sessions/{id}/responses/{request_id}`.
     pub(crate) request_id: String,
     pub(crate) tool_name: String,
@@ -261,7 +261,7 @@ pub(crate) enum PermissionResolution {
 
 impl PermissionResolution {
     /// The decision's wire word, as `POST /responses/{request_id}` takes it and
-    /// `permission_resolved` reports it.
+    /// `approval.resolved` reports it.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Allow => "allow",
@@ -327,7 +327,7 @@ impl HttpFrontend {
             .map_or(Opener::DRIVER, |turn| turn.opener)
     }
 
-    /// How many readers are attending the session right now: the SSE response of a `POST /turn`
+    /// How many readers are attending the session right now: the SSE response of a `POST /turns`
     /// on a session that said it shows prompts, and every feed reader that said so itself.
     fn attending(&self) -> usize {
         let guard = crate::sync::lock(&self.feed);
@@ -439,8 +439,8 @@ impl HttpFrontend {
         }
     }
 
-    /// How many prompts are parked on this session right now.
-    pub(crate) fn approvals_pending(&self) -> u64 {
+    /// How many requests, approvals and elicitations, are parked on this session right now.
+    pub(crate) fn requests_pending(&self) -> u64 {
         crate::sync::lock(&self.pending).len() as u64
     }
 
@@ -453,7 +453,7 @@ impl HttpFrontend {
     }
 
     /// Close the session's feed, when the session leaves the process: dropping the channel is
-    /// what ends every `GET /stream` still reading it, since the stream holds this frontend and
+    /// what ends every `GET /feed` still reading it, since the stream holds this frontend and
     /// nothing else would. A turn on the frontend afterwards installs a fresh one.
     pub(crate) fn close_feed(&self) {
         crate::sync::lock(&self.feed).take();
@@ -822,7 +822,7 @@ impl HttpFrontend {
         backlog.retain(|event| {
             if !matches!(
                 event.event_type,
-                SseEventType::PermissionRequired | SseEventType::ElicitationRequired
+                SseEventType::ApprovalRequested | SseEventType::ElicitationRequested
             ) {
                 return true;
             }
@@ -899,7 +899,7 @@ impl HttpFrontend {
     ///
     /// A command's output is coalesced per call through [`crate::host::LiveOutput`], as ACP does.
     /// The shell relays every read, and one wire event per read would let a chatty command lag the
-    /// feed's readers, which for a `POST /turn` stream with no other reader cancels the turn.
+    /// feed's readers, which for a `POST /turns` stream with no other reader cancels the turn.
     fn wire_events(&self, event: &FrontendEvent) -> Vec<(SseEventType, serde_json::Value)> {
         let delta = |id: &str, chunk: String| {
             translate(
@@ -1058,7 +1058,7 @@ impl Frontend for HttpFrontend {
         {
             let mut guard = crate::sync::lock(&self.feed);
             if let Some(feed) = guard.as_mut() {
-                let payload = serde_json::to_value(PermissionRequiredEvent {
+                let payload = serde_json::to_value(ApprovalRequestedEvent {
                     request_id: request_id.clone(),
                     tool_name: request.tool_name.clone(),
                     input: request.input.clone(),
@@ -1067,16 +1067,16 @@ impl Frontend for HttpFrontend {
                     subagent_id: request.subagent_id,
                 })
                 .unwrap_or_else(|error| {
-                    tracing::warn!("failed to serialize the permission_required payload: {error}");
+                    tracing::warn!("failed to serialize the approval.requested payload: {error}");
                     serde_json::Value::Null
                 });
                 // Recorded like any other event: a client that reconnects mid-pause has to learn
                 // that the turn is waiting on it, or the turn sits there until the timeout.
-                feed.publish(SseEventType::PermissionRequired, payload.clone());
+                feed.publish(SseEventType::ApprovalRequested, payload.clone());
                 drop(guard);
                 self.mirror_to_subagent(
                     request.subagent_id,
-                    SseEventType::PermissionRequired,
+                    SseEventType::ApprovalRequested,
                     &payload,
                 );
             }
@@ -1103,7 +1103,7 @@ impl Frontend for HttpFrontend {
             _ = request.cancellation.cancelled() => (PermissionOutcome::Canceled, "canceled"),
             _ = disconnect_poll => {
                 tracing::info!(
-                    "nobody is left to answer permission_required for '{tool}'; auto-canceling",
+                    "nobody is left to answer approval.requested for '{tool}'; auto-canceling",
                     tool = request.tool_name,
                 );
                 (PermissionOutcome::Canceled, "canceled")
@@ -1133,10 +1133,10 @@ impl Frontend for HttpFrontend {
             guard.remove(&request_id);
         }
         let resolved = serde_json::json!({ "request_id": request_id, "outcome": closed_as });
-        self.push_sse(SseEventType::PermissionResolved, resolved.clone());
+        self.push_sse(SseEventType::ApprovalResolved, resolved.clone());
         self.mirror_to_subagent(
             request.subagent_id,
-            SseEventType::PermissionResolved,
+            SseEventType::ApprovalResolved,
             &resolved,
         );
         outcome
@@ -1197,7 +1197,7 @@ impl Frontend for HttpFrontend {
             ElicitationKind::Form { schema } => ("form", Some(schema.clone()), None),
             ElicitationKind::Url { url } => ("url", None, Some(url.clone())),
         };
-        let payload = serde_json::to_value(ElicitationRequiredEvent {
+        let payload = serde_json::to_value(ElicitationRequestedEvent {
             request_id,
             server: prompt.server_name.clone(),
             kind,
@@ -1211,15 +1211,15 @@ impl Frontend for HttpFrontend {
             subagent_id: prompt.subagent_id,
         })
         .unwrap_or_else(|error| {
-            tracing::warn!("failed to serialize the elicitation_required payload: {error}");
+            tracing::warn!("failed to serialize the elicitation.requested payload: {error}");
             serde_json::Value::Null
         });
         // Recorded like any other event: a client that reconnects mid-pause has to learn that
         // the call is waiting on it, or the call sits there until the timeout.
-        self.push_sse(SseEventType::ElicitationRequired, payload.clone());
+        self.push_sse(SseEventType::ElicitationRequested, payload.clone());
         self.mirror_to_subagent(
             prompt.subagent_id,
-            SseEventType::ElicitationRequired,
+            SseEventType::ElicitationRequested,
             &payload,
         );
 
@@ -1236,7 +1236,7 @@ impl Frontend for HttpFrontend {
             biased;
             _ = disconnect_poll => {
                 tracing::info!(
-                    "nobody is left to answer elicitation_required from '{server}'; canceling",
+                    "nobody is left to answer elicitation.requested from '{server}'; canceling",
                     server = prompt.server_name,
                 );
                 (ElicitationResponse::Cancel, "canceled")
@@ -1277,7 +1277,7 @@ impl Frontend for HttpFrontend {
     /// The second half is a response that renders the turn or an attending feed reader: both
     /// declared that they render what they are sent. A subscriber that did not attend does not
     /// count, because the feed is always there and a bridge holding it open may well be reading
-    /// whole blocks off `GET /messages` afterwards; costing every turn its retry for that reader
+    /// whole blocks off `GET /history` afterwards; costing every turn its retry for that reader
     /// would be paying for a duplicate it never sees.
     fn retains_reasoning(&self) -> bool {
         self.capabilities.supports_reasoning_stream
@@ -1360,7 +1360,7 @@ impl FeedWiring {
 /// What a sub-agent runs under when its parent is an HTTP session: the forwarding adapter every
 /// host uses, so its prompts reach the parent's feed and its calls roll into the `agent_spawn`
 /// call's activity, plus a feed of the sub-agent's own, published under its id for as long as
-/// the run lasts, which `GET /v1/sessions/{child}/stream` attaches to read-only.
+/// the run lasts, which `GET /v1/sessions/{child}/feed` attaches to read-only.
 pub(crate) struct SubagentFeed {
     child: uuid::Uuid,
     feed: Arc<HttpFrontend>,
@@ -1857,7 +1857,7 @@ mod tests {
         // Longer than the disconnect poll, so the poll has looked and left the prompt alone.
         tokio::time::sleep(DISCONNECT_POLL_INTERVAL * 3).await;
         assert_eq!(
-            frontend.approvals_pending(),
+            frontend.requests_pending(),
             1,
             "still parked inside the grace"
         );
@@ -1899,7 +1899,7 @@ mod tests {
         drop(attendee);
         tokio::time::sleep(DISCONNECT_POLL_INTERVAL * 3).await;
         assert_eq!(
-            frontend.approvals_pending(),
+            frontend.requests_pending(),
             1,
             "still parked inside the grace"
         );
@@ -2592,7 +2592,7 @@ mod tests {
         let event = receiver
             .try_recv()
             .expect("the pause event is on the stream");
-        assert_eq!(event.event_type, SseEventType::PermissionRequired);
+        assert_eq!(event.event_type, SseEventType::ApprovalRequested);
         assert_eq!(event.data["tool_name"], "file_write");
         assert_eq!(
             event.data["input"],
@@ -2882,13 +2882,13 @@ mod tests {
             parked
                 .backlog
                 .iter()
-                .any(|event| event.event_type == SseEventType::PermissionRequired),
+                .any(|event| event.event_type == SseEventType::ApprovalRequested),
             "a live prompt must reach a reconnecting client, or the turn stalls until timeout"
         );
         let request_id = parked
             .backlog
             .iter()
-            .find(|event| event.event_type == SseEventType::PermissionRequired)
+            .find(|event| event.event_type == SseEventType::ApprovalRequested)
             .and_then(|event| event.data.get("request_id"))
             .and_then(serde_json::Value::as_str)
             .expect("prompt carries a request_id")
@@ -2904,7 +2904,7 @@ mod tests {
             !after
                 .backlog
                 .iter()
-                .any(|event| event.event_type == SseEventType::PermissionRequired),
+                .any(|event| event.event_type == SseEventType::ApprovalRequested),
             "an answered prompt must not be replayed"
         );
     }
@@ -2985,7 +2985,7 @@ mod tests {
         assert_eq!(outcome, PermissionOutcome::Canceled);
     }
 
-    /// A held blocking request never sees a `permission_required`, so it is not an answerer:
+    /// A held blocking request never sees a `approval.requested`, so it is not an answerer:
     /// with nobody attending, its gated call is refused without asking rather than parked on a
     /// client that cannot look.
     #[tokio::test]
@@ -3218,7 +3218,7 @@ mod tests {
         let request_id = parked
             .backlog
             .iter()
-            .find(|event| event.event_type == SseEventType::ElicitationRequired)
+            .find(|event| event.event_type == SseEventType::ElicitationRequested)
             .and_then(|event| event.data.get("request_id"))
             .and_then(serde_json::Value::as_str)
             .expect("a parked elicitation is replayed")
@@ -3235,7 +3235,7 @@ mod tests {
             !after
                 .backlog
                 .iter()
-                .any(|event| event.event_type == SseEventType::ElicitationRequired),
+                .any(|event| event.event_type == SseEventType::ElicitationRequested),
             "an answered elicitation must not be replayed"
         );
     }

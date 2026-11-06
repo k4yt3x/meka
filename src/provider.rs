@@ -538,7 +538,7 @@ pub(crate) trait Provider: Send + Sync {
 
     /// Fetch the account's historical usage (lifetime tokens, streaks, per-day counts, first-used
     /// date). Same `Ok(None)` contract as [`Self::fetch_usage`].
-    async fn fetch_history(&self) -> Result<Option<UsageHistory>> {
+    async fn fetch_usage_stats(&self) -> Result<Option<UsageStats>> {
         Ok(None)
     }
 

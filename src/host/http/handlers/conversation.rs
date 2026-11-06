@@ -31,7 +31,10 @@ use crate::{
     host::http::{
         errors::{ErrorKind, ProblemDetail},
         handlers::{
-            messages::{check_if_match, conversation_etag},
+            messages::{
+                HistoryItem, check_if_match, context_view, conversation_etag,
+                conversation_position, history_item,
+            },
             sessions::turn_in_flight_conflict,
         },
         reattach::{ensure_session_loaded, require_session_exists},
@@ -55,22 +58,6 @@ pub(crate) struct CompactRequestBody {
     pub(crate) keep_recent: Option<bool>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct CompactResponse {
-    pub(crate) session_id: Uuid,
-    /// Which strategy produced the summary: `checkpoint` or `summarizer`. Reported because they
-    /// differ in fidelity, not just in mechanism: `summarizer` means the checkpoint turn was
-    /// disabled, failed, or ended without submitting a summary.
-    pub(crate) source: String,
-    /// Memories the checkpoint turn wrote, observed from its `memory_write` calls rather than
-    /// self-reported, so this cannot disagree with what actually landed on disk.
-    pub(crate) memories_written: Vec<String>,
-    /// Whether the recent turns were kept verbatim after the summary.
-    pub(crate) kept_recent: bool,
-    pub(crate) messages_before: usize,
-    pub(crate) messages_after: usize,
-}
-
 /// `POST /v1/sessions/{id}/compact`: summarize the conversation now.
 #[utoipa::path(
     post,
@@ -79,7 +66,7 @@ pub(crate) struct CompactResponse {
     params(("id" = Uuid, Path, description = "Session UUID")),
     request_body = CompactRequestBody,
     responses(
-        (status = 200, description = "Compaction completed", body = CompactResponse),
+        (status = 200, description = "Compaction completed: the compaction as `GET /v1/sessions/{id}/history` lists it. The `ETag` header is the conversation's new position", body = HistoryItem),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
@@ -101,7 +88,7 @@ pub(crate) async fn compact(
     _scoped: scope::Scoped<scope::SessionsWrite>,
     Path(id): Path<Uuid>,
     raw_body: Bytes,
-) -> Result<Json<CompactResponse>, ProblemDetail> {
+) -> Result<Response, ProblemDetail> {
     // An empty body means "compact with no guidance", which is the common case; `serde_json` would
     // reject the zero-length slice, so treat it as `{}` rather than making every client send one.
     let body: CompactRequestBody = if raw_body.is_empty() {
@@ -141,6 +128,24 @@ pub(crate) async fn compact(
     let mut conversation = std::sync::Arc::clone(&entry.conversation)
         .try_lock_owned()
         .map_err(|_| turn_in_flight_conflict(id, "compact the conversation"))?;
+    // What is compacted is what the store holds, as on every turn door, and it is what the
+    // refusal below judges.
+    entry
+        .agent
+        .match_the_store_after_a_failed_save(id, &mut conversation)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to read the conversation", error)
+                .with("session_id", id.to_string())
+        })?;
+    // Before the compaction is announced as a turn, so a refusal leaves no turn on the feed that
+    // the session's turns do not hold.
+    if let Some(refusal) = crate::agent::compaction_refusal(&conversation) {
+        return Err(
+            ProblemDetail::for_error(&refusal, state.config.relay_provider_errors)
+                .with("session_id", id.to_string()),
+        );
+    }
     // Under the lock and before the checkpoint's first round, as on every turn door: the
     // checkpoint and the summarizer bill the profile the row names, or do not run.
     if let Err(error) = crate::host::apply_recorded_bindings(&state.shared, &entry.agent, id).await
@@ -151,7 +156,6 @@ pub(crate) async fn compact(
             error,
         ));
     }
-    let messages_before = conversation.len();
     let request = CompactRequest {
         // `Manual` and not `Requested`: the origin distinguishes who asked, and an API caller is
         // standing in for the human at the keyboard, not for the model asking on its own behalf.
@@ -172,6 +176,8 @@ pub(crate) async fn compact(
     // Publishing it keeps `POST /cancel` and the shutdown drain working: both fire whatever token
     // is in this cell, which is now this compaction's.
     let cancellation = crate::agent::TurnCancellation::new();
+    // The compaction's own id too, so the checkpoint's events and the compaction's are filed under
+    // one.
     let turn_id = Uuid::new_v4();
     let published = entry
         .cancel
@@ -189,7 +195,7 @@ pub(crate) async fn compact(
     // Spawned for the reason a client's turn is (see `run_blocking_turn`): axum drops the
     // handler's future when the client hangs up, and a checkpoint runs for minutes against
     // client timeouts of seconds. Dropped after `begin_turn`, the compaction would leave the
-    // feed's turn open with no terminal: `GET /stream` would announce a resumed turn that never
+    // feed's turn open with no terminal: `GET /feed` would announce a resumed turn that never
     // ends and withhold the previous turn's terminal until another turn started. The terminal is
     // recorded and the turn closed before the conversation is released, so a turn winning the
     // lock next finds nothing of this one in the recorder or on the feed.
@@ -205,9 +211,8 @@ pub(crate) async fn compact(
             );
             let outcome = entry
                 .agent
-                .compact_session(&mut conversation, request, cancellation.token().clone())
+                .compact_session_under(&mut conversation, request, &cancellation, turn_id)
                 .await;
-            let messages_after = conversation.len();
             // The checkpoint turn emits provider notices and the `Compacted` event into the
             // session's recorder; its usage rides the terminal, and the rest is dropped, as every
             // other path that runs a turn outside a request drops it: left alone the events
@@ -226,7 +231,7 @@ pub(crate) async fn compact(
                     id,
                     state.config.relay_provider_errors,
                     None,
-                    crate::host::http::handlers::turn::revision_for_terminal(
+                    crate::host::http::handlers::turn::position_for_terminal(
                         &state.shared.store,
                         id,
                     )
@@ -240,6 +245,15 @@ pub(crate) async fn compact(
                 );
                 entry.frontend.record_terminal(event_type, data);
             }
+            // Read while the session is still this compaction's, so the answer and its tag are
+            // the conversation it left, never one a turn queued behind it has since added to.
+            let answered = match outcome {
+                Ok(_) => Ok((
+                    latest_compaction(&state, id).await,
+                    conversation_position(&state.shared.store, id).await,
+                )),
+                Err(error) => Err(error),
+            };
             drop(stream_guard);
             drop(conversation);
             // Same reason every turn path touches: this both advances the `updated_at` clients
@@ -248,10 +262,10 @@ pub(crate) async fn compact(
             // `idle_timeout` is evicted on the next scan, throwing away the context gauge
             // `compact_session` has just re-seeded.
             entry.touch();
-            (outcome, messages_after)
+            answered
         }
     });
-    let (outcome, messages_after) = match join.await {
+    let answered = match join.await {
         Ok(result) => result,
         Err(panic) => {
             tracing::error!("compaction task panicked: {panic:?}");
@@ -263,35 +277,54 @@ pub(crate) async fn compact(
             .with("session_id", id.to_string()));
         }
     };
-    let outcome = outcome.map_err(|error| {
+    let (compaction, position) = answered.map_err(|error| {
         ProblemDetail::for_error(&error, state.config.relay_provider_errors)
             .with("session_id", id.to_string())
     })?;
+    tracing::info!("compacted session {id} via HTTP");
+    let (compaction, position) = (compaction?, position?);
+    Ok((
+        [(header::ETAG, conversation_etag(position))],
+        Json(compaction),
+    )
+        .into_response())
+}
 
-    tracing::info!(
-        "compacted session {id} via HTTP: {messages_before} -> {messages_after} messages"
-    );
-
-    Ok(Json(CompactResponse {
-        session_id: id,
-        source: outcome.source.name().to_string(),
-        memories_written: outcome.memories_written,
-        kept_recent: outcome.kept_recent,
-        messages_before,
-        messages_after,
-    }))
+/// The session's latest compaction as the history lists it, for the answer to the one that has
+/// just landed.
+async fn latest_compaction(state: &ServerState, id: Uuid) -> Result<HistoryItem, ProblemDetail> {
+    let store = &state.shared.store;
+    let entry = match store.last_compaction(id).await {
+        Ok(Some(position)) => store.history_entry(id, position).await,
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+    }
+    .map_err(|error| {
+        ProblemDetail::internal_sanitized("failed to read the compaction back", error)
+            .with("session_id", id.to_string())
+    })?;
+    entry.map(history_item).ok_or_else(|| {
+        ProblemDetail::new(
+            ErrorKind::Internal,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the compaction landed but its row is not in the history",
+        )
+        .with("session_id", id.to_string())
+    })
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ContextResponse {
     pub(crate) session_id: Uuid,
+    /// The conversation's position, which `GET /v1/sessions/{id}/context/messages` and its `ETag`
+    /// carry too.
+    pub(crate) position: i64,
     /// Tokens behind the most recent provider round, omitted when no turn has run since this
     /// process loaded the session.
     ///
     /// Absent rather than zero, deliberately. A re-attached session has a full conversation and an
     /// unmeasured window, and reporting `0` there would read as "empty" to every client that
-    /// divides by `window`. Run a turn, or read `total_input_tokens` for the cumulative figure
-    /// that does survive a restart.
+    /// divides by `window`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) used: Option<u64>,
     /// The model's context window, omitted when meka has no metadata for it. A percentage of an
@@ -313,28 +346,9 @@ pub(crate) struct ContextResponse {
     /// How many times this session has already been compacted. Fidelity degrades with each pass,
     /// so a client deciding whether to fork rather than compact again wants this.
     pub(crate) generation: u64,
-    /// Messages currently in the materialized window (post-compaction), not the full history.
-    ///
-    /// Absent while a turn holds the conversation. Everything else here is read from atomics and
-    /// the database, so occupancy stays answerable during a turn; this one field genuinely needs
-    /// the log, and blocking the whole response on it would defeat the point of asking.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) message_count: Option<usize>,
-    /// Cumulative turns and tokens for this session, read from the DB and so unaffected by
-    /// eviction or restart.
-    pub(crate) totals: SessionTotals,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct SessionTotals {
-    pub(crate) turns: u64,
-    pub(crate) input_tokens: u64,
-    pub(crate) output_tokens: u64,
-    pub(crate) cache_creation_input_tokens: u64,
-    pub(crate) cache_read_input_tokens: u64,
-}
-
-/// `GET /v1/sessions/{id}/context`: live window occupancy plus cumulative usage.
+/// `GET /v1/sessions/{id}/context`: what the context holds, measured.
 #[utoipa::path(
     get,
     path = "/v1/sessions/{id}/context",
@@ -362,15 +376,7 @@ pub(crate) async fn context(
     // counters are missing, and they are already `Option` for exactly that reason.
     require_session_exists(&state, id).await?;
     let entry = state.sessions.read().await.get(&id).cloned();
-    let stats = state
-        .shared
-        .store
-        .load_session_stats(id)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to load session stats", error)
-                .with("session_id", id.to_string())
-        })?;
+    let position = conversation_position(&state.shared.store, id).await?;
     // Counted from the database rather than the agent's cache, because the cache lives behind the
     // runtime mutex and this is the same figure `Agent::compaction_generation` would seed itself
     // from.
@@ -384,9 +390,8 @@ pub(crate) async fn context(
                 .with("session_id", id.to_string())
         })?;
 
-    // Atomics, so no lock. `try_lock` for the message count alone: a turn in flight is exactly
-    // when headroom is worth asking about, and waiting on it would turn this into a request that
-    // hangs for the length of a turn.
+    // Atomics, so no lock: a turn in flight is exactly when headroom is worth asking about, and
+    // waiting on it would turn this into a request that hangs for the length of a turn.
     let used_raw = entry
         .as_ref()
         .map(|entry| {
@@ -405,10 +410,6 @@ pub(crate) async fn context(
                 .load(std::sync::atomic::Ordering::Relaxed)
         })
         .unwrap_or(0);
-    let message_count = entry
-        .as_ref()
-        .and_then(|entry| entry.conversation.try_lock().ok())
-        .map(|conversation| conversation.len());
 
     // Per session, not per process: a session runs on the profile it recorded, and two sessions on
     // one server can have different windows. Reading the shared `agent_options` reported the
@@ -448,44 +449,24 @@ pub(crate) async fn context(
     let window = window_raw.filter(|window| *window > 0);
     Ok(Json(ContextResponse {
         session_id: id,
+        position,
         used,
         window,
         overhead,
         compact_at_percent,
         generation,
-        message_count,
-        totals: SessionTotals {
-            turns: stats.turns,
-            input_tokens: stats.input_tokens,
-            output_tokens: stats.output_tokens,
-            cache_creation_input_tokens: stats.cache_creation_input_tokens,
-            cache_read_input_tokens: stats.cache_read_input_tokens,
-        },
     }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RewindRequestBody {
-    /// How many trailing turns to drop. A turn starts at a user message that is not a tool result,
-    /// so dropping one removes that message and every assistant / tool-result message after it.
-    #[serde(default = "default_turns")]
-    pub(crate) turns: usize,
+    /// The first turn to drop: the conversation goes back to how it stood before this turn, as
+    /// `GET /v1/sessions/{id}/turns` names it, and every later turn goes too.
+    pub(crate) turn_id: Uuid,
 }
 
-fn default_turns() -> usize {
-    1
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct RewindResponse {
-    pub(crate) session_id: Uuid,
-    pub(crate) turns_removed: usize,
-    pub(crate) messages_before: usize,
-    pub(crate) messages_after: usize,
-}
-
-/// `POST /v1/sessions/{id}/rewind`: drop trailing turns from the conversation.
+/// `POST /v1/sessions/{id}/rewind`: take the conversation back to before a turn.
 #[utoipa::path(
     post,
     path = "/v1/sessions/{id}/rewind",
@@ -493,17 +474,17 @@ pub(crate) struct RewindResponse {
     request_body = RewindRequestBody,
     params(
         ("id" = Uuid, Path, description = "Session UUID"),
-        ("If-Match" = Option<String>, Header, description = "The `ETag` of `GET /v1/sessions/{id}/messages` the edit was decided on. The rewind is refused with 412 when the conversation has changed since."),
+        ("If-Match" = Option<String>, Header, description = "The conversation's `ETag`, from `GET /v1/sessions/{id}/history` or `/context/messages`, the edit was decided on. The rewind is refused with 412 when the conversation has changed since."),
     ),
     responses(
-        (status = 200, description = "Turns removed. The `ETag` header is the conversation's new tag", body = RewindResponse),
+        (status = 200, description = "The rewind as `GET /v1/sessions/{id}/history` lists it. The `ETag` header is the conversation's new position", body = HistoryItem),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session, as a running sub-agent's parent does (`/errors/session-locked`)", body = ProblemDetail),
-        (status = 412, description = "`If-Match` names a conversation that has since changed (`/errors/precondition-failed`); `revision` and `total` carry the current state", body = ProblemDetail),
+        (status = 412, description = "`If-Match` names a conversation that has since changed (`/errors/precondition-failed`); `position` carries the current one", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body, or fewer turns than requested", body = ProblemDetail),
+        (status = 422, description = "Invalid body, or `turn_id` names no turn the context holds", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:w"]))
@@ -515,19 +496,8 @@ pub(crate) async fn rewind(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Result<Response, ProblemDetail> {
-    let body: RewindRequestBody = if raw_body.is_empty() {
-        RewindRequestBody { turns: 1 }
-    } else {
-        serde_json::from_slice(&raw_body)
-            .map_err(|error| ProblemDetail::invalid_body("rewind", error))?
-    };
-    if body.turns == 0 {
-        return Err(ProblemDetail::new(
-            ErrorKind::InvalidBody,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "`turns` must be at least 1",
-        ));
-    }
+    let body: RewindRequestBody = serde_json::from_slice(&raw_body)
+        .map_err(|error| ProblemDetail::invalid_body("rewind", error))?;
 
     // Acquired under the sessions read-lock, for the reason `compact` gives: DELETE's `in_flight`
     // re-check has to see this operation, or the rewind lands on a session that no longer exists.
@@ -546,7 +516,7 @@ pub(crate) async fn rewind(
         // hold the result, and a session with no runtime has nothing to hold. This is also what
         // makes the endpoint symmetrical with `meka session rewind`, which has always been a
         // store-only operation and therefore always worked on a sub-agent.
-        if let Some(response) = rewind_dormant_session(&state, id, body.turns, &headers).await? {
+        if let Some(response) = rewind_dormant_session(&state, id, body.turn_id, &headers).await? {
             return Ok(response);
         }
         // It became resident while we looked; re-attach and claim it on the next pass, under the
@@ -561,72 +531,115 @@ pub(crate) async fn rewind(
         .conversation
         .try_lock()
         .map_err(|_| turn_in_flight_conflict(id, "rewind the conversation"))?;
-    let messages_before = conversation.len();
-    // Under the mutex, so the view the precondition is checked against is the view the edit
-    // lands on.
-    let revision = current_revision(&state, id).await?;
-    check_if_match(&headers, revision, messages_before, id)?;
-    let Some(event) = conversation.rewind(body.turns) else {
-        return Err(ProblemDetail::new(
-            ErrorKind::InvalidBody,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "nothing to rewind: session has fewer than {} turn(s)",
-                body.turns
-            ),
+    // Under the mutex, so the conversation the precondition is checked against is the one the
+    // edit lands on.
+    let position = conversation_position(&state.shared.store, id).await?;
+    check_if_match(&headers, position, id)?;
+    // The count is taken on the store's view, so memory is matched to it first, and anything the
+    // match writes to the store (an unanswered call it drops) is in the view counted.
+    entry
+        .agent
+        .match_the_store(id, &mut conversation)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to read the conversation", error)
+                .with("session_id", id.to_string())
+        })?;
+    let count = messages_from_turn(&state.shared.store, id, body.turn_id).await?;
+    // Put back if it cannot be saved: left diverged, the history would still show the turns the
+    // model no longer sees, and a client retrying the 500 would be refused a turn that is gone.
+    let rewind = entry
+        .agent
+        .rewind_resident(
+            id,
+            &mut conversation,
+            crate::agent::RewindCut::Messages(count),
         )
-        .with("session_id", id.to_string()));
-    };
-    let messages_after = conversation.len();
-    // The in-memory log is already rewound; persisting is what makes it survive eviction.
-    if let Err(error) = state.shared.store.save_rewind(id, &event).await {
-        // Put the turns back rather than leave memory and disk disagreeing, exactly as the screen's
-        // `/rewind` does. Left diverged, `GET /messages` reads the DB and still shows the turns
-        // with `revision` unmoved -- so the counter added to make a rewrite detectable reports
-        // that nothing happened -- while the model no longer sees them, and a client retrying the
-        // 500 eats another turn per attempt. `pop_repair` is the exact inverse of the
-        // `replace_tail` that `rewind` just performed.
-        conversation.pop_repair();
-        return Err(
-            ProblemDetail::internal_sanitized("failed to persist rewind event", error)
-                .with("session_id", id.to_string()),
-        );
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to rewind the conversation", error)
+                .with("session_id", id.to_string())
+        })?;
+    if rewind.event.is_none() {
+        return Err(turn_not_in_context(id, body.turn_id));
     }
-    // The conversation was rewritten under the agent; the one reset every rewrite door calls.
-    entry.agent.reset_conversation_markers(&conversation).await;
-    // The repair row just written is the one rewrite since the count, under the mutex.
-    let revision = revision + 1;
-    // Every reader of the feed learns the view was rewritten, with the tag their next edit needs.
-    // Only a resident session has a feed; a dormant one has nobody attached, since a subscriber
-    // keeps a session resident.
-    entry.frontend.push_sse(
-        SseEventType::ConversationRewound,
-        serde_json::json!({
-            "revision": revision,
-            "total": messages_after,
-            "turns_removed": body.turns,
-        }),
-    );
+    let item = rewind_item(&state, id).await?;
+    // Every reader of the feed learns what the rewind took, with the position their next edit
+    // needs. Only a resident session has a feed; a dormant one has nobody attached, since a
+    // subscriber keeps a session resident.
+    let mut announced = match serde_json::to_value(&item) {
+        Ok(announced) => announced,
+        Err(error) => {
+            tracing::warn!("failed to announce the rewind of session {id}: {error}");
+            serde_json::Value::Null
+        }
+    };
+    if let Some(fields) = announced.as_object_mut() {
+        fields.insert("session_id".into(), serde_json::json!(id.to_string()));
+    }
+    entry
+        .frontend
+        .push_sse(SseEventType::ConversationRewound, announced);
     drop(conversation);
     // See the note in `compact`. `save_event` has already moved `updated_at` on the row, so
     // without this the resident entry reports an older timestamp than `meka session list` does for
     // the same session, and only agrees again once the GC evicts it.
     entry.touch();
     announce_rewound(&state, id, Some(&entry)).await;
-
     tracing::info!(
-        "rewound {turns} turn(s) from session {id} via HTTP: {messages_before} -> \
-         {messages_after} messages",
-        turns = body.turns,
+        "rewound session {id} via HTTP to before turn {turn}: {count} message(s) dropped",
+        turn = body.turn_id,
     );
+    Ok(rewound(item))
+}
 
-    Ok(rewound(
-        id,
-        body.turns,
-        messages_before,
-        messages_after,
-        revision,
-    ))
+/// How many of the context's last messages a rewind to before turn `turn` drops: every one from
+/// the first the turn said. A summary stands for the turns before it, not for the turn whose
+/// compaction wrote it, so it is never where a turn starts, and a copy a compaction kept or a
+/// message a retry rewrote names the turn that said it, never the turn that wrote its row.
+pub(crate) async fn messages_from_turn(
+    store: &crate::store::Store,
+    id: Uuid,
+    turn: Uuid,
+) -> Result<usize, ProblemDetail> {
+    let context = context_view(store, id).await?;
+    let total = context.messages.len();
+    context
+        .messages
+        .iter()
+        .position(|message| message.turn_id == Some(turn))
+        .map(|first| total - first)
+        .ok_or_else(|| turn_not_in_context(id, turn))
+}
+
+/// The refusal for a rewind or a branch to a turn the context does not hold: another session's,
+/// one a compaction summarized, a compaction's own, one that left nothing in it, or none at all.
+pub(crate) fn turn_not_in_context(id: Uuid, turn: Uuid) -> ProblemDetail {
+    ProblemDetail::new(
+        ErrorKind::InvalidBody,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!("turn '{turn}' has nothing in the conversation the model sees"),
+    )
+    .with("session_id", id.to_string())
+    .with("turn_id", turn.to_string())
+}
+
+/// The rewind just written, as the history lists it: the conversation's last row.
+async fn rewind_item(state: &ServerState, id: Uuid) -> Result<HistoryItem, ProblemDetail> {
+    let store = &state.shared.store;
+    let position = conversation_position(store, id).await?;
+    let entry = store.history_entry(id, position).await.map_err(|error| {
+        ProblemDetail::internal_sanitized("failed to read the rewind back", error)
+            .with("session_id", id.to_string())
+    })?;
+    entry.map(history_item).ok_or_else(|| {
+        ProblemDetail::new(
+            ErrorKind::Internal,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the rewind landed but its row is not in the history",
+        )
+        .with("session_id", id.to_string())
+    })
 }
 
 /// A rewind moves the session's row (`updated_at`), so the record is announced as `PATCH`
@@ -657,38 +670,13 @@ async fn announce_rewound(
     );
 }
 
-/// The answer to a rewind: the counts, under the conversation's new tag.
-fn rewound(
-    session_id: Uuid,
-    turns_removed: usize,
-    messages_before: usize,
-    messages_after: usize,
-    revision: u64,
-) -> Response {
+/// The answer to a rewind: what it took, under the conversation's new tag.
+fn rewound(item: HistoryItem) -> Response {
     (
-        [(header::ETAG, conversation_etag(revision, messages_after))],
-        Json(RewindResponse {
-            session_id,
-            turns_removed,
-            messages_before,
-            messages_after,
-        }),
+        [(header::ETAG, conversation_etag(item.position))],
+        Json(item),
     )
         .into_response()
-}
-
-/// The conversation's current revision, from the rows, as every door that edits or reports the
-/// view reads it.
-async fn current_revision(state: &ServerState, id: Uuid) -> Result<u64, ProblemDetail> {
-    state
-        .shared
-        .store
-        .count_rewrites(id)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to count the conversation's rewrites", error)
-                .with("session_id", id.to_string())
-        })
 }
 
 /// Rewind a session this server has not loaded, without loading it.
@@ -707,11 +695,11 @@ async fn current_revision(state: &ServerState, id: Uuid) -> Result<u64, ProblemD
 ///
 /// Deliberately unlike `/compact`, which stays refused for a sub-agent: compaction runs the model,
 /// which is driving a conversation only the parent may drive. A rewind writes no request and reads
-/// no provider; it truncates an event log the caller can already read in full through `/export`.
+/// no provider; it truncates an event log the caller can already read in full through `/history`.
 async fn rewind_dormant_session(
     state: &ServerState,
     id: Uuid,
-    turns: usize,
+    turn: Uuid,
     headers: &HeaderMap,
 ) -> Result<Option<Response>, ProblemDetail> {
     let _reconstruction = state.reconstruction_locks.lock(id).await;
@@ -743,24 +731,18 @@ async fn rewind_dormant_session(
                 .with("session_id", id.to_string()),
         })?;
 
+    // Under the session lock, as on the resident path under the mutex.
+    let position = conversation_position(&state.shared.store, id).await?;
+    check_if_match(headers, position, id)?;
+    let count = messages_from_turn(&state.shared.store, id, turn).await?;
     let events = state.shared.store.load_events(id).await.map_err(|error| {
         ProblemDetail::internal_sanitized("failed to load session events", error)
             .with("session_id", id.to_string())
     })?;
     let mut conversation = crate::conversation::Conversation::from_events(events);
-    let messages_before = conversation.len();
-    // Under the session lock, as on the resident path under the mutex.
-    let revision = current_revision(state, id).await?;
-    check_if_match(headers, revision, messages_before, id)?;
-    let Some(event) = conversation.rewind(turns) else {
-        return Err(ProblemDetail::new(
-            ErrorKind::InvalidBody,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("nothing to rewind: session has fewer than {turns} turn(s)"),
-        )
-        .with("session_id", id.to_string()));
+    let Some(event) = conversation.rewind_messages(count) else {
+        return Err(turn_not_in_context(id, turn));
     };
-    let messages_after = conversation.len();
     state
         .shared
         .store
@@ -770,19 +752,12 @@ async fn rewind_dormant_session(
             ProblemDetail::internal_sanitized("failed to persist rewind event", error)
                 .with("session_id", id.to_string())
         })?;
-
+    let item = rewind_item(state, id).await?;
     announce_rewound(state, id, None).await;
     tracing::info!(
-        "rewound {turns} turn(s) from dormant session {id} via HTTP: {messages_before} -> {messages_after} messages"
+        "rewound dormant session {id} via HTTP to before turn {turn}: {count} message(s) dropped"
     );
-
-    Ok(Some(rewound(
-        id,
-        turns,
-        messages_before,
-        messages_after,
-        revision + 1,
-    )))
+    Ok(Some(rewound(item)))
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -830,7 +805,7 @@ pub(crate) async fn turns(
     Path(id): Path<Uuid>,
     Query(query): Query<TurnsQuery>,
 ) -> Result<Json<TurnsResponse>, ProblemDetail> {
-    // Read-only, like `/messages`: a listing never revives a session.
+    // Read-only, like `/history`: a listing never revives a session.
     require_session_exists(&state, id).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let (turns, next_before) = state
@@ -912,33 +887,21 @@ pub(crate) async fn turn(
     })
 }
 
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub(crate) struct ExportQuery {
-    /// `markdown` (default) or `json`. Markdown is a rendered transcript for a human; JSON is the
-    /// round-trippable envelope `POST /v1/sessions/import` accepts.
-    #[serde(default)]
-    pub(crate) format: Option<String>,
-}
-
-/// `GET /v1/sessions/{id}/export`: the full conversation, including pre-compaction turns.
+/// `GET /v1/sessions/{id}/export`: the session's archive.
 ///
-/// Reads the raw event log rather than the materialized view, so turns that compaction hid from
-/// the model are still in the export. That is the whole point of having it: `GET /messages` shows
-/// what the model can see, and this shows what actually happened.
+/// The whole event log, every sub-agent's beside it, as the archive `POST /v1/sessions/import`
+/// takes. Its shape is the store's, versioned by `format_version`, which an import refuses unless
+/// it can bring the archive forward.
 #[utoipa::path(
     get,
     path = "/v1/sessions/{id}/export",
     tag = "conversation",
-    params(
-        ("id" = Uuid, Path, description = "Session UUID"),
-        ExportQuery,
-    ),
+    params(("id" = Uuid, Path, description = "Session UUID")),
     responses(
-        (status = 200, description = "Rendered transcript (text/markdown) or export envelope (application/json)"),
+        (status = 200, description = "The session's archive, the object `POST /v1/sessions/import` takes, versioned by its `format_version`", body = Object, content_type = "application/json"),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 422, description = "Unknown format", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:r"]))
@@ -947,51 +910,17 @@ pub(crate) async fn export(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::SessionsRead>,
     Path(id): Path<Uuid>,
-    Query(query): Query<ExportQuery>,
 ) -> Result<Response, ProblemDetail> {
     // Read-only: never revive the runtime. Exporting a spawn tree would otherwise rebuild an agent
     // per sub-agent session just to read rows back out of SQLite.
     require_session_exists(&state, id).await?;
-
-    let manager = &state.shared.store;
-    match query.format.as_deref().unwrap_or("markdown") {
-        "markdown" => {
-            let events = manager.load_history(id).await.map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to load session events", error)
-                    .with("session_id", id.to_string())
-            })?;
-            let scratchpad_entries: std::collections::HashMap<String, String> = manager
-                .load_all_scratchpad_entries(id)
-                .await
-                .map_err(|error| {
-                    ProblemDetail::internal_sanitized("failed to load scratchpad entries", error)
-                        .with("session_id", id.to_string())
-                })?
-                .into_iter()
-                .collect();
-            let body =
-                crate::conversation::format_session_as_markdown(id, &events, &scratchpad_entries);
-            Ok((
-                [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
-                body,
-            )
-                .into_response())
-        }
-        "json" => {
-            let export = crate::store::export::build_session_export(manager, id)
-                .await
-                .map_err(|error| {
-                    ProblemDetail::internal_sanitized("failed to build session export", error)
-                        .with("session_id", id.to_string())
-                })?;
-            Ok(Json(export).into_response())
-        }
-        other => Err(ProblemDetail::new(
-            ErrorKind::InvalidBody,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            crate::text::unknown_name("export format", other, ["markdown", "json"]),
-        )),
-    }
+    let export = crate::store::export::build_session_export(&state.shared.store, id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to build session export", error)
+                .with("session_id", id.to_string())
+        })?;
+    Ok(Json(export).into_response())
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1111,6 +1040,175 @@ pub(crate) async fn import(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A turn a compaction kept is said under its own turn and at its own time once the turn sweep
+    /// has taken the rows it was said in and left the copy standing alone: not under the turn
+    /// whose compaction wrote the copy, which a rewind or a branch to that turn would otherwise cut
+    /// before, taking the kept turn the summary does not hold. Its turn stays on record, and the
+    /// compacting turn's own messages are its own.
+    #[tokio::test]
+    async fn a_kept_turn_keeps_its_turn_and_time_once_retention_takes_its_rows() {
+        use crate::conversation::{Event, Message};
+        let store = crate::store::Store::for_test().await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("session");
+        let (said, compacting) = (Uuid::new_v4(), Uuid::new_v4());
+        let long_ago = (chrono::Utc::now() - chrono::TimeDelta::days(90)).to_rfc3339();
+        for turn in [said, compacting] {
+            store
+                .turn_store()
+                .open_turn(
+                    id,
+                    turn,
+                    crate::store::turns::TurnSource::Client,
+                    crate::permission::Permission::Read,
+                    &long_ago,
+                )
+                .await
+                .expect("the turn's row");
+        }
+        let kept = [Message::user("kept"), Message::assistant_text("about kept")];
+        for message in &kept {
+            store
+                .save_event(id, &Event::Append(message.clone()), Some(said))
+                .await
+                .expect("save");
+        }
+        let said_at: Vec<String> = context_view(&store, id)
+            .await
+            .expect("the context")
+            .messages
+            .into_iter()
+            .map(|message| message.created_at)
+            .collect();
+        store
+            .turn_store()
+            .close_turn(
+                said,
+                &crate::store::turns::TurnEnding::succeeded(
+                    "end_turn",
+                    crate::store::turns::TurnUsage::default(),
+                ),
+            )
+            .await
+            .expect("close");
+        store
+            .run_sql_for_test(&format!(
+                "UPDATE turns SET ended_at = '{long_ago}' WHERE id = '{said}'"
+            ))
+            .await;
+        // A compaction inside the next turn keeps the first, then the turn goes on.
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("summary"),
+            replaced_count: 2,
+            record: crate::conversation::CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        store
+            .save_compaction(id, &boundary, &kept, Some(compacting))
+            .await
+            .expect("compaction");
+        for message in [Message::user("next"), Message::assistant_text("Next.")] {
+            store
+                .save_event(id, &Event::Append(message), Some(compacting))
+                .await
+                .expect("save");
+        }
+        store
+            .delete_expired_turns(chrono::Utc::now() - chrono::TimeDelta::days(30), None)
+            .await
+            .expect("sweep");
+
+        let context = context_view(&store, id).await.expect("the context");
+        let turns: Vec<Option<Uuid>> = context
+            .messages
+            .iter()
+            .map(|message| message.turn_id)
+            .collect();
+        assert_eq!(turns, [
+            None,
+            Some(said),
+            Some(said),
+            Some(compacting),
+            Some(compacting)
+        ]);
+        let times: Vec<&str> = context
+            .messages
+            .iter()
+            .skip(1)
+            .take(2)
+            .map(|message| message.created_at.as_str())
+            .collect();
+        assert_eq!(times, [said_at[0].as_str(), said_at[1].as_str()]);
+        assert_eq!(
+            messages_from_turn(&store, id, compacting)
+                .await
+                .expect("the turn"),
+            2,
+            "the cut falls before the turn's own words"
+        );
+        assert_eq!(
+            messages_from_turn(&store, id, said)
+                .await
+                .expect("the kept turn"),
+            4,
+            "the kept turn is a turn to rewind to"
+        );
+        let wrote: Vec<String> = store
+            .turn_entries(id, compacting)
+            .await
+            .expect("the turn's items")
+            .into_iter()
+            .filter_map(|entry| match entry.kind {
+                crate::store::HistoryKind::Message(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wrote, ["next", "Next."]);
+        assert!(
+            store
+                .turn_store()
+                .get_turn(id, said)
+                .await
+                .expect("read")
+                .is_some(),
+            "the kept turn stays on record while its copy says it"
+        );
+        let history: Vec<Option<Uuid>> = store
+            .history_page(id, crate::store::HistoryEdge::After(0), 20)
+            .await
+            .expect("the history")
+            .entries
+            .into_iter()
+            .filter(|entry| matches!(entry.kind, crate::store::HistoryKind::Message(_)))
+            .map(|entry| entry.turn_id)
+            .collect();
+        assert_eq!(history, [
+            Some(said),
+            Some(said),
+            Some(compacting),
+            Some(compacting)
+        ]);
+        // A rewind to the kept turn takes it and the turn after it: two turns, as they were said.
+        let mut conversation = crate::conversation::Conversation::from_events(
+            store.load_events(id).await.expect("load"),
+        );
+        let rewind = conversation.rewind_messages(4).expect("four messages");
+        store.save_rewind(id, &rewind).await.expect("rewind");
+        let stretches = store.rewound(id).await.expect("stretches");
+        assert_eq!(
+            stretches
+                .iter()
+                .map(|stretch| stretch.turns)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+    }
+
     /// The dormant rewind must hold both locks; see
     /// [`crate::host::http::reattach::assert_dormant_fast_path_is_serialized`] for why this is
     /// asserted against the source.
@@ -1130,7 +1228,7 @@ mod tests {
         crate::host::http::reattach::assert_dormant_fast_path_is_serialized(
             include_str!("conversation.rs"),
             "async fn rewind_dormant_session(",
-            "from dormant session",
+            "rewound dormant session",
             "save_rewind(id, &event)",
         );
     }

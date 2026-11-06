@@ -381,23 +381,17 @@ impl BackgroundStore {
             })
     }
 
-    /// Resolve a full or unique-prefix task id within a session. An ambiguous prefix is an error
-    /// rather than an arbitrary pick, matching
-    /// [`crate::store::schedule::ScheduleStore::cancel_scheduled_job`] in behavior and in error
-    /// variant, so the two `serve` endpoints answer the same HTTP status (422) for the same
-    /// mistake.
-    /// One task of a session by its full id, or `None` when the session has no such task.
-    pub(crate) async fn background_task(
+    /// One task by its full id, whatever session it is in, or `None` when no task has it.
+    pub(crate) async fn background_task_by_id(
         &self,
-        session_id: Uuid,
         id: &str,
     ) -> crate::error::Result<Option<BackgroundTask>> {
         let tasks = self
             .query_background_tasks(
                 "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
                  started_at, finished_at, announced_at, delivered_at, subagent_id FROM background_tasks \
-                 WHERE session_id = ?1 AND id = ?2",
-                vec![session_id.to_string(), id.to_string()],
+                 WHERE id = ?1",
+                vec![id.to_string()],
             )
             .await?;
         Ok(tasks.into_iter().next())
@@ -451,6 +445,11 @@ impl BackgroundStore {
         }
     }
 
+    /// Resolve a full or unique-prefix task id within a session. An ambiguous prefix is an error
+    /// rather than an arbitrary pick, matching
+    /// [`crate::store::schedule::ScheduleStore::cancel_scheduled_job`] in behavior and in error
+    /// variant, so a tool, the screen's `/task` and `meka` name a prefix the same way for tasks
+    /// and jobs. The HTTP routes take a task's full id ([`Self::background_task_by_id`]).
     pub(crate) async fn resolve_background_task(
         &self,
         session_id: Uuid,

@@ -391,7 +391,7 @@ fn run_list(format: crate::cli::OutputFormat) -> anyhow::Result<()> {
                         } else {
                             view.fallbacks.join(", ")
                         },
-                        if view.active { "yes" } else { "no" }.to_string(),
+                        if view.default { "yes" } else { "no" }.to_string(),
                     ]
                 })
                 .collect();
@@ -411,7 +411,7 @@ fn run_list(format: crate::cli::OutputFormat) -> anyhow::Result<()> {
 /// JSON. A profile on a missing account is listed without a backend and [`report_broken_profiles`]
 /// says so on stderr.
 fn profile_views(config_file: &config::ConfigFile) -> Vec<crate::view::ProfileView> {
-    let (active, _) = config::select_profile(
+    let (default_profile, _) = config::select_profile(
         config_file.default_profile.clone(),
         config::ProfileRequest::DefaultProfile,
         &config_file.profiles,
@@ -424,7 +424,7 @@ fn profile_views(config_file: &config::ConfigFile) -> Vec<crate::view::ProfileVi
                 name,
                 profile,
                 &config_file.accounts,
-                Some(name.as_str()) == active.as_deref(),
+                Some(name.as_str()) == default_profile.as_deref(),
             )
         })
         .collect()
@@ -942,7 +942,7 @@ mod tests {
         let views = profile_views(&sole);
         assert_eq!(views.len(), 1);
         assert!(
-            views[0].active,
+            views[0].default,
             "a sole profile is the default by the selection rule"
         );
 
@@ -952,7 +952,7 @@ mod tests {
         ))
         .expect("parse");
         assert!(
-            profile_views(&two).iter().all(|view| !view.active),
+            profile_views(&two).iter().all(|view| !view.default),
             "two profiles and no `default_profile` pick nothing"
         );
 
@@ -961,12 +961,12 @@ mod tests {
              \"work\"\nmodel = \"m\"\n\n[profiles.side]\naccount = \"oai\"\nmodel = \"m\"\n"
         ))
         .expect("parse");
-        let active: Vec<String> = profile_views(&pointed)
+        let defaults: Vec<String> = profile_views(&pointed)
             .into_iter()
-            .filter(|view| view.active)
+            .filter(|view| view.default)
             .map(|view| view.name)
             .collect();
-        assert_eq!(active, ["side"]);
+        assert_eq!(defaults, ["side"]);
     }
 
     /// Every settable key parses its own value type, and refuses what it cannot mean.

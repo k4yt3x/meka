@@ -478,7 +478,7 @@ pub(crate) fn prepare_image_source(
 /// `declared_mime` is only a hint; [`prepare_image_source`] decides from the bytes. That matters
 /// here more than anywhere else, since a client's declared type is attacker-or-typo controlled.
 ///
-/// Shared by the ACP `session/prompt` handler and the HTTP `POST /turn` handler so both frontends
+/// Shared by the ACP `session/prompt` handler and the HTTP `POST /turns` handler so both frontends
 /// enforce identical limits on client-supplied images.
 pub(crate) fn decode_base64_image(data: &str, declared_mime: &str) -> Result<ImageSource, String> {
     let bytes = base64::engine::general_purpose::STANDARD

@@ -44,6 +44,8 @@ pub(crate) struct SessionMatch {
     /// cut to [`EXCERPT_CHARS`], marked `(summary)` when the message is a compaction's summary.
     /// `None` for a session found by its title alone.
     pub(crate) excerpt: Option<String>,
+    /// The position of the message the excerpt was taken from, present beside it.
+    pub(crate) excerpt_position: Option<i64>,
 }
 
 /// The definition of the words the index holds, bumped whenever [`indexed_words`] changes what a
@@ -109,6 +111,8 @@ fn spoken_words_of_row(kind: &str, content: &str) -> String {
         created_at: String::new(),
         turn_id: None,
         copy_of: None,
+        said_turn_id: None,
+        said_at: None,
     };
     match decode_event_from_row(&row) {
         Ok(Some(Event::Append(message))) => spoken_words(&message),
@@ -211,15 +215,18 @@ pub(super) fn insert_message(
     // the one it is running or one a dead process left open, so the store is told rather than
     // left to guess from the table.
     connection.execute(
-        "INSERT INTO messages (session_id, kind, content, created_at, turn_id, copy_of)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO messages
+             (session_id, kind, content, created_at, turn_id, copy_of, said_turn_id, said_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             session_id,
             row.kind,
             row.content,
             row.created_at,
             row.turn_id,
-            row.copy_of
+            row.copy_of,
+            row.said_turn_id,
+            row.said_at
         ],
     )?;
     let message_id = connection.last_insert_rowid();
@@ -231,6 +238,25 @@ pub(super) fn insert_message(
         ],
     )?;
     Ok(message_id)
+}
+
+/// A session's best match in one tier of a search: the row, its rank (lower is better), and when
+/// the session was last updated, which orders sessions of equal rank, newest first.
+struct SessionHit {
+    session: String,
+    row: i64,
+    rank: f64,
+    updated_at: String,
+}
+
+impl SessionHit {
+    /// Whether this ranks at or ahead of `other`, which then goes after it.
+    fn ranks_ahead_of(&self, other: &Self) -> bool {
+        self.rank
+            .total_cmp(&other.rank)
+            .then_with(|| other.updated_at.cmp(&self.updated_at))
+            .is_le()
+    }
 }
 
 /// Make the copies of `originals` rows of their own, for a door about to delete those rows: each
@@ -276,6 +302,10 @@ pub(super) struct NewMessage<'a> {
     /// copies stands: the model reads the copy there, and every reader that shows history reads
     /// the row it copies instead.
     pub(super) copy_of: Option<i64>,
+    /// For a copy a compaction kept, the turn that said it; see [`super::sessions::SaidStamp`].
+    pub(super) said_turn_id: Option<&'a str>,
+    /// For a copy a compaction kept, when it was said.
+    pub(super) said_at: Option<&'a str>,
 }
 
 /// Bring the index into line with the `messages` table and with this build's definition of the
@@ -472,7 +502,9 @@ impl Store {
     /// A session whose set title holds every term comes first, newest first among those. The rest
     /// are ranked by their best-matching message, through the tiers the memory search uses: every
     /// term, then any term, then any term as a prefix, stopping at the first tier that finds
-    /// anything. `reach` says which sessions are searched at all.
+    /// anything. A message is a match only while the history shows it, so a row a rewind took
+    /// back is passed over for the session's next best, which the session is ranked by. `reach`
+    /// says which sessions are searched at all.
     pub(crate) async fn search_sessions(
         &self,
         query: &str,
@@ -485,83 +517,98 @@ impl Store {
         }
         // Zero is every match, as it is on every other listing that takes a count.
         let limit = if limit == 0 { usize::MAX } else { limit };
-        // SQLite reads a negative `LIMIT` as no limit.
-        let sql_limit: i64 = i64::try_from(limit).unwrap_or(-1);
         let words = terms.words().to_vec();
         let words_for_titles = words.clone();
         let expressions = tiered_expressions(&words);
-        let (titled, ranked) = self
+        let titled = self
             .connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                let (within_reach, root) = reach.sql_term();
-                // Bound only when the term names it: SQLite refuses a parameter the statement
-                // has no placeholder for.
-                let root_parameter = root
-                    .as_ref()
-                    .map(|root| (":root", root as &dyn rusqlite::ToSql));
-                // Matched here rather than in SQL: the set titles are few, `Terms::parse` folded
-                // the words with Unicode case rules, and SQLite's `lower()` folds ASCII alone.
-                let titled: Vec<String> = {
-                    let mut statement = connection.prepare(&format!(
-                        "SELECT s.id, s.title FROM sessions s
+            .call({
+                let reach = reach.clone();
+                move |connection| -> rusqlite::Result<_> {
+                    let (within_reach, bound) = reach.sql_term();
+                    // Bound only when the term names it: SQLite refuses a parameter the statement
+                    // has no placeholder for.
+                    let reach_parameters: Vec<(&str, &dyn rusqlite::ToSql)> = bound
+                        .iter()
+                        .map(|(name, value)| (*name, value as &dyn rusqlite::ToSql))
+                        .collect();
+                    // Matched here rather than in SQL: the set titles are few, `Terms::parse`
+                    // folded the words with Unicode case rules, and SQLite's `lower()` folds ASCII
+                    // alone.
+                    let titled: Vec<String> = {
+                        let mut statement = connection.prepare(&format!(
+                            "SELECT s.id, s.title FROM sessions s
                          WHERE s.title IS NOT NULL AND {within_reach}
                          ORDER BY s.updated_at DESC, s.id DESC"
-                    ))?;
-                    let parameters: Vec<(&str, &dyn rusqlite::ToSql)> =
-                        root_parameter.into_iter().collect();
-                    let rows = statement.query_map(parameters.as_slice(), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?;
-                    let mut titled = Vec::new();
-                    for row in rows {
-                        let (id, title) = row?;
-                        let folded = title.to_lowercase();
-                        if words_for_titles
-                            .iter()
-                            .all(|word| folded.contains(word.as_str()))
-                        {
-                            titled.push(id);
-                            if titled.len() == limit {
-                                break;
+                        ))?;
+                        let parameters = reach_parameters.clone();
+                        let rows = statement.query_map(parameters.as_slice(), |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?;
+                        let mut titled = Vec::new();
+                        for row in rows {
+                            let (id, title) = row?;
+                            let folded = title.to_lowercase();
+                            if words_for_titles
+                                .iter()
+                                .all(|word| folded.contains(word.as_str()))
+                            {
+                                titled.push(id);
+                                if titled.len() == limit {
+                                    break;
+                                }
                             }
                         }
-                    }
-                    titled
-                };
-                // `MATERIALIZED`, because the planner otherwise flattens the subquery and `rank`
-                // leaves the `MATCH` it is only defined under. Grouping by session takes the bare
-                // `m.id` beside `min()`, which SQLite guarantees is the row of the minimum.
-                let mut statement = connection.prepare(&format!(
-                    "WITH hits AS MATERIALIZED (
-                         SELECT rowid AS id, rank FROM messages_fts
-                         WHERE messages_fts MATCH :expression
-                     )
-                     SELECT m.session_id, m.id, min(hits.rank)
-                     FROM hits
-                     JOIN messages m ON m.id = hits.id
-                     JOIN sessions s ON s.id = m.session_id
-                     WHERE {within_reach}
-                     GROUP BY m.session_id
-                     ORDER BY 3 ASC, s.updated_at DESC
-                     LIMIT :limit"
-                ))?;
-                let mut ranked: Vec<(String, i64)> = Vec::new();
-                for expression in &expressions {
-                    let mut parameters: Vec<(&str, &dyn rusqlite::ToSql)> =
-                        vec![(":expression", expression), (":limit", &sql_limit)];
-                    parameters.extend(root_parameter);
-                    let rows = statement.query_map(parameters.as_slice(), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })?;
-                    ranked = rows.collect::<rusqlite::Result<_>>()?;
-                    if !ranked.is_empty() {
-                        break;
-                    }
+                        titled
+                    };
+                    Ok(titled)
                 }
-                Ok((titled, ranked))
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to search sessions: {error}")))?;
+        // The tiers in turn, stopping at the first that finds a session with anything it still
+        // says. A session ranks by the best match its history shows: a hit on a row a rewind took
+        // is no match, so the session is ranked by its next best, which may put it behind
+        // sessions its rewound hit ranked it ahead of.
+        let mut ranked: Vec<(String, i64)> = Vec::new();
+        for expression in expressions {
+            let mut shown: Vec<SessionHit> = Vec::new();
+            for hit in self.best_hits(expression.clone(), reach.clone()).await? {
+                // Every session from here on ranks no better than its best hit, so once `limit`
+                // sessions rank better than that, none of them can enter.
+                if shown
+                    .get(limit.saturating_sub(1))
+                    .is_some_and(|last| last.rank < hit.rank)
+                {
+                    break;
+                }
+                let Some(id) = super::sessions::session_id_in(&hit.session) else {
+                    continue;
+                };
+                let rewound = self.rewound(id).await?;
+                let best = if super::sessions::is_rewound(&rewound, hit.row) {
+                    self.hits_in_session(expression.clone(), id)
+                        .await?
+                        .into_iter()
+                        .find(|(row, _)| !super::sessions::is_rewound(&rewound, *row))
+                } else {
+                    Some((hit.row, hit.rank))
+                };
+                if let Some((row, rank)) = best {
+                    let hit = SessionHit { row, rank, ..hit };
+                    let at = shown.partition_point(|other| other.ranks_ahead_of(&hit));
+                    shown.insert(at, hit);
+                }
+            }
+            if !shown.is_empty() {
+                shown.truncate(limit);
+                ranked = shown
+                    .into_iter()
+                    .map(|hit| (hit.session, hit.row))
+                    .collect();
+                break;
+            }
+        }
 
         let best_row: HashMap<&str, i64> = ranked
             .iter()
@@ -593,9 +640,80 @@ impl Store {
                 Some(row) => self.excerpt_of(row, &words).await?,
                 None => None,
             };
-            matches.push(SessionMatch { session, excerpt });
+            let excerpt_position = row.filter(|_| excerpt.is_some());
+            matches.push(SessionMatch {
+                session,
+                excerpt,
+                excerpt_position,
+            });
         }
         Ok(matches)
+    }
+
+    /// Each session within `reach` with a message matching `expression`, best first, with its
+    /// best-matching message.
+    async fn best_hits(&self, expression: String, reach: SessionReach) -> Result<Vec<SessionHit>> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let (within_reach, bound) = reach.sql_term();
+                // `MATERIALIZED`, because the planner otherwise flattens the subquery and `rank`
+                // leaves the `MATCH` it is only defined under. Grouping by session takes the bare
+                // `m.id` beside `min()`, which SQLite guarantees is the row of the minimum.
+                let mut statement = connection.prepare(&format!(
+                    "WITH hits AS MATERIALIZED (
+                         SELECT rowid AS id, rank FROM messages_fts
+                         WHERE messages_fts MATCH :expression
+                     )
+                     SELECT m.session_id, m.id, min(hits.rank), s.updated_at
+                     FROM hits
+                     JOIN messages m ON m.id = hits.id
+                     JOIN sessions s ON s.id = m.session_id
+                     WHERE {within_reach}
+                     GROUP BY m.session_id
+                     ORDER BY 3 ASC, s.updated_at DESC"
+                ))?;
+                let mut parameters: Vec<(&str, &dyn rusqlite::ToSql)> =
+                    vec![(":expression", &expression)];
+                parameters.extend(
+                    bound
+                        .iter()
+                        .map(|(name, value)| (*name, value as &dyn rusqlite::ToSql)),
+                );
+                let rows = statement.query_map(parameters.as_slice(), |row| {
+                    Ok(SessionHit {
+                        session: row.get(0)?,
+                        row: row.get(1)?,
+                        rank: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<_>>()
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to search sessions: {error}")))
+    }
+
+    /// The rows of session `session` matching `expression`, best first, each with its rank.
+    async fn hits_in_session(&self, expression: String, session: Uuid) -> Result<Vec<(i64, f64)>> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(
+                    "WITH hits AS MATERIALIZED (
+                         SELECT rowid AS id, rank FROM messages_fts
+                         WHERE messages_fts MATCH ?1
+                     )
+                     SELECT m.id, hits.rank FROM hits JOIN messages m ON m.id = hits.id
+                     WHERE m.session_id = ?2
+                     ORDER BY hits.rank ASC",
+                )?;
+                let rows = statement
+                    .query_map(rusqlite::params![expression, session.to_string()], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+                    })?;
+                rows.collect::<rusqlite::Result<_>>()
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to search sessions: {error}")))
     }
 
     /// The line of message `row` a query term is in, cut to [`EXCERPT_CHARS`]; the first line
@@ -761,9 +879,14 @@ mod tests {
 
     async fn ids_found(store: &Store, query: &str) -> Vec<Uuid> {
         store
-            .search_sessions(query, 10, SessionReach::Store {
-                include_children: false,
-            })
+            .search_sessions(
+                query,
+                10,
+                SessionReach::Store(crate::store::SessionFilter {
+                    include_children: false,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("search")
             .into_iter()
@@ -779,16 +902,26 @@ mod tests {
             session_saying(&store, &["egrets by the water"]).await;
         }
         let found = store
-            .search_sessions("egrets", 0, SessionReach::Store {
-                include_children: false,
-            })
+            .search_sessions(
+                "egrets",
+                0,
+                SessionReach::Store(crate::store::SessionFilter {
+                    include_children: false,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("search");
         assert_eq!(found.len(), 3);
         let found = store
-            .search_sessions("egrets", 2, SessionReach::Store {
-                include_children: false,
-            })
+            .search_sessions(
+                "egrets",
+                2,
+                SessionReach::Store(crate::store::SessionFilter {
+                    include_children: false,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("search");
         assert_eq!(found.len(), 2);
@@ -868,9 +1001,14 @@ mod tests {
 
         assert_eq!(ids_found(&store, "giraffes").await, vec![spoken]);
         let found = store
-            .search_sessions("giraffes", 10, SessionReach::Store {
-                include_children: false,
-            })
+            .search_sessions(
+                "giraffes",
+                10,
+                SessionReach::Store(crate::store::SessionFilter {
+                    include_children: false,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("search");
         assert_eq!(
@@ -917,9 +1055,14 @@ mod tests {
         store.mark_spawned_for_test(spawned, body).await;
 
         let found = store
-            .search_sessions("kestrel", 10, SessionReach::Store {
-                include_children: false,
-            })
+            .search_sessions(
+                "kestrel",
+                10,
+                SessionReach::Store(crate::store::SessionFilter {
+                    include_children: false,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("search");
         let ids: Vec<Uuid> = found.iter().map(|found| found.session.id).collect();
@@ -928,9 +1071,14 @@ mod tests {
         assert!(
             ids_found(&store, "kestrel").await.len() == 2
                 && store
-                    .search_sessions("kestrel", 10, SessionReach::Store {
-                        include_children: true
-                    })
+                    .search_sessions(
+                        "kestrel",
+                        10,
+                        SessionReach::Store(crate::store::SessionFilter {
+                            include_children: true,
+                            ..Default::default()
+                        })
+                    )
                     .await
                     .expect("search")
                     .len()
@@ -979,9 +1127,14 @@ mod tests {
             sentence
         ]);
         let found = store
-            .search_sessions("深圳", 10, SessionReach::Store {
-                include_children: false,
-            })
+            .search_sessions(
+                "深圳",
+                10,
+                SessionReach::Store(crate::store::SessionFilter {
+                    include_children: false,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("search");
         assert_eq!(
@@ -1270,9 +1423,14 @@ mod tests {
             .await
             .expect("save");
         let found = store
-            .search_sessions("pelicans", 10, SessionReach::Store {
-                include_children: false,
-            })
+            .search_sessions(
+                "pelicans",
+                10,
+                SessionReach::Store(crate::store::SessionFilter {
+                    include_children: false,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("search");
         assert_eq!(found[0].session.id, session);

@@ -5,7 +5,8 @@ use super::*;
 use crate::{
     conversation::{
         COMPACTION_SUMMARY_PREFIX, CompactionRecord, CompactionSource, CompactionTrigger,
-        RETAINED_MESSAGES_END, RETAINED_MESSAGES_HEADER, is_harness_stand_in,
+        NudgeKind, RETAINED_MESSAGES_END, RETAINED_MESSAGES_HEADER, THINKING_ONLY_NUDGE,
+        is_harness_stand_in,
     },
     session::{
         CompactRequest, SUMMARY_SHAPE, compaction_retained_budget, compaction_tail_budget,
@@ -37,17 +38,6 @@ pub(super) fn report_checkpoint_memories(memories_written: &[String]) {
     let noun = if count == 1 { "memory" } else { "memories" };
     let names = memories_written.join(", ");
     tracing::info!("checkpoint wrote {count} {noun}: {names}");
-}
-/// What a compaction did, for the caller to report. `POST /compact` answers with it; the screen's
-/// `/compact` and the automatic triggers discard it, since the `Compacted` event carries the facts.
-#[derive(Debug, Clone)]
-pub(crate) struct CompactOutcome {
-    pub(crate) source: CompactionSource,
-    /// Memories the checkpoint turn wrote, each once, observed from its `memory_write` and
-    /// `memory_edit` calls rather than self-reported, so this cannot disagree with what actually
-    /// landed on disk.
-    pub(crate) memories_written: Vec<String>,
-    pub(crate) kept_recent: bool,
 }
 /// Provider round-trips one checkpoint turn may take before its summary is read off.
 ///
@@ -511,6 +501,14 @@ pub(super) fn bound_checkpoint_result(
         .collect()
 }
 
+/// Why `messages` cannot be compacted, when it cannot: what every door that compacts refuses
+/// before it announces a compaction, and what the compaction itself refuses.
+pub(crate) fn compaction_refusal(messages: &Conversation) -> Option<MekaError> {
+    messages
+        .is_empty()
+        .then(|| MekaError::Config("no messages to compact".to_string()))
+}
+
 impl Agent {
     /// Replace the conversation's head with a summary of it, keeping a recent tail verbatim.
     ///
@@ -523,19 +521,173 @@ impl Agent {
         messages: &mut Conversation,
         request: CompactRequest,
         cancellation: CancellationToken,
-    ) -> Result<CompactOutcome> {
+    ) -> Result<CompactionRecord> {
+        self.compact(messages, request, cancellation, None, uuid::Uuid::new_v4())
+            .await
+    }
+
+    /// [`Self::compact_session`] under an id the caller minted: the HTTP door announces the
+    /// checkpoint turn under the id the compaction's own events carry, so a client files them
+    /// together.
+    ///
+    /// A compaction run between turns is a turn of its own under that id, a row with
+    /// [`TurnSource::Compaction`](crate::store::turns::TurnSource::Compaction) that its boundary
+    /// names and its spend closes, so the session's turns account for everything it spent. One
+    /// run inside a turn is that turn's, and its spend goes on that turn's row.
+    pub(crate) async fn compact_session_under(
+        &self,
+        messages: &mut Conversation,
+        request: CompactRequest,
+        cancellation: &crate::agent::TurnCancellation,
+        id: uuid::Uuid,
+    ) -> Result<CompactionRecord> {
+        self.compact(
+            messages,
+            request,
+            cancellation.token().clone(),
+            Some(cancellation),
+            id,
+        )
+        .await
+    }
+
+    /// The compaction both doors run; `stopped_by`, when the caller has one, says why a stop
+    /// came, for the row of a compaction that is its own turn.
+    async fn compact(
+        &self,
+        messages: &mut Conversation,
+        request: CompactRequest,
+        cancellation: CancellationToken,
+        stopped_by: Option<&crate::agent::TurnCancellation>,
+        id: uuid::Uuid,
+    ) -> Result<CompactionRecord> {
         let Some(session_id) = self.cells.session_id.get() else {
             return Err(MekaError::Config(
                 "no active session to compact".to_string(),
             ));
         };
-        if messages.is_empty() {
-            return Err(MekaError::Config("no messages to compact".to_string()));
+        let own_turn = self.current_turn().is_none();
+        // The kept tail is written as copies of what memory holds, so a round the store failed to
+        // take would be saved here after all, beside the inbox items its failure offered again.
+        // Between turns alone: a turn's start has matched the two already, and the one write that
+        // can fail ahead of a compaction inside a turn, its prompt's, is one this compaction makes.
+        if own_turn {
+            self.match_the_store_after_a_failed_save(session_id, messages)
+                .await?;
         }
+        if let Some(refusal) = compaction_refusal(messages) {
+            return Err(refusal);
+        }
+        // Ahead of the turn it clears, so a run dropped while the row is written leaves none set.
+        let _turn_scope = own_turn.then(|| super::turn::TurnScope { agent: self });
+        if own_turn {
+            self.open_compaction_turn(session_id, id).await;
+        }
+        let outcome = self
+            .compact_announced(session_id, messages, request, cancellation, id)
+            .await;
+        // Every position a reload left known accepted up to is gone with the old shape.
+        if outcome.is_ok() {
+            let mut from = crate::sync::lock(&self.unaccepted_from);
+            if from.is_some() {
+                *from = Some(SUSPECT_FLOOR_AFTER_REWRITE);
+            }
+        }
+        if own_turn {
+            let reason = stopped_by.and_then(crate::agent::TurnCancellation::reason);
+            self.close_compaction_turn(session_id, id, &outcome, reason)
+                .await;
+        }
+        outcome
+    }
+
+    /// Open the row of a compaction run between turns, and make it the turn every row written
+    /// until it ends names. Best-effort like every turn's row: one that could not be written costs
+    /// the compaction its bookkeeping, not its run.
+    async fn open_compaction_turn(&self, session_id: Uuid, id: uuid::Uuid) {
+        *crate::sync::lock(&self.current_turn) = Some(id);
+        *crate::sync::lock(&self.compaction_spend) = crate::stats::TokenUsage::default();
+        if let Err(error) = self
+            .store
+            .turn_store()
+            .open_turn(
+                session_id,
+                id,
+                crate::store::turns::TurnSource::Compaction,
+                self.cells.permission.get(),
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+        {
+            tracing::warn!("failed to record the compaction's turn: {error}");
+        }
+    }
+
+    /// Close the row [`Self::open_compaction_turn`] opened with how the compaction ended and what
+    /// it spent, and say the spend as a turn that finished says its own.
+    async fn close_compaction_turn(
+        &self,
+        session_id: Uuid,
+        id: uuid::Uuid,
+        outcome: &Result<CompactionRecord>,
+        reason: Option<crate::store::turns::CancelReason>,
+    ) {
+        let spent = std::mem::take(&mut *crate::sync::lock(&self.compaction_spend));
+        // As a turn's end persists them, so a resume's `/status` still counts what this spent.
+        if !spent.is_empty()
+            && self.role.is_root()
+            && let Err(error) = self
+                .store
+                .save_session_stats(session_id, &self.session_stats.snapshot())
+                .await
+        {
+            tracing::warn!("failed to persist session stats: {error}");
+        }
+        let usage = crate::store::turns::TurnUsage::from(&spent);
+        let ending = match outcome {
+            Ok(_) => crate::store::turns::TurnEnding::succeeded(
+                crate::agent::TurnOutcome::EndTurn.stop_reason(),
+                usage,
+            ),
+            // A stop with no reason given is one asked for, as a turn's is.
+            Err(MekaError::Interrupted) => crate::store::turns::TurnEnding::canceled(
+                usage,
+                reason.unwrap_or(crate::store::turns::CancelReason::Client),
+            ),
+            Err(error) => crate::store::turns::TurnEnding::failed(error, usage),
+        }
+        .served_by(self.serving_fallback());
+        if let Err(error) = self.store.turn_store().close_turn(id, &ending).await {
+            tracing::warn!("failed to record the compaction turn's ending: {error}");
+        }
+        if outcome.is_ok() {
+            self.cells
+                .frontend
+                .emit(FrontendEvent::TokenUsage(spent))
+                .await;
+        }
+    }
+
+    /// Count what a compaction's call spent: in the session's totals, which take it without a
+    /// turn, and toward the row of the turn it runs in.
+    fn record_compaction_spend(&self, usage: &crate::stats::TokenUsage) {
+        self.session_stats.record_untracked_tokens(usage);
+        crate::sync::lock(&self.compaction_spend).add(usage);
+    }
+
+    /// The compaction itself, opened and closed on the frontend under `id`.
+    async fn compact_announced(
+        &self,
+        session_id: Uuid,
+        messages: &mut Conversation,
+        request: CompactRequest,
+        cancellation: CancellationToken,
+        id: uuid::Uuid,
+    ) -> Result<CompactionRecord> {
         // Opened on the frontend before any request is made, since the checkpoint turn is up to
         // eight round trips long and a client with a compaction entry shows it running; whichever
         // way this ends, the event that closes it names the same id.
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = id.to_string();
         let trigger = request.trigger;
         self.cells
             .frontend
@@ -573,8 +725,7 @@ impl Agent {
         request: CompactRequest,
         cancellation: CancellationToken,
         compaction_id: &str,
-    ) -> Result<CompactOutcome> {
-        let _serving = super::fallback::RestoreWhenIdle { agent: self };
+    ) -> Result<CompactionRecord> {
         let compaction_kind = crate::provider::CompactionKind::from(request.trigger);
 
         // Owned here rather than returned by the checkpoint, because a `memory_write` is durable
@@ -676,8 +827,9 @@ impl Agent {
             crate::tools::checklist::replay_checklist_over(baseline, &to_summarize)
         };
 
-        // The first of two places a fired token ends an automatic compaction; the second, after
-        // the summary is built, catches an interrupt that lands inside the summarizer. This one is
+        // The first of the places a fired token ends an automatic compaction; the summarizer ends
+        // one that lands during its call, and the check after the summary is built catches an
+        // interrupt that lands later. This one is
         // for a token fired before or during the checkpoint, which answers it with `Ok(None)` and
         // would otherwise send the conversation to the summarizer: a full request paid for and
         // then thrown away by the check below. Same exception for `Manual`, and for the same
@@ -694,8 +846,11 @@ impl Agent {
         let (summary_text, source) = match checkpoint {
             Some(checkpoint) => (checkpoint.summary, CompactionSource::Checkpoint),
             None => (
+                // Reported however the summary ends, as the checks around the checkpoint report
+                // it: the memories the checkpoint wrote are durable, and this is their one trace.
                 self.summarize_via_provider(&request, to_summarize, &cancellation)
-                    .await?,
+                    .await
+                    .inspect_err(|_| report_checkpoint_memories(&memories_written))?,
                 CompactionSource::Summarizer,
             ),
         };
@@ -841,12 +996,6 @@ impl Agent {
                     "compact boundary missing after replace_for_compaction".to_string(),
                 )
             })?;
-        let replaced_count = match &boundary_event {
-            crate::conversation::Event::CompactBoundary { replaced_count, .. } => *replaced_count,
-            // Unreachable: the `find` above matched on this variant. Zero rather than a panic
-            // because a miscounted advisory figure is not worth failing a compaction over.
-            _ => 0,
-        };
         // One transaction, for the reason `save_events_atomic` exists: a boundary that commits and
         // a tail write that then fails leaves the database holding a valid boundary with a
         // truncated tail, which puts those messages permanently outside the materialized view of
@@ -896,7 +1045,7 @@ impl Agent {
         }
 
         // Announced after everything is persisted and the counters are settled, so a frontend
-        // acting on it (an SSE client refetching `/messages`) cannot observe a half-applied
+        // acting on it (an SSE client reading the context again) cannot observe a half-applied
         // compaction. Every trigger reaches here, including the automatic ones nobody asked for,
         // which are exactly the ones a remote client would otherwise never learn about.
         // Read back rather than reusing the counter above: when the cache was `GENERATION_UNKNOWN`
@@ -908,7 +1057,6 @@ impl Agent {
             .emit(FrontendEvent::Compacted {
                 id: compaction_id.to_string(),
                 record: record.clone(),
-                replaced_count,
                 generation: reported_generation,
             })
             .await;
@@ -928,15 +1076,7 @@ impl Agent {
             *crate::sync::lock(&self.previous_request) = None;
         }
 
-        Ok(CompactOutcome {
-            source,
-            memories_written,
-            // The outcome, not the intent: `compute_compaction_split` yields an empty tail whenever
-            // the snapped boundary lands below `MIN_SUMMARIZE`, which is routine in a session whose
-            // user turns are separated by long tool runs. Reporting the request would tell the user
-            // their recent turns survived on exactly the occasions they did not.
-            kept_recent: !to_keep.is_empty(),
-        })
+        Ok(record)
     }
 
     /// Who a compaction's requests are for. Claude Code's compaction names the request and the
@@ -1110,7 +1250,7 @@ impl Agent {
                 cache_read = usage.cache_read_input_tokens,
                 output = usage.output_tokens
             );
-            self.session_stats.record_untracked_tokens(&usage);
+            self.record_compaction_spend(&usage);
             for notice in notices {
                 self.forward_notice(notice).await;
             }
@@ -1266,8 +1406,8 @@ impl Agent {
         Ok(None)
     }
 
-    /// Summarize `to_summarize` in one standalone call that carries no tools and none of the
-    /// agent's own identity.
+    /// Summarize `to_summarize` in a standalone call that carries no tools and none of the
+    /// agent's own identity, asked once more when its answer holds no text.
     ///
     /// This is the original compaction mechanism, kept for the two cases the checkpoint turn cannot
     /// serve: [`CompactionTrigger::Emergency`], where the provider has already refused a request
@@ -1279,8 +1419,8 @@ impl Agent {
         request: &CompactRequest,
         to_summarize: Vec<Message>,
         // The caller's, so a retry between attempts is interruptible for the same reason the
-        // checkpoint's rounds are. Not used for anything else here: the call itself is one
-        // `complete`, which this cannot reach inside.
+        // checkpoint's rounds are, and an automatic compaction stopped during a call asks for no
+        // second summary. Each call itself is one `complete`, which this cannot reach inside.
         cancellation: &CancellationToken,
     ) -> Result<String> {
         let mut system_prompt = format!(
@@ -1303,73 +1443,100 @@ impl Agent {
             "Summarize this conversation into a concise context message.",
         ));
 
-        // A summary is not worth reasoning over, so this one request turns thinking off. The
-        // override travels with the request rather than living on the shared provider, so a
-        // sibling sub-agent's in-flight turn keeps whatever thinking its profile configured.
-        // Sent under a token nothing fires: the caller's may already have, and the summary is the
-        // one thing a stop must not deny. See `complete_with_retry`.
+        // Under the profile's thinking, as every request is: the profile is what the user chose for
+        // this model, and some models answer far worse without it. Sent under a token nothing
+        // fires: the caller's may already have, and the summary is the one thing a stop must not
+        // deny. See `complete_with_retry`.
         let unfired = CancellationToken::new();
         let mut thinking_removed = false;
-        let completed = loop {
-            let completed = self
-                .complete_with_retry(
-                    "the summarizer's provider call",
-                    CompletionRequest::new(&system_prompt, &compact_messages, &[])
-                        .attributed(self.compaction_attribution(request))
-                        .without_thinking(),
-                    None,
-                    cancellation,
-                    &unfired,
-                )
-                .await;
-            // The thinking goes out with the rest, since leaving it out unasked would cost the
-            // summary whatever the model reads from it. This request has its own system prompt and
-            // no tools, though, so every block in it is bound to another conversation, and an
-            // account that enforces Claude's check rejects it. The copy is thrown away after, so
-            // retrying without the thinking costs this one summary alone.
-            match completed {
-                Err(error)
-                    if error.rejects_thinking_signature()
-                        && !thinking_removed
-                        && remove_claude_thinking(&mut compact_messages) =>
-                {
-                    thinking_removed = true;
+        let mut asked_again = false;
+        loop {
+            let completed = loop {
+                let completed = self
+                    .complete_with_retry(
+                        "the summarizer's provider call",
+                        CompletionRequest::new(&system_prompt, &compact_messages, &[])
+                            .attributed(self.compaction_attribution(request)),
+                        None,
+                        cancellation,
+                        &unfired,
+                    )
+                    .await;
+                // The thinking goes out with the rest, since leaving it out unasked would cost the
+                // summary whatever the model reads from it. This request has its own system prompt
+                // and no tools, though, so every block in it is bound to another conversation, and
+                // an account that enforces Claude's check rejects it. The copy is thrown away
+                // after, so retrying without the thinking costs this one summary alone.
+                match completed {
+                    Err(error)
+                        if error.rejects_thinking_signature()
+                            && !thinking_removed
+                            && remove_claude_thinking(&mut compact_messages) =>
+                    {
+                        thinking_removed = true;
+                        tracing::warn!(
+                            "provider rejected a thinking block's signature; summarizing without the \
+                             thinking"
+                        );
+                    }
+                    completed => break completed,
+                }
+            };
+            let crate::provider::Completion {
+                message: summary_message,
+                stop_reason,
+                usage,
+                notices,
+            } = completed?;
+            tracing::debug!(
+                "summary usage: input={input} cache_creation={cache_creation} \
+                 cache_read={cache_read} output={output}",
+                input = usage.input_tokens,
+                cache_creation = usage.cache_creation_input_tokens,
+                cache_read = usage.cache_read_input_tokens,
+                output = usage.output_tokens
+            );
+            self.record_compaction_spend(&usage);
+            // Provider notices from the summary call (image redaction on a very large window),
+            // emitted before the conversation is mutated so the user-facing order stays stable.
+            for notice in notices {
+                self.forward_notice(notice).await;
+            }
+
+            let summary_text = summary_message.text_content();
+            if !summary_text.is_empty() {
+                // The profile's thinking shares the output cap with the summary, so a cap that
+                // leaves little room past the thinking ends the summary early.
+                if matches!(stop_reason, crate::provider::StopReason::MaxTokens) {
                     tracing::warn!(
-                        "provider rejected a thinking block's signature; summarizing without the \
-                         thinking"
+                        "the compaction summary reached the profile's output cap and may be cut short"
                     );
                 }
-                completed => break completed,
+                return Ok(summary_text);
             }
-        };
-        let crate::provider::Completion {
-            message: summary_message,
-            usage,
-            notices,
-            ..
-        } = completed?;
-        tracing::debug!(
-            "summary usage: input={input} cache_creation={cache_creation} cache_read={cache_read} \
-             output={output}",
-            input = usage.input_tokens,
-            cache_creation = usage.cache_creation_input_tokens,
-            cache_read = usage.cache_read_input_tokens,
-            output = usage.output_tokens
-        );
-        self.session_stats.record_untracked_tokens(&usage);
-        // Provider notices from the summary call (image redaction on a very large window), emitted
-        // before the conversation is mutated so the user-facing order stays stable.
-        for notice in notices {
-            self.forward_notice(notice).await;
-        }
-
-        let summary_text = summary_message.text_content();
-        if summary_text.is_empty() {
-            return Err(MekaError::Provider(
-                "provider returned an empty summary".to_string(),
+            // A stop that landed during the call ends an automatic compaction here, whichever
+            // request it was, rather than after a second whole one or as a failure, as the checks
+            // around the checkpoint end it.
+            if request.trigger != CompactionTrigger::Manual && cancellation.is_cancelled() {
+                return Err(MekaError::Interrupted);
+            }
+            if asked_again {
+                return Err(MekaError::Provider(
+                    "provider returned an empty summary".to_string(),
+                ));
+            }
+            // A reply that is all thinking ended before its answer, as a turn's can; it is asked
+            // again once, with the nudge a turn gets, before the compaction fails.
+            asked_again = true;
+            tracing::warn!("the summarizer answered with no text; asking again");
+            if !summary_message.content.is_empty() {
+                compact_messages.push(summary_message);
+            }
+            compact_messages.push(Message::nudge_message(
+                NudgeKind::VisibleReply,
+                THINKING_ONLY_NUDGE,
             ));
         }
-        Ok(summary_text)
     }
 
     /// How many compactions this session has been through, reading the database once and caching.
@@ -2163,7 +2330,7 @@ mod tests {
         store: &Store,
         messages: &mut Conversation,
         request: CompactRequest,
-    ) -> CompactOutcome {
+    ) -> CompactionRecord {
         agent.cells().session_id.set(
             store
                 .create_session(None, "test-profile".to_string())
@@ -2669,12 +2836,22 @@ mod tests {
         );
     }
 
-    /// The summary is the one request that turns thinking off, and it says so on the request
-    /// itself: a flag on the shared provider would take the thinking from a sibling sub-agent's
-    /// turn in flight over the same `Arc<dyn Provider>`.
+    /// An automatic compaction stopped while its summary was being written does not ask again
+    /// when the summary comes back with no text: the second request would be paid for and thrown
+    /// away.
     #[tokio::test]
-    async fn the_summary_turns_thinking_off_on_its_own_request_only() {
+    async fn a_stopped_compaction_does_not_ask_again_for_an_empty_summary() {
         let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Sleep { ms: 300 },
+                MockEvent::ThinkingDelta {
+                    text: "considering".to_string(),
+                },
+                MockEvent::ThinkingComplete { opaque: None },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
             vec![
                 MockEvent::Text {
                     text: "the summary".to_string(),
@@ -2683,24 +2860,73 @@ mod tests {
                     stop_reason: MockStopReason::EndTurn,
                 },
             ],
-            vec![
-                MockEvent::Text {
-                    text: "a turn after it".to_string(),
-                },
-                MockEvent::MessageEnd {
-                    stop_reason: MockStopReason::EndTurn,
-                },
-            ],
         ]));
         let (agent, store) = agent_with_checkpoint(provider.clone(), false).await;
-        let mut messages = conversation();
         agent.cells().session_id.set(
             store
                 .create_session(None, "test-profile".to_string())
                 .await
                 .expect("create session"),
         );
+        let mut messages = conversation();
+        let token = CancellationToken::new();
+        // Fired once the summary has been asked for, so the stop lands inside the call however
+        // long the way there takes.
+        let stopper = tokio::spawn({
+            let token = token.clone();
+            let provider = provider.clone();
+            async move {
+                while provider.completions().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                token.cancel();
+            }
+        });
+        let outcome = agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Reactive),
+                token,
+            )
+            .await;
+        stopper.await.expect("stopper");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "{outcome:?}"
+        );
+        assert_eq!(provider.completions().len(), 1);
+    }
 
+    /// A compaction after a failed save compacts what the store holds: the message memory kept and
+    /// the store never took is neither summarized nor kept, so the compaction does not save it
+    /// after all beside the inbox items its failure offered again.
+    #[tokio::test]
+    async fn a_compaction_after_a_failed_save_compacts_what_the_store_holds() {
+        use crate::conversation::Event;
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::Text {
+                text: "the summary".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]]));
+        let (agent, store) = agent_with_checkpoint(provider.clone(), false).await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session);
+        let mut messages = conversation();
+        for message in messages.as_slice() {
+            store
+                .save_event(session, &Event::Append(message.clone()), None)
+                .await
+                .expect("save");
+        }
+        messages.append(Message::user("never saved"));
+        let noted: Result<()> = agent.note_save(Err(MekaError::Database("full".to_string())));
+        assert!(noted.is_err());
         agent
             .compact_session(
                 &mut messages,
@@ -2708,31 +2934,156 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
-            .expect("compaction");
-        agent
-            .run_turn(
+            .expect("compacts");
+        let summarized = provider.completions();
+        assert!(
+            !summarized
+                .iter()
+                .flatten()
+                .any(|message| message.text_content() == "never saved"),
+            "not summarized"
+        );
+        let rows = store.load_events(session).await.expect("rows");
+        assert!(
+            !rows.iter().any(|event| matches!(
+                event,
+                Event::Append(message) if message.text_content() == "never saved"
+            )),
+            "not kept"
+        );
+    }
+
+    /// A stop that lands while the summary is asked for the second time ends the compaction as
+    /// stopped, not as one whose summary came back empty.
+    #[tokio::test]
+    async fn a_compaction_stopped_while_asking_again_is_stopped_not_failed() {
+        let thinking_only = |sleep: u64| {
+            vec![
+                MockEvent::Sleep { ms: sleep },
+                MockEvent::ThinkingDelta {
+                    text: "considering".to_string(),
+                },
+                MockEvent::ThinkingComplete { opaque: None },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            thinking_only(0),
+            thinking_only(300),
+        ]));
+        let (agent, store) = agent_with_checkpoint(provider.clone(), false).await;
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session"),
+        );
+        let mut messages = conversation();
+        let token = CancellationToken::new();
+        // Fired once the second request has been made, so the stop lands inside it.
+        let stopper = tokio::spawn({
+            let token = token.clone();
+            let provider = provider.clone();
+            async move {
+                while provider.completions().len() < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                token.cancel();
+            }
+        });
+        let outcome = agent
+            .compact_session(
                 &mut messages,
-                crate::agent::TurnInput::from_parts("carry on".to_string(), Vec::new())
-                    .expect("a prompt"),
-                crate::agent::TurnCancellation::new(),
+                CompactRequest::new(CompactionTrigger::Reactive),
+                token,
+            )
+            .await;
+        stopper.await.expect("stopper");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "{outcome:?}"
+        );
+        assert_eq!(provider.completions().len(), 2);
+    }
+
+    /// A summary that comes back with no text, all of it thinking, is asked for once more with
+    /// the nudge a turn gets, its reply carried ahead of it; a second empty one fails the
+    /// compaction rather than writing an empty summary.
+    #[tokio::test]
+    async fn a_summary_with_no_text_is_asked_for_once_more() {
+        let thinking_only = || {
+            vec![
+                MockEvent::ThinkingDelta {
+                    text: "considering".to_string(),
+                },
+                MockEvent::ThinkingComplete { opaque: None },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![thinking_only(), vec![
+            MockEvent::Text {
+                text: "the summary".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]]));
+        let (agent, store) = agent_with_checkpoint(provider.clone(), false).await;
+        let mut messages = conversation();
+        let record = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Manual),
+        )
+        .await;
+        assert!(record.written_summary.contains("the summary"), "{record:?}");
+        let completions = provider.completions();
+        assert_eq!(completions.len(), 2, "asked once more");
+        let again = &completions[1];
+        assert_eq!(
+            again.last().and_then(Message::nudge).map(|(kind, _)| kind),
+            Some(NudgeKind::VisibleReply),
+            "the second request ends on the nudge: {again:?}"
+        );
+        assert!(
+            again
+                .iter()
+                .rev()
+                .nth(1)
+                .is_some_and(|reply| reply.role == Role::Assistant),
+            "the empty reply goes ahead of the nudge"
+        );
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            thinking_only(),
+            thinking_only(),
+        ]));
+        let (agent, store) = agent_with_checkpoint(provider.clone(), false).await;
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session"),
+        );
+        let mut messages = conversation();
+        let error = agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Manual),
+                CancellationToken::new(),
             )
             .await
-            .expect("a turn after compaction");
-
+            .expect_err("two empty summaries fail it");
+        assert!(error.to_string().contains("empty summary"), "{error}");
         assert_eq!(
-            provider.completion_thinking(),
-            vec![crate::provider::ThinkingOverride::Off],
-            "the summary is the one request that asks for thinking off"
-        );
-        let streamed: Vec<_> = provider
-            .streams()
-            .into_iter()
-            .map(|request| request.thinking)
-            .collect();
-        assert_eq!(
-            streamed,
-            vec![crate::provider::ThinkingOverride::Inherit],
-            "the turn after it inherits the profile's setting"
+            provider.completions().len(),
+            2,
+            "asked no more than once more"
         );
     }
 

@@ -1,6 +1,6 @@
 //! The session inbox over HTTP: `POST`, `GET` and `DELETE` under `/v1/sessions/{id}/inbox`.
 //!
-//! The asynchronous door beside `POST /turn`. A client that lives with a session (a chat bridge, a
+//! The asynchronous door beside `POST /turns`. A client that lives with a session (a chat bridge, a
 //! UI) enqueues here and watches the session feed, rather than holding a turn open end to end:
 //! the item is durable before the 202, a `steer` reaches the running turn at its next round
 //! boundary, an `interrupt` cuts the answer it is streaming, a `followup` rides the next turn, and
@@ -179,7 +179,7 @@ pub(crate) async fn enqueue(
 ) -> Result<(StatusCode, Json<InboxResponse>), ProblemDetail> {
     let body: InboxRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("inbox", error))?;
-    // The same doors `POST /turn` goes through, in the same order: a sub-agent's session and one
+    // The same doors `POST /turns` goes through, in the same order: a sub-agent's session and one
     // another process holds are refused before anything is written, and an evicted session is
     // revived so its driver has a runtime to run the item in.
     let entry = ensure_session_loaded(&state, session_id).await?;
@@ -221,7 +221,7 @@ pub(crate) async fn enqueue(
             )
             .with("session_id", session_id.to_string())
         })?;
-    // A retry that carries other words under the same key is the contract `POST /turn` refuses
+    // A retry that carries other words under the same key is the contract `POST /turns` refuses
     // too.
     if enqueued.replayed && (item.body != body.message || item.class != body.class) {
         return Err(ProblemDetail::new(
@@ -245,7 +245,7 @@ pub(crate) async fn enqueue(
     ))
 }
 
-/// The `Idempotency-Key` header, validated the way `POST /turn` validates it.
+/// The `Idempotency-Key` header, validated the way `POST /turns` validates it.
 fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ProblemDetail> {
     let Some(value) = headers.get("idempotency-key") else {
         return Ok(None);

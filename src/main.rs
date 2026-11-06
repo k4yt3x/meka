@@ -298,8 +298,8 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     )
                     .await
                 }
-                cli::Command::History { action } => {
-                    cli::history::run_history_subcommand(&store, action)
+                cli::Command::Recall { action } => {
+                    cli::recall::run_recall_subcommand(&store, action)
                 }
                 cli::Command::Mcp { action } => {
                     cli::mcp::run_mcp_subcommand(&store, action, cli_ref).await
@@ -382,7 +382,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     if acp_mode {
                         "a turn is the editor's `session/prompt`"
                     } else {
-                        "a turn is `POST /v1/sessions/{id}/turn`"
+                        "a turn is `POST /v1/sessions/{id}/turns`"
                     },
                 ),
                 (

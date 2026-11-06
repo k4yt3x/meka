@@ -7,12 +7,12 @@ use crate::permission::Permission;
 
 pub(crate) mod account;
 pub(crate) mod background;
-pub(crate) mod history;
 pub(crate) mod instructions;
 pub(crate) mod mcp;
 pub(crate) mod memory;
 pub(crate) mod profile;
 pub(crate) mod project;
+pub(crate) mod recall;
 pub(crate) mod schedule;
 pub(crate) mod session;
 pub(crate) mod skills;
@@ -44,10 +44,10 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
-    /// View or clear screen input history
-    History {
+    /// View or clear the screen's recall
+    Recall {
         #[command(subcommand)]
-        action: HistoryAction,
+        action: RecallAction,
     },
     /// Manage MCP servers
     Mcp {
@@ -305,8 +305,8 @@ impl std::str::FromStr for SessionField {
 }
 
 #[derive(clap::Subcommand, Debug)]
-pub(crate) enum HistoryAction {
-    /// List input history
+pub(crate) enum RecallAction {
+    /// List recall entries
     List {
         /// Maximum number of entries to show (0 = all)
         #[arg(short = 'n', long, default_value = "50")]
@@ -314,7 +314,7 @@ pub(crate) enum HistoryAction {
         #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Clear input history
+    /// Clear recall entries
     Clear,
 }
 
@@ -1795,7 +1795,7 @@ mod tests {
             &["memory", "get", "m"],
             &["memory", "show", "m"],
             &["tool", "list"],
-            &["history", "list"],
+            &["recall", "list"],
             &["skill", "list"],
             &["skill", "get", "s"],
             &["skill", "show", "s"],
@@ -1931,23 +1931,23 @@ mod tests {
     }
 
     #[test]
-    fn cli_history_list_subcommand() {
-        let cli = Cli::parse_from(["meka", "history", "list", "-n", "10"]);
+    fn cli_recall_list_subcommand() {
+        let cli = Cli::parse_from(["meka", "recall", "list", "-n", "10"]);
         match cli.command {
-            Some(Command::History {
-                action: HistoryAction::List { limit, .. },
+            Some(Command::Recall {
+                action: RecallAction::List { limit, .. },
             }) => assert_eq!(limit, 10),
-            other => panic!("expected history list, got {other:?}"),
+            other => panic!("expected recall list, got {other:?}"),
         }
     }
 
     #[test]
-    fn cli_history_clear_subcommand() {
-        let cli = Cli::parse_from(["meka", "history", "clear"]);
+    fn cli_recall_clear_subcommand() {
+        let cli = Cli::parse_from(["meka", "recall", "clear"]);
         assert!(matches!(
             cli.command,
-            Some(Command::History {
-                action: HistoryAction::Clear
+            Some(Command::Recall {
+                action: RecallAction::Clear
             })
         ));
     }

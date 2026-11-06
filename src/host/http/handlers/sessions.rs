@@ -9,7 +9,7 @@ use axum::{
     Json,
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -134,7 +134,7 @@ pub(crate) struct CapabilitiesBody {
     /// the last attending reader leaves. Default `false`.
     #[serde(default)]
     pub(crate) answers_prompts_on_return: bool,
-    /// When `true`, an MCP server's elicitation parks as an `elicitation_required` event for an
+    /// When `true`, an MCP server's elicitation parks as an `elicitation.requested` event for an
     /// attending client to answer at the responses route, as an approval does; when `false` it
     /// is declined with a notice. Default `false`.
     #[serde(default)]
@@ -205,13 +205,14 @@ pub(crate) struct SessionResponse {
     /// client asks a session it is driving; a listing does not pay a query per row for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) inbox_pending: Option<u64>,
-    /// Prompts parked on this session, approvals and elicitations, waiting for a person. Reported
+    /// Requests parked on this session, approvals and elicitations, waiting for a person's answer
+    /// at `POST /v1/sessions/{id}/responses/{request_id}`. Reported
     /// for a session this process holds, on the listing too, since the count is a fact of the
     /// resident frontend and costs no query; it is what lets a session list say "waiting on a
     /// person" without a feed per row. The prompts themselves are on the feed, which replays
     /// every one still parked.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) approvals_pending: Option<u64>,
+    pub(crate) requests_pending: Option<u64>,
     /// The open checklist: every item the agent has committed to and not yet disposed of. Reported
     /// for a session this process holds, whose cell is the live list; a dormant session's list is
     /// in its conversation, which a record does not replay. `checklist.updated` on the feed
@@ -222,6 +223,13 @@ pub(crate) struct SessionResponse {
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub(crate) struct ListSessionsQuery {
+    /// Search: only the sessions whose conversations hold these words, best first, each with the
+    /// line they were found on. What was said is searched, not what tools were called with or
+    /// returned; a session whose title holds every word comes first. Blank is no search.
+    #[serde(default)]
+    pub(crate) q: Option<String>,
+    /// How many sessions at most: 50 by default, clamped to 1..200; with `q`, 20 by default,
+    /// clamped to 1..100.
     #[serde(default)]
     pub(crate) limit: Option<u32>,
     #[serde(default)]
@@ -261,9 +269,26 @@ pub(crate) struct ListSessionsQuery {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ListSessionsResponse {
-    pub(crate) sessions: Vec<SessionResponse>,
+    pub(crate) sessions: Vec<ListedSession>,
+    /// Present when more sessions remain: the `cursor` of the next page. A search answers its best
+    /// `limit` and has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) next_cursor: Option<String>,
+}
+
+/// A session as the listing answers with it: the record, and with `q` the words it was found by.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ListedSession {
+    #[serde(flatten)]
+    pub(crate) session: SessionResponse,
+    /// The line of the best-matching message that holds a query term, whitespace collapsed and
+    /// cut short, marked `(summary)` when taken from a compaction summary. Omitted outside a
+    /// search and for a session found by its title alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) excerpt: Option<String>,
+    /// The position of the message the excerpt was taken from, for opening the history there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) excerpt_position: Option<i64>,
 }
 
 /// A caller's `cwd` through the one acceptor, refused as a 422 like every other field of the body.
@@ -275,7 +300,7 @@ fn accepted_cwd(path: &std::path::Path) -> Result<std::path::PathBuf, ProblemDet
 /// POST /v1/sessions: create a session.
 ///
 /// Requires scope `sessions:w`. The created session's runtime (Agent, ToolRegistry,
-/// HttpFrontend) is constructed eagerly so subsequent `POST /turn` doesn't pay the build cost.
+/// HttpFrontend) is constructed eagerly so subsequent `POST /turns` doesn't pay the build cost.
 #[utoipa::path(
     post,
     path = "/v1/sessions",
@@ -483,12 +508,14 @@ pub(crate) async fn create_session(
             parent_id: None,
             pinned_at: None,
             last_turn: None,
+            turn_count: 0,
+            usage: Default::default(),
         },
         capabilities,
         turn_in_flight: false,
         inbox_pending: None,
         // Just made: nothing can be parked on it yet.
-        approvals_pending: Some(0),
+        requests_pending: Some(0),
         checklist: Some(Vec::new()),
     };
     announce_session(
@@ -512,6 +539,10 @@ pub(crate) struct ForkSessionBody {
     /// Absolute path for the forked session. Absent → inherit the source's.
     #[schema(value_type = Option<String>)]
     pub(crate) working_directory: Option<std::path::PathBuf>,
+    /// Branch before this turn: the copy holds the conversation as it stood before it, as a
+    /// rewind of the copy to it would leave it. Absent → the whole conversation.
+    #[serde(default)]
+    pub(crate) turn_id: Option<Uuid>,
 }
 
 /// POST /v1/sessions/{id}/fork: copy a session's conversation into a new one.
@@ -526,7 +557,7 @@ pub(crate) struct ForkSessionBody {
     tag = "sessions",
     params(
         ("id" = Uuid, Path, description = "Session UUID to fork"),
-        ("If-Match" = Option<String>, Header, description = "The `ETag` of `GET /v1/sessions/{id}/messages` the copy was decided on. The fork is refused with 412 when the source has changed since."),
+        ("If-Match" = Option<String>, Header, description = "The conversation's `ETag`, from `GET /v1/sessions/{id}/history` or `/context/messages`, the copy was decided on. The fork is refused with 412 when the source has changed since."),
     ),
     request_body = Option<ForkSessionBody>,
     responses(
@@ -535,9 +566,9 @@ pub(crate) struct ForkSessionBody {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 409, description = "A turn is in flight on the source; cancel first (`/errors/turn-in-flight`). Or another meka process holds the source (`/errors/session-locked`)", body = ProblemDetail),
-        (status = 412, description = "`If-Match` names a conversation that has since changed (`/errors/precondition-failed`); `revision` and `total` carry the current state", body = ProblemDetail),
+        (status = 412, description = "`If-Match` names a conversation that has since changed (`/errors/precondition-failed`); `position` carries the current one", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body, or the source is a sub-agent's conversation, whose copy is another sub-agent and so has no live session to hand back (`/errors/session-not-drivable`)", body = ProblemDetail),
+        (status = 422, description = "Invalid body, `turn_id` names no turn the source's context holds, or the source is a sub-agent's conversation, whose copy is another sub-agent and so has no live session to hand back (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:w"]))
@@ -607,8 +638,8 @@ pub(crate) async fn fork_session(
     // key.
     //
     // A resident source is this process's own, held through its entry, so the store is told rather
-    // than asked; a dormant one is probed, and a source another process is mid-turn on answers
-    // `409 session-locked` rather than being copied half-written.
+    // than asked; a dormant one is probed here, before it is read, and a source another process is
+    // mid-turn on answers `409 session-locked` rather than being copied half-written.
     //
     // Told only once it stands still. A turn persists its prompt before the provider answers, so
     // a resident source copied mid-turn ends on a user message nothing answered, the very copy the
@@ -617,53 +648,49 @@ pub(crate) async fn fork_session(
     // that takes the mutex before marking itself busy. Both are held across the copy: a busy entry
     // is one the idle sweep leaves alone, where a momentary residency check could see the entry
     // evicted, and its file lock released, between the answer and the copy.
-    let (source_idle, source_still, source_lock) = {
-        let map = state.sessions.read().await;
-        match map.get(&id).cloned() {
-            Some(entry) => {
+    let (resident, probed) = loop {
+        {
+            let map = state.sessions.read().await;
+            if let Some(entry) = map.get(&id).cloned() {
                 let idle = entry
                     .claim_idle()
                     .ok_or_else(|| turn_in_flight_conflict(id, "fork the session"))?;
                 let still = Arc::clone(&entry.conversation)
                     .try_lock_owned()
                     .map_err(|_| turn_in_flight_conflict(id, "fork the session"))?;
-                (
-                    Some(idle),
-                    Some(still),
-                    crate::store::SourceLock::HeldByCaller,
-                )
+                break (Some((idle, still)), None);
             }
-            None => (None, None, crate::store::SourceLock::Probe),
+        }
+        // Out from under the sessions lock, since the probe may queue behind a sibling fork's
+        // whole copy. An unknown id is refused first, so no lock file is made for it.
+        require_session_exists(&state, id).await?;
+        match state.shared.store.probe_fork_source(id).await {
+            Ok(probed) => break (None, Some(probed)),
+            // This process made it resident while the probe waited, and holds its lock through the
+            // entry, so it is claimed as a resident source on the next pass.
+            Err(crate::error::MekaError::SessionLocked(_))
+                if state.sessions.read().await.contains_key(&id) => {}
+            Err(error) => return Err(agent_build_problem(id, "failed to fork session", error)),
         }
     };
-    // The precondition is checked against the view about to be copied: a resident source under
-    // the conversation mutex held above, a dormant one from its rows. Only when the client sent
-    // one, since a dormant source's length costs a read of its log.
-    if headers.contains_key(header::IF_MATCH) {
-        let revision = state
-            .shared
-            .store
-            .count_rewrites(id)
-            .await
-            .map_err(|error| {
-                ProblemDetail::internal_sanitized(
-                    "failed to count the conversation's rewrites",
-                    error,
-                )
-                .with("session_id", id.to_string())
-            })?;
-        let total = match &source_still {
-            Some(conversation) => conversation.len(),
-            None => {
-                let events = state.shared.store.load_events(id).await.map_err(|error| {
-                    ProblemDetail::internal_sanitized("failed to load session events", error)
-                        .with("session_id", id.to_string())
-                })?;
-                crate::conversation::Conversation::from_events(events).len()
-            }
-        };
-        check_if_match(&headers, revision, total, id)?;
-    }
+    // The precondition is checked against the conversation about to be copied, which the claim
+    // above holds still for a resident source and the probe for a dormant one; and so is the turn
+    // to branch before.
+    let position =
+        crate::host::http::handlers::messages::conversation_position(&state.shared.store, id)
+            .await?;
+    check_if_match(&headers, position, id)?;
+    let branch = match body.turn_id {
+        Some(turn) => Some(
+            crate::host::http::handlers::conversation::messages_from_turn(
+                &state.shared.store,
+                id,
+                turn,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let (forked, copy_lock) = state
         .shared
         .store
@@ -680,15 +707,20 @@ pub(crate) async fn fork_session(
                 // token doing the forking is the only correct answer.
                 token_id: Some(principal.token_id.clone()),
             },
-            source_lock,
+            match probed {
+                Some(probed) => crate::store::SourceLock::Probed(probed),
+                None => crate::store::SourceLock::HeldByCaller,
+            },
         )
         .await
         .map_err(|error| agent_build_problem(id, "failed to fork session", error))?
         .ok_or_else(|| session_not_found(id))?;
     // The copy has committed, so the source is free to move again, and stays free while the
     // copy's runtime is built below.
-    drop(source_still);
-    drop(source_idle);
+    if let Some((idle, still)) = resident {
+        drop(still);
+        drop(idle);
+    }
 
     // A lock that could not be taken is reported by re-attach when it tries for itself.
     let copy_lock = match copy_lock {
@@ -707,9 +739,27 @@ pub(crate) async fn fork_session(
     // runtime is built, so a read that fails can still take the row with it; once the copy is
     // resident the caller would be told of a session the response then denied. A row this handler
     // wrote a moment ago and holds the lock on cannot be missing, so an absence is a fault too.
-    let forked_info = match state.shared.store.session_info(forked.id).await {
-        Ok(Some(info)) => Ok(info),
-        Ok(None) => Err(crate::error::MekaError::SessionNotFound(forked.id)),
+    // The branch is the copy rewound, written while the copy is still no runtime's, so the
+    // runtime built below hydrates the conversation as it stood before the turn.
+    let branched = match branch {
+        Some(count) => {
+            state
+                .shared
+                .store
+                .save_rewind(forked.id, &crate::conversation::Event::Repair {
+                    replaced_count: count,
+                    messages: Vec::new(),
+                })
+                .await
+        }
+        None => Ok(()),
+    };
+    let forked_info = match branched {
+        Ok(()) => match state.shared.store.session_info(forked.id).await {
+            Ok(Some(info)) => Ok(info),
+            Ok(None) => Err(crate::error::MekaError::SessionNotFound(forked.id)),
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     };
     let forked_info = match forked_info {
@@ -764,11 +814,13 @@ pub(crate) async fn fork_session(
             parent_id: forked_info.parent_id,
             pinned_at: forked_info.pinned_at,
             last_turn: forked_info.last_turn,
+            turn_count: forked_info.turn_count,
+            usage: forked_info.usage,
         },
         capabilities: entry.capabilities,
         turn_in_flight: false,
         inbox_pending: None,
-        approvals_pending: Some(entry.frontend.approvals_pending()),
+        requests_pending: Some(entry.frontend.requests_pending()),
         checklist: Some(entry.agent.cells().checklist.get().items),
     };
     announce_session(
@@ -809,10 +861,10 @@ async fn roll_back_fork(state: &ServerState, forked: Uuid) {
     tag = "sessions",
     params(ListSessionsQuery),
     responses(
-        (status = 200, description = "Page of sessions", body = ListSessionsResponse),
+        (status = 200, description = "Page of sessions; with `q`, the sessions a search found, best first", body = ListSessionsResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 422, description = "The cursor is not one this server issued (`/errors/invalid-body`)", body = ProblemDetail),
+        (status = 422, description = "The cursor is not one this server issued, or was sent beside `q` (`/errors/invalid-body`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:r"]))
@@ -822,9 +874,6 @@ pub(crate) async fn list_sessions(
     _scoped: scope::Scoped<scope::SessionsRead>,
     Query(query): Query<ListSessionsQuery>,
 ) -> Result<Json<ListSessionsResponse>, ProblemDetail> {
-    // At least one: a zero-row page came back with no cursor, which reads as "no sessions" to a
-    // paging client on a store full of them.
-    let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let filter = crate::store::SessionFilter {
         project: query.project,
         include_children: query.include_children.unwrap_or(false),
@@ -837,6 +886,50 @@ pub(crate) async fn list_sessions(
         pinned: query.pinned,
         updated_since: query.updated_since,
     };
+    let words = query.q.filter(|words| !crate::text::is_blank(words));
+    if let Some(words) = words {
+        if query.cursor.is_some() {
+            return Err(ProblemDetail::new(
+                ErrorKind::InvalidBody,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a search answers its best `limit` and has no next page, so it takes no `cursor`",
+            ));
+        }
+        let limit = query.limit.unwrap_or(20).clamp(1, 100);
+        let found = state
+            .shared
+            .store
+            .search_sessions(
+                &words,
+                limit as usize,
+                crate::store::SessionReach::Store(filter),
+            )
+            .await
+            .map_err(|error| {
+                ProblemDetail::internal_sanitized("failed to search sessions", error)
+            })?;
+        let in_memory = state.sessions.read().await;
+        let sessions = found
+            .into_iter()
+            .map(|found| ListedSession {
+                session: listed_session(
+                    &found.session,
+                    in_memory.get(&found.session.id),
+                    state.shared.running_subagents.is_running(found.session.id),
+                ),
+                excerpt: found.excerpt,
+                excerpt_position: found.excerpt_position,
+            })
+            .collect();
+        drop(in_memory);
+        return Ok(Json(ListSessionsResponse {
+            sessions,
+            next_cursor: None,
+        }));
+    }
+    // At least one: a zero-row page came back with no cursor, which reads as "no sessions" to a
+    // paging client on a store full of them.
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let (rows, next_cursor) = state
         .shared
         .store
@@ -856,12 +949,14 @@ pub(crate) async fn list_sessions(
     let in_memory = state.sessions.read().await;
     let sessions = rows
         .iter()
-        .map(|row| {
-            listed_session(
+        .map(|row| ListedSession {
+            session: listed_session(
                 row,
                 in_memory.get(&row.id),
                 state.shared.running_subagents.is_running(row.id),
-            )
+            ),
+            excerpt: None,
+            excerpt_position: None,
         })
         .collect();
     drop(in_memory);
@@ -1020,88 +1115,9 @@ pub(crate) fn listed_session(
         capabilities,
         turn_in_flight,
         inbox_pending: None,
-        approvals_pending: live.map(|entry| entry.frontend.approvals_pending()),
+        requests_pending: live.map(|entry| entry.frontend.requests_pending()),
         checklist: live.map(|entry| entry.agent.cells().checklist.get().items),
     }
-}
-
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub(crate) struct SearchSessionsQuery {
-    /// The words to search for. What was said is searched, not what tools were called with or
-    /// returned; a session whose title holds every word is listed first. Blank finds nothing.
-    pub(crate) q: String,
-    /// How many sessions to answer with at most. Default 20, clamped to 1..100.
-    #[serde(default)]
-    pub(crate) limit: Option<u32>,
-    /// Include sub-agent sessions. Default `false`, like the listing.
-    #[serde(default)]
-    pub(crate) include_children: Option<bool>,
-}
-
-/// A session a search found: the record every listing answers with, plus the words it was found
-/// by.
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct SessionMatchResponse {
-    #[serde(flatten)]
-    pub(crate) session: SessionResponse,
-    /// The line of the best-matching message that holds a query term, whitespace collapsed and
-    /// cut short, marked `(summary)` when taken from a compaction summary. Omitted for a session
-    /// found by its title alone.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) excerpt: Option<String>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct SearchSessionsResponse {
-    pub(crate) sessions: Vec<SessionMatchResponse>,
-}
-
-/// GET /v1/sessions/search: the sessions whose conversations hold the words of `q`, best first.
-#[utoipa::path(
-    get,
-    path = "/v1/sessions/search",
-    tag = "sessions",
-    params(SearchSessionsQuery),
-    responses(
-        (status = 200, description = "Matching sessions, best first, each with the words it was found by", body = SearchSessionsResponse),
-        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
-        (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 500, description = "Internal server error", body = ProblemDetail),
-    ),
-    security(("bearerAuth" = ["sessions:r"]))
-)]
-pub(crate) async fn search_sessions(
-    State(state): State<ServerState>,
-    _scoped: scope::Scoped<scope::SessionsRead>,
-    Query(query): Query<SearchSessionsQuery>,
-) -> Result<Json<SearchSessionsResponse>, ProblemDetail> {
-    let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let found = state
-        .shared
-        .store
-        .search_sessions(
-            &query.q,
-            limit as usize,
-            crate::store::SessionReach::Store {
-                include_children: query.include_children.unwrap_or(false),
-            },
-        )
-        .await
-        .map_err(|error| ProblemDetail::internal_sanitized("failed to search sessions", error))?;
-    let in_memory = state.sessions.read().await;
-    let sessions = found
-        .iter()
-        .map(|found| SessionMatchResponse {
-            session: listed_session(
-                &found.session,
-                in_memory.get(&found.session.id),
-                state.shared.running_subagents.is_running(found.session.id),
-            ),
-            excerpt: found.excerpt.clone(),
-        })
-        .collect();
-    drop(in_memory);
-    Ok(Json(SearchSessionsResponse { sessions }))
 }
 
 /// GET /v1/sessions/{id}: single session metadata.
@@ -1142,7 +1158,7 @@ pub(crate) async fn get_session(
         // A sub-agent is never resident; its parent's run is what makes it busy.
         turn_in_flight: state.shared.running_subagents.is_running(id),
         inbox_pending: None,
-        approvals_pending: None,
+        requests_pending: None,
         checklist: None,
     }))
 }
@@ -1359,11 +1375,13 @@ async fn resident_record(
             parent_id: info.parent_id,
             pinned_at: info.pinned_at,
             last_turn: info.last_turn,
+            turn_count: info.turn_count,
+            usage: info.usage,
         },
         capabilities: entry.capabilities,
         turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
         inbox_pending: Some(inbox_pending),
-        approvals_pending: Some(entry.frontend.approvals_pending()),
+        requests_pending: Some(entry.frontend.requests_pending()),
         checklist: Some(entry.agent.cells().checklist.get().items),
     })
 }
@@ -1412,7 +1430,7 @@ async fn dormant_record(state: &ServerState, id: Uuid) -> Result<SessionResponse
         capabilities: capabilities_from_row(summary.capabilities_json.as_deref()),
         turn_in_flight: false,
         inbox_pending: None,
-        approvals_pending: None,
+        requests_pending: None,
         checklist: None,
     })
 }
@@ -1434,7 +1452,7 @@ async fn dormant_record(state: &ServerState, id: Uuid) -> Result<SessionResponse
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "A turn is in flight and the body names `cwd` or `profile`; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session, so only that process may move it (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 409, description = "A turn is in flight and the body names `working_directory`, `profile` or `project`; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session, so only that process may move it (`/errors/session-locked`)", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, or the id names a sub-agent's conversation, whose permission, cwd and profile come from the terms its parent spawned it with (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -1759,6 +1777,8 @@ pub(crate) async fn patch_session(
             parent_id: info.parent_id,
             pinned_at: info.pinned_at,
             last_turn: info.last_turn,
+            turn_count: info.turn_count,
+            usage: info.usage,
         },
         capabilities: entry.capabilities,
         // The claim this handler holds is the counter's one increment and no turn, and nothing
@@ -1767,7 +1787,7 @@ pub(crate) async fn patch_session(
         turn_in_flight: turn_exclusive.is_none()
             && entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
         inbox_pending: None,
-        approvals_pending: Some(entry.frontend.approvals_pending()),
+        requests_pending: Some(entry.frontend.requests_pending()),
         checklist: Some(entry.agent.cells().checklist.get().items),
     };
     // A `PATCH` that moved nothing is not a change anyone needs to hear of.
@@ -1898,7 +1918,7 @@ pub(crate) async fn delete_session(
     // blocking `read_dir` / `remove_file` on the connection thread; that thread is shared, so the
     // call can queue behind a large `GET /export` or `POST /import`. Held across that, and with
     // tokio's `RwLock` being write-preferring, a single DELETE stalls every reader in the process:
-    // `POST /cancel`, `GET /stream`, the GC scan, the background poller.
+    // `POST /cancel`, `GET /feed`, the GC scan, the background poller.
     //
     // Shortening it is safe because the map lock is not what serializes this against a concurrent
     // re-attach: the removed entry still owns the session's cross-process `FileLock`, and holds it
@@ -1970,7 +1990,7 @@ pub(crate) async fn delete_session(
         // `in_flight`, so DELETE sails past one, and the cascade has just taken the
         // `background_tasks` rows with the session -- which is what makes this the last chance to
         // stop it. Without this the task and its whole process group run on with no row to find
-        // them by, so `DELETE /v1/sessions/{id}/tasks/{task_id}` now 404s and only restarting the
+        // them by, so `DELETE /v1/tasks/{task_id}` now 404s and only restarting the
         // server (which still would not reap the process group) ends it. The screen does the same
         // thing on its way out.
         let signaled = entry.release(state.shared.mcp_manager.as_ref()).await;

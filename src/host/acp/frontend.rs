@@ -745,16 +745,8 @@ impl Frontend for AcpFrontend {
             FrontendEvent::Compacted {
                 id,
                 record,
-                replaced_count,
                 generation,
-            } => compacted_update(
-                &self.client_state,
-                id,
-                &record,
-                replaced_count,
-                generation,
-                true,
-            ),
+            } => compacted_update(&self.client_state, id, &record, generation, true),
             FrontendEvent::CompactionFailed {
                 id,
                 trigger,
@@ -1688,40 +1680,42 @@ pub(super) enum Replayed<'a> {
     Compaction {
         id: String,
         record: &'a crate::conversation::CompactionRecord,
-        replaced_count: usize,
         generation: u64,
     },
 }
 
-/// A log's events as a replay says them: each message, and each boundary as the compaction it
-/// recorded, numbered from `first_generation`. The log is a page of history, which holds no copy
-/// of the turns a compaction kept, so each is said once, where it was first said.
-pub(super) fn replay_entries(
-    events: &[crate::conversation::Event],
+/// A page of the log as a replay says it: each message, and each boundary as the compaction it
+/// recorded, numbered from `first_generation`, by the rules every surface that shows history reads
+/// a row by ([`crate::store::Said`]). The page is history, which holds no copy of the turns a
+/// compaction kept, so each is said once, where it was first said.
+pub(super) fn replay_entries<'a>(
+    rows: &'a [crate::store::LogRow],
+    rewound: &'a [crate::store::Rewound],
     first_generation: u64,
-) -> Vec<Replayed<'_>> {
-    use crate::conversation::Event;
-    let mut entries: Vec<Replayed<'_>> = Vec::new();
+) -> Vec<Replayed<'a>> {
+    use crate::store::Said;
+    let mut entries: Vec<Replayed<'a>> = Vec::new();
     let mut generation = first_generation;
-    for event in events {
-        match event {
-            Event::Append(message) => entries.push(Replayed::Message(message)),
-            Event::CompactBoundary {
-                replaced_count,
-                record,
-                ..
-            } => {
+    for row in rows {
+        let said = row.said(rewound);
+        if let Said::Message(message) = said {
+            entries.push(Replayed::Message(message));
+        }
+        // Every boundary counts, one a rewind took included, as the history numbers them.
+        if matches!(
+            row.event,
+            crate::conversation::Event::CompactBoundary { .. }
+        ) {
+            if let Said::Compaction { record } = said {
                 entries.push(Replayed::Compaction {
                     id: format!("replayed-{generation}"),
                     record,
-                    replaced_count: *replaced_count,
                     generation,
                 });
-                generation += 1;
             }
-            // A repair rewrites rows the log keeps, and the log is what is said.
-            Event::Repair { .. } | Event::Redact { .. } | Event::Unsign => {}
+            generation += 1;
         }
+        // The live run said nothing in an editor about a rewind or a joined prompt.
     }
     entries
 }
@@ -1797,15 +1791,10 @@ pub(super) fn compacted_update(
     client_state: &SharedClientState,
     id: String,
     record: &crate::conversation::CompactionRecord,
-    replaced_count: usize,
     generation: u64,
     announced: bool,
 ) -> SessionUpdate {
-    let facts = serde_json::json!(crate::view::CompactionView::new(
-        record,
-        replaced_count,
-        generation
-    ));
+    let facts = serde_json::json!(crate::view::CompactionView::new(record, generation));
     // An empty summary would leave an entry that opens onto nothing.
     let summary =
         (!crate::text::is_blank(&record.written_summary)).then(|| record.written_summary.clone());
@@ -1961,20 +1950,12 @@ pub(super) fn replay_session_updates(
             Replayed::Compaction {
                 id,
                 record,
-                replaced_count,
                 generation,
             } => {
                 send_session_update(
                     connection,
                     session_id,
-                    compacted_update(
-                        client_state,
-                        id.clone(),
-                        record,
-                        *replaced_count,
-                        *generation,
-                        false,
-                    ),
+                    compacted_update(client_state, id.clone(), record, *generation, false),
                 );
                 for call in checkpoint_calls(id, &record.checkpoint, cwd) {
                     send_session_update(connection, session_id, SessionUpdate::ToolCall(call));

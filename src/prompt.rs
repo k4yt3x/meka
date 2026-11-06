@@ -4139,7 +4139,7 @@ mod tests {
     /// appearing between two turns is around 85k tokens on a single line, in the section whose
     /// full index render is held to 8 KB.
     ///
-    /// Reachable without anything exotic: a restore loop through `PUT /v1/memory`, a
+    /// Reachable without anything exotic: a restore loop through `PUT /v1/memories/{name}`, a
     /// `meka memory` sweep from a second terminal, or `shell_execute` (which gates at `read`)
     /// shelling out to one.
     #[test]

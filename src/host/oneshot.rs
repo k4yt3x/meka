@@ -123,17 +123,10 @@ fn assemble_report(
             }
             FrontendEvent::Notice(notice) => notices.push(notice.into()),
             FrontendEvent::Compacted {
-                record,
-                replaced_count,
-                generation,
-                ..
+                record, generation, ..
             } => {
                 round_boundary = true;
-                compactions.push(crate::view::CompactionView::new(
-                    &record,
-                    replaced_count,
-                    generation,
-                ));
+                compactions.push(crate::view::CompactionView::new(&record, generation));
             }
             _ => {}
         }
@@ -591,7 +584,6 @@ mod tests {
                         written_summary: String::new(),
                         checkpoint: Vec::new(),
                     },
-                    replaced_count: 4,
                     generation: 1,
                 },
                 FrontendEvent::AssistantTextDelta("Missing.".to_string()),
@@ -624,7 +616,6 @@ mod tests {
         assert_eq!(report.compactions.len(), 1);
         assert_eq!(report.compactions[0].trigger, "requested");
         assert_eq!(report.compactions[0].memories_written, vec!["notes"]);
-        assert_eq!(report.compactions[0].replaced_count, 4);
     }
 
     /// A report for a turn that never got a session leaves `session_id` out rather than sending

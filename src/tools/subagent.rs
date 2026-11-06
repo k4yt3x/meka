@@ -1263,26 +1263,24 @@ impl Tool for AgentListTool {
         // cannot follow up on.
         let mut lines = Vec::new();
         for row in rows.iter().filter(|row| row.parent_id == Some(session_id)) {
-            // Tool results are persisted as user-role messages too (`Agent::run_turn` wraps them in
-            // one), so counting every user message would report a single task that took four tool
-            // rounds as five turns. A turn is a user message that opens one, by
-            // `Message::opens_turn`: a steer that rides a round's results is part of that round.
-            let turns = self
+            // A turn is a row of `turns`, the count the session's record carries: a task through
+            // several tool rounds, or a prompt the turn took back to join a message to it, is one.
+            let turns = match self
                 .tool_builder_params
                 .materials
                 .store
-                .load_history(row.id)
+                .session_info(row.id)
                 .await
-                .map(|events| {
-                    events
-                        .iter()
-                        .filter(|event| match event {
-                            crate::conversation::Event::Append(message) => message.opens_turn(),
-                            _ => false,
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
+            {
+                Ok(session) => session.map_or(0, |session| session.turn_count),
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to count the turns of sub-agent {id}: {error}",
+                        id = row.id
+                    );
+                    0
+                }
+            };
             lines.push(format!(
                 "{}\t{}\tturns={}\tlast_active={}",
                 row.id,
@@ -4902,11 +4900,11 @@ mod tests {
             .expect("delete succeeds once the worker is free");
     }
 
-    /// `turns` counts tasks, not messages. `Agent::run_turn` persists tool results as user-role
-    /// messages, so a single task that took three tool rounds must still read as one turn, and a
-    /// steer that landed beside one round's results is part of that round rather than a turn.
+    /// `turns` counts the sub-agent's turn rows, not its messages: a single task that took three
+    /// tool rounds, with a steer beside one round's results and its prompt taken back to join a
+    /// message to it, reads as one turn.
     #[tokio::test]
-    async fn agent_list_turns_excludes_tool_result_messages() {
+    async fn agent_list_turns_counts_turn_rows_not_messages() {
         use crate::conversation::{ContentBlock, Event, Message, Role, ToolResultContent};
 
         let store = store_for_test().await;
@@ -4954,15 +4952,46 @@ mod tests {
                 },
             ],
         });
+        let turn = uuid::Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(
+                child,
+                turn,
+                crate::store::turns::TurnSource::Parent,
+                crate::permission::Permission::Read,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+            .expect("the turn's row");
+        let joined = Event::Append(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "the one and only task".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "and one thing more".to_string(),
+                },
+            ],
+        });
         for event in [
             Event::Append(Message::user("the one and only task")),
+            Event::Repair {
+                replaced_count: 1,
+                messages: Vec::new(),
+            },
+            joined,
             Event::Append(Message::assistant_text("working")),
             tool_result,
             Event::Append(Message::assistant_text("still working")),
             steered,
             Event::Append(Message::assistant_text("done")),
         ] {
-            store.save_event(child, &event, None).await.expect("save");
+            store
+                .save_event(child, &event, Some(turn))
+                .await
+                .expect("save");
         }
 
         let list = AgentListTool {

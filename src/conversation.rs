@@ -336,8 +336,7 @@ pub(crate) enum Event {
     /// `messages` therefore means "drop them", which is what [`Conversation::rewind`] emits.
     ///
     /// Position-relative rather than index-addressed, deliberately: like
-    /// [`Self::CompactBoundary`] it replays correctly no matter what precedes it, so
-    /// [`Conversation::sanitize_orphans`] removing an earlier event can't silently retarget it.
+    /// [`Self::CompactBoundary`] it replays correctly no matter what precedes it.
     /// The corollary is an invariant on producers: emit it only while the messages it replaces are
     /// still the trailing materialized entries.
     Repair {
@@ -384,6 +383,9 @@ pub(crate) struct Conversation {
     /// The checklist the boundary whose summary heads the view recorded, when one does; see
     /// [`Self::checklist_baseline`]. Kept in lockstep with `materialized` by the same rebuild.
     baseline_checklist: Option<crate::checklist::ChecklistState>,
+    /// Whether a compaction's summary heads the view, as it does from the boundary until a rewind
+    /// before it. Kept in lockstep with `materialized` by the same rebuild.
+    summary_heads: bool,
     /// Images replaced since the last full rebuild, for
     /// [`Conversation::invalid_images_replaced`].
     invalid_images_replaced: usize,
@@ -644,9 +646,9 @@ impl Conversation {
     ///
     /// The counterpart to [`Self::pop_repair`], and it exists for the same reason: compaction
     /// rewrites the in-memory conversation *before* it persists, so a failed write would otherwise
-    /// leave the model reasoning from a summary the database has never heard of, while
-    /// `GET /messages` still serves the full history with `revision` unmoved. The caller was told
-    /// the compaction failed, so the two must agree that it did.
+    /// leave the model reasoning from a summary the database has never heard of, while the store
+    /// still holds the full context. The caller was told the compaction failed, so the two must
+    /// agree that it did.
     ///
     /// Only correct while the caller still holds the lock it compacted under, and before
     /// [`Self::prune_compacted_events`] has dropped the superseded events: this truncates back to
@@ -731,25 +733,38 @@ impl Conversation {
     /// empty replacement. Returns the event to persist, or `None` when there is nothing to drop.
     ///
     /// The cut snaps to a message that opens a turn (a `User` message carrying no `tool_result`),
-    /// so a `tool_use` is never separated from its `tool_result`; the rounds a compaction keeps
-    /// from inside a turn open no turn, so a rewind past them takes the summary before them
-    /// too. A compaction summary is a plain `User` message and so counts as one such
-    /// boundary: rewinding far enough past a compaction discards the summary too, which is right
-    /// (it stands in for the turns before it) but means a big `turns` can empty a compacted session
-    /// faster than the turn count suggests.
+    /// so a `tool_use` is never separated from its `tool_result`. A summary heading the view is
+    /// no turn and is never taken: it stands for the turns before it, which no rewind gives
+    /// back, so taking it would only empty the context, and `POST /rewind` refuses those turns
+    /// for the same reason. The rounds after it that open no turn are the rest of the turn the
+    /// compaction cut into, and count as that turn.
     pub(crate) fn rewind(&mut self, turns: usize) -> Option<Event> {
         if turns == 0 {
             return None;
         }
+        let first = usize::from(self.summary_heads);
         let cut = self
             .materialized
             .iter()
             .enumerate()
-            .filter(|(_, message)| opens_turn(message))
+            .skip(first)
+            .filter(|(index, message)| {
+                (self.summary_heads && *index == first) || opens_turn(message)
+            })
             .map(|(index, _)| index)
             .nth_back(turns - 1)?;
         let replaced_count = self.materialized.len() - cut;
         Some(self.replace_tail(replaced_count, Vec::new()))
+    }
+
+    /// Drop the last `count` messages, as one [`Event::Repair`] that puts nothing back: a rewind
+    /// whose cut its caller has placed, as the HTTP door places it before a named turn. `None`
+    /// when `count` is zero or more than the view holds.
+    pub(crate) fn rewind_messages(&mut self, count: usize) -> Option<Event> {
+        if count == 0 || count > self.materialized.len() {
+            return None;
+        }
+        Some(self.replace_tail(count, Vec::new()))
     }
 
     /// Drop every event preceding the most recent `CompactBoundary`.
@@ -784,28 +799,34 @@ impl Conversation {
     /// Used at session resume to repair the log after a crash mid-tool-call (the Anthropic API
     /// rejects orphaned `tool_use` blocks).
     ///
-    /// Removes the corresponding `Event::Append` entries from the event log so future
-    /// re-materializations stay clean. `Event::CompactBoundary` events are never touched (their
-    /// synthetic summary is a plain user message that can't be orphaned).
+    /// The drop is one [`Event::Repair`] of the view's tail, from the message before the first
+    /// orphan, putting back everything but the orphans, so it is the log's last event and a caller
+    /// with a store saves it: the store's replay then holds the view this does, and a count taken
+    /// on either is the count on both. Starting a message early means it puts that message back,
+    /// a view opening on a user message, a prompt or a summary, so it never reads as a rewind.
+    /// `Event::CompactBoundary` events are never touched (their synthetic summary is a plain user
+    /// message that can't be orphaned).
     pub(crate) fn sanitize_orphans(&mut self) -> Vec<Message> {
-        let dropped_indices = orphan_event_indices(&self.events);
-        if dropped_indices.is_empty() {
+        let Replayed { placed, .. } = replay(self.events.iter());
+        let orphans = orphan_positions(&placed);
+        let Some(&first) = orphans.first() else {
             return Vec::new();
-        }
-
-        let mut dropped = Vec::with_capacity(dropped_indices.len());
-        // Highest index first, so each removal leaves the earlier indices valid; `remove` keeps
-        // the log's order, and the reverse below restores the dropped messages' own.
-        let mut to_remove = dropped_indices;
-        to_remove.sort_unstable_by(|a, b| b.cmp(a));
-        for index in to_remove {
-            if let Event::Append(message) = self.events.remove(index) {
-                dropped.push(message);
-            }
-        }
-        dropped.reverse();
-        self.rebuild_materialized();
+        };
+        let start = first.saturating_sub(1);
+        let (dropped, kept): (Vec<_>, Vec<_>) = placed
+            .into_iter()
+            .enumerate()
+            .skip(start)
+            .partition(|(position, _)| orphans.contains(position));
+        let replaced_count = dropped.len() + kept.len();
+        self.replace_tail(
+            replaced_count,
+            kept.into_iter().map(|(_, placed)| placed.message).collect(),
+        );
         dropped
+            .into_iter()
+            .map(|(_, placed)| placed.message)
+            .collect()
     }
 
     /// How many images have been replaced because their bytes disagreed with their declared
@@ -819,6 +840,10 @@ impl Conversation {
 
     fn rebuild_materialized(&mut self) {
         let Replayed { placed, .. } = replay(self.events.iter());
+        self.summary_heads = matches!(
+            placed.first().map(|placed| placed.source),
+            Some(Source::Boundary(_))
+        );
         self.baseline_checklist = match placed.first().map(|placed| placed.source) {
             Some(Source::Boundary(index)) => match self.events.get(index) {
                 Some(Event::CompactBoundary {
@@ -852,7 +877,8 @@ impl Conversation {
     }
 }
 
-/// The event a materialized message came from.
+/// The event whose row a materialized message is shown as: the one that placed it, or for a
+/// message a repair rewrote in place, the one that placed what it rewrote.
 #[derive(Debug, Clone, Copy)]
 enum Source {
     Append(usize),
@@ -892,11 +918,13 @@ pub(crate) struct Rewind<Stamp> {
     pub(crate) rejoined: bool,
 }
 
-/// A replay of the log: the view, its rewrite count, and its rewinds by event index.
+/// A replay of the log: the view and its rewinds by event index.
 struct Replayed {
     placed: Vec<Placed>,
-    revision: u64,
     rewinds: Vec<Rewind<usize>>,
+    /// Whether every repair found the messages it replaces: false once one reached past the first
+    /// event, as one does whose earlier rows a turn sweep took.
+    whole: bool,
 }
 
 /// Which compaction a summary stands for, as a view of the log reports it.
@@ -910,8 +938,28 @@ pub(crate) struct CompactionMarker {
     pub(crate) record: CompactionRecord,
 }
 
-/// Replay `events` into the messages the model sees, with each one's origin, the count of
-/// rewrites (boundaries and repairs) the log has been through, and what each rewind dropped.
+/// Where in `removed` each of `messages` stands, when `messages` is `removed` with one or more
+/// messages left out and nothing else changed; `None` otherwise.
+fn kept_in_order(removed: &[Placed], messages: &[Message]) -> Option<Vec<usize>> {
+    if messages.is_empty() || messages.len() >= removed.len() {
+        return None;
+    }
+    let mut kept = Vec::with_capacity(messages.len());
+    let mut from = 0;
+    for message in messages {
+        let index = from
+            + removed
+                .get(from..)?
+                .iter()
+                .position(|placed| &placed.message == message)?;
+        kept.push(index);
+        from = index + 1;
+    }
+    Some(kept)
+}
+
+/// Replay `events` into the messages the model sees, with each one's origin, and what each rewind
+/// dropped.
 ///
 /// The one statement of the rules. A boundary replaces everything before it: its producer,
 /// [`Conversation::replace_for_compaction`], records the whole view as `replaced_count`, but that
@@ -922,8 +970,8 @@ pub(crate) struct CompactionMarker {
 fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
     let mut placed: Vec<Placed> = Vec::new();
     let mut generation: u64 = 0;
-    let mut revision: u64 = 0;
     let mut rewinds: Vec<Rewind<usize>> = Vec::new();
+    let mut whole = true;
     // The one message the last repair took, while the next event may bring it back joined.
     let mut taken: Option<Placed> = None;
     for (index, event) in events.enumerate() {
@@ -967,7 +1015,6 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
                 record,
                 ..
             } => {
-                revision = revision.saturating_add(1);
                 generation = generation.saturating_add(1);
                 let origin = placed.first().map_or(index, |first| first.origin);
                 placed.clear();
@@ -986,7 +1033,7 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
                 replaced_count,
                 messages,
             } => {
-                revision = revision.saturating_add(1);
+                whole &= *replaced_count <= placed.len();
                 let truncate_to = placed.len().saturating_sub(*replaced_count);
                 // A repair that rewrites the whole view and puts something back has rewritten the
                 // summary heading it, not removed it: the first message it places is that summary
@@ -1014,15 +1061,34 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
                         taken = removed.pop();
                     }
                 }
+                // A replacement that is what it replaced with messages left out keeps the rest as
+                // they were placed, each still the row it was said in: the orphan drop on resume
+                // writes one, and the turns after an orphan stay theirs.
+                if let Some(kept) = kept_in_order(&removed, messages) {
+                    let mut removed: Vec<Option<Placed>> = removed.into_iter().map(Some).collect();
+                    placed.extend(
+                        kept.into_iter()
+                            .filter_map(|index| removed.get_mut(index).and_then(Option::take)),
+                    );
+                    continue;
+                }
                 // A replacement of the same length stands for what it replaced position by
-                // position; one of another length, for the whole run.
+                // position, and is shown as the row it rewrote, as a redacted message is; one of
+                // another length stands for the whole run and is the repair's own.
+                let same_length = removed.len() == messages.len();
                 let origin = |position: usize| {
-                    let replaced = if removed.len() == messages.len() {
+                    let replaced = if same_length {
                         removed.get(position)
                     } else {
                         removed.first()
                     };
                     replaced.map_or(index, |replaced| replaced.origin)
+                };
+                let source = |position: usize| {
+                    removed
+                        .get(position)
+                        .filter(|_| same_length)
+                        .map_or(Source::Repair(index), |replaced| replaced.source)
                 };
                 placed.extend(messages.iter().enumerate().map(|(position, message)| {
                     match (position, &heading_boundary) {
@@ -1034,7 +1100,7 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
                         },
                         _ => Placed {
                             message: message.clone(),
-                            source: Source::Repair(index),
+                            source: source(position),
                             origin: origin(position),
                             marker: None,
                         },
@@ -1042,7 +1108,6 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
                 }));
             }
             Event::Redact { images } => {
-                revision = revision.saturating_add(1);
                 for image in images {
                     let Some(at) = placed.len().checked_sub(image.from_end) else {
                         continue;
@@ -1053,7 +1118,6 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
                 }
             }
             Event::Unsign => {
-                revision = revision.saturating_add(1);
                 for placed in &mut placed {
                     if let Some(without) = placed.message.without_claude_thinking() {
                         placed.message = without;
@@ -1064,8 +1128,8 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
     }
     Replayed {
         placed,
-        revision,
         rewinds,
+        whole,
     }
 }
 
@@ -1115,19 +1179,20 @@ pub(crate) struct AnnotatedView<Stamp> {
     /// Each message's stamp: whatever the caller stored beside the event that placed it.
     pub(crate) stamps: Vec<Stamp>,
     pub(crate) markers: Vec<Option<CompactionMarker>>,
-    /// How many times the log was rewritten: every boundary and every repair.
-    pub(crate) revision: u64,
+    /// Whether the events held everything their repairs replace. A view below a boundary loses
+    /// that once a turn sweep takes rows a repair rewrote, and is then no view anything saw.
+    pub(crate) whole: bool,
 }
 
-/// What `GET /v1/sessions/{id}/messages` serves: the same view the model gets, by the same rules,
-/// with each message stamped from the row that produced it. A summary takes its boundary's time
-/// and a repair's replacements take the repair's, because that is when the content came to be.
+/// What `GET /v1/sessions/{id}/context/messages` serves: the same view the model gets, by the same
+/// rules, with each message stamped from the row it is shown as. A summary takes its boundary's
+/// stamp. A message rewritten in place, by a redaction or by a repair of the same length, keeps the
+/// stamp of the row that said it, since it is still that message, and so does one a repair kept as
+/// it was; one a repair of another length put in place of others takes the repair's.
 pub(crate) fn materialize_annotated<Stamp: Clone>(
     events: &[(Stamp, Event)],
 ) -> AnnotatedView<Stamp> {
-    let Replayed {
-        placed, revision, ..
-    } = replay(events.iter().map(|(_, event)| event));
+    let Replayed { placed, whole, .. } = replay(events.iter().map(|(_, event)| event));
     let mut messages = Vec::with_capacity(placed.len());
     let mut stamps = Vec::with_capacity(placed.len());
     let mut markers = Vec::with_capacity(placed.len());
@@ -1147,7 +1212,7 @@ pub(crate) fn materialize_annotated<Stamp: Clone>(
         messages,
         stamps,
         markers,
-        revision,
+        whole,
     }
 }
 
@@ -1318,37 +1383,18 @@ impl<'a> IntoIterator for &'a Conversation {
     }
 }
 
-/// Walk the event log and return the indices of `Event::Append` entries that carry orphaned
-/// assistant `tool_use` blocks (i.e. no matching `tool_result` in the next materialized message).
-/// The check uses the *materialized* view so a `CompactBoundary` between an orphan and its would-be
-/// result correctly counts as orphaned.
-fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
-    // `(event_index, &Message)` pairs in materialization order, so the adjacency scan can report
-    // event indices rather than materialized ones. An `Append` a `CompactBoundary` truncated
-    // away is not visited, since the materialized view never sees that orphan.
-    //
-    // The index is `None` for messages that don't come from an `Append` event (a repair's
-    // replacement). They still take part in the adjacency scan, since a `tool_result` inside one
-    // answers the `tool_use` before it, but they can't be removed.
-    let Replayed { placed, .. } = replay(events.iter());
-    let pairs: Vec<(Option<usize>, &Message)> = placed
-        .iter()
-        .map(|placed| {
-            (
-                match placed.source {
-                    Source::Append(index) => Some(index),
-                    Source::Boundary(_) | Source::Repair(_) => None,
-                },
-                &placed.message,
-            )
-        })
-        .collect();
-
+/// The positions in `placed`, a replay's view, of the assistant messages whose `tool_use` blocks
+/// the next message does not answer. The check uses the *materialized* view so a
+/// `CompactBoundary` between an orphan and its would-be result correctly counts as orphaned. A
+/// message a repair placed takes part in the adjacency scan, since a `tool_result` inside one
+/// answers the `tool_use` before it, but only one an `Append` placed is reported.
+fn orphan_positions(placed: &[Placed]) -> Vec<usize> {
     let mut orphan = Vec::new();
-    for (window_index, pair) in pairs.iter().enumerate() {
-        let &(Some(event_index), message) = pair else {
+    for (position, current) in placed.iter().enumerate() {
+        if !matches!(current.source, Source::Append(_)) {
             continue;
-        };
+        }
+        let message = &current.message;
         if message.role != Role::Assistant {
             continue;
         }
@@ -1366,8 +1412,7 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
         if tool_use_ids.is_empty() {
             continue;
         }
-
-        let next = pairs.get(window_index + 1).map(|(_, m)| *m);
+        let next = placed.get(position + 1).map(|placed| &placed.message);
         let has_results = next.is_some_and(|next_message| {
             next_message.role == Role::User
                 && tool_use_ids.iter().all(|id| {
@@ -1376,9 +1421,8 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
                     })
                 })
         });
-
         if !has_results {
-            orphan.push(event_index);
+            orphan.push(position);
         }
     }
     orphan
@@ -2577,8 +2621,8 @@ pub(crate) fn format_session_as_markdown(
             }
             // Same treatment as a boundary: mark what happened and render the replacement, leaving
             // the superseded messages above it. An export is the record of the session, and a
-            // repair (or a rewind, which is a repair with nothing to put back) is the one place
-            // where what the model saw and what actually happened diverge.
+            // repair (a rewind, a degraded retry, a dropped call a crash cut, a prompt taken back)
+            // is the one place where what the model saw and what actually happened diverge.
             Event::Repair {
                 replaced_count,
                 messages,
@@ -2587,7 +2631,7 @@ pub(crate) fn format_session_as_markdown(
                 writeln!(output, "<details>").ok();
                 writeln!(
                     output,
-                    "<summary>{} message(s) above replaced with {} (rejected by the provider, or rewound)</summary>\n",
+                    "<summary>{} message(s) above replaced with {}</summary>\n",
                     replaced_count,
                     if messages.is_empty() {
                         "nothing".to_string()
@@ -3919,7 +3963,7 @@ mod tests {
         assert_eq!(view[0].text_content(), "turn one");
         assert_eq!(view[1].text_content(), "answer one");
         assert!(
-            orphan_event_indices(log.events()).is_empty(),
+            orphan_positions(&replay(log.events().iter()).placed).is_empty(),
             "the cut must not separate a tool_use from its tool_result"
         );
     }
@@ -3976,13 +4020,62 @@ mod tests {
         assert_eq!(view[1].text_content(), "answer one");
     }
 
+    /// A summary heading the view is no turn and is never taken: a rewind past every turn after
+    /// it answers nothing to drop rather than emptying the context. The rounds a compaction kept
+    /// from inside a turn are the rest of that turn and count as one.
+    #[test]
+    fn a_rewind_never_takes_the_summary_heading_the_view() {
+        let compacted = |after: Vec<Message>| {
+            Conversation::from_events(
+                [
+                    Event::Append(Message::user("old turn")),
+                    Event::CompactBoundary {
+                        summary: Message::user("summary"),
+                        replaced_count: 1,
+                        record: CompactionRecord::for_test(),
+                        loaded_tools_snapshot: Default::default(),
+                        checklist_snapshot: Default::default(),
+                    },
+                ]
+                .into_iter()
+                .chain(after.into_iter().map(Event::Append))
+                .collect(),
+            )
+        };
+        let texts = |log: &Conversation| -> Vec<String> {
+            log.as_slice().iter().map(Message::text_content).collect()
+        };
+
+        assert!(compacted(Vec::new()).rewind(1).is_none());
+
+        let mut log = compacted(vec![
+            Message::user("new turn"),
+            Message::assistant_text("new answer"),
+        ]);
+        assert!(log.rewind(2).is_none(), "one turn follows the summary");
+        assert!(log.rewind(1).is_some());
+        assert_eq!(texts(&log), ["summary"]);
+        assert!(log.rewind(1).is_none());
+
+        let mut log = compacted(vec![
+            assistant_with_tool_use("call_1"),
+            user_with_tool_result("call_1"),
+            Message::assistant_text("kept answer"),
+            Message::user("new turn"),
+            Message::assistant_text("new answer"),
+        ]);
+        assert!(log.rewind(3).is_none());
+        assert!(log.rewind(2).is_some(), "the kept rounds count as a turn");
+        assert_eq!(texts(&log), ["summary"]);
+    }
+
     /// A repair that puts nothing back spans the events from the earliest one a dropped message
     /// stood for to its own. A repair's replacement stands for the message it replaced, position
     /// by position, so a cut at the second of them leaves the first's event out. A summary stands
-    /// for everything it replaced, so a rewind that takes it takes the turns before it too, and
-    /// counts as a turn, as the rewind counted it. A prompt taken back and appended again with a
-    /// message joined to it is marked as such, and stands for the prompt it took the place of; a
-    /// summary taken back so spans the repair alone, the turns before it staying where they are.
+    /// for everything it replaced, so a repair that takes it takes the turns before it too, and
+    /// counts it as a turn. A prompt taken back and appended again with a message joined to it is
+    /// marked as such, and stands for the prompt it took the place of; a summary taken back so
+    /// spans the repair alone, the turns before it staying where they are.
     #[test]
     fn a_rewind_spans_the_events_its_dropped_messages_stood_for() {
         let stamped = |log: &Conversation| -> Vec<(usize, Event)> {
@@ -4022,7 +4115,7 @@ mod tests {
             Event::Append(Message::user("new turn")),
             Event::Append(Message::assistant_text("new answer")),
         ]);
-        assert!(compacted.rewind(2).is_some());
+        compacted.replace_tail(3, Vec::new());
         assert_eq!(rewinds(&stamped(&compacted)), vec![rewind(0, 4, 2, false)]);
 
         let mut joined = Conversation::new();

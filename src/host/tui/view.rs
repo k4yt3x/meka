@@ -3741,7 +3741,6 @@ mod tests {
         transcript.apply(FrontendEvent::Compacted {
             id: "c1".into(),
             record,
-            replaced_count: 3,
             generation: 1,
         });
         let mut viewport = Viewport::new();
@@ -3858,7 +3857,6 @@ mod tests {
                 trigger: CompactionTrigger::Manual,
                 ..CompactionRecord::for_test()
             },
-            replaced_count: 3,
             generation: 1,
         });
         assert!(
@@ -4771,6 +4769,8 @@ mod tests {
                 .enumerate()
                 .map(|(offset, text)| LogRow {
                     turn_id: None,
+                    created_at: String::new(),
+                    said: None,
                     id: first + offset as i64,
                     event: Event::Append(Message {
                         role: Role::Assistant,

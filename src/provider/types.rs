@@ -85,7 +85,7 @@ pub(crate) struct AccountIdentity {
 /// providers report very different amounts: Codex is rich (lifetime/daily/streaks), Claude offers
 /// only a first-used date.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct UsageHistory {
+pub(crate) struct UsageStats {
     pub(crate) lifetime_tokens: Option<i64>,
     pub(crate) peak_daily_tokens: Option<i64>,
     pub(crate) current_streak_days: Option<i64>,
@@ -95,7 +95,7 @@ pub(crate) struct UsageHistory {
     /// Per-day token counts, in the order the provider returned them.
     pub(crate) daily: Vec<DailyUsage>,
 }
-/// One day's token count in [`UsageHistory::daily`].
+/// One day's token count in [`UsageStats::daily`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct DailyUsage {
     pub(crate) date: String,
@@ -296,18 +296,10 @@ pub(crate) enum StopReason {
     Unknown(String),
 }
 
-/// Whether a request keeps the profile's thinking setting or turns it off for this one call. A
-/// request can only turn thinking *off*: nothing resurrects a mode the profile disabled.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ThinkingOverride {
-    #[default]
-    Inherit,
-    Off,
-}
-
-/// One completion, as every backend receives it: the prompt, the conversation, the tools on offer,
-/// and the per-call thinking override. Borrowed, because the redact-and-retry loop re-invokes a
-/// body builder over a substituted message slice and nothing else changes.
+/// One completion, as every backend receives it: the prompt, the conversation and the tools on
+/// offer, under the profile's thinking setting, which no request overrides. Borrowed, because the
+/// redact-and-retry loop re-invokes a body builder over a substituted message slice and nothing
+/// else changes.
 #[derive(Clone, Debug)]
 pub(crate) struct CompletionRequest<'a> {
     pub(crate) system_prompt: &'a str,
@@ -316,7 +308,6 @@ pub(crate) struct CompletionRequest<'a> {
     /// The deferred tools a declaring wire lists beside `tools` with `defer_loading`; empty on a
     /// wire that appends, and on every request that carries no deferred tool.
     pub(crate) deferred_tools: &'a [ToolDefinition],
-    pub(crate) thinking: ThinkingOverride,
     /// Who the request is for; see [`crate::provider::Attribution`].
     pub(crate) attribution: crate::provider::Attribution,
 }
@@ -332,7 +323,6 @@ impl<'a> CompletionRequest<'a> {
             messages,
             tools,
             deferred_tools: &[],
-            thinking: ThinkingOverride::Inherit,
             attribution: crate::provider::Attribution::default(),
         }
     }
@@ -347,14 +337,5 @@ impl<'a> CompletionRequest<'a> {
     pub(crate) fn attributed(mut self, attribution: crate::provider::Attribution) -> Self {
         self.attribution = attribution;
         self
-    }
-
-    /// The same request with thinking turned off, for a call whose answer is not worth reasoning
-    /// over: the compaction summary.
-    pub(crate) fn without_thinking(self) -> Self {
-        Self {
-            thinking: ThinkingOverride::Off,
-            ..self
-        }
     }
 }

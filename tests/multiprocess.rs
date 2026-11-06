@@ -729,7 +729,8 @@ fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
 /// The store is rewound to the shape a 0.42 release left, stamp included, so both processes find
 /// work waiting rather than racing over nothing. The rewind covers what the replay reads by name:
 /// the `provider_credentials` view, without which an unversioned store is classified past every
-/// step this test races, and the `messages` and `blobs` columns the frozen 0.46 conversions name.
+/// step this test races, the `messages` and `blobs` columns the frozen 0.46 conversions name, and
+/// the recall table under the name the frozen 0.46 step creates it by.
 #[test]
 fn two_processes_migrating_one_store_apply_it_once() {
     let cluster = Cluster::new("");
@@ -746,6 +747,7 @@ fn two_processes_migrating_one_store_apply_it_once() {
                  ALTER TABLE scheduled_jobs ADD COLUMN gate_fire TEXT;
                  ALTER TABLE messages RENAME COLUMN kind TO role;
                  ALTER TABLE blobs RENAME COLUMN size_bytes TO size;
+                 ALTER TABLE recall_entries RENAME TO prompt_history;
                  CREATE VIEW provider_credentials AS
                      SELECT account AS profile, credentials_json, updated_at
                      FROM account_credentials;

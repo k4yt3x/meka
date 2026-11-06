@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 21;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 22;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -167,6 +167,13 @@ pub(crate) struct ExportedEvent {
     /// For a copy a compaction kept, the position among the session's `events` of the one it
     /// copies, always an earlier one: history shows that one and the model reads this.
     pub(crate) copy_of: Option<usize>,
+    /// For a copy a compaction kept, the turn that said it, one of the session's `turns`; absent
+    /// for one said before turns were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) said_turn_id: Option<String>,
+    /// For a copy a compaction kept, when it was said; absent on every other event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) said_at: Option<String>,
 }
 /// A turn as its row records it: the stored names (`status`, `error_type`) rather than the API's
 /// spellings, so an import writes the row back as it was.
@@ -234,6 +241,12 @@ pub(crate) async fn build_session_export(
                 copy_of: stamp
                     .copy_of
                     .and_then(|original| positions.get(&original).copied()),
+                said_turn_id: stamp
+                    .said
+                    .as_ref()
+                    .and_then(|said| said.turn_id)
+                    .map(|id| id.to_string()),
+                said_at: stamp.said.map(|said| said.created_at),
             })
             .collect();
         let turns: Vec<ExportedTurn> = store
@@ -361,6 +374,9 @@ pub(crate) fn plan_import(
         }
         for event in &mut session.events {
             utc_rfc3339(&id, "an event's `at`", &mut event.at)?;
+            if let Some(said_at) = event.said_at.as_mut() {
+                utc_rfc3339(&id, "an event's `said_at`", said_at)?;
+            }
         }
     }
 
@@ -507,22 +523,108 @@ pub(crate) fn plan_import(
             );
             turns.push(turn);
         }
-        let mut events = Vec::with_capacity(session.events.len());
+        let mut events: Vec<crate::store::ImportedEvent> = Vec::with_capacity(session.events.len());
+        // What the view the latest compaction replaced showed of each message row it held, by the
+        // row's position: what a copy of that row may hold, whatever the view rewrote on the way.
+        // `None` when that view cannot be replayed, a turn sweep having taken rows a repair in it
+        // rewrote: a copy then stands for any message row the view was built from.
+        let mut shown_before_boundary: Option<
+            std::collections::HashSet<(usize, (String, String))>,
+        > = Some(std::collections::HashSet::new());
+        let mut replaced = 0..0;
+        let mut since_boundary = 0;
         for event in session.events {
-            let turn = match event.turn_id {
-                Some(old) => Some(turn_ids.get(&old).copied().ok_or_else(|| {
-                    crate::error::MekaError::Usage(format!(
-                        "session {} in the archive has an event naming turn '{old}', which the \
-                         archive does not carry",
-                        session.id
-                    ))
-                })?),
-                None => None,
+            if matches!(
+                event.event,
+                crate::conversation::Event::CompactBoundary { .. }
+            ) {
+                let window: Vec<(usize, crate::conversation::Event)> = events
+                    .iter()
+                    .enumerate()
+                    .skip(since_boundary)
+                    .map(|(position, earlier)| (position, earlier.event.clone()))
+                    .collect();
+                let view = crate::conversation::materialize_annotated(&window);
+                replaced = since_boundary..events.len();
+                shown_before_boundary = view.whole.then(|| {
+                    view.messages
+                        .iter()
+                        .zip(&view.stamps)
+                        .filter(|(_, position)| {
+                            matches!(
+                                events.get(**position).map(|earlier| &earlier.event),
+                                Some(crate::conversation::Event::Append(_))
+                            )
+                        })
+                        .filter_map(|(message, position)| {
+                            match super::sessions::encode_message_for_db(message) {
+                                Ok(held) => Some((*position, held)),
+                                Err(_) => None,
+                            }
+                        })
+                        .collect()
+                });
+                since_boundary = events.len();
+            }
+            let carried = |turn: Option<String>| -> crate::error::Result<Option<uuid::Uuid>> {
+                match turn {
+                    Some(old) => Ok(Some(turn_ids.get(&old).copied().ok_or_else(|| {
+                        crate::error::MekaError::Usage(format!(
+                            "session {} in the archive has an event naming turn '{old}', which \
+                             the archive does not carry",
+                            session.id
+                        ))
+                    })?)),
+                    None => Ok(None),
+                }
             };
-            // A link hides the copy from every history, so it is taken only in the one shape a
-            // compaction writes: a message repeating an earlier one, word for word, below a
+            let turn = carried(event.turn_id)?;
+            let said = match (event.said_turn_id, event.said_at) {
+                (turn, Some(at))
+                    if matches!(event.event, crate::conversation::Event::Append(_)) =>
+                {
+                    Some(crate::store::SaidStamp {
+                        turn_id: carried(turn)?,
+                        created_at: at,
+                    })
+                }
+                (_, Some(_)) => {
+                    return Err(crate::error::MekaError::Usage(format!(
+                        "session {} in the archive has event {position} saying where it was said, \
+                         which only a message does",
+                        session.id,
+                        position = events.len()
+                    )));
+                }
+                (None, None) => None,
+                (Some(_), None) => {
+                    return Err(crate::error::MekaError::Usage(format!(
+                        "session {} in the archive has event {position} naming the turn it was \
+                         said in but not when",
+                        session.id,
+                        position = events.len()
+                    )));
+                }
+            };
+            // A link hides the copy from every history, so it is taken only in the shapes a
+            // compaction writes: a message holding what an earlier row was shown as in the view
+            // the latest compaction replaced, or repeating an earlier one word for word below a
             // boundary the original is above. On anything else it would hide what it names.
             if let Some(original) = event.copy_of {
+                let stands_for = match (&event.event, &shown_before_boundary) {
+                    (crate::conversation::Event::Append(message), Some(shown)) => {
+                        super::sessions::encode_message_for_db(message)
+                            .is_ok_and(|held| shown.contains(&(original, held)))
+                    }
+                    (crate::conversation::Event::Append(_), None) => {
+                        replaced.contains(&original)
+                            && matches!(
+                                events.get(original).map(|earlier| &earlier.event),
+                                Some(crate::conversation::Event::Append(_))
+                            )
+                    }
+                    _ => false,
+                };
                 let repeats = |earlier: &crate::conversation::Event| {
                     matches!(
                         (earlier, &event.event),
@@ -547,7 +649,7 @@ pub(crate) fn plan_import(
                             crate::conversation::Event::CompactBoundary { .. }
                         )
                     });
-                if !copies_a_message {
+                if !stands_for && !copies_a_message {
                     return Err(crate::error::MekaError::Usage(format!(
                         "session {} in the archive has event {position} copying event {original}, \
                          which is not an earlier message it repeats from before a compaction",
@@ -561,6 +663,7 @@ pub(crate) fn plan_import(
                 event: event.event,
                 turn_id: turn,
                 copy_of: event.copy_of,
+                said,
             });
         }
         let permission = match (session.permission, default_permission) {
@@ -696,6 +799,109 @@ pub(crate) fn parents_first_order(
 mod tests {
     use super::*;
 
+    /// A turn sweep that takes the turns a retry's rewrite reached back into leaves that rewrite
+    /// unable to replay below the compaction that kept its message, and the archive of what is
+    /// left still imports, the copy still standing for the row it was said in.
+    #[tokio::test]
+    async fn an_archive_exported_after_a_sweep_imports_a_rewritten_copy() {
+        use crate::conversation::{Event, Message};
+        let store = crate::store::Store::for_test().await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("session");
+        let (old, new) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let long_ago = (chrono::Utc::now() - chrono::TimeDelta::days(90)).to_rfc3339();
+        let recent = chrono::Utc::now().to_rfc3339();
+        for (turn, at) in [(old, &long_ago), (new, &recent)] {
+            store
+                .turn_store()
+                .open_turn(
+                    id,
+                    turn,
+                    crate::store::turns::TurnSource::Client,
+                    crate::permission::Permission::Read,
+                    at,
+                )
+                .await
+                .expect("turn");
+        }
+        for message in [Message::user("one?"), Message::assistant_text("One.")] {
+            store
+                .save_event(id, &Event::Append(message), Some(old))
+                .await
+                .expect("save");
+        }
+        store
+            .turn_store()
+            .close_turn(
+                old,
+                &crate::store::turns::TurnEnding::succeeded(
+                    "end_turn",
+                    crate::store::turns::TurnUsage::default(),
+                ),
+            )
+            .await
+            .expect("close");
+        store
+            .run_sql_for_test(&format!(
+                "UPDATE turns SET ended_at = '{long_ago}' WHERE id = '{old}'"
+            ))
+            .await;
+        for event in [
+            Event::Append(Message::user("two?")),
+            // The retry reaches back past its own prompt into the turn before.
+            Event::Repair {
+                replaced_count: 2,
+                messages: vec![
+                    Message::assistant_text("One."),
+                    Message::user("two, degraded?"),
+                ],
+            },
+        ] {
+            store.save_event(id, &event, Some(new)).await.expect("save");
+        }
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("summary"),
+            replaced_count: 3,
+            record: crate::conversation::CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        store
+            .save_compaction(id, &boundary, &[Message::user("two, degraded?")], Some(new))
+            .await
+            .expect("compaction");
+        let swept = store
+            .delete_expired_turns(chrono::Utc::now() - chrono::TimeDelta::days(30), None)
+            .await
+            .expect("sweep");
+        assert_eq!(swept.rows, 2, "the earlier turn goes");
+        let archive = build_session_export(&store, id).await.expect("export");
+        let links: Vec<Option<usize>> = archive.sessions[0]
+            .events
+            .iter()
+            .map(|event| event.copy_of)
+            .collect();
+        assert_eq!(
+            links,
+            [None, None, None, Some(0)],
+            "the copy stands for its row"
+        );
+        let plan = plan_import(
+            archive,
+            ImportInstallation {
+                selected: None,
+                default: Some("test-profile"),
+                configured: None,
+                projects: Vec::new(),
+            },
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("imports");
+        assert_eq!(plan.records[0].events[3].copy_of, Some(0));
+    }
+
     /// An archive from another release is refused by its version, which names the remedy, and
     /// not by the first field that release spelled differently: the 0.53 key `tool_outputs` is
     /// missing its 0.54 name here, and the message must not say so.
@@ -739,6 +945,81 @@ mod tests {
             parse_session_export(archive.to_string().as_bytes()).is_err(),
             "`blobs` must be required"
         );
+    }
+
+    /// A 0.88 archive, `format_version` 21, reads as this build's version, each copy a compaction
+    /// kept saying where it was said: the event it copies.
+    #[test]
+    fn a_0_88_archive_is_read_with_its_copies_saying_where_they_were_said() {
+        let mut archive = serde_json::to_value(archive_on("work")).expect("serialize");
+        archive["format_version"] = 21.into();
+        let said = |text: &str, at: &str, copy_of: Option<usize>| {
+            serde_json::json!({
+                "at": at,
+                "event": {"Append": crate::conversation::Message::user(text)},
+                "turn_id": null,
+                "copy_of": copy_of,
+            })
+        };
+        archive["sessions"][0]["events"] = serde_json::json!([
+            said("kept", "when it was said", None),
+            said("kept", "when it was kept", Some(0)),
+        ]);
+        let read = parse_session_export(archive.to_string().as_bytes()).expect("brought forward");
+        assert_eq!(read.format_version, SESSION_EXPORT_FORMAT_VERSION);
+        let says: Vec<Option<&str>> = read.sessions[0]
+            .events
+            .iter()
+            .map(|event| event.said_at.as_deref())
+            .collect();
+        assert_eq!(says, [None, Some("when it was said")]);
+    }
+
+    /// Where a message was said is a stamp like the others: one that is not RFC 3339 is refused,
+    /// one in another zone is read in UTC, and one on anything but a message is refused, since
+    /// only a message is said.
+    #[test]
+    fn an_archive_s_said_stamps_are_read_as_every_stamp_is() {
+        let profiles = configured(&["work"]);
+        let plan = |events: serde_json::Value| {
+            let mut archive = serde_json::to_value(archive_on("work")).expect("serialize");
+            archive["sessions"][0]["events"] = events;
+            plan_import(
+                serde_json::from_value(archive).expect("an archive"),
+                ImportInstallation {
+                    selected: None,
+                    default: Some("work"),
+                    configured: Some(&profiles),
+                    projects: Vec::new(),
+                },
+                Some(crate::permission::Permission::Read),
+            )
+        };
+        let said_at = |event: serde_json::Value, at: &str| {
+            serde_json::json!([{
+                "at": "2020-01-01T00:00:00Z",
+                "event": event,
+                "turn_id": null,
+                "copy_of": null,
+                "said_at": at,
+            }])
+        };
+        let message = || serde_json::json!({"Append": crate::conversation::Message::user("kept")});
+        let refused = refusal(plan(said_at(message(), "yesterday")));
+        assert!(refused.contains("`said_at`"), "{refused}");
+        let read = plan(said_at(message(), "2020-01-01T02:00:00+02:00")).expect("plans");
+        assert_eq!(
+            read.records[0].events[0]
+                .said
+                .as_ref()
+                .map(|said| said.created_at.as_str()),
+            Some("2020-01-01T00:00:00+00:00")
+        );
+        let refused = refusal(plan(said_at(
+            serde_json::json!("Unsign"),
+            "2020-01-01T00:00:00Z",
+        )));
+        assert!(refused.contains("only a message"), "{refused}");
     }
 
     /// A one-session archive whose session ran on `profile`.
@@ -968,6 +1249,8 @@ mod tests {
             },
             turn_id: None,
             copy_of: None,
+            said_turn_id: None,
+            said_at: None,
         });
         let whole = serde_json::to_value(&archive).expect("json");
         parse_session_export(whole.to_string().as_bytes()).expect("the whole archive reads");

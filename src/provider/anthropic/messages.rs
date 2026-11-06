@@ -19,7 +19,7 @@ use crate::{
     config::ThinkingMode,
     conversation::Message,
     error::Result,
-    provider::{CompletionRequest, Provider, StreamEvent, ThinkingOverride, ToolDefinition},
+    provider::{CompletionRequest, Provider, StreamEvent, ToolDefinition},
 };
 
 /// The `anthropic-messages` backend: one profile's model, endpoint and API key.
@@ -88,16 +88,12 @@ impl AnthropicMessagesProvider {
         })
     }
 
-    fn effective_thinking(&self, thinking: ThinkingOverride) -> ThinkingMode {
-        shared::effective_thinking(thinking, self.thinking)
-    }
-
     /// The settled effort to send as `output_config.effort` (see [`Self::resolved_effort`]).
     fn wire_effort(&self) -> Option<String> {
         self.resolved_effort.clone()
     }
 
-    fn compute_betas(&self, thinking: ThinkingOverride, declares_deferred: bool) -> Option<String> {
+    fn compute_betas(&self, declares_deferred: bool) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
         // The beta `defer_loading` and `tool_reference` need, sent only on a request that declares
         // a deferred tool: the profile's `deferred_tools` says whether this endpoint takes it.
@@ -107,7 +103,7 @@ impl AnthropicMessagesProvider {
         // Whether the endpoint takes the beta is the endpoint's fact, which this backend cannot
         // know from `base_url`; the account states it, defaulting to the direct API's answer, so
         // a gateway that refuses the header has a key rather than a `thinking = off`.
-        if self.interleaved_thinking && self.effective_thinking(thinking).is_on() {
+        if self.interleaved_thinking && self.thinking.is_on() {
             parts.push("interleaved-thinking-2025-05-14");
         }
         // No `context-1m-2025-08-07`: on the direct Messages API, 1M context is the *default* for
@@ -128,7 +124,6 @@ impl AnthropicMessagesProvider {
         messages: &[Message],
         tools: &[ToolDefinition],
         stream: bool,
-        thinking: ThinkingOverride,
     ) -> serde_json::Value {
         // The API's own TTL. The one-hour breakpoint needs a beta this backend does not send, and
         // this endpoint is whatever `base_url` names. Whether a breakpoint goes out at all is the
@@ -148,7 +143,7 @@ impl AnthropicMessagesProvider {
 
         shared::insert_thinking_fields(
             &mut body,
-            self.effective_thinking(thinking),
+            self.thinking,
             self.thinking_budget_tokens,
             self.max_output_tokens,
             None,
@@ -179,7 +174,6 @@ impl AnthropicMessagesProvider {
     fn apply_headers(
         &self,
         request: reqwest::RequestBuilder,
-        thinking: ThinkingOverride,
         declares_deferred: bool,
     ) -> reqwest::RequestBuilder {
         let mut request = request
@@ -188,7 +182,7 @@ impl AnthropicMessagesProvider {
             .header("anthropic-version", "2023-06-01")
             .header("x-api-key", &self.api_key);
 
-        if let Some(betas) = self.compute_betas(thinking, declares_deferred) {
+        if let Some(betas) = self.compute_betas(declares_deferred) {
             request = request.header("anthropic-beta", betas);
         }
 
@@ -220,10 +214,9 @@ impl shared::ClaudeBackend for AnthropicMessagesProvider {
         tools: &[ToolDefinition],
         deferred_tools: &[ToolDefinition],
         stream: bool,
-        thinking: ThinkingOverride,
         _attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        let mut body = self.build_request_body(system_prompt, messages, tools, stream, thinking);
+        let mut body = self.build_request_body(system_prompt, messages, tools, stream);
         shared::declare_deferred_tools(&mut body, deferred_tools);
         body
     }
@@ -234,7 +227,6 @@ impl shared::ClaudeBackend for AnthropicMessagesProvider {
         _has_tools: bool,
         declares_deferred: bool,
         stream: bool,
-        thinking: ThinkingOverride,
         _attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder> {
         let request = if stream {
@@ -242,7 +234,7 @@ impl shared::ClaudeBackend for AnthropicMessagesProvider {
         } else {
             request
         };
-        Ok(self.apply_headers(request, thinking, declares_deferred))
+        Ok(self.apply_headers(request, declares_deferred))
     }
 }
 
@@ -512,22 +504,15 @@ mod tests {
             )
             .expect("provider")
         };
-        assert_eq!(
-            build(false).compute_betas(ThinkingOverride::Inherit, false),
-            None
-        );
+        assert_eq!(build(false).compute_betas(false), None);
         // The deferred-tools beta rides only on a request that declares one, whatever the
         // account says about thinking.
         assert_eq!(
-            build(false)
-                .compute_betas(ThinkingOverride::Inherit, true)
-                .as_deref(),
+            build(false).compute_betas(true).as_deref(),
             Some("advanced-tool-use-2025-11-20")
         );
         assert_eq!(
-            build(true)
-                .compute_betas(ThinkingOverride::Inherit, false)
-                .as_deref(),
+            build(true).compute_betas(false).as_deref(),
             Some("interleaved-thinking-2025-05-14")
         );
     }
@@ -544,13 +529,8 @@ mod tests {
             "claude-sonnet-4-20250514",
             "hf.co/bartowski/Qwen3.8-27B-GGUF:Q8_0",
         ] {
-            let body = provider(model, None).build_request_body(
-                "s",
-                &[Message::user("hi")],
-                &[],
-                false,
-                ThinkingOverride::Inherit,
-            );
+            let body =
+                provider(model, None).build_request_body("s", &[Message::user("hi")], &[], false);
             assert!(body.get("output_config").is_none(), "{model}");
         }
         // A configured value is absolute: sent verbatim on any model, including one meka has never
@@ -561,7 +541,6 @@ mod tests {
                 &[Message::user("hi")],
                 &[],
                 false,
-                ThinkingOverride::Inherit,
             );
             assert_eq!(body["output_config"]["effort"], "medium", "{model}");
         }
@@ -590,9 +569,7 @@ mod tests {
             )
         }
         .expect("build test provider");
-        let betas = thinking_on
-            .compute_betas(ThinkingOverride::Inherit, false)
-            .unwrap_or_default();
+        let betas = thinking_on.compute_betas(false).unwrap_or_default();
         assert!(betas.contains("interleaved-thinking-2025-05-14"));
         assert!(
             !betas.contains("context-1m"),
@@ -601,7 +578,7 @@ mod tests {
         // Thinking off on a 1M-capable model → no betas at all.
         assert!(
             provider("claude-opus-4-8", None)
-                .compute_betas(ThinkingOverride::Inherit, false)
+                .compute_betas(false)
                 .is_none()
         );
     }
@@ -626,13 +603,7 @@ mod tests {
                 input: serde_json::json!({"[meka harness]": "arguments removed"}),
             }],
         }];
-        let body = provider.build_request_body(
-            "be nice",
-            &messages,
-            &[],
-            false,
-            ThinkingOverride::Inherit,
-        );
+        let body = provider.build_request_body("be nice", &messages, &[], false);
 
         let serialized = serde_json::to_string(&body).expect("serialize");
         assert!(
@@ -649,13 +620,7 @@ mod tests {
     fn api_body_has_no_billing_header() {
         let provider = provider_for_test();
         let messages = vec![Message::user("hello")];
-        let body = provider.build_request_body(
-            "be nice",
-            &messages,
-            &[],
-            false,
-            ThinkingOverride::Inherit,
-        );
+        let body = provider.build_request_body("be nice", &messages, &[], false);
 
         let serialized = serde_json::to_string(&body).unwrap();
         assert!(
@@ -675,13 +640,7 @@ mod tests {
     #[test]
     fn api_body_has_no_metadata() {
         let provider = provider_for_test();
-        let body = provider.build_request_body(
-            "",
-            &[Message::user("hi")],
-            &[],
-            false,
-            ThinkingOverride::Inherit,
-        );
+        let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert!(
             body.get("metadata").is_none(),
             "anthropic-messages body must not include metadata.user_id"
@@ -691,13 +650,7 @@ mod tests {
     #[test]
     fn api_body_plain_string_system_prompt() {
         let provider = provider_for_test();
-        let body = provider.build_request_body(
-            "my system",
-            &[Message::user("hi")],
-            &[],
-            false,
-            ThinkingOverride::Inherit,
-        );
+        let body = provider.build_request_body("my system", &[Message::user("hi")], &[], false);
         let system = body.get("system").unwrap();
         assert_eq!(
             system.as_str(),
@@ -709,13 +662,7 @@ mod tests {
     #[test]
     fn api_body_omits_system_when_empty() {
         let provider = provider_for_test();
-        let body = provider.build_request_body(
-            "",
-            &[Message::user("hi")],
-            &[],
-            false,
-            ThinkingOverride::Inherit,
-        );
+        let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert!(
             body.get("system").is_none(),
             "anthropic-messages should omit `system` when the prompt is empty"
@@ -754,13 +701,7 @@ mod tests {
             Message::user("second"),
         ];
         let body = |cache_control: bool| {
-            build(cache_control).build_request_body(
-                "be terse",
-                &messages,
-                &[],
-                true,
-                ThinkingOverride::Inherit,
-            )
+            build(cache_control).build_request_body("be terse", &messages, &[], true)
         };
 
         let withheld = body(false);

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.89.0] - 2026-11-06
+
+### Added
+
+- `GET /v1/sessions/{id}/history` and `/context/messages`: what a session said, what the model sees.
+- `POST /v1/sessions/{id}/fork` takes `turn_id` to branch the conversation before that turn.
+- A session search hit carries `excerpt_position`, its place in the session's history.
+
+### Changed
+
+- **Breaking:** `GET /messages` is gone, and `/turn`, `/stream`, tasks, jobs and memories moved.
+- **Breaking:** session search is `GET /v1/sessions?q=`, and every listing filter applies to it.
+- **Breaking:** `position` replaces `revision` in a conversation's `ETag`, events and edits.
+- **Breaking:** turns, rewinds and compactions answer with history items, rewinds take `turn_id`.
+- **Breaking:** events, response fields and `GET /export`'s answer changed; see the upgrade guide.
+- **Breaking:** a memory search hit's `snippet` is `excerpt`, over HTTP and in `--format json`.
+- **Breaking:** `meka history` is `meka recall`, and its JSON listing key is `recall`.
+- A compaction's spend counts toward its turn, and one run between turns is a turn of its own.
+- The compaction summarizer uses the profile's thinking setting instead of turning thinking off.
+- Session archives are `format_version` 22, which an older meka refuses to import.
+- `conversation_search` and `conversation_read` read a session's history as the screen shows it.
+
+### Fixed
+
+- `/rewind` and `meka session rewind` stop at a compaction summary instead of emptying the context.
+- History shows each turn a compaction kept once, where and when it was said, until it is rewound.
+- A compaction summary that comes back empty is asked for once more instead of failing.
+- Session search no longer matches, or ranks a session by, a message a rewind took back.
+- A rewind or retry after a failed save or a crash cuts the conversation in the right place.
+
 ## [0.88.3] - 2026-11-05
 
 ### Fixed
@@ -3131,7 +3161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.88.3...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.89.0...HEAD
+[0.89.0]: https://github.com/k4yt3x/meka/compare/0.88.3...0.89.0
 [0.88.3]: https://github.com/k4yt3x/meka/compare/0.88.2...0.88.3
 [0.88.2]: https://github.com/k4yt3x/meka/compare/0.88.1...0.88.2
 [0.88.1]: https://github.com/k4yt3x/meka/compare/0.88.0...0.88.1
