@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** events, response fields and `GET /export`'s answer changed; see the upgrade guide.
 - **Breaking:** a memory search hit's `snippet` is `excerpt`, over HTTP and in `--format json`.
 - **Breaking:** `meka history` is `meka recall`, and its JSON listing key is `recall`.
+- **Breaking:** Problem `type` URIs moved to `https://meka.bot/errors/`.
 - A compaction's spend counts toward its turn, and one run between turns is a turn of its own.
 - The compaction summarizer uses the profile's thinking setting instead of turning thinking off.
 - Session archives are `format_version` 22, which an older meka refuses to import.

@@ -955,7 +955,7 @@ mod tests {
             .await
             .expect("stamp");
         let not_before = Utc::now() + chrono::Duration::minutes(5);
-        let record = r#"{"type":"https://meka.run/errors/provider-exhausted","status":503}"#;
+        let record = r#"{"type":"https://meka.bot/errors/provider-exhausted","status":503}"#;
         let deferred = inbox
             .defer_pending(&[id, carried], not_before, Some(record))
             .await
@@ -1000,7 +1000,7 @@ mod tests {
             .await
             .expect("enqueue")
             .id;
-        let decided = r#"{"type":"https://meka.run/errors/provider","status":502}"#;
+        let decided = r#"{"type":"https://meka.bot/errors/provider","status":502}"#;
         inbox
             .withdraw(
                 at_once,
@@ -1021,7 +1021,7 @@ mod tests {
             .await
             .expect("enqueue")
             .id;
-        let deferred_for = r#"{"type":"https://meka.run/errors/provider-exhausted"}"#;
+        let deferred_for = r#"{"type":"https://meka.bot/errors/provider-exhausted"}"#;
         inbox
             .defer_pending(&[at_the_ceiling], Utc::now(), Some(deferred_for))
             .await

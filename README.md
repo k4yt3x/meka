@@ -33,7 +33,7 @@ The same agent core is available through several interfaces:
 - **CLI**: an interactive screen in the terminal, or one-shot commands for scripts.
 - **ACP**: runs inside editors like Zed via the [Agent Client Protocol](https://agentclientprotocol.com/).
 - **HTTP API**: use meka to power your own apps and bots.
-- [**mekaweb**](https://github.com/k4yt3x/mekaweb), a web interface, hosted at [web.meka.run](https://web.meka.run).
+- [**mekaweb**](https://github.com/k4yt3x/mekaweb), a web interface, hosted at [web.meka.bot](https://web.meka.bot).
 - [**mekabridge**](https://github.com/k4yt3x/mekabridge) connects the agent to messaging platforms such as Telegram.
 
 ## Installation
@@ -67,7 +67,7 @@ meka profile add astra --account openrouter --model openai/gpt-6-astra
 
 Run `meka` and start typing. Press Shift+Tab to cycle permissions (none, read, workspace, unrestricted).
 
-See the [documentation](https://docs.meka.run) for the full usage guide.
+See the [documentation](https://docs.meka.bot) for the full usage guide.
 
 ## Tools
 
@@ -90,7 +90,7 @@ The agent has access to the following built-in tools, grouped by class:
 - `mcp_*`: list, read, and subscribe to MCP resources, and render MCP prompts
 - `tool_*`: find a tool by keyword, or load a deferred tool's schema
 
-Run `meka tool list` for the current set with descriptions. See the [tool reference](https://docs.meka.run/tools/overview.html).
+Run `meka tool list` for the current set with descriptions. See the [tool reference](https://docs.meka.bot/tools/overview.html).
 
 ## Permissions
 

@@ -755,38 +755,38 @@ impl ErrorKind {
     /// The `type` URI a Problem Detail carries: [`Self::name`] under meka's error namespace.
     pub(crate) const fn type_uri(self) -> &'static str {
         match self {
-            Self::Auth => "https://meka.run/errors/auth",
-            Self::AuthScope => "https://meka.run/errors/auth-scope",
-            Self::SessionNotFound => "https://meka.run/errors/session-not-found",
-            Self::NotFound => "https://meka.run/errors/not-found",
-            Self::SessionPermission => "https://meka.run/errors/session-permission",
-            Self::SessionLocked => "https://meka.run/errors/session-locked",
-            Self::SessionNotLoaded => "https://meka.run/errors/session-not-loaded",
-            Self::TurnInFlight => "https://meka.run/errors/turn-in-flight",
-            Self::TurnCanceled => "https://meka.run/errors/turn-canceled",
-            Self::StreamDetached => "https://meka.run/errors/stream-detached",
-            Self::SseLag => "https://meka.run/errors/sse-lag",
-            Self::RequestNotFound => "https://meka.run/errors/request-not-found",
-            Self::Idempotency => "https://meka.run/errors/idempotency",
-            Self::InboxAppended => "https://meka.run/errors/inbox-appended",
-            Self::TurnMismatch => "https://meka.run/errors/turn-mismatch",
-            Self::StoreReadOnly => "https://meka.run/errors/store-read-only",
-            Self::InstructionsOverridden => "https://meka.run/errors/instructions-overridden",
-            Self::AccountInUse => "https://meka.run/errors/account-in-use",
-            Self::ShuttingDown => "https://meka.run/errors/shutting-down",
-            Self::SessionNotDrivable => "https://meka.run/errors/session-not-drivable",
-            Self::SubagentNotRunning => "https://meka.run/errors/subagent-not-running",
-            Self::InvalidBody => "https://meka.run/errors/invalid-body",
-            Self::PreconditionFailed => "https://meka.run/errors/precondition-failed",
-            Self::RequestTooLarge => "https://meka.run/errors/request-too-large",
-            Self::PayloadTooLarge => "https://meka.run/errors/payload-too-large",
-            Self::ConcurrencyLimit => "https://meka.run/errors/concurrency-limit",
-            Self::Provider => "https://meka.run/errors/provider",
-            Self::ProviderUnavailable => "https://meka.run/errors/provider-unavailable",
-            Self::ProviderExhausted => "https://meka.run/errors/provider-exhausted",
-            Self::ContextOverflow => "https://meka.run/errors/context-overflow",
-            Self::McpUnavailable => "https://meka.run/errors/mcp-unavailable",
-            Self::Internal => "https://meka.run/errors/internal",
+            Self::Auth => "https://meka.bot/errors/auth",
+            Self::AuthScope => "https://meka.bot/errors/auth-scope",
+            Self::SessionNotFound => "https://meka.bot/errors/session-not-found",
+            Self::NotFound => "https://meka.bot/errors/not-found",
+            Self::SessionPermission => "https://meka.bot/errors/session-permission",
+            Self::SessionLocked => "https://meka.bot/errors/session-locked",
+            Self::SessionNotLoaded => "https://meka.bot/errors/session-not-loaded",
+            Self::TurnInFlight => "https://meka.bot/errors/turn-in-flight",
+            Self::TurnCanceled => "https://meka.bot/errors/turn-canceled",
+            Self::StreamDetached => "https://meka.bot/errors/stream-detached",
+            Self::SseLag => "https://meka.bot/errors/sse-lag",
+            Self::RequestNotFound => "https://meka.bot/errors/request-not-found",
+            Self::Idempotency => "https://meka.bot/errors/idempotency",
+            Self::InboxAppended => "https://meka.bot/errors/inbox-appended",
+            Self::TurnMismatch => "https://meka.bot/errors/turn-mismatch",
+            Self::StoreReadOnly => "https://meka.bot/errors/store-read-only",
+            Self::InstructionsOverridden => "https://meka.bot/errors/instructions-overridden",
+            Self::AccountInUse => "https://meka.bot/errors/account-in-use",
+            Self::ShuttingDown => "https://meka.bot/errors/shutting-down",
+            Self::SessionNotDrivable => "https://meka.bot/errors/session-not-drivable",
+            Self::SubagentNotRunning => "https://meka.bot/errors/subagent-not-running",
+            Self::InvalidBody => "https://meka.bot/errors/invalid-body",
+            Self::PreconditionFailed => "https://meka.bot/errors/precondition-failed",
+            Self::RequestTooLarge => "https://meka.bot/errors/request-too-large",
+            Self::PayloadTooLarge => "https://meka.bot/errors/payload-too-large",
+            Self::ConcurrencyLimit => "https://meka.bot/errors/concurrency-limit",
+            Self::Provider => "https://meka.bot/errors/provider",
+            Self::ProviderUnavailable => "https://meka.bot/errors/provider-unavailable",
+            Self::ProviderExhausted => "https://meka.bot/errors/provider-exhausted",
+            Self::ContextOverflow => "https://meka.bot/errors/context-overflow",
+            Self::McpUnavailable => "https://meka.bot/errors/mcp-unavailable",
+            Self::Internal => "https://meka.bot/errors/internal",
         }
     }
 
@@ -1674,14 +1674,14 @@ mod tests {
         for kind in super::ErrorKind::ALL {
             assert_eq!(
                 kind.type_uri(),
-                format!("https://meka.run/errors/{}", kind.name()),
+                format!("https://meka.bot/errors/{}", kind.name()),
                 "{kind:?}"
             );
             assert_eq!(super::ErrorKind::from_name(kind.name()), Some(kind));
             assert!(names.insert(kind.name()), "{kind:?} shares a name");
         }
         assert_eq!(
-            super::ErrorKind::from_name("https://meka.run/errors/provider"),
+            super::ErrorKind::from_name("https://meka.bot/errors/provider"),
             None
         );
     }

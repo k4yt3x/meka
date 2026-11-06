@@ -22,6 +22,13 @@ under the turn and time of the compaction that wrote it. 0.88 refuses a store
 compaction kept records where it was said; a 0.88 archive (21) imports as it is, and 0.88 refuses a
 22.
 
+**The problem `type` URIs moved to `meka.bot`.** Every error document meka returns now names a
+`type` under `https://meka.bot/errors/` where it used to sit under `https://meka.run/errors/`, and
+the store moves the error an inbox item recorded the same way. The identifier after the last slash
+is unchanged, as are the HTTP status, the `title` and every other member of the document. A client
+that matches the whole URI must update its table; one that reads only the final segment is
+unaffected.
+
 **`meka history` is `meka recall`.** `meka recall list` and `meka recall clear` do what the old
 pair did, and `meka history` is no command at all. The JSON listing is `{"recall": [...]}`, and an
 empty one says `No recall entries.`
@@ -1134,7 +1141,7 @@ key whose value is not a whole number is left under its old name and reported, w
 - **A gate's pointer test is `not_empty`** (was `not-empty`) in `schedule_create`, `POST
   /v1/sessions/{id}/schedule` and `meka schedule add`; stored jobs are converted by the store.
 - **`canceled`, one `l`, on every wire meka owns.** Match `turn.canceled` as the SSE terminal event,
-  `https://meka.run/errors/turn-canceled` as the problem `type`, and `status == "canceled"` in task
+  `https://meka.bot/errors/turn-canceled` as the problem `type`, and `status == "canceled"` in task
   views (`GET /v1/sessions/{id}/tasks`, `DELETE .../tasks/{task_id}`), `task_list` output and
   `schedule.fired` webhook bodies; the `reason` values are unchanged. The store rewrites its stored
   task rows on first open (the tenth ledger step). ACP's `stopReason: "cancelled"` and MCP's

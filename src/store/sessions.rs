@@ -5665,7 +5665,7 @@ mod tests {
         let ids: Vec<Uuid> = turns.iter().map(|turn| turn.id).collect();
         assert_eq!(ids, vec![second, first], "newest first");
         let error = turns[0].error.as_ref().expect("a failure names its error");
-        assert_eq!(error.kind.type_uri(), "https://meka.run/errors/provider");
+        assert_eq!(error.kind.type_uri(), "https://meka.bot/errors/provider");
         assert!(
             !error.detail.contains("acct-0f3c"),
             "the provider's text never reaches the row: {}",

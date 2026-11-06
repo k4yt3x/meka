@@ -567,6 +567,13 @@ const MIGRATIONS: &[Migration] = &[
         name: "kept_copies_say_where_they_were_said",
         step: Step::Rust(kept_copies_say_where_they_were_said),
     },
+    // 0.89 names every problem `type` under `https://meka.bot/errors/`. An inbox item keeps the
+    // error object it was last deferred or given up on for, which the API hands back as stored, so
+    // one written before takes the new namespace.
+    Migration {
+        name: "inbox_errors_name_their_type_under_meka_bot",
+        step: Step::Rust(inbox_errors_name_their_type_under_meka_bot),
+    },
 ];
 
 /// The column that marks a session whose copy is unfinished. Safe to replay: the column is added
@@ -1014,6 +1021,20 @@ fn kept_copies_say_where_they_were_said(
              said_at = COALESCE(r.said_at, r.created_at)
          FROM roots JOIN messages r ON r.id = roots.root
          WHERE roots.copy = messages.id",
+    )
+}
+
+/// Every `type` an inbox item's recorded error names under `https://meka.run/errors/` moves to
+/// `https://meka.bot/errors/`, its last segment kept. The object is compact JSON, and a quote
+/// inside one of its strings is escaped, so the pair matches where it is a member and nowhere
+/// else. Safe to replay: a moved `type` no longer matches.
+fn inbox_errors_name_their_type_under_meka_bot(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "UPDATE inbox_items SET last_error = replace(last_error, \
+             '\"type\":\"https://meka.run/errors/', '\"type\":\"https://meka.bot/errors/') \
+         WHERE instr(last_error, '\"type\":\"https://meka.run/errors/') > 0",
     )
 }
 
@@ -6027,6 +6048,10 @@ mod tests {
                 "kept_copies_say_where_they_were_said",
                 7155948609130484468_u64,
             ),
+            (
+                "inbox_errors_name_their_type_under_meka_bot",
+                5298058929951792361_u64,
+            ),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or
         /// as a constant it reads, whatever its visibility, with its text: an item the digest
@@ -9312,6 +9337,68 @@ mod tests {
             (None, None),
             (None, None),
         ]);
+    }
+
+    /// The step moves the `type` of every inbox item's recorded error to the new namespace and
+    /// leaves the rest of the object as it was, the same words quoted inside a `detail` included;
+    /// a replay changes nothing.
+    #[test]
+    fn inbox_errors_name_their_type_under_the_new_namespace() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        let quoted = r#"{"detail":"it said \"type\":\"https://meka.run/errors/x\"","status":500,"type":"https://meka.run/errors/internal"}"#;
+        connection
+            .execute(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'then', 'then')",
+                [],
+            )
+            .expect("a session");
+        for (id, last_error) in [
+            (
+                "deferred",
+                Some(r#"{"status":503,"type":"https://meka.run/errors/provider-exhausted"}"#),
+            ),
+            ("quoted", Some(quoted)),
+            (
+                "moved",
+                Some(r#"{"type":"https://meka.bot/errors/provider"}"#),
+            ),
+            ("waiting", None),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO inbox_items (id, session_id, class, source, body, created_at, \
+                     last_error) VALUES (?1, 's', 'steer', 'api', 'hi', 'then', ?2)",
+                    rusqlite::params![id, last_error],
+                )
+                .expect("an item");
+        }
+        let recorded = |connection: &rusqlite::Connection| -> Vec<Option<String>> {
+            connection
+                .prepare("SELECT last_error FROM inbox_items ORDER BY rowid")
+                .expect("prepare")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let expected = [
+            Some(
+                r#"{"status":503,"type":"https://meka.bot/errors/provider-exhausted"}"#.to_string(),
+            ),
+            Some(quoted.replace(
+                r#""type":"https://meka.run/errors/internal""#,
+                r#""type":"https://meka.bot/errors/internal""#,
+            )),
+            Some(r#"{"type":"https://meka.bot/errors/provider"}"#.to_string()),
+            None,
+        ];
+        let transaction = connection.transaction().expect("transaction");
+        inbox_errors_name_their_type_under_meka_bot(&transaction).expect("the step");
+        assert_eq!(recorded(&transaction), expected);
+        inbox_errors_name_their_type_under_meka_bot(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(recorded(&connection), expected);
     }
 
     /// An archive from before 0.89 has each copy a compaction kept, a copy of a copy included,
