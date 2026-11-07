@@ -1481,8 +1481,8 @@ pub(crate) fn shaded_row(line: Line<'static>, shade: Color, width: usize) -> Lin
 /// `line` as it is drawn on a shade, whichever shade: what is dimmed in the terminal's dark gray
 /// in [`DIM_ON_SHADE`], which the shade does not swallow. Every row a shaded surface draws from
 /// rows laid out elsewhere passes here: the transcript's runs and code blocks, a panel, a
-/// question, the completion list, the status row. The composer, which draws its own few dimmed
-/// words, draws them in [`DIM_ON_SHADE`] itself.
+/// question, the completion list. The composer, which draws its own few dimmed words, draws them
+/// in [`DIM_ON_SHADE`] itself.
 pub(crate) fn on_shade(line: Line<'static>) -> Line<'static> {
     // The palette's dark gray by name, or by its slot, as a program's `38;5;8` names it.
     let dim = |style: Style| {

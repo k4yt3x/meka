@@ -77,7 +77,11 @@ non-streaming request.
 
 Request body fields meka sets: `model`, `input`, `instructions` (the system prompt, when non-empty),
 `tools`, `tool_choice: auto`, `store: false`, `stream: true`, `reasoning.effort` (only when `effort`
-is set), and `max_output_tokens` (only when `max_output_tokens` is set).
+is set), and `max_output_tokens` (only when `max_output_tokens` is set), and the three in the table
+below. Any other field goes in the profile's
+[`parameters`](../configuration/config-file.md#parameters), as
+[OpenAI's API reference](https://platform.openai.com/docs/api-reference/responses/create) names it
+(`temperature`, `service_tier`, `text = { verbosity = "low" }`), and one meka sets is refused there.
 
 OpenAI's own fields go out too, as `chatgpt-subscription` sends them, each with a switch for an
 endpoint or a model that refuses it:

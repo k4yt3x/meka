@@ -1542,6 +1542,11 @@ pub(crate) struct CreateProfileRequest {
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
     pub(crate) encrypted_reasoning: Option<bool>,
     pub(crate) reasoning_summary: Option<bool>,
+    #[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]
+    pub(crate) cyber_access_program: Option<String>,
+    /// Request fields sent as written, each a top-level field of the request body.
+    #[schema(value_type = Option<Object>)]
+    pub(crate) parameters: Option<serde_json::Map<String, serde_json::Value>>,
     /// Make the profile the one a session gets when it names none.
     #[serde(default)]
     pub(crate) default: bool,
@@ -1585,6 +1590,12 @@ pub(crate) async fn create_profile(
         thinking_display: body.thinking_display,
         encrypted_reasoning: body.encrypted_reasoning,
         reasoning_summary: body.reasoning_summary,
+        cyber_access_program: body.cyber_access_program,
+        parameters: match &body.parameters {
+            Some(parameters) => profile::parameters_from_json(parameters)
+                .map_err(|error| door_problem(&state, "failed to read the parameters", error))?,
+            None => Vec::new(),
+        },
     };
     refuse_a_default_under_the_started_profile(&state, body.default)?;
     write_installation(&state, async |_| {
@@ -1656,13 +1667,28 @@ pub(crate) struct PatchProfileRequest {
     #[serde(default)]
     #[schema(value_type = Option<bool>)]
     pub(crate) reasoning_summary: Patch<bool>,
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub(crate) cyber_access_program: Patch<String>,
+    /// The request fields sent as written, replaced whole; `null` removes them all.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub(crate) parameters: Patch<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl PatchProfileRequest {
     /// The changes the body asks for, as the edit door takes them. The door reads each value and
-    /// refuses one no profile may carry, in the words `meka profile set` would.
-    fn into_changes(self) -> profile::ProfileChanges {
-        profile::ProfileChanges {
+    /// refuses one no profile may carry, in the words `meka profile set` would; a `parameters`
+    /// value TOML cannot hold is refused here, on its way into the file's terms.
+    fn into_changes(self) -> crate::error::Result<profile::ProfileChanges> {
+        let parameters = match &self.parameters {
+            Patch::Keep => profile::ParametersChange::Keep,
+            Patch::Remove => profile::ParametersChange::Remove,
+            Patch::Set(parameters) => {
+                profile::ParametersChange::Replace(profile::parameters_from_json(parameters)?)
+            }
+        };
+        Ok(profile::ProfileChanges {
             model: self.model,
             fallbacks: self.fallbacks,
             context_window: self.context_window,
@@ -1677,7 +1703,9 @@ impl PatchProfileRequest {
             thinking_display: self.thinking_display,
             encrypted_reasoning: self.encrypted_reasoning,
             reasoning_summary: self.reasoning_summary,
-        }
+            cyber_access_program: self.cyber_access_program,
+            parameters,
+        })
     }
 }
 
@@ -1715,7 +1743,9 @@ pub(crate) async fn patch_profile(
     let make_default = body.default == Some(true);
     refuse_a_default_under_the_started_profile(&state, make_default)?;
     let new_name = body.name.clone();
-    let changes = body.into_changes();
+    let changes = body
+        .into_changes()
+        .map_err(|error| door_problem(&state, "failed to read the parameters", error))?;
     if new_name.is_some() && (make_default || !changes.is_empty()) {
         return Err(refused(
             "`name` renames the profile and is sent on its own; change its settings in another \
@@ -2555,7 +2585,7 @@ mod tests {
             r#"{"context_window": null, "effort": "", "model": "m", "vision": false}"#,
         )
         .expect("parse");
-        let changes = body.into_changes();
+        let changes = body.into_changes().expect("changes");
         assert_eq!(changes.model, Patch::Set("m".to_string()));
         assert_eq!(changes.fallbacks, Patch::Keep);
         assert_eq!(changes.context_window, Patch::Remove);
@@ -2572,7 +2602,7 @@ mod tests {
             serde_json::from_str(r#"{"name": "primary"}"#).expect("parse");
         assert_eq!(rename.name.as_deref(), Some("primary"));
         assert_eq!(rename.default, None);
-        assert!(rename.into_changes().is_empty());
+        assert!(rename.into_changes().expect("changes").is_empty());
     }
 
     /// The secrets ride beside the entry and are taken out of it: the entry keeps refusing a key

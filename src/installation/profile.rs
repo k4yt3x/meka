@@ -42,17 +42,23 @@ pub(crate) struct ProfileTuning {
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
     pub(crate) encrypted_reasoning: Option<bool>,
     pub(crate) reasoning_summary: Option<bool>,
+    pub(crate) cyber_access_program: Option<String>,
+    /// The `parameters` fields, in the order given; written as `[profiles.<name>.parameters]`.
+    pub(crate) parameters: Vec<(String, toml_edit::Value)>,
 }
 
 impl ProfileTuning {
     /// The keys this states a value for, which the account's backend must read.
-    fn stated_keys(&self) -> Vec<&'static str> {
+    pub(crate) fn stated_keys(&self) -> Vec<&'static str> {
         [
             ("fallbacks", !self.fallbacks.is_empty()),
             ("context_window", self.context_window.is_some()),
             ("max_output_tokens", self.max_output_tokens.is_some()),
             ("max_request_bytes", self.max_request_bytes.is_some()),
-            ("effort", self.effort.is_some()),
+            (
+                "effort",
+                config::stated_text(self.effort.as_deref()).is_some(),
+            ),
             ("vision", self.vision.is_some()),
             ("deferred_tools", self.deferred_tools.is_some()),
             ("thinking", self.thinking.is_some()),
@@ -61,6 +67,11 @@ impl ProfileTuning {
             ("thinking_display", self.thinking_display.is_some()),
             ("encrypted_reasoning", self.encrypted_reasoning.is_some()),
             ("reasoning_summary", self.reasoning_summary.is_some()),
+            (
+                "cyber_access_program",
+                config::stated_text(self.cyber_access_program.as_deref()).is_some(),
+            ),
+            ("parameters", !self.parameters.is_empty()),
         ]
         .into_iter()
         .filter_map(|(key, stated)| stated.then_some(key))
@@ -306,14 +317,92 @@ fn set_profile_field(
     true
 }
 
+/// Apply `change` to `[profiles.<name>.parameters]`, a field-level edit like [`set_profile_field`]
+/// so every other field keeps its place and its comments. A new table is the header table after
+/// the profile's own, or an inline one inside an inline profile; one left empty is removed, since
+/// it says nothing.
+fn set_profile_parameters(
+    document: &mut toml_edit::DocumentMut,
+    name: &str,
+    change: &ParametersChange,
+) {
+    let Some(item) = document
+        .get_mut("profiles")
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|profiles| profiles.get_mut(name))
+    else {
+        return;
+    };
+    let inline = item.is_inline_table();
+    let Some(profile) = item.as_table_like_mut() else {
+        return;
+    };
+    fn fields(
+        profile: &mut dyn toml_edit::TableLike,
+        inline: bool,
+    ) -> Option<&mut dyn toml_edit::TableLike> {
+        if profile.get("parameters").is_none() {
+            let table = if inline {
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(toml_edit::InlineTable::new()))
+            } else {
+                toml_edit::Item::Table(toml_edit::Table::new())
+            };
+            profile.insert("parameters", table);
+        }
+        profile
+            .get_mut("parameters")
+            .and_then(|item| item.as_table_like_mut())
+    }
+    match change {
+        ParametersChange::Keep => return,
+        ParametersChange::Remove => {
+            profile.remove("parameters");
+        }
+        ParametersChange::Replace(replacement) => {
+            if let Some(table) = fields(profile, inline) {
+                table.clear();
+                for (field, value) in replacement {
+                    table.insert(field, toml_edit::Item::Value(value.clone()));
+                }
+            }
+        }
+        ParametersChange::Field(field, Some(value)) => {
+            if let Some(table) = fields(profile, inline) {
+                let mut value = value.clone();
+                // Kept for the reason `set_profile_field` keeps them: `insert` clears both.
+                if let Some(existing) = table.get(field).and_then(|item| item.as_value()) {
+                    *value.decor_mut() = existing.decor().clone();
+                }
+                let key_decor = table.key(field).map(|key| key.leaf_decor().clone());
+                table.insert(field, toml_edit::Item::Value(value));
+                if let (Some(decor), Some(mut written)) = (key_decor, table.key_mut(field)) {
+                    *written.leaf_decor_mut() = decor;
+                }
+            }
+        }
+        ParametersChange::Field(field, None) => {
+            if let Some(table) = profile
+                .get_mut("parameters")
+                .and_then(|item| item.as_table_like_mut())
+            {
+                table.remove(field);
+            }
+        }
+    }
+    if profile
+        .get("parameters")
+        .and_then(|item| item.as_table_like())
+        .is_some_and(|table| table.is_empty())
+    {
+        profile.remove("parameters");
+    }
+}
+
 /// Refuse a key on a profile whose account's backend will never send it.
 ///
-/// `resolve_tuning` drops such a flag on `profile add` with a warning, on the grounds that
-/// writing it "would produce a setting that reads plausibly and does nothing". `set` reaches the
-/// same outcome by refusing rather than dropping, and the difference is deliberate: `add` is
-/// building a bundle out of many flags, where ignoring one inapplicable knob and saying so is
-/// proportionate, whereas `set` exists to write exactly one key, so dropping it would mean
-/// reporting success for a command that did nothing at all.
+/// Such a key would be a setting that reads plausibly and does nothing. `profile add` refuses the
+/// flag before its prompts, through the same keys, and this refuses it under the lock for every
+/// door that writes one.
 ///
 /// Every key, through [`config::Backend::reads_profile_key`], which is the one place that knows.
 /// A list of the thinking keys here let `max_request_bytes` onto an `openai-responses` profile,
@@ -378,11 +467,39 @@ pub(crate) struct ProfileChanges {
     pub(crate) thinking_display: Patch<crate::config::ThinkingDisplay>,
     pub(crate) encrypted_reasoning: Patch<bool>,
     pub(crate) reasoning_summary: Patch<bool>,
+    pub(crate) cyber_access_program: Patch<String>,
+    pub(crate) parameters: ParametersChange,
+}
+
+/// What an edit does to `[profiles.<name>.parameters]`: the table replaced or removed whole, as a
+/// request's JSON says it, or one field set or removed, as `profile set parameters.<field>` does.
+#[derive(Debug, Default)]
+pub(crate) enum ParametersChange {
+    #[default]
+    Keep,
+    Remove,
+    Replace(Vec<(String, toml_edit::Value)>),
+    /// One field, set to the value or removed with `None`; the table goes with its last field.
+    Field(String, Option<toml_edit::Value>),
+}
+
+impl ParametersChange {
+    /// Which of the three [`Patch`] states this is, for a caller that names keys. An empty
+    /// replacement writes nothing and leaves no table, so it is a removal, which a backend that
+    /// never sends `parameters` takes as the remedy rather than the offense.
+    fn state(&self) -> PatchState {
+        match self {
+            Self::Keep => PatchState::Keep,
+            Self::Remove | Self::Field(_, None) => PatchState::Remove,
+            Self::Replace(fields) if fields.is_empty() => PatchState::Remove,
+            Self::Replace(_) | Self::Field(_, Some(_)) => PatchState::Set,
+        }
+    }
 }
 
 impl ProfileChanges {
     /// Every key with what happens to it, in the order the file carries the keys.
-    fn states(&self) -> [(&'static str, PatchState); 14] {
+    fn states(&self) -> [(&'static str, PatchState); 16] {
         [
             ("model", self.model.state()),
             ("fallbacks", self.fallbacks.state()),
@@ -398,6 +515,8 @@ impl ProfileChanges {
             ("thinking_display", self.thinking_display.state()),
             ("encrypted_reasoning", self.encrypted_reasoning.state()),
             ("reasoning_summary", self.reasoning_summary.state()),
+            ("cyber_access_program", self.cyber_access_program.state()),
+            ("parameters", self.parameters.state()),
         ]
     }
 
@@ -503,6 +622,7 @@ impl ProfileChanges {
         ));
         changes.extend(boolean("encrypted_reasoning", &self.encrypted_reasoning));
         changes.extend(boolean("reasoning_summary", &self.reasoning_summary));
+        changes.extend(text("cyber_access_program", &self.cyber_access_program));
         Ok(changes)
     }
 }
@@ -521,6 +641,7 @@ pub(crate) fn edit_profile(
     changes: &ProfileChanges,
     make_default: bool,
 ) -> crate::error::Result<()> {
+    let parameters = &changes.parameters;
     let changes = changes.to_document(name)?;
     // `_lock` is held to the end of the function, so the read, the validation and the write are one
     // critical section.
@@ -545,6 +666,10 @@ pub(crate) fn edit_profile(
         if value.is_some() {
             refuse_an_inert_key(&document, name, key)?;
         }
+    }
+    set_profile_parameters(&mut document, name, parameters);
+    if parameters.state() == PatchState::Set {
+        refuse_an_inert_key(&document, name, "parameters")?;
     }
     // Asked of the document about to be written, not of the one on disk, so no write door can
     // leave behind a profile another would have refused. Checked here rather than at the next run
@@ -577,6 +702,106 @@ pub(crate) fn toml_integer(field: &str, value: u64) -> crate::error::Result<i64>
             value
         ))
     })
+}
+
+/// A `parameters` value as typed at a shell: a TOML literal, so `0.6` is a number, `true` a
+/// boolean and `'"text"'` a string. A bare word is refused rather than read as a string, since a
+/// guess that reads `1.10` as a number has already sent `1.1`; the refusal shows it quoted when
+/// quoting is what it lacks.
+pub(crate) fn parameter_from_literal(
+    field: &str,
+    literal: &str,
+) -> crate::error::Result<toml_edit::Value> {
+    let literal = literal.trim();
+    literal.parse::<toml_edit::Value>().map_err(|_| {
+        let quoted = format!("\"{literal}\"");
+        let is_a_word = !literal.starts_with(['[', '{', '"', '\''])
+            && quoted
+                .parse::<toml_edit::Value>()
+                .is_ok_and(|value| value.as_str() == Some(literal));
+        super::refusal(if is_a_word {
+            format!(
+                "'{literal}' for `parameters.{field}` is not a TOML value; a string takes quotes: \
+                 '{quoted}'"
+            )
+        } else {
+            format!("'{literal}' for `parameters.{field}` is not a TOML value")
+        })
+    })
+}
+
+/// Refuse `fields` as load would refuse them on a `backend` profile, for a door that asks before
+/// it prompts: read back in the file's own terms, so the answer is the check's and nothing else's.
+pub(crate) fn refuse_unsendable_parameters(
+    backend: config::Backend,
+    fields: &[(String, toml_edit::Value)],
+) -> crate::error::Result<()> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let mut document = toml_edit::DocumentMut::new();
+    for (field, value) in fields {
+        document.insert(field, toml_edit::Item::Value(value.clone()));
+    }
+    // Every value here was parsed or built by `toml_edit`, so one that does not read back is meka's
+    // fault, never the user's.
+    let table: toml::Table = toml::from_str(&document.to_string()).map_err(|error| {
+        crate::error::MekaError::Internal(format!("failed to read parameters back: {error}"))
+    })?;
+    config::request_parameters(backend, Some(&table))
+        .map(|_| ())
+        .map_err(super::refusal)
+}
+
+/// A request's `parameters` object as the fields the table holds, or the first value TOML cannot:
+/// a `null`, which TOML has no word for, and an integer past the signed 64 bits TOML has.
+pub(crate) fn parameters_from_json(
+    parameters: &serde_json::Map<String, serde_json::Value>,
+) -> crate::error::Result<Vec<(String, toml_edit::Value)>> {
+    fn convert(path: &str, value: &serde_json::Value) -> crate::error::Result<toml_edit::Value> {
+        Ok(match value {
+            serde_json::Value::Null => {
+                return Err(super::refusal(format!(
+                    "`{path}` is null, which TOML cannot hold; leave the field out"
+                )));
+            }
+            serde_json::Value::Bool(flag) => toml_edit::Value::from(*flag),
+            serde_json::Value::Number(number) => match (number.as_i64(), number.as_f64()) {
+                (Some(integer), _) => toml_edit::Value::from(integer),
+                (None, Some(float)) if !number.is_u64() => toml_edit::Value::from(float),
+                _ => {
+                    return Err(super::refusal(format!(
+                        "`{path}` must be at most {} (the largest TOML integer), got {number}",
+                        i64::MAX
+                    )));
+                }
+            },
+            serde_json::Value::String(text) => toml_edit::Value::from(text.as_str()),
+            serde_json::Value::Array(items) => toml_edit::Value::Array(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| convert(&format!("{path}[{index}]"), item))
+                    .collect::<crate::error::Result<toml_edit::Array>>()?,
+            ),
+            serde_json::Value::Object(fields) => {
+                let mut table = toml_edit::InlineTable::new();
+                for (key, item) in fields {
+                    table.insert(key, convert(&format!("{path}.{key}"), item)?);
+                }
+                toml_edit::Value::InlineTable(table)
+            }
+        })
+    }
+    parameters
+        .iter()
+        .map(|(field, value)| {
+            Ok((
+                field.clone(),
+                convert(&format!("parameters.{field}"), value)?,
+            ))
+        })
+        .collect()
 }
 
 /// Insert `[profiles.<name>]` into `document`. Pure mutation so it can be unit-tested without
@@ -620,7 +845,7 @@ fn upsert_profile_document(
             toml_edit::value(toml_integer("max_request_bytes", bytes)?),
         );
     }
-    if let Some(effort) = tuning.effort.as_deref() {
+    if let Some(effort) = config::stated_text(tuning.effort.as_deref()) {
         profile.insert("effort", toml_edit::value(effort));
     }
     if let Some(vision) = tuning.vision {
@@ -649,6 +874,16 @@ fn upsert_profile_document(
     }
     if let Some(reasoning_summary) = tuning.reasoning_summary {
         profile.insert("reasoning_summary", toml_edit::value(reasoning_summary));
+    }
+    if let Some(program) = config::stated_text(tuning.cyber_access_program.as_deref()) {
+        profile.insert("cyber_access_program", toml_edit::value(program));
+    }
+    if !tuning.parameters.is_empty() {
+        let mut parameters = toml_edit::Table::new();
+        for (field, value) in &tuning.parameters {
+            parameters.insert(field, toml_edit::Item::Value(value.clone()));
+        }
+        profile.insert("parameters", toml_edit::Item::Table(parameters));
     }
     // Redundant here, since the inserts above already run in order, and deliberately kept: it is
     // the one line that makes "every writer leaves the canonical order" true of this writer too,
@@ -1421,6 +1656,41 @@ model = "untouched"
             .expect("only the named profile is judged");
     }
 
+    /// A blank string setting on an add writes no key, as one on an edit removes it, so it is not
+    /// refused either as a key the backend never sends.
+    #[test]
+    fn an_add_reads_a_blank_string_setting_as_unstated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[accounts.oai]\nbackend = \"openai-responses\"\n",
+        )
+        .expect("write config");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let written = write_profile(
+            "p",
+            "oai",
+            "m",
+            &ProfileTuning {
+                effort: Some("  ".to_string()),
+                cyber_access_program: Some(String::new()),
+                ..Default::default()
+            },
+            false,
+        );
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        written.expect("a blank states nothing to refuse");
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(
+            !contents.contains("effort") && !contents.contains("cyber_access_program"),
+            "{contents}"
+        );
+    }
+
     /// The account is checked under the lock the write takes, not only before the prompts.
     ///
     /// `run_add` asks of the config it parsed before prompting, and `account remove` re-asks its
@@ -1547,9 +1817,7 @@ model = "untouched"
 
     /// A thinking key is refused on a profile whose account's backend never sends one.
     ///
-    /// `profile add` drops such a flag with a warning; `set` refuses, because a command whose
-    /// entire job is one key cannot report success having written nothing. Both doors reach the
-    /// same place: the key does not end up in a profile that ignores it.
+    /// Every door refuses such a key, so it does not end up in a profile that ignores it.
     #[test]
     fn setting_a_thinking_key_on_a_backend_without_thinking_is_refused() {
         let document = r#"[accounts.oai]
@@ -1557,6 +1825,9 @@ backend = "openai-responses"
 
 [accounts.work]
 backend = "anthropic-messages"
+
+[accounts.gpt]
+backend = "chatgpt-subscription"
 
 [accounts.typo]
 backend = "not-a-backend"
@@ -1568,6 +1839,10 @@ model = "gpt-5.6"
 [profiles.work]
 account = "work"
 model = "claude-opus-5-5"
+
+[profiles.gpt]
+account = "gpt"
+model = "gpt-6-sol"
 
 [profiles.typo]
 account = "typo"
@@ -1626,6 +1901,14 @@ model = "m"
             message.contains("cache_control") && message.contains("openai-responses"),
             "the refusal names the key and the backend: {message}"
         );
+        // Codex's setting is `chatgpt-subscription`'s alone: an API-key Responses profile sends
+        // the field among its `parameters`.
+        refuse_an_inert_key(&document, "gpt", "cyber_access_program")
+            .expect("a ChatGPT profile may ask for a program");
+        for profile in ["oai", "work"] {
+            refuse_an_inert_key(&document, profile, "cyber_access_program")
+                .expect_err("no other backend sends it");
+        }
     }
 
     /// `--unset` removes the key rather than writing an empty value.
@@ -1698,6 +1981,7 @@ account = "work"
             "thinking_display",
             "max_request_bytes",
             "cache_control",
+            "parameters",
         ] {
             assert!(!rendered.contains(key), "{key} written unasked: {rendered}");
         }
@@ -1721,6 +2005,13 @@ account = "work"
                 thinking_display: Some(crate::config::ThinkingDisplay::Summarized),
                 max_request_bytes: Some(8_388_608),
                 cache_control: Some(false),
+                parameters: vec![
+                    ("temperature".to_string(), toml_edit::Value::from(0.6)),
+                    (
+                        "stop".to_string(),
+                        toml_edit::Value::Array(["a"].into_iter().collect()),
+                    ),
+                ],
                 ..Default::default()
             },
         )
@@ -1740,6 +2031,311 @@ account = "work"
         );
         assert_eq!(profile.max_request_bytes, Some(8_388_608));
         assert_eq!(profile.cache_control, Some(false));
+        assert_eq!(
+            profile.parameters,
+            Some(toml::from_str("temperature = 0.6\nstop = [\"a\"]").expect("a table"))
+        );
+    }
+
+    /// `parameters` is edited a field at a time in a table of its own, placed after its profile's
+    /// keys and before the next profile, and a field's comments survive an edit as a key's do. The
+    /// table goes with its last field, a request's object replaces it whole, and an inline profile
+    /// gets an inline table.
+    #[test]
+    fn parameters_are_edited_field_by_field_in_their_own_table() {
+        let mut document = r#"[profiles.work]
+account = "work"
+model = "m"
+
+[profiles.other]
+account = "work"
+model = "o"
+"#
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse");
+        let field = |name: &str, value: Option<toml_edit::Value>| {
+            ParametersChange::Field(name.to_string(), value)
+        };
+        set_profile_parameters(
+            &mut document,
+            "work",
+            &field("temperature", Some(toml_edit::Value::from(0.6))),
+        );
+        set_profile_parameters(
+            &mut document,
+            "work",
+            &field("top_p", Some(toml_edit::Value::from(0.9))),
+        );
+        assert_eq!(
+            document.to_string(),
+            "[profiles.work]\naccount = \"work\"\nmodel = \"m\"\n\n[profiles.work.parameters]\n\
+             temperature = 0.6\ntop_p = 0.9\n\n[profiles.other]\naccount = \"work\"\nmodel = \"o\"\n"
+        );
+
+        let mut annotated = document
+            .to_string()
+            .replace("temperature = 0.6", "# warm\ntemperature = 0.6 # for now")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse");
+        set_profile_parameters(
+            &mut annotated,
+            "work",
+            &field("temperature", Some(toml_edit::Value::from(0.2))),
+        );
+        let rendered = annotated.to_string();
+        assert!(
+            rendered.contains("# warm\ntemperature = 0.2 # for now"),
+            "{rendered}"
+        );
+
+        set_profile_parameters(&mut document, "work", &field("temperature", None));
+        set_profile_parameters(&mut document, "work", &field("top_p", None));
+        assert!(
+            !document.to_string().contains("parameters"),
+            "the table goes with its last field: {document}"
+        );
+
+        set_profile_parameters(
+            &mut document,
+            "work",
+            &ParametersChange::Replace(vec![("seed".to_string(), toml_edit::Value::from(7))]),
+        );
+        set_profile_parameters(
+            &mut document,
+            "work",
+            &ParametersChange::Replace(vec![("top_k".to_string(), toml_edit::Value::from(20))]),
+        );
+        let rendered = document.to_string();
+        assert!(
+            rendered.contains("[profiles.work.parameters]\ntop_k = 20\n")
+                && !rendered.contains("seed"),
+            "a replacement leaves only what it names: {rendered}"
+        );
+        set_profile_parameters(&mut document, "work", &ParametersChange::Remove);
+        assert!(!document.to_string().contains("parameters"), "{document}");
+
+        let mut inline = "profiles.work = { account = \"work\", model = \"m\" }\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse");
+        set_profile_parameters(
+            &mut inline,
+            "work",
+            &field("temperature", Some(toml_edit::Value::from(0.6))),
+        );
+        let parsed: config::ConfigFile = toml::from_str(&inline.to_string()).expect("parses");
+        assert_eq!(
+            parsed.profiles["work"].parameters,
+            Some(toml::from_str("temperature = 0.6").expect("a table")),
+            "{inline}"
+        );
+    }
+
+    /// An edit of another key sorts the profile's own keys and leaves `parameters` last, its fields
+    /// in the order they were written, a field named like a profile key included.
+    #[test]
+    fn an_edit_leaves_the_parameters_in_their_order() {
+        let mut document = "[profiles.work]\naccount = \"work\"\nmodel = \"m\"\n\
+                            parameters.top_p = 0.9\nparameters.temperature = 0.6\n\
+                            parameters.thinking = { type = \"disabled\" }\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse");
+        assert!(set_profile_field(
+            &mut document,
+            "work",
+            "effort",
+            Some(toml_edit::Value::from("high"))
+        ));
+        assert_eq!(
+            document.to_string(),
+            "[profiles.work]\naccount = \"work\"\nmodel = \"m\"\neffort = \"high\"\n\
+             parameters.top_p = 0.9\nparameters.temperature = 0.6\n\
+             parameters.thinking = { type = \"disabled\" }\n"
+        );
+        let mut inline =
+            "profiles.work = { account = \"work\", parameters = { b = 1, a = 2 }, model = \
+                          \"m\" }\n"
+                .parse::<toml_edit::DocumentMut>()
+                .expect("parse");
+        assert!(set_profile_field(
+            &mut inline,
+            "work",
+            "effort",
+            Some(toml_edit::Value::from("high"))
+        ));
+        let profile = inline["profiles"]["work"]
+            .as_inline_table()
+            .expect("an inline profile");
+        assert_eq!(
+            profile.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            ["account", "model", "effort", "parameters"],
+            "{inline}"
+        );
+        let parameters = profile
+            .get("parameters")
+            .and_then(|value| value.as_inline_table())
+            .expect("the parameters");
+        assert_eq!(
+            parameters.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            ["b", "a"],
+            "{inline}"
+        );
+    }
+
+    /// The check a door asks before it prompts refuses what load would, in load's words, and an
+    /// empty replacement is a removal, which a backend that never sends the table takes.
+    #[test]
+    fn a_door_asks_the_load_check_before_it_prompts() {
+        let fields = |field: &str, value: toml_edit::Value| vec![(field.to_string(), value)];
+        refuse_unsendable_parameters(
+            config::Backend::OpenAiChatCompletions,
+            &fields("temperature", toml_edit::Value::from(0.6)),
+        )
+        .expect("a field meka leaves alone");
+        let message = refuse_unsendable_parameters(
+            config::Backend::OpenAiChatCompletions,
+            &fields("stream", toml_edit::Value::from(false)),
+        )
+        .expect_err("a field meka writes")
+        .to_string();
+        assert!(
+            message.contains("`parameters.stream` is written by meka on 'openai-chat-completions'"),
+            "{message}"
+        );
+        let date = "1979-05-27"
+            .parse::<toml_edit::Value>()
+            .expect("a date literal");
+        assert!(
+            refuse_unsendable_parameters(
+                config::Backend::ClaudeSubscription,
+                &fields("when", date)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ParametersChange::Replace(Vec::new()).state(),
+            PatchState::Remove
+        );
+    }
+
+    /// A rename takes the profile's `parameters` table with it, and a removal takes it away.
+    #[test]
+    fn a_profile_s_parameters_follow_a_rename_and_a_removal() {
+        let mut document = "[profiles.work]\naccount = \"work\"\nmodel = \"m\"\n\n\
+                            [profiles.work.parameters]\ntemperature = 0.6\n\n\
+                            [profiles.other]\naccount = \"work\"\nmodel = \"o\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse");
+        rename_table_entry(&mut document, "profiles", "work", "main").expect("rename");
+        let parsed: config::ConfigFile = toml::from_str(&document.to_string()).expect("parses");
+        assert_eq!(
+            parsed.profiles["main"].parameters,
+            Some(toml::from_str("temperature = 0.6").expect("a table")),
+            "{document}"
+        );
+        assert!(!parsed.profiles.contains_key("work"), "{document}");
+        assert!(remove_profile_document(&mut document, "main"));
+        assert!(!document.to_string().contains("temperature"), "{document}");
+    }
+
+    /// A field meka writes is refused by the check both write doors ask, before anything is
+    /// written, and a subscription refuses the table as a key it never sends.
+    #[test]
+    fn a_parameter_meka_writes_is_refused_by_both_write_doors() {
+        let good = "[accounts.work]\nbackend = \"openai-chat-completions\"\n\n[profiles.work]\n\
+                    account = \"work\"\nmodel = \"m\"\n";
+        let with = |parameters: &str| format!("{good}\n[profiles.work.parameters]\n{parameters}\n");
+        refuse_a_profile_that_cannot_run(good, &with("temperature = 0.6"), "work")
+            .expect("a parameter meka leaves alone");
+        let message = refuse_a_profile_that_cannot_run(good, &with("stream = false"), "work")
+            .expect_err("a field meka writes")
+            .to_string();
+        assert!(
+            message.contains("`parameters.stream` is written by meka"),
+            "{message}"
+        );
+
+        let document = "[accounts.claude]\nbackend = \"claude-subscription\"\n\n\
+                        [profiles.claude]\naccount = \"claude\"\nmodel = \"m\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse");
+        let message = refuse_an_inert_key(&document, "claude", "parameters")
+            .expect_err("a subscription sends no parameters")
+            .to_string();
+        assert!(message.contains("never sends `parameters`"), "{message}");
+    }
+
+    /// A shell's literal and a request's JSON reach the file as the TOML they mean, and a value
+    /// TOML has no form for is refused naming where it sits.
+    #[test]
+    fn a_shell_s_and_a_request_s_parameters_reach_the_file_as_toml() {
+        for (literal, expected) in [
+            ("0.6", "0.6"),
+            ("20", "20"),
+            ("true", "true"),
+            ("\"text\"", "\"text\""),
+            ("[\"a\", 1]", "[\"a\", 1]"),
+            ("{ order = [\"x\"] }", "{ order = [\"x\"] }"),
+        ] {
+            assert_eq!(
+                parameter_from_literal("field", literal)
+                    .expect("a literal")
+                    .to_string(),
+                expected
+            );
+        }
+        let message = parameter_from_literal("provider", "deepinfra")
+            .expect_err("a bare word")
+            .to_string();
+        assert!(
+            message.contains("a string takes quotes: '\"deepinfra\"'"),
+            "{message}"
+        );
+        for broken in ["[\"a\",", "{ order = ", "a\\b"] {
+            let message = parameter_from_literal("stop", broken)
+                .expect_err("not a value")
+                .to_string();
+            assert!(
+                message.contains("is not a TOML value") && !message.contains("takes quotes"),
+                "quoting would not make '{broken}' one: {message}"
+            );
+        }
+
+        let from_json = |json: serde_json::Value| {
+            parameters_from_json(json.as_object().expect("an object")).map(|fields| {
+                fields
+                    .into_iter()
+                    .map(|(field, value)| format!("{field} = {value}"))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            from_json(serde_json::json!({
+                "temperature": 0.6,
+                "seed": 7,
+                "stream_extra": true,
+                "provider": {"order": ["x"], "weights": [1, 2.5]},
+            }))
+            .expect("fields"),
+            [
+                "temperature = 0.6",
+                "seed = 7",
+                "stream_extra = true",
+                "provider = { order = [\"x\"], weights = [1, 2.5] }",
+            ]
+        );
+        for (json, refusal) in [
+            (
+                serde_json::json!({"provider": {"order": [null]}}),
+                "`parameters.provider.order[0]` is null",
+            ),
+            (
+                serde_json::json!({"seed": u64::MAX}),
+                "`parameters.seed` must be at most 9223372036854775807",
+            ),
+        ] {
+            let message = from_json(json).expect_err("no TOML form").to_string();
+            assert!(message.contains(refusal), "{message}");
+        }
     }
 
     #[test]

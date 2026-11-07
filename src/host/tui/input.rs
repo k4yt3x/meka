@@ -14,7 +14,7 @@ use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use crate::store::recall::{CommandLineMatch, RecallFilter, RecallOrder, RecallStore};
 
 /// The composer's background: a dark block that reads as "type here" on a dark theme and stays
-/// quiet on a light one, a step lighter than the status row under it so the two do not merge.
+/// quiet on a light one.
 pub(crate) const COMPOSER_BACKGROUND: Color = Color::Indexed(234);
 
 /// Entries loaded into memory when a walk through the recall entries begins.

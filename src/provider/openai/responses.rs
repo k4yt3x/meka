@@ -51,6 +51,8 @@ pub(crate) struct OpenAiResponsesProvider {
     reasoning_summary: bool,
     /// See `AccountConfig::prompt_cache_key`.
     prompt_cache_key: bool,
+    /// See [`crate::config::ProfileConfig::parameters`].
+    parameters: serde_json::Map<String, serde_json::Value>,
 }
 
 impl OpenAiResponsesProvider {
@@ -69,6 +71,7 @@ impl OpenAiResponsesProvider {
             encrypted_reasoning,
             reasoning_summary,
             prompt_cache_key,
+            parameters,
             ..
         } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
@@ -92,6 +95,7 @@ impl OpenAiResponsesProvider {
             encrypted_reasoning,
             reasoning_summary,
             prompt_cache_key,
+            parameters,
         })
     }
 
@@ -146,6 +150,9 @@ impl OpenAiResponsesProvider {
                 "prompt_cache_key".into(),
                 serde_json::Value::String(session_id.to_string()),
             );
+        }
+        if let Some(fields) = body.as_object_mut() {
+            crate::provider::add_parameters(fields, &self.parameters);
         }
         body
     }
@@ -322,6 +329,38 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["instructions"], "s");
+    }
+
+    /// Every field this builder writes is one a profile's `parameters` may not name, and the
+    /// parameters go out beside them.
+    #[test]
+    fn the_reserved_fields_are_what_the_builder_writes() {
+        let provider = OpenAiResponsesProvider::from_settings(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::OpenAiResponses,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "gpt-6-astra".to_string(),
+            )
+            .effort(Some("high".to_string()))
+            .max_output_tokens(Some(4096))
+            .parameters(crate::provider::parameters_for_test()),
+        )
+        .expect("build test provider");
+        let attribution = crate::provider::Attribution {
+            session_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let tools = [crate::provider::ToolDefinition::new(
+            "read",
+            "reads",
+            serde_json::json!({"type": "object"}),
+        )];
+        let body = provider.build_body("s", &[Message::user("hi")], &tools, &[], &attribution);
+        crate::provider::assert_writes_its_reserved_fields(
+            crate::config::Backend::OpenAiResponses,
+            &body,
+        );
     }
 
     /// Each field has its own switch, for the endpoint or the model that refuses it, and a switch

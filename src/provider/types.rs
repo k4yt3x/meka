@@ -37,6 +37,64 @@ pub(crate) fn resolve_effort_level(configured: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase)
 }
+/// Add a profile's `parameters` to a request `body`, each as the top-level field it names.
+///
+/// Called by each API-key backend's one body builder, so the request-size budget counts them and a
+/// streamed and a whole request both carry them. A field meka writes was refused at load (see
+/// [`crate::config::Backend::reserved_request_fields`]); one that reached here anyway is a list
+/// out of step with its builder, and meka's own value stays, since the conversation depends on it.
+pub(crate) fn add_parameters(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    parameters: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (field, value) in parameters {
+        debug_assert!(
+            !body.contains_key(field),
+            "`{field}` is written by meka and missing from its backend's reserved fields"
+        );
+        body.entry(field.clone()).or_insert_with(|| value.clone());
+    }
+}
+/// The parameters each builder test sends: a number and an object, beside meka's own fields.
+#[cfg(test)]
+pub(crate) fn parameters_for_test() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("temperature".to_string(), serde_json::json!(0.3)),
+        (
+            "provider".to_string(),
+            serde_json::json!({"order": ["deepinfra"]}),
+        ),
+    ])
+}
+/// Assert that `body`, built with every switch on and [`parameters_for_test`], writes exactly the
+/// fields `backend` reserves and carries the parameters beside them as sent.
+#[cfg(test)]
+pub(crate) fn assert_writes_its_reserved_fields(
+    backend: crate::config::Backend,
+    body: &serde_json::Value,
+) {
+    let parameters = parameters_for_test();
+    let fields = body.as_object().expect("a request body is an object");
+    let mut written: Vec<&str> = fields
+        .keys()
+        .map(String::as_str)
+        .filter(|field| !parameters.contains_key(*field))
+        .collect();
+    written.sort_unstable();
+    let mut reserved: Vec<&str> = backend
+        .reserved_request_fields()
+        .iter()
+        .map(|(field, _)| *field)
+        .collect();
+    reserved.sort_unstable();
+    assert_eq!(
+        written, reserved,
+        "{backend} reserves what its builder writes"
+    );
+    for (field, value) in &parameters {
+        assert_eq!(fields.get(field), Some(value), "{backend} sends `{field}`");
+    }
+}
 /// Pay-as-you-go / extra-usage (overage credits) state. Normalized from Anthropic's `extra_usage` +
 /// `spend` blocks and Codex's `credits` + `spend_control` blocks; every numeric field is optional
 /// because the two providers report different subsets.

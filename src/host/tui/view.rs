@@ -30,9 +30,6 @@ use crate::{
 
 /// Rows left between two items.
 const ITEM_GAP: usize = 1;
-/// The status row's background: a shade darker than the composer's, so the two read as a footer
-/// under a field rather than one block.
-pub(crate) const STATUS_BACKGROUND: Color = Color::Indexed(233);
 /// The icon on a compaction's boundary row: two arrows pressing in, as Zed's icon of four does.
 const COMPACTION_ICON: &str = "→←";
 /// The words on a compaction's boundary row.
@@ -1877,11 +1874,12 @@ pub(crate) fn composer_bar_color(facts: &StatusFacts<'_>) -> Color {
     }
 }
 
-/// The status row under the composer. Against the left, after a dot each, what the next prompt
-/// goes under, the permission level in its color and the profile in white and the model dimmed,
-/// then where the session works, the path and the project, dimmed; in the shell mode, what Enter
-/// does instead, in red. Against the right edge, the session's live readings, the context gauge and
-/// the work running, or a hint while one stands. Each fact as the config lists it.
+/// The status row under the composer, on the terminal's background in its own colors. Against the
+/// left, after a dot each, what the next prompt goes under: the permission level in its color, the
+/// profile, and the model dimmed, then where the session works, the path and the project, dimmed;
+/// in the shell mode, what Enter does instead, in red. Against the right edge, the session's live
+/// readings, the context gauge and the work running, or a hint while one stands. Each fact as the
+/// config lists it.
 ///
 /// Where the row is narrow, the level stays whole and the readings give way to it; the facts after
 /// the level give way from the last, the one that no longer fits cut to what is left (a path from
@@ -1918,12 +1916,12 @@ pub(crate) fn status_line(facts: &StatusFacts<'_>, width: usize) -> Line<'static
                         | StatusFact::Path
                         | StatusFact::Project
                 ) => {}
-            StatusFact::Profile => after.extend(facts.profile.clone().map(|profile| {
-                (
-                    Span::styled(profile, Style::default().fg(draw::WHITE)),
-                    false,
-                )
-            })),
+            StatusFact::Profile => after.extend(
+                facts
+                    .profile
+                    .clone()
+                    .map(|profile| (Span::raw(profile), false)),
+            ),
             StatusFact::Model => after.extend(
                 facts
                     .model
@@ -2018,7 +2016,7 @@ pub(crate) fn status_line(facts: &StatusFacts<'_>, width: usize) -> Line<'static
     let mut spans = left.spans;
     spans.push(Span::raw(" ".repeat(fill)));
     spans.push(right);
-    draw::on_shade(Line::from(spans))
+    Line::from(spans)
 }
 
 /// What the agent is doing, as the stream says it: the word on the working row.
@@ -4661,11 +4659,15 @@ mod tests {
                 .map(|span| span.style.fg)
         };
         assert_eq!(style_of("workspace"), Some(Some(level)));
-        assert_eq!(style_of("work"), Some(Some(draw::WHITE)));
+        assert_eq!(
+            style_of("work"),
+            Some(None),
+            "the profile is in the terminal's own color"
+        );
         assert_eq!(
             style_of("claude-opus-4-8"),
-            Some(Some(draw::DIM_ON_SHADE)),
-            "what is dimmed on the row's shade is in the shade's gray"
+            Some(Some(Color::DarkGray)),
+            "what is dimmed is in the terminal's dark gray, with no shade to swallow it"
         );
         let running = RunningWork {
             tasks: 2,

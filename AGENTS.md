@@ -374,6 +374,41 @@ combination nobody configured and no field states the mismatch.
   because `base_url` decides the endpoint, subscription backends for the product because the
   endpoint is fixed.
 
+## Typed keys and `parameters`
+
+A profile shapes the request two ways. A **typed key** is meka's: a name meka defines and writes in
+each wire's own form. **`[profiles.<name>.parameters]`** is the provider's: fields meka copies
+into the request body without reading them, spelled as that provider documents them. A setting is a
+typed key only when it answers yes to one of three questions:
+
+1. **Is it meka's own?** meka acts on the value (computes from it, decides by it, or changes how it
+   builds, reads or replays the conversation), or sends the field unasked for a feature of its own,
+   where the key is the switch an endpoint that refuses the field needs. `thinking`,
+   `max_output_tokens` on a Messages wire, `encrypted_reasoning`, `reasoning_summary` and
+   `deferred_tools` are meka's own. Typed, on the backends where that holds.
+2. **Does every backend have it?** One concept every wire states, under whatever names: `effort`,
+   `max_output_tokens`. Typed, as one name meka translates.
+3. **Does a subscription's official client offer it?** A subscription's request copies an official
+   client's and takes no `parameters`, so a setting that client offers its user is a typed key on
+   that backend alone, sent as the client sends it: `thinking_display` is Claude Code's display
+   modes, `cyber_access_program` is Codex's Daybreak. An API-key backend copies no client's
+   request, so there the same setting answers the first two questions like any other:
+   `access_programs` is a parameter on `openai-responses`.
+
+Anything else is a parameter: `temperature`, `top_p`, `stop`, verbosity, a server's own extensions.
+Showing a value on `/status` is not acting on it, and translating a name is no reason on its own: a
+concept only some backends share is written in each one's spelling, or the typed set becomes a
+translation table that grows with every provider.
+
+Each top-level field of a request has one owner, so nothing overrides anything. meka reserves every
+field it writes on a backend, whether or not a given profile makes it write that field, and a
+parameter naming one is refused at load and at every write door through one predicate, with the
+typed key to use when there is one. A server's synonym for a reserved field (`max_tokens` beside
+`max_completion_tokens`) is the server's fact and stays free. The reserved fields are listed per
+backend beside `reads_profile_key`, and a test holds the list equal to what each backend's largest
+request writes: a builder that starts writing a new field makes a config that sets it refuse to
+load, which is a `**Breaking:**` change.
+
 ## Schema and migrations
 
 `src/store/migrations.rs` is an append-only ledger applied on open inside the schema lock, in one

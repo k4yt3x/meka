@@ -42,6 +42,8 @@ pub(crate) struct OpenAiChatCompletionsProvider {
     max_request_bytes: Option<usize>,
     /// See `AccountConfig::stream_usage`.
     stream_usage: bool,
+    /// See [`crate::config::ProfileConfig::parameters`].
+    parameters: serde_json::Map<String, serde_json::Value>,
 }
 
 impl OpenAiChatCompletionsProvider {
@@ -57,6 +59,7 @@ impl OpenAiChatCompletionsProvider {
             max_output_tokens,
             max_request_bytes,
             stream_usage,
+            parameters,
             ..
         } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
@@ -75,6 +78,7 @@ impl OpenAiChatCompletionsProvider {
             max_output_tokens,
             max_request_bytes,
             stream_usage,
+            parameters,
         })
     }
 
@@ -323,6 +327,7 @@ impl OpenAiChatCompletionsProvider {
                 .collect();
             body.insert("tools".into(), serde_json::json!(openai_tools));
         }
+        crate::provider::add_parameters(&mut body, &self.parameters);
 
         serde_json::Value::Object(body)
     }
@@ -601,6 +606,9 @@ struct ChatCompletionsStream {
     /// wire marks no end of reasoning, so the first content or tool-call delta closes it, and the
     /// stream's end closes one that nothing followed.
     reasoning_open: bool,
+    /// The `index` of the choice this stream follows: the first one it names. A profile's
+    /// `parameters` may ask for `n` answers, which stream interleaved, one choice per chunk.
+    choice_index: Option<u64>,
 }
 
 impl ChatCompletionsStream {
@@ -703,7 +711,24 @@ async fn handle_stream_chunk(
         }
     }
 
-    let Some(choice) = data.get("choices").and_then(|choices| choices.get(0)) else {
+    // The first choice the stream names is the answer, whatever number a server gives it; a choice
+    // under another `index` is one more of `n` answers, left out rather than mixed in.
+    let index_of = |choice: &serde_json::Value| {
+        choice
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let Some(choice) = data
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| {
+            let followed = *stream
+                .choice_index
+                .get_or_insert(index_of(choices.first()?));
+            choices.iter().find(|choice| index_of(choice) == followed)
+        })
+    else {
         return ChunkOutcome::Continue;
     };
 
@@ -1179,6 +1204,78 @@ mod tests {
             .await
             .expect_err("no stop reason and no terminal frame is a truncated stream");
         assert!(matches!(error, MekaError::StreamError(_)), "{error:?}");
+    }
+
+    /// A profile that sends `n` gets its answers interleaved, one choice per chunk under its own
+    /// `index`; the first is the answer, and the others are not mixed into it.
+    #[tokio::test]
+    async fn a_second_answer_streamed_under_n_is_left_out() {
+        let (events, _, final_stop) = drive_chunks(&[
+            serde_json::json!({"choices": [{"index": 0, "delta": {"content": "first"}}]}),
+            serde_json::json!({"choices": [{"index": 1, "delta": {"content": "second"}}]}),
+            serde_json::json!({"choices": [{"index": 1, "delta": {}, "finish_reason": "length"}]}),
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ])
+        .await;
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "first");
+        assert_eq!(final_stop, Some(StopReason::EndTurn));
+
+        // A server that numbers its only choice otherwise is still followed, an empty first chunk
+        // fixing nothing.
+        let (events, ..) = drive_chunks(&[
+            serde_json::json!({"choices": []}),
+            serde_json::json!({"choices": [{"index": 1, "delta": {"content": "only"}}]}),
+        ])
+        .await;
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::TextDelta(text)] if text == "only"),
+            "{events:?}"
+        );
+    }
+
+    /// Every field this builder writes, streamed or whole, is one a profile's `parameters` may not
+    /// name, and the parameters go out on both.
+    #[test]
+    fn the_reserved_fields_are_what_the_builder_writes() {
+        let provider = OpenAiChatCompletionsProvider::from_settings(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::OpenAiChatCompletions,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "gpt-4o".to_string(),
+            )
+            .effort(Some("high".to_string()))
+            .max_output_tokens(Some(4096))
+            .parameters(crate::provider::parameters_for_test()),
+        )
+        .expect("build test provider");
+        let tools = [ToolDefinition::new(
+            "read",
+            "reads",
+            serde_json::json!({"type": "object"}),
+        )];
+        let streamed = provider.build_request_body("s", &[Message::user("hi")], &tools, true);
+        crate::provider::assert_writes_its_reserved_fields(
+            crate::config::Backend::OpenAiChatCompletions,
+            &streamed,
+        );
+        let whole = provider.build_request_body("s", &[Message::user("hi")], &tools, false);
+        let reserved = crate::config::Backend::OpenAiChatCompletions.reserved_request_fields();
+        for field in whole.as_object().expect("an object").keys() {
+            assert!(
+                reserved.iter().any(|(reserved, _)| reserved == field)
+                    || crate::provider::parameters_for_test().contains_key(field),
+                "a whole request writes `{field}`, which is not reserved"
+            );
+        }
+        assert_eq!(whole["temperature"], 0.3);
     }
 
     /// `"error": null` rides on every chunk from some servers and is not a failure.

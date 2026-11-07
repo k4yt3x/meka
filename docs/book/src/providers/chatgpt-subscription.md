@@ -63,6 +63,24 @@ account endpoints behind `meka account usage`, `whoami` and `stats` hang off `/b
 `codex` rather than under it: a trailing `/codex` is stripped and `/backend-api` appended when the
 path has none, so both shapes reach `/backend-api/wham/usage`.
 
+### Daybreak
+
+With Daybreak on, Codex sends `access_programs: {"cyber": "<program>"}` on every request, the
+Daybreak program the account's model list offers for the model in use, `daybreak_blue` ahead of
+`daybreak_red`; with it off, `standard` where the model offers it. A profile asks for a program with
+[`cyber_access_program`](../configuration/config-file.md#cyber_access_program), so Codex's switch is
+a second profile on the same account, chosen with `--profile` or `/profile` from the next turn:
+
+```toml
+[profiles.daybreak]
+account              = "chatgpt"
+model                = "gpt-6-sol"
+cyber_access_program = "daybreak_blue"
+```
+
+The program is stated rather than looked up, since meka reads no model list, and the endpoint
+rejects one the model does not offer the account, naming the one to set.
+
 ## Supported models
 
 Whatever your ChatGPT subscription tier exposes. For the current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models); `meka profile add` suggests `gpt-6-astra` for a profile on an OpenAI account. The model field on the request body is forwarded verbatim; meka doesn't gate which model strings are valid.
@@ -73,7 +91,7 @@ Each request:
 
 1. **Auth header set**: `Authorization: Bearer <access_token>`, `ChatGPT-Account-ID: <workspace_id>` (extracted from the JWT id_token at login), `originator: meka_cli`, plus a `User-Agent` identifying meka. A turn also carries `session-id` and `thread-id`, both the session's id; see [Prompt caching](#prompt-caching).
 2. **Cookie jar enabled**: `chatgpt.com` is fronted by Cloudflare; bot-clearance cookies (`__cf_bm` etc.) persist across requests automatically.
-3. **Body**: standard Responses API JSON: `instructions`, `input` (an array of `message` / `reasoning` / `function_call` / `function_call_output` items), `tools`, optional `reasoning.effort`, plus the two reasoning parameters Codex also sends: `reasoning.summary: "auto"` and `include: ["reasoning.encrypted_content"]`. Both are sent on every request, whether or not `effort` is configured. A turn adds `prompt_cache_key`, the session's id.
+3. **Body**: standard Responses API JSON: `instructions`, `input` (an array of `message` / `reasoning` / `function_call` / `function_call_output` items), `tools`, optional `reasoning.effort`, plus the two reasoning parameters Codex also sends: `reasoning.summary: "auto"` and `include: ["reasoning.encrypted_content"]`. Both are sent on every request, whether or not `effort` is configured. A turn adds `prompt_cache_key`, the session's id, and a profile's [`cyber_access_program`](#daybreak) adds `access_programs`.
 4. **Stream**: SSE events: `response.output_text.delta` for text, `response.output_item.added` / `…done` for tool calls, `response.reasoning_summary_text.delta` (and `response.reasoning_text.delta`) for thinking, `response.reasoning_summary_part.added` for the break between summary sections, `response.completed` for end-of-turn with token usage.
 
 ### Reasoning across turns
@@ -94,6 +112,7 @@ OpenAI's prompt cache is automatic and unbilled, but a hit needs the request to 
 - **Streaming-only**: the Codex endpoint has no non-streaming shape, so meka always streams here and folds the stream internally to satisfy a non-streaming completion. `--no-stream` is accepted and behaves normally; it changes what the terminal renders, not what goes on the wire.
 - **Subscription required**: you need a paid ChatGPT plan with Codex enabled. Free-tier accounts can complete the OAuth flow but most models will reject requests at the API layer.
 - **Bot detection**: chatgpt.com may serve a Cloudflare challenge if request patterns look automated. meka's reqwest client handles cookie-clearance automatically; if you hit a hard challenge, complete it once in a regular browser to refresh the cookies.
+- **No `parameters`**: the request is Codex's, so a profile's [`parameters`](../configuration/config-file.md#parameters) are not sent; a table on such a profile is reported at startup and refused by `meka profile add` and `set`.
 - **Endpoint stability**: this is OpenAI's subscription-internal API; OpenAI doesn't guarantee compatibility for third-party clients. Future Codex versions could add request signing or rotate scopes; meka will need updates if that happens.
 
 ## Subscription vs API key

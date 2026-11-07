@@ -3101,8 +3101,7 @@ impl Screen {
                     Paragraph::new(Text::from(view::status_line(
                         &facts,
                         status_area.width as usize,
-                    )))
-                    .style(Style::default().bg(view::STATUS_BACKGROUND)),
+                    ))),
                     status_area,
                 );
             }

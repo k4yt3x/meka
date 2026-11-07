@@ -450,7 +450,7 @@ twice the real occupancy, since the two tiers are counted as separate tokens. Su
 `false`, which sends no breakpoint at all and leaves the endpoint's own implicit caching to work; a
 Claude model on the same account keeps the default. The other backends never read it:
 `claude-subscription` pins its own breakpoint and the OpenAI wires have none, so `meka profile add
---cache-control` is dropped for them and `meka profile set` refuses it.
+--cache-control` and `meka profile set` refuse it for them.
 
 ```toml
 [profiles.gemini]
@@ -510,6 +510,65 @@ model               = "gpt-4.1"
 encrypted_reasoning = false
 reasoning_summary   = false
 ```
+
+### `cyber_access_program`
+
+`chatgpt-subscription` only. The cyber access program each request asks for, sent as
+`access_programs.cyber`, which is what Codex sends with Daybreak on. The value is OpenAI's:
+`standard`, `daybreak_blue` or `daybreak_red`, trimmed and otherwise sent as written. Unset sends
+nothing, which leaves the program to the server. Which programs a model offers is the account's
+fact: Codex reads it off the account's model list, meka reads no such list, and the endpoint
+rejects a program the model does not offer, naming the one to set. A Daybreak model such as `gpt-daybreak-blue-latest` runs on
+its own program with the key unset. The other backends never read it, and `meka profile add` and
+`set` refuse it on their profiles; on `openai-responses` the field is a parameter like any other,
+`access_programs = { cyber = "daybreak_blue" }`.
+
+```toml
+[profiles.daybreak]
+account              = "chatgpt"
+model                = "gpt-6-sol"
+cyber_access_program = "daybreak_blue"
+```
+
+### `parameters`
+
+`anthropic-messages`, `openai-chat-completions` and `openai-responses` only. Fields meka adds to
+every request the profile makes, sent as written: sampling settings such as `temperature` and
+`top_p`, and anything else the endpoint accepts, a server's own extensions included. Each key is
+one top-level field of the request body, spelled as the provider's API reference spells it, and
+its value is any TOML value: a string, a number, a boolean, an array or a table. meka reads none
+of them, so a field the endpoint does not know is the endpoint's to refuse or ignore.
+
+```toml
+[profiles.qwen]
+account = "openrouter"
+model   = "qwen/qwen3-235b-a22b"
+effort  = "high"
+
+[profiles.qwen.parameters]
+temperature = 0.6
+top_p       = 0.95
+top_k       = 20
+provider    = { order = ["deepinfra"], allow_fallbacks = false }
+```
+
+A setting meka understands is a profile field of its own, never a parameter: `effort` and
+`max_output_tokens` are sent under each backend's own name, and `thinking` decides fields of its
+own. So a field meka writes itself is refused when the config loads and by every command that
+writes a profile, naming the profile field to set instead; each backend's page lists the fields
+it writes. A server's other name for one of them is not refused: on a server that reads
+`max_tokens` and not `max_completion_tokens`, leave `max_output_tokens` unset and send
+`max_tokens` here.
+
+The parameters go out on every request the profile makes, compaction summaries and sub-agents on
+the profile included. A value JSON cannot carry is refused: a date or time, and `nan` or `inf`.
+The two subscription backends read no `parameters`, because their request is the official
+client's; a table on such a profile is reported at startup and refused by `meka profile add` and
+`meka profile set`.
+
+Set one field with `meka profile set <name> parameters.<field> <value>`, the value a TOML literal
+(`0.6`, `true`, `'"text"'`, `'["a", "b"]'`, `'{ order = ["x"] }'`), or on `meka profile add` with
+`--parameter <field>=<value>`, repeatable.
 
 ## `[mcp]`
 

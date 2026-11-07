@@ -52,7 +52,7 @@ gray, keywords blue, strings green, numbers yellow, names of functions and types
 wider than the block folds at its edge, and a tab is drawn as four columns. The text is drawn in the
 terminal's own colors, so the screen follows your terminal's theme. Fixed are the shades behind the
 composer, a prompt, an open run and a code block, a diff's tints and the marks on its lines, the
-white of a prompt's words and of the profile on the status row, the gray of dimmed text on a shade,
+white of a prompt's words, the gray of dimmed text on a shade,
 and a picture's pixels.
 
 A turn, its finished run of steps opened:

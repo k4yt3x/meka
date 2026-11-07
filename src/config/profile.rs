@@ -113,8 +113,10 @@ where
 /// it: [`ProfileSettings`], [`resolve_profile`], `ProfileTuning`, `upsert_profile_document`,
 /// `SETTABLE_PROFILE_KEYS`, the `profile add` flags, and the `config.toml` reference. `account`
 /// leads, then `model`, then `fallbacks` as the one key that names another profile, then every
-/// model-tied knob by how many backends read it: the keys every backend reads first, down to
-/// `thinking_display` as the only `claude-subscription` setting.
+/// model-tied knob by how many backends read it: the keys every backend reads first, down to the
+/// keys of one backend, Anthropic's ahead of OpenAI's and each API-key backend's ahead of its
+/// subscription's. `parameters` is last whatever its count, because its usual spelling, a table of
+/// its own, can only follow the profile's own keys.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileConfig {
@@ -174,7 +176,7 @@ pub(crate) struct ProfileConfig {
     /// `false` to leave the endpoint's own implicit caching to work.
     pub(crate) cache_control: Option<bool>,
     /// `claude-subscription` only: how the model's thinking is presented, one of Claude Code's
-    /// three display modes. Defaults to `updates`, Claude Code's own default.
+    /// three display modes. Defaults to `summarized`; see [`crate::config::ThinkingDisplay`].
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
     /// `openai-responses` only: whether a request asks for the model's reasoning sealed, with
     /// `include: ["reasoning.encrypted_content"]`, and sends it back on the turn's later requests
@@ -185,6 +187,58 @@ pub(crate) struct ProfileConfig {
     /// model's reasoning meka shows as its thinking. Defaults to `true`; a model or endpoint that
     /// refuses the field sets it `false`.
     pub(crate) reasoning_summary: Option<bool>,
+    /// `chatgpt-subscription` only: the cyber access program a request asks for, sent as
+    /// `access_programs.cyber` the way Codex sends it under `/daybreak`. A value of OpenAI's
+    /// (`standard`, `daybreak_blue`, `daybreak_red`), trimmed and otherwise sent as written: which
+    /// programs a model offers an account is the server's to say, and it rejects one the model
+    /// does not. Unset sends nothing, which leaves the program to the server.
+    pub(crate) cyber_access_program: Option<String>,
+    /// Request body fields meka sends as written and never reads, spelled as the provider
+    /// documents them: `temperature`, `top_p`, a server's own extensions. Each is one top-level
+    /// field, and one meka writes itself is refused, so nothing overrides anything; see
+    /// [`request_parameters`]. Read by the API-key backends alone, since a subscription's request
+    /// copies an official client's.
+    pub(crate) parameters: Option<toml::Table>,
+}
+/// A string setting as a profile states it: a blank value states nothing, which is how resolution
+/// reads one, how an edit removes the key, and how an add writes none.
+pub(crate) fn stated_text(value: Option<&str>) -> Option<&str> {
+    value.filter(|text| !text.trim().is_empty())
+}
+
+impl ProfileConfig {
+    /// The keys after `account` and `model` this profile states a value for, in the file's order. A
+    /// blank string and an empty `parameters` table state nothing.
+    pub(crate) fn stated_keys(&self) -> Vec<&'static str> {
+        [
+            ("fallbacks", !self.fallbacks.is_empty()),
+            ("context_window", self.context_window.is_some()),
+            ("max_output_tokens", self.max_output_tokens.is_some()),
+            ("max_request_bytes", self.max_request_bytes.is_some()),
+            ("effort", stated_text(self.effort.as_deref()).is_some()),
+            ("vision", self.vision.is_some()),
+            ("deferred_tools", self.deferred_tools.is_some()),
+            ("thinking", self.thinking.is_some()),
+            ("thinking_budget", self.thinking_budget.is_some()),
+            ("cache_control", self.cache_control.is_some()),
+            ("thinking_display", self.thinking_display.is_some()),
+            ("encrypted_reasoning", self.encrypted_reasoning.is_some()),
+            ("reasoning_summary", self.reasoning_summary.is_some()),
+            (
+                "cyber_access_program",
+                stated_text(self.cyber_access_program.as_deref()).is_some(),
+            ),
+            (
+                "parameters",
+                self.parameters
+                    .as_ref()
+                    .is_some_and(|fields| !fields.is_empty()),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(key, stated)| stated.then_some(key))
+        .collect()
+    }
 }
 /// [`AccountConfig`]'s field order, as the key names a `config.toml` account table carries.
 pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
@@ -219,6 +273,8 @@ pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
     "thinking_display",
     "encrypted_reasoning",
     "reasoning_summary",
+    "cyber_access_program",
+    "parameters",
 ];
 /// Put one table's keys into `order`.
 ///
@@ -256,8 +312,34 @@ pub(crate) fn sort_account_keys(account: &mut toml_edit::Item) {
     sort_keys(account, ACCOUNT_KEY_ORDER);
 }
 /// Put one profile table's keys into [`PROFILE_KEY_ORDER`].
+///
+/// `parameters` is lifted out first and put back last, where the order puts it: its fields are the
+/// provider's, in the order the user wrote them, and `toml_edit` sorts inside a dotted table with
+/// the same ranking, which would move a field named like a profile key ahead of the rest.
 pub(crate) fn sort_profile_keys(profile: &mut toml_edit::Item) {
+    let parameters = match profile {
+        toml_edit::Item::Table(table) => table.remove_entry("parameters"),
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(table)) => table
+            .remove_entry("parameters")
+            .map(|(key, value)| (key, toml_edit::Item::Value(value))),
+        _ => None,
+    };
     sort_keys(profile, PROFILE_KEY_ORDER);
+    let Some((key, parameters)) = parameters else {
+        return;
+    };
+    match (profile, parameters) {
+        (toml_edit::Item::Table(table), parameters) => {
+            table.insert_formatted(&key, parameters);
+        }
+        (
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(table)),
+            toml_edit::Item::Value(parameters),
+        ) => {
+            table.insert_formatted(&key, parameters);
+        }
+        _ => {}
+    }
 }
 /// One profile resolved through its account into everything needed to build a provider for it.
 ///
@@ -304,6 +386,11 @@ pub(crate) struct ProfileSettings {
     pub(crate) encrypted_reasoning: bool,
     /// See [`ProfileConfig::reasoning_summary`]; resolved to the default here.
     pub(crate) reasoning_summary: bool,
+    /// See [`ProfileConfig::cyber_access_program`]; trimmed, and `None` when blank.
+    pub(crate) cyber_access_program: Option<String>,
+    /// See [`ProfileConfig::parameters`]; as the body carries them, empty on a backend that reads
+    /// none.
+    pub(crate) parameters: serde_json::Map<String, serde_json::Value>,
     /// See [`AccountConfig::prompt_cache_key`]; resolved to the default here.
     pub(crate) prompt_cache_key: bool,
     /// See [`AccountConfig::stream_usage`]; resolved to the default here.
@@ -427,6 +514,9 @@ pub(crate) fn resolve_profile(
         thinking_display: profile.thinking_display.unwrap_or_default(),
         encrypted_reasoning: profile.encrypted_reasoning.unwrap_or(true),
         reasoning_summary: profile.reasoning_summary.unwrap_or(true),
+        cyber_access_program: stated_text(profile.cyber_access_program.as_deref())
+            .map(|program| program.trim().to_string()),
+        parameters: request_parameters(backend, profile.parameters.as_ref())?,
         prompt_cache_key: account.prompt_cache_key.unwrap_or(true),
         stream_usage: account.stream_usage.unwrap_or(true),
         // Only where the backend reads it: a hand-edited file can state it anywhere, and load warns
@@ -435,6 +525,96 @@ pub(crate) fn resolve_profile(
             .max_tool_name_bytes
             .filter(|_| backend.reads_account_key("max_tool_name_bytes"))
             .unwrap_or(backend.max_tool_name_bytes()),
+    })
+}
+/// A profile's `parameters` as the request body carries them, each a top-level field sent as
+/// written, or why the profile cannot run with them.
+///
+/// The one check, through [`resolve_profile`], which load, a session's resolution and every write
+/// door's reparse all reach. A field `backend` writes itself is refused naming the setting that
+/// decides it, since either owner winning would make the other's setting a lie. A value is held to
+/// what JSON can carry on every backend, so whatever a profile states can be shown; the map is
+/// empty on a backend that reads no `parameters`, where load warns and the write doors refuse.
+pub(crate) fn request_parameters(
+    backend: Backend,
+    parameters: Option<&toml::Table>,
+) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
+    let Some(parameters) = parameters else {
+        return Ok(serde_json::Map::new());
+    };
+    let sent = backend.reads_profile_key("parameters");
+    parameters
+        .iter()
+        .filter_map(|(field, value)| {
+            let checked = check_parameter(backend, field, value);
+            (sent || checked.is_err()).then_some(checked)
+        })
+        .collect()
+}
+/// One field of `parameters` as the body carries it, or why it cannot be.
+fn check_parameter(
+    backend: Backend,
+    field: &str,
+    value: &toml::Value,
+) -> std::result::Result<(String, serde_json::Value), String> {
+    if field.trim().is_empty() {
+        return Err("a field of `parameters` needs a name".to_string());
+    }
+    if let Some((_, decided_by)) = backend
+        .reserved_request_fields()
+        .iter()
+        .find(|(reserved, _)| *reserved == field)
+    {
+        return Err(match decided_by {
+            Some(setting) => format!(
+                "`parameters.{field}` is written by meka on '{backend}'; set {setting} instead"
+            ),
+            None => format!("`parameters.{field}` is written by meka on '{backend}'; remove it"),
+        });
+    }
+    Ok((
+        field.to_string(),
+        parameter_to_json(&format!("parameters.{field}"), value)?,
+    ))
+}
+/// One `parameters` value as JSON, or why a request cannot carry it.
+///
+/// Converted by hand rather than by deserializing the table into `serde_json::Value`, which reads
+/// a date as an object holding `toml`'s private field and a NaN as `null`, both without a word.
+fn parameter_to_json(
+    path: &str,
+    value: &toml::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    Ok(match value {
+        toml::Value::String(text) => serde_json::Value::String(text.clone()),
+        toml::Value::Integer(number) => serde_json::Value::from(*number),
+        toml::Value::Float(number) => serde_json::Number::from_f64(*number)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| format!("`{path}` is not a finite number"))?,
+        toml::Value::Boolean(flag) => serde_json::Value::Bool(*flag),
+        toml::Value::Datetime(_) => {
+            return Err(format!(
+                "`{path}` is a date or time, which a request cannot carry"
+            ));
+        }
+        toml::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| parameter_to_json(&format!("{path}[{index}]"), item))
+                .collect::<std::result::Result<_, _>>()?,
+        ),
+        toml::Value::Table(table) => serde_json::Value::Object(
+            table
+                .iter()
+                .map(|(key, item)| {
+                    Ok((
+                        key.clone(),
+                        parameter_to_json(&format!("{path}.{key}"), item)?,
+                    ))
+                })
+                .collect::<std::result::Result<_, String>>()?,
+        ),
     })
 }
 /// The `claude-subscription` device identifier for one account, seeding and persisting one when
@@ -843,6 +1023,105 @@ mod tests {
         }
     }
 
+    fn parameters(text: &str) -> toml::Table {
+        toml::from_str(text).expect("a parameters table")
+    }
+
+    /// Every value goes out as written, nested ones included, on each backend that reads them; a
+    /// field the backend writes itself is refused naming what decides it, or with "remove it"
+    /// where nothing does; a subscription carries none.
+    #[test]
+    fn parameters_go_out_as_written_and_a_field_meka_writes_is_refused() {
+        let table = parameters(
+            "temperature = 0.6\ntop_k = 20\nlogprobs = true\nstop = [\"a\", \"b\"]\n\
+             provider = { order = [\"deepinfra\"], allow_fallbacks = false }\n",
+        );
+        for backend in [
+            Backend::AnthropicMessages,
+            Backend::OpenAiChatCompletions,
+            Backend::OpenAiResponses,
+        ] {
+            let sent = request_parameters(backend, Some(&table)).expect("parameters");
+            assert_eq!(
+                serde_json::Value::Object(sent),
+                serde_json::json!({
+                    "temperature": 0.6,
+                    "top_k": 20,
+                    "logprobs": true,
+                    "stop": ["a", "b"],
+                    "provider": {"order": ["deepinfra"], "allow_fallbacks": false},
+                }),
+                "{backend}"
+            );
+        }
+        for backend in [Backend::ClaudeSubscription, Backend::ChatGptSubscription] {
+            assert!(
+                request_parameters(backend, Some(&table))
+                    .expect("inert")
+                    .is_empty(),
+                "{backend} copies an official client's request"
+            );
+        }
+
+        let refused = |backend: Backend, field: &str| {
+            request_parameters(backend, Some(&parameters(&format!("{field} = 1"))))
+                .expect_err("a field meka writes")
+        };
+        assert_eq!(
+            refused(Backend::OpenAiChatCompletions, "max_completion_tokens"),
+            "`parameters.max_completion_tokens` is written by meka on 'openai-chat-completions'; \
+             set the profile's `max_output_tokens` instead"
+        );
+        assert_eq!(
+            refused(Backend::OpenAiResponses, "reasoning"),
+            "`parameters.reasoning` is written by meka on 'openai-responses'; set the profile's \
+             `effort` and `reasoning_summary` instead"
+        );
+        assert_eq!(
+            refused(Backend::AnthropicMessages, "stream"),
+            "`parameters.stream` is written by meka on 'anthropic-messages'; remove it"
+        );
+        // A server's synonym for a field meka writes is the server's to read.
+        assert!(
+            request_parameters(
+                Backend::OpenAiChatCompletions,
+                Some(&parameters("max_tokens = 100"))
+            )
+            .is_ok()
+        );
+    }
+
+    /// A value JSON has no form for is refused naming where it sits, never sent as something else.
+    #[test]
+    fn a_parameter_a_request_cannot_carry_is_refused() {
+        let refused = |text: &str| {
+            request_parameters(Backend::OpenAiChatCompletions, Some(&parameters(text)))
+                .expect_err("a value a request cannot carry")
+        };
+        assert_eq!(
+            refused("when = 1979-05-27"),
+            "`parameters.when` is a date or time, which a request cannot carry"
+        );
+        assert_eq!(
+            refused("top_p = nan"),
+            "`parameters.top_p` is not a finite number"
+        );
+        assert_eq!(
+            refused("provider = { weights = [1.0, inf] }"),
+            "`parameters.provider.weights[1]` is not a finite number"
+        );
+        assert_eq!(refused("\" \" = 1"), "a field of `parameters` needs a name");
+        // On a backend that never sends the table too, so whatever a profile states can be shown.
+        for backend in Backend::ALL {
+            assert_eq!(
+                request_parameters(backend, Some(&parameters("when = 1979-05-27")))
+                    .expect_err("a date"),
+                "`parameters.when` is a date or time, which a request cannot carry",
+                "{backend}"
+            );
+        }
+    }
+
     fn profiles_from(
         backends: &[(&str, &str)],
     ) -> std::collections::BTreeMap<String, ProfileConfig> {
@@ -894,6 +1173,28 @@ mod tests {
             "falls back to `[session].context_window`"
         );
         assert_eq!(settings.effort, None, "no effort means the provider's own");
+    }
+
+    /// A program is sent trimmed, and a blank one is no program at all.
+    #[test]
+    fn a_cyber_access_program_resolves_trimmed_and_a_blank_one_to_none() {
+        let resolve = |program: &str| {
+            let profile = ProfileConfig {
+                cyber_access_program: Some(program.to_string()),
+                ..Default::default()
+            };
+            resolve_profile(
+                &profile,
+                &account_on("chatgpt-subscription"),
+                None,
+                None,
+                String::new(),
+            )
+            .expect("resolves")
+            .cyber_access_program
+        };
+        assert_eq!(resolve(" daybreak_blue ").as_deref(), Some("daybreak_blue"));
+        assert_eq!(resolve("  "), None);
     }
 
     /// An account's tool-name cap is the wire's own limit unless the account states the
@@ -1238,6 +1539,8 @@ mod tests {
             "thinking_display = \"redacted\"\n",
             "encrypted_reasoning = false\n",
             "reasoning_summary = false\n",
+            "cyber_access_program = \"daybreak_blue\"\n",
+            "parameters = { temperature = 0.6 }\n",
         );
 
         let parsed: ConfigFile =
@@ -1263,6 +1566,11 @@ mod tests {
             keys_of("profiles"),
             PROFILE_KEY_ORDER,
             "the fixture must cover the profile list exactly, in order"
+        );
+        assert_eq!(
+            parsed.profiles["work"].stated_keys(),
+            PROFILE_KEY_ORDER[2..],
+            "every key after `account` and `model` is one a profile can state"
         );
     }
 

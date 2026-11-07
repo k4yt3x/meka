@@ -40,7 +40,7 @@ login.
 
 | Command | Action |
 |---|---|
-| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5-5` on a Claude account and `gpt-6-astra` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](../configuration/config-file.md#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget`, `--max-request-bytes`, `--cache-control`, `--thinking-display <DISPLAY>`, `--encrypted-reasoning` and `--reasoning-summary`, so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Writes `default_profile` only when a second profile joins a sole one, naming the one that was alone. |
+| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5-5` on a Claude account and `gpt-6-astra` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](../configuration/config-file.md#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--max-request-bytes`, `--effort`, `--vision`, `--deferred-tools`, `--thinking`, `--thinking-budget`, `--cache-control`, `--thinking-display <DISPLAY>`, `--encrypted-reasoning`, `--reasoning-summary` and `--cyber-access-program`; `--fallback <name>`, repeatable, adds to `fallbacks`, and `--parameter <field>=<value>`, repeatable, writes one of the [`parameters`](../configuration/config-file.md#parameters), so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Writes `default_profile` only when a second profile joins a sole one, naming the one that was alone. |
 | `meka profile list` | List configured profiles with account, backend, model and the default marker; `--format json` prints the same as one document. Names any profile whose account is not configured. |
 | `meka profile set <name> <key> <value>` | Change one setting on an existing profile, in place. `--unset` in place of the value removes the key instead. See [Changing one setting](#changing-one-setting). |
 | `meka profile use <name>` | Set `default_profile` to this profile. |
@@ -69,12 +69,12 @@ $ meka profile set work context_window 200000
 $ meka profile set work effort --unset
 ```
 
-`--unset` removes the key so the profile falls back to meka's default for it. That is not the same
-as writing an empty value: an absent key follows whatever the documented default later becomes,
-which is what an unstated setting has always meant. `model` is the one key with no default to fall
+`--unset` removes the key so the profile falls back to meka's default for it, and an absent key
+follows whatever the documented default later becomes. An empty value on a string key (`effort`,
+`cyber_access_program`) removes it the same way. `model` is the one key with no default to fall
 back to, so `--unset model` and an empty `model` are both refused.
 
-Twelve keys are settable, each named after the [profile field](../configuration/config-file.md#profile-fields) it writes, in the
+These keys are settable, each named after the [profile field](../configuration/config-file.md#profile-fields) it writes, in the
 order the fields are documented:
 
 | Key | Value |
@@ -91,6 +91,10 @@ order the fields are documented:
 | `thinking_budget` | A whole number of tokens |
 | `cache_control` | `true` or `false` |
 | `thinking_display` | `updates`, `summarized` or `redacted` |
+| `encrypted_reasoning` | `true` or `false` |
+| `reasoning_summary` | `true` or `false` |
+| `cyber_access_program` | Any string |
+| `parameters.<field>` | A TOML literal: `0.6`, `true`, `'"text"'`, `'["a", "b"]'` or `'{ order = ["x"] }'`; a bare word is refused rather than read as a string. One top-level field at a time; `--unset parameters` removes them all |
 
 A token count must be whole and at most 9223372036854775807, the largest integer TOML can represent;
 anything else is refused before the file is opened. A boolean takes `true` or `false` and nothing
@@ -102,7 +106,7 @@ leaving it silently off the list: moving a profile to another account moves ever
 onto another credential and possibly another backend. Add a profile on the other account instead.
 An account key (`base_url`, `client_id`, ...) is refused with a pointer to the account table.
 
-Three more rules are enforced on `meka profile add` and `meka profile set` alike, so neither door
+Four more rules are enforced on `meka profile add` and `meka profile set` alike, so neither door
 can leave behind a profile the other would have declined:
 
 - **A profile without a model.** A session on such a profile is refused by name at its first turn,
@@ -120,7 +124,11 @@ can leave behind a profile the other would have declined:
   them, because removing an inert key is the remedy rather than the offense, and a hand-edited file
   is the one place one can already be sitting; such a file warns at startup. The account keys
   `client_id` and `oauth_token_url` follow the same rule on `meka account add`, which refuses them
-  for an API-key backend.
+  for an API-key backend. [`parameters`](../configuration/config-file.md#parameters) is the same
+  on the two subscription backends, which send none.
+- **A parameter meka writes itself**, such as `stream` or `max_completion_tokens`. Each field of
+  the request has one owner, so the refusal names the profile field that decides it, where one
+  does; the config is refused at load the same way.
 - **A [`max_output_tokens`](../configuration/config-file.md#max_output_tokens) that does not exceed the thinking budget**, under
   `thinking = "budgeted"` on one of those two backends. The budget is drawn from the output cap, so
   such a profile cannot produce a valid request; both commands check the file they are about to

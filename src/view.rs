@@ -301,6 +301,13 @@ pub(crate) struct ProfileDetailView {
     pub(crate) encrypted_reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_summary: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cyber_access_program: Option<String>,
+    /// The request fields sent as written, as the file states them. Load holds every profile's to
+    /// values JSON can carry, on a backend that sends them or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "serve", schema(value_type = Option<Object>))]
+    pub(crate) parameters: Option<toml::Table>,
 }
 
 impl ProfileDetailView {
@@ -337,6 +344,11 @@ impl ProfileDetailView {
                 .map(|display| display.name().to_string()),
             encrypted_reasoning: profile.encrypted_reasoning,
             reasoning_summary: profile.reasoning_summary,
+            cyber_access_program: profile.cyber_access_program.clone(),
+            parameters: profile
+                .parameters
+                .clone()
+                .filter(|parameters| !parameters.is_empty()),
         }
     }
 }

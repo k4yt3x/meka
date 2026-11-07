@@ -9,8 +9,8 @@ use crate::{
         Patch,
         account::validate_backend,
         profile::{
-            ProfileChanges, ProfileTuning, edit_profile, remove_profile, rename_profile,
-            write_profile,
+            ParametersChange, ProfileChanges, ProfileTuning, edit_profile, parameter_from_literal,
+            refuse_unsendable_parameters, remove_profile, rename_profile, write_profile,
         },
     },
 };
@@ -40,6 +40,8 @@ pub(crate) async fn run(
             thinking_display,
             encrypted_reasoning,
             reasoning_summary,
+            cyber_access_program,
+            parameter,
         } => run_add(name, account.as_deref(), model.clone(), ProfileTuning {
             fallbacks: fallback.clone(),
             context_window: *context_window,
@@ -54,6 +56,8 @@ pub(crate) async fn run(
             thinking_display: *thinking_display,
             encrypted_reasoning: *encrypted_reasoning,
             reasoning_summary: *reasoning_summary,
+            cyber_access_program: cyber_access_program.clone(),
+            parameters: parameter_flags(parameter)?,
         }),
         ProfileAction::List { format } => run_list(*format),
         ProfileAction::Set {
@@ -208,7 +212,22 @@ pub(super) const SETTABLE_PROFILE_KEYS: &[&str] = &[
     "thinking_display",
     "encrypted_reasoning",
     "reasoning_summary",
+    "cyber_access_program",
+    "parameters",
 ];
+
+/// [`SETTABLE_PROFILE_KEYS`] as a listing shows them: `parameters` by the spelling that sets a
+/// field of it.
+pub(super) fn settable_profile_keys_listing() -> String {
+    SETTABLE_PROFILE_KEYS
+        .iter()
+        .map(|key| match *key {
+            "parameters" => "parameters.<field>",
+            key => key,
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// One `key`/`value` pair as typed at a shell, as the edit door takes it; `None` removes the key.
 ///
@@ -241,8 +260,25 @@ fn parse_profile_change(key: &str, value: Option<&str>) -> anyhow::Result<Profil
         })
     };
     let mut changes = ProfileChanges::default();
+    if let Some(field) = key.strip_prefix("parameters.") {
+        changes.parameters = ParametersChange::Field(
+            parameter_field(field)?.to_string(),
+            value
+                .map(|value| parameter_from_literal(field, value))
+                .transpose()?,
+        );
+        return Ok(changes);
+    }
     match key {
         "model" => changes.model = patch(value, |value| Ok(value.to_string()))?,
+        "parameters" => {
+            if value.is_some() {
+                anyhow::bail!(
+                    "`parameters` is set one field at a time, as `parameters.<field> <value>`"
+                );
+            }
+            changes.parameters = ParametersChange::Remove;
+        }
         "fallbacks" => {
             changes.fallbacks = patch(value, |value| {
                 let names = fallback_names(value);
@@ -257,6 +293,9 @@ fn parse_profile_change(key: &str, value: Option<&str>) -> anyhow::Result<Profil
             })?;
         }
         "effort" => changes.effort = patch(value, |value| Ok(value.to_string()))?,
+        "cyber_access_program" => {
+            changes.cyber_access_program = patch(value, |value| Ok(value.to_string()))?;
+        }
         "context_window" => changes.context_window = integer("context_window")?,
         "max_output_tokens" => changes.max_output_tokens = integer("max_output_tokens")?,
         "max_request_bytes" => changes.max_request_bytes = integer("max_request_bytes")?,
@@ -291,6 +330,38 @@ fn parse_profile_change(key: &str, value: Option<&str>) -> anyhow::Result<Profil
     Ok(changes)
 }
 
+/// The field `parameters.<field>` names: one top-level field of the request, since that is what a
+/// parameter is. A dotted name would reach inside one, which is the value's to say.
+fn parameter_field(field: &str) -> anyhow::Result<&str> {
+    if field.trim().is_empty() {
+        anyhow::bail!("`parameters.` needs a field name");
+    }
+    if let Some((outer, _)) = field.split_once('.') {
+        anyhow::bail!(
+            "`parameters.{field}` names a field inside `{outer}`; set `parameters.{outer}` whole, \
+             as an inline table"
+        );
+    }
+    Ok(field)
+}
+
+/// The `--parameter FIELD=VALUE` flags of `profile add`, each value a TOML literal.
+fn parameter_flags(flags: &[String]) -> anyhow::Result<Vec<(String, toml_edit::Value)>> {
+    flags
+        .iter()
+        .map(|flag| {
+            let Some((field, value)) = flag
+                .split_once('=')
+                .filter(|(field, _)| !field.trim().is_empty())
+            else {
+                anyhow::bail!("`--parameter` takes FIELD=VALUE, got '{flag}'");
+            };
+            let field = parameter_field(field.trim())?;
+            Ok((field.to_string(), parameter_from_literal(field, value)?))
+        })
+        .collect()
+}
+
 /// The names a `fallbacks` value on the command line carries: comma-separated, blanks dropped.
 pub(crate) fn fallback_names(value: &str) -> Vec<String> {
     value
@@ -316,7 +387,7 @@ fn unsettable_key_refusal(key: &str) -> anyhow::Error {
         }
         _ => anyhow::anyhow!(
             "'{key}' is not a profile setting (settable: {})",
-            SETTABLE_PROFILE_KEYS.join(", ")
+            settable_profile_keys_listing()
         ),
     }
 }
@@ -327,7 +398,7 @@ fn unsettable_key_refusal(key: &str) -> anyhow::Error {
 /// the same words as `set modle x`. Checking it inside the value branch instead left `--unset` to
 /// accept any spelling and report success, having changed nothing.
 fn ensure_settable_key(key: &str) -> anyhow::Result<()> {
-    if SETTABLE_PROFILE_KEYS.contains(&key) {
+    if SETTABLE_PROFILE_KEYS.contains(&key) || key.starts_with("parameters.") {
         return Ok(());
     }
     Err(unsettable_key_refusal(key))
@@ -508,6 +579,15 @@ fn budget_is_worth_asking_about(thinking: Option<crate::config::ThinkingMode>) -
     thinking == Some(crate::config::ThinkingMode::Budgeted)
 }
 
+/// The `profile add` flag that states `key`: its own name, singular for the two that repeat.
+fn add_flag(key: &str) -> String {
+    match key {
+        "fallbacks" => "--fallback".to_string(),
+        "parameters" => "--parameter".to_string(),
+        key => format!("--{}", key.replace('_', "-")),
+    }
+}
+
 /// Fill in whatever the flags didn't set, offering one opt-in prompt rather than three
 /// unconditional ones. Declining leaves every unset knob out of the profile, and says which
 /// defaults that implies, because these are settings meka never infers: nothing else will tell the
@@ -532,51 +612,24 @@ fn resolve_tuning(
     // reads plausibly and does nothing.
     let takes_thinking = backend.takes_thinking();
     // Refused ahead of any prompt, as the door refuses the keys over HTTP: a flag the backend never
-    // sends would be written as a setting that reads plausibly and does nothing. Through the one
-    // function that knows which backend reads what, so no flag is missed.
-    let inert: Vec<&str> = [
-        ("thinking", "--thinking", flags.thinking.is_some()),
-        (
-            "thinking_budget",
-            "--thinking-budget",
-            flags.thinking_budget.is_some(),
-        ),
-        (
-            "thinking_display",
-            "--thinking-display",
-            flags.thinking_display.is_some(),
-        ),
-        (
-            "cache_control",
-            "--cache-control",
-            flags.cache_control.is_some(),
-        ),
-        (
-            "deferred_tools",
-            "--deferred-tools",
-            flags.deferred_tools.is_some(),
-        ),
-        (
-            "encrypted_reasoning",
-            "--encrypted-reasoning",
-            flags.encrypted_reasoning.is_some(),
-        ),
-        (
-            "reasoning_summary",
-            "--reasoning-summary",
-            flags.reasoning_summary.is_some(),
-        ),
-    ]
-    .into_iter()
-    .filter(|(key, _, given)| *given && !backend.reads_profile_key(key))
-    .map(|(_, flag, _)| flag)
-    .collect();
+    // sends would be written as a setting that reads plausibly and does nothing. Asked of the keys
+    // the door itself will check, so no flag is missed.
+    let inert: Vec<String> = flags
+        .stated_keys()
+        .into_iter()
+        .filter(|key| !backend.reads_profile_key(key))
+        .map(add_flag)
+        .collect();
     if !inert.is_empty() {
         anyhow::bail!(
             "a '{backend}' account never sends {}; nothing was written",
             inert.join(", ")
         );
     }
+    // A field the backend writes itself, or a value no request can carry, refused before the
+    // prompts too, in the words the write would use.
+    refuse_unsendable_parameters(backend, &flags.parameters)
+        .map_err(|error| anyhow::anyhow!("profile '{profile_name}': {error}"))?;
     let complete = flags.context_window.is_some()
         && flags.effort.is_some()
         && (!takes_thinking || flags.thinking.is_some());
@@ -668,6 +721,8 @@ fn resolve_tuning(
         deferred_tools: flags.deferred_tools,
         encrypted_reasoning: flags.encrypted_reasoning,
         reasoning_summary: flags.reasoning_summary,
+        cyber_access_program: flags.cyber_access_program,
+        parameters: flags.parameters,
     })
 }
 
@@ -796,6 +851,65 @@ mod tests {
             subscription.thinking_display,
             Some(crate::config::ThinkingDisplay::Redacted)
         );
+
+        // A parameter the backend writes itself is refused here too, in the words load uses.
+        let Err(refused) = resolve_tuning(
+            ProfileTuning {
+                context_window: Some(1_024),
+                effort: Some("low".to_string()),
+                parameters: vec![("stream".to_string(), toml_edit::Value::from(false))],
+                ..Default::default()
+            },
+            config::Backend::OpenAiChatCompletions,
+            "oai",
+            None,
+            None,
+        ) else {
+            panic!("a field meka writes was kept");
+        };
+        assert_eq!(
+            refused.to_string(),
+            "profile 'oai': `parameters.stream` is written by meka on 'openai-chat-completions'; \
+             remove it"
+        );
+    }
+
+    /// Every key a profile states, in the file's order, names a `profile add` flag, so the early
+    /// refusal names what was typed.
+    #[test]
+    fn every_stated_key_names_a_profile_add_flag() {
+        use clap::CommandFactory;
+        let command = crate::cli::Cli::command();
+        let add = command
+            .find_subcommand("profile")
+            .and_then(|profile| profile.find_subcommand("add"))
+            .expect("`profile add`");
+        let flags: Vec<String> = add
+            .get_arguments()
+            .filter_map(|argument| argument.get_long().map(|long| format!("--{long}")))
+            .collect();
+        let every = ProfileTuning {
+            fallbacks: vec!["backup".to_string()],
+            context_window: Some(1_024),
+            max_output_tokens: Some(1_024),
+            max_request_bytes: Some(1_024),
+            effort: Some("low".to_string()),
+            vision: Some(true),
+            deferred_tools: Some(config::DeferredTools::Native),
+            thinking: Some(config::ThinkingMode::Off),
+            thinking_budget: Some(1_024),
+            cache_control: Some(true),
+            thinking_display: Some(config::ThinkingDisplay::Updates),
+            encrypted_reasoning: Some(true),
+            reasoning_summary: Some(true),
+            cyber_access_program: Some("standard".to_string()),
+            parameters: vec![("seed".to_string(), toml_edit::Value::from(1))],
+        };
+        let keys = every.stated_keys();
+        assert_eq!(keys, config::PROFILE_KEY_ORDER[2..]);
+        for key in keys {
+            assert!(flags.contains(&add_flag(key)), "{key}: {flags:?}");
+        }
     }
 
     /// `--cache-control` is read on `anthropic-messages` alone: the OpenAI wires have no
@@ -1009,11 +1123,72 @@ mod tests {
                 "thinking" => "adaptive",
                 "deferred_tools" => "native",
                 "fallbacks" => "backup",
+                // Set a field at a time, and removed whole.
+                "parameters" => {
+                    assert!(parse_profile_change("parameters.seed", Some("1")).is_ok());
+                    assert!(parse_profile_change(key, None).is_ok());
+                    continue;
+                }
                 _ => "value",
             };
             assert!(
                 parse_profile_change(key, Some(sample)).is_ok(),
                 "'{key}' is advertised as settable but does not parse"
+            );
+        }
+    }
+
+    /// `parameters.<field>` sets or removes one top-level field, its value a TOML literal; the
+    /// table goes whole with `--unset parameters`, and a dotted field, a value for the whole table
+    /// and a malformed `--parameter` are refused with the spelling that works.
+    #[test]
+    fn a_parameter_is_set_one_field_at_a_time() {
+        let change = |key: &str, value: Option<&str>| {
+            parse_profile_change(key, value)
+                .map(|changes| changes.parameters)
+                .map_err(|error| error.to_string())
+        };
+        assert!(matches!(
+            change("parameters.temperature", Some("0.6")),
+            Ok(ParametersChange::Field(field, Some(value)))
+                if field == "temperature" && value.as_float() == Some(0.6)
+        ));
+        assert!(matches!(
+            change("parameters.temperature", None),
+            Ok(ParametersChange::Field(field, None)) if field == "temperature"
+        ));
+        assert!(matches!(
+            change("parameters", None),
+            Ok(ParametersChange::Remove)
+        ));
+        ensure_settable_key("parameters.temperature").expect("settable");
+        ensure_settable_key("parameters").expect("removable");
+
+        let refused = |key: &str, value: Option<&str>| change(key, value).expect_err("refused");
+        assert!(
+            refused("parameters.provider.order", Some("[\"x\"]"))
+                .contains("set `parameters.provider` whole")
+        );
+        assert!(refused("parameters", Some("1")).contains("`parameters.<field> <value>`"));
+        assert!(refused("parameters.", Some("1")).contains("needs a field name"));
+        assert!(refused("parameters.provider", Some("deepinfra")).contains("takes quotes"));
+
+        let flags = parameter_flags(&["temperature=0.6".to_string(), "stop=[\"a=b\"]".to_string()])
+            .expect("flags");
+        assert_eq!(
+            flags
+                .iter()
+                .map(|(field, value)| format!("{field} = {value}"))
+                .collect::<Vec<_>>(),
+            ["temperature = 0.6", "stop = [\"a=b\"]"]
+        );
+        for flag in ["temperature", "=1"] {
+            let message = parameter_flags(&[flag.to_string()])
+                .expect_err("no field and value")
+                .to_string();
+            assert!(
+                message.contains("`--parameter` takes FIELD=VALUE"),
+                "{message}"
             );
         }
     }

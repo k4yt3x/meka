@@ -46,6 +46,8 @@ pub(crate) struct AnthropicMessagesProvider {
     max_output_tokens: Option<u64>,
     /// See [`crate::config::ProfileConfig::max_request_bytes`].
     max_request_bytes: Option<usize>,
+    /// See [`crate::config::ProfileConfig::parameters`].
+    parameters: serde_json::Map<String, serde_json::Value>,
 }
 
 impl AnthropicMessagesProvider {
@@ -65,6 +67,7 @@ impl AnthropicMessagesProvider {
             effort,
             max_output_tokens,
             max_request_bytes,
+            parameters,
             ..
         } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(effort.as_deref());
@@ -85,6 +88,7 @@ impl AnthropicMessagesProvider {
             resolved_effort,
             max_output_tokens,
             max_request_bytes,
+            parameters,
         })
     }
 
@@ -167,6 +171,7 @@ impl AnthropicMessagesProvider {
                 serde_json::json!({ "effort": effort }),
             );
         }
+        crate::provider::add_parameters(&mut body, &self.parameters);
 
         serde_json::Value::Object(body)
     }
@@ -544,6 +549,35 @@ mod tests {
             );
             assert_eq!(body["output_config"]["effort"], "medium", "{model}");
         }
+    }
+
+    /// Every field this builder writes is one a profile's `parameters` may not name, and the
+    /// parameters go out beside them.
+    #[test]
+    fn the_reserved_fields_are_what_the_builder_writes() {
+        let provider = AnthropicMessagesProvider::from_settings(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::AnthropicMessages,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "claude-opus-5-5".to_string(),
+            )
+            .thinking(ThinkingMode::Budgeted, 10_000)
+            .effort(Some("high".to_string()))
+            .max_output_tokens(Some(64_000))
+            .parameters(crate::provider::parameters_for_test()),
+        )
+        .expect("build test provider");
+        let tools = [ToolDefinition::new(
+            "read",
+            "reads",
+            serde_json::json!({"type": "object"}),
+        )];
+        let body = provider.build_request_body("s", &[Message::user("hi")], &tools, true);
+        crate::provider::assert_writes_its_reserved_fields(
+            crate::config::Backend::AnthropicMessages,
+            &body,
+        );
     }
 
     #[test]

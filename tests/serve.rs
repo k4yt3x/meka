@@ -20784,6 +20784,57 @@ fn accounts_and_profiles_are_managed_over_http() {
     assert_eq!(body["effort"], "high");
     assert_eq!(body["fallbacks"], serde_json::json!(["main"]));
     assert_eq!(body["context_window"], 40000);
+
+    // `parameters` is replaced whole and removed with `null`; a field meka writes, a value TOML
+    // cannot hold, and a subscription's are refused before anything is written.
+    let parameters = serde_json::json!({"temperature": 0.6, "provider": {"order": ["x"]}});
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/profiles/side",
+        serde_json::json!({"parameters": parameters}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["parameters"], parameters);
+    let (status, body) = get("/v1/profiles/side");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["parameters"], parameters);
+    for (payload, expected) in [
+        (
+            serde_json::json!({"parameters": {"max_tokens": 10}}),
+            "`parameters.max_tokens` is written by meka on 'anthropic-messages'; set the \
+             profile's `max_output_tokens` instead",
+        ),
+        (
+            serde_json::json!({"parameters": {"stop": [null]}}),
+            "`parameters.stop[0]` is null, which TOML cannot hold; leave the field out",
+        ),
+    ] {
+        let (status, body) = send(reqwest::Method::PATCH, "/v1/profiles/side", payload);
+        assert_eq!(status, 422, "{body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains(expected),
+            "{body}"
+        );
+    }
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "/v1/profiles",
+        serde_json::json!({"name": "subp", "account": "sub", "model": "m", "parameters": {"top_k": 1}}),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["detail"],
+        "profile 'subp' bills 'sub', a 'claude-subscription' account, which never sends \
+         `parameters`; nothing was written"
+    );
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        "/v1/profiles/side",
+        serde_json::json!({"parameters": null}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("parameters").is_none(), "{body}");
+
     let (status, listing) = get("/v1/profiles");
     assert_eq!(status, 200);
     let active: Vec<&str> = listing["profiles"]

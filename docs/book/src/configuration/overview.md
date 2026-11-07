@@ -51,8 +51,9 @@ credential, meka prints an error pointing at `meka profile add` / `meka account 
 
 A profile is a named bundle: the account it bills, the model, the profiles that stand in for it,
 and every model-tied setting (`context_window`, `max_output_tokens`, `max_request_bytes`, `effort`,
-`vision`, `deferred_tools`, `thinking`, `thinking_budget`, `cache_control`, `thinking_display`). A
-session selects one by name and records that name.
+`vision`, `deferred_tools`, `thinking`, `thinking_budget`, `cache_control`, `thinking_display`,
+`encrypted_reasoning`, `reasoning_summary`, `cyber_access_program`, and the request
+[`parameters`](./config-file.md#parameters)). A session selects one by name and records that name.
 **Nothing overrides a field inside one.**
 
 There is deliberately no `--model`, `--base-url`, `--thinking` or `--thinking-budget`. A flag that

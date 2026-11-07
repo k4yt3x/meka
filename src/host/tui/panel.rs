@@ -343,7 +343,8 @@ impl Panel {
     }
 
     /// Draw the panel into `area`, on the composer's background: the heading when there is one,
-    /// the body and the choices at the text edge, the footer on the status row's shade.
+    /// the body and the choices at the text edge, the footer on the terminal's background, as the
+    /// status row is.
     pub(crate) fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(Clear, area);
         let width = area.width as usize;
@@ -426,11 +427,10 @@ impl Panel {
             },
         );
         frame.render_widget(
-            Paragraph::new(draw::on_shade(Line::from(vec![
+            Paragraph::new(Line::from(vec![
                 Span::raw(" ".repeat(TEXT_EDGE)),
                 Span::styled(footer, gray()),
-            ])))
-            .style(Style::default().bg(super::view::STATUS_BACKGROUND)),
+            ])),
             footer_row,
         );
     }

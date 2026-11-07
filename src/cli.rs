@@ -533,6 +533,12 @@ pub(crate) enum ProfileAction {
             value_name = "BOOL"
         )]
         reasoning_summary: Option<bool>,
+        /// Cyber access program to request
+        #[arg(long = "cyber-access-program", value_name = "PROGRAM")]
+        cyber_access_program: Option<String>,
+        /// Request field sent as written, the value a TOML literal (repeatable)
+        #[arg(long = "parameter", value_name = "FIELD=VALUE")]
+        parameter: Vec<String>,
     },
     /// List configured profiles
     List {
@@ -547,6 +553,7 @@ pub(crate) enum ProfileAction {
         /// Setting to write
         key: String,
         /// New value
+        #[arg(allow_negative_numbers = true)]
         value: Option<String>,
         /// Remove the setting
         #[arg(long, conflicts_with = "value")]
@@ -1187,7 +1194,7 @@ fn profile_set_about() -> String {
     format!(
         "Set one of a profile's settings\n\nKeys: {}. `account` is not settable; add a profile on the \
          other account instead.",
-        profile::SETTABLE_PROFILE_KEYS.join(", ")
+        profile::settable_profile_keys_listing()
     )
 }
 
@@ -1484,6 +1491,43 @@ mod tests {
         let cli = Cli::parse_from(["meka", "--skill", "demo", "-p", "extra context"]);
         assert_eq!(cli.skill.as_deref(), Some("demo"));
         assert_eq!(cli.prompt.as_deref(), Some("extra context"));
+    }
+
+    /// A value may be a negative number, as a penalty often is, and `--unset` after the key stays
+    /// the flag.
+    #[test]
+    fn profile_set_takes_a_negative_value_and_unset_stays_a_flag() {
+        let cli = Cli::try_parse_from([
+            "meka",
+            "profile",
+            "set",
+            "q",
+            "parameters.presence_penalty",
+            "-0.5",
+        ])
+        .expect("a negative value parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Profile {
+                action: ProfileAction::Set {
+                    value: Some(ref value),
+                    unset: false,
+                    ..
+                }
+            }) if value == "-0.5"
+        ));
+        let cli = Cli::try_parse_from(["meka", "profile", "set", "q", "effort", "--unset"])
+            .expect("`--unset` parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Profile {
+                action: ProfileAction::Set {
+                    value: None,
+                    unset: true,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]

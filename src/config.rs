@@ -28,8 +28,8 @@ pub(crate) use profile::{
     ANTHROPIC_MAX_REQUEST_BYTES, AccountConfig, Backend, DEFAULT_CONTEXT_WINDOW, ProfileCatalog,
     ProfileConfig, ProfileRefusal, ProfileRequest, ProfileSettings, account_for,
     default_profile_on_disk, refuse_an_unrunnable_profile, refuse_unrunnable_profiles,
-    require_model, require_profile, resolve_device_id, resolve_profile, select_profile,
-    sort_account_keys, sort_profile_keys, validate_max_output_tokens,
+    request_parameters, require_model, require_profile, resolve_device_id, resolve_profile,
+    select_profile, sort_account_keys, sort_profile_keys, stated_text, validate_max_output_tokens,
 };
 
 pub(crate) use self::{mcp::*, serve::*};
@@ -1329,9 +1329,72 @@ impl Backend {
             "cache_control" => matches!(self, Self::AnthropicMessages),
             // Not `chatgpt-subscription`: its endpoint is always ChatGPT, which takes both.
             "encrypted_reasoning" | "reasoning_summary" => matches!(self, Self::OpenAiResponses),
+            // Codex's own setting; an API-key profile sends the field among its `parameters`.
+            "cyber_access_program" => matches!(self, Self::ChatGptSubscription),
             // Chat Completions has no declaration to make.
             "deferred_tools" => !matches!(self, Self::OpenAiChatCompletions),
+            // Not the subscriptions: their request copies an official client's, against an
+            // endpoint that cannot vary.
+            "parameters" => !matches!(self, Self::ClaudeSubscription | Self::ChatGptSubscription),
             _ => true,
+        }
+    }
+
+    /// The top-level request fields meka writes on this backend, each with the setting that
+    /// decides it where one does. A profile's `parameters` may name none of them, so every field
+    /// has one owner. Every field the backend may write on any request whatever a profile's
+    /// settings, so whether a parameter is allowed never turns on another key. Empty on the
+    /// subscriptions, which read no `parameters`. A test beside each builder holds its list equal
+    /// to what the builder writes.
+    pub(crate) const fn reserved_request_fields(
+        self,
+    ) -> &'static [(&'static str, Option<&'static str>)] {
+        match self {
+            Self::AnthropicMessages => &[
+                ("model", Some("the profile's `model`")),
+                ("system", None),
+                ("messages", None),
+                ("tools", None),
+                ("stream", None),
+                ("max_tokens", Some("the profile's `max_output_tokens`")),
+                (
+                    "thinking",
+                    Some("the profile's `thinking` and `thinking_budget`"),
+                ),
+                ("output_config", Some("the profile's `effort`")),
+            ],
+            Self::OpenAiChatCompletions => &[
+                ("model", Some("the profile's `model`")),
+                ("messages", None),
+                ("tools", None),
+                ("stream", None),
+                ("stream_options", Some("the account's `stream_usage`")),
+                ("reasoning_effort", Some("the profile's `effort`")),
+                (
+                    "max_completion_tokens",
+                    Some("the profile's `max_output_tokens`"),
+                ),
+            ],
+            Self::OpenAiResponses => &[
+                ("model", Some("the profile's `model`")),
+                ("input", None),
+                ("instructions", None),
+                ("tools", None),
+                ("tool_choice", None),
+                ("store", None),
+                ("stream", None),
+                (
+                    "max_output_tokens",
+                    Some("the profile's `max_output_tokens`"),
+                ),
+                (
+                    "reasoning",
+                    Some("the profile's `effort` and `reasoning_summary`"),
+                ),
+                ("include", Some("the profile's `encrypted_reasoning`")),
+                ("prompt_cache_key", Some("the account's `prompt_cache_key`")),
+            ],
+            Self::ClaudeSubscription | Self::ChatGptSubscription => &[],
         }
     }
 
@@ -1566,7 +1629,7 @@ pub(crate) fn validate_fallback_chains(
 
 /// Say so for every profile or account key its backend never reads.
 ///
-/// The CLI write doors refuse or drop such a key, but a hand-written `config.toml` is another door
+/// The write doors refuse such a key, but a hand-written `config.toml` is another door
 /// with no check at all, and AGENTS.md's profile rule is that no field may state a mismatch
 /// silently: a profile on an `openai-responses` account with `thinking = "off"` read as reasoning
 /// turned off while the backend ignored the key. Asked once at load, not in `resolve_profile`,
@@ -1607,16 +1670,8 @@ fn warn_about_inert_profile_keys(
         else {
             continue;
         };
-        let set = [
-            ("thinking", profile.thinking.is_some()),
-            ("thinking_budget", profile.thinking_budget.is_some()),
-            ("cache_control", profile.cache_control.is_some()),
-            ("thinking_display", profile.thinking_display.is_some()),
-            ("encrypted_reasoning", profile.encrypted_reasoning.is_some()),
-            ("reasoning_summary", profile.reasoning_summary.is_some()),
-        ];
-        for (key, is_set) in set {
-            if is_set && !backend.reads_profile_key(key) {
+        for key in profile.stated_keys() {
+            if !backend.reads_profile_key(key) {
                 tracing::warn!(
                     "profile '{name}' sets `{key}`, which its '{backend}' account never sends"
                 );
@@ -4874,6 +4929,29 @@ required = false
             "an explicit opt-out is the file's word"
         );
         assert!(resolved.mcp_overlay.required);
+    }
+
+    /// Load warns about every key a profile states that its backend never sends, and not about a
+    /// blank string, which states nothing.
+    #[test]
+    fn load_warns_about_each_stated_key_the_backend_never_sends() {
+        let file: ConfigFile = toml::from_str(
+            "[accounts.chat]\nbackend = \"openai-chat-completions\"\n\n[profiles.inert]\naccount = \
+             \"chat\"\nmodel = \"m\"\ndeferred_tools = \"native\"\ncyber_access_program = \
+             \"daybreak_blue\"\n\n[profiles.blank]\naccount = \"chat\"\nmodel = \
+             \"m\"\ncyber_access_program = \" \"\n",
+        )
+        .expect("a config");
+        let captured = crate::streams::capture::capture_logs(tracing::Level::WARN);
+        warn_about_inert_profile_keys(&file.accounts, &file.profiles);
+        let logged = captured.logged();
+        for key in ["deferred_tools", "cyber_access_program"] {
+            assert!(
+                logged.contains(&format!("profile 'inert' sets `{key}`")),
+                "{logged}"
+            );
+        }
+        assert!(!logged.contains("profile 'blank'"), "{logged}");
     }
 
     /// Unset, the key takes the endpoint's answer: native where the endpoint is fixed or official,

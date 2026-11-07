@@ -191,6 +191,7 @@ Nothing in meka depends on that order. `patch_request_body` finds the `cch=00000
 - `diagnostics.previous_message_id`: the id of the previous response's message in this conversation, `null` on the first request, after a resume, and after a compaction that summarized that response away. A compaction's own requests name it too, and what answers them is not the conversation's previous response. Pairs with the `cache-diagnosis-2026-04-07` beta.
 - `temperature: 1` (only when `thinking = "off"`, and only for models that still accept sampling params).
 - `tools`: never meka's MCP meta-tools (`mcp_resource_*`, `mcp_prompt_*`). The endpoint answers a request declaring a tool named `mcp_<x>` with "You're out of extra usage" whatever the tool is, while a server's `mcp__<server>__<tool>` names pass, so a session on this backend neither carries nor lists them.
+- Nothing from a profile's [`parameters`](../configuration/config-file.md#parameters): the body is Claude Code's, and a table on such a profile is reported at startup and refused by `meka profile add` and `set`.
 - `max_tokens`: `128_000` under `thinking = "adaptive"`, `max(thinking_budget * 2, 32_000)` under `budgeted`, `32_000` under `off`. Claude Code reads the figure off a per-model catalog, which says `128_000` for the 5.5 line and `64_000` for the rest of the current line-up; [`max_output_tokens`](../configuration/config-file.md#max_output_tokens) on the profile states another.
 
 ### Reasoning effort

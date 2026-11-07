@@ -111,3 +111,5 @@ thinking = "budgeted"   # only if the endpoint rejects the adaptive form
 ```
 
 **Streaming:** Server-Sent Events with named event types (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`, `ping`). A non-streaming call (`--no-stream`, a compaction's checkpoint or summary) is the same stream folded in place, so every request has one shape and reads one cache; a gateway can keep a separate cache per shape.
+
+**Body fields meka writes:** `model`, `system` (when non-empty), `messages`, `tools`, `stream`, `max_tokens`, `thinking` (unless `thinking = "off"`) and `output_config` (when `effort` is set). Any other field, such as `temperature`, `top_p` or `top_k`, goes in the profile's [`parameters`](../configuration/config-file.md#parameters) as [Anthropic's API reference](https://docs.claude.com/en/api/messages) names it, and one of the fields above is refused there. Which sampling fields a model takes, and how thinking narrows them, is the API's to say, and its error names the field.

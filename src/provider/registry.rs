@@ -35,6 +35,10 @@ pub(crate) struct ProviderBuilder {
     pub(super) encrypted_reasoning: bool,
     /// See `ProfileConfig::reasoning_summary`; read by `openai-responses` alone.
     pub(super) reasoning_summary: bool,
+    /// See `ProfileConfig::cyber_access_program`; read by `chatgpt-subscription` alone.
+    pub(super) cyber_access_program: Option<String>,
+    /// See `ProfileConfig::parameters`, as the body carries them; read by the API-key backends.
+    pub(super) parameters: serde_json::Map<String, serde_json::Value>,
     /// See `AccountConfig::prompt_cache_key`; read by `openai-responses` alone.
     pub(super) prompt_cache_key: bool,
     /// See `AccountConfig::stream_usage`; read by `openai-chat-completions` alone.
@@ -70,6 +74,8 @@ impl ProviderBuilder {
             max_request_bytes: None,
             encrypted_reasoning: true,
             reasoning_summary: true,
+            cyber_access_program: None,
+            parameters: serde_json::Map::new(),
             prompt_cache_key: true,
             stream_usage: true,
             max_tool_name_bytes: None,
@@ -123,6 +129,18 @@ impl ProviderBuilder {
     /// Whether a request asks for a reasoning summary; `openai-responses` alone.
     pub(crate) fn reasoning_summary(mut self, value: bool) -> Self {
         self.reasoning_summary = value;
+        self
+    }
+
+    /// The cyber access program a request asks for; `chatgpt-subscription` alone.
+    pub(crate) fn cyber_access_program(mut self, value: Option<String>) -> Self {
+        self.cyber_access_program = value;
+        self
+    }
+
+    /// The fields a request carries as written; the API-key backends alone.
+    pub(crate) fn parameters(mut self, value: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.parameters = value;
         self
     }
 
@@ -705,6 +723,8 @@ impl ProviderRegistry {
             .max_request_bytes(settings.max_request_bytes)
             .encrypted_reasoning(settings.encrypted_reasoning)
             .reasoning_summary(settings.reasoning_summary)
+            .cyber_access_program(settings.cyber_access_program.clone())
+            .parameters(settings.parameters.clone())
             .prompt_cache_key(settings.prompt_cache_key)
             .stream_usage(settings.stream_usage)
             .max_tool_name_bytes(settings.max_tool_name_bytes)
@@ -1377,6 +1397,144 @@ mod tests {
         let (_, settings) = registry.resolve("p").await.expect("resolved");
         assert_eq!(settings.effort.as_deref(), Some("high"));
         assert_eq!(crate::sync::lock(&registry.built).len(), 1);
+    }
+
+    /// An endpoint on a free loopback port that hands back the body of the one request it takes,
+    /// then refuses it.
+    async fn one_request_endpoint() -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        let (saw_body, body_seen) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                request.extend_from_slice(&chunk[..read]);
+                let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let length: usize = String::from_utf8_lossy(&request[..head_end])
+                    .split("\r\n")
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse().ok())
+                    .unwrap_or(0);
+                if request.len() >= head_end + 4 + length {
+                    let body = String::from_utf8_lossy(&request[head_end + 4..]).into_owned();
+                    if saw_body.send(body).is_err() {
+                        return;
+                    }
+                    break;
+                }
+            }
+            if socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                      content-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if socket.shutdown().await.is_err() {
+                tracing::debug!("mock endpoint failed to shut its socket down cleanly");
+            }
+        });
+
+        (port, body_seen)
+    }
+
+    /// The body profile `p` of `file` sends through a resolved provider, its credential saved
+    /// first.
+    async fn body_sent_for(
+        file: &str,
+        credential: crate::store::AuthCredential,
+        body_seen: tokio::sync::oneshot::Receiver<String>,
+    ) -> serde_json::Value {
+        let store = crate::store::Store::for_test().await;
+        store
+            .token_store()
+            .save_account_credential("work", &credential)
+            .await
+            .expect("save");
+        let file: crate::config::ConfigFile = toml::from_str(file).expect("a config");
+        let registry = crate::provider::ProviderRegistry::for_test_over(
+            file.accounts,
+            file.profiles,
+            store.token_store(),
+        );
+        let (provider, _) = registry.resolve("p").await.expect("resolved");
+        let outcome = provider
+            .complete(
+                crate::provider::CompletionRequest::new(
+                    "",
+                    &[crate::conversation::Message::user("hi")],
+                    &[],
+                ),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(outcome.is_err(), "the endpoint refuses the request");
+        serde_json::from_str(&body_seen.await.expect("the request arrives")).expect("json")
+    }
+
+    /// A profile's `parameters` reach the request its resolved provider sends, from the parsed
+    /// file through the resolution and the builder to the body on a socket.
+    #[tokio::test]
+    async fn a_profile_s_parameters_reach_the_wire() {
+        let (port, body_seen) = one_request_endpoint().await;
+        let body = body_sent_for(
+            &format!(
+                "[accounts.work]\nbackend = \"openai-chat-completions\"\nbase_url = \
+                 \"http://127.0.0.1:{port}/v1\"\n\n[profiles.p]\naccount = \"work\"\nmodel = \
+                 \"m\"\n\n[profiles.p.parameters]\ntemperature = 0.3\n"
+            ),
+            crate::store::AuthCredential::ApiKey("sk-test".to_string()),
+            body_seen,
+        )
+        .await;
+        assert_eq!(body["temperature"], 0.3, "{body}");
+    }
+
+    /// A `chatgpt-subscription` profile's `cyber_access_program` reaches its request as Codex
+    /// sends it under `/daybreak`.
+    #[tokio::test]
+    async fn a_profile_s_cyber_access_program_reaches_the_wire() {
+        let (port, body_seen) = one_request_endpoint().await;
+        let body = body_sent_for(
+            &format!(
+                "[accounts.work]\nbackend = \"chatgpt-subscription\"\nbase_url = \
+                 \"http://127.0.0.1:{port}\"\n\n[profiles.p]\naccount = \"work\"\nmodel = \
+                 \"m\"\ncyber_access_program = \"daybreak_blue\"\n"
+            ),
+            crate::store::AuthCredential::OAuthToken {
+                access_token: "access-test".to_string(),
+                refresh_token: Some("refresh-test".to_string()),
+                // A day ahead, so nothing is refreshed.
+                expires_at: Some(crate::oauth::now_epoch_millis() + 86_400_000),
+                account_id: Some("workspace-test".to_string()),
+            },
+            body_seen,
+        )
+        .await;
+        assert_eq!(
+            body["access_programs"],
+            serde_json::json!({"cyber": "daybreak_blue"}),
+            "{body}"
+        );
     }
 
     /// A served file's `[thinking].budget` and `[session].context_window` are the ones its

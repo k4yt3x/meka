@@ -6,9 +6,10 @@
 //!
 //! The protocol itself lives in [`super::responses_wire`], shared with the API-key
 //! [`super::responses`] backend. What is particular to this one is the endpoint, the OAuth
-//! credential, the Codex client headers, and the two reasoning parameters Codex sends: the
-//! `include` of encrypted reasoning content and the `reasoning.summary` that makes the reasoning
-//! visible. Those two stay here because this backend's endpoint is always ChatGPT.
+//! credential, the Codex client headers, the two reasoning parameters Codex sends (the `include`
+//! of encrypted reasoning content and the `reasoning.summary` that makes the reasoning visible),
+//! and the cyber access program a profile may ask for, as Codex does under `/daybreak`. The two
+//! reasoning parameters stay here because this backend's endpoint is always ChatGPT.
 
 mod auth;
 
@@ -62,6 +63,8 @@ pub(crate) struct ChatGptSubscriptionProvider {
     /// See `ProfileConfig::deferred_tools`: whether deferred tools are declared with
     /// `defer_loading` and loaded through the endpoint's own `tool_search`.
     deferred_tools: crate::config::DeferredTools,
+    /// See `ProfileConfig::cyber_access_program`; `None` sends no `access_programs`.
+    cyber_access_program: Option<String>,
     user_agent: String,
 }
 
@@ -80,6 +83,7 @@ impl ChatGptSubscriptionProvider {
             max_output_tokens,
             max_request_bytes,
             deferred_tools,
+            cyber_access_program,
             ..
         } = settings;
         // chatgpt.com is fronted by Cloudflare; enabling the cookie jar lets bot-clearance cookies
@@ -115,6 +119,7 @@ impl ChatGptSubscriptionProvider {
             max_output_tokens,
             max_request_bytes,
             deferred_tools,
+            cyber_access_program,
             user_agent: format!(
                 "meka/{} ({}; {})",
                 env!("CARGO_PKG_VERSION"),
@@ -129,8 +134,8 @@ impl ChatGptSubscriptionProvider {
         self.resolved_effort.clone()
     }
 
-    /// The request body: the shared Responses encoding, plus the one thing this backend may add
-    /// that its API-key sibling may not.
+    /// The request body: the shared Responses encoding, plus the fields Codex sends that this
+    /// backend writes itself.
     ///
     /// A named method rather than inline in `stream` so the `include` can be asserted without a
     /// live endpoint. It is the half of the split that has to keep *sending*, and a test that only
@@ -169,6 +174,14 @@ impl ChatGptSubscriptionProvider {
             fields.insert(
                 "prompt_cache_key".into(),
                 serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        if let Some(program) = &self.cyber_access_program
+            && let Some(fields) = body.as_object_mut()
+        {
+            fields.insert(
+                "access_programs".into(),
+                serde_json::json!({ "cyber": program }),
             );
         }
         body
@@ -916,6 +929,25 @@ mod tests {
             content_types, 1,
             "the turn request must carry exactly one Content-Type header; head:\n{head}"
         );
+    }
+
+    /// A profile's program goes out as Codex sends it, and a profile stating none sends no field,
+    /// which leaves the program to the server.
+    #[test]
+    fn only_a_profile_naming_a_program_sends_access_programs() {
+        let body_for = |program: Option<&str>| {
+            ChatGptSubscriptionProvider {
+                cyber_access_program: program.map(str::to_string),
+                ..provider_for_test()
+            }
+            .build_body("s", &[Message::user("hi")], &[], &[], &Default::default())
+        };
+        assert_eq!(
+            body_for(Some("daybreak_blue"))["access_programs"],
+            serde_json::json!({"cyber": "daybreak_blue"})
+        );
+        let unset = body_for(None);
+        assert!(unset.get("access_programs").is_none(), "{unset}");
     }
 
     /// One conversation's requests have to reach the machine holding its cached prefix. Codex

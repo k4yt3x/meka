@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.90.0] - 2026-11-07
+
+### Added
+
+- Profiles take a `parameters` table of request fields sent as written, such as `temperature`.
+- A `chatgpt-subscription` profile asks for Codex's Daybreak with `cyber_access_program`.
+
+### Changed
+
+- The status row and a panel's last row sit on the terminal's background, in its own colors.
+
 ### Fixed
 
+- Startup warns about a profile's `deferred_tools` when its backend never sends it.
 - Text stops a column short of the right edge in the transcript, composer, panels and questions.
 - A wrapped row in `/help` or another panel's listing continues under its own column.
 - The approval prompt no longer splits a long argument's rows away from their tree.
@@ -3169,7 +3181,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.89.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.90.0...HEAD
+[0.90.0]: https://github.com/k4yt3x/meka/compare/0.89.0...0.90.0
 [0.89.0]: https://github.com/k4yt3x/meka/compare/0.88.3...0.89.0
 [0.88.3]: https://github.com/k4yt3x/meka/compare/0.88.2...0.88.3
 [0.88.2]: https://github.com/k4yt3x/meka/compare/0.88.1...0.88.2
