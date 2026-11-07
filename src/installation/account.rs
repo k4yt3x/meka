@@ -2217,7 +2217,11 @@ mod tests {
     /// A connection that never sends, as a browser's speculative one, holds the listener for a
     /// few seconds at most, and an error under no state is nobody's answer to this login: the
     /// login's own callback still lands after both.
-    #[tokio::test(start_paused = true)]
+    ///
+    /// On the real clock: a paused one skips ahead whenever the runtime finds nothing ready, and
+    /// macOS delivers loopback bytes a moment after the write returns, so it would skip the wait on
+    /// a request still in flight and drop it unread, which the client sees as a reset.
+    #[tokio::test]
     async fn the_loopback_listener_waits_past_an_idle_connection_and_a_stateless_error() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
