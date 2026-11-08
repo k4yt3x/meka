@@ -397,7 +397,28 @@ impl BackgroundStore {
         Ok(tasks.into_iter().next())
     }
 
-    /// Record the session a backgrounded spawn runs, on the task's row.
+    /// Remove the row of a call that did not start, so the call leaves no task. A stop recorded on
+    /// it while the call was starting goes with it, since nothing ran for a report to tell of; a
+    /// row with an outcome or a delivery is not one this call alone wrote, and stays.
+    pub(crate) async fn withdraw_background_task(&self, id: &str) -> crate::error::Result<()> {
+        let id = id.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "DELETE FROM background_tasks \
+                     WHERE id = ?1 AND outcome IS NULL AND delivered_at IS NULL",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to withdraw a background task: {error}"))
+            })
+    }
+
+    /// Record the sub-agent a backgrounded `agent_spawn` or `agent_followup` drives, on the task's
+    /// row.
     pub(crate) async fn record_task_subagent(
         &self,
         task_id: &str,
@@ -700,7 +721,8 @@ pub(crate) struct BackgroundTask {
     /// outcome could wait for a turn instead of causing one.
     pub(crate) announced_at: Option<DateTime<Utc>>,
     pub(crate) delivered_at: Option<DateTime<Utc>>,
-    /// The session a backgrounded `agent_spawn` runs, once it has made one.
+    /// The sub-agent a backgrounded `agent_spawn` or `agent_followup` drives, linked once its
+    /// start step has made or found it.
     pub(crate) subagent_id: Option<Uuid>,
 }
 impl BackgroundTask {

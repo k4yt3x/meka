@@ -482,11 +482,27 @@ impl Tool for FetchUrlTool {
         Permission::Read
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[async_trait]
+impl crate::tools::Detachable for FetchUrlTool {
+    /// Every argument and the destination guard, with the request built; the run sends it.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
         let url = require_str(&input, "url", "web_fetch")?;
         let guard = DestinationGuard {
             refuse_private: self.refuse_private_destinations,
@@ -498,13 +514,6 @@ impl Tool for FetchUrlTool {
                 message: format!("'{url}' names {address}, which {switch} refuses"),
             });
         }
-        // Every wait below is raced against the turn's cancellation, as `shell_execute` races
-        // its child: the agent awaits every tool future, so a fetch that ignored the token held a
-        // canceled turn until the peer answered or `[web] request_timeout` ran out. Dropping the
-        // send or the body read aborts the request; a conversion already running off the runtime
-        // finishes on its own and is discarded.
-        let cancellation = context.cancellation;
-
         // Every argument is read ahead of the request, so a call refused for one sends nothing.
         let raw = super::util::optional_bool(&input, "raw", "web_fetch")?.unwrap_or(false);
         // When the caller redirects to the scratchpad we produce full content regardless of
@@ -520,118 +529,154 @@ impl Tool for FetchUrlTool {
         let pattern = optional_str(&input, "regex", "web_fetch")?
             .map(|pattern| compile_user_regex(pattern, "web_fetch"))
             .transpose()?;
-        let request = apply_headers(self.client.get(&url), &input)?;
-        let response = unless_canceled(&cancellation, request.send())
-            .await?
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "web_fetch".to_string(),
-                message: format!(
-                    "failed to fetch '{}': {}",
-                    url,
-                    crate::error::format_reqwest_error(&error)
-                ),
-            })?;
+        // Built here, since the builder holds a malformed URL or header until it is asked for the
+        // request, and the run would only find out when it sent it.
+        let request = apply_headers(self.client.get(&url), &input)?
+            .build()
+            .map_err(|error| fetch_failure(&url, &error))?;
+        let client = self.client.clone();
+        Ok(crate::tools::Started::running(None, move |context| {
+            fetch(
+                client,
+                url,
+                raw,
+                limit,
+                pattern,
+                request,
+                context.cancellation,
+            )
+        }))
+    }
+}
 
-        let status = response.status();
-        if !status.is_success() {
-            return Ok(ToolOutput::text(format!("HTTP {status} for '{url}'"), true));
-        }
+/// The error for a request to `url` that `error` stopped.
+fn fetch_failure(url: &str, error: &reqwest::Error) -> MekaError {
+    MekaError::ToolExecution {
+        tool_name: "web_fetch".to_string(),
+        message: format!(
+            "failed to fetch '{url}': {}",
+            crate::error::format_reqwest_error(error)
+        ),
+    }
+}
 
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+/// Send the request `web_fetch` built and turn the response into the result. Every wait is raced
+/// against the call's cancellation, as `shell_execute` races its child: the agent awaits every
+/// tool future, so a fetch that ignored the token held a canceled turn until the peer answered or
+/// `[web] request_timeout` ran out. Dropping the send or the body read aborts the request; a
+/// conversion already running off the runtime finishes on its own and is discarded.
+async fn fetch(
+    client: reqwest::Client,
+    url: String,
+    raw: bool,
+    limit: usize,
+    pattern: Option<regex::Regex>,
+    request: reqwest::Request,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ToolOutput> {
+    let response = unless_canceled(&cancellation, client.execute(request))
+        .await?
+        .map_err(|error| fetch_failure(&url, &error))?;
 
-        // Capture the document's final (post-redirect) URL to resolve relative links against. Taken
-        // before `read_body_capped` consumes the response; re-parsed through our own `url` crate so
-        // the type matches `html_to_markdown` regardless of reqwest's `url` re-export.
-        let document_url: Option<url::Url> = url::Url::parse(response.url().as_str()).ok();
+    let status = response.status();
+    if !status.is_success() {
+        return Ok(ToolOutput::text(format!("HTTP {status} for '{url}'"), true));
+    }
 
-        let body_bytes = unless_canceled(&cancellation, read_body_capped(response)).await??;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
 
-        // A response the server labeled as an image becomes a multimodal Image block rather than
-        // going through html2md. `Content-Type` only gates whether to try: the media type comes
-        // from the bytes, and a body that isn't an image at all (an HTML error page served
-        // as `image/png`, which is common) falls through to the text path below instead of
-        // shipping a block the provider will reject.
-        if !matches!(
-            classify_content_type(&content_type),
-            ImageHandling::Unsupported
-        ) {
-            let sniffed = crate::image::classify_bytes(&body_bytes);
-            if !matches!(sniffed, ImageHandling::Unsupported) {
-                let marker = format!("Image fetched from {url}");
-                // Off the runtime, as `file_read` does it: decoding and re-encoding a
-                // multi-megapixel image is tens of milliseconds of pure CPU, and on the runtime it
-                // blocks every other task on that worker.
-                let marker = marker.clone();
-                return unless_canceled(
-                    &cancellation,
-                    tokio::task::spawn_blocking(move || {
-                        build_image_tool_output(&marker, sniffed, &body_bytes)
-                    }),
-                )
-                .await?
-                .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "web_fetch".to_string(),
-                    message: format!("image decode task failed: {error}"),
-                });
-            }
-        }
+    // Capture the document's final (post-redirect) URL to resolve relative links against. Taken
+    // before `read_body_capped` consumes the response; re-parsed through our own `url` crate so
+    // the type matches `html_to_markdown` regardless of reqwest's `url` re-export.
+    let document_url: Option<url::Url> = url::Url::parse(response.url().as_str()).ok();
 
-        let html = String::from_utf8_lossy(&body_bytes).into_owned();
+    let body_bytes = unless_canceled(&cancellation, read_body_capped(response)).await??;
 
-        // Parsing and converting up to ten megabytes of HTML is pure CPU, and on the runtime it
-        // blocks every other task on that worker.
-        let body = if raw {
-            html
-        } else {
-            let document_url = document_url.clone();
-            unless_canceled(
+    // A response the server labeled as an image becomes a multimodal Image block rather than
+    // going through html2md. `Content-Type` only gates whether to try: the media type comes
+    // from the bytes, and a body that isn't an image at all (an HTML error page served
+    // as `image/png`, which is common) falls through to the text path below instead of
+    // shipping a block the provider will reject.
+    if !matches!(
+        classify_content_type(&content_type),
+        ImageHandling::Unsupported
+    ) {
+        let sniffed = crate::image::classify_bytes(&body_bytes);
+        if !matches!(sniffed, ImageHandling::Unsupported) {
+            let marker = format!("Image fetched from {url}");
+            // Off the runtime, as `file_read` does it: decoding and re-encoding a
+            // multi-megapixel image is tens of milliseconds of pure CPU, and on the runtime it
+            // blocks every other task on that worker.
+            let marker = marker.clone();
+            return unless_canceled(
                 &cancellation,
-                tokio::task::spawn_blocking(move || html_to_markdown(&html, &document_url)),
+                tokio::task::spawn_blocking(move || {
+                    build_image_tool_output(&marker, sniffed, &body_bytes)
+                }),
             )
             .await?
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "web_fetch".to_string(),
-                message: format!("HTML conversion task failed: {error}"),
-            })?
-        };
-
-        // The regex runs against the whole document, before any truncation: run after, `limit`
-        // would decide which matches existed, and "No matches found" would read as a fact about
-        // the page. The cap then applies to the match list.
-        let matched = match pattern {
-            Some(re) => {
-                let mut matches = re.find_iter(&body).map(|found| found.as_str());
-                let Some(first) = matches.next() else {
-                    return Ok(ToolOutput::text(
-                        "No matches found for the given regex pattern.".to_string(),
-                        false,
-                    ));
-                };
-                let mut joined = first.to_string();
-                let mut joined_chars = first.chars().count();
-                // Past `limit` the rest is cut anyway, and a pattern that matches every character
-                // of a large page would otherwise build a list as long as the page first.
-                for found in matches {
-                    if limit > 0 && joined_chars > limit {
-                        break;
-                    }
-                    joined.push('\n');
-                    joined.push_str(found);
-                    joined_chars += 1 + found.chars().count();
-                }
-                Some(joined)
-            }
-            None => None,
-        };
-        let content = matched.unwrap_or(body);
-
-        Ok(ToolOutput::text(truncate_to_chars(content, limit), false))
+                message: format!("image decode task failed: {error}"),
+            });
+        }
     }
+
+    let html = String::from_utf8_lossy(&body_bytes).into_owned();
+
+    // Parsing and converting up to ten megabytes of HTML is pure CPU, and on the runtime it
+    // blocks every other task on that worker.
+    let body = if raw {
+        html
+    } else {
+        let document_url = document_url.clone();
+        unless_canceled(
+            &cancellation,
+            tokio::task::spawn_blocking(move || html_to_markdown(&html, &document_url)),
+        )
+        .await?
+        .map_err(|error| MekaError::ToolExecution {
+            tool_name: "web_fetch".to_string(),
+            message: format!("HTML conversion task failed: {error}"),
+        })?
+    };
+
+    // The regex runs against the whole document, before any truncation: run after, `limit`
+    // would decide which matches existed, and "No matches found" would read as a fact about
+    // the page. The cap then applies to the match list.
+    let matched = match pattern {
+        Some(re) => {
+            let mut matches = re.find_iter(&body).map(|found| found.as_str());
+            let Some(first) = matches.next() else {
+                return Ok(ToolOutput::text(
+                    "No matches found for the given regex pattern.".to_string(),
+                    false,
+                ));
+            };
+            let mut joined = first.to_string();
+            let mut joined_chars = first.chars().count();
+            // Past `limit` the rest is cut anyway, and a pattern that matches every character
+            // of a large page would otherwise build a list as long as the page first.
+            for found in matches {
+                if limit > 0 && joined_chars > limit {
+                    break;
+                }
+                joined.push('\n');
+                joined.push_str(found);
+                joined_chars += 1 + found.chars().count();
+            }
+            Some(joined)
+        }
+        None => None,
+    };
+    let content = matched.unwrap_or(body);
+
+    Ok(ToolOutput::text(truncate_to_chars(content, limit), false))
 }
 
 /// `content` cut to its first `limit` characters with a note saying so, or whole when it fits or
@@ -1063,6 +1108,39 @@ mod tests {
         assert!(props.get("raw").is_some());
     }
 
+    /// A URL or a header the request cannot be built from is refused by the start step, so a call
+    /// in the background hears it at once rather than in its report.
+    #[tokio::test]
+    async fn a_request_that_cannot_be_built_is_refused_at_the_start() {
+        use crate::tools::Detachable;
+
+        let tool = FetchUrlTool {
+            refuse_private_destinations: false,
+            refuse_own_addresses: false,
+            client: build_web_client(&WebClientConfig::default(), false).expect("client"),
+        };
+        for input in [
+            serde_json::json!({ "url": "example.com/page" }),
+            serde_json::json!({
+                "url": "https://example.com/",
+                "headers": { "X-Bad": "line\nbreak" },
+            }),
+        ] {
+            let refused = tool
+                .start(
+                    input.clone(),
+                    &crate::tools::ToolContext::for_test(
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
+                )
+                .await;
+            assert!(
+                matches!(&refused, Err(error) if error.to_string().contains("failed to fetch")),
+                "{input}"
+            );
+        }
+    }
+
     /// The agent awaits every tool future, so a fetch that ignores the turn's token holds a
     /// canceled turn until the peer answers or `[web] request_timeout` runs out. The peer here
     /// accepts the connection and never answers.
@@ -1095,7 +1173,7 @@ mod tests {
             std::time::Duration::from_secs(5),
             tool.execute(
                 serde_json::json!({ "url": format!("http://{address}/") }),
-                crate::tools::ToolContext::detached(cancellation),
+                crate::tools::ToolContext::for_test(cancellation),
             ),
         )
         .await
@@ -1367,7 +1445,7 @@ mod tests {
             let error = tool
                 .execute(
                     serde_json::json!({ "url": format!("{origin}/") }),
-                    crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new()),
                 )
                 .await
                 .expect_err("the tool refuses the literal")

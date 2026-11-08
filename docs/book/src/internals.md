@@ -107,7 +107,10 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    render the first as text ahead of the second; exports, `GET /history`, replays and the title
    read the words. It then sends a `CompletionRequest` and dispatches every tool call the response
    carries. `admit_arguments` type-checks the call's arguments and takes out `background`, the flag
-   that detaches it; `admit_tool_call` decides run, ask or refuse. Each call gets a `ToolContext`:
+   that detaches it, which a tool takes only when it has a start step (`Tool::as_detachable`):
+   `start_background_call` records the task, runs that step inline, so every refusal is the call's
+   own result, and spawns the run it hands back. `admit_tool_call` decides run, ask or refuse. Each
+   call gets a `ToolContext`:
    the session id, the tool-use id, the prompt id, the frontend and the cancellation token. Every
    request carries the conversation whole; the context ceiling and compaction are its only bound.
    The world state's `[Tool discovery]` index is bounded like the skills and memory indexes, in
@@ -166,7 +169,7 @@ columns of the tables in `HEAD_TABLES`. The count is the ledger's to state: `the
 | `blobs`, `message_blobs` | `store/blobs.rs` | `hash`, `media_type`, `bytes`, `size_bytes`, `created_at`; and `message_id`, `hash` for which message rows reference a blob. `idx_message_blobs_hash`. |
 | `scratchpad_entries` | `store/scratchpad.rs` | `session_id`, `name`, `content`, `created_at`. |
 | `scheduled_jobs` | `store/schedule.rs` | `id`, `session_id`, `kind`, `spec`, `prompt`, `gate_kind`, `gate_spec_json`, `gate_last_output`, `gate_permission`, `claimed_by`, `claim_expires_at`, `attempts`, `created_at`, `last_fired_at`, `next_fire_at`. `idx_scheduled_jobs_next_fire_at`, `idx_scheduled_jobs_session_id`. |
-| `background_tasks` | `store/background.rs` | `id`, `session_id`, `tool`, `label`, `status`, `outcome`, `scratchpad_entry`, `started_at`, `finished_at`, `announced_at`, `delivered_at`. `idx_background_tasks_session_id_status`. |
+| `background_tasks` | `store/background.rs` | `id`, `session_id`, `tool`, `label`, `status`, `outcome`, `scratchpad_entry`, `started_at`, `finished_at`, `announced_at`, `delivered_at`, `subagent_id`. `idx_background_tasks_session_id_status`. |
 | `memories`, `memories_fts` | `store/memory.rs` | `id`, `name`, `description`, `tags`, `body`, `priority`, `created_at`, `updated_at`, `read_count`. `idx_memories_priority_created_at`. The FTS index and its triggers are rebuilt to this build's definition by `reconcile_index` on every open, so they are outside the ledger's fingerprint. |
 | `recall_entries` | `store/recall.rs` | The screen's recall: `id`, `command_line`, `created_at`. |
 
@@ -234,7 +237,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | What a frontend answered for a file operation | `Delegation` | `file_read`, `file_edit`, `file_write` |
 | Where an image's bytes rest | `store/blobs.rs`: `externalize_images` on write, `inline_blobs` on read | writes: `PreparedEvent::from_event` on the caller's thread, then `store::sessions::insert_event`, the one door into `messages`, which every writer takes (`save_event`, `save_events_atomic`, a rewind, a withdrawal, `import_sessions`); the fork copies rows that came through it; reads: `Store::load_conversation` for every resume and the sub-agent follow-up; `GET /history` and `GET /context/messages` serve the reference, `GET /blobs/{hash}` the bytes, and an export carries both |
 | What a session's history holds | `LogRow::said` over the session's stretches (`Said`: a message, a compaction, a rewind, a joined prompt, or a row that says nothing), the one classifier the screen, ACP's replay and the history call, `Store::rewound` with `is_rewound` (the runs of history rows a rewind took, a kept copy standing for the row it copies, and the prompts a turn took back), and the log pages, which leave out the copies a compaction kept; `history_entries` and `Store::history_page` in `store/sessions.rs` compose them into entries | the screen's pages, ACP's `session/load` replay, `GET /v1/sessions/{id}/history`, a blocking turn's `messages` (`Store::turn_entries`), the answers of compact and rewind (`Store::history_entry`), `conversation_search` and `conversation_read` (`Store::history_messages`), session search's matches |
-| What a session has run and spent | its rows of `turns`: a turn's row closes in `settle_turn` with its rounds and what the compactions it ran spent, and one that ended before its row was written gets it from `settle_unopened_turn` when its compactions spent or wrote anything (`Agent::compaction_spend`, which `record_compaction_spend` fills), and a compaction run between turns opens a row of its own under its compaction id (`open_compaction_turn`, `close_compaction_turn`) that its boundary names; the record's `turn_count` and `usage` are those rows counted and summed (`SPENT_COLUMNS`). The `/status` counters (`SessionStats`) are the screen's alone: a sub-agent's spend and a turn that never finished reach them too | `GET /v1/sessions`, a session's record and its events, `GET /turns`, `meka session list` and `show`, `agent_list`'s `turns=`, the screen's turn-end rows |
+| What a session has run and spent | its rows of `turns`: a turn's row closes in `settle_turn` with its rounds and what the compactions it ran spent, and one that ended before its row was written gets it from `settle_unopened_turn` when its compactions spent or wrote anything (`Agent::compaction_spend`, which `record_compaction_spend` fills), and a compaction run between turns opens a row of its own under its compaction id (`open_compaction_turn`, `close_compaction_turn`) that its boundary names; the record's `turn_count` and `usage` are those rows counted and summed (`SPENT_COLUMNS`). The `/status` counters (`SessionStats`) are the screen's alone: a sub-agent's spend and a turn that never finished reach them too | `GET /v1/sessions`, a session's record and its events, `GET /turns`, `meka session list` and `show`, `agent_list`'s turn count, the screen's turn-end rows |
 | The sentence for a name that matches nothing | `text::unknown_name` | every refusal by name: profiles, accounts, MCP servers, configuration options, scopes, gates |
 | How a terminal shows a time, a size, an id | `text::format_timestamp` with `Precision`, `text::format_size` with `KIB` and `MIB`, `text::ID_PREFIX` | every listing and status line; the wire keeps RFC 3339 and raw byte counts |
 | The `Authorization` value for a token | `text::bearer` | every backend that sends one, and `store/credentials.rs` |
@@ -382,10 +385,11 @@ the idle sweep), whose thread the editor already holds. Every event about a call
 `ToolCallStarted`, an approval prompt's `PromptedCall::Announced` included, goes under that id, the
 oldest still running under the provider's id, and `session/load`'s replay goes through the same
 `CallIds`, so a live call after it is told apart from the replayed ones. A sub-agent's activity goes
-under the id its `agent_spawn` card had when the sub-agent started (`AcpFrontend::for_subagent`),
-since a background sub-agent outlasts its call. A call `ToolCallDropped` names, or one still running
-at `TurnEnded`, is closed `failed`, unless a `session/cancel` stopped the turn, which the client
-marks; a detached command streams no output (`OutputRelay::for_call`), its call having returned.
+under the id its `agent_spawn` card had when the sub-agent started (`AcpFrontend::for_subagent`). A
+call `ToolCallDropped` names, or one still running at `TurnEnded`, is closed `failed`, unless a
+`session/cancel` stopped the turn, which the client marks. A call in the background shows nothing
+live, its call having returned: a command streams no output (`OutputRelay::for_call`) and a
+sub-agent rolls no activity into the card, both because `ToolContext::live_call_id` is `None`.
 
 ## Building
 

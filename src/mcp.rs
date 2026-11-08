@@ -4249,7 +4249,7 @@ mod tests {
         let output = tool_load
             .execute(
                 serde_json::json!({"name": "mcp__ida__decompile"}),
-                crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
+                crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new()),
             )
             .await
             .expect("tool_load returns Ok with an error payload");
@@ -4293,7 +4293,7 @@ mod tests {
         let output = tool_load
             .execute(
                 serde_json::json!({"name": "mcp__ida__decompile"}),
-                crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
+                crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new()),
             )
             .await
             .expect("tool_load returns Ok with an error payload");
@@ -4403,6 +4403,7 @@ mod tests {
         let context = handler::CallContext {
             session_id: None,
             tool_call_id: None,
+            live_call_id: None,
             frontend: Arc::new(crate::frontend::testing::RecordingFrontend::new()),
             cancellation: tokio_util::sync::CancellationToken::new(),
         };
@@ -5110,6 +5111,7 @@ mod tests {
         CallContext {
             session_id: None,
             tool_call_id: Some("tu-1".to_string()),
+            live_call_id: Some("tu-1".to_string()),
             frontend,
             cancellation: CancellationToken::new(),
         }
@@ -5476,6 +5478,7 @@ mod tests {
                 let context = CallContext {
                     session_id: None,
                     tool_call_id: Some("tu-1".to_string()),
+                    live_call_id: Some("tu-1".to_string()),
                     frontend: Arc::new(AbsentFrontend),
                     cancellation,
                 };
@@ -5838,10 +5841,48 @@ mod tests {
                     event,
                     crate::frontend::FrontendEvent::McpProgress(update)
                         if update.message.as_deref() == Some("halfway")
-                            && update.tool_use_id.as_deref() == Some("tu-1")
+                            && update.tool_use_id == "tu-1"
                 )))
             .await,
             "no progress reached the frontend: {:?}",
+            recorder.events()
+        );
+    }
+
+    /// A call with no live view open on it, one in the background, is still named to the server but
+    /// shows its progress under no call. rmcp handles a notification on a task of its own,
+    /// unordered against the call's answer, so the test waits for the log line that says the
+    /// progress was handled for this call before it looks for what the frontend got.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_with_no_live_view_shows_no_progress() {
+        let logs = crate::streams::capture::capture_logs(tracing::Level::INFO);
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "progress": true
+        }))
+        .await;
+        stub.connect().await;
+        let tool = stub.tool("search").await;
+        let recorder = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        let context = CallContext {
+            live_call_id: None,
+            ..call_context(Arc::clone(&recorder) as Arc<dyn crate::frontend::Frontend>)
+        };
+        tool.call(None, &context).await.expect("the call completes");
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || logs
+                .logged()
+                .contains("search progress: "))
+            .await,
+            "the progress was handled while the call was in flight: {}",
+            logs.logged()
+        );
+        assert!(
+            !recorder
+                .events()
+                .iter()
+                .any(|event| matches!(event, crate::frontend::FrontendEvent::McpProgress(_))),
+            "{:?}",
             recorder.events()
         );
     }
@@ -6118,7 +6159,7 @@ mod tests {
         let output = subscribe
             .execute(
                 arguments.clone(),
-                ToolContext::detached(CancellationToken::new()),
+                ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("subscribed");
@@ -6134,7 +6175,7 @@ mod tests {
             tool_scope: Arc::clone(&scope),
         };
         let output = unsubscribe
-            .execute(arguments, ToolContext::detached(CancellationToken::new()))
+            .execute(arguments, ToolContext::for_test(CancellationToken::new()))
             .await
             .expect("unsubscribed");
         assert!(

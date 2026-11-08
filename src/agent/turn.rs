@@ -10113,7 +10113,9 @@ mod tests {
     ) -> (Agent, Store) {
         let registry = crate::tools::ToolRegistry::new();
         registry.enable_background();
-        registry.register(tool).expect("register fixture");
+        registry
+            .register(Arc::new(crate::tools::DetachableForTest(tool)))
+            .expect("register fixture");
         let (mut agent, store) = agent_with_registry_for_test(provider, registry).await;
         agent.enable_background_for_test(2);
         (agent, store)
@@ -10127,7 +10129,9 @@ mod tests {
     ) -> (Agent, Store) {
         let registry = crate::tools::ToolRegistry::new();
         registry.enable_background();
-        registry.register(tool).expect("register fixture");
+        registry
+            .register(Arc::new(crate::tools::DetachableForTest(tool)))
+            .expect("register fixture");
         let store = Store::open(Some(path), &Default::default())
             .await
             .expect("open");
@@ -10434,7 +10438,9 @@ mod tests {
         let registry = crate::tools::ToolRegistry::new();
         registry.enable_background();
         registry
-            .register(Arc::new(GatedFixture(gate.clone())))
+            .register(Arc::new(crate::tools::DetachableForTest(Arc::new(
+                GatedFixture(gate.clone()),
+            ))))
             .expect("register the gated fixture");
         registry
             .register(Arc::new(AwaitFinished {
@@ -10503,7 +10509,9 @@ mod tests {
         let registry = crate::tools::ToolRegistry::new();
         registry.enable_background();
         registry
-            .register(Arc::new(GatedFixture(gate.clone())))
+            .register(Arc::new(crate::tools::DetachableForTest(Arc::new(
+                GatedFixture(gate.clone()),
+            ))))
             .expect("register the gated fixture");
         registry
             .register(Arc::new(AwaitFinished {
@@ -10792,7 +10800,9 @@ mod tests {
 
         let registry = crate::tools::ToolRegistry::new();
         registry
-            .register(Arc::new(QuickFixture))
+            .register(Arc::new(crate::tools::DetachableForTest(Arc::new(
+                QuickFixture,
+            ))))
             .expect("register fixture");
         // Deliberately no `enable_background`: this is what a default installation looks like.
         let provider = Arc::new(MockProvider::from_rounds(vec![
@@ -13359,7 +13369,9 @@ mod tests {
         let registry = crate::tools::ToolRegistry::new();
         registry.enable_background();
         registry
-            .register(Arc::new(GatedFixture(gate.clone())))
+            .register(Arc::new(crate::tools::DetachableForTest(Arc::new(
+                GatedFixture(gate.clone()),
+            ))))
             .expect("register");
         registry
             .register(Arc::new(AwaitFinished {

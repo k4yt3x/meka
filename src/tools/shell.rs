@@ -236,6 +236,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[derive(Clone)]
 pub(crate) struct ExecuteCommandTool {
     /// The process's workspace-ACE ledger on Windows.
     ///
@@ -398,20 +399,36 @@ impl Tool for ExecuteCommandTool {
             .map(|error| ToolOutput::from_error(&error))
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let cancellation = context.cancellation.clone();
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[async_trait]
+impl crate::tools::Detachable for ExecuteCommandTool {
+    /// The arguments and the confinement the level admits; the run spawns the command, so no
+    /// process exists before the call is recorded.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
         let command = require_str(&input, "command", "shell_execute")?;
         let timeout = super::util::optional_u64(&input, "timeout_ms", "shell_execute")?
             .map(std::time::Duration::from_millis)
             .unwrap_or(DEFAULT_TIMEOUT);
         let permission = self.site.permission.get();
-        // Three states, resolved once: the rest of this function asks the `Confinement` rather than
-        // re-deriving "is it sandboxed" from the level, which is how the read-only and
-        // workspace-writable cases would drift apart.
+        // Three states, resolved once: the run asks the `Confinement` rather than re-deriving "is
+        // it sandboxed" from the level, which is how the read-only and workspace-writable cases
+        // would drift apart.
         let confinement = crate::sandbox::Confinement::resolve(
             self.sandbox_enabled,
             permission,
@@ -420,8 +437,26 @@ impl Tool for ExecuteCommandTool {
             &self.site.cwd,
             self.site.network,
         );
+        self.admit_confinement(permission, confinement.is_sandboxed())?;
+        let tool = self.clone();
+        Ok(crate::tools::Started::running(
+            None,
+            move |context| async move { tool.run(command, timeout, confinement, context).await },
+        ))
+    }
+}
+
+impl ExecuteCommandTool {
+    /// Spawn `command` under `confinement`, as admitted, and collect what it printed.
+    async fn run(
+        &self,
+        command: String,
+        timeout: std::time::Duration,
+        confinement: crate::sandbox::Confinement,
+        context: crate::tools::ToolContext,
+    ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let sandboxed = confinement.is_sandboxed();
-        self.admit_confinement(permission, sandboxed)?;
 
         // Windows + AppContainer: the policy is meka's own model of this call, encoded per
         // command, and the OS enforces it; no ACE is written and no token derived.
@@ -994,8 +1029,7 @@ const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Forwards a running command's output to the frontend as it is produced. Cloned into both drain
 /// tasks so stdout and stderr land in one stream in arrival order, which is what a terminal shows.
 ///
-/// `None` when there is no tool call to correlate against (direct tool construction in tests), in
-/// which case draining behaves exactly as it did before deltas existed.
+/// `None` when no live view is open on the call, in which case the output is only collected.
 #[derive(Clone)]
 struct OutputRelay {
     frontend: Arc<dyn crate::frontend::Frontend>,
@@ -1003,18 +1037,12 @@ struct OutputRelay {
 }
 
 impl OutputRelay {
-    /// The id has to be captured here rather than inside the drain task: it lives in a task-local
-    /// scoped by `Agent::resolve_and_execute_tool`, and `tokio::spawn` does not inherit
-    /// task-locals. The relay for a call a model made; a call with no tool-use id has nothing to
-    /// tag chunks with, and a detached call has no view open anywhere: its call returned when it
-    /// detached, so a chunk would land on whatever call the id names next.
+    /// The relay for the call `context` runs, or `None` when no live view is open on it; see
+    /// [`crate::tools::ToolContext::live_call_id`].
     fn for_call(context: &crate::tools::ToolContext) -> Option<Self> {
-        if context.task_id.is_some() {
-            return None;
-        }
-        context.tool_call_id.clone().map(|tool_call_id| Self {
+        context.live_call_id().map(|tool_call_id| Self {
             frontend: Arc::clone(&context.frontend),
-            tool_call_id,
+            tool_call_id: tool_call_id.to_string(),
         })
     }
 
@@ -1441,7 +1469,7 @@ mod tests {
         // makes a call a background one.
         let waited_for = crate::tools::ToolContext {
             tool_call_id: Some("call_0".to_string()),
-            ..crate::tools::ToolContext::detached(CancellationToken::new())
+            ..crate::tools::ToolContext::for_test(CancellationToken::new())
         };
         assert!(OutputRelay::for_call(&waited_for).is_some());
         let in_the_background = crate::tools::ToolContext {
@@ -1618,7 +1646,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"command": "exit 42"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("tool runs");
@@ -1848,7 +1876,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo hello"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -1876,7 +1904,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({ "command": script, "timeout_ms": 300u64 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("execute should not error");
@@ -1919,7 +1947,7 @@ mod tests {
         let error = tool
             .execute(
                 serde_json::json!({ "command": "true" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("nothing can confine it, so it does not run");
@@ -1938,7 +1966,7 @@ mod tests {
             std::time::Duration::from_millis(300),
             tool.execute(
                 serde_json::json!({ "command": "sleep 31.4159 & sleep 31.4159", "timeout_ms": 60_000u64 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             ),
         )
         .await;
@@ -1975,7 +2003,7 @@ mod tests {
                     ),
                     "timeout_ms": 60_000u64,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a stopped command is a result");
@@ -2055,7 +2083,7 @@ mod tests {
                     "command": format!("head -c {just_past} /dev/zero | tr '\\0' x"),
                     "timeout_ms": 60_000u64,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a result");
@@ -2088,7 +2116,7 @@ mod tests {
                     "command": "echo before-the-stall; echo on-stderr >&2; sleep 30",
                     "timeout_ms": 300u64,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a timeout is a result");
@@ -2126,7 +2154,7 @@ mod tests {
                     "command": format!("echo kept; sleep {hold} &"),
                     "timeout_ms": 60_000u64,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("the command itself succeeds");
@@ -2153,7 +2181,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"command": "false"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -2202,7 +2230,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo nope"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         match result {
@@ -2246,7 +2274,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo nope"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         match result {
@@ -2313,7 +2341,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo hello"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed at unrestricted");
@@ -2339,7 +2367,7 @@ mod tests {
                         "head -c 50000 /dev/zero | tr '\\0' x"
                     }
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -2370,7 +2398,7 @@ mod tests {
                 serde_json::json!({
                     "command": "head -c 5242880 /dev/zero | tr '\\0' x"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -2485,7 +2513,7 @@ mod tests {
                             outside.display()
                         ),
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");
@@ -2635,7 +2663,7 @@ mod tests {
                                 probe_child_test_name()
                             ),
                         }),
-                        crate::tools::ToolContext::detached(CancellationToken::new()),
+                        crate::tools::ToolContext::for_test(CancellationToken::new()),
                     )
                     .await
                     .expect("execute should not error");
@@ -2683,7 +2711,7 @@ mod tests {
                     serde_json::json!({
                         "command": format!("echo hello > \"{probe_path}\""),
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");
@@ -2712,7 +2740,7 @@ mod tests {
                         "command": "'x' * 262144",
                         "timeout_ms": 60000u64,
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");
@@ -2743,7 +2771,7 @@ mod tests {
                         "command": "($input | Measure-Object).Count",
                         "timeout_ms": 5000u64,
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 ),
             )
             .await
@@ -2780,7 +2808,7 @@ mod tests {
                 let result = tool
                     .execute(
                         serde_json::json!({ "command": script, "timeout_ms": 10000u64 }),
-                        crate::tools::ToolContext::detached(CancellationToken::new()),
+                        crate::tools::ToolContext::for_test(CancellationToken::new()),
                     )
                     .await
                     .expect("execute should not error");
@@ -2812,7 +2840,7 @@ mod tests {
                         "command": "$env:ANTHROPIC_API_KEY",
                         "timeout_ms": 10000u64,
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");
@@ -2838,7 +2866,7 @@ mod tests {
                     serde_json::json!({
                         "command": "type C:\\Windows\\System32\\drivers\\etc\\hosts",
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");
@@ -3725,7 +3753,7 @@ mod tests {
             let result = tool
                 .execute(
                     serde_json::json!({"command": command}),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("the shell itself must run");
@@ -3780,7 +3808,7 @@ mod tests {
                 let result = tool
                     .execute(
                         serde_json::json!({"command": probe}),
-                        crate::tools::ToolContext::detached(CancellationToken::new()),
+                        crate::tools::ToolContext::for_test(CancellationToken::new()),
                     )
                     .await
                     .expect("the shell itself must run");
@@ -3984,7 +4012,7 @@ mod tests {
                     serde_json::json!({
                         "command": "echo \"TMPDIR=${TMPDIR-unset}\"; mktemp && echo CREATED",
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("the shell itself must run");
@@ -4040,7 +4068,7 @@ mod tests {
                             outside.display()
                         ),
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("the shell itself must run");

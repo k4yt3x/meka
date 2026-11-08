@@ -55,8 +55,9 @@ const MAX_ADVISED_PARAMETERS: usize = 5;
 /// than by the tool itself. See [`crate::tools::scratchpad::save_explicit_scratchpad_results`].
 pub(crate) const SCRATCHPAD_PARAMETER: &str = "scratchpad";
 
-/// The universal detach parameter, consumed by the agent loop. Where `scratchpad` changes *where* a
-/// tool's output goes, this changes *when* it arrives. See [`crate::background`].
+/// The detach parameter, offered on the tools that can run in the background and consumed by the
+/// agent loop. Where `scratchpad` changes *where* a tool's output goes, this changes *when* it
+/// arrives. See [`crate::background`].
 pub(crate) const BACKGROUND_PARAMETER: &str = "background";
 
 /// Whether `background` in this call means the *tool's* `background`, not meka's.
@@ -122,13 +123,8 @@ pub(crate) fn meka_parameter_error(
     let object = input.as_object()?;
     let wrong_type = |key: &str, want: &str, value: &serde_json::Value| {
         format!(
-            "Error: `{}` must be {}, but this call sent {}. Retry the call with a real {}, or \
-             leave `{}` out.",
-            key,
-            want,
+            "Error: `{key}` must be {want}, but this call sent {}. Send that, or leave `{key}` out.",
             json_type_name(value),
-            want,
-            key,
         )
     };
 
@@ -210,12 +206,13 @@ pub(crate) fn take_background_flag(
 /// itself keeps its argument.
 ///
 /// Returns the arguments the tool receives and whether the call asked to detach; the error is the
-/// output the model reads instead.
+/// output the model reads instead. `definition` is `tool`'s own, which the caller already holds.
 pub(crate) fn admit_arguments(
-    name: &str,
+    tool: &dyn Tool,
+    definition: &ToolDefinition,
     input: &serde_json::Value,
-    schema: &serde_json::Value,
 ) -> std::result::Result<(serde_json::Value, bool), ToolOutput> {
+    let (name, schema) = (&definition.name, &definition.parameters);
     if let Some(reason) = input
         .get(crate::provider::INVALID_TOOL_ARGS_MARKER)
         .and_then(|value| value.as_str())
@@ -229,28 +226,13 @@ pub(crate) fn admit_arguments(
         return Err(ToolOutput::text(complaint, true));
     }
     let (input, detach) = take_background_flag(input, schema);
-    if detach && !detachable(name) {
+    if detach && tool.as_detachable().is_none() {
         return Err(ToolOutput::text(
             format!("`{name}` cannot run in the background; call it without `background`."),
             true,
         ));
     }
     Ok((input, detach))
-}
-
-/// Whether a tool may be detached with `background: true`. Asked where the flag is offered and
-/// where it is consumed, so the schema and the dispatch cannot disagree about it.
-///
-/// `context_compact` is one exception: it does not do work, it parks a request the tool loop
-/// drains once the batch's results are in. Detaching it would race that drain, leaving the request
-/// to fire a round later than the agent asked for, or against the next turn entirely, and would
-/// persist a `background_tasks` row for an operation that takes microseconds. `context_replace` is
-/// another: it hands the checkpoint its summary and ends it, and nothing waits on a task for that.
-/// The checklist tools are the other: an edit takes microseconds and the model needs the list it
-/// returns in the same round, and a detached one would land at a time the replay that recovers the
-/// list cannot know.
-pub(crate) fn detachable(name: &str) -> bool {
-    !matches!(name, "context_compact" | "context_replace") && !crate::checklist::is_tool(name)
 }
 
 /// A call's arguments as a built-in that does not own `background` received them: the flag meka
@@ -355,9 +337,9 @@ pub(crate) fn schema_disagreement(
         .iter()
         .copied()
         .filter(|key| !properties.contains_key(*key))
-        // `scratchpad` and `background` are meka's own, accepted on every tool and consumed by the
-        // agent loop rather than by the tool. Neither appears in the raw definition this function
-        // reads, so flagging them would fire on documented features.
+        // `scratchpad` and `background` are meka's own, consumed by the agent loop rather than by
+        // the tool. Neither appears in the raw definition this function reads, so flagging them
+        // would fire on documented features.
         .filter(|key| *key != SCRATCHPAD_PARAMETER && *key != BACKGROUND_PARAMETER)
         .collect();
     // An explicit `additionalProperties: true` means the server documented that it takes more than
@@ -828,10 +810,20 @@ pub(crate) struct ToolContext {
 }
 
 impl ToolContext {
+    /// The id of the call a live view is open on: the call's own id while it runs inline, `None`
+    /// once it runs in the background, since its call returned when it detached and a chunk or an
+    /// activity row sent under the id would land on whatever the id names next. Asked wherever a
+    /// call addresses the view of the call it came from.
+    pub(crate) fn live_call_id(&self) -> Option<&str> {
+        match self.task_id {
+            Some(_) => None,
+            None => self.tool_call_id.as_deref(),
+        }
+    }
+
     /// A call outside any session: no ids, a frontend that swallows everything, the given token.
-    /// Tests and gate probes use it.
     #[cfg(test)]
-    pub(crate) fn detached(cancellation: CancellationToken) -> Self {
+    pub(crate) fn for_test(cancellation: CancellationToken) -> Self {
         Self {
             session_id: None,
             tool_call_id: None,
@@ -892,9 +884,134 @@ pub(crate) trait Tool: Send + Sync {
     fn reports_failure_as_output(&self) -> bool {
         false
     }
+    /// The tool's start step, when its call can run in the background; `None`, the default, for
+    /// every other tool. The one definition of "may this call detach": the registry offers
+    /// `background` on exactly the tools that answer, and [`admit_arguments`] refuses it on the
+    /// rest. A tool answers when its call can outlast a round and nothing reads its effect back
+    /// from its recorded result; see AGENTS.md, "Background calls". A tool that answers implements
+    /// [`Self::execute`] as [`start_and_run`], so an inline call runs the same code.
+    fn as_detachable(&self) -> Option<&dyn Detachable> {
+        None
+    }
     /// Run the tool. Long-running implementations must observe `context.cancellation` (e.g. via
     /// `tokio::select!`) so a user interrupt or turn-level abort unblocks promptly.
     async fn execute(&self, input: serde_json::Value, context: ToolContext) -> Result<ToolOutput>;
+}
+
+/// The start step of a tool whose call can run in the background.
+#[async_trait]
+pub(crate) trait Detachable: Send + Sync {
+    /// Everything that can refuse the call, and what its run needs: read the arguments, resolve
+    /// and create what the work uses, and hand back the rest as [`Running`]. Nothing created here
+    /// may outlive the process without a record, since the dispatcher records the task before
+    /// this runs and nothing after: a process the work owns is spawned by the run.
+    async fn start(&self, input: serde_json::Value, context: &ToolContext) -> Result<Started>;
+}
+
+/// What a [`Detachable::start`] came to.
+pub(crate) enum Started {
+    /// The call ended while starting, a refusal most often: this is its result.
+    Answered(ToolOutput),
+    /// The call's work, ready to run wherever the caller runs it.
+    Running(Running),
+}
+
+/// The work a started call has left to do, and what it drives.
+pub(crate) struct Running {
+    /// The sub-agent the run drives, for `agent_spawn` and `agent_followup`: the id the started
+    /// answer names, and the one the task's row links to.
+    pub(crate) subagent: Option<Uuid>,
+    run: Run,
+}
+
+/// The work itself. It takes its context from the caller, which gives a detached run a token of
+/// its own and the task it runs as, so it owns everything it touches.
+type Run =
+    Box<dyn FnOnce(ToolContext) -> futures::future::BoxFuture<'static, Result<ToolOutput>> + Send>;
+
+impl Started {
+    /// A start that leaves `work` to run, driving `subagent` when it runs one.
+    pub(crate) fn running<Work, Future>(subagent: Option<Uuid>, work: Work) -> Self
+    where
+        Work: FnOnce(ToolContext) -> Future + Send + 'static,
+        Future: std::future::Future<Output = Result<ToolOutput>> + Send + 'static,
+    {
+        Self::Running(Running {
+            subagent,
+            run: Box::new(move |context| Box::pin(work(context))),
+        })
+    }
+}
+
+impl Running {
+    /// Do the work under `context`.
+    pub(crate) async fn run(self, context: ToolContext) -> Result<ToolOutput> {
+        (self.run)(context).await
+    }
+}
+
+/// Any tool given a start step that leaves everything to the run, so a test can send a fixture to
+/// the background without writing a start step of its own.
+#[cfg(test)]
+pub(crate) struct DetachableForTest(pub(crate) Arc<dyn Tool>);
+
+#[cfg(test)]
+#[async_trait]
+impl Tool for DetachableForTest {
+    fn definition(&self) -> ToolDefinition {
+        self.0.definition()
+    }
+
+    fn required_permission(&self) -> Permission {
+        self.0.required_permission()
+    }
+
+    async fn refusal_at_level(
+        &self,
+        level: Permission,
+        input: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        self.0.refusal_at_level(level, input).await
+    }
+
+    fn runs_outside_confinement(&self) -> bool {
+        self.0.runs_outside_confinement()
+    }
+
+    fn reports_failure_as_output(&self) -> bool {
+        self.0.reports_failure_as_output()
+    }
+
+    fn as_detachable(&self) -> Option<&dyn Detachable> {
+        Some(self)
+    }
+
+    async fn execute(&self, input: serde_json::Value, context: ToolContext) -> Result<ToolOutput> {
+        start_and_run(self, input, context).await
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Detachable for DetachableForTest {
+    async fn start(&self, input: serde_json::Value, _context: &ToolContext) -> Result<Started> {
+        let tool = Arc::clone(&self.0);
+        Ok(Started::running(None, move |context| async move {
+            tool.execute(input, context).await
+        }))
+    }
+}
+
+/// [`Tool::execute`] for a detachable tool: start, then run in place under the same context.
+pub(crate) async fn start_and_run(
+    tool: &dyn Detachable,
+    input: serde_json::Value,
+    context: ToolContext,
+) -> Result<ToolOutput> {
+    match tool.start(input, &context).await? {
+        Started::Answered(output) => Ok(output),
+        Started::Running(running) => running.run(context).await,
+    }
 }
 
 /// The text blocks of a tool result, concatenated. Images carry nothing a predicate can judge.
@@ -1162,7 +1279,8 @@ impl ToolOutput {
 
 /// A no-op tool for the deferred-loading tests: registered after `build_default` and then
 /// deferred, so `tool_load` is exercised against a tool that is genuinely deferred rather than by
-/// re-deferring a production tool that ships active.
+/// re-deferring a production tool that ships active. It stands in for an MCP tool, so it can run
+/// in the background as one can.
 #[cfg(test)]
 pub(crate) struct FixtureDeferredTool {
     pub(crate) name: String,
@@ -1183,12 +1301,22 @@ impl Tool for FixtureDeferredTool {
         Permission::Read
     }
 
-    async fn execute(
-        &self,
-        _input: serde_json::Value,
-        _context: ToolContext,
-    ) -> Result<ToolOutput> {
-        Ok(ToolOutput::text("ok".to_string(), false))
+    fn as_detachable(&self) -> Option<&dyn Detachable> {
+        Some(self)
+    }
+
+    async fn execute(&self, input: serde_json::Value, context: ToolContext) -> Result<ToolOutput> {
+        start_and_run(self, input, context).await
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Detachable for FixtureDeferredTool {
+    async fn start(&self, _input: serde_json::Value, _context: &ToolContext) -> Result<Started> {
+        Ok(Started::running(None, |_| async {
+            Ok(ToolOutput::text("ok".to_string(), false))
+        }))
     }
 }
 
@@ -1200,27 +1328,142 @@ mod tests {
     };
     use crate::store::Store;
 
-    /// The context tools that do no work are refused where the flag is consumed, not only left out
-    /// of the schema: a model that generalizes `background` to them would get a detached compaction
-    /// that fires against a later turn, or a summary nothing waits for.
+    /// A live view is open on a call only while it runs inline: once detached, its call returned,
+    /// and an id sent on would name whatever the id names next.
     #[test]
-    fn the_context_tools_that_do_no_work_cannot_be_detached() {
-        let schema = serde_json::json!({"type": "object", "properties": {"instructions": {"type": "string"}}});
-        for name in ["context_compact", "context_replace"] {
-            let refused =
-                super::admit_arguments(name, &serde_json::json!({"background": true}), &schema);
-            assert!(
-                matches!(refused, Err(ref output) if output.is_error && output.text_content().contains("background")),
-                "{name}: {refused:?}"
-            );
+    fn a_call_has_a_live_view_only_while_it_runs_inline() {
+        let mut context = super::ToolContext::for_test(tokio_util::sync::CancellationToken::new());
+        assert_eq!(context.live_call_id(), None, "a call no model made");
+        context.tool_call_id = Some("call-1".to_string());
+        assert_eq!(context.live_call_id(), Some("call-1"));
+        context.task_id = Some("7f3a1c22".to_string());
+        assert_eq!(context.live_call_id(), None);
+    }
+
+    /// A tool with no start step refuses `background` where the flag is consumed, not only by
+    /// leaving it out of the schema: a model that generalizes it would otherwise get a call that
+    /// records its effect before it has happened. A tool with one detaches, and `false` is no ask.
+    #[test]
+    fn only_a_tool_with_a_start_step_detaches() {
+        struct Quick;
+        #[async_trait::async_trait]
+        impl super::Tool for Quick {
+            fn definition(&self) -> crate::provider::ToolDefinition {
+                crate::provider::ToolDefinition::new(
+                    "quick".to_string(),
+                    "test".to_string(),
+                    serde_json::json!({"type": "object", "properties": {}}),
+                )
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: super::ToolContext,
+            ) -> crate::error::Result<super::ToolOutput> {
+                Ok(super::ToolOutput::text("ok".to_string(), false))
+            }
         }
-        let (_, detach) = super::admit_arguments(
-            "file_read",
+        let quick = Quick;
+        let definition = super::Tool::definition(&quick);
+        let refused = super::admit_arguments(
+            &quick,
+            &definition,
             &serde_json::json!({"background": true}),
-            &schema,
+        );
+        assert!(
+            matches!(refused, Err(ref output) if output.is_error && output.text_content().contains("`quick` cannot run in the background")),
+            "{refused:?}"
+        );
+        let (_, detach) = super::admit_arguments(
+            &quick,
+            &definition,
+            &serde_json::json!({"background": false}),
         )
-        .expect("any other tool may detach");
+        .expect("not asking is no ask");
+        assert!(!detach);
+        let detachable = super::DetachableForTest(std::sync::Arc::new(Quick));
+        let (input, detach) = super::admit_arguments(
+            &detachable,
+            &definition,
+            &serde_json::json!({"background": true}),
+        )
+        .expect("a tool with a start step detaches");
         assert!(detach);
+        assert_eq!(input, serde_json::json!({}));
+    }
+
+    /// `background` rides on exactly the tools with a start step, and among the built-ins a
+    /// session holds those are the ones whose call can outlast a round: a tool whose effect is
+    /// read back from its recorded result, or whose call takes milliseconds, never offers it and
+    /// refuses it.
+    #[tokio::test]
+    async fn background_rides_on_exactly_the_tools_with_a_start_step() {
+        let registry = tool_registry_for_test().await;
+        registry.enable_background();
+        let names: Vec<String> = super::registry::BUILTIN_TOOL_NAMES
+            .iter()
+            .filter(|name| registry.get(name).is_some())
+            .map(|name| name.to_string())
+            .collect();
+        let detachable: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| {
+                registry
+                    .get(name)
+                    .is_some_and(|tool| tool.as_detachable().is_some())
+            })
+            .collect();
+        assert_eq!(detachable, ["shell_execute", "web_fetch"]);
+        let active = registry.active_tools(&names);
+        let mut offered = 0;
+        for definition in active
+            .definitions
+            .iter()
+            .chain(&active.deferred_definitions)
+        {
+            let detaches = registry
+                .get(&definition.name)
+                .is_some_and(|tool| tool.as_detachable().is_some());
+            assert_eq!(
+                definition.parameters["properties"]
+                    .get(super::BACKGROUND_PARAMETER)
+                    .is_some(),
+                detaches,
+                "{}",
+                definition.name
+            );
+            offered += usize::from(detaches);
+        }
+        assert_eq!(
+            offered,
+            detachable.len(),
+            "every detachable tool was checked"
+        );
+        for name in [
+            "checklist_add",
+            "checklist_edit",
+            "checklist_read",
+            "context_compact",
+            "file_read",
+            "memory_write",
+            "scratchpad_read",
+        ] {
+            let tool = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            let refused = super::admit_arguments(
+                &*tool,
+                &tool.definition(),
+                &serde_json::json!({"background": true}),
+            );
+            assert!(refused.is_err(), "{name}: {refused:?}");
+        }
     }
 
     /// A pathological argument costs one pass over itself, not one distance matrix per candidate,
@@ -1847,11 +2090,24 @@ mod tests {
             assert!(complaint.contains("boolean"), "{complaint}");
         }
 
-        let complaint =
-            meka_parameter_error(&serde_json::json!({"scratchpad": 7}), &plain_schema())
-                .expect("a wrong-typed scratchpad name must be refused");
-        assert!(complaint.contains("scratchpad"), "{complaint}");
-        assert!(complaint.contains("string"), "{complaint}");
+        assert_eq!(
+            meka_parameter_error(&serde_json::json!({"background": "yes"}), &plain_schema()),
+            Some(
+                "Error: `background` must be a boolean (`true` or `false`, unquoted), but this \
+                 call sent a string. Send that, or leave `background` out."
+                    .to_string()
+            ),
+            "it says what to send once"
+        );
+        assert_eq!(
+            meka_parameter_error(&serde_json::json!({"scratchpad": 7}), &plain_schema()),
+            Some(
+                "Error: `scratchpad` must be a string naming the entry to save under, but this \
+                 call sent a number. Send that, or leave `scratchpad` out."
+                    .to_string()
+            ),
+            "a wrong-typed scratchpad name must be refused"
+        );
     }
 
     /// Models emit `null` for optional arguments they are not using, and a tool's own arguments
@@ -2316,7 +2572,7 @@ mod tests {
             async move {
                 tool.execute(
                     input.clone(),
-                    crate::tools::ToolContext::detached(cancellation),
+                    crate::tools::ToolContext::for_test(cancellation),
                 )
                 .await
             }
@@ -2378,7 +2634,7 @@ mod tests {
             async move {
                 tool.execute(
                     input.clone(),
-                    crate::tools::ToolContext::detached(cancellation),
+                    crate::tools::ToolContext::for_test(cancellation),
                 )
                 .await
             }

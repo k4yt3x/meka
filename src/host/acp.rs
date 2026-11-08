@@ -2089,26 +2089,52 @@ mod tests {
         );
     }
 
-    /// A worker reports on the card of the call that started it, even once a later call holds the
-    /// provider's id, as a background spawn's worker starts after its call returned.
+    /// A worker reports on the card of the call that started it, not on one a call under the same
+    /// provider id left queued: a call refused before its worker started lets go of its card when
+    /// it ends, one abandoned at the turn's end when the turn ends, and one in the background
+    /// takes its own while showing its worker on none.
     #[test]
     fn a_worker_takes_the_card_of_the_call_that_started_it() {
         let mut ids = frontend::CallIds::new(frontend::EditorThread::Empty);
-        let spawn = ids.open("call_0");
-        ids.await_worker("call_0", &spawn);
-        assert_eq!(ids.close("call_0"), spawn);
-        let later = ids.open("call_0");
-        assert_ne!(later, spawn);
-        assert_eq!(ids.take_worker("call_0").as_deref(), Some(spawn.as_str()));
+        let refused = ids.open("call_0");
+        ids.await_worker("call_0", &refused);
+        assert_eq!(ids.close("call_0"), refused);
+        let retried = ids.open("call_0");
+        assert_ne!(retried, refused);
+        ids.await_worker("call_0", &retried);
         assert_eq!(
-            ids.take_worker("call_0").as_deref(),
-            Some(later.as_str()),
+            ids.worker_card("call_0", true).as_deref(),
+            Some(retried.as_str()),
+            "not the refused call's card"
+        );
+        assert_eq!(
+            ids.worker_card("call_0", true).as_deref(),
+            Some(retried.as_str()),
             "with no card waiting, the call the id names now"
         );
-        let refused = ids.open("call_1");
-        ids.await_worker("call_1", &refused);
+
+        let abandoned = ids.open("call_1");
+        ids.await_worker("call_1", &abandoned);
+        ids.abandon_running();
         ids.forget_workers();
-        assert_eq!(ids.take_worker("call_1").as_deref(), Some(refused.as_str()));
+        let next = ids.open("call_1");
+        ids.await_worker("call_1", &next);
+        assert_eq!(
+            ids.worker_card("call_1", true).as_deref(),
+            Some(next.as_str()),
+            "not the abandoned call's card"
+        );
+
+        let detached = ids.open("call_2");
+        ids.await_worker("call_2", &detached);
+        let inline = ids.open("call_2");
+        ids.await_worker("call_2", &inline);
+        assert_eq!(ids.worker_card("call_2", false), None);
+        assert_eq!(
+            ids.worker_card("call_2", true).as_deref(),
+            Some(inline.as_str()),
+            "not the card of the call in the background"
+        );
     }
 
     /// A recorded change reads as a unified diff whose hunk headers number both sides, the side a

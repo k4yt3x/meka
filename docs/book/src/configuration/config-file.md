@@ -1169,7 +1169,7 @@ enabled = true
 max_tasks = 10
 ```
 
-**Alone among the capability blocks, this one is off by default.** `[schedule]`, `[skills]`, and `[memory]` add capability without changing when a turn ends; this changes the contract of the primary interaction into "you asked, it answered, and something else may interrupt you later". That is right for an unattended assistant and wrong for someone using the screen as a command line. A scheduled job also takes an explicit act to create, whereas `background` is reachable from any tool call, so an agent will reach for it unprompted.
+**Alone among the capability blocks, this one is off by default.** `[schedule]`, `[skills]`, and `[memory]` add capability without changing when a turn ends; this changes the contract of the primary interaction into "you asked, it answered, and something else may interrupt you later". That is right for an unattended assistant and wrong for someone using the screen as a command line. A scheduled job also takes an explicit act to create, whereas `background` is offered on every tool whose call can outlast a round, so an agent will reach for it unprompted.
 
 Setting `enabled = false` keeps the `background` property out of every tool schema and the two `task_*` tools out of every request, rather than advertising a parameter that would only ever be refused.
 

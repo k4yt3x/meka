@@ -93,6 +93,17 @@ impl Tool for TaskListTool {
                     task.short_id().to_string(),
                     task.status.name().to_string(),
                     task.tool.clone(),
+                    // The sub-agent a task drives, by the prefix `agent_steer` takes.
+                    task.subagent_id.map_or_else(
+                        || "-".to_string(),
+                        |subagent| {
+                            subagent
+                                .to_string()
+                                .get(..crate::text::ID_PREFIX)
+                                .unwrap_or_default()
+                                .to_string()
+                        },
+                    ),
                     crate::background::excerpt(&task.label, LABEL_EXCERPT_CHARS),
                     humantime_serde::re::humantime::format_duration(
                         std::time::Duration::from_secs(task.elapsed().num_seconds().max(0) as u64),
@@ -115,7 +126,15 @@ impl Tool for TaskListTool {
             .collect();
 
         let mut rendered = crate::text::format_columns(
-            &["ID", "Status", "Tool", "What", "Elapsed", "Result"],
+            &[
+                "ID",
+                "Status",
+                "Tool",
+                "Sub-agent",
+                "What",
+                "Elapsed",
+                "Result",
+            ],
             &rows,
         );
         rendered.push_str(
@@ -343,7 +362,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");
@@ -359,7 +378,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");
@@ -386,7 +405,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");
@@ -414,7 +433,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"id": &task.id[..8]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");
@@ -436,7 +455,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"id": "deadbeef"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");
@@ -469,7 +488,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");
@@ -486,7 +505,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");
@@ -516,7 +535,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"all": true}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");
@@ -562,7 +581,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"all": true}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");
@@ -586,7 +605,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"all": true}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("ok");

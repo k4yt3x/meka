@@ -2108,14 +2108,14 @@ mod tests {
                 serde_json::json!({"path": path_arg, "old_string": "alpha", "new_string": "ALPHA"}),
                 crate::tools::ToolContext {
                     frontend: probe.clone(),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             ),
             tool_two.execute(
                 serde_json::json!({"path": path_arg, "old_string": "beta", "new_string": "BETA"}),
                 crate::tools::ToolContext {
                     frontend: probe.clone(),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             ),
         );
@@ -2160,7 +2160,7 @@ mod tests {
         let refused = read_only
             .execute(
                 serde_json::json!({"path": secret.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         let unrestricted = ReadFileTool {
@@ -2170,7 +2170,7 @@ mod tests {
         let allowed = unrestricted
             .execute(
                 serde_json::json!({"path": secret.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
@@ -2202,7 +2202,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"path": file_path.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -2234,7 +2234,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"path": file_path.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a broken image is a tool error, not a failed turn");
@@ -2269,7 +2269,7 @@ mod tests {
                 serde_json::json!({"path": file_path.to_str().expect("path")}),
                 crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::unservable()),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2296,7 +2296,7 @@ mod tests {
                 serde_json::json!({"path": file_path.to_str().expect("path")}),
                 crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::transient()),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2332,11 +2332,11 @@ mod tests {
         let (first, second) = tokio::join!(
             tool_one.execute(
                 serde_json::json!({"path": path_arg, "old_string": "alpha", "new_string": "ALPHA"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             ),
             tool_two.execute(
                 serde_json::json!({"path": path_arg, "old_string": "beta", "new_string": "BETA"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             ),
         );
 
@@ -2377,7 +2377,7 @@ mod tests {
                     "new_string": "X",
                     "replace_all": true,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(
@@ -2416,7 +2416,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: frontend.clone(),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2462,7 +2462,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::transient()),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2508,7 +2508,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: frontend.clone(),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2549,7 +2549,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: frontend.clone(),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2569,7 +2569,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: frontend.clone(),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2609,7 +2609,7 @@ mod tests {
                     frontend: frontend.clone(),
                     ..crate::tools::ToolContext {
                         frontend: frontend.clone(),
-                        ..crate::tools::ToolContext::detached(CancellationToken::new())
+                        ..crate::tools::ToolContext::for_test(CancellationToken::new())
                     }
                 },
             )
@@ -2640,7 +2640,7 @@ mod tests {
                     frontend: frontend.clone(),
                     ..crate::tools::ToolContext {
                         frontend: frontend.clone(),
-                        ..crate::tools::ToolContext::detached(CancellationToken::new())
+                        ..crate::tools::ToolContext::for_test(CancellationToken::new())
                     }
                 },
             )
@@ -2693,7 +2693,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: frontend.clone(),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2734,7 +2734,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: frontend.clone(),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2791,7 +2791,7 @@ mod tests {
                     }),
                     crate::tools::ToolContext {
                         frontend: frontend.clone(),
-                        ..crate::tools::ToolContext::detached(CancellationToken::new())
+                        ..crate::tools::ToolContext::for_test(CancellationToken::new())
                     },
                 )
                 .await
@@ -2833,7 +2833,7 @@ mod tests {
             serde_json::json!({"path": file_path.to_str().expect("path")}),
             crate::tools::ToolContext {
                 frontend: frontend.clone(),
-                ..crate::tools::ToolContext::detached(CancellationToken::new())
+                ..crate::tools::ToolContext::for_test(CancellationToken::new())
             },
         )
         .await
@@ -2854,7 +2854,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend,
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2901,7 +2901,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: frontend.clone(),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2943,7 +2943,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::unservable()),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -2987,7 +2987,7 @@ mod tests {
             serde_json::json!({"path": file_path.to_str().expect("path")}),
             crate::tools::ToolContext {
                 frontend: Arc::new(ScriptedDelegateFrontend::serving("in the buffer\n")),
-                ..crate::tools::ToolContext::detached(CancellationToken::new())
+                ..crate::tools::ToolContext::for_test(CancellationToken::new())
             },
         )
         .await
@@ -3012,7 +3012,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::serving("in the buffer\n")),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await;
@@ -3051,7 +3051,7 @@ mod tests {
                 frontend: Arc::new(ScriptedDelegateFrontend::serving("in the buffer\n")),
                 ..crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::transient_read_only()),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 }
             },
         )
@@ -3074,7 +3074,7 @@ mod tests {
                     frontend: Arc::new(ScriptedDelegateFrontend::serving("in the buffer\n")),
                     ..crate::tools::ToolContext {
                         frontend: Arc::new(ScriptedDelegateFrontend::transient_read_only()),
-                        ..crate::tools::ToolContext::detached(CancellationToken::new())
+                        ..crate::tools::ToolContext::for_test(CancellationToken::new())
                     }
                 },
             )
@@ -3109,7 +3109,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::transient()),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -3144,7 +3144,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::canceled(Some("in buffer\n"))),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -3185,7 +3185,7 @@ mod tests {
                 }),
                 crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::canceled(None)),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -3218,7 +3218,7 @@ mod tests {
                 serde_json::json!({"path": file_path.to_str().expect("path")}),
                 crate::tools::ToolContext {
                     frontend: Arc::new(ScriptedDelegateFrontend::canceled(None)),
-                    ..crate::tools::ToolContext::detached(CancellationToken::new())
+                    ..crate::tools::ToolContext::for_test(CancellationToken::new())
                 },
             )
             .await
@@ -3246,7 +3246,7 @@ mod tests {
                     "start": 2,
                     "end": 3
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -3284,7 +3284,7 @@ mod tests {
                     "path": file_path.to_str().expect("path"),
                     "content": "hello world"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -3323,7 +3323,7 @@ mod tests {
                     "content": "rewritten",
                     "force": true,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write should succeed");
@@ -3384,7 +3384,7 @@ mod tests {
                     "path": link.to_str().expect("path"),
                     "content": "the model's stale copy",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("execute");
@@ -3428,7 +3428,7 @@ mod tests {
                     "content": "rewritten",
                     "force": true,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write should succeed");
@@ -3470,7 +3470,7 @@ mod tests {
                     "path": file_path.to_str().expect("path"),
                     "content": "hello world"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write should succeed");
@@ -3487,7 +3487,7 @@ mod tests {
                     "old_string": "world",
                     "new_string": "rust"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("edit should succeed without force");
@@ -3516,7 +3516,7 @@ mod tests {
         read_tool
             .execute(
                 serde_json::json!({"path": file_path.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read should succeed");
@@ -3533,7 +3533,7 @@ mod tests {
                     "old_string": "world",
                     "new_string": "rust"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -3563,7 +3563,7 @@ mod tests {
                     "replace_all": true,
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -3593,7 +3593,7 @@ mod tests {
                     "new_string": "qux",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -3628,7 +3628,7 @@ mod tests {
                     "new_string": "replacement",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -3655,7 +3655,7 @@ mod tests {
                     "old_string": "world",
                     "new_string": "rust"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -3695,7 +3695,7 @@ mod tests {
                     "old_string": "world",
                     "new_string": "rust"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -3740,7 +3740,7 @@ mod tests {
         let result = tool
             .execute(
                 arguments.clone(),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -3759,7 +3759,7 @@ mod tests {
         let result = tool
             .execute(
                 forced,
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -3787,7 +3787,7 @@ mod tests {
         let result = read
             .execute(
                 serde_json::json!({ "path": file_path.to_str().expect("path") }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -3807,7 +3807,7 @@ mod tests {
                     "old_string": "first\r\nsecond",
                     "new_string": "first\r\nSECOND",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -3840,7 +3840,7 @@ mod tests {
                     "old_string": "first\nsecond",
                     "new_string": "first\nSECOND",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -3884,7 +3884,7 @@ mod tests {
                     frontend: frontend.clone(),
                     ..crate::tools::ToolContext {
                         frontend: frontend.clone(),
-                        ..crate::tools::ToolContext::detached(CancellationToken::new())
+                        ..crate::tools::ToolContext::for_test(CancellationToken::new())
                     }
                 },
             )
@@ -3915,7 +3915,7 @@ mod tests {
                     frontend: frontend.clone(),
                     ..crate::tools::ToolContext {
                         frontend: frontend.clone(),
-                        ..crate::tools::ToolContext::detached(CancellationToken::new())
+                        ..crate::tools::ToolContext::for_test(CancellationToken::new())
                     }
                 },
             )
@@ -3958,7 +3958,7 @@ mod tests {
                     "start": 4,
                     "end": 5,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a windowed read of an oversized capture must succeed");
@@ -4028,7 +4028,7 @@ mod tests {
             async move {
                 tool.execute(
                     input,
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("read")
@@ -4123,7 +4123,7 @@ mod tests {
         let error = tool
             .execute(
                 serde_json::json!({"path": huge.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a file too large to return whole must be refused");
@@ -4178,7 +4178,7 @@ mod tests {
                     "path": path.to_str().expect("path"),
                     "content": "replacement\n",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("the tool reports, it does not error");
@@ -4197,7 +4197,7 @@ mod tests {
                     "content": "replacement\n",
                     "force": true,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("forced write");
@@ -4434,7 +4434,7 @@ mod tests {
                     "path": file_path.to_str().expect("path"),
                     "content": "brand new",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -4467,7 +4467,7 @@ mod tests {
                     "old_string": "world",
                     "new_string": "rust"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -4502,7 +4502,7 @@ mod tests {
                     "new_string": "rust",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -4536,7 +4536,7 @@ mod tests {
                         "old_string": old,
                         "new_string": new
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("should return Ok")
@@ -4575,7 +4575,7 @@ mod tests {
                     "path": file_path.to_str().expect("path"),
                     "content": "hello world"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write succeeds");
@@ -4592,7 +4592,7 @@ mod tests {
                     "old_string": "world",
                     "new_string": "rust"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -4619,7 +4619,7 @@ mod tests {
                     "new_string": "rust",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -4644,7 +4644,7 @@ mod tests {
         read_tool
             .execute(
                 serde_json::json!({"path": file_path.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read should succeed");
@@ -4661,7 +4661,7 @@ mod tests {
                     "old_string": "world",
                     "new_string": "rust"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -4693,7 +4693,7 @@ mod tests {
         read_tool
             .execute(
                 serde_json::json!({"path": link.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read");
@@ -4714,7 +4714,7 @@ mod tests {
                     "old_string": "value-a",
                     "new_string": "overwritten",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("execute");
@@ -4755,7 +4755,7 @@ mod tests {
                     "path": file_path.to_str().expect("path"),
                     "regex": r"\d+"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("regex search should succeed");
@@ -4784,7 +4784,7 @@ mod tests {
                     "path": file_path.to_str().expect("path"),
                     "regex": r"xyz\d+"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -4809,7 +4809,7 @@ mod tests {
                     "path": file_path.to_str().expect("path"),
                     "regex": "[invalid"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         let error = result.expect_err("invalid regex must surface as an error");
@@ -4836,7 +4836,7 @@ mod tests {
                     "path": file_path.to_str().expect("path"),
                     "regex": "match-"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -4867,7 +4867,7 @@ mod tests {
         let error = tool
             .execute(
                 serde_json::json!({"path": file_path.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a file past the ceiling must be refused");
@@ -4882,7 +4882,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"path": file_path.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a file exactly at the ceiling is readable");
@@ -4904,7 +4904,7 @@ mod tests {
         let found = tool
             .execute(
                 serde_json::json!({"path": file_path.to_str().expect("path"), "regex": "needle"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search");
@@ -4917,7 +4917,7 @@ mod tests {
                     "start": 3,
                     "end": 3,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read");
@@ -4947,7 +4947,7 @@ mod tests {
         let zero = tool
             .execute(
                 serde_json::json!({"path": file_path.to_str().expect("path"), "start": 0}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a start of 0 is refused");
@@ -4964,7 +4964,7 @@ mod tests {
                     "start": 3,
                     "end": 2,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("an end before the start is refused");
@@ -4995,7 +4995,7 @@ mod tests {
             async move {
                 tool.execute(
                     input,
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("read")
@@ -5033,7 +5033,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"path": file_path.to_str().expect("path"), "start": 100}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5074,7 +5074,7 @@ mod tests {
                     "path": file_path.to_str().expect("path"),
                     "regex": "match-"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5110,7 +5110,7 @@ mod tests {
                     "insert_before": "prefix-",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5139,7 +5139,7 @@ mod tests {
                     "insert_after": "-suffix",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5169,7 +5169,7 @@ mod tests {
                     "insert_after": "tail",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5198,7 +5198,7 @@ mod tests {
                     "insert_after": "tail",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5225,7 +5225,7 @@ mod tests {
                     "old_string": "anchor",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5261,7 +5261,7 @@ mod tests {
                     "new_string": "FIVE",
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5297,7 +5297,7 @@ mod tests {
                     "replace_all": true,
                     "force": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5325,7 +5325,7 @@ mod tests {
         read_tool
             .execute(
                 serde_json::json!({"path": file_a.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read should succeed");
@@ -5342,7 +5342,7 @@ mod tests {
                     "old_string": "content",
                     "new_string": "modified"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -5681,7 +5681,7 @@ mod tests {
                     "path": outside.to_str().expect("path"),
                     "content": "payload",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(
@@ -5698,7 +5698,7 @@ mod tests {
                     "path": inside.to_str().expect("path"),
                     "content": "payload",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a write inside the workspace");
@@ -5859,7 +5859,7 @@ mod tests {
                     "old_string": "alpha",
                     "new_string": "BETA",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("the refusal is a tool result, not a hard error");
@@ -5878,7 +5878,7 @@ mod tests {
                     "old_string": "alpha",
                     "new_string": "BETA",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("outside the workspace, whether or not it exists");
@@ -5898,7 +5898,7 @@ mod tests {
                     "old_string": "alpha",
                     "new_string": "BETA",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("edit inside");
@@ -5939,7 +5939,7 @@ mod tests {
         let refused = tool
             .execute(
                 serde_json::json!({"path": elsewhere.join("secret.txt")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("outside the roots");
@@ -5955,7 +5955,7 @@ mod tests {
         let missing = tool
             .execute(
                 serde_json::json!({"path": elsewhere.join("missing.txt")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("outside the roots, whether or not it exists");
@@ -5975,7 +5975,7 @@ mod tests {
             let through_link = tool
                 .execute(
                     serde_json::json!({"path": "link"}),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect_err("the link lands outside the roots")
@@ -5989,7 +5989,7 @@ mod tests {
         let allowed = tool
             .execute(
                 serde_json::json!({"path": "inside.txt"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("inside the roots");

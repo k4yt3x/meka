@@ -10,6 +10,22 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.90 to 0.91
+
+Nothing in `config.toml` is renamed. The store moves forward on its first open: the result of
+every call that went to the background records the task it became, and the sub-agent it ran when
+its task row still says, behind the automatic backup. 0.90 refuses a store 0.91 has opened;
+downgrading means restoring the backup the upgrade took. Session archives are `format_version` 23;
+a 0.89 or 0.90 archive (22) imports as it is, and 0.90 refuses a 23.
+
+**Fewer tools take `background`.** With `[background] enabled`, `background` is offered only on
+the tools whose call can outlast a round: `shell_execute`, `web_fetch`, `agent_spawn`,
+`agent_followup`, MCP tools, and the MCP resource and prompt tools that ask the server. Every other
+tool refuses a call that sets it. A skill or standing instructions that tell the agent to run
+another tool in the background now get that refusal; take the instruction out, since the call was
+quick enough to run in the foreground. A scheduled job whose gate calls such a tool with
+`background` fails every probe the same way; cancel it and schedule it again without the flag.
+
 ## 0.88 to 0.89
 
 Nothing in `config.toml` is renamed. The store moves forward on its first open: the table of the

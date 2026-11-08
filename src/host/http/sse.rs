@@ -495,14 +495,12 @@ fn tool_result_content_view(
         .collect()
 }
 
-/// The `tool_call.progress` event's payload. The three optional fields are omitted rather than
+/// The `tool_call.progress` event's payload. The two optional fields are omitted rather than
 /// `null`, like every optional field on this API.
 #[derive(Debug, Serialize)]
 struct ProgressView {
-    /// The call this belongs to, as its `tool_call.executing` named it, when the call carried a
-    /// provider id.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
+    /// The call this belongs to, as its `tool_call.executing` named it.
+    id: String,
     progress: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<f64>,
@@ -796,7 +794,7 @@ mod tests {
         let event = FrontendEvent::McpProgress(ProgressUpdate {
             server_name: "exa".into(),
             tool_name: "web_search_exa".into(),
-            tool_use_id: Some("tu_1".into()),
+            tool_use_id: "tu_1".into(),
             progress: 3.0,
             total: None,
             message: Some("fetching".into()),

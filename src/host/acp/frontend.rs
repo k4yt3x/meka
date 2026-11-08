@@ -234,8 +234,10 @@ pub(super) struct CallIds {
     /// call under.
     newest: std::collections::HashMap<String, String>,
     /// The calls that run a worker and whose worker has not taken its card yet, by what they were
-    /// sent as, oldest first: a background spawn's worker starts after its call returned, by
-    /// which time a later call may be the one under the provider's id.
+    /// sent as, oldest first: a provider may give several calls one id, and a worker takes the
+    /// oldest card under its call's id rather than the newest call. A worker is built while its
+    /// call runs, so the oldest is its own call's, unless two calls under one id build workers at
+    /// once and take each other's.
     workers: std::collections::HashMap<String, std::collections::VecDeque<String>>,
 }
 
@@ -290,7 +292,9 @@ impl CallIds {
     }
 
     /// End the oldest call running under the provider's `id`, if one is, and say what it was sent
-    /// as.
+    /// as. A card the call queued for a worker goes with it: a worker is built while its call
+    /// runs, so a card still queued belongs to a call refused before its worker started, and the
+    /// next worker under the id would take it.
     pub(super) fn close_running(&mut self, id: &str) -> Option<String> {
         let closed = self
             .running
@@ -302,6 +306,14 @@ impl CallIds {
             .is_some_and(std::collections::VecDeque::is_empty)
         {
             self.running.remove(id);
+        }
+        if let Some(sent) = &closed
+            && let Some(cards) = self.workers.get_mut(id)
+        {
+            cards.retain(|card| card != sent);
+            if cards.is_empty() {
+                self.workers.remove(id);
+            }
         }
         closed
     }
@@ -317,7 +329,7 @@ impl CallIds {
 
     /// The card a worker started by a call under the provider's `id` reports on: the oldest such
     /// call whose worker has not taken its card, else the call [`Self::current`] names.
-    pub(super) fn take_worker(&mut self, id: &str) -> Option<String> {
+    fn take_worker(&mut self, id: &str) -> Option<String> {
         let taken = self
             .workers
             .get_mut(id)
@@ -332,9 +344,18 @@ impl CallIds {
         taken.or_else(|| self.current(id))
     }
 
-    /// Let go of the cards no worker took: a call refused before its worker started leaves one,
-    /// and the turn's end comes after any background worker of its started, since a turn answers
-    /// its tool results with a round of its own.
+    /// The card a worker started by a call under the provider's `id` reports its activity on,
+    /// while `live` says a live view is open on that call: [`Self::take_worker`]'s, else `id`. A
+    /// call in the background shows its worker on no card, and still takes the one it queued,
+    /// which a worker another call under the id builds before this call ends would otherwise
+    /// take.
+    pub(super) fn worker_card(&mut self, id: &str, live: bool) -> Option<String> {
+        let card = self.take_worker(id).unwrap_or_else(|| id.to_string());
+        live.then_some(card)
+    }
+
+    /// Let go of every card still queued, at the turn's end: a call abandoned there never closes
+    /// to let go of its own.
     pub(super) fn forget_workers(&mut self) {
         self.workers.clear();
     }
@@ -930,20 +951,18 @@ impl Frontend for AcpFrontend {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The default adapter, told the call that runs the worker by the id its card was sent under:
-    /// a worker can outlast its call, as a background spawn's does, so its activity names the card
-    /// rather than whichever call holds the provider's id when it reports.
+    /// The default adapter, told the call that runs the worker by the id its card was sent under,
+    /// so its activity names that card rather than whichever call holds the provider's id when it
+    /// reports; see [`CallIds::worker_card`].
     fn for_subagent(
         &self,
         this: Arc<dyn Frontend>,
         child: uuid::Uuid,
         tool_call_id: Option<String>,
+        live: bool,
     ) -> Arc<dyn Frontend> {
-        let card = tool_call_id.map(|id| {
-            crate::sync::lock(&self.call_ids)
-                .take_worker(&id)
-                .unwrap_or(id)
-        });
+        let card =
+            tool_call_id.and_then(|id| crate::sync::lock(&self.call_ids).worker_card(&id, live));
         Arc::new(crate::frontend::PermissionForwardingFrontend::new(
             this,
             card,

@@ -2136,7 +2136,12 @@ fn settle_call(
     else {
         return;
     };
-    *result = Some(shown_result(text, input.as_ref()));
+    *result = Some(
+        match display.and_then(|display| display.background.as_ref()) {
+            Some(started) => background_row(started),
+            None => text,
+        },
+    );
     *result_images = images;
     *state = ToolState::Done { is_error };
     *progress = None;
@@ -2152,19 +2157,19 @@ fn settle_call(
     }
 }
 
-/// What a call's result shows of `text`: for a call that asked to go to the background, the
-/// notice the dispatcher answered it with as the task it became, and otherwise the text itself.
-fn shown_result(text: String, input: Option<&serde_json::Value>) -> String {
-    let backgrounded = input
-        .and_then(|input| input.get(crate::tools::BACKGROUND_PARAMETER))
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-    match backgrounded
-        .then(|| crate::background::started_task(&text))
-        .flatten()
-    {
-        Some(task) => format!("Background task {task}"),
-        None => text,
+/// What a call that went to the background shows in place of the answer it was given: the task it
+/// runs as, and the sub-agent the task drives.
+fn background_row(started: &crate::conversation::BackgroundStart) -> String {
+    match started.subagent {
+        Some(subagent) => format!(
+            "Background task {} running sub-agent {}",
+            started.short_task(),
+            subagent
+                .to_string()
+                .get(..crate::text::ID_PREFIX)
+                .unwrap_or_default()
+        ),
+        None => format!("Background task {}", started.short_task()),
     }
 }
 
@@ -2532,6 +2537,43 @@ mod tests {
             shown[0],
             Item::ToolCall { state: ToolState::Done { is_error: false }, output, result: Some(result), summary: Some(summary), .. }
                 if output == "a\nb\n" && result == "a\nb\n" && summary == "ls"
+        ));
+    }
+
+    /// A call that went to the background is drawn from what its result records, the task and the
+    /// sub-agent, whatever the words it was answered with say.
+    #[test]
+    fn a_call_in_the_background_is_drawn_from_its_record() {
+        let mut transcript = transcript();
+        transcript.apply(FrontendEvent::ToolCallStarted {
+            id: "call-1".into(),
+            name: "agent_spawn".into(),
+            input: serde_json::json!({"prompt": "count the files", "background": true}),
+            display_summary: None,
+        });
+        transcript.apply(FrontendEvent::ToolCallCompleted {
+            id: "call-1".into(),
+            name: "agent_spawn".into(),
+            is_error: false,
+            content: vec![ToolResultContent::Text {
+                text: "Started, in words a screen does not read.".into(),
+            }],
+            metadata: None,
+            display: Some(ResultDisplay {
+                background: Some(crate::conversation::BackgroundStart {
+                    task: "7f3a1c22-0000-4000-8000-000000000000".to_string(),
+                    subagent: Some(
+                        uuid::Uuid::parse_str("3e9b51d0-0000-4000-8000-000000000000")
+                            .expect("a uuid"),
+                    ),
+                }),
+                ..ResultDisplay::default()
+            }),
+        });
+        assert!(matches!(
+            &items(&transcript)[0],
+            Item::ToolCall { result: Some(result), .. }
+                if result == "Background task 7f3a1c22 running sub-agent 3e9b51d0"
         ));
     }
 
@@ -3145,22 +3187,24 @@ mod tests {
             }]),
             (String::new(), 0)
         );
-        let started = format!(
-            "{} Use `task_list` for status.",
-            crate::background::started_notice("7f3a1c22", "cargo build")
-        );
-        let detached = serde_json::json!({"command": "cargo build", "background": true});
+        let started = |subagent| crate::conversation::BackgroundStart {
+            task: "7f3a1c22-0000-4000-8000-000000000000".to_string(),
+            subagent,
+        };
+        assert_eq!(background_row(&started(None)), "Background task 7f3a1c22");
         assert_eq!(
-            shown_result(started.clone(), Some(&detached)),
-            "Background task 7f3a1c22"
+            background_row(&started(Some(
+                uuid::Uuid::parse_str("3e9b51d0-0000-4000-8000-000000000000").expect("a uuid")
+            ))),
+            "Background task 7f3a1c22 running sub-agent 3e9b51d0"
         );
         assert_eq!(
-            shown_result(
-                started.clone(),
-                Some(&serde_json::json!({"command": "echo"}))
-            ),
-            started,
-            "a call that ran in the foreground shows what it printed, whatever it reads like"
+            background_row(&crate::conversation::BackgroundStart {
+                task: "7f3a1c22".to_string(),
+                subagent: None,
+            }),
+            "Background task 7f3a1c22",
+            "a task named by its prefix alone"
         );
         let spilled = "<large-output name=\"shell_execute_x_1\" size=\"47000\">\nOutput too \
                        large (45.9 KiB). Read it with `scratchpad_read`.\n\nPreview (first 5 \

@@ -455,12 +455,28 @@ impl Tool for AgentSpawnTool {
         Permission::Read
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let cancellation = context.cancellation.clone();
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[async_trait]
+impl crate::tools::Detachable for AgentSpawnTool {
+    /// Everything up to a built worker whose session is recorded, locked and running: every
+    /// refusal, the row, and the build with its rollback. The run is the worker's turn.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
         // Both `prompt` and `skill` are optional, but at least one must be present. This mirrors
         // the CLI's `--oneshot` guard in `src/main.rs`. An empty/whitespace `prompt` counts
         // as absent.
@@ -486,14 +502,14 @@ impl Tool for AgentSpawnTool {
                     // available answers a question the caller did not ask and invites it to pick a
                     // substitute. Name the file instead, the way `skill_read` does.
                     None if installed.skip_reason(name).is_some() => {
-                        return Ok(ToolOutput::text(
+                        return Ok(crate::tools::Started::Answered(ToolOutput::text(
                             format!(
                                 "Error: {}. Tell the user; they need to fix that file. Do not \
                                  delegate a procedure you invented in its place.",
                                 installed.unavailable(name)
                             ),
                             true,
-                        ));
+                        )));
                     }
                     None => {
                         let available: Vec<&str> = installed
@@ -741,6 +757,12 @@ impl Tool for AgentSpawnTool {
                 message: "agent_spawn requires 'prompt', 'skill', or both".to_string(),
             }
         })?;
+        let turn = crate::agent::TurnInput::sent(vec![task], Vec::new()).map_err(|empty| {
+            MekaError::ToolExecution {
+                tool_name: "agent_spawn".to_string(),
+                message: empty.to_string(),
+            }
+        })?;
 
         // Bound the sub-agent's own recursion budget before the spec is written:
         // `child_spawn_depth` turns this tool's counters plus the optional `max_depth`
@@ -850,13 +872,13 @@ impl Tool for AgentSpawnTool {
                 tool_name: "agent_spawn".to_string(),
                 message: format!("failed to create sub-agent session: {error}"),
             })?;
-        // Held for the whole of the worker's run, then released with this scope. Unlocked, a
+        // Held for the whole of the worker's run, which takes it over. Unlocked, a
         // sub-agent's row can be taken by a concurrent `meka session remove --all` and its
         // conversation cascaded away mid-turn. A failure to claim is a warning rather than a
         // refusal, matching the root agent's own creation path: the id is one nobody else can be
         // holding, so the only way here is a filesystem problem, and refusing to spawn over that
         // would break installations that work today.
-        let _sub_session_lock = match sub_session_lock {
+        let sub_session_lock = match sub_session_lock {
             Ok(lock) => Some(lock),
             Err(error) => {
                 tracing::warn!("sub-agent session {sub_session_id} is running unlocked: {error}");
@@ -864,20 +886,6 @@ impl Tool for AgentSpawnTool {
             }
         };
         tracing::info!("spawning sub-agent {sub_session_id} for parent {parent_sid}");
-        // A detached spawn is a task row; the row names the session it runs, so a client
-        // connects the two without parsing the task's words. Best-effort: the link is
-        // bookkeeping, and the run does not wait on it.
-        if let Some(task_id) = &context.task_id
-            && let Err(error) = self
-                .tool_builder_params
-                .materials
-                .store
-                .background_store()
-                .record_task_subagent(task_id, sub_session_id)
-                .await
-        {
-            tracing::warn!("failed to record the task's sub-agent: {error}");
-        }
         // The last step that can fail before the worker exists in its own right. Nothing here is
         // reachable in practice (the web client is built from config the root already used, and a
         // fresh registry cannot collide), but the row is already on disk, so a failure would leave
@@ -894,7 +902,7 @@ impl Tool for AgentSpawnTool {
             parent_sid,
             sub_session_id,
             "agent_spawn",
-            &context,
+            context,
         )
         .await
         {
@@ -918,8 +926,9 @@ impl Tool for AgentSpawnTool {
         // Registered for the whole of the run, lock or no lock: a sub-agent is never a resident
         // session of any host, so this is what a session record answers `turn_in_flight` from.
         // Taken after the build, which installs the worker's feed, so a record that says the
-        // worker is running never names a feed that is not yet there to read.
-        let _running = self
+        // worker is running never names a feed that is not yet there to read, and here rather
+        // than in the run, so a listing made the moment a detached call returns says so too.
+        let running = self
             .tool_builder_params
             .materials
             .core
@@ -929,36 +938,34 @@ impl Tool for AgentSpawnTool {
                 crate::session::SubagentRun::Spawned,
                 &sub_agent.cells().profile,
             );
-
-        // Run the sub-agent's single turn via the shared `Agent::run_turn` path. Conversation
-        // persistence (user message, assistant messages, tool results) happens inside `run_turn`
-        // against the sub-session, so the audit trail is identical to the root agent's. Silent
-        // rendering and the omitted MCP gate are baked into the options via `new_subagent`.
-        let mut messages = Conversation::new();
-        // Every request the sub-agent makes is attributed as one (`Attribution::subagent`, from its
-        // role), which the Claude OAuth billing header reports as `cc_is_subagent=true;`.
-        let outcome = sub_agent
-            .run_turn(
-                &mut messages,
-                crate::agent::TurnInput::sent(vec![task], Vec::new()).map_err(|empty| {
-                    MekaError::ToolExecution {
-                        tool_name: "agent_spawn".to_string(),
-                        message: empty.to_string(),
-                    }
-                })?,
-                crate::agent::TurnCancellation::child_of(
-                    &cancellation,
-                    crate::store::turns::CancelReason::Parent,
-                ),
-            )
-            .await;
-        worker_report(
-            sub_session_id,
-            &scope_lines,
-            outcome,
-            &messages,
-            super::util::redirects_to_scratchpad(&input),
-        )
+        let redirected = super::util::redirects_to_scratchpad(&input);
+        Ok(crate::tools::Started::running(
+            Some(sub_session_id),
+            move |context| async move {
+                // Bound rather than discarded, so they last the whole of the worker's turn.
+                let _sub_session_lock = sub_session_lock;
+                let _running = running;
+                // Run the sub-agent's single turn via the shared `Agent::run_turn` path.
+                // Conversation persistence (user message, assistant messages, tool results)
+                // happens inside `run_turn` against the sub-session, so the audit trail is
+                // identical to the root agent's. Silent rendering and the omitted MCP gate are
+                // baked into the options via `new_subagent`. Every request the sub-agent makes is
+                // attributed as one (`Attribution::subagent`, from its role), which the Claude
+                // OAuth billing header reports as `cc_is_subagent=true;`.
+                let mut messages = Conversation::new();
+                let outcome = sub_agent
+                    .run_turn(
+                        &mut messages,
+                        turn,
+                        crate::agent::TurnCancellation::child_of(
+                            &context.cancellation,
+                            crate::store::turns::CancelReason::Parent,
+                        ),
+                    )
+                    .await;
+                worker_report(sub_session_id, &scope_lines, outcome, &messages, redirected)
+            },
+        ))
     }
 }
 
@@ -1220,8 +1227,9 @@ pub(crate) struct AgentListTool {
 pub(crate) fn agent_list_definition() -> ToolDefinition {
     ToolDefinition {
         name: "agent_list".to_string(),
-        description: "List the sub-agents you have spawned in this session, with each one's \
-                      id, working directory, turn count, and last activity. Pass an id to \
+        description: "List the sub-agents you have spawned in this session: each one's id, \
+                      whether it is running and the background task running it, turn count, \
+                      last activity, working directory, and what it was asked. Pass an id to \
                       `agent_followup` to ask it another question, to `agent_steer` to send it \
                       a message without waiting, or to `agent_delete` to discard it and free \
                       what it held."
@@ -1247,7 +1255,7 @@ impl Tool for AgentListTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let session_id = current_session_id(&self.tool_builder_params, "agent_list")?;
-        let rows = self
+        let rows_of_tree = self
             .tool_builder_params
             .materials
             .store
@@ -1258,50 +1266,103 @@ impl Tool for AgentListTool {
                 message: format!("failed to list sub-agents: {error}"),
             })?;
 
+        // The tasks running a worker, so a row names the one a backgrounded call started, and
+        // says what it was asked before the worker's own first prompt is saved.
+        let tasks = self
+            .tool_builder_params
+            .materials
+            .store
+            .background_store()
+            .list_running_background_tasks(session_id)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!("failed to read the background tasks for agent_list: {error}");
+                Vec::new()
+            });
+        let running = &self.tool_builder_params.materials.core.running_subagents;
+
         // Direct children only. Grandchildren belong to the worker that spawned them and are
         // reachable through *its* `agent_list`; listing them here would advertise ids this session
         // cannot follow up on.
-        let mut lines = Vec::new();
-        for row in rows.iter().filter(|row| row.parent_id == Some(session_id)) {
+        let mut rows = Vec::new();
+        for row in rows_of_tree
+            .iter()
+            .filter(|row| row.parent_id == Some(session_id))
+        {
             // A turn is a row of `turns`, the count the session's record carries: a task through
             // several tool rounds, or a prompt the turn took back to join a message to it, is one.
-            let turns = match self
+            let session = match self
                 .tool_builder_params
                 .materials
                 .store
                 .session_info(row.id)
                 .await
             {
-                Ok(session) => session.map_or(0, |session| session.turn_count),
+                Ok(session) => session,
                 Err(error) => {
                     tracing::warn!(
-                        "failed to count the turns of sub-agent {id}: {error}",
+                        "failed to read the record of sub-agent {id}: {error}",
                         id = row.id
                     );
-                    0
+                    None
                 }
             };
-            lines.push(format!(
-                "{}\t{}\tturns={}\tlast_active={}",
-                row.id,
+            let task = tasks.iter().find(|task| task.subagent_id == Some(row.id));
+            let asked = session
+                .as_ref()
+                .map(|session| session.title.as_str())
+                .filter(|title| !title.is_empty())
+                .or_else(|| task.map(|task| task.label.as_str()))
+                .unwrap_or_default();
+            rows.push(vec![
+                row.id.to_string(),
+                if running.is_running(row.id) {
+                    "running"
+                } else {
+                    "idle"
+                }
+                .to_string(),
+                task.map_or_else(|| "-".to_string(), |task| task.short_id().to_string()),
+                session
+                    .as_ref()
+                    .map_or(0, |session| session.turn_count)
+                    .to_string(),
+                row.updated_at.clone(),
                 row.cwd
                     .as_deref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_default(),
-                turns,
-                row.updated_at,
-            ));
+                crate::background::excerpt(asked, ASKED_EXCERPT_CHARS),
+            ]);
         }
 
-        if lines.is_empty() {
+        if rows.is_empty() {
             return Ok(ToolOutput::text(
                 "(no sub-agents spawned in this session)".to_string(),
                 false,
             ));
         }
-        Ok(ToolOutput::text(lines.join("\n"), false))
+        Ok(ToolOutput::text(
+            crate::text::format_columns(
+                &[
+                    "ID",
+                    "Status",
+                    "Task",
+                    "Turns",
+                    "Last active",
+                    "Directory",
+                    "Asked",
+                ],
+                &rows,
+            ),
+            false,
+        ))
     }
 }
+
+/// How much of what a worker was asked `agent_list` shows: enough to tell two workers apart, not
+/// the task itself, which the worker's own conversation holds.
+const ASKED_EXCERPT_CHARS: usize = 80;
 
 /// Puts a message in a sub-agent's inbox without waiting on it.
 ///
@@ -1523,18 +1584,40 @@ impl Tool for AgentFollowupTool {
         Permission::Read
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let cancellation = context.cancellation.clone();
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[async_trait]
+impl crate::tools::Detachable for AgentFollowupTool {
+    /// Everything up to a built worker that is claimed, locked, hydrated, running and recorded on
+    /// its row: every refusal and every write. The run is the worker's turn.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
         let prompt = super::util::require_str(&input, "prompt", "agent_followup")?;
+        let turn = crate::agent::TurnInput::from_parts(prompt, Vec::new()).map_err(|empty| {
+            MekaError::ToolExecution {
+                tool_name: "agent_followup".to_string(),
+                message: empty.to_string(),
+            }
+        })?;
         let agent_id = require_child_session(&self.tool_builder_params, "agent_followup", &input)
             .await?
             .1
             .id;
-        let Some(_guard) = FollowupGuard::claim(&self.in_flight, agent_id) else {
+        let Some(claim) = FollowupGuard::claim(&self.in_flight, agent_id) else {
             return Err(MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
                 message: format!(
@@ -1715,7 +1798,7 @@ impl Tool for AgentFollowupTool {
         // brand new, so a failure can only be a filesystem problem, while this id already exists
         // and a refusal genuinely means somebody else is running a turn on this worker. Two turns
         // interleaved into one conversation is the thing the lock is for.
-        let _worker_lock = self
+        let worker_lock = self
             .tool_builder_params
             .materials
             .store
@@ -1746,11 +1829,11 @@ impl Tool for AgentFollowupTool {
             parent_sid,
             agent_id,
             "agent_followup",
-            &context,
+            context,
         )
         .await?;
         // After the build, for the reason `agent_spawn` registers after its own.
-        let _running = self
+        let running = self
             .tool_builder_params
             .materials
             .core
@@ -1818,28 +1901,27 @@ impl Tool for AgentFollowupTool {
                 ),
             })?;
 
-        let outcome = sub_agent
-            .run_turn(
-                &mut messages,
-                crate::agent::TurnInput::from_parts(prompt, Vec::new()).map_err(|empty| {
-                    MekaError::ToolExecution {
-                        tool_name: "agent_followup".to_string(),
-                        message: empty.to_string(),
-                    }
-                })?,
-                crate::agent::TurnCancellation::child_of(
-                    &cancellation,
-                    crate::store::turns::CancelReason::Parent,
-                ),
-            )
-            .await;
-        worker_report(
-            agent_id,
-            &scope_lines,
-            outcome,
-            &messages,
-            super::util::redirects_to_scratchpad(&input),
-        )
+        let redirected = super::util::redirects_to_scratchpad(&input);
+        Ok(crate::tools::Started::running(
+            Some(agent_id),
+            move |context| async move {
+                // Bound rather than discarded, so they last the whole of the worker's turn.
+                let _claim = claim;
+                let _worker_lock = worker_lock;
+                let _running = running;
+                let outcome = sub_agent
+                    .run_turn(
+                        &mut messages,
+                        turn,
+                        crate::agent::TurnCancellation::child_of(
+                            &context.cancellation,
+                            crate::store::turns::CancelReason::Parent,
+                        ),
+                    )
+                    .await;
+                worker_report(agent_id, &scope_lines, outcome, &messages, redirected)
+            },
+        ))
     }
 }
 
@@ -2105,11 +2187,12 @@ async fn build_subagent(
     // Wrap so approval prompts surface in the parent's UI while emits stay silent (the
     // sub-agent's output flows back as this tool's result, not as live notifications). The one
     // exception is the sub-agent's tool calls, which are rolled up into this call's own display
-    // so a long run is not an opaque spinner, hence the tool-call id.
+    // so a long run is not an opaque spinner, hence the tool-call id, while that display is live.
     let sub_frontend: Arc<dyn crate::frontend::Frontend> = params.cells.frontend.for_subagent(
         Arc::clone(&params.cells.frontend),
         sub_session_id,
         call.tool_call_id.clone(),
+        call.live_call_id().is_some(),
     );
     // The worker's own cells: its clamped permission, the directory and roots it was handed, a
     // session of its own, fresh gauges, and a profile seeded from its binding. A
@@ -2896,7 +2979,7 @@ mod tests {
             .expect("subagent should have checklist_add");
         add.execute(
             serde_json::json!({ "items": ["sub task"] }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("the add should succeed");
@@ -3029,7 +3112,7 @@ mod tests {
             parent_session,
             Uuid::new_v4(),
             "agent_spawn",
-            &crate::tools::ToolContext::detached(CancellationToken::new()),
+            &crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("build the worker");
@@ -3274,6 +3357,251 @@ mod tests {
         }
     }
 
+    /// `agent_list` tells its workers apart: a running worker names the task running it and,
+    /// before its first prompt is saved, what that task asked; `task_list` names the sub-agent a
+    /// task drives, by the prefix `agent_steer` takes.
+    #[tokio::test]
+    async fn the_listings_say_which_task_runs_which_worker() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent session");
+        let (worker, _lock) = store
+            .create_child_session_for_test(
+                parent_sid,
+                None,
+                Vec::new(),
+                None,
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
+            .await
+            .expect("a worker");
+        let task_id = "7f3a1c22-0000-4000-8000-000000000000";
+        store
+            .background_store()
+            .start_background_task(&crate::store::background::BackgroundTask {
+                id: task_id.to_string(),
+                session_id: parent_sid,
+                tool: "agent_spawn".to_string(),
+                label: "count the files".to_string(),
+                status: crate::store::background::TaskStatus::Running,
+                outcome: None,
+                scratchpad_entry: None,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                announced_at: None,
+                delivered_at: None,
+                subagent_id: None,
+            })
+            .await
+            .expect("the task");
+        store
+            .background_store()
+            .record_task_subagent(task_id, worker)
+            .await
+            .expect("the link the dispatcher records once the start step names the worker");
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        let _running = params.materials.core.running_subagents.run(
+            worker,
+            crate::session::SubagentRun::Spawned,
+            &binding_for_test(),
+        );
+
+        let listed = AgentListTool {
+            tool_builder_params: params,
+        }
+        .execute(
+            serde_json::json!({}),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
+        )
+        .await
+        .expect("list")
+        .text_content();
+        let row = listed
+            .lines()
+            .find(|line| line.starts_with(&worker.to_string()))
+            .unwrap_or_else(|| panic!("a row for the worker: {listed}"));
+        let cells: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cells[1..4], ["running", "7f3a1c22", "0"], "{listed}");
+        assert!(row.ends_with("count the files"), "{listed}");
+
+        let tasks = crate::tools::background::build(
+            store.clone(),
+            {
+                let site = crate::session::ToolSite::for_test();
+                site.session_id.set(parent_sid);
+                site
+            },
+            crate::background::BackgroundTasks::default(),
+        );
+        let task_list = tasks
+            .iter()
+            .find(|tool| tool.definition().name == "task_list")
+            .expect("task_list");
+        let listed = task_list
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
+            )
+            .await
+            .expect("list")
+            .text_content();
+        let short = worker.to_string()[..crate::text::ID_PREFIX].to_string();
+        assert!(
+            listed.lines().any(|line| {
+                let cells: Vec<&str> = line.split_whitespace().collect();
+                cells.first() == Some(&"7f3a1c22") && cells.get(3) == Some(&short.as_str())
+            }),
+            "{listed}"
+        );
+    }
+
+    /// A spawn's start step leaves a worker that is recorded as a child of the parent and running
+    /// before the call returns, and names it, so a detached call can answer with the id and the
+    /// parent can steer the worker by it; its run is the worker's turn, which takes the steer in,
+    /// rolls no activity into a call that already returned, and ends the registration. A
+    /// follow-up's start step names the worker it resumes the same way.
+    #[tokio::test]
+    async fn a_detached_spawn_starts_a_recorded_running_worker_it_names() {
+        use crate::{
+            provider::mock::{MockEvent, MockStopReason},
+            tools::{Detachable, Started},
+        };
+
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent session");
+        // One tool call by the worker, so activity rolled into the parent's call has something to
+        // show, then its answer; then the follow-up's.
+        let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "read-1".to_string(),
+                    name: "checklist_read".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("counted"),
+            text_round("carried on"),
+        ]));
+        let provider: Arc<dyn Provider> = Arc::clone(&mock) as Arc<dyn Provider>;
+        let recorder = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        params.cells.frontend = Arc::clone(&recorder) as Arc<dyn crate::frontend::Frontend>;
+        let running_subagents = params.materials.core.running_subagents.clone();
+        let detached = || crate::tools::ToolContext {
+            session_id: Some(parent_sid),
+            tool_call_id: Some("call-1".to_string()),
+            prompt_id: None,
+            frontend: Arc::clone(&recorder) as Arc<dyn crate::frontend::Frontend>,
+            cancellation: CancellationToken::new(),
+            task_id: Some("7f3a1c22-0000-4000-8000-000000000000".to_string()),
+        };
+
+        let spawn = spawn_tool_for(params.clone(), Arc::clone(&provider));
+        assert!(
+            Tool::as_detachable(&spawn).is_some(),
+            "a spawn can run in the background"
+        );
+        let Started::Running(running) = spawn
+            .start(
+                serde_json::json!({ "prompt": "count the files" }),
+                &detached(),
+            )
+            .await
+            .expect("the spawn starts")
+        else {
+            panic!("a spawn runs a worker");
+        };
+        let worker = running.subagent.expect("the start names its worker");
+        let tree = store.load_session_tree(parent_sid).await.expect("tree");
+        assert!(
+            tree.iter()
+                .any(|row| row.id == worker && row.parent_id == Some(parent_sid)),
+            "recorded before the call returns: {tree:?}"
+        );
+        assert!(running_subagents.is_running(worker));
+        let steered = AgentSteerTool {
+            tool_builder_params: params.clone(),
+        }
+        .execute(
+            serde_json::json!({ "id": worker.to_string(), "message": "only the top level" }),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
+        )
+        .await
+        .expect("the worker is steered by the id the start named")
+        .text_content();
+        assert!(steered.contains("Queued for sub-agent"), "{steered}");
+        let report = running
+            .run(detached())
+            .await
+            .expect("the worker's turn")
+            .text_content();
+        assert!(report.contains(&format!("Agent: {worker}")), "{report}");
+        assert!(report.ends_with("counted"), "{report}");
+        assert!(
+            mock.completions()
+                .iter()
+                .flatten()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(
+                    block,
+                    crate::conversation::ContentBlock::Inbox { text, .. }
+                        if text.contains("only the top level")
+                )),
+            "the worker's turn took the steer in"
+        );
+        assert!(!running_subagents.is_running(worker));
+        assert!(
+            !recorder.events().iter().any(|event| matches!(
+                event,
+                crate::frontend::FrontendEvent::SubAgentActivity { .. }
+            )),
+            "the call it would roll into had returned: {:?}",
+            recorder.events()
+        );
+
+        let followup = followup_tool_for(params, provider);
+        assert!(
+            Tool::as_detachable(&followup).is_some(),
+            "so can a follow-up"
+        );
+        let Started::Running(running) = followup
+            .start(
+                serde_json::json!({ "id": worker.to_string(), "prompt": "carry on" }),
+                &detached(),
+            )
+            .await
+            .expect("the follow-up starts")
+        else {
+            panic!("a follow-up runs a worker");
+        };
+        assert_eq!(running.subagent, Some(worker), "the worker it resumes");
+        assert!(running_subagents.is_running(worker));
+        let report = running
+            .run(detached())
+            .await
+            .expect("the worker's turn")
+            .text_content();
+        assert!(report.ends_with("carried on"), "{report}");
+        assert!(!running_subagents.is_running(worker));
+    }
+
     /// The whole Phase 4 loop against a scripted provider: spawn returns an id, `agent_list`
     /// reports the worker, a follow-up sees the first turn's history, and `agent_delete`
     /// removes it.
@@ -3428,7 +3756,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "permission": "read" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -3470,7 +3798,7 @@ mod tests {
         let listed = list
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("list succeeds")
@@ -3488,7 +3816,7 @@ mod tests {
         let second = followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "and then?" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("followup succeeds")
@@ -3530,7 +3858,7 @@ mod tests {
         delete
             .execute(
                 serde_json::json!({ "id": agent_id.to_string() }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("delete succeeds");
@@ -3623,7 +3951,7 @@ mod tests {
         let refused = followup
             .execute(
                 serde_json::json!({ "id": worker.to_string(), "prompt": "carry on" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a worker somebody else is running must not be run again");
@@ -3693,7 +4021,7 @@ mod tests {
         let error = followup
             .execute(
                 serde_json::json!({ "id": worker.to_string(), "prompt": "carry on" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("the held lock refuses the follow-up");
@@ -3798,7 +4126,7 @@ mod tests {
         followup
             .execute(
                 serde_json::json!({ "id": child.to_string(), "prompt": "write the file" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("followup runs");
@@ -3886,7 +4214,7 @@ mod tests {
         followup
             .execute(
                 serde_json::json!({ "id": child.to_string(), "prompt": "go" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("followup runs");
@@ -3982,7 +4310,7 @@ mod tests {
         let output = spawn
             .execute(
                 input,
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await?;
         let text = output.text_content();
@@ -4043,7 +4371,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({"prompt": "do a thing", "permission": "read"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn");
@@ -4103,7 +4431,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({"prompt": "do a thing", "permission": "read"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn");
@@ -4152,7 +4480,7 @@ mod tests {
         let text = spawn
             .execute(
                 serde_json::json!({"prompt": "do a thing", "permission": "read"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn")
@@ -4177,7 +4505,7 @@ mod tests {
         let second = followup
             .execute(
                 serde_json::json!({"id": agent_id.to_string(), "prompt": "and then?"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("follow-up")
@@ -4229,7 +4557,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({"prompt": "do a thing", "permission": "read"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn");
@@ -4257,7 +4585,7 @@ mod tests {
         followup
             .execute(
                 serde_json::json!({"id": agent_id.to_string(), "prompt": "again"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("follow up");
@@ -4455,7 +4783,7 @@ mod tests {
         spawn
             .execute(
                 serde_json::json!({ "prompt": "worker task" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn");
@@ -4526,7 +4854,7 @@ mod tests {
         let redirected = spawn
             .execute(
                 serde_json::json!({ "prompt": "go", "scratchpad": "findings" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn")
@@ -4542,7 +4870,7 @@ mod tests {
         let inline = spawn
             .execute(
                 serde_json::json!({ "prompt": "go" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn")
@@ -4813,7 +5141,7 @@ mod tests {
         let error = delete
             .execute(
                 serde_json::json!({ "id": child.to_string() }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a running worker must not be deleted");
@@ -4827,7 +5155,7 @@ mod tests {
         delete
             .execute(
                 serde_json::json!({ "id": child.to_string() }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("delete succeeds once the worker has finished");
@@ -4874,7 +5202,7 @@ mod tests {
         let error = delete
             .execute(
                 serde_json::json!({ "id": child.to_string() }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a busy worker must not be deleted mid-follow-up");
@@ -4894,7 +5222,7 @@ mod tests {
         delete
             .execute(
                 serde_json::json!({ "id": child.to_string() }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("delete succeeds once the worker is free");
@@ -5003,14 +5331,21 @@ mod tests {
         let rendered = list
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("list")
             .text_content();
-        assert!(
-            rendered.contains("turns=1"),
-            "one task through two tool rounds is one turn, got: {rendered}"
+        let row: Vec<&str> = rendered
+            .lines()
+            .find(|line| line.starts_with(&child.to_string()))
+            .unwrap_or_else(|| panic!("a row for the worker: {rendered}"))
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            row[1..4],
+            ["idle", "-", "1"],
+            "one task through two tool rounds is one turn, and nothing runs it: {rendered}"
         );
     }
 
@@ -5080,7 +5415,7 @@ mod tests {
         let error = spawn
             .execute(
                 serde_json::json!({ "skill": "broken" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("an unreadable skill body must fail the spawn");
@@ -5151,7 +5486,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "skill": "wrecked" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a broken skill is a tool result, not a tool error");
@@ -5228,7 +5563,7 @@ mod tests {
         let text = spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "permission": "read" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds")
@@ -5245,7 +5580,7 @@ mod tests {
         let queued = steer
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "message": "check the dates too" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("steer succeeds")
@@ -5270,7 +5605,7 @@ mod tests {
         followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "and then?" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("followup succeeds");
@@ -5345,7 +5680,7 @@ mod tests {
             spawn
                 .execute(
                     serde_json::json!({ "prompt": "look into it", "permission": "read" }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("spawn succeeds")
@@ -5372,7 +5707,7 @@ mod tests {
         steer
             .execute(
                 serde_json::json!({ "id": child.to_string(), "message": "narrow it to 2026" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("steer succeeds");
@@ -5446,7 +5781,7 @@ mod tests {
             spawn
                 .execute(
                     serde_json::json!({ "prompt": "write the report", "permission": "read" }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("spawn succeeds")
@@ -5478,7 +5813,7 @@ mod tests {
                     "message": "stop, summarize instead",
                     "interrupt": true
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("steer succeeds")
@@ -5558,7 +5893,7 @@ mod tests {
         let error = steer
             .execute(
                 serde_json::json!({ "id": child.to_string(), "message": "hello" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a stranger's worker must be refused");
@@ -5618,7 +5953,7 @@ mod tests {
         let error = followup
             .execute(
                 serde_json::json!({ "id": child.to_string(), "prompt": "hello" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a stranger's worker must be refused");
@@ -5632,7 +5967,7 @@ mod tests {
             delete
                 .execute(
                     serde_json::json!({ "id": child.to_string() }),
-                    crate::tools::ToolContext::detached(CancellationToken::new())
+                    crate::tools::ToolContext::for_test(CancellationToken::new())
                 )
                 .await
                 .is_err(),
@@ -5746,7 +6081,7 @@ mod tests {
         let queued = steer
             .execute(
                 serde_json::json!({ "id": short, "message": "hello" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a steer by prefix")
@@ -5769,7 +6104,7 @@ mod tests {
         delete
             .execute(
                 serde_json::json!({ "id": short }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a delete by prefix");
@@ -5825,7 +6160,7 @@ mod tests {
         let error = followup
             .execute(
                 serde_json::json!({ "id": child.to_string(), "prompt": "hello" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a spec-less worker must be refused");
@@ -6043,7 +6378,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "profile": "other" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -6099,7 +6434,7 @@ mod tests {
         let error = spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "profile": "other" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("the choice is closed");
@@ -6132,7 +6467,7 @@ mod tests {
         let error = spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "profile": "missing" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("an unconfigured profile is refused");
@@ -6164,7 +6499,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "profile": "other" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -6175,7 +6510,7 @@ mod tests {
         let output = followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("the follow-up runs");
@@ -6232,7 +6567,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "profile": "other" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -6274,7 +6609,7 @@ mod tests {
         let output = spawn
             .execute(
                 input,
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -6286,7 +6621,7 @@ mod tests {
         followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("the follow-up runs")
@@ -6436,7 +6771,7 @@ mod tests {
         let error = followup
             .execute(
                 serde_json::json!({ "id": worker.to_string(), "prompt": "carry on" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a profile that is gone refuses the follow-up");
@@ -6471,7 +6806,7 @@ mod tests {
         let error = spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "profile": "other" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a provider that cannot be built refuses the spawn");
@@ -6701,7 +7036,7 @@ mod tests {
             parent_sid,
             worker_id,
             "agent_spawn",
-            &crate::tools::ToolContext::detached(CancellationToken::new()),
+            &crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("build the worker");
@@ -6842,7 +7177,7 @@ mod tests {
         let error = spawn
             .execute(
                 input,
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("the spawn must be refused");
@@ -6894,7 +7229,7 @@ mod tests {
                     "working_directory": dirs.sub.to_string_lossy(),
                     "additional_workspace_directories": [dirs.extra.to_string_lossy()],
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -7084,7 +7419,7 @@ mod tests {
                     "prompt": "look",
                     "working_directory": dirs.elsewhere.to_string_lossy(),
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a working directory alone places an unrestricted worker");
@@ -7153,7 +7488,7 @@ mod tests {
                     "additional_workspace_directories": [],
                     "additional_readable_directories": [],
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("empty lists are a bare spawn");
@@ -7203,7 +7538,7 @@ mod tests {
                     "permission": "workspace",
                     "working_directory": dirs.elsewhere.to_string_lossy(),
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -7247,7 +7582,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "look", "working_directory": "sub" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -7284,7 +7619,7 @@ mod tests {
                     "prompt": "wait",
                     "working_directory": dirs.sub.to_string_lossy(),
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -7314,7 +7649,7 @@ mod tests {
         followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "write all three" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("the follow-up runs");
@@ -7353,7 +7688,7 @@ mod tests {
         let refusal = followup
             .execute(
                 ask(),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a parent whose workspace no longer contains the scope cannot resume")
@@ -7385,7 +7720,7 @@ mod tests {
         let output = followup
             .execute(
                 ask(),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a parent dropped to `read` resumes the worker as a reader");
@@ -7422,7 +7757,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "wait" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -7443,7 +7778,7 @@ mod tests {
         let refusal = followup
             .execute(
                 ask(),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a parent that has moved out from over the worker cannot resume it")
@@ -7472,7 +7807,7 @@ mod tests {
         followup
             .execute(
                 ask(),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("an unrestricted parent resumes the worker wherever it has moved");
@@ -7572,7 +7907,7 @@ mod tests {
         spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "permission": "read" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -7611,7 +7946,7 @@ mod tests {
             spawn
                 .execute(
                     serde_json::json!({ "prompt": "draft a chapter", "permission": "read" }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("spawn succeeds");
@@ -7649,7 +7984,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "wait" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -7672,7 +8007,7 @@ mod tests {
         followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("the follow-up runs");
@@ -7798,7 +8133,7 @@ mod tests {
         };
         let output = spawn.execute(serde_json::json!({"prompt":"Review the fixture", "memory":"read",
             "deny_servers":["hidden"], "deny_tools":["checklist_add","checklist_edit","checklist_read","memory_search"]}),
-            crate::tools::ToolContext::detached(CancellationToken::new())).await.expect("spawn");
+            crate::tools::ToolContext::for_test(CancellationToken::new())).await.expect("spawn");
         assert!(!output.is_error, "{}", output.text_content());
         let requests = mock.streams();
         assert_eq!(
@@ -7889,7 +8224,7 @@ mod tests {
                     "working_directory": dirs.sub.to_string_lossy(),
                     "additional_readable_directories": [dirs.extra.to_string_lossy()],
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -7955,7 +8290,7 @@ mod tests {
                     "working_directory": ".",
                     "additional_readable_directories": [dirs.elsewhere.to_string_lossy()],
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("the spawn must be refused");
@@ -8020,7 +8355,7 @@ mod tests {
                     "working_directory": dirs.sub.to_string_lossy(),
                     "additional_readable_directories": [dirs.extra.to_string_lossy()],
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -8083,7 +8418,7 @@ mod tests {
                     "allow_tools": ["file_read", "file_write"],
                     "deny_tools": ["file_write"],
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -8147,7 +8482,7 @@ mod tests {
                     "prompt": "look",
                     "allow_tools": ["file_read", "file_write"],
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -8182,7 +8517,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "wait", "allow_tools": ["file_read"] }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -8192,7 +8527,7 @@ mod tests {
         followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("follow-up succeeds");
@@ -8238,7 +8573,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "work like me" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -8313,7 +8648,7 @@ mod tests {
             let output = spawn
                 .execute(
                     input,
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("merged, never refused");
@@ -8360,7 +8695,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "wait" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -8372,7 +8707,7 @@ mod tests {
         let refusal = followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a parent that can no longer read the worker's directory cannot resume it")
@@ -8443,7 +8778,7 @@ mod tests {
                     "working_directory": dirs.sub.to_string_lossy(),
                     "additional_readable_directories": [dirs.extra.to_string_lossy()],
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -8460,7 +8795,7 @@ mod tests {
         followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "read both" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("follow-up succeeds");
@@ -8492,7 +8827,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "look", "network": "none" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -8526,7 +8861,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "look" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a bare spawn inherits");
@@ -8556,7 +8891,7 @@ mod tests {
             spawn_tool_for(params, mock(vec![text_round("never runs")]))
                 .execute(
                     input,
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect_err("refused")
@@ -8583,7 +8918,7 @@ mod tests {
         spawn_tool_for(params.clone(), mock(vec![text_round("done")]))
             .execute(
                 serde_json::json!({ "prompt": "look", "network": "none", "permission": "workspace" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("`none` holds at a sandboxed level");
@@ -8601,7 +8936,7 @@ mod tests {
         let output = spawn_tool_for(params, Arc::clone(&provider) as Arc<dyn Provider>)
             .execute(
                 serde_json::json!({ "prompt": "look" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("an inherited `none` is what the parent holds, at `unrestricted` too");
@@ -8633,7 +8968,7 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "wait" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
@@ -8646,7 +8981,7 @@ mod tests {
         let output = followup
             .execute(
                 serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("the follow-up runs");

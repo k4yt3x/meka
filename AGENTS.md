@@ -544,6 +544,30 @@ anywhere in `src/tools` outside the two functions its ledger names, both of whic
 calls among others and must tolerate what history holds; a new raw read is a new reader to write,
 not a ledger entry to add.
 
+## Background calls
+
+A call runs in the background only when its tool says it can: `Tool::as_detachable` returns the
+tool's `Detachable`, its start step. The registry offers `background` on exactly those tools and
+`admit_arguments` refuses it on every other; no list of names decides it. A tool is detachable
+when both hold:
+
+- **Its call can outlast a round**: a command, a sub-agent, a fetch, a remote MCP round trip. A
+  call that takes milliseconds gains nothing from detaching, and its result is wanted in the round
+  that asked for it.
+- **Nothing reads its effect back from its recorded result.** A detached call's recorded result
+  is the started answer, and its output arrives later in a report, so a tool whose effect is
+  recovered from the conversation (the checklist tools, `tool_load`, `tool_search`) would record
+  an effect that has not happened. Such a tool is never detachable, however long it runs.
+
+`start` runs inline and does everything that can refuse: it reads the arguments, resolves what the
+call needs and creates what the run uses, then returns either an answer or the run. A refusal from
+`start` is the call's own result and leaves no task. The run is the rest, and the guards the work
+holds (a session lock, a running registration) move into it. `start` creates nothing that outlives
+the process without a record: the task row is written before it, and a process the run owns is
+spawned by the run. A detachable tool's `execute` is `tools::start_and_run`, so an inline call and
+a background one run the same code. A run reads `ToolContext::live_call_id`, `None` once detached,
+wherever it would address the call it came from, since that call has already returned.
+
 ## Layering
 
 The tree reads top-down. `src/main.rs` dispatches to `host/` and `cli/`; the screen's slash commands

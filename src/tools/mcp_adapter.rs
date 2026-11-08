@@ -52,19 +52,48 @@ impl Tool for McpToolAdapter {
         true
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(&self, input: serde_json::Value, context: ToolContext) -> Result<ToolOutput> {
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[async_trait]
+impl crate::tools::Detachable for McpToolAdapter {
+    /// The arguments as the server receives them; the run makes the request, whose arguments are
+    /// the server's to refuse.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        _context: &ToolContext,
+    ) -> Result<crate::tools::Started> {
         let arguments = forwarded_arguments(&input, &self.tool.parameters);
-        let call = CallContext {
-            session_id: context.session_id,
-            tool_call_id: context.tool_call_id,
-            frontend: context.frontend,
-            cancellation: context.cancellation,
-        };
-        let result = self.tool.call(arguments, &call).await?;
-        Ok(tool_output_from_result(
-            &result,
-            format!("mcp_{}_{}", self.tool.server_name(), self.tool.raw_name()),
+        let tool = Arc::clone(&self.tool);
+        Ok(crate::tools::Started::running(
+            None,
+            move |context| async move {
+                let result = tool.call(arguments, &call_context(context)).await?;
+                Ok(tool_output_from_result(
+                    &result,
+                    format!("mcp_{}_{}", tool.server_name(), tool.raw_name()),
+                ))
+            },
         ))
+    }
+}
+
+/// What a remote call carries of the tool call it runs: the call's id for the server to correlate
+/// on whatever runs it, and for its progress only while a live view is open on the call.
+fn call_context(context: ToolContext) -> CallContext {
+    CallContext {
+        session_id: context.session_id,
+        live_call_id: context.live_call_id().map(str::to_string),
+        tool_call_id: context.tool_call_id,
+        frontend: context.frontend,
+        cancellation: context.cancellation,
     }
 }
 
@@ -206,8 +235,8 @@ fn tool_output_from_result(
 
 /// The arguments an MCP call actually carries: everything the model sent, minus meka's own.
 ///
-/// `scratchpad` and `background` are accepted on every tool and consumed by the agent loop, so a
-/// remote server never declared them, and a strict schema validator on the far side rejects a
+/// `scratchpad` and `background` are accepted on every MCP tool and consumed by the agent loop, so
+/// a remote server never declared them, and a strict schema validator on the far side rejects a
 /// property the server did not ask for.
 ///
 /// `schema` is the tool's own advertised `input_schema`, and a name it declares belongs to it:
@@ -241,6 +270,28 @@ fn forwarded_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A call in the background still names itself to the server, and shows its progress under no
+    /// call, its own having returned.
+    #[test]
+    fn a_call_in_the_background_names_itself_but_shows_no_progress() {
+        let mut context = ToolContext::for_test(tokio_util::sync::CancellationToken::new());
+        context.tool_call_id = Some("call-1".to_string());
+        let inline = call_context(context.clone());
+        assert_eq!(
+            (
+                inline.tool_call_id.as_deref(),
+                inline.live_call_id.as_deref()
+            ),
+            (Some("call-1"), Some("call-1"))
+        );
+        context.task_id = Some("7f3a1c22".to_string());
+        let detached = call_context(context);
+        assert_eq!(
+            (detached.tool_call_id.as_deref(), detached.live_call_id),
+            (Some("call-1"), None)
+        );
+    }
 
     /// A server's structured output reaches callers as data, not only as rendered prose.
     ///
@@ -293,7 +344,7 @@ mod tests {
 
     /// A remote server sees the model's arguments and nothing of meka's.
     ///
-    /// `scratchpad` and `background` are accepted on every tool and consumed here, so no server
+    /// `scratchpad` and `background` are accepted on every MCP tool and consumed here, so no server
     /// declares them and a server validating its schema strictly rejects the call over one. A
     /// server that declares either name itself owns it, and the value the model sent must reach
     /// the server: `offer_background` leaves the server's parameter in the schema the model reads,

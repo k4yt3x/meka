@@ -887,11 +887,12 @@ impl ToolRegistry {
         crate::sync::write(&self.deferred).insert(name.to_string());
     }
 
-    /// Offer `background` on every tool this registry hands the provider.
+    /// Offer `background` on every tool this registry hands the provider that can run in the
+    /// background ([`crate::tools::Tool::as_detachable`]).
     ///
     /// Set once, from `[background] enabled`. Sub-agent registries are deliberately left off: a
-    /// sub-agent's session ends with the single turn that spawned it, so a task outliving that turn
-    /// would have no conversation to report back into.
+    /// sub-agent runs only inside its parent's call, and nothing opens a turn of its own for a
+    /// report between follow-ups, so a task outliving the call would report to nobody.
     pub(crate) fn enable_background(&self) {
         self.background_enabled
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1049,13 +1050,25 @@ impl ToolRegistry {
                 schema_tokens = schema_tokens.saturating_add(entry.schema_tokens);
             }
         }
+        // Asked of the tools themselves while the map is held: the property rides on exactly the
+        // tools that can start in the background.
+        let detachable: HashSet<String> = definitions
+            .iter()
+            .chain(&deferred_definitions)
+            .filter(|definition| {
+                tools
+                    .get(&definition.name)
+                    .is_some_and(|entry| entry.tool.as_detachable().is_some())
+            })
+            .map(|definition| definition.name.clone())
+            .collect();
         drop(carried);
         drop(tools);
         drop(deferred);
 
         if self.background_enabled() {
             for definition in &mut definitions {
-                if crate::tools::detachable(&definition.name)
+                if detachable.contains(&definition.name)
                     && offer_background(&mut definition.parameters)
                 {
                     schema_tokens = schema_tokens.saturating_add(*BACKGROUND_PROPERTY_TOKENS);
@@ -1065,7 +1078,7 @@ impl ToolRegistry {
             // offers it, but the window holds only the schemas the model loaded, so only those
             // price it.
             for definition in &mut deferred_definitions {
-                if crate::tools::detachable(&definition.name)
+                if detachable.contains(&definition.name)
                     && offer_background(&mut definition.parameters)
                     && loaded_names.contains(definition.name.as_str())
                 {
@@ -1758,7 +1771,7 @@ mod tests {
         let result = shell_execute
             .execute(
                 serde_json::json!({"command": "cmd /c echo ok"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(result.is_ok(), "the confined command must run: {result:?}");
@@ -1840,7 +1853,7 @@ mod tests {
                     "path": outside.to_str().expect("path"),
                     "content": "payload",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
         };
 

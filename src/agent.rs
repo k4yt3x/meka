@@ -222,8 +222,9 @@ impl Agent {
         // The registry's switch is the one definition of whether background is on: it is what
         // offers `background` to the model, so the ceiling refusing a call the model was told
         // about cannot disagree with it. Zero for a worker whatever the configuration says: a
-        // worker's session ends with the one turn that spawned it, so a task outliving that turn
-        // would have no conversation left to report into.
+        // worker runs only inside its parent's call, and nothing opens a turn of its own for a
+        // report between follow-ups, so a task outliving the call would report to nobody until a
+        // follow-up the parent may never make.
         let background_max_tasks = match role {
             AgentRole::Root if tool_registry.background_enabled() => materials.background.max_tasks,
             _ => 0,

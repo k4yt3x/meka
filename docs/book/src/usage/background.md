@@ -24,7 +24,12 @@ Every other capability block (`[schedule]`, `[skills]`, `[memory]`) defaults on.
 
 ## How the agent uses it
 
-Once enabled, every tool gains an optional `background` parameter, including tools from MCP servers, since a slow MCP call is exactly the kind worth detaching:
+Once enabled, the tools whose call can outlast a round gain an optional `background` parameter:
+`shell_execute`, `web_fetch`, `agent_spawn`, `agent_followup`, every tool an MCP server provides,
+and the MCP resource and prompt tools that ask the server. The rest never offer it and refuse it:
+a call that takes milliseconds gains nothing from detaching, and some tools (the checklist tools,
+`tool_load`, `tool_search`) record their effect in the result the call is answered with, which a
+background call answers with its start instead.
 
 ```text
 shell_execute({"command": "cargo test --all", "timeout_ms": 900000, "background": true})
@@ -38,6 +43,21 @@ That returns something like:
 ```text
 Started in the background as task 7f3a1c22 (cargo test --all). Use `task_list` for status. Use `task_cancel` to stop it.
 ```
+
+What can refuse the call before its work starts does so before it returns: its arguments are
+read, the command's confinement is checked, the fetch's request is built and an address written
+in its URL checked, and a sub-agent's session is created. A call refused there is answered with
+the refusal at once, as it would be in the foreground, and leaves no task. A host name that
+resolves to a refused address is found out when the fetch connects, so that refusal comes in the
+report. A backgrounded `agent_spawn` or `agent_followup` names the
+sub-agent it runs, so the agent can reach it with `agent_steer` while it works:
+
+```text
+Started in the background as task 7f3a1c22 (count the files). It runs sub-agent 3e9b51d0-…. Use `agent_steer` to message it. Use `task_list` for status. Use `task_cancel` to stop it.
+```
+
+`task_list` shows the sub-agent a task runs, and `agent_list` shows each sub-agent's state, the
+task running it and what it was asked.
 
 The agent then carries on. When the task ends between turns, its outcome arrives as a new turn:
 
@@ -89,7 +109,7 @@ Every task ends in one of four states, and every one of them is reported: inside
 
 `interrupted` is the one that matters most. A task in flight when meka lets go of its session cannot be resumed, so it is stopped and recorded as interrupted on the way out, and reported the next time something takes ownership of that session: a screen resume, a `meka serve` reattach, or an ACP `session/load`. A process that dies writes nothing; the *next* owner does the retiring then, because holding the session lock is what proves the previous owner is gone. Without this the agent would wait forever on a result it had usually already promised someone.
 
-Large output is written to a [scratchpad](../tools/scratchpad.md) entry and the delivered turn carries the beginning plus the entry name, so a long build log does not occupy the conversation permanently. A call that names a `scratchpad` entry has its whole output saved there instead, whatever its size, and the delivered turn says where it went rather than carrying it; a task stopped before its work came back writes nothing there.
+Large output is written to a [scratchpad](../tools/scratchpad.md) entry and the delivered turn carries the beginning plus the entry name, so a long build log does not occupy the conversation permanently. A call that names a `scratchpad` entry has its whole output saved there instead, whatever its size, and the delivered turn says where it went rather than carrying it; a task stopped before its work came back writes nothing there. A report carries text alone, so an image the tool returned (an MCP screenshot, a fetched picture) is saved to a scratchpad entry of its own, which `image_render` shows, and the report names the entry where the image was.
 
 ## Managing tasks
 
@@ -153,7 +173,7 @@ A **second** press during the same turn stops them. Between turns, `/task cancel
 
 A one-shot run exits with the turn, so there is no later turn to deliver into. A task that ends while the turn is still calling tools reaches the model at the next round boundary, as anywhere else. For the rest, rather than kill the work halfway through, the run waits for every outstanding task and then prints the outcomes on stderr; the agent does not see those, since its turn is already over. So a background call whose result the answer needs is worth keeping in the foreground under `--oneshot`.
 
-Sub-agents (`agent_spawn`) deliberately cannot start background tasks. A sub-agent's session ends with the single turn that spawned it, so it could neither outlive that turn nor be around to hear the result.
+Sub-agents (`agent_spawn`) deliberately cannot start background tasks. A sub-agent runs only inside its parent's call, and nothing opens a turn of its own for a report between follow-ups, so a task outliving that call would report to nobody until a follow-up the parent may never make.
 
 ## Concurrent edits
 

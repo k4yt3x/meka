@@ -539,7 +539,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("context_check");
@@ -657,7 +657,7 @@ mod tests {
         };
         tool.execute(
             serde_json::json!({"instructions": "keep the decisions", "keep_recent": false}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("context_compact");
@@ -681,7 +681,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({"summary": "   "}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("context_replace");
@@ -699,7 +699,7 @@ mod tests {
         let tool = ContextReplaceTool { slot: slot.clone() };
         tool.execute(
             serde_json::json!({"summary": "what happened", "keep_recent": false}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("context_replace");
@@ -719,7 +719,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({"summary": "what happened"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("context_replace");
@@ -745,7 +745,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({"summary": "what happened"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("context_replace");

@@ -783,7 +783,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"name": "nonexistent-skill-xyz"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok with error output");
@@ -801,7 +801,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err());
@@ -821,7 +821,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"name": "demo"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should load");
@@ -1014,7 +1014,7 @@ mod tests {
                     "description": "d",
                     "body": ["line one", "line two"],
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         let message = match result {
@@ -1069,7 +1069,7 @@ mod tests {
         let missing = write
             .execute(
                 serde_json::json!({"name": "brand-new", "body": "text"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         let message = match missing {
@@ -1314,7 +1314,7 @@ mod tests {
         let error = write
             .execute(
                 serde_json::json!({"name": "verbatim", "description": "refined", "priority": 1}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("must refuse rather than write and explain");
@@ -1336,7 +1336,7 @@ mod tests {
     async fn run(tool: &dyn Tool, input: serde_json::Value) -> ToolOutput {
         tool.execute(
             input,
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("tool should return Ok")
@@ -1467,7 +1467,7 @@ mod tests {
         let result = write
             .execute(
                 serde_json::json!({"name": "../escape", "description": "d"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err(), "a traversing name must not reach the disk");
@@ -1600,7 +1600,7 @@ mod tests {
         let result = write
             .execute(
                 serde_json::json!({"name": "words", "description": "d", "priority": "high"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err(), "a non-number priority must not be guessed");
@@ -1642,7 +1642,7 @@ mod tests {
         let result = search
             .execute(
                 serde_json::json!({"pattern": "[unclosed"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err());
@@ -1658,7 +1658,7 @@ mod tests {
         let error = write
             .execute(
                 serde_json::json!({"name": "x", "description": "d"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a rootless cache has nowhere to write");
@@ -1823,7 +1823,7 @@ mod tests {
         let unknown = edit
             .execute(
                 serde_json::json!({"name": "nots", "old_string": "a", "new_string": "b"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         match unknown {
@@ -1841,7 +1841,7 @@ mod tests {
                     "new_string": "b",
                     "replace_all": "yes"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(not_a_bool.is_err(), "a string replace_all is refused");
@@ -1908,7 +1908,7 @@ mod tests {
         let traversing = edit
             .execute(
                 serde_json::json!({"name": "../escape", "old_string": "a", "new_string": "b"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(

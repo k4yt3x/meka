@@ -978,15 +978,18 @@ impl Frontend for HttpFrontend {
         self.push_event(event);
     }
 
+    /// The sub-agent's feed names `tool_call_id` as the call running it whether or not a live
+    /// view is open on that call: a call in the background still started it.
     fn for_subagent(
         &self,
         this: Arc<dyn Frontend>,
         child: uuid::Uuid,
         tool_call_id: Option<String>,
+        live: bool,
     ) -> Arc<dyn Frontend> {
         let forward = crate::frontend::PermissionForwardingFrontend::new(
             this,
-            tool_call_id.clone(),
+            tool_call_id.clone().filter(|_| live),
             Some(child),
         );
         let wiring = crate::sync::lock(&self.wiring).clone();
@@ -1465,8 +1468,9 @@ impl Frontend for SubagentFeed {
         this: Arc<dyn Frontend>,
         child: uuid::Uuid,
         tool_call_id: Option<String>,
+        live: bool,
     ) -> Arc<dyn Frontend> {
-        self.feed.for_subagent(this, child, tool_call_id)
+        self.feed.for_subagent(this, child, tool_call_id, live)
     }
 
     async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
@@ -1930,7 +1934,7 @@ mod tests {
         });
         let child = uuid::Uuid::from_u128(0x2);
         let root_as_frontend: Arc<dyn Frontend> = Arc::clone(&root) as Arc<dyn Frontend>;
-        let child_frontend = root.for_subagent(root_as_frontend, child, Some("tu_1".into()));
+        let child_frontend = root.for_subagent(root_as_frontend, child, Some("tu_1".into()), true);
         let turn_id = uuid::Uuid::from_u128(0x20);
         child_frontend
             .emit(FrontendEvent::TurnStarted { turn_id })
@@ -2066,7 +2070,7 @@ mod tests {
         );
         let child = uuid::Uuid::from_u128(0x2);
         let root_as_frontend: Arc<dyn Frontend> = Arc::clone(&root) as Arc<dyn Frontend>;
-        let _child_frontend = root.for_subagent(root_as_frontend, child, Some("tu_1".into()));
+        let _child_frontend = root.for_subagent(root_as_frontend, child, Some("tu_1".into()), true);
         let under_the_stream = crate::sync::lock(&children).get(&child).is_some();
         let (_receiver, _ids) = root.begin_turn(
             uuid::Uuid::from_u128(0x8),
@@ -2077,7 +2081,7 @@ mod tests {
         );
         let later = uuid::Uuid::from_u128(0x3);
         let root_as_frontend: Arc<dyn Frontend> = Arc::clone(&root) as Arc<dyn Frontend>;
-        let _later_frontend = root.for_subagent(root_as_frontend, later, Some("tu_2".into()));
+        let _later_frontend = root.for_subagent(root_as_frontend, later, Some("tu_2".into()), true);
         let under_the_next_turn = crate::sync::lock(&children).get(&later).is_some();
         assert!(
             under_the_stream && under_the_next_turn,
@@ -3288,6 +3292,38 @@ mod tests {
         assert_eq!(resolved.data["outcome"], "expired");
     }
 
+    /// A sub-agent run by a call in the background still names that call as the one running it on
+    /// its feed: no live view is open on the call, but the call started it.
+    #[tokio::test]
+    async fn a_background_sub_agents_feed_names_the_call_that_started_it() {
+        let children: ChildFeeds = Default::default();
+        let root = Arc::new(HttpFrontend::new());
+        root.install_feed(uuid::Uuid::from_u128(0x1), &FeedWiring {
+            children: Some(Arc::clone(&children)),
+            ..FeedWiring::bare(16, 16, Duration::from_secs(30))
+        });
+        let child = uuid::Uuid::from_u128(0x2);
+        let root_as_frontend: Arc<dyn Frontend> = Arc::clone(&root) as Arc<dyn Frontend>;
+        let child_frontend = root.for_subagent(root_as_frontend, child, Some("tu_1".into()), false);
+        let turn_id = uuid::Uuid::from_u128(0x20);
+        child_frontend
+            .emit(FrontendEvent::TurnStarted { turn_id })
+            .await;
+        let attachment = crate::sync::lock(&children)
+            .get(&child)
+            .cloned()
+            .expect("registered while it runs")
+            .attach_stream(None, false, false)
+            .expect("attaches");
+        assert_eq!(
+            attachment.turn_source,
+            Some(TurnStarter::Parent {
+                parent_id: Some(uuid::Uuid::from_u128(0x1)),
+                tool_call_id: Some("tu_1".into()),
+            })
+        );
+    }
+
     /// A sub-agent's sub-agent gets a feed of its own, registered beside the others and naming
     /// the sub-agent that spawned it as its parent; its turn never opens on the feed above it.
     #[tokio::test]
@@ -3301,11 +3337,12 @@ mod tests {
         let child = uuid::Uuid::from_u128(0x2);
         let grandchild = uuid::Uuid::from_u128(0x3);
         let root_as_frontend: Arc<dyn Frontend> = Arc::clone(&root) as Arc<dyn Frontend>;
-        let child_frontend = root.for_subagent(root_as_frontend, child, Some("tu_1".into()));
+        let child_frontend = root.for_subagent(root_as_frontend, child, Some("tu_1".into()), true);
         let grandchild_frontend = child_frontend.for_subagent(
             Arc::clone(&child_frontend),
             grandchild,
             Some("tu_2".into()),
+            true,
         );
         let feed_of = |id: uuid::Uuid| crate::sync::lock(&children).get(&id).cloned();
         assert!(feed_of(child).is_some(), "the child's feed is registered");

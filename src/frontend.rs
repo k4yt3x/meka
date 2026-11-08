@@ -70,19 +70,20 @@ pub(crate) trait Frontend: Send + Sync {
     }
 
     /// The frontend a sub-agent of this one runs under: its prompts and elicitations forwarded
-    /// here, its tool calls rolled into the `agent_spawn` call's activity, everything else
-    /// dropped. A host that can show a sub-agent's own events overrides this with a frontend that
-    /// also publishes them. `this` is the caller's own handle, since a trait object cannot hand
-    /// out an `Arc` to itself.
+    /// here, its tool calls rolled into the activity of `tool_call_id`, the call that runs it,
+    /// while `live` says a live view is open on that call, everything else dropped. A host that
+    /// can show a sub-agent's own events overrides this with a frontend that also publishes them.
+    /// `this` is the caller's own handle, since a trait object cannot hand out an `Arc` to itself.
     fn for_subagent(
         &self,
         this: Arc<dyn Frontend>,
         child: Uuid,
         tool_call_id: Option<String>,
+        live: bool,
     ) -> Arc<dyn Frontend> {
         Arc::new(PermissionForwardingFrontend::new(
             this,
-            tool_call_id,
+            tool_call_id.filter(|_| live),
             Some(child),
         ))
     }
@@ -663,6 +664,12 @@ pub(crate) enum ToolOutputMetadata {
         exit_code: Option<i32>,
         signal: Option<String>,
     },
+    /// The call went to the background: the task it runs as, and the sub-agent the task drives
+    /// when it runs one. A screen draws the call from these rather than from the answer's words.
+    BackgroundStarted {
+        task: String,
+        subagent: Option<uuid::Uuid>,
+    },
 }
 
 impl ToolOutputMetadata {
@@ -682,6 +689,13 @@ impl ToolOutputMetadata {
             },
             Self::CommandExit { exit_code, .. } => crate::conversation::ResultDisplay {
                 exit_code: exit_code.filter(|code| *code != 0),
+                ..Default::default()
+            },
+            Self::BackgroundStarted { task, subagent } => crate::conversation::ResultDisplay {
+                background: Some(crate::conversation::BackgroundStart {
+                    task: task.clone(),
+                    subagent: *subagent,
+                }),
                 ..Default::default()
             },
         }
@@ -779,9 +793,9 @@ pub(crate) enum PermissionOutcome {
 pub(crate) struct PermissionForwardingFrontend {
     delegate: Arc<dyn Frontend>,
     /// The `agent_spawn` call this sub-agent is running under, by the id the parent's frontend
-    /// shows it under (the provider's id, or the one an ACP frontend sent the call as), when one
-    /// is in scope. `None` outside a tool call (tests, direct construction), which disables
-    /// activity forwarding rather than guessing at a correlation id.
+    /// shows it under (the provider's id, or the one an ACP frontend sent the call as), while a
+    /// live view is open on it. `None` otherwise (a call in the background, a test), which
+    /// disables activity forwarding rather than guessing at a correlation id.
     tool_call_id: Option<String>,
     /// Rolling record of what the sub-agent has done, oldest first, capped at
     /// [`Self::MAX_ACTIVITY_LINES`].
@@ -1160,10 +1174,10 @@ impl ElicitationResponse {
 pub(crate) struct ProgressUpdate {
     pub(crate) server_name: String,
     pub(crate) tool_name: String,
-    /// The provider's `tool_use_id` for the in-flight call, when one was supplied, so a client
-    /// holding state per call (the SSE `tool_call.progress` event's readers) can attach the update
-    /// to the `tool_call.executing` it belongs to.
-    pub(crate) tool_use_id: Option<String>,
+    /// The provider's `tool_use_id` for the in-flight call, so a client holding state per call
+    /// (the SSE `tool_call.progress` event's readers) can attach the update to the
+    /// `tool_call.executing` it belongs to. Only a call a live view is open on reports progress.
+    pub(crate) tool_use_id: String,
     pub(crate) progress: f64,
     pub(crate) total: Option<f64>,
     pub(crate) message: Option<String>,

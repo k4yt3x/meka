@@ -152,7 +152,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({ "base64": encoded }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -175,7 +175,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({ "base64": encoded }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -209,7 +209,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({ "from_scratchpad": "frame" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -230,7 +230,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({ "from_scratchpad": "nonexistent" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err());
@@ -242,7 +242,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err());
@@ -254,7 +254,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({ "from_scratchpad": "a", "base64": "aGVsbG8=" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("returns error tool output");
@@ -268,7 +268,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({ "base64": "!!!not-base64!!!" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("returns error tool output");
@@ -284,7 +284,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({ "base64": encoded }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("returns error tool output");

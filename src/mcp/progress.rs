@@ -104,34 +104,36 @@ impl ProgressRegistry {
             );
             return;
         };
-        let update = ProgressUpdate {
-            server_name: server_name.to_string(),
-            tool_name,
-            tool_use_id,
-            progress: params.progress,
-            total: params.total,
-            // Sanitized at ingress like a connector's stderr: the line below reaches the terminal
-            // at `-v` with whatever escapes the server put in it.
-            message: params
-                .message
-                .map(|message| crate::text::sanitize_to_line(&message, usize::MAX)),
-        };
-        let total = update
-            .total
-            .map(|total| format!("/{total}"))
-            .unwrap_or_default();
-        let message = update
+        // Sanitized at ingress like a connector's stderr: the line below reaches the terminal at
+        // `-v` with whatever escapes the server put in it.
+        let message = params
             .message
-            .as_deref()
-            .map(|message| format!(", {message}"))
-            .unwrap_or_default();
+            .map(|message| crate::text::sanitize_to_line(&message, usize::MAX));
         tracing::info!(
-            "MCP '{server_name}' {tool_name} progress: {progress}{total}{message}",
-            tool_name = update.tool_name,
-            progress = update.progress,
+            "MCP '{server_name}' {tool_name} progress: {progress}{total}{shown}",
+            progress = params.progress,
+            total = params
+                .total
+                .map(|total| format!("/{total}"))
+                .unwrap_or_default(),
+            shown = message
+                .as_deref()
+                .map(|message| format!(", {message}"))
+                .unwrap_or_default(),
         );
-        if let Some(frontend) = frontend {
-            frontend.emit(FrontendEvent::McpProgress(update)).await;
+        // A call with no live view open on it, one in the background, has nowhere to show its
+        // progress but the log above: a screen draws progress on whichever call is running.
+        if let (Some(tool_use_id), Some(frontend)) = (tool_use_id, frontend) {
+            frontend
+                .emit(FrontendEvent::McpProgress(ProgressUpdate {
+                    server_name: server_name.to_string(),
+                    tool_name,
+                    tool_use_id,
+                    progress: params.progress,
+                    total: params.total,
+                    message,
+                }))
+                .await;
         }
     }
 
@@ -324,9 +326,44 @@ mod tests {
             })
             .next_back()
             .expect("frontend should have received exactly one McpProgress");
-        assert_eq!(update.tool_use_id.as_deref(), Some("tu-1"));
+        assert_eq!(update.tool_use_id, "tu-1");
         assert_eq!(update.progress, 0.5);
         assert_eq!(update.message.as_deref(), Some("halfway"));
+    }
+
+    /// A call with no live view open on it, one in the background, shows no progress: a screen
+    /// would draw it on whichever call is running. Its frontend stays on the entry, where an
+    /// elicitation finds it.
+    #[tokio::test]
+    async fn a_call_with_no_live_view_shows_no_progress() {
+        let recorder: Arc<RecordingFrontend> = Arc::new(RecordingFrontend::new());
+        let frontend: Arc<dyn Frontend> = recorder.clone();
+        let registry = ProgressRegistry::default();
+        let _guard = registry.register(
+            &minted(7),
+            "srv".into(),
+            "tool".into(),
+            None,
+            Some(frontend),
+            far(),
+        );
+
+        registry
+            .dispatch("srv", ProgressNotificationParam::new(minted(7), 0.5))
+            .await;
+
+        assert!(
+            !recorder
+                .events()
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::McpProgress(_))),
+            "{:?}",
+            recorder.events()
+        );
+        assert!(matches!(
+            registry.elicitation_route("srv"),
+            ElicitationRoute::To { .. }
+        ));
     }
 
     /// Multi-session isolation: two concurrent calls with distinct frontends must each receive

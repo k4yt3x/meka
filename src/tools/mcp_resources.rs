@@ -67,6 +67,30 @@ fn visible_server_entry(
         .ok_or_else(|| no_such_server(tool_name, server, &visible_servers(manager, tool_scope)))
 }
 
+/// Servers a listing asks, each by its name.
+type ListedServers = Vec<(String, Arc<crate::mcp::ServerEntry>)>;
+
+/// The servers a listing asks: the one `server` names, refused as [`visible_server_entry`]
+/// refuses it, or every visible one. `None` when there are none to ask.
+fn listed_servers(
+    tool_name: &str,
+    manager: &McpClientManager,
+    tool_scope: &ToolScope,
+    server: Option<&str>,
+) -> Result<Option<ListedServers>> {
+    let entries: ListedServers = match server {
+        Some(name) => vec![(
+            name.to_string(),
+            visible_server_entry(tool_name, manager, tool_scope, name)?,
+        )],
+        None => visible_servers(manager, tool_scope)
+            .into_iter()
+            .filter_map(|name| manager.server_entry(&name).map(|entry| (name, entry)))
+            .collect(),
+    };
+    Ok((!entries.is_empty()).then_some(entries))
+}
+
 pub(crate) struct ListMcpResourcesTool {
     pub(crate) manager: Arc<McpClientManager>,
     pub(crate) tool_scope: Arc<ToolScope>,
@@ -98,69 +122,87 @@ impl Tool for ListMcpResourcesTool {
         Permission::Read
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let cancellation = context.cancellation.clone();
-        let server_filter = optional_str(&input, "server", "mcp_resource_list")?.map(String::from);
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
 
-        let names: Vec<String> = if let Some(name) = &server_filter {
-            visible_server_entry("mcp_resource_list", &self.manager, &self.tool_scope, name)?;
-            vec![name.clone()]
-        } else {
-            visible_servers(&self.manager, &self.tool_scope)
-        };
-
-        if names.is_empty() {
-            return Ok(ToolOutput::text(
+#[async_trait]
+impl crate::tools::Detachable for ListMcpResourcesTool {
+    /// The servers the call names; the run asks each for its resources.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
+        let Some(entries) = listed_servers(
+            "mcp_resource_list",
+            &self.manager,
+            &self.tool_scope,
+            optional_str(&input, "server", "mcp_resource_list")?,
+        )?
+        else {
+            return Ok(crate::tools::Started::Answered(ToolOutput::text(
                 "(no MCP servers configured)".to_string(),
                 false,
-            ));
-        }
+            )));
+        };
+        Ok(crate::tools::Started::running(None, move |context| {
+            list_resources_of(entries, context.cancellation)
+        }))
+    }
+}
 
-        let mut lines = Vec::new();
-        let mut any_error = false;
+/// Each server's resources, a row per resource, and a row per server that failed to answer.
+async fn list_resources_of(
+    entries: ListedServers,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ToolOutput> {
+    let mut lines = Vec::new();
+    let mut any_error = false;
 
-        for name in names {
-            let Some(entry) = self.manager.server_entry(&name) else {
-                continue;
-            };
-            match crate::mcp::list_resources(&entry, &cancellation).await {
-                Ok(resources) => {
-                    for resource in resources {
-                        let raw = &resource;
-                        let mime = raw.mime_type.as_deref().unwrap_or("");
-                        let description = raw.description.as_deref().unwrap_or("");
-                        let description =
-                            truncate(&sanitize_text(description), MAX_MCP_DESCRIPTION_CHARS);
-                        lines.push(format!(
-                            "{}\t{}\t{}\t{}\t{}",
-                            name,
-                            sanitize_text(&raw.uri),
-                            sanitize_text(&raw.name),
-                            sanitize_text(mime),
-                            description
-                        ));
-                    }
-                }
-                Err(error) => {
-                    any_error = true;
-                    lines.push(format!("{name}\t<error>\t\t\t{error}"));
+    for (name, entry) in entries {
+        match crate::mcp::list_resources(&entry, &cancellation).await {
+            Ok(resources) => {
+                for resource in resources {
+                    let raw = &resource;
+                    let mime = raw.mime_type.as_deref().unwrap_or("");
+                    let description = raw.description.as_deref().unwrap_or("");
+                    let description =
+                        truncate(&sanitize_text(description), MAX_MCP_DESCRIPTION_CHARS);
+                    lines.push(format!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        name,
+                        sanitize_text(&raw.uri),
+                        sanitize_text(&raw.name),
+                        sanitize_text(mime),
+                        description
+                    ));
                 }
             }
+            Err(error) => {
+                any_error = true;
+                lines.push(format!("{name}\t<error>\t\t\t{error}"));
+            }
         }
-
-        if lines.is_empty() {
-            return Ok(ToolOutput::text(
-                "(no resources advertised)".to_string(),
-                false,
-            ));
-        }
-
-        Ok(ToolOutput::text(lines.join("\n"), any_error))
     }
+
+    if lines.is_empty() {
+        return Ok(ToolOutput::text(
+            "(no resources advertised)".to_string(),
+            false,
+        ));
+    }
+
+    Ok(ToolOutput::text(lines.join("\n"), any_error))
 }
 
 pub(crate) struct ReadMcpResourceTool {
@@ -199,35 +241,59 @@ impl Tool for ReadMcpResourceTool {
         Permission::Read
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let cancellation = context.cancellation.clone();
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[async_trait]
+impl crate::tools::Detachable for ReadMcpResourceTool {
+    /// The server and the resource; the run reads it.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
         let server = require_str(&input, "server", "mcp_resource_read")?;
         let uri = require_str(&input, "uri", "mcp_resource_read")?;
-
         let entry = visible_server_entry(
             "mcp_resource_read",
             &self.manager,
             &self.tool_scope,
             &server,
         )?;
-
-        let result = crate::mcp::read_resource(&entry, uri.clone(), &cancellation).await?;
-
-        let chunks = format_resource_contents(&result.contents, MAX_MCP_RESOURCE_BYTES);
-
-        if chunks.is_empty() {
-            return Ok(ToolOutput::text(
-                format!("resource '{uri}' returned no content"),
-                false,
-            ));
-        }
-
-        Ok(ToolOutput::text(chunks.join("\n\n"), false))
+        Ok(crate::tools::Started::running(None, move |context| {
+            read_resource_of(entry, uri, context.cancellation)
+        }))
     }
+}
+
+/// The resource `uri` as `entry`'s server returns it.
+async fn read_resource_of(
+    entry: Arc<crate::mcp::ServerEntry>,
+    uri: String,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ToolOutput> {
+    let result = crate::mcp::read_resource(&entry, uri.clone(), &cancellation).await?;
+
+    let chunks = format_resource_contents(&result.contents, MAX_MCP_RESOURCE_BYTES);
+
+    if chunks.is_empty() {
+        return Ok(ToolOutput::text(
+            format!("resource '{uri}' returned no content"),
+            false,
+        ));
+    }
+
+    Ok(ToolOutput::text(chunks.join("\n\n"), false))
 }
 
 /// Render MCP `ResourceContents` into formatted chunks with Unicode sanitization applied to all
@@ -330,80 +396,98 @@ impl Tool for ListMcpPromptsTool {
         Permission::Read
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let cancellation = context.cancellation.clone();
-        let server_filter = optional_str(&input, "server", "mcp_prompt_list")?.map(String::from);
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
 
-        let names: Vec<String> = if let Some(name) = &server_filter {
-            visible_server_entry("mcp_prompt_list", &self.manager, &self.tool_scope, name)?;
-            vec![name.clone()]
-        } else {
-            visible_servers(&self.manager, &self.tool_scope)
-        };
-
-        if names.is_empty() {
-            return Ok(ToolOutput::text(
+#[async_trait]
+impl crate::tools::Detachable for ListMcpPromptsTool {
+    /// The servers the call names; the run asks each for its prompts.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
+        let Some(entries) = listed_servers(
+            "mcp_prompt_list",
+            &self.manager,
+            &self.tool_scope,
+            optional_str(&input, "server", "mcp_prompt_list")?,
+        )?
+        else {
+            return Ok(crate::tools::Started::Answered(ToolOutput::text(
                 "(no MCP servers configured)".to_string(),
                 false,
-            ));
-        }
+            )));
+        };
+        Ok(crate::tools::Started::running(None, move |context| {
+            list_prompts_of(entries, context.cancellation)
+        }))
+    }
+}
 
-        let mut lines = Vec::new();
-        let mut any_error = false;
+/// Each server's prompts, a row per prompt, and a row per server that failed to answer.
+async fn list_prompts_of(
+    entries: ListedServers,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ToolOutput> {
+    let mut lines = Vec::new();
+    let mut any_error = false;
 
-        for name in names {
-            let Some(entry) = self.manager.server_entry(&name) else {
-                continue;
-            };
-            match crate::mcp::list_prompts(&entry, &cancellation).await {
-                Ok(prompts) => {
-                    for prompt in prompts {
-                        let description = prompt.description.unwrap_or_default();
-                        let description =
-                            truncate(&sanitize_text(&description), MAX_MCP_DESCRIPTION_CHARS);
-                        let args = prompt
-                            .arguments
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|a| {
-                                let sanitized = sanitize_text(&a.name);
-                                if a.required == Some(true) {
-                                    format!("{sanitized}!")
-                                } else {
-                                    sanitized
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        lines.push(format!(
-                            "{}\t{}\t{}\t{}",
-                            name,
-                            sanitize_text(&prompt.name),
-                            description,
-                            args
-                        ));
-                    }
-                }
-                Err(error) => {
-                    any_error = true;
-                    lines.push(format!("{name}\t<error>\t{error}\t"));
+    for (name, entry) in entries {
+        match crate::mcp::list_prompts(&entry, &cancellation).await {
+            Ok(prompts) => {
+                for prompt in prompts {
+                    let description = prompt.description.unwrap_or_default();
+                    let description =
+                        truncate(&sanitize_text(&description), MAX_MCP_DESCRIPTION_CHARS);
+                    let args = prompt
+                        .arguments
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| {
+                            let sanitized = sanitize_text(&a.name);
+                            if a.required == Some(true) {
+                                format!("{sanitized}!")
+                            } else {
+                                sanitized
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    lines.push(format!(
+                        "{}\t{}\t{}\t{}",
+                        name,
+                        sanitize_text(&prompt.name),
+                        description,
+                        args
+                    ));
                 }
             }
+            Err(error) => {
+                any_error = true;
+                lines.push(format!("{name}\t<error>\t{error}\t"));
+            }
         }
-
-        if lines.is_empty() {
-            return Ok(ToolOutput::text(
-                "(no prompts advertised)".to_string(),
-                false,
-            ));
-        }
-
-        Ok(ToolOutput::text(lines.join("\n"), any_error))
     }
+
+    if lines.is_empty() {
+        return Ok(ToolOutput::text(
+            "(no prompts advertised)".to_string(),
+            false,
+        ));
+    }
+
+    Ok(ToolOutput::text(lines.join("\n"), any_error))
 }
 
 pub(crate) struct GetMcpPromptTool {
@@ -449,80 +533,104 @@ impl Tool for GetMcpPromptTool {
         Permission::Read
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let cancellation = context.cancellation.clone();
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[async_trait]
+impl crate::tools::Detachable for GetMcpPromptTool {
+    /// The server, the prompt and its arguments; the run renders it.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
         let server = require_str(&input, "server", "mcp_prompt_get")?;
         let name = require_str(&input, "name", "mcp_prompt_get")?;
-
         let arguments = optional_object(&input, "arguments", "mcp_prompt_get")?.cloned();
-
         let entry =
             visible_server_entry("mcp_prompt_get", &self.manager, &self.tool_scope, &server)?;
-
-        let result = crate::mcp::get_prompt(&entry, name.clone(), arguments, &cancellation).await?;
-
-        // Sanitized before truncation, like every other server-supplied string in this file: it
-        // reaches the model and the terminal.
-        let description = result
-            .description
-            .map(|description| {
-                truncate(
-                    &crate::text::sanitize_text(&description),
-                    MAX_MCP_DESCRIPTION_CHARS,
-                )
-            })
-            .unwrap_or_default();
-
-        let mut lines = Vec::new();
-        if !description.is_empty() {
-            lines.push(format!("# {description}"));
-        }
-
-        for message in &result.messages {
-            let role_label = match message.role {
-                rmcp::model::Role::User => "user",
-                rmcp::model::Role::Assistant => "assistant",
-            };
-            match &message.content {
-                rmcp::model::ContentBlock::Text(text) => {
-                    lines.push(format!("{}: {}", role_label, sanitize_text(&text.text)));
-                }
-                rmcp::model::ContentBlock::Image(_) => {
-                    lines.push(format!("{role_label}: [image content]"));
-                }
-                rmcp::model::ContentBlock::Audio(_) => {
-                    lines.push(format!("{role_label}: [audio content]"));
-                }
-                rmcp::model::ContentBlock::Resource(embedded) => {
-                    lines.push(format!(
-                        "{}: [embedded resource: {:?}]",
-                        role_label, embedded.resource
-                    ));
-                }
-                rmcp::model::ContentBlock::ResourceLink(link) => {
-                    lines.push(format!(
-                        "{}: [resource link: {}]",
-                        role_label,
-                        sanitize_text(&link.uri)
-                    ));
-                }
-                _ => lines.push(format!("{role_label}: [unsupported content]")),
-            }
-        }
-
-        if lines.is_empty() {
-            return Ok(ToolOutput::text(
-                format!("prompt '{name}' returned no messages"),
-                false,
-            ));
-        }
-
-        Ok(ToolOutput::text(lines.join("\n"), false))
+        Ok(crate::tools::Started::running(None, move |context| {
+            rendered_prompt(entry, name, arguments, context.cancellation)
+        }))
     }
+}
+
+/// The prompt `name` as `entry`'s server renders it, a line per message.
+async fn rendered_prompt(
+    entry: Arc<crate::mcp::ServerEntry>,
+    name: String,
+    arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ToolOutput> {
+    let result = crate::mcp::get_prompt(&entry, name.clone(), arguments, &cancellation).await?;
+
+    // Sanitized before truncation, like every other server-supplied string in this file: it
+    // reaches the model and the terminal.
+    let description = result
+        .description
+        .map(|description| {
+            truncate(
+                &crate::text::sanitize_text(&description),
+                MAX_MCP_DESCRIPTION_CHARS,
+            )
+        })
+        .unwrap_or_default();
+
+    let mut lines = Vec::new();
+    if !description.is_empty() {
+        lines.push(format!("# {description}"));
+    }
+
+    for message in &result.messages {
+        let role_label = match message.role {
+            rmcp::model::Role::User => "user",
+            rmcp::model::Role::Assistant => "assistant",
+        };
+        match &message.content {
+            rmcp::model::ContentBlock::Text(text) => {
+                lines.push(format!("{}: {}", role_label, sanitize_text(&text.text)));
+            }
+            rmcp::model::ContentBlock::Image(_) => {
+                lines.push(format!("{role_label}: [image content]"));
+            }
+            rmcp::model::ContentBlock::Audio(_) => {
+                lines.push(format!("{role_label}: [audio content]"));
+            }
+            rmcp::model::ContentBlock::Resource(embedded) => {
+                lines.push(format!(
+                    "{}: [embedded resource: {:?}]",
+                    role_label, embedded.resource
+                ));
+            }
+            rmcp::model::ContentBlock::ResourceLink(link) => {
+                lines.push(format!(
+                    "{}: [resource link: {}]",
+                    role_label,
+                    sanitize_text(&link.uri)
+                ));
+            }
+            _ => lines.push(format!("{role_label}: [unsupported content]")),
+        }
+    }
+
+    if lines.is_empty() {
+        return Ok(ToolOutput::text(
+            format!("prompt '{name}' returned no messages"),
+            false,
+        ));
+    }
+
+    Ok(ToolOutput::text(lines.join("\n"), false))
 }
 
 pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClientManager>) {
@@ -627,12 +735,27 @@ impl Tool for SubscribeMcpResourceTool {
         Permission::Read
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let cancellation = context.cancellation.clone();
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[async_trait]
+impl crate::tools::Detachable for SubscribeMcpResourceTool {
+    /// The server and the resource; the run asks the server to subscribe.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
         let server = require_str(&input, "server", "mcp_resource_subscribe")?;
         let uri = require_str(&input, "uri", "mcp_resource_subscribe")?;
         let entry = visible_server_entry(
@@ -641,15 +764,20 @@ impl Tool for SubscribeMcpResourceTool {
             &self.tool_scope,
             &server,
         )?;
-        crate::mcp::subscriptions::subscribe(&entry, uri.clone(), &cancellation)
-            .await
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "mcp_resource_subscribe".to_string(),
-                message: format!("subscribe failed: {error}"),
-            })?;
-        Ok(ToolOutput::text(
-            format!("subscribed to '{uri}' on server '{server}'"),
-            false,
+        Ok(crate::tools::Started::running(
+            None,
+            move |context| async move {
+                crate::mcp::subscriptions::subscribe(&entry, uri.clone(), &context.cancellation)
+                    .await
+                    .map_err(|error| MekaError::ToolExecution {
+                        tool_name: "mcp_resource_subscribe".to_string(),
+                        message: format!("subscribe failed: {error}"),
+                    })?;
+                Ok(ToolOutput::text(
+                    format!("subscribed to '{uri}' on server '{server}'"),
+                    false,
+                ))
+            },
         ))
     }
 }
@@ -681,12 +809,27 @@ impl Tool for UnsubscribeMcpResourceTool {
         Permission::Read
     }
 
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let cancellation = context.cancellation.clone();
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[async_trait]
+impl crate::tools::Detachable for UnsubscribeMcpResourceTool {
+    /// The server and the resource; the run asks the server to unsubscribe.
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
         let server = require_str(&input, "server", "mcp_resource_unsubscribe")?;
         let uri = require_str(&input, "uri", "mcp_resource_unsubscribe")?;
         let entry = visible_server_entry(
@@ -695,15 +838,20 @@ impl Tool for UnsubscribeMcpResourceTool {
             &self.tool_scope,
             &server,
         )?;
-        crate::mcp::subscriptions::unsubscribe(&entry, uri.clone(), &cancellation)
-            .await
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "mcp_resource_unsubscribe".to_string(),
-                message: format!("unsubscribe failed: {error}"),
-            })?;
-        Ok(ToolOutput::text(
-            format!("unsubscribed from '{uri}' on server '{server}'"),
-            false,
+        Ok(crate::tools::Started::running(
+            None,
+            move |context| async move {
+                crate::mcp::subscriptions::unsubscribe(&entry, uri.clone(), &context.cancellation)
+                    .await
+                    .map_err(|error| MekaError::ToolExecution {
+                        tool_name: "mcp_resource_unsubscribe".to_string(),
+                        message: format!("unsubscribe failed: {error}"),
+                    })?;
+                Ok(ToolOutput::text(
+                    format!("unsubscribed from '{uri}' on server '{server}'"),
+                    false,
+                ))
+            },
         ))
     }
 }
@@ -916,7 +1064,8 @@ mod tests {
     }
 
     /// The seven MCP resource tools stay deferred after registration, or every MCP-using session
-    /// would carry seven extra tool schemas in its tools array on the first turn.
+    /// would carry seven extra tool schemas in its tools array on the first turn; and the six
+    /// that ask the server can run in the background.
     #[tokio::test]
     async fn mcp_resource_tools_remain_deferred() {
         use crate::{
@@ -976,6 +1125,15 @@ mod tests {
                 registry.is_deferred(name),
                 "MCP resource tool {name} should still be deferred (would otherwise \
                  bloat the tools array on every MCP-enabled session)",
+            );
+            // Every one that asks the server is a remote round trip, whose time is the
+            // server's; the updates list reads what this process already holds.
+            assert_eq!(
+                registry
+                    .get(name)
+                    .is_some_and(|tool| tool.as_detachable().is_some()),
+                name != "mcp_resource_updates_list",
+                "{name}"
             );
         }
     }

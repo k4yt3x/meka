@@ -18,11 +18,6 @@ pub(crate) const EDIT_TOOL_NAME: &str = "checklist_edit";
 /// The tool that returns the list.
 pub(crate) const READ_TOOL_NAME: &str = "checklist_read";
 
-/// Whether `name` is one of the three.
-pub(crate) fn is_tool(name: &str) -> bool {
-    name == ADD_TOOL_NAME || name == EDIT_TOOL_NAME || name == READ_TOOL_NAME
-}
-
 /// A background task's id as the list shows it: the prefix `task_list` shows, whether the model
 /// named that or the whole id.
 pub(crate) fn short_task_id(task: &str) -> &str {

@@ -320,7 +320,7 @@ mod tests {
                     "glob": "*.txt",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -353,7 +353,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({ "glob": "*.md" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -384,7 +384,7 @@ mod tests {
                     "glob": "*.txt",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -415,7 +415,7 @@ mod tests {
                     "path": temp_dir.path().to_str().expect("path"),
                     "limit": 100
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -446,7 +446,7 @@ mod tests {
                     "path": temp_dir.path().to_str().expect("path"),
                     "scratchpad": "paths"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -485,7 +485,7 @@ mod tests {
                     "scratchpad": "paths",
                     "limit": 50
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -516,7 +516,7 @@ mod tests {
                     "glob": "*.txt",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(cancellation),
+                crate::tools::ToolContext::for_test(cancellation),
             )
             .await
             .expect_err("a canceled turn must not run the walk to completion");
@@ -792,7 +792,7 @@ mod tests {
         let refused = tool
             .execute(
                 serde_json::json!({"glob": "*.txt", "path": elsewhere.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a base outside the roots");
@@ -805,7 +805,7 @@ mod tests {
         let listed = tool
             .execute(
                 serde_json::json!({"glob": "**/*.txt"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a walk inside the roots")

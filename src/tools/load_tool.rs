@@ -864,7 +864,7 @@ mod tests {
             .tool_search
             .execute(
                 serde_json::json!({"query": query}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a search answers")
@@ -929,7 +929,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": "mcp_probe"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("answers");
@@ -941,7 +941,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": ["mcp_probe", "fixture_alpha"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("answers");
@@ -973,7 +973,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": "probe"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("answers");
@@ -1002,7 +1002,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": "fixture_alpha"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("loads");
@@ -1019,7 +1019,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": "fixture_alpha"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("loads");
@@ -1047,7 +1047,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": ["fixture_alpha", "fixture_missing"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("answers");
@@ -1072,7 +1072,7 @@ mod tests {
             .tool_search
             .execute(
                 serde_json::json!({"names": over_the_cap}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("answers");
@@ -1110,7 +1110,7 @@ mod tests {
                 .tool_search
                 .execute(
                     by_names.clone(),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .is_err(),
@@ -1141,7 +1141,7 @@ mod tests {
             .tool_search
             .execute(
                 by_names,
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("loads by name");
@@ -1150,7 +1150,7 @@ mod tests {
             .tool_search
             .execute(
                 serde_json::json!({"names": []}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("an empty list is no load, so the query is required");
@@ -1253,7 +1253,7 @@ mod tests {
                 .tool_search
                 .execute(
                     input,
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await;
             assert!(outcome.is_err());
@@ -1334,7 +1334,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": "mcp__x__wipe"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a load answers");
@@ -1367,7 +1367,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": ["thing_read", "thing_write"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a load answers");
@@ -1401,7 +1401,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": "xrefs"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a load answers");
@@ -1419,7 +1419,7 @@ mod tests {
         let result = tool_load
             .execute(
                 serde_json::json!({"name": "nonexistent"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -1441,7 +1441,7 @@ mod tests {
         let result = tool_load
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err());
@@ -1466,7 +1466,7 @@ mod tests {
         let result = tool_load
             .execute(
                 serde_json::json!({"name": "mcp__notion__fetch"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -1497,7 +1497,7 @@ mod tests {
         let result = tool_load
             .execute(
                 serde_json::json!({"name": "file_read"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -1524,7 +1524,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": ["mcp__notion__fetch", "mcp__notion__search"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -1548,7 +1548,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": ["mcp__notion__fetch", "nope"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -1574,7 +1574,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({ "name": names }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -1597,7 +1597,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": "fetch"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
@@ -1621,7 +1621,7 @@ mod tests {
             .tool_load
             .execute(
                 serde_json::json!({"name": "anything"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should return Ok with error tool_result");

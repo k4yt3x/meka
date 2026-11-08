@@ -1941,7 +1941,7 @@ mod tests {
     /// A checkpoint tool is told which session it serves and receives its arguments through the
     /// same admission as an inline call: an MCP tool called from a checkpoint carries
     /// `meka/sessionId`, and a `background: true` does not reach a tool that never advertised the
-    /// key.
+    /// key, nor detaches one that could run in the background.
     #[tokio::test]
     async fn a_checkpoint_tool_is_told_its_session_and_gets_admitted_arguments() {
         let provider = Arc::new(MockProvider::from_rounds(vec![
@@ -1962,10 +1962,12 @@ mod tests {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let registry = crate::tools::ToolRegistry::new();
         registry
-            .register(Arc::new(StubTool {
-                name: "memory_write".to_string(),
-                calls: calls.clone(),
-            }))
+            .register(Arc::new(crate::tools::DetachableForTest(Arc::new(
+                StubTool {
+                    name: "memory_write".to_string(),
+                    calls: calls.clone(),
+                },
+            ))))
             .expect("register stub");
         let (agent, store) = agent_with_registry_and_checkpoint(provider, registry).await;
         let mut messages = conversation();

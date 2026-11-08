@@ -516,7 +516,7 @@ mod tests {
     async fn call(tool: &dyn Tool, input: serde_json::Value) -> ToolOutput {
         tool.execute(
             input,
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("a checklist call answers with a result, never an Err")
@@ -903,10 +903,6 @@ mod tests {
         let state = replay_checklist(&Conversation::from_events(events));
         assert_eq!(state.items.len(), 1, "{state:?}");
         assert_eq!(state.items[0].status, ChecklistStatus::InProgress);
-        assert!(
-            !crate::tools::detachable(ADD_TOOL_NAME) && !crate::tools::detachable(EDIT_TOOL_NAME),
-            "and the flag is never offered on a list edit, whose result the model needs at once"
-        );
     }
 
     /// A rewind drops the turn's rows from the view, and the items it added with them.

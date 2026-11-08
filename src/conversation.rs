@@ -1525,6 +1525,28 @@ pub(crate) struct ResultDisplay {
     /// changes the list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) checklist: Option<Vec<crate::checklist::ChecklistItem>>,
+    /// The task a call that went to the background runs as, and the sub-agent it drives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) background: Option<BackgroundStart>,
+}
+
+/// A call that went to the background, as its result records it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BackgroundStart {
+    /// The task's id, whole or by the prefix a row shows it by, so a reader matches it by prefix.
+    pub(crate) task: String,
+    /// The sub-agent the task drives, for `agent_spawn` and `agent_followup`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subagent: Option<uuid::Uuid>,
+}
+
+impl BackgroundStart {
+    /// The task's id as a row shows it.
+    pub(crate) fn short_task(&self) -> &str {
+        self.task
+            .get(..crate::text::ID_PREFIX)
+            .unwrap_or(&self.task)
+    }
 }
 
 impl ResultDisplay {
@@ -2816,6 +2838,7 @@ mod tests {
                 exit_code: Some(2),
                 change: Some(Change::between(Some("a\nb\n"), Some("a\nc\n"))),
                 checklist: Some(Vec::new()),
+                background: None,
             }
             .recorded(),
         );

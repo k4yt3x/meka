@@ -574,6 +574,14 @@ const MIGRATIONS: &[Migration] = &[
         name: "inbox_errors_name_their_type_under_meka_bot",
         step: Step::Rust(inbox_errors_name_their_type_under_meka_bot),
     },
+    // 0.91 records the task a call that went to the background runs as, and the sub-agent it
+    // drives, with the call's result rather than only in the words it was answered with. A result
+    // written before takes the task its words name, by its whole id and with the sub-agent it
+    // links while its row is still there.
+    Migration {
+        name: "background_starts_record_their_task",
+        step: Step::Rust(background_starts_record_their_task),
+    },
 ];
 
 /// The column that marks a session whose copy is unfinished. Safe to replay: the column is added
@@ -1036,6 +1044,172 @@ fn inbox_errors_name_their_type_under_meka_bot(
              '\"type\":\"https://meka.run/errors/', '\"type\":\"https://meka.bot/errors/') \
          WHERE instr(last_error, '\"type\":\"https://meka.run/errors/') > 0",
     )
+}
+
+fn background_starts_record_their_task(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    const KINDS: &str = "kind IN ('assistant', 'tool_results', 'repair')";
+    let sessions: Vec<String> = transaction
+        .prepare(&format!(
+            "SELECT DISTINCT session_id FROM messages WHERE {KINDS}"
+        ))?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for session_id in sessions {
+        let rows: Vec<(i64, String)> = transaction
+            .prepare(&format!(
+                "SELECT id, content FROM messages WHERE session_id = ?1 AND {KINDS} ORDER BY id"
+            ))?
+            .query_map([&session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let tasks: Vec<StartedTask0_90> = transaction
+            .prepare("SELECT id, subagent_id FROM background_tasks WHERE session_id = ?1")?
+            .query_map([&session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // The one task of the session the short id names: its whole id and its sub-agent.
+        let task_of = |short: &str| -> Option<StartedTask0_90> {
+            let mut named = tasks.iter().filter(|(id, _)| id.starts_with(short));
+            match (named.next(), named.next()) {
+                (Some(task), None) => Some(task.clone()),
+                _ => None,
+            }
+        };
+        let mut backgrounded = std::collections::HashMap::new();
+        for (id, content) in rows {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            if !record_background_starts_0_90(&mut value, &mut backgrounded, &task_of) {
+                continue;
+            }
+            let encoded = match serde_json::to_string(&value) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+                }
+            };
+            transaction.execute(
+                "UPDATE messages SET content = ?1 WHERE id = ?2",
+                rusqlite::params![encoded, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The task a started answer's short id names: its whole id and the sub-agent it links.
+type StartedTask0_90 = (String, Option<String>);
+
+/// How the answer to a call that went to the background began before 0.91 recorded the task with
+/// the result. Frozen here, since the answer may change and this converts what was written then.
+const STARTED_ANSWER_0_90: &str = "Started in the background as task ";
+
+/// Record on every result that answered a backgrounded call before 0.91 the task its words name,
+/// as the result's `display.background`: by the whole id and with the sub-agent `task_of` finds
+/// for the short one, else by the short id alone.
+/// Walks `value` in document order and keeps `backgrounded`, each call's id and whether it asked
+/// for the background, across the walks of one session, so a result pairs with the latest call
+/// under its id: providers reuse ids round to round. A call's `input` is the model's data and is
+/// not descended into. A result that records a start already is left as it is. Reports whether
+/// anything changed; one walk serves the store and an archive.
+fn record_background_starts_0_90(
+    value: &mut serde_json::Value,
+    backgrounded: &mut std::collections::HashMap<String, bool>,
+    task_of: &dyn Fn(&str) -> Option<StartedTask0_90>,
+) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            match object.get("type").and_then(|kind| kind.as_str()) {
+                Some("tool_use") => {
+                    if let Some(id) = object.get("id").and_then(|id| id.as_str()) {
+                        let asked = object
+                            .get("input")
+                            .and_then(|input| input.get("background"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true);
+                        backgrounded.insert(id.to_string(), asked);
+                    }
+                    false
+                }
+                Some("tool_result") => {
+                    let asked = object
+                        .get("tool_use_id")
+                        .and_then(|id| id.as_str())
+                        .and_then(|id| backgrounded.get(id))
+                        .copied()
+                        == Some(true);
+                    let recorded = object
+                        .get("display")
+                        .and_then(|display| display.get("background"))
+                        .is_some();
+                    let task = object
+                        .get("content")
+                        .and_then(|content| content.get(0))
+                        .filter(|item| {
+                            item.get("type").and_then(|kind| kind.as_str()) == Some("text")
+                        })
+                        .and_then(|item| item.get("text"))
+                        .and_then(|text| text.as_str())
+                        .and_then(|text| text.strip_prefix(STARTED_ANSWER_0_90))
+                        .and_then(|rest| rest.split_once(" ("))
+                        .map(|(task, _)| task.to_string())
+                        .filter(|task| !task.is_empty());
+                    let (true, false, Some(task)) = (asked, recorded, task) else {
+                        return false;
+                    };
+                    let start = match task_of(&task) {
+                        Some((id, Some(subagent))) => {
+                            serde_json::json!({ "task": id, "subagent": subagent })
+                        }
+                        Some((id, None)) => serde_json::json!({ "task": id }),
+                        None => serde_json::json!({ "task": task }),
+                    };
+                    let display = object
+                        .entry("display")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if !display.is_object() {
+                        *display = serde_json::json!({});
+                    }
+                    if let Some(display) = display.as_object_mut() {
+                        display.insert("background".to_string(), start);
+                    }
+                    true
+                }
+                _ => {
+                    let mut changed = false;
+                    for child in object.values_mut() {
+                        changed |= record_background_starts_0_90(child, backgrounded, task_of);
+                    }
+                    changed
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= record_background_starts_0_90(item, backgrounded, task_of);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Each result that answered a backgrounded call in an archive from before 0.91 records the task
+/// its words name. An archive carries no task rows, so none names a sub-agent.
+fn record_background_starts_in_archive_0_90(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(events) = session.get_mut("events") {
+            record_background_starts_0_90(events, &mut std::collections::HashMap::new(), &|_| None);
+        }
+    }
 }
 
 fn recall_entries_take_their_name(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
@@ -3964,6 +4138,9 @@ const ARCHIVE_FORMAT_0_88_DEVELOPMENT_2: u64 = 20;
 /// The archive `format_version` 0.88 wrote, in which a compaction run between turns is no turn: a
 /// build that reads one draws it as the compaction alone, as it always was, so nothing converts.
 const ARCHIVE_FORMAT_0_88: u64 = 21;
+/// The archive `format_version` 0.89 and 0.90 wrote, whose background calls record their task
+/// only in the words they were answered with.
+const ARCHIVE_FORMAT_0_90: u64 = 22;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -4548,7 +4725,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_87)
         | Some(ARCHIVE_FORMAT_0_88_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_88_DEVELOPMENT_2)
-        | Some(ARCHIVE_FORMAT_0_88) => {}
+        | Some(ARCHIVE_FORMAT_0_88)
+        | Some(ARCHIVE_FORMAT_0_90) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -4591,6 +4769,9 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     link_kept_copies_0_87(document);
     say_where_kept_copies_were_said_0_89(document);
     record_turn_levels_0_88(document);
+    if from <= ARCHIVE_FORMAT_0_90 {
+        record_background_starts_in_archive_0_90(document);
+    }
     document["format_version"] = current.into();
     true
 }
@@ -6051,6 +6232,10 @@ mod tests {
             (
                 "inbox_errors_name_their_type_under_meka_bot",
                 5298058929951792361_u64,
+            ),
+            (
+                "background_starts_record_their_task",
+                1392066146600183403_u64,
             ),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or
@@ -9267,6 +9452,135 @@ mod tests {
             )
             .expect("count");
         assert_eq!(old, 0);
+    }
+
+    /// A call answered in the background records the task its answer named, by the whole id and
+    /// with the sub-agent its row links, or by the short id once the row is gone; a result pairs
+    /// with the latest call under its id, so a reused id's later inline call converts nothing; a
+    /// result that records a start already is kept; and a replay changes nothing.
+    #[test]
+    fn background_starts_record_the_task_their_answer_named() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        let call = |input: serde_json::Value| {
+            serde_json::json!([{"type": "tool_use", "id": "c1", "name": "shell_execute", "input": input}])
+                .to_string()
+        };
+        let result = |text: &str, display: Option<serde_json::Value>| {
+            let mut block = serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "c1",
+                "content": [{"type": "text", "text": text}],
+                "is_error": false,
+            });
+            if let Some(display) = display {
+                block["display"] = display;
+            }
+            serde_json::json!([block]).to_string()
+        };
+        let rows = [
+            (
+                "assistant",
+                call(serde_json::json!({"command": "make", "background": true})),
+            ),
+            (
+                "tool_results",
+                result(
+                    "Started in the background as task 7f3a1c22 (make). Use `task_list` for \
+                     status.",
+                    None,
+                ),
+            ),
+            ("assistant", call(serde_json::json!({"command": "echo"}))),
+            (
+                "tool_results",
+                result("Started in the background as task 99999999 (echo).", None),
+            ),
+            (
+                "assistant",
+                call(serde_json::json!({"command": "make", "background": true})),
+            ),
+            (
+                "tool_results",
+                result(
+                    "Started in the background as task 7f3a1c22 (make).",
+                    Some(serde_json::json!({"background": {"task": "kept"}})),
+                ),
+            ),
+            (
+                "assistant",
+                call(serde_json::json!({"command": "make", "background": true})),
+            ),
+            (
+                "tool_results",
+                result("Started in the background as task 5a5a5a5a (make).", None),
+            ),
+        ];
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'then', 'then'); \
+                 INSERT INTO background_tasks (id, session_id, tool, label, status, started_at, \
+                     subagent_id) \
+                 VALUES ('7f3a1c22-0000-4000-8000-000000000000', 's', 'agent_spawn', 'make', \
+                     'completed', 'then', '3e9b51d0-0000-4000-8000-000000000000');",
+            )
+            .expect("a session and its task");
+        for (id, (kind, content)) in (1_i64..).zip(&rows) {
+            connection
+                .execute(
+                    "INSERT INTO messages (id, session_id, kind, content, created_at) \
+                     VALUES (?1, 's', ?2, ?3, 'then')",
+                    rusqlite::params![id, kind, content],
+                )
+                .expect("a row");
+        }
+        let starts = |connection: &rusqlite::Connection| -> Vec<serde_json::Value> {
+            connection
+                .prepare("SELECT content FROM messages WHERE kind = 'tool_results' ORDER BY id")
+                .expect("prepare")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .map(|content| {
+                    let blocks: serde_json::Value =
+                        serde_json::from_str(&content.expect("row")).expect("json");
+                    blocks[0]["display"]["background"].clone()
+                })
+                .collect()
+        };
+        let transaction = connection.transaction().expect("transaction");
+        background_starts_record_their_task(&transaction).expect("the step");
+        let converted = starts(&transaction);
+        assert_eq!(converted, [
+            serde_json::json!({
+                "task": "7f3a1c22-0000-4000-8000-000000000000",
+                "subagent": "3e9b51d0-0000-4000-8000-000000000000",
+            }),
+            serde_json::Value::Null,
+            serde_json::json!({"task": "kept"}),
+            serde_json::json!({"task": "5a5a5a5a"}),
+        ]);
+        background_starts_record_their_task(&transaction).expect("a replay");
+        assert_eq!(starts(&transaction), converted);
+
+        let mut archive = serde_json::json!({
+            "format_version": ARCHIVE_FORMAT_0_90,
+            "sessions": [{"events": rows.iter().map(|(kind, content)| {
+                let role = if *kind == "assistant" { "assistant" } else { "user" };
+                let content: serde_json::Value = serde_json::from_str(content).expect("json");
+                serde_json::json!({"event": {"Append": {"role": role, "content": content}}})
+            }).collect::<Vec<_>>()}],
+        });
+        assert!(bring_archive_forward(
+            &mut archive,
+            u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION)
+        ));
+        let events = &archive["sessions"][0]["events"];
+        assert_eq!(
+            events[1]["event"]["Append"]["content"][0]["display"]["background"],
+            serde_json::json!({"task": "7f3a1c22"}),
+            "an archive carries no task rows, so no sub-agent"
+        );
+        assert!(events[3]["event"]["Append"]["content"][0]["display"].is_null());
     }
 
     /// The step gives every copy a compaction kept, a copy of a copy included, the turn and the

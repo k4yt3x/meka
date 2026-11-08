@@ -1018,7 +1018,7 @@ mod tests {
         let output = tool
             .execute(
                 input,
-                crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
+                crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new()),
             )
             .await?;
         Ok(output

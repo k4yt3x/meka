@@ -5,8 +5,9 @@ use super::*;
 
 /// The arguments an approval prompt is shown, which is not quite the arguments the tool receives.
 ///
-/// `background` is meka's own parameter, spliced into every schema by the registry and taken out
-/// again before dispatch so no tool sees a key it never advertised. It is also the argument that
+/// `background` is meka's own parameter, spliced by the registry into the schema of every tool that
+/// can run in the background and taken out again before dispatch so no tool sees a key it never
+/// advertised. It is also the argument that
 /// decides whether the call detaches and outlives the turn, so a prompt that showed everything
 /// except that would be asking about a different call than the one about to run.
 pub(super) fn approval_input(input: &serde_json::Value, detach: bool) -> serde_json::Value {
@@ -41,11 +42,11 @@ pub(super) enum CallDoor {
 
 impl Agent {
     /// What a screen draws of `output` beyond its words, as its result records it and the
-    /// announcement of its end carries it: how a command ended, the change a call made, and the
-    /// list a checklist call left, as the batch left it, since the batch has run by the time a
-    /// result is recorded. The one place a result's display is made, for the turn and the
-    /// checkpoint alike. A change is worked out on a blocking thread, since diffing two large
-    /// texts can take up to the diff's timeout.
+    /// announcement of its end carries it: how a command ended, the change a call made, the task
+    /// a call that went to the background became, and the list a checklist call left, as the
+    /// batch left it, since the batch has run by the time a result is recorded. The one place a
+    /// result's display is made, for the turn and the checkpoint alike. A change is worked out on a
+    /// blocking thread, since diffing two large texts can take up to the diff's timeout.
     pub(super) async fn result_display(
         &self,
         name: &str,
@@ -319,22 +320,27 @@ impl Agent {
         // conversation it came from. `run_turn` populates `cells.session_id` before the tool loop,
         // so this is only `None` on paths that never established a session.
         let session_id = self.cells.session_id.get();
-        let schema = tool.definition().parameters;
+        let definition = tool.definition();
+        let schema = &definition.parameters;
 
-        let (input, detach) = match crate::tools::admit_arguments(name, input, &schema) {
+        let (input, detach) = match crate::tools::admit_arguments(&**tool, &definition, input) {
             Ok(admitted) => admitted,
             Err(refusal) => return refusal,
         };
         let input = &input;
         // A checkpoint tool runs inline whatever the model asked: the flag is stripped like
         // everywhere else and not honored, since a task outliving the checkpoint would report
-        // into a conversation the summary has replaced.
-        let detach = detach && matches!(door, CallDoor::Dispatch);
+        // into a conversation the summary has replaced. A detaching call's tool has a start step,
+        // `admit_arguments` having refused the flag on any other.
+        let detachable = tool
+            .as_detachable()
+            .filter(|_| detach && matches!(door, CallDoor::Dispatch));
+        let detach = detachable.is_some();
 
-        // A detached call that cannot start is refused here, ahead of the approval prompt. Every
-        // refusal `start_background_call` makes needs nothing but what is known now, so asking the
-        // user first put a question to them whose answer could not matter: the call was refused the
-        // moment they said yes.
+        // A call that cannot detach is refused here, ahead of the approval prompt: the session,
+        // the ceiling and the slot are known now, so asking first would put a question whose answer
+        // could not matter. What the tool's own start step refuses comes after approval, as it
+        // would for the call inline.
         if detach && let Err(refusal) = self.admit_detach(session_id).await {
             return refusal;
         }
@@ -366,9 +372,18 @@ impl Agent {
             }
         }
 
-        let mut output = if detach {
-            self.start_background_call(tool, tool_call_id, name, input, session_id, attribution)
-                .await
+        let mut output = if let Some(detachable) = detachable {
+            self.start_background_call(
+                tool,
+                detachable,
+                tool_call_id,
+                name,
+                input,
+                session_id,
+                attribution,
+                cancellation,
+            )
+            .await
         } else {
             Self::run_tool(&**tool, input, crate::tools::ToolContext {
                 session_id,
@@ -380,7 +395,7 @@ impl Agent {
             })
             .await
         };
-        if let Some(advisory) = self.schema_advisory(name, input, &schema, loaded, !output.is_error)
+        if let Some(advisory) = self.schema_advisory(name, input, schema, loaded, !output.is_error)
         {
             output.append_notice(&advisory);
         }
@@ -464,8 +479,8 @@ impl Agent {
     /// instead.
     ///
     /// One predicate for the two doors that ask it, the approval prompt and the start itself, so
-    /// the user is never asked about a call that is refused the moment they approve it. The slot
-    /// check here is a preview: [`crate::background::BackgroundTasks::try_reserve`] is the atomic
+    /// the user is never asked about a call that cannot detach. The slot check here is a
+    /// preview: [`crate::background::BackgroundTasks::try_reserve`] is the atomic
     /// claim, and both refuse in the same words.
     pub(super) async fn admit_detach(
         &self,
@@ -494,20 +509,28 @@ impl Agent {
         Ok(session_id)
     }
 
-    /// Detach one call: record it, spawn it, and hand the model a task id instead of a result.
+    /// Detach one call: record it, start it, spawn its run, and hand the model the started answer
+    /// instead of a result.
     ///
-    /// The spawned work gets a **fresh** cancellation token rather than the turn's. Sharing the
-    /// turn's would kill the task the instant the turn ended, which is the whole thing this exists
-    /// to avoid; the cost is that Ctrl+C no longer reaches it, which is why `task_cancel` and the
-    /// second-press escalation exist.
+    /// The row is written before the start step, so a process that dies anywhere after leaves a
+    /// `running` row the sweep retires rather than work, or a worker's session, nobody recorded.
+    /// The start step runs under the turn's token, so a turn interrupted while the call starts
+    /// interrupts the call; that, a refusal from the start step, or a panic in it withdraws the
+    /// row and frees the slot, and the call reads as an inline call's would. The run gets a
+    /// **fresh** token rather than the turn's. Sharing the turn's would kill the task the instant
+    /// the turn ended, which is the whole thing this exists to avoid; the cost is that Ctrl+C no
+    /// longer reaches it, which is why `task_cancel` and the second-press escalation exist.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn start_background_call(
         &self,
         tool: &Arc<dyn crate::tools::Tool>,
+        detachable: &dyn crate::tools::Detachable,
         tool_call_id: &str,
         name: &str,
         input: &serde_json::Value,
         session_id: Option<Uuid>,
         attribution: &crate::provider::Attribution,
+        turn_cancellation: CancellationToken,
     ) -> crate::tools::ToolOutput {
         let prompt_id = attribution.prompt_id;
         let session_id = match self.admit_detach(session_id).await {
@@ -548,9 +571,6 @@ impl Agent {
         {
             return background_limit_refusal(self.background_max_tasks);
         }
-
-        // Recorded before the spawn, so a process that dies in between leaves a `running` row the
-        // sweep can retire rather than work nobody knows happened.
         if let Err(error) = self
             .store
             .background_store()
@@ -565,33 +585,84 @@ impl Agent {
                 true,
             );
         }
+
+        // Published for the frontend as well as passed to the tool: a delegated `fs/*` or
+        // elicitation must race the token the work runs under, not the session's current turn.
+        // See `crate::frontend::scope_call_cancellation`.
+        let context = |cancellation: CancellationToken| crate::tools::ToolContext {
+            session_id: Some(session_id),
+            tool_call_id: Some(tool_call_id.to_string()),
+            prompt_id,
+            frontend: Arc::clone(&self.cells.frontend),
+            cancellation,
+            task_id: Some(task.id.clone()),
+        };
+        let begun = async {
+            use std::ops::ControlFlow;
+            let started = crate::frontend::scope_call_cancellation(
+                turn_cancellation.clone(),
+                detachable.start(input.clone(), &context(turn_cancellation.clone())),
+            )
+            .await;
+            match started {
+                Ok(crate::tools::Started::Running(running))
+                    if !turn_cancellation.is_cancelled() =>
+                {
+                    ControlFlow::Continue(running)
+                }
+                // Stopped while it started, by a start step that did not wait on the stop: the
+                // run sees it at once and settles what the start began, as it would inline.
+                Ok(crate::tools::Started::Running(running)) => ControlFlow::Break(
+                    crate::frontend::scope_call_cancellation(
+                        turn_cancellation.clone(),
+                        running.run(context(turn_cancellation.clone())),
+                    )
+                    .await,
+                ),
+                Ok(crate::tools::Started::Answered(output)) => ControlFlow::Break(Ok(output)),
+                Err(error) => ControlFlow::Break(Err(error)),
+            }
+        };
+        // A panic is caught here only to take the row and the slot with it, and carried on to the
+        // batch, which words it as it words any tool's.
+        use futures::FutureExt;
+        let running = match std::panic::AssertUnwindSafe(begun).catch_unwind().await {
+            Ok(std::ops::ControlFlow::Continue(running)) => running,
+            Ok(std::ops::ControlFlow::Break(result)) => {
+                self.withdraw_background_call(&task.id).await;
+                return Self::tool_result(&**tool, result);
+            }
+            Err(panic) => {
+                self.withdraw_background_call(&task.id).await;
+                std::panic::resume_unwind(panic);
+            }
+        };
+        let subagent = running.subagent;
+        // A failed write is a warning: the model holds the sub-agent's id from the answer below
+        // either way, and what goes without the link is the listings' word on which task runs it.
+        if let Some(subagent) = subagent
+            && let Err(error) = self
+                .store
+                .background_store()
+                .record_task_subagent(&task.id, subagent)
+                .await
+        {
+            let task_id = &task.id;
+            tracing::warn!("failed to record the sub-agent of task {task_id}: {error}");
+        }
+
         let requested_entry = crate::tools::scratchpad::requested_entry(input).map(str::to_string);
+        let inherited_names = self.tool_registry.inherited_scratchpad_names();
+        let context = context(cancellation.clone());
         let join = tokio::spawn({
             let tool = Arc::clone(tool);
-            let input = input.clone();
-            let frontend = Arc::clone(&self.cells.frontend);
             let store = self.store.clone();
             let tasks = self.cells.background_tasks.clone();
-            let cancellation = cancellation.clone();
-            let tool_call_id = tool_call_id.to_string();
             let task_id = task.id.clone();
             let tool_name = task.tool.clone();
             async move {
-                // Published for the frontend as well as passed to the tool: a delegated `fs/*` or
-                // elicitation must race *this* token, not the session's current turn. See
-                // `crate::frontend::scope_call_cancellation`.
-                let scoped = cancellation.clone();
-                let context = crate::tools::ToolContext {
-                    session_id: Some(session_id),
-                    tool_call_id: Some(tool_call_id),
-                    prompt_id,
-                    frontend,
-                    cancellation: scoped.clone(),
-                    task_id: Some(task_id.clone()),
-                };
-                let run = crate::frontend::scope_call_cancellation(scoped, async move {
-                    Self::run_tool(&*tool, &input, context).await
-                });
+                let run =
+                    crate::frontend::scope_call_cancellation(cancellation, running.run(context));
                 // A panic must not escape this task. Nothing awaits its `JoinHandle` outside
                 // `--oneshot`, so an unwind here would skip both the outcome write and the slot
                 // release: the agent would wait forever on a report that is never coming, and the
@@ -599,7 +670,7 @@ impl Agent {
                 // what the rest of the machinery already knows how to deliver.
                 use futures::FutureExt;
                 let output = match std::panic::AssertUnwindSafe(run).catch_unwind().await {
-                    Ok(output) => output,
+                    Ok(result) => Self::tool_result(&*tool, result),
                     Err(_) => {
                         tracing::error!("background task {task_id} panicked");
                         crate::tools::ToolOutput::text(
@@ -609,82 +680,87 @@ impl Agent {
                     }
                 };
 
-                let text =
-                    crate::conversation::ContentBlock::tool_result_text_content(&output.content);
                 let status = tasks.outcome_status(&task_id, output.is_error).await;
-                // The entry the call named takes the whole output and the report says where, as
-                // an inline call's result does; a word about the call rather than its output is
-                // the report itself, as it stays inline there.
-                match requested_entry.filter(|_| output.is_output && !text.is_empty()) {
-                    Some(name) => {
-                        let outcome =
-                            crate::tools::scratchpad::build_scratchpad_reference(&name, text.len());
-                        let entry = crate::store::background::SavedOutput {
-                            session_id,
-                            name,
-                            content: text,
-                        };
-                        record_background_outcome(
-                            &store,
-                            &task_id,
-                            status,
-                            outcome,
-                            None,
-                            Some(entry),
-                        )
-                        .await;
-                    }
-                    None => {
-                        let (inline, spilled) = crate::background::split_outcome(&text);
-                        let mut scratchpad_entry = None;
-                        if let Some(full) = spilled {
-                            let name = crate::background::spill_entry_name(&task_id, &tool_name);
-                            match store.save_scratchpad_entry(session_id, &name, &full).await {
-                                Ok(()) => scratchpad_entry = Some(name),
-                                // Not fatal: the head still reaches the model, and losing the tail
-                                // is far better than losing the whole report.
-                                Err(error) => tracing::warn!(
-                                    "background task {task_id}: failed to spill output to the \
-                                     scratchpad: {error}"
-                                ),
-                            }
-                        }
-                        record_background_outcome(
-                            &store,
-                            &task_id,
-                            status,
-                            inline,
-                            scratchpad_entry,
-                            None,
-                        )
-                        .await;
-                    }
-                }
+                let (outcome, scratchpad_entry, named_entry) = background_outcome(
+                    &store,
+                    session_id,
+                    &task_id,
+                    &tool_name,
+                    output,
+                    requested_entry.as_deref(),
+                    &inherited_names,
+                )
+                .await;
+                record_background_outcome(
+                    &store,
+                    &task_id,
+                    status,
+                    outcome,
+                    scratchpad_entry,
+                    named_entry,
+                )
+                .await;
                 tasks.forget(&task_id).await;
             }
         });
         self.cells.background_tasks.attach(&task.id, join).await;
 
         let mut notice = crate::background::started_notice(task.short_id(), &task.label);
+        if let Some(subagent) = subagent {
+            notice.push_str(&format!(" It runs sub-agent {subagent}."));
+            if self.tool_registry.get("agent_steer").is_some() {
+                notice.push_str(" Use `agent_steer` to message it.");
+            }
+        }
         if self.tool_registry.get("task_list").is_some() {
             notice.push_str(" Use `task_list` for status.");
         }
         if self.tool_registry.get("task_cancel").is_some() {
             notice.push_str(" Use `task_cancel` to stop it.");
         }
-        crate::tools::ToolOutput::text(notice, false)
+        crate::tools::ToolOutput {
+            frontend_metadata: Some(crate::frontend::ToolOutputMetadata::BackgroundStarted {
+                task: task.id,
+                subagent,
+            }),
+            ..crate::tools::ToolOutput::text(notice, false)
+        }
     }
 
-    /// Invoke a tool and turn its failure into the output the model reads, marking the tool's
-    /// output ([`crate::tools::ToolOutput::is_output`]): a result it returned, or a failure it
-    /// reports when it says its failures are its output. This is the one door a tool's result
-    /// comes through, so the mark is set here and nowhere else.
+    /// Undo the record of a call whose start step did not start it: its row goes and its slot is
+    /// freed, so the call leaves no task behind.
+    async fn withdraw_background_call(&self, task_id: &str) {
+        if let Err(error) = self
+            .store
+            .background_store()
+            .withdraw_background_task(task_id)
+            .await
+        {
+            tracing::warn!("failed to withdraw background task {task_id}: {error}");
+        }
+        self.cells.background_tasks.forget(task_id).await;
+    }
+
+    /// Invoke a tool and turn what it returned into the output the model reads; see
+    /// [`Self::tool_result`].
     pub(super) async fn run_tool(
         tool: &dyn crate::tools::Tool,
         input: &serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> crate::tools::ToolOutput {
-        match tool.execute(input.clone(), context).await {
+        Self::tool_result(tool, tool.execute(input.clone(), context).await)
+    }
+
+    /// Turn what `tool` returned into the output the model reads, marking the tool's output
+    /// ([`crate::tools::ToolOutput::is_output`]): a result it returned, or a failure it reports
+    /// when it says its failures are its output. This is the one door a tool's result comes
+    /// through, inline, from a start step that refused, and from a run in the background, so the
+    /// mark is set here and nowhere else.
+    pub(super) fn tool_result(
+        tool: &dyn crate::tools::Tool,
+        result: Result<crate::tools::ToolOutput>,
+    ) -> crate::tools::ToolOutput {
+        match result {
             Ok(output) => said_even_when_empty(&tool.definition().name, crate::tools::ToolOutput {
                 is_output: !output.is_error || tool.reports_failure_as_output(),
                 // A failed call changed nothing, whatever it reports, and every frontend's
@@ -733,6 +809,75 @@ fn background_limit_refusal(max_tasks: usize) -> crate::tools::ToolOutput {
         ),
         true,
     )
+}
+
+/// What a background run's `output` is recorded as: the text its report carries, the entry a spill
+/// wrote, and the entry the call named with what goes in it, through the doors a round's result
+/// takes. Its images go to scratchpad entries first, since a report carries text alone. Then the
+/// entry the call named takes the output, as a round's result's does, and otherwise a text over
+/// the report's bound spills whole, the report keeping its head, under the name the tool hinted.
+/// The bound is the report's own, below any a tool sizes its result to, so it cuts a result the
+/// tool sized to the context too; the note on a refused entry follows the head, not the tail.
+async fn background_outcome(
+    store: &crate::store::Store,
+    session_id: Uuid,
+    task_id: &str,
+    tool_name: &str,
+    mut output: crate::tools::ToolOutput,
+    requested_entry: Option<&str>,
+    inherited_names: &[String],
+) -> (
+    String,
+    Option<String>,
+    Option<crate::store::background::SavedOutput>,
+) {
+    use crate::tools::scratchpad::{Redirect, redirect, save_images, spill};
+    let wanted = output
+        .spill_hint
+        .name
+        .clone()
+        .unwrap_or_else(|| crate::background::spill_entry_name(task_id, tool_name));
+    if let Err(error) = save_images(store, session_id, &mut output.content, &wanted).await {
+        tracing::warn!(
+            "background task {task_id}: failed to save an image to the scratchpad: {error}"
+        );
+    }
+    let mut note = String::new();
+    if let Some(name) = requested_entry.filter(|_| output.is_output) {
+        match redirect(inherited_names, name, &output.content) {
+            Some(Redirect::Save {
+                name,
+                text,
+                reference,
+            }) => {
+                let entry = crate::store::background::SavedOutput {
+                    session_id,
+                    name,
+                    content: text,
+                };
+                return (reference, None, Some(entry));
+            }
+            Some(Redirect::Refused(refusal)) => note = refusal,
+            None => {}
+        }
+    }
+    let text = crate::conversation::ContentBlock::tool_result_text_content(&output.content);
+    let (inline, spilled) = crate::background::split_outcome(&text);
+    let entry = match spilled {
+        None => None,
+        Some(full) => match spill(store, session_id, &full, wanted).await {
+            Ok(name) => Some(name),
+            // Not fatal: the head still reaches the model, and losing the tail is far better
+            // than losing the whole report.
+            Err(error) => {
+                tracing::warn!(
+                    "background task {task_id}: failed to spill output to the scratchpad: {error}"
+                );
+                None
+            }
+        },
+    };
+    (inline + &note, entry, None)
 }
 
 /// How long a failed outcome write waits before its one retry: enough for the `SQLITE_BUSY` a
@@ -1158,7 +1303,9 @@ mod tests {
         }
 
         let registry = crate::tools::ToolRegistry::new();
-        registry.register(Arc::new(Fixture)).expect("registration");
+        registry
+            .register(Arc::new(crate::tools::DetachableForTest(Arc::new(Fixture))))
+            .expect("registration");
         // Deliberately no `enable_background`: the ceiling is zero, as on a default installation.
         let (mut agent, _store) =
             agent_with_registry_for_test(Arc::new(MockProvider::from_rounds(vec![])), registry)
@@ -1230,7 +1377,7 @@ mod tests {
             }
         }
 
-        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let context = || crate::tools::ToolContext::for_test(CancellationToken::new());
         let failed =
             Agent::run_tool(&Fixture { fails: true }, &serde_json::json!({}), context()).await;
         assert!(failed.is_error);
@@ -1813,5 +1960,459 @@ mod tests {
             frontend.events().last(),
             Some(FrontendEvent::ChecklistUpdated { items }) if items.is_empty()
         ));
+    }
+
+    /// What a test asks a [`StartFixture`]'s start step to do.
+    #[derive(Clone, Copy)]
+    enum StartAs {
+        /// Hand back a run driving this sub-agent, or none.
+        Running(Option<Uuid>),
+        /// Refuse the call.
+        Refused,
+        /// Answer the call without running anything.
+        Answered,
+        /// Wait until the call is stopped, as a start step mid-request does.
+        Stopped,
+        /// Panic.
+        Panics,
+    }
+
+    /// A tool whose start step does what [`StartAs`] says.
+    struct StartFixture(StartAs);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for StartFixture {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "start_fixture".to_string(),
+                description: "fixture".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+            Some(self)
+        }
+
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            context: crate::tools::ToolContext,
+        ) -> crate::error::Result<crate::tools::ToolOutput> {
+            crate::tools::start_and_run(self, input, context).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Detachable for StartFixture {
+        async fn start(
+            &self,
+            _input: serde_json::Value,
+            context: &crate::tools::ToolContext,
+        ) -> crate::error::Result<crate::tools::Started> {
+            match self.0 {
+                StartAs::Running(subagent) => Ok(crate::tools::Started::running(
+                    subagent,
+                    |context| async move {
+                        if context.cancellation.is_cancelled() {
+                            return Err(MekaError::Interrupted);
+                        }
+                        Ok(crate::tools::ToolOutput::text("done".to_string(), false))
+                    },
+                )),
+                StartAs::Refused => Err(MekaError::ToolExecution {
+                    tool_name: "start_fixture".to_string(),
+                    message: "refused at the start".to_string(),
+                }),
+                StartAs::Answered => Ok(crate::tools::Started::Answered(
+                    crate::tools::ToolOutput::text("refused at the start".to_string(), true),
+                )),
+                StartAs::Stopped => {
+                    context.cancellation.cancelled().await;
+                    Err(MekaError::Interrupted)
+                }
+                StartAs::Panics => panic!("the start step broke"),
+            }
+        }
+    }
+
+    /// An agent holding a [`StartFixture`] that starts as `start`, with background calls on and a
+    /// session of its own.
+    async fn agent_with_start(start: StartAs) -> (Agent, crate::store::Store, Uuid) {
+        use crate::provider::mock::MockProvider;
+
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(StartFixture(start)))
+            .expect("registration");
+        let (mut agent, store) =
+            agent_with_registry_for_test(Arc::new(MockProvider::from_rounds(vec![])), registry)
+                .await;
+        agent.enable_background_for_test(1);
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("a session");
+        agent.cells.session_id.set(session_id);
+        (agent, store, session_id)
+    }
+
+    /// A detached call answers with the sub-agent its start step drives, records it with the
+    /// result for a screen to draw, and its task's row links the sub-agent by the time the answer
+    /// is given, so a model or a client acting on the answer finds both.
+    #[tokio::test]
+    async fn a_detached_call_names_the_sub_agent_its_start_step_drives() {
+        let worker = Uuid::new_v4();
+        let (agent, store, session_id) = agent_with_start(StartAs::Running(Some(worker))).await;
+
+        let output = agent
+            .resolve_and_execute_tool(
+                "call-1",
+                "start_fixture",
+                &serde_json::json!({"background": true}),
+                &[],
+                &crate::provider::Attribution::default(),
+                CancellationToken::new(),
+            )
+            .await;
+
+        let body = output.text_content();
+        assert!(!output.is_error, "{body}");
+        assert!(
+            body.starts_with("Started in the background as task ")
+                && body.contains(&format!("It runs sub-agent {worker}.")),
+            "{body}"
+        );
+        let rows = store
+            .background_store()
+            .list_background_tasks(session_id)
+            .await
+            .expect("tasks");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].subagent_id,
+            Some(worker),
+            "linked before the answer"
+        );
+        let Some(metadata) = &output.frontend_metadata else {
+            panic!("the answer records the start: {body}");
+        };
+        assert_eq!(
+            metadata.display().background,
+            Some(crate::conversation::BackgroundStart {
+                task: rows[0].id.clone(),
+                subagent: Some(worker),
+            })
+        );
+    }
+
+    /// A call its start step refuses, by an error or by an answer, reads as an inline call's
+    /// refusal would and leaves no task: its row is withdrawn and its slot freed, so the next call
+    /// can take the one slot there is.
+    #[tokio::test]
+    async fn a_call_its_start_step_refuses_leaves_no_task() {
+        for start in [StartAs::Refused, StartAs::Answered] {
+            let (agent, store, session_id) = agent_with_start(start).await;
+            let input = serde_json::json!({"background": true});
+            let attribution = crate::provider::Attribution::default();
+
+            for attempt in 0..2 {
+                let output = agent
+                    .resolve_and_execute_tool(
+                        "call-1",
+                        "start_fixture",
+                        &input,
+                        &[],
+                        &attribution,
+                        CancellationToken::new(),
+                    )
+                    .await;
+                let body = output.text_content();
+                assert!(output.is_error, "{body}");
+                assert!(
+                    body.contains("refused at the start"),
+                    "attempt {attempt}, not a ceiling refusal: {body}"
+                );
+            }
+            assert!(
+                store
+                    .background_store()
+                    .list_background_tasks(session_id)
+                    .await
+                    .expect("tasks")
+                    .is_empty()
+            );
+            assert_eq!(
+                agent.cells.background_tasks.running_count(session_id).await,
+                0
+            );
+        }
+    }
+
+    /// A start step that panics takes its row and its slot with it, and the panic goes on to the
+    /// batch that words it, as an inline tool's does.
+    #[tokio::test]
+    async fn a_start_step_that_panics_leaves_no_task() {
+        use futures::FutureExt;
+
+        let (agent, store, session_id) = agent_with_start(StartAs::Panics).await;
+        let input = serde_json::json!({"background": true});
+        let attribution = crate::provider::Attribution::default();
+        let call = agent.resolve_and_execute_tool(
+            "call-1",
+            "start_fixture",
+            &input,
+            &[],
+            &attribution,
+            CancellationToken::new(),
+        );
+        assert!(
+            std::panic::AssertUnwindSafe(call)
+                .catch_unwind()
+                .await
+                .is_err(),
+            "the panic reaches the batch"
+        );
+        assert!(
+            store
+                .background_store()
+                .list_background_tasks(session_id)
+                .await
+                .expect("tasks")
+                .is_empty()
+        );
+        assert_eq!(
+            agent.cells.background_tasks.running_count(session_id).await,
+            0
+        );
+    }
+
+    /// A turn stopped while a start step that never waits on the stop runs still stops the call:
+    /// its run sees the stop at once, inline, and the call reads as interrupted with no task left.
+    #[tokio::test]
+    async fn a_start_step_that_finishes_after_the_stop_is_interrupted_and_leaves_no_task() {
+        let (agent, store, session_id) = agent_with_start(StartAs::Running(None)).await;
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let output = agent
+            .resolve_and_execute_tool(
+                "call-1",
+                "start_fixture",
+                &serde_json::json!({"background": true}),
+                &[],
+                &crate::provider::Attribution::default(),
+                stop,
+            )
+            .await;
+
+        assert_eq!(output.text_content(), "Tool execution interrupted.");
+        assert!(
+            store
+                .background_store()
+                .list_background_tasks(session_id)
+                .await
+                .expect("tasks")
+                .is_empty()
+        );
+        assert_eq!(
+            agent.cells.background_tasks.running_count(session_id).await,
+            0
+        );
+    }
+
+    /// The row is written before the start step runs, and a call stopped while it starts is an
+    /// interrupted call: the row is withdrawn and the slot freed, whatever a second press that
+    /// stopped every task recorded on it meanwhile, since nothing ran for a report to tell of.
+    #[tokio::test]
+    async fn a_call_stopped_while_it_starts_is_interrupted_and_leaves_no_task() {
+        let (agent, store, session_id) = agent_with_start(StartAs::Stopped).await;
+        let stop = CancellationToken::new();
+        let input = serde_json::json!({"background": true});
+        let attribution = crate::provider::Attribution::default();
+        let call = agent.resolve_and_execute_tool(
+            "call-1",
+            "start_fixture",
+            &input,
+            &[],
+            &attribution,
+            stop.clone(),
+        );
+        let stopper = async {
+            loop {
+                let rows = store
+                    .background_store()
+                    .list_background_tasks(session_id)
+                    .await
+                    .expect("tasks");
+                if !rows.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            agent
+                .cells
+                .background_tasks
+                .stop_all(
+                    &store.background_store(),
+                    crate::store::background::TaskStatus::Interrupted,
+                )
+                .await;
+            stop.cancel();
+        };
+        let (output, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(call, stopper)
+        })
+        .await
+        .expect("the row appears while the start step waits, and the stop ends it");
+
+        assert!(output.is_error);
+        assert_eq!(output.text_content(), "Tool execution interrupted.");
+        assert!(
+            store
+                .background_store()
+                .list_background_tasks(session_id)
+                .await
+                .expect("tasks")
+                .is_empty()
+        );
+        assert_eq!(
+            agent.cells.background_tasks.running_count(session_id).await,
+            0
+        );
+    }
+
+    /// A background run's output reaches its report through the doors a round's result takes:
+    /// an image goes to a scratchpad entry of its base64 bytes, the form `image_render` takes one
+    /// in, rather than becoming `[Image]`; a text over the report's bound spills under the name the
+    /// tool hinted, one the tool sized to the context included; and an entry a parent lent
+    /// read-only is refused rather than shadowed, the refusal following the head of a long output.
+    #[tokio::test]
+    async fn a_background_outcome_takes_the_doors_a_result_takes() {
+        use crate::conversation::ToolResultContent;
+
+        let store = crate::store::Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("a session");
+        let image = crate::image::ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        };
+        let output = |content: Vec<ToolResultContent>, hint: crate::tools::SpillHint| {
+            crate::tools::ToolOutput {
+                content,
+                is_output: true,
+                spill_hint: hint,
+                ..Default::default()
+            }
+        };
+        let text = |text: &str| ToolResultContent::Text {
+            text: text.to_string(),
+        };
+        let task = "7f3a1c22-0000-4000-8000-000000000000";
+
+        let (outcome, spilled, named) = background_outcome(
+            &store,
+            session_id,
+            task,
+            "mcp__kv__shot",
+            output(
+                vec![text("a shot: "), ToolResultContent::Image {
+                    source: image.clone(),
+                }],
+                crate::tools::SpillHint::under("mcp_kv_shot".to_string()),
+            ),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            "a shot: [Image in scratchpad entry 'mcp_kv_shot_image_1']"
+        );
+        assert!(spilled.is_none() && named.is_none());
+        let saved = store
+            .load_scratchpad_entry(session_id, "mcp_kv_shot_image_1")
+            .await
+            .expect("read")
+            .expect("the image's entry");
+        assert_eq!(saved, "iVBORw0KGgo=", "its base64 bytes");
+
+        let long = "x".repeat(crate::background::OUTCOME_INLINE_BYTES + 10);
+        let (outcome, spilled, _) = background_outcome(
+            &store,
+            session_id,
+            task,
+            "mcp__kv__fetch",
+            output(
+                vec![text(&long)],
+                crate::tools::SpillHint::under("mcp_kv_fetch".to_string()),
+            ),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(outcome.len(), crate::background::OUTCOME_INLINE_BYTES);
+        assert_eq!(spilled.as_deref(), Some("mcp_kv_fetch"));
+        let (outcome, spilled, _) = background_outcome(
+            &store,
+            session_id,
+            task,
+            "shell_execute",
+            output(
+                vec![text(&long)],
+                crate::tools::SpillHint::sized_to_context(),
+            ),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            outcome.len(),
+            crate::background::OUTCOME_INLINE_BYTES,
+            "the report's bound, below what the tool sized to"
+        );
+        assert!(spilled.is_some());
+
+        let (outcome, spilled, named) = background_outcome(
+            &store,
+            session_id,
+            task,
+            "shell_execute",
+            output(vec![text(&long)], crate::tools::SpillHint::default()),
+            Some("parent-notes"),
+            &["parent-notes".to_string()],
+        )
+        .await;
+        assert!(named.is_none(), "nothing written under the lent name");
+        assert!(spilled.is_some_and(|name| name != "parent-notes"));
+        assert!(
+            outcome.starts_with('x')
+                && outcome.trim_end().ends_with(']')
+                && outcome.contains("[Not saved to the scratchpad:"),
+            "{outcome}"
+        );
+        let (outcome, _, named) = background_outcome(
+            &store,
+            session_id,
+            task,
+            "shell_execute",
+            output(vec![text("built")], crate::tools::SpillHint::default()),
+            Some("build-log"),
+            &[],
+        )
+        .await;
+        let named = named.expect("the entry the call named");
+        assert_eq!(
+            (named.name.as_str(), named.content.as_str()),
+            ("build-log", "built")
+        );
+        assert!(outcome.contains("'build-log'"), "{outcome}");
     }
 }

@@ -506,6 +506,9 @@ pub(crate) struct McpTool {
 pub(crate) struct CallContext {
     pub(crate) session_id: Option<uuid::Uuid>,
     pub(crate) tool_call_id: Option<String>,
+    /// The call's id while a live view is open on it, which its progress is drawn under; see
+    /// [`crate::tools::ToolContext::live_call_id`].
+    pub(crate) live_call_id: Option<String>,
     pub(crate) frontend: Arc<dyn crate::frontend::Frontend>,
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
 }
@@ -607,7 +610,7 @@ impl McpTool {
             &handle.progress_token,
             self.entry.server_name().to_string(),
             self.remote_tool_name.clone(),
-            context.tool_call_id.clone(),
+            context.live_call_id.clone(),
             Some(Arc::clone(&context.frontend)),
             deadline,
         );

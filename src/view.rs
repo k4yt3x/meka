@@ -724,8 +724,8 @@ pub(crate) struct BackgroundTaskView {
     /// on the session's next turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) delivered_at: Option<String>,
-    /// The session a backgrounded `agent_spawn` runs, once it has made one. Omitted on every
-    /// other task.
+    /// The sub-agent a backgrounded `agent_spawn` or `agent_followup` drives, from the moment the
+    /// call returns. Omitted on every other task.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) subagent_id: Option<Uuid>,
 }

@@ -515,7 +515,7 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({"prompt": "check the deploy", "at": "20m"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("creates");
@@ -532,7 +532,7 @@ mod tests {
         let none = tool
             .execute(
                 serde_json::json!({"prompt": "x"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("no schedule is an error");
@@ -541,7 +541,7 @@ mod tests {
         let both = tool
             .execute(
                 serde_json::json!({"prompt": "x", "at": "20m", "every": "1h"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("two schedules is an error");
@@ -573,7 +573,7 @@ mod tests {
                     "every": "1h",
                     "gate": {"check": {"command": "true"}}
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a gate needs an unattended-write level");
@@ -586,7 +586,7 @@ mod tests {
         // the turn it produces is permission-checked when it runs.
         tool.execute(
             serde_json::json!({"prompt": "x", "every": "1h"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .unwrap_or_else(|error| panic!("an ungated reminder is allowed at {level}: {error}"));
@@ -603,7 +603,7 @@ mod tests {
                     "every": "1h",
                     "gate": "{\"check\": {\"command\": \"true\"}}"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a string is not a gate");
@@ -622,14 +622,14 @@ mod tests {
         };
         tool.execute(
             serde_json::json!({"prompt": "first", "every": "1h"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("first fits");
         let error = tool
             .execute(
                 serde_json::json!({"prompt": "second", "every": "1h"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("second exceeds the ceiling");
@@ -642,7 +642,7 @@ mod tests {
         let error = tool
             .execute(
                 serde_json::json!({"prompt": "x", "at": "2020-01-01T00:00:00Z"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a past instant has no next occurrence");
@@ -705,7 +705,7 @@ mod tests {
         let listed = list
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("lists")
@@ -729,7 +729,7 @@ mod tests {
                 "every": "1h",
                 "gate": {"check": {"command": "gh pr checks"}, "when": "changed"}
             }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("creates at unrestricted");
@@ -750,7 +750,7 @@ mod tests {
         let listed = list
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("lists")
@@ -770,7 +770,7 @@ mod tests {
         let (tool, session_id, manager) = harness().await;
         tool.execute(
             serde_json::json!({"prompt": "watch the build", "every": "1h"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("creates");
@@ -790,7 +790,7 @@ mod tests {
         let listed = list
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("lists")
@@ -811,7 +811,7 @@ mod tests {
         let canceled = cancel
             .execute(
                 serde_json::json!({"id": short}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("cancels")
@@ -821,7 +821,7 @@ mod tests {
         let after = list
             .execute(
                 serde_json::json!({}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("lists")
@@ -841,7 +841,7 @@ mod tests {
         let text = cancel
             .execute(
                 serde_json::json!({"id": "deadbeef"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a miss is not an error")

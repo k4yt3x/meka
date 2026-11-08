@@ -505,7 +505,7 @@ mod tests {
                     "pattern": "sk-",
                     "path": config_dir.to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         let walked = tool
@@ -514,7 +514,7 @@ mod tests {
                     "pattern": "sk-",
                     "path": home.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
@@ -556,7 +556,7 @@ mod tests {
                     "pattern": "needle",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("the search completes");
@@ -588,7 +588,7 @@ mod tests {
                     "pattern": "hello",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -619,7 +619,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({ "pattern": "needle" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -660,7 +660,7 @@ mod tests {
                     "pattern": "needle",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -687,7 +687,7 @@ mod tests {
                     "pattern": "match",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -720,7 +720,7 @@ mod tests {
                         "path": temp_dir.path().to_str().expect("path"),
                         "limit": limit,
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("should succeed");
@@ -755,7 +755,7 @@ mod tests {
                     "scratchpad": "matches",
                     "limit": 10,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -783,7 +783,7 @@ mod tests {
                     "path": temp_dir.path().to_str().expect("path"),
                     "glob": "[unclosed",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("invalid glob must be rejected, not silently scan everything");
@@ -812,7 +812,7 @@ mod tests {
                     "path": temp_dir.path().to_str().expect("path"),
                     "scratchpad": "matches"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -851,7 +851,7 @@ mod tests {
                     "pattern": "match",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(cancellation),
+                crate::tools::ToolContext::for_test(cancellation),
             )
             .await
             .expect_err("a canceled turn must not run the search to completion");
@@ -888,7 +888,7 @@ mod tests {
                     "pattern": "needle",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -1070,7 +1070,7 @@ mod tests {
         let refused = tool
             .execute(
                 serde_json::json!({"pattern": "needle", "path": elsewhere.to_str().expect("path")}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a base outside the roots");
@@ -1083,7 +1083,7 @@ mod tests {
         let found = tool
             .execute(
                 serde_json::json!({"pattern": "needle"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a search inside the roots")

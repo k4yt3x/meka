@@ -1592,7 +1592,7 @@ mod tests {
             memories: memories.clone(),
             project: Default::default(),
         };
-        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let context = || crate::tools::ToolContext::for_test(CancellationToken::new());
         let change = |output: &ToolOutput| match output.frontend_metadata.clone() {
             Some(crate::frontend::ToolOutputMetadata::Diff {
                 path,
@@ -1671,7 +1671,7 @@ mod tests {
         write
             .execute(
                 serde_json::json!({"name": "retention", "description": long, "body": "first"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("create");
@@ -1680,7 +1680,7 @@ mod tests {
         write
             .execute(
                 serde_json::json!({"name": "retention", "body": "second"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("refine");
@@ -1701,7 +1701,7 @@ mod tests {
         let missing = write
             .execute(
                 serde_json::json!({"name": "brand-new", "body": "text"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await;
         let message = match missing {
@@ -1735,7 +1735,7 @@ mod tests {
             write
                 .execute(
                     serde_json::json!({ "name": name, "description": description }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("write");
@@ -1749,7 +1749,7 @@ mod tests {
         let latin = search
             .execute(
                 serde_json::json!({"queries": ["abcd"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search")
@@ -1762,7 +1762,7 @@ mod tests {
         let cjk = search
             .execute(
                 serde_json::json!({"queries": ["東京都"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search")
@@ -1787,7 +1787,7 @@ mod tests {
         let refused = write
             .execute(
                 serde_json::json!({"name": "invisible", "description": "\u{200b}\u{200b}\u{200b}"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a description that renders as nothing must not be stored");
@@ -1826,7 +1826,7 @@ mod tests {
         let opened = read
             .execute(
                 serde_json::json!({ "name": long }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a stored name must be reachable however long it is")
@@ -1846,7 +1846,7 @@ mod tests {
         let found = read
             .execute(
                 serde_json::json!({ "name": "hand.edited" }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a row the index shows the model must be one it can open")
@@ -1861,7 +1861,7 @@ mod tests {
             }
             .execute(
                 serde_json::json!({ "name": "hand.edited" }),
-                crate::tools::ToolContext::detached(CancellationToken::new())
+                crate::tools::ToolContext::for_test(CancellationToken::new())
             )
             .await
             .is_ok(),
@@ -1892,7 +1892,7 @@ mod tests {
                     "name": "note",
                     "description": "first line\nsecond   line",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -1922,7 +1922,7 @@ mod tests {
         let output = write
             .execute(
                 serde_json::json!({"name": "bare", "description": "No body"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("create without a body");
@@ -1939,7 +1939,7 @@ mod tests {
                     "description": "How to reply",
                     "body": "Always answer in kind."
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("initial write");
@@ -1951,7 +1951,7 @@ mod tests {
                     "description": "How to reply",
                     "priority": 0
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("metadata-only write");
@@ -1969,7 +1969,7 @@ mod tests {
         let output = read
             .execute(
                 serde_json::json!({"name": "policy"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read");
@@ -1987,14 +1987,14 @@ mod tests {
                     "description": "How to reply",
                     "body": ""
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("explicit clear");
         let output = read
             .execute(
                 serde_json::json!({"name": "policy"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read");
@@ -2022,7 +2022,7 @@ mod tests {
                 "description": "benign",
                 "body": "ordinary line\n\u{1b}[2Jcleared",
             }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -2034,7 +2034,7 @@ mod tests {
         let output = read
             .execute(
                 serde_json::json!({"name": "planted"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read");
@@ -2065,7 +2065,7 @@ mod tests {
                     "priority": 0,
                     "body": "Ten to seven."
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("create");
@@ -2076,7 +2076,7 @@ mod tests {
                     "name": "POLICY",
                     "description": "alice works from Tokyo in JST"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("rewrite")
@@ -2124,7 +2124,7 @@ mod tests {
             let text = search
                 .execute(
                     queries.clone(),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("search")
@@ -2143,7 +2143,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "planted"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("read")
@@ -2167,7 +2167,7 @@ mod tests {
                     "priority": 2,
                     "body": "She works 10:00-19:00 JST."
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -2179,7 +2179,7 @@ mod tests {
         let output = read
             .execute(
                 serde_json::json!({"name": "alice-timezone"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read");
@@ -2209,7 +2209,7 @@ mod tests {
             write
                 .execute(
                     serde_json::json!({"name": name, "description": "d", "priority": given}),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .unwrap_or_else(|error| panic!("priority {given} must be accepted: {error}"));
@@ -2229,7 +2229,7 @@ mod tests {
             write
                 .execute(
                     serde_json::json!({"name": "bad", "description": "d", "priority": "high"}),
-                    crate::tools::ToolContext::detached(CancellationToken::new())
+                    crate::tools::ToolContext::for_test(CancellationToken::new())
                 )
                 .await
                 .is_err()
@@ -2247,7 +2247,7 @@ mod tests {
             let result = write
                 .execute(
                     serde_json::json!({"name": bad, "description": "x"}),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await;
             assert!(result.is_err(), "'{bad}' must be rejected");
@@ -2277,7 +2277,7 @@ mod tests {
             delete
                 .execute(
                     serde_json::json!({ "name": planted }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .unwrap_or_else(|error| panic!("'{planted}' must be removable: {error}"));
@@ -2294,7 +2294,7 @@ mod tests {
         let absent = delete
             .execute(
                 serde_json::json!({"name": "never-stored"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a name the store does not hold is still an error");
@@ -2321,7 +2321,7 @@ mod tests {
                     "priority": 3,
                     "body": "Hostname is nas.lan. The operator prefers ssh keys."
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -2333,7 +2333,7 @@ mod tests {
         let hit = search
             .execute(
                 serde_json::json!({"queries": ["preference"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search");
@@ -2362,7 +2362,7 @@ mod tests {
                 "description": "K4YT3X wants terse answers",
                 "body": "No preamble, no recap."
             }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -2376,7 +2376,7 @@ mod tests {
         let hit = search
             .execute(
                 serde_json::json!({"queries": ["verbosity", "terse", "brevity"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search");
@@ -2391,7 +2391,7 @@ mod tests {
         let hit = search
             .execute(
                 serde_json::json!({"queries": "terse"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search");
@@ -2419,7 +2419,7 @@ mod tests {
                         "name": format!("note-{index:02}"),
                         "description": format!("deployment note {index}"),
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("write");
@@ -2434,7 +2434,7 @@ mod tests {
         let capped = search
             .execute(
                 serde_json::json!({"queries": ["deployment"], "limit": 100}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search");
@@ -2452,7 +2452,7 @@ mod tests {
         let room = search
             .execute(
                 serde_json::json!({"queries": ["deployment"], "limit": 2}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search");
@@ -2480,14 +2480,14 @@ mod tests {
                     "description": "a very long note",
                     "body": "y".repeat(READ_BODY_MAX_CHARS * 2),
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
         write
             .execute(
                 serde_json::json!({"name": "terse", "description": "all of it is the description"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -2499,7 +2499,7 @@ mod tests {
         let long = read
             .execute(
                 serde_json::json!({"name": "enormous"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read")
@@ -2518,7 +2518,7 @@ mod tests {
         let empty = read
             .execute(
                 serde_json::json!({"name": "terse"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read")
@@ -2545,7 +2545,7 @@ mod tests {
                         "name": format!("note-{index:02}"),
                         "description": format!("deployment note {index}"),
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("write");
@@ -2557,7 +2557,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"queries": ["deployment"], "limit": 3}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("search");
@@ -2589,7 +2589,7 @@ mod tests {
                 "description": "alice works from Tokyo",
                 "body": "Ten to seven, JST."
             }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -2602,7 +2602,7 @@ mod tests {
         let exact = search
             .execute(
                 serde_json::json!({"queries": ["Tokyo"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search")
@@ -2614,7 +2614,7 @@ mod tests {
         let prefix = search
             .execute(
                 serde_json::json!({"queries": ["Tok"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search")
@@ -2626,7 +2626,7 @@ mod tests {
         let fuzzy = search
             .execute(
                 serde_json::json!({"queries": ["Tokoy"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search")
@@ -2638,7 +2638,7 @@ mod tests {
         let miss = search
             .execute(
                 serde_json::json!({"queries": ["xylophone"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search")
@@ -2658,7 +2658,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "alice-timezone", "description": "JST"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -2670,7 +2670,7 @@ mod tests {
         let error = read
             .execute(
                 serde_json::json!({"name": "alice-timezon"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("a misspelled name is still a miss");
@@ -2696,7 +2696,7 @@ mod tests {
                         "description": "deployment procedure",
                         "body": "Run the thing."
                     }),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("write");
@@ -2709,7 +2709,7 @@ mod tests {
         for _ in 0..5 {
             read.execute(
                 serde_json::json!({"name": "read-often"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("read");
@@ -2721,7 +2721,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"queries": ["deployment"], "limit": 1}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("search");
@@ -2748,7 +2748,7 @@ mod tests {
                     "name": "alice-timezone",
                     "description": "alice works from Tokyo in JST"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -2759,7 +2759,7 @@ mod tests {
                     "name": "alice-tz",
                     "description": "alice works from Tokyo in JST"
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("a duplicate must still be written");
@@ -2777,7 +2777,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "alice-tz"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("delete the duplicate");
@@ -2789,7 +2789,7 @@ mod tests {
                     "description": "alice works from Tokyo in JST",
                     "priority": 1
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("self-update");
@@ -2821,7 +2821,7 @@ mod tests {
                             "name": name,
                             "description": "Backups run nightly at 02:00 UTC"
                         }),
-                        crate::tools::ToolContext::detached(CancellationToken::new()),
+                        crate::tools::ToolContext::for_test(CancellationToken::new()),
                     )
                     .await
                     .expect("write")
@@ -2854,7 +2854,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "transient", "description": "a note"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -2864,7 +2864,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "transient"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("read");
@@ -2884,7 +2884,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "transient"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("delete");
@@ -2897,7 +2897,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "transient", "description": "a different note"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("rewrite");
@@ -2968,7 +2968,7 @@ mod tests {
                 "tags": ["deploy", "infra"],
                 "body": "Deploys go out on Fridays.",
             }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -2980,7 +2980,7 @@ mod tests {
             }
             .execute(
                 serde_json::json!({"queries": [query]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search")
@@ -3013,7 +3013,7 @@ mod tests {
                 "description": "office location note",
                 "body": "办公室在深圳南山区的科技园",
             }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -3025,7 +3025,7 @@ mod tests {
             }
             .execute(
                 serde_json::json!({"queries": [query]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search")
@@ -3064,7 +3064,7 @@ mod tests {
             }
             .execute(
                 serde_json::json!({"name": name, "description": description, "body": body}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -3076,7 +3076,7 @@ mod tests {
             }
             .execute(
                 serde_json::json!({"queries": queries}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("search")
@@ -3132,7 +3132,7 @@ mod tests {
                 "description": "a trip to Việt Nam",
                 "body": "Hà Nội in the spring",
             }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -3142,7 +3142,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"queries": ["viet"]}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("search")
@@ -3171,7 +3171,7 @@ mod tests {
                     "body": "nothing else",
                     "priority": 1,
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -3187,7 +3187,7 @@ mod tests {
                 "body": "地址在深圳",
                 "priority": 9,
             }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -3198,7 +3198,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"queries": ["Tokyo 深圳"], "limit": 10}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("search")
@@ -3228,7 +3228,7 @@ mod tests {
                     "name": format!("note-{index}"),
                     "description": "a deployment note",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -3241,7 +3241,7 @@ mod tests {
             let out = search
                 .execute(
                     serde_json::json!({"queries": ["deployment"], "limit": limit}),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect("search")
@@ -3261,7 +3261,7 @@ mod tests {
             let error = search
                 .execute(
                     serde_json::json!({"queries": ["deployment"], "limit": limit}),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect_err("a limit that is not a count is refused, not swapped for the default");
@@ -3287,7 +3287,7 @@ mod tests {
                     "tags": ["infra", "deploy"],
                     "body": "the detail",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -3300,7 +3300,7 @@ mod tests {
             write
                 .execute(
                     bad.clone(),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
                 )
                 .await
                 .expect_err("must refuse rather than silently clear");
@@ -3335,7 +3335,7 @@ mod tests {
                     "description": "a deployment note",
                     "body": "deployment ".repeat(70),
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -3346,7 +3346,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"queries": ["deployment"], "limit": MAX_SEARCH_LIMIT}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("search")
@@ -3382,7 +3382,7 @@ mod tests {
                 "description": format!("deployment {}", "a".repeat(60_000)),
                 "body": "b".repeat(200_000),
             }),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -3393,7 +3393,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"queries": ["deployment"]}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("search")
@@ -3418,7 +3418,7 @@ mod tests {
         write
             .execute(
                 serde_json::json!({"name":"paged", "description":"long note", "body":body}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -3429,7 +3429,7 @@ mod tests {
         let first = read
             .execute(
                 serde_json::json!({"name":"paged"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("first page")
@@ -3439,7 +3439,7 @@ mod tests {
         let last = read
             .execute(
                 serde_json::json!({"name":"paged", "offset":READ_BODY_MAX_CHARS}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("last page")
@@ -3463,7 +3463,7 @@ mod tests {
             assert!(
                 read.execute(
                     serde_json::json!({"name":"paged", "offset":offset}),
-                    crate::tools::ToolContext::detached(CancellationToken::new())
+                    crate::tools::ToolContext::for_test(CancellationToken::new())
                 )
                 .await
                 .is_err()
@@ -3494,7 +3494,7 @@ mod tests {
             memories: memories.clone(),
             project: Default::default(),
         };
-        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let context = || crate::tools::ToolContext::for_test(CancellationToken::new());
         write
             .execute(
                 serde_json::json!({"name": "alice-timezone", "description": "Alice is in Lisbon"}),
@@ -3626,7 +3626,7 @@ mod tests {
             memories: memories.clone(),
             project: Default::default(),
         };
-        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let context = || crate::tools::ToolContext::for_test(CancellationToken::new());
         let long = "word ".repeat(50).trim().to_string();
         let saved = write
             .execute(
@@ -3746,7 +3746,7 @@ mod tests {
             memories: memories.clone(),
             project: Default::default(),
         };
-        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let context = || crate::tools::ToolContext::for_test(CancellationToken::new());
         write
             .execute(
                 serde_json::json!({
@@ -3884,7 +3884,7 @@ mod tests {
             memories: memories.clone(),
             project: Default::default(),
         };
-        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let context = || crate::tools::ToolContext::for_test(CancellationToken::new());
         for (name, extra) in [
             (
                 "a",
@@ -3996,7 +3996,7 @@ mod tests {
             memories: memories.clone(),
             project: Default::default(),
         };
-        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let context = || crate::tools::ToolContext::for_test(CancellationToken::new());
         write
             .execute(
                 serde_json::json!({"name": "hub", "description": "the hub"}),
@@ -4046,7 +4046,7 @@ mod tests {
             memories: memories.clone(),
             project: Default::default(),
         };
-        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let context = || crate::tools::ToolContext::for_test(CancellationToken::new());
         write
             .execute(
                 serde_json::json!({"name": "hub", "description": "the hub"}),
@@ -4095,7 +4095,7 @@ mod tests {
             memories: memories.clone(),
             project: Default::default(),
         };
-        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let context = || crate::tools::ToolContext::for_test(CancellationToken::new());
         let schema = write.definition().parameters;
         let load = schema["properties"]["load"]["description"]
             .as_str()
@@ -4222,7 +4222,7 @@ mod tests {
                 write
                     .execute(
                         input,
-                        crate::tools::ToolContext::detached(CancellationToken::new()),
+                        crate::tools::ToolContext::for_test(CancellationToken::new()),
                     )
                     .await
             }
@@ -4290,7 +4290,7 @@ mod tests {
         let refused = no_project
             .execute(
                 serde_json::json!({"name": "x", "description": "d", "tier": "project"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect_err("no project to name");
@@ -4304,7 +4304,7 @@ mod tests {
         no_project
             .execute(
                 serde_json::json!({"name": "plain", "description": "d"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -4335,7 +4335,7 @@ mod tests {
                 MemorySearchTool { memories, project }
                     .execute(
                         input,
-                        crate::tools::ToolContext::detached(CancellationToken::new()),
+                        crate::tools::ToolContext::for_test(CancellationToken::new()),
                     )
                     .await
                     .map(|output| output.text_content())
@@ -4423,7 +4423,7 @@ mod tests {
                     "name": "pipeline",
                     "description": "the deploy pipeline runs nightly at two",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -4440,7 +4440,7 @@ mod tests {
                     "name": "pipeline-again",
                     "description": "the deploy pipeline runs nightly at two",
                 }),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -4457,7 +4457,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "pipeline"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect("read");
@@ -4472,7 +4472,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "elsewhere"}),
-            crate::tools::ToolContext::detached(CancellationToken::new()),
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
         )
         .await
         .expect_err("another project's memory is unknown here");
