@@ -5,7 +5,7 @@ A general-purpose AI agent harness.
 > [!IMPORTANT]
 > meka is opinionated software and does not keep a stable interface. It favors the better design over compatibility, so anything may change between releases. Read the changelog before upgrading.
 
-![meka Screenshot](https://github.com/user-attachments/assets/287e5609-97f8-4a23-837c-6f97e67f3b5a)
+![meka Screenshot](assets/screenshot.webp)
 
 ## Features
 
