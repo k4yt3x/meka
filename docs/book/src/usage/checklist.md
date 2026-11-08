@@ -39,10 +39,12 @@ because it is hard or tedious; the tool descriptions and the nudge both say so, 
 recorded. A deferred item stays deferred until the agent or you pick it up again: meka does not
 guess when a person has answered. The one case it can see is a background task. An item deferred
 with the `task` it waits on reopens once the task's outcome has been reported, however the task
-ended; the report arrives as a turn of its own, and that turn cannot end without the agent
-finishing, canceling or re-deferring the item. A task that has exited but not yet reported holds
-nothing, so the turn that deferred on it ends normally even when the task ended under it, and
-the report's turn is the one held.
+ended. The report lands as a turn of its own, or at the next round boundary of a turn that is
+running (see [Background tasks](./background.md)), and from then on the turn cannot end without
+the agent finishing, canceling or re-deferring the item; every list the agent reads shows the item
+open again, with how the task ended and the reason it was deferred for. A task that has exited but
+not yet reported holds nothing: a turn that ends before the report lands ends normally, and the
+turn the report lands in is the one held.
 
 A task that has already reported cannot be waited on: `checklist_edit` refuses a deferral that
 names one, or that would keep one from an earlier deferral, because the item would be open the

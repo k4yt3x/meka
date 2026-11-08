@@ -1356,13 +1356,19 @@ impl ToolRegistry {
         }
         self.register_builtin(Arc::new(checklist::ChecklistAddTool {
             checklist: checklist.clone(),
+            store: store.clone(),
+            site: site.clone(),
         }));
         self.register_builtin(Arc::new(checklist::ChecklistEditTool {
             checklist: checklist.clone(),
             store: store.clone(),
             site: site.clone(),
         }));
-        self.register_builtin(Arc::new(checklist::ChecklistReadTool { checklist }));
+        self.register_builtin(Arc::new(checklist::ChecklistReadTool {
+            checklist,
+            store: store.clone(),
+            site: site.clone(),
+        }));
         self.register_builtin(Arc::new(scratchpad::ScratchpadWriteTool {
             store: store.clone(),
             inherited_names: inherited_scratchpad_names.clone(),

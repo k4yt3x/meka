@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.90.1] - 2026-11-08
+
+### Fixed
+
+- `checklist_read` and every checklist result show an item open again once its task has reported.
+
 ## [0.90.0] - 2026-11-07
 
 ### Added
@@ -3181,7 +3187,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.90.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.90.1...HEAD
+[0.90.1]: https://github.com/k4yt3x/meka/compare/0.90.0...0.90.1
 [0.90.0]: https://github.com/k4yt3x/meka/compare/0.89.0...0.90.0
 [0.89.0]: https://github.com/k4yt3x/meka/compare/0.88.3...0.89.0
 [0.88.3]: https://github.com/k4yt3x/meka/compare/0.88.2...0.88.3

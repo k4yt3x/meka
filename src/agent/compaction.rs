@@ -865,6 +865,8 @@ impl Agent {
         // The summary shows the list as it stands, from the cell; the boundary above carries it
         // as it stood before the tail.
         let live_checklist = self.cells.checklist.get();
+        let reported =
+            crate::tools::checklist::reported_tasks(&self.store, session_id, &live_checklist).await;
 
         let mut context_message = format!("{COMPACTION_SUMMARY_PREFIX}\n\n{summary_text}");
         // Before the request section, so the message reads in the order things happened: what was
@@ -893,7 +895,7 @@ impl Agent {
         if !live_checklist.items.is_empty() {
             context_message.push_str(&format!(
                 "\n\n[Checklist]\n\n{}",
-                crate::checklist::format_checklist(&live_checklist).trim_end()
+                crate::checklist::format_checklist(&live_checklist, &reported).trim_end()
             ));
         }
         if !post_context.is_empty() {
@@ -2595,6 +2597,106 @@ mod tests {
             !the_summary_message(&messages).contains("[Checklist]"),
             "{}",
             the_summary_message(&messages)
+        );
+    }
+
+    /// The summary's copy is a list the model reads like any other, so an item deferred on a task
+    /// that has reported is copied open again, as the turn's end holds it.
+    #[tokio::test]
+    async fn a_compaction_copies_an_item_whose_task_has_reported_as_open_again() {
+        use crate::store::background::{BackgroundTask, TaskStatus};
+
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::from_rounds(vec![text_round("the summary")]));
+        let (agent, store) = agent_with_checkpoint(provider, false).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("a session");
+        agent.cells().session_id.set(session_id);
+        let task_id = "1a2b3c4d-0000-4000-8000-000000000000";
+        store
+            .background_store()
+            .start_background_task(&BackgroundTask {
+                id: task_id.to_string(),
+                session_id,
+                tool: "shell_execute".to_string(),
+                label: "make".to_string(),
+                status: TaskStatus::Running,
+                outcome: None,
+                scratchpad_entry: None,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                announced_at: None,
+                delivered_at: None,
+                subagent_id: None,
+            })
+            .await
+            .expect("a task");
+        let mut messages = a_turn_in_progress("a request that has been answered", 6);
+        for (id, name, input) in [
+            (
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["read the build log"]}),
+            ),
+            (
+                "edit-1",
+                "checklist_edit",
+                serde_json::json!({
+                    "id": 1, "status": "deferred", "reason": "building", "task": "1a2b3c4d"
+                }),
+            ),
+        ] {
+            messages.append(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input,
+                }],
+            });
+            messages.append(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    content: vec![crate::conversation::ToolResultContent::Text {
+                        text: "ok".to_string(),
+                    }],
+                    is_error: false,
+                    display: None,
+                }],
+            });
+        }
+        messages.append(Message::assistant_text("done"));
+        agent.hydrate_checklist(&messages).await;
+        store
+            .background_store()
+            .finish_background_task(task_id, TaskStatus::Completed, None, None)
+            .await
+            .expect("the task ends");
+        store
+            .background_store()
+            .mark_background_tasks_delivered(&[task_id.to_string()])
+            .await
+            .expect("the task reports");
+
+        agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Reactive),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("compaction");
+
+        let summary = the_summary_message(&messages);
+        assert!(
+            summary.contains(
+                "[Checklist]\n\n- 1 (task 1a2b3c4d finished, so this item is open again; was \
+                 deferred: building): read the build log"
+            ),
+            "{summary}"
         );
     }
 

@@ -1387,15 +1387,12 @@ pub(crate) fn render_checklist_nudge(
     state: &crate::checklist::ChecklistState,
     reported: &[crate::checklist::ReportedTask],
 ) -> String {
-    use crate::checklist::{format_item, format_reopened_item, is_open, reported_task};
+    use crate::checklist::{format_item, is_open};
 
     let mut text =
         String::from("[Checklist: items are still open, so this turn is not over.]\n\nOpen:\n");
     for item in state.open_items(reported) {
-        text.push_str(&match reported_task(item, reported) {
-            Some(task) => format_reopened_item(item, task),
-            None => format_item(item),
-        });
+        text.push_str(&format_item(item, reported));
         text.push('\n');
     }
     let waiting: Vec<&crate::checklist::ChecklistItem> = state
@@ -1406,7 +1403,7 @@ pub(crate) fn render_checklist_nudge(
     if !waiting.is_empty() {
         text.push_str("\nDeferred, for reference:\n");
         for item in waiting {
-            text.push_str(&format_item(item));
+            text.push_str(&format_item(item, reported));
             text.push('\n');
         }
     }

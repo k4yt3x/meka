@@ -1436,7 +1436,7 @@ mod tests {
     async fn a_round_reports_the_duration_of_each_call_in_dispatch_order() {
         use crate::provider::mock::MockProvider;
 
-        let (agent, _store) = agent_with_registry_for_test(
+        let (agent, store) = agent_with_registry_for_test(
             Arc::new(MockProvider::from_rounds(vec![])),
             crate::tools::ToolRegistry::new(),
         )
@@ -1445,6 +1445,8 @@ mod tests {
             .tool_registry
             .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
                 checklist: agent.cells.checklist.clone(),
+                store: store.clone(),
+                site: agent.cells.site(),
             }))
             .expect("register");
         let message = Message {
@@ -1517,6 +1519,8 @@ mod tests {
             .tool_registry
             .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
                 checklist: agent.cells.checklist.clone(),
+                store: store.clone(),
+                site: agent.cells.site(),
             }))
             .expect("registration");
         agent
@@ -1617,7 +1621,7 @@ mod tests {
             }
         }
 
-        let (agent, _store) = agent_with_registry_for_test(
+        let (agent, store) = agent_with_registry_for_test(
             Arc::new(MockProvider::from_rounds(vec![])),
             crate::tools::ToolRegistry::new(),
         )
@@ -1649,6 +1653,8 @@ mod tests {
             .tool_registry
             .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
                 checklist: agent.cells.checklist.clone(),
+                store: store.clone(),
+                site: agent.cells.site(),
             }))
             .expect("registration");
         let calls = Message {
@@ -1721,7 +1727,7 @@ mod tests {
     async fn an_unchanged_checklist_is_not_re_announced_and_an_emptied_one_is() {
         use crate::provider::mock::MockProvider;
 
-        let (mut agent, _store) = agent_with_registry_for_test(
+        let (mut agent, store) = agent_with_registry_for_test(
             Arc::new(MockProvider::from_rounds(vec![])),
             crate::tools::ToolRegistry::new(),
         )
@@ -1730,19 +1736,23 @@ mod tests {
             .tool_registry
             .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
                 checklist: agent.cells.checklist.clone(),
+                store: store.clone(),
+                site: agent.cells.site(),
             }))
             .expect("registration");
         agent
             .tool_registry
             .register(Arc::new(crate::tools::checklist::ChecklistReadTool {
                 checklist: agent.cells.checklist.clone(),
+                store: store.clone(),
+                site: agent.cells.site(),
             }))
             .expect("registration");
         agent
             .tool_registry
             .register(Arc::new(crate::tools::checklist::ChecklistEditTool {
                 checklist: agent.cells.checklist.clone(),
-                store: _store.clone(),
+                store: store.clone(),
                 site: crate::session::ToolSite::for_test(),
             }))
             .expect("registration");

@@ -245,10 +245,10 @@ impl Default for ChecklistState {
     }
 }
 
-/// A background task whose outcome the model has been given, as the turn loop and the display
-/// hand it to [`is_open`]: the id and how it ended, in the words the report led with. A task that
-/// has merely exited is not one of these: its report arrives as a turn of its own, and until then
-/// the model has nothing to act on, so an item deferred on it keeps waiting.
+/// A background task whose outcome the model has been given, as [`is_open`] and [`format_item`]
+/// take it: the id and how it ended, in the words the report led with. A task that has merely
+/// exited is not one of these: until its report lands, at a round boundary of a running turn or as
+/// a turn of its own, the model has nothing to act on, so an item deferred on it keeps waiting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReportedTask {
     pub(crate) id: String,
@@ -706,56 +706,46 @@ impl SharedChecklist {
 }
 
 /// One item as a line: the id, a tag in parentheses with the state in the word `checklist_edit`
-/// takes and what a deferred item waits on, then the text. Plain text for the model alone, in the
-/// tool echo, the nudge and the compaction copy; the terminal rendering is
-/// `render::render_checklist`. The tag stands between the id and the text so what meka says
-/// about the item comes ahead of the words the model wrote, which may say anything, and the id is
-/// delimited whatever the text opens with.
-pub(crate) fn format_item(item: &ChecklistItem) -> String {
+/// takes and what a deferred item waits on, then the text. An item deferred on a task in
+/// `reported` is tagged open again, with how the task ended and the reason it was deferred for,
+/// because [`is_open`] holds the turn to it. Plain text for the model alone, in the tool echo, the
+/// nudge and the compaction copy, so every list the model reads shows the item as the turn's end
+/// holds it; the terminal rendering is `render::render_checklist`. The tag stands between the id
+/// and the text so what meka says about the item comes ahead of the words the model wrote, which
+/// may say anything, and the id is delimited whatever the text opens with.
+pub(crate) fn format_item(item: &ChecklistItem, reported: &[ReportedTask]) -> String {
     let tag = match item.status {
         ChecklistStatus::Pending | ChecklistStatus::InProgress => item.status.name().to_string(),
-        ChecklistStatus::Deferred => match &item.task {
-            Some(task) => format!(
+        ChecklistStatus::Deferred => match (reported_task(item, reported), &item.task) {
+            (Some(task), _) => format!(
+                "task {} {}, so this item is open again; was deferred: {}",
+                short_task_id(&task.id),
+                task.ended,
+                reason_of(item)
+            ),
+            (None, Some(task)) => format!(
                 "deferred until task {} reports: {}",
                 short_task_id(task),
                 reason_of(item)
             ),
-            None => format!("deferred: {}", reason_of(item)),
+            (None, None) => format!("deferred: {}", reason_of(item)),
         },
     };
-    tagged_line(item, &tag)
-}
-
-/// [`format_item`] for an item whose task has reported, as the nudge lists it: the tag says what
-/// reopened it and keeps the reason it was deferred for, ahead of the text like any other tag.
-pub(crate) fn format_reopened_item(item: &ChecklistItem, task: &ReportedTask) -> String {
-    tagged_line(
-        item,
-        &format!(
-            "task {} {}, so this item is open again; was deferred: {}",
-            short_task_id(&task.id),
-            task.ended,
-            reason_of(item)
-        ),
-    )
+    format!("- {} ({tag}): {}", item.id, item.text)
 }
 
 fn reason_of(item: &ChecklistItem) -> &str {
     item.reason.as_deref().unwrap_or_default()
 }
 
-fn tagged_line(item: &ChecklistItem, tag: &str) -> String {
-    format!("- {} ({tag}): {}", item.id, item.text)
-}
-
-/// The whole list as plain text, one line per item.
-pub(crate) fn format_checklist(state: &ChecklistState) -> String {
+/// The whole list as plain text, one [`format_item`] line per item.
+pub(crate) fn format_checklist(state: &ChecklistState, reported: &[ReportedTask]) -> String {
     if state.items.is_empty() {
         return "(no open items)\n".to_string();
     }
     let mut output = String::new();
     for item in &state.items {
-        output.push_str(&format_item(item));
+        output.push_str(&format_item(item, reported));
         output.push('\n');
     }
     output
@@ -1128,13 +1118,13 @@ mod tests {
         state.edit(edit).expect("defers");
         assert_eq!(state.items[0].reason.as_deref(), Some("waiting on Sam"));
         assert_eq!(state.items[0].text, "ask    Sam");
-        assert_eq!(format_checklist(&state).lines().count(), 1);
+        assert_eq!(format_checklist(&state, &[]).lines().count(), 1);
     }
 
     #[test]
     fn the_plain_rendering_names_what_each_item_waits_on() {
         let mut state = ChecklistState::default();
-        assert_eq!(format_checklist(&state), "(no open items)\n");
+        assert_eq!(format_checklist(&state, &[]), "(no open items)\n");
         state.add(items(&["a", "b", "c", "d"]));
         state
             .edit(edit(2, StatusWord::InProgress))
@@ -1146,21 +1136,23 @@ mod tests {
         on_task.task = Some("1a2b3c4d".to_string());
         state.edit(on_task).expect("deferred on a task");
         assert_eq!(
-            format_checklist(&state),
+            format_checklist(&state, &[]),
             "- 1 (pending): a\n- 2 (in_progress): b\n- 3 (deferred: waiting on Sam): c\n\
              - 4 (deferred until task 1a2b3c4d reports: building): d\n"
         );
-        let reported = ReportedTask {
+        let reported = [ReportedTask {
             id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
             ended: "finished",
-        };
+        }];
         assert_eq!(
-            format_reopened_item(&state.items[3], &reported),
-            "- 4 (task 1a2b3c4d finished, so this item is open again; was deferred: building): d"
+            format_checklist(&state, &reported),
+            "- 1 (pending): a\n- 2 (in_progress): b\n- 3 (deferred: waiting on Sam): c\n\
+             - 4 (task 1a2b3c4d finished, so this item is open again; was deferred: building): d\n",
+            "an item whose task has reported is shown open, as the turn's end holds it"
         );
         state.items[3].task = Some("1a2b3c4d-0000-4000-8000-000000000000".to_string());
         assert!(
-            format_item(&state.items[3])
+            format_item(&state.items[3], &[])
                 == "- 4 (deferred until task 1a2b3c4d reports: building): d",
             "a task named in full is shown by the prefix task_list shows"
         );

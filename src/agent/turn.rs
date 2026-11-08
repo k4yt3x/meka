@@ -2004,7 +2004,8 @@ impl Agent {
             // the items where they are, and the notice says so.
             if !has_tool_calls {
                 let state = self.cells.checklist.get();
-                let reported = self.reported_tasks(session_id, &state).await;
+                let reported =
+                    crate::tools::checklist::reported_tasks(&self.store, session_id, &state).await;
                 let open = state.open_items(&reported).len();
                 if should_nudge_checklist(
                     has_tool_calls,
@@ -2185,42 +2186,6 @@ impl Agent {
             Vec::new()
         };
         Arrivals::new(items, outcomes)
-    }
-
-    /// The session's background tasks whose outcome the model has been given, for the checklist's
-    /// rule on items deferred on one. Delivery is the fact, not exit: a task that ended while the
-    /// deferring turn was still running has told the model nothing, and reopening the item then
-    /// would have the model close it on the nudge's word rather than on the result, which arrives
-    /// as a turn of its own and is stamped delivered before that turn starts. Read only when an
-    /// item names a task, so a session that never defers on one never pays the query; a failed
-    /// read leaves such items deferred, which is the safe side.
-    async fn reported_tasks(
-        &self,
-        session_id: Uuid,
-        state: &crate::checklist::ChecklistState,
-    ) -> Vec<crate::checklist::ReportedTask> {
-        if !state.items.iter().any(|item| item.task.is_some()) {
-            return Vec::new();
-        }
-        match self
-            .store
-            .background_store()
-            .list_background_tasks(session_id)
-            .await
-        {
-            Ok(tasks) => tasks
-                .into_iter()
-                .filter(|task| task.status.is_terminal() && task.delivered_at.is_some())
-                .map(|task| crate::checklist::ReportedTask {
-                    id: task.id,
-                    ended: task.status.headline(),
-                })
-                .collect(),
-            Err(error) => {
-                tracing::warn!("failed to read the background tasks for the checklist: {error}");
-                Vec::new()
-            }
-        }
     }
 
     /// The tools the model has loaded in `events`, and the set a request carries for them, both
@@ -11642,6 +11607,8 @@ mod tests {
             .tool_registry
             .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
                 checklist: checklist.clone(),
+                store: store.clone(),
+                site: agent.cells.site(),
             }))
             .expect("register");
         agent
@@ -11656,6 +11623,8 @@ mod tests {
             .tool_registry
             .register(Arc::new(crate::tools::checklist::ChecklistReadTool {
                 checklist,
+                store: store.clone(),
+                site: agent.cells.site(),
             }))
             .expect("register");
     }
@@ -12124,6 +12093,93 @@ mod tests {
             "the ended task reopened the item: {:?}",
             messages.as_slice()
         );
+        assert!(agent.cells.checklist.get().items.is_empty());
+    }
+
+    /// The list the model reads is the one the turn's end holds it to. In the turn that reports
+    /// the task, `checklist_read` and the list an add or an edit echoes show the item open again,
+    /// as the nudge would; before the report, an exited task still holds it, and the deferral's
+    /// echo says so.
+    #[tokio::test]
+    async fn a_report_turn_reads_the_item_deferred_on_its_task_as_open_again() {
+        use crate::{provider::mock::MockStopReason, store::background::TaskStatus};
+
+        let (agent, store, session_id, _frontend) = checklist_agent_with_session(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["read the build log"]}),
+            ),
+            defer_round("edit-1", 1, "1a2b3c4d"),
+            answer_round("Build started.", MockStopReason::EndTurn),
+            checklist_call_round("read-1", "checklist_read", serde_json::json!({})),
+            checklist_call_round(
+                "add-2",
+                "checklist_add",
+                serde_json::json!({"items": ["tell Sam"]}),
+            ),
+            checklist_call_round(
+                "edit-2",
+                "checklist_edit",
+                serde_json::json!({"id": 2, "status": "in_progress"}),
+            ),
+            complete_round("edit-3", 1),
+            complete_round("edit-4", 2),
+            answer_round("Read it.", MockStopReason::EndTurn),
+        ])
+        .await;
+        start_running_task(&store, session_id, TASK_A).await;
+        store
+            .background_store()
+            .finish_background_task(TASK_A, TaskStatus::Completed, None, None)
+            .await
+            .expect("the task exits ahead of the deferral");
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("build and read".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the deferring turn ends");
+        let task = claim_task(&store, TASK_A).await;
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::outcomes(vec![task]),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the reporting turn ends");
+
+        let result = |call: &str| {
+            messages
+                .as_slice()
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } if tool_use_id == call => match content.first() {
+                        Some(ToolResultContent::Text { text }) => Some(text.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("a result for {call}"))
+        };
+        let waiting = "- 1 (deferred until task 1a2b3c4d reports: building): read the build log";
+        assert!(result("edit-1").contains(waiting), "{}", result("edit-1"));
+        let reopened = "- 1 (task 1a2b3c4d finished, so this item is open again; was deferred: \
+                        building): read the build log";
+        for call in ["read-1", "add-2", "edit-2"] {
+            assert!(result(call).contains(reopened), "{call}: {}", result(call));
+        }
+        assert_eq!(nudges_in(&messages), 0, "{:?}", messages.as_slice());
         assert!(agent.cells.checklist.get().items.is_empty());
     }
 

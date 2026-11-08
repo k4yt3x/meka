@@ -6,17 +6,19 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use super::{Tool, ToolOutput, util::resolve_session_id};
 use crate::{
     checklist::{
         ADD_TOOL_NAME, ChecklistState, EDIT_TOOL_NAME, EditOutcome, ItemEdit, NewItem,
-        READ_TOOL_NAME, SharedChecklist, format_checklist, parse_add, parse_edit,
+        READ_TOOL_NAME, ReportedTask, SharedChecklist, format_checklist, parse_add, parse_edit,
     },
     conversation::{ContentBlock, Conversation},
     error::Result,
     permission::Permission,
     provider::ToolDefinition,
+    session::ToolSite,
     store::Store,
 };
 
@@ -52,13 +54,64 @@ const RULE: &str = "A turn cannot end while an item is pending or in progress: f
                     waits on a person, an event or an explicit later, never because it is hard or \
                     tedious. Reasons are recorded. Completed and canceled items leave the list.";
 
-/// The result every member returns, with what the call did ahead of the list.
-fn echo(did: &str, state: &ChecklistState) -> ToolOutput {
-    ToolOutput::text(format!("{did}\n\n{}", format_checklist(state)), false)
+/// The session's background tasks whose outcome the model has been given, for the checklist's
+/// rule on items deferred on one: what the turn's end holds the model to, and what every list it
+/// reads shows. Delivery is the fact, not exit: a task that has ended but not reported has told
+/// the model nothing, and reopening the item then would have the model close it on the nudge's
+/// word rather than on the result. A report is stamped delivered when it is claimed for the
+/// conversation, at a round boundary of a running turn or ahead of a turn of its own. Read only
+/// when an item names a task, so a session that never defers on one never pays the query; a
+/// failed read leaves such items deferred, which is the safe side.
+pub(crate) async fn reported_tasks(
+    store: &Store,
+    session_id: Uuid,
+    state: &ChecklistState,
+) -> Vec<ReportedTask> {
+    if !state.items.iter().any(|item| item.task.is_some()) {
+        return Vec::new();
+    }
+    match store
+        .background_store()
+        .list_background_tasks(session_id)
+        .await
+    {
+        Ok(tasks) => tasks
+            .into_iter()
+            .filter(|task| task.status.is_terminal() && task.delivered_at.is_some())
+            .map(|task| ReportedTask {
+                id: task.id,
+                ended: task.status.headline(),
+            })
+            .collect(),
+        Err(error) => {
+            tracing::warn!("failed to read the background tasks for the checklist: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// The list as every member returns it, each item shown as the turn's end holds it.
+async fn listing(store: &Store, site: &ToolSite, state: &ChecklistState) -> String {
+    let reported = match site.session_id.get() {
+        Some(session_id) => reported_tasks(store, session_id, state).await,
+        // A task is recorded for a session, so outside one none has reported.
+        None => Vec::new(),
+    };
+    format_checklist(state, &reported)
+}
+
+/// The result an add or an edit returns, with what the call did ahead of the list.
+async fn echo(did: &str, store: &Store, site: &ToolSite, state: &ChecklistState) -> ToolOutput {
+    ToolOutput::text(
+        format!("{did}\n\n{}", listing(store, site, state).await),
+        false,
+    )
 }
 
 pub(crate) struct ChecklistAddTool {
     pub(crate) checklist: SharedChecklist,
+    pub(crate) store: Store,
+    pub(crate) site: ToolSite,
 }
 
 #[async_trait]
@@ -127,22 +180,28 @@ impl Tool for ChecklistAddTool {
                 ));
             }
         };
-        Ok(self.checklist.update(|state| {
-            let ids = state.add(items);
-            let ids = ids
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            echo(&format!("Added with ids {ids}."), state)
-        }))
+        let (ids, state) = self
+            .checklist
+            .update(|state| (state.add(items), state.clone()));
+        let ids = ids
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(echo(
+            &format!("Added with ids {ids}."),
+            &self.store,
+            &self.site,
+            &state,
+        )
+        .await)
     }
 }
 
 pub(crate) struct ChecklistEditTool {
     pub(crate) checklist: SharedChecklist,
     pub(crate) store: Store,
-    pub(crate) site: crate::session::ToolSite,
+    pub(crate) site: ToolSite,
 }
 
 #[async_trait]
@@ -257,18 +316,27 @@ impl Tool for ChecklistEditTool {
                 Some(_) => {}
             }
         }
-        Ok(self.checklist.update(|state| match state.edit(edit) {
-            Ok(EditOutcome::Kept(status)) => {
-                echo(&format!("Item {id} is {}.", status.name()), state)
+        let edited = self
+            .checklist
+            .update(|state| state.edit(edit).map(|outcome| (outcome, state.clone())));
+        let (outcome, state) = match edited {
+            Ok(edited) => edited,
+            Err(error) => {
+                return Ok(ToolOutput::text(format!("{EDIT_TOOL_NAME}: {error}"), true));
             }
-            Ok(EditOutcome::Removed(word)) => echo(&format!("Item {id} {}.", word.name()), state),
-            Err(error) => ToolOutput::text(format!("{EDIT_TOOL_NAME}: {error}"), true),
-        }))
+        };
+        let did = match outcome {
+            EditOutcome::Kept(status) => format!("Item {id} is {}.", status.name()),
+            EditOutcome::Removed(word) => format!("Item {id} {}.", word.name()),
+        };
+        Ok(echo(&did, &self.store, &self.site, &state).await)
     }
 }
 
 pub(crate) struct ChecklistReadTool {
     pub(crate) checklist: SharedChecklist,
+    pub(crate) store: Store,
+    pub(crate) site: ToolSite,
 }
 
 #[async_trait]
@@ -313,7 +381,7 @@ impl Tool for ChecklistReadTool {
             ));
         }
         Ok(ToolOutput::text(
-            format_checklist(&self.checklist.get()),
+            listing(&self.store, &self.site, &self.checklist.get()).await,
             false,
         ))
     }
@@ -411,14 +479,23 @@ mod tests {
         list: SharedChecklist,
     }
 
-    fn family() -> Family {
+    /// The add and the read over one list, outside any session.
+    async fn family() -> Family {
+        family_on(Store::for_test().await, ToolSite::for_test())
+    }
+
+    fn family_on(store: Store, site: ToolSite) -> Family {
         let list = SharedChecklist::default();
         Family {
             add: ChecklistAddTool {
                 checklist: list.clone(),
+                store: store.clone(),
+                site: site.clone(),
             },
             read: ChecklistReadTool {
                 checklist: list.clone(),
+                store,
+                site,
             },
             list,
         }
@@ -427,7 +504,7 @@ mod tests {
     async fn edit_tool(list: &SharedChecklist) -> ChecklistEditTool {
         // A session to resolve a task against; it has no tasks, which is the point of the one
         // test that names one.
-        let site = crate::session::ToolSite::for_test();
+        let site = ToolSite::for_test();
         site.session_id.set(uuid::Uuid::new_v4());
         ChecklistEditTool {
             checklist: list.clone(),
@@ -447,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_takes_no_arguments() {
-        let family = family();
+        let family = family().await;
         let result = call(&family.read, serde_json::json!({})).await;
         assert!(!result.is_error);
         assert!(result.text_content().contains("(no open items)"));
@@ -459,7 +536,7 @@ mod tests {
     /// would refuse a call that carries it unless each input names it.
     #[tokio::test]
     async fn the_universal_scratchpad_parameter_is_accepted() {
-        let family = family();
+        let family = family().await;
         let result = call(
             &family.add,
             serde_json::json!({ "items": ["One"], "scratchpad": "plan" }),
@@ -473,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_add_appends_and_answers_with_the_ids() {
-        let family = family();
+        let family = family().await;
         let result = call(
             &family.add,
             serde_json::json!({ "items": ["First", {"text": "Second", "status": "in_progress"}] }),
@@ -506,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_edit_moves_one_item_and_refuses_a_bad_one_whole() {
-        let family = family();
+        let family = family().await;
         let edit = edit_tool(&family.list).await;
         call(&family.add, serde_json::json!({ "items": ["A", "B"] })).await;
 
@@ -550,7 +627,7 @@ mod tests {
     /// reach; the replay trusts that check through the result's error flag.
     #[tokio::test]
     async fn a_deferral_on_an_unknown_task_is_refused() {
-        let family = family();
+        let family = family().await;
         let edit = edit_tool(&family.list).await;
         call(&family.add, serde_json::json!({ "items": ["A"] })).await;
         let refused = call(
@@ -576,14 +653,14 @@ mod tests {
     async fn a_deferral_on_a_task_that_has_already_reported_is_refused() {
         use crate::store::background::{BackgroundTask, TaskStatus};
 
-        let family = family();
         let store = Store::for_test().await;
         let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("a session");
-        let site = crate::session::ToolSite::for_test();
+        let site = ToolSite::for_test();
         site.session_id.set(session_id);
+        let family = family_on(store.clone(), site.clone());
         let edit = ChecklistEditTool {
             checklist: family.list.clone(),
             store: store.clone(),
@@ -676,21 +753,14 @@ mod tests {
 
     /// Each tool tells the model what it is for, names its parameters with the `scratchpad` every
     /// tool takes, and repeats the rule the turn is held to.
-    #[test]
-    fn every_member_describes_itself_and_its_parameters() {
-        let family = family();
-        let store_free_edit = ChecklistEditTool {
-            checklist: family.list.clone(),
-            store: {
-                let runtime = tokio::runtime::Runtime::new().expect("a runtime");
-                runtime.block_on(Store::for_test())
-            },
-            site: crate::session::ToolSite::for_test(),
-        };
+    #[tokio::test]
+    async fn every_member_describes_itself_and_its_parameters() {
+        let family = family().await;
+        let edit = edit_tool(&family.list).await;
         let definitions = [
             (family.add.definition(), &["items", "scratchpad"][..]),
             (
-                store_free_edit.definition(),
+                edit.definition(),
                 &["id", "status", "reason", "task", "text", "scratchpad"][..],
             ),
             (family.read.definition(), &["scratchpad"][..]),
@@ -711,7 +781,7 @@ mod tests {
         }
         assert!(
             family.add.definition().description.contains(RULE)
-                && store_free_edit.definition().description.contains(RULE),
+                && edit.definition().description.contains(RULE),
             "the rule rides every tool that changes the list"
         );
     }
