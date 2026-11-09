@@ -12,7 +12,7 @@ use crate::{
 /// `ResourceNotFound` (`-32002`) is the protocol's way for a client to say it will not serve a
 /// path. Which paths those are is the client's business and differs between editors -- Zed answers
 /// it for anything outside the project it has open, another client may serve any absolute path --
-/// which is exactly why meka asks per path instead of modeling any editor's rule. Every other
+/// which is exactly why Meka asks per path instead of modeling any editor's rule. Every other
 /// code (transport, timeout, an internal error inside the client) leaves open the possibility that
 /// the client owns the file and holds unsaved changes for it, so it must not route around it.
 pub(super) fn classify_fs_error(
@@ -79,10 +79,10 @@ impl SharedClientState {
             .is_some_and(|session| session.notices.is_some())
     }
 
-    /// Whether the client renders agent-owned terminals from meka's `_meta` frames.
+    /// Whether the client renders agent-owned terminals from Meka's `_meta` frames.
     ///
     /// Deliberately not the typed `terminal` capability: that one says the client implements
-    /// `terminal/*` so an agent can run commands *in the client*, which meka never does. A client
+    /// `terminal/*` so an agent can run commands *in the client*, which Meka never does. A client
     /// can offer that and still have no idea what [`META_TERMINAL_INFO`] means.
     pub(super) fn renders_agent_terminals(&self) -> bool {
         self.capabilities()
@@ -164,7 +164,7 @@ pub(super) const META_TERMINAL_INFO: &str = "terminal_info";
 pub(super) const META_TERMINAL_OUTPUT: &str = "terminal_output";
 /// `_meta` key marking an agent-owned terminal as finished, with its exit status.
 pub(super) const META_TERMINAL_EXIT: &str = "terminal_exit";
-/// The `_meta` key under which a `compaction_update` carries meka's facts about the compaction:
+/// The `_meta` key under which a `compaction_update` carries Meka's facts about the compaction:
 /// what set it going, and once it lands, the fields of the `context.compacted` event.
 pub(super) const META_COMPACTION: &str = "compaction";
 /// The title of the card a running compaction is for a client without the protocol's compaction
@@ -630,7 +630,7 @@ impl Frontend for AcpFrontend {
                 // terminal id: it is unique per call and is what the client already correlates on.
                 if self.begin_live_output(&id, &name) == Some(LiveOutputMode::Terminal) {
                     // `cwd` is optional in the frame but worth sending: the client labels the
-                    // terminal with it, and meka's per-session cwd (which `/cd` moves) is not
+                    // terminal with it, and Meka's per-session cwd (which `/cd` moves) is not
                     // something the client could otherwise know.
                     let cwd = self.cwd.get();
                     call = call
@@ -868,7 +868,7 @@ impl Frontend for AcpFrontend {
             // The message a turn opens with, or one an interrupt appends. What the editor did not
             // type is shown as the user turn it is, so the reply has its question above it; the
             // editor's own words and images are in its transcript already, and the context block
-            // is meka's, shown nowhere. A report is said as what reported, as one read mid-turn
+            // is Meka's, shown nowhere. A report is said as what reported, as one read mid-turn
             // is.
             FrontendEvent::MessageAppended {
                 message, outcomes, ..
@@ -1229,7 +1229,7 @@ impl Frontend for AcpFrontend {
 /// client renders: it annotates a place in the reply, and a notice has no place.
 ///
 /// Deliberately not [`crate::conversation::HARNESS_NOTE`], despite the resemblance. That marker is
-/// longer because a *model* has to read it and should not have to recall what meka is; this one is
+/// longer because a *model* has to read it and should not have to recall what Meka is; this one is
 /// read by a person looking at their own editor, where the product name needs no gloss, and by
 /// clients matching on the prefix, which a rename would break.
 pub(super) fn notice_update(
@@ -1360,7 +1360,7 @@ pub(super) enum StickyDecision {
     AllowAlways,
     RejectAlways,
 }
-/// Map an ACP outcome to meka's [`PermissionOutcome`] and fire `record_sticky` when the user picked
+/// Map an ACP outcome to Meka's [`PermissionOutcome`] and fire `record_sticky` when the user picked
 /// one of the `*_always` options. Pure function so it's easy to unit-test.
 pub(super) fn translate_permission_outcome<F>(
     outcome: RequestPermissionOutcome,
@@ -1405,12 +1405,12 @@ where
         }
     }
 }
-/// Map meka's tool name to ACP's [`ToolKind`] so clients can pick the right icon and grouping.
+/// Map Meka's tool name to ACP's [`ToolKind`] so clients can pick the right icon and grouping.
 /// MCP-loaded tools (named `mcp__server__tool`) and anything unknown fall through to `Other`.
 pub(super) fn tool_kind_for(name: &str) -> ToolKind {
     match name {
         "file_read" | "checklist_read" => ToolKind::Read,
-        // A skill is a file in meka's store, so its change opens the editor's diff view on it.
+        // A skill is a file in Meka's store, so its change opens the editor's diff view on it.
         "file_edit" | "file_write" | "skill_write" | "skill_edit" => ToolKind::Edit,
         "skill_delete" => ToolKind::Delete,
         "file_find" | "file_search" => ToolKind::Search,
@@ -1451,7 +1451,7 @@ pub(super) fn tool_call_title(name: &str, display_summary: Option<&str>) -> Stri
 /// Collapse internal whitespace and cap the length, so an editor never gets an unwieldy label.
 ///
 /// The cap is the one claude-agent-acp puts on a session title; it puts none on a tool call's, but
-/// its tool titles are a verb and a path, where meka's primary argument can be a sub-agent's whole
+/// its tool titles are a verb and a path, where Meka's primary argument can be a sub-agent's whole
 /// prompt.
 pub(super) fn sanitize_title(text: &str) -> String {
     const MAX_TITLE_CHARS: usize = 256;
@@ -1463,10 +1463,10 @@ pub(super) fn sanitize_title(text: &str) -> String {
         format!("{truncated}…")
     }
 }
-/// Convert meka's checklist into ACP [`PlanEntry`] rows for [`SessionUpdate::Plan`]. A deferred
+/// Convert Meka's checklist into ACP [`PlanEntry`] rows for [`SessionUpdate::Plan`]. A deferred
 /// item is still open from the user's side and ACP has no fourth state, so it reports as
 /// `Pending`, with what it waits on in its text. Completed and canceled items have left the list,
-/// so the panel only ever shows what remains. meka tracks no per-item priority, so every entry is
+/// so the panel only ever shows what remains. Meka tracks no per-item priority, so every entry is
 /// reported as `Medium`.
 pub(super) fn checklist_to_plan(items: &[ChecklistItem]) -> Vec<PlanEntry> {
     items
@@ -1587,7 +1587,7 @@ pub(super) fn text_content_block(text: impl Into<String>) -> ToolCallContent {
 /// Build the `tool_call_update` that carries a running command's output, in whichever shape the
 /// client understands. Terminal mode appends `text` to the client's scrollback and repeats the
 /// content block so the terminal stays attached; text mode replaces the content with the window
-/// meka is holding.
+/// Meka is holding.
 pub(super) fn live_output_update(id: &str, mode: LiveOutputMode, text: &str) -> ToolCallUpdate {
     match mode {
         LiveOutputMode::Terminal => {
@@ -1629,7 +1629,7 @@ pub(super) fn command_signal(metadata: &Option<ToolOutputMetadata>) -> Option<St
 pub(super) fn console_content_block(output: &str) -> ToolCallContent {
     text_content_block(format!("```console\n{}\n```", output.trim_end()))
 }
-/// Build the `content` array of a `tool_call_update` from meka's tool output. A change the tool
+/// Build the `content` array of a `tool_call_update` from Meka's tool output. A change the tool
 /// reported wins: the words the tool wrote about it are the model's, and the change is what the
 /// human reads. `shell_execute` output is wrapped in a `console` code block so editors render it
 /// monospaced (mirrors claude-agent-acp's no-terminal fallback). Other tools pass their text and
@@ -1982,7 +1982,7 @@ pub(super) fn replay_session_updates(
                 continue;
             }
         };
-        // A nudge is meka's words, not the person's: the live run said it as a stage direction,
+        // A nudge is Meka's words, not the person's: the live run said it as a stage direction,
         // and the replay says the same, or nothing for the nudge after a reply with no visible
         // text, as live. What rode behind it, an inbox item, is the person's and follows as a
         // user chunk like any other text block.
@@ -2299,7 +2299,7 @@ pub(super) fn maybe_emit_session_title(
         SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title)),
     );
 }
-/// Map a meka [`Permission`] to its ACP [`SessionModeId`] string: the same lowercase word
+/// Map a Meka [`Permission`] to its ACP [`SessionModeId`] string: the same lowercase word
 /// `Permission::Display` produces, so the id a client reads back is the one it sees in
 /// `config.toml` and on the `--permission` flag.
 pub(super) fn mode_id_for(permission: Permission) -> SessionModeId {
@@ -2421,7 +2421,7 @@ pub(super) fn profile_config_option(
                     name.clone(),
                 );
                 // The model, when the profile names one. A profile that leaves it to the provider
-                // has nothing truthful to put here, and inventing a label would be meka asserting
+                // has nothing truthful to put here, and inventing a label would be Meka asserting
                 // a fact about someone else's system.
                 match &profile.model {
                     Some(model) => option.description(model.clone()),
@@ -2509,7 +2509,7 @@ pub(super) async fn build_config_options(
     options
 }
 /// Push a `config_option_update` so a client's pickers reflect a change it did not make, whether
-/// that was another surface repinning the session or meka's own `session/set_mode` handler.
+/// that was another surface repinning the session or Meka's own `session/set_mode` handler.
 pub(super) async fn emit_config_options(
     state: &ServerState,
     entry: &SessionEntry,

@@ -37,15 +37,15 @@ Images are refused if the final payload exceeds 3.75 MB (~5 MB base64). Conversi
 
 Every image `file_read` returns is decoded before it is sent, including the pass-through formats, and one that does not decode is a tool error naming the failure. The same door covers `web_fetch`, `image_render`, and an image a client attaches over ACP or the HTTP API. The decode is not about the extension: a truncated or corrupt PNG keeps a valid signature, so nothing short of decoding it tells the two apart. It matters because a broken image is not refused where it is read but inside the provider, by which time it sits in a tool result the session has already saved and every later turn re-sends.
 
-The check is strict, including PNG chunk checksums, so a damaged file that some viewers still render is refused here. That is deliberate: meka cannot know which decoder is on the other end, and being wrong the other way puts an image the provider rejects into the session permanently. The error names what failed, so a file reported as corrupt is worth re-exporting.
+The check is strict, including PNG chunk checksums, so a damaged file that some viewers still render is refused here. That is deliberate: Meka cannot know which decoder is on the other end, and being wrong the other way puts an image the provider rejects into the session permanently. The error names what failed, so a file reported as corrupt is worth re-exporting.
 
-JPEG is decoded through a separate strict path rather than the shared one. The library meka uses for every other format hardcodes its JPEG decoder into a permissive mode with no way to switch it off, and that mode returns a picture for a stream truncated to a tenth of its bytes; the file is the one most likely to arrive truncated, so it gets a decoder configured to say so. Truncation at any depth, and a scan corrupted in place, are both refused.
+JPEG is decoded through a separate strict path rather than the shared one. The library Meka uses for every other format hardcodes its JPEG decoder into a permissive mode with no way to switch it off, and that mode returns a picture for a stream truncated to a tenth of its bytes; the file is the one most likely to arrive truncated, so it gets a decoder configured to say so. Truncation at any depth, and a scan corrupted in place, are both refused.
 
 Three cases are *not* verified, and the last two are gaps rather than decisions:
 
-- **An image too big to decode**: one whose pixel count would cost more than 128 MiB, roughly 33 megapixels. The ceiling exists to stop a crafted file exhausting meka's own memory, and declining to decode achieves that; refusing as well would reject legitimate images, since a 6000x6000 screenshot compresses to a few hundred kilobytes and is inside Anthropic's 8000 px single-image cap. Such a file is passed through and the provider decides. Note that meka cannot downscale one either, so it also bypasses the 2000 px multi-image cap the Claude provider applies.
+- **An image too big to decode**: one whose pixel count would cost more than 128 MiB, roughly 33 megapixels. The ceiling exists to stop a crafted file exhausting Meka's own memory, and declining to decode achieves that; refusing as well would reject legitimate images, since a 6000x6000 screenshot compresses to a few hundred kilobytes and is inside Anthropic's 8000 px single-image cap. Such a file is passed through and the provider decides. Note that Meka cannot downscale one either, so it also bypasses the 2000 px multi-image cap the Claude provider applies.
 - **Frames after the first of an animated GIF or WebP**: the decoder reads one frame, so damage confined to later frames is not seen.
-- **An image arriving from an [MCP server](../usage/mcp.md)**, which sniffs magic bytes only rather than decoding a payload meka did not produce, and **a conversation restored by `meka session import`**, whose message content is stored as supplied. A broken image through either door reaches the provider; the [degrade-and-retry](../usage/sessions.md#rewinding-a-session) is what recovers the session when it does.
+- **An image arriving from an [MCP server](../usage/mcp.md)**, which sniffs magic bytes only rather than decoding a payload Meka did not produce, and **a conversation restored by `meka session import`**, whose message content is stored as supplied. A broken image through either door reaches the provider; the [degrade-and-retry](../usage/sessions.md#rewinding-a-session) is what recovers the session when it does.
 
 Only read image files when the current model supports vision input; text-only models will either error or silently drop the image block.
 
@@ -92,7 +92,7 @@ Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided
 - If `old_string` matches more than once and `replace_all` is not set, the edit is **refused**. Add surrounding context to make the anchor unique, or set `replace_all` to change every occurrence.
 - To delete text, use replace mode with an empty `new_string`.
 - The file must have been previously read with `file_read` on the same path. This prevents blind edits. Set `force` to bypass this requirement.
-- The read must still be **valid**. meka records the file's modification time and size when it is read, and refuses an edit if either has changed since:
+- The read must still be **valid**. Meka records the file's modification time and size when it is read, and refuses an edit if either has changed since:
 
   ```text
   Error: file 'src/main.rs' changed on disk after you read it. Something else
@@ -102,7 +102,7 @@ Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided
 
   This is a deliberately different message from the never-read case, because the next move differs: re-read to see what changed, then decide whether the edit still applies. Anything can be the other writer, a `shell_execute` running `sed -i`, a [background task](../usage/background.md), or you in another window. `file_write` and a successful `file_edit` both re-record the file, so consecutive edits never trip it.
 
-  A read served by the editor under [ACP](../usage/acp.md) is checked against the editor, not the disk. Those are two different documents that share a path: the editor serves its own copy of every file it owns, saved or not, so comparing one to the other would fire every time you save a file nobody edited and stay silent when you rewrite the buffer the agent is about to edit. meka fingerprints what the editor served and compares it against what the editor serves when the edit arrives, which it fetches anyway. Editing the buffer, or the editor reloading a file something else rewrote, is reported:
+  A read served by the editor under [ACP](../usage/acp.md) is checked against the editor, not the disk. Those are two different documents that share a path: the editor serves its own copy of every file it owns, saved or not, so comparing one to the other would fire every time you save a file nobody edited and stay silent when you rewrite the buffer the agent is about to edit. Meka fingerprints what the editor served and compares it against what the editor serves when the edit arrives, which it fetches anyway. Editing the buffer, or the editor reloading a file something else rewrote, is reported:
 
   ```text
   Error: file 'src/main.rs' changed in the editor after you read it. Someone edited

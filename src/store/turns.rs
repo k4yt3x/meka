@@ -57,7 +57,7 @@ pub(crate) struct TurnRecord {
     pub(crate) usage: TurnUsage,
 }
 
-/// The failure a turn ended on: its `type`, as every Problem Detail names it, and meka's own
+/// The failure a turn ended on: its `type`, as every Problem Detail names it, and Meka's own
 /// sentence about it. Never the provider's text, which `[serve] relay_provider_errors` decides
 /// about per deployment and a stored copy would hand to every reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +95,7 @@ impl utoipa::PartialSchema for TurnError {
                 "detail",
                 ObjectBuilder::new()
                     .schema_type(Type::String)
-                    .description(Some("meka's own sentence about the failure")),
+                    .description(Some("Meka's own sentence about the failure")),
             )
             .required("detail")
             .into()
@@ -410,7 +410,7 @@ pub(super) const LATEST_TURN_JOIN: &str = "LEFT JOIN turns t ON t.id = (SELECT i
      WHERE session_id = s.id ORDER BY started_at DESC, id DESC LIMIT 1)";
 
 /// One turn from the [`TURN_COLUMNS`] starting at column `offset`, or `None` when the join
-/// found no turn. A status word meka cannot read is a row nothing here wrote, and is warned
+/// found no turn. A status word Meka cannot read is a row nothing here wrote, and is warned
 /// about rather than invented.
 pub(super) fn turn_from_row(
     row: &rusqlite::Row<'_>,
@@ -425,7 +425,7 @@ pub(super) fn turn_from_row(
         Some(word) => match word.parse::<TurnStatus>() {
             Ok(status) => Some(status),
             Err(error) => {
-                tracing::warn!("turn {id} records an ending meka cannot read: {error}");
+                tracing::warn!("turn {id} records an ending Meka cannot read: {error}");
                 None
             }
         },
@@ -438,7 +438,7 @@ pub(super) fn turn_from_row(
         (Some(name), Some(detail)) => match crate::error::ErrorKind::from_name(&name) {
             Some(kind) => Some(TurnError { kind, detail }),
             None => {
-                tracing::warn!("turn {id} records an error type meka cannot read: {name}");
+                tracing::warn!("turn {id} records an error type Meka cannot read: {name}");
                 None
             }
         },
@@ -448,7 +448,7 @@ pub(super) fn turn_from_row(
         Some(word) => match word.parse::<CancelReason>() {
             Ok(reason) => Some(reason),
             Err(error) => {
-                tracing::warn!("turn {id} records a cancel reason meka cannot read: {error}");
+                tracing::warn!("turn {id} records a cancel reason Meka cannot read: {error}");
                 None
             }
         },

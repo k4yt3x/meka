@@ -29,8 +29,8 @@
 //! [`Cluster`] owns the tempdir, the `config.toml` every process reads, and the database they
 //! share. Processes come from [`Cluster::meka`] (a one-shot command) and [`Cluster::serve`] (a
 //! long-lived server, waited on until it logs its bind address). Assertions read the database
-//! directly through `rusqlite` rather than through meka, because what is being checked is what the
-//! processes *left behind*, and asking meka would ask one of the processes under test.
+//! directly through `rusqlite` rather than through Meka, because what is being checked is what the
+//! processes *left behind*, and asking Meka would ask one of the processes under test.
 //!
 //! Turns run through the scripted mock provider (`MEKA_MOCK_PROVIDER=1`), so nothing here reaches
 //! the network or needs a credential.
@@ -271,7 +271,7 @@ enabled = ["read", "unrestricted"]
             .unwrap_or(false)
     }
 
-    /// Plant scheduled jobs directly, since creating one through meka needs an agent turn to ask
+    /// Plant scheduled jobs directly, since creating one through Meka needs an agent turn to ask
     /// for it and what is under test here is what happens to a job that already exists.
     ///
     /// `overdue_by` puts a job's occurrence that far in the past, so it is due the moment a
@@ -284,7 +284,7 @@ enabled = ["read", "unrestricted"]
     /// exercising anything -- which is the worst outcome available to a race test.
     fn plant_jobs(&self, jobs: &[PlantedJob<'_>]) {
         // `chrono` is not a dev-dependency of the test crate, and SQLite renders the one shape
-        // meka's own writer produces: UTC with an explicit offset.
+        // Meka's own writer produces: UTC with an explicit offset.
         let mut connection = rusqlite::Connection::open(self.database()).expect("open the store");
         let transaction = connection.transaction().expect("begin");
         for job in jobs {
@@ -414,7 +414,7 @@ fn record_a_run_then_decline(log: &Path) -> String {
 /// POSIX spelling `printf done > …` has no `printf` in PowerShell, so on Windows the command died
 /// the instant its sleep ended and the proof file was never written. The test then read that as the
 /// product having thrown a completed task's outcome away, which is the one thing it exists to deny,
-/// so the Windows leg of CI failed on a claim about the shell rather than about meka. `sleep` needs
+/// so the Windows leg of CI failed on a claim about the shell rather than about Meka. `sleep` needs
 /// no such treatment; PowerShell aliases it to `Start-Sleep`.
 fn sleep_then_leave_proof(seconds: u32, proof: &Path) -> String {
     if cfg!(windows) {
@@ -823,7 +823,7 @@ fn two_processes_migrating_one_store_apply_it_once() {
 
 /// Two profiles on unreachable endpoints, so the connection error names the URL a turn was sent to.
 ///
-/// No credential is needed to reach a socket, but meka refuses a profile that has none before it
+/// No credential is needed to reach a socket, but Meka refuses a profile that has none before it
 /// gets that far, so one is planted directly. The value is never sent anywhere: both base URLs
 /// point at port 9, which discards.
 fn cluster_with_two_unreachable_profiles() -> Cluster {

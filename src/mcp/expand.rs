@@ -99,7 +99,7 @@ pub(crate) fn expand_server_config(config: &mut McpServerConfig) -> Unresolved {
         }
         *headers = new_headers;
     }
-    // The helper is a path meka runs, like `command`: a miss names a program that will not be
+    // The helper is a path Meka runs, like `command`: a miss names a program that will not be
     // found, and fails on its own.
     if let Some(helper) = &config.headers_helper {
         config.headers_helper = Some(record(expand_env_vars(helper, lookup), false));

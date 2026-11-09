@@ -255,7 +255,7 @@ pub(crate) async fn list_history(
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ContextMessage {
     /// The position of the history item this message shows: its own row, the row a copy a
-    /// compaction kept stands for, the row a message meka rewrote in place was said in, or a
+    /// compaction kept stands for, the row a message Meka rewrote in place was said in, or a
     /// summary's compaction.
     pub(crate) position: i64,
     /// RFC 3339, when the entry it shows was said.
@@ -470,15 +470,15 @@ pub(crate) enum ContentBlockView {
     Text {
         text: String,
     },
-    /// What meka injected ahead of the user's words for that turn (permission and environment
+    /// What Meka injected ahead of the user's words for that turn (permission and environment
     /// context, catalog changes, background outcomes, the resume notice), which the model
     /// saw as text ahead of them. Typed so a client can show or hide it; `text` alone is the words.
     TurnContext {
         text: String,
     },
-    /// Words meka wrote into the model's own turn in the user's role, to send it back to work:
+    /// Words Meka wrote into the model's own turn in the user's role, to send it back to work:
     /// `kind` is `visible_reply` after a reply with no visible text, `checklist` after one that
-    /// left checklist items open. Typed so a client can show it as meka's rather than the person's.
+    /// left checklist items open. Typed so a client can show it as Meka's rather than the person's.
     Nudge {
         kind: String,
         text: String,
@@ -953,7 +953,7 @@ mod tests {
         );
     }
 
-    /// What meka wrote on another's behalf keeps its kind on the wire, with the facts a client
+    /// What Meka wrote on another's behalf keeps its kind on the wire, with the facts a client
     /// labels it by: an inbox item's words beside its class and source, a fire's job and words, a
     /// report's tasks; and `text` on each is what the model read.
     #[test]

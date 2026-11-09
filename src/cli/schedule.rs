@@ -210,7 +210,7 @@ impl Resolvable {
 
 /// One row per job, separated from printing so it can be tested.
 ///
-/// The `Prompt` cell carries text meka did not write, possibly composed from a page the agent
+/// The `Prompt` cell carries text Meka did not write, possibly composed from a page the agent
 /// fetched, so it goes through [`crate::text::sanitize_to_line`]. The separation from `render`
 /// matters for exactly that: `render` prints, so sanitizing done there has no way to be asserted.
 ///

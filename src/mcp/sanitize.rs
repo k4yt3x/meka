@@ -1,9 +1,9 @@
-//! Names crossing the MCP boundary: the server names meka refuses, and the normalization of a
+//! Names crossing the MCP boundary: the server names Meka refuses, and the normalization of a
 //! server name to the alphabet provider tool schemas accept. Text a server sends (descriptions,
 //! progress, stderr, results) is sanitized where it enters through `crate::text::sanitize_to_line`
 //! and its siblings, not here.
 
-/// Reserved server names that collide with meka internals or with the tool namespace separator.
+/// Reserved server names that collide with Meka internals or with the tool namespace separator.
 /// Connection requests for these names are rejected.
 pub(crate) const RESERVED_SERVER_NAMES: &[&str] = &["meka", "ide"];
 
@@ -41,7 +41,7 @@ pub(crate) fn normalize_server_name(input: &str) -> String {
 }
 
 /// Returns true when the given name is reserved (either an explicit entry in
-/// [`RESERVED_SERVER_NAMES`] or starts with the `mcp_` prefix that meka uses for internal tools).
+/// [`RESERVED_SERVER_NAMES`] or starts with the `mcp_` prefix that Meka uses for internal tools).
 pub(crate) fn is_reserved_server_name(name: &str) -> bool {
     if RESERVED_SERVER_NAMES
         .iter()
@@ -52,7 +52,7 @@ pub(crate) fn is_reserved_server_name(name: &str) -> bool {
     name.to_ascii_lowercase().starts_with("mcp_")
 }
 
-/// Why `name` cannot name a server, when it cannot: it is empty, meka reserves it, or a tool
+/// Why `name` cannot name a server, when it cannot: it is empty, Meka reserves it, or a tool
 /// prefix cannot carry it. One definition for every door an entry comes through, `config.toml`'s
 /// and the running manager's, so a name the file takes is a name the manager takes.
 pub(crate) fn validate_server_name(name: &str) -> Result<(), String> {
@@ -168,7 +168,7 @@ mod tests {
     }
 
     /// `\r` is the one control that can forge UI without an escape sequence: it moves the cursor
-    /// back to column zero, so a server can overwrite a line meka already wrote. Every render site
+    /// back to column zero, so a server can overwrite a line Meka already wrote. Every render site
     /// for server-supplied text relies on this function, so the strip has to happen here.
     #[test]
     fn sanitize_strips_carriage_return() {

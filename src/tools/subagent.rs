@@ -1700,7 +1700,7 @@ impl crate::tools::Detachable for AgentFollowupTool {
             .map_err(|reason| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
                 message: format!(
-                    "sub-agent '{agent_id}' has spawn terms this meka cannot read: {reason}"
+                    "sub-agent '{agent_id}' has spawn terms this Meka cannot read: {reason}"
                 ),
             })?;
         let workspace = match &recorded {
@@ -3906,7 +3906,7 @@ mod tests {
                 text_round("unreachable"),
             ]));
         // The claim `create_child_session` takes *is* the contention: holding it here is exactly
-        // what a second meka looks like from the follow-up's side, since `flock` conflicts across
+        // what a second Meka looks like from the follow-up's side, since `flock` conflicts across
         // open file descriptions rather than across processes. A real spec, or the follow-up
         // refuses at the resumability check before it ever reaches the lock.
         let spec = SubagentSpec {
@@ -4524,7 +4524,7 @@ mod tests {
     /// spawn, so unless the follow-up writes it down too, a worker spawned on `first-profile` and
     /// followed up after a `/profile` switch runs on and bills `second-profile` while its row still
     /// says `first-profile`: a session whose turns do not run on the profile its row names, which
-    /// meka otherwise forbids.
+    /// Meka otherwise forbids.
     ///
     /// The switch between the two calls is the whole point; a test where the profile never moves
     /// passes with the write deleted.
@@ -6004,7 +6004,7 @@ mod tests {
     }
 
     /// The three id-taking tools resolve one way: the full id, or a prefix no other sub-agent of
-    /// this session shares, folded for case like every other id meka resolves.
+    /// this session shares, folded for case like every other id Meka resolves.
     #[test]
     fn a_sub_agent_id_resolves_in_full_or_by_a_prefix_unique_among_the_children() {
         let parent = Uuid::from_u128(0x1);

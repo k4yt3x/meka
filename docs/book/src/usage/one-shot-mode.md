@@ -16,7 +16,7 @@ A prompt **without** `--oneshot` is not a one-shot run: it seeds the first turn 
 
 An empty or whitespace-only prompt is refused rather than sent.
 
-[Approvals](./permissions.md#approvals) have nothing to ask from here: there is no prompt to answer, so with the switch on every tool that needs approval is refused. meka says so once at startup and names each tool as it is refused, but the run is still less useful than it looks. Give a non-interactive run the level it needs with `--permission`, or use [`meka serve`](./http-api.md) if you need a human in the loop over an API.
+[Approvals](./permissions.md#approvals) have nothing to ask from here: there is no prompt to answer, so with the switch on every tool that needs approval is refused. Meka says so once at startup and names each tool as it is refused, but the run is still less useful than it looks. Give a non-interactive run the level it needs with `--permission`, or use [`meka serve`](./http-api.md) if you need a human in the loop over an API.
 
 ## Examples
 
@@ -90,9 +90,9 @@ session existed, which is the one way a run prints a report without one; every o
 present. `text` is the assistant's text with the rounds joined by a blank line,
 `tool_calls` lists every call in the order it was dispatched, and `usage` sums the rounds and the
 compactions the turn ran. `notices`
-is what meka itself said during the turn (a refused approval, a lost write, a declined MCP
+is what Meka itself said during the turn (a refused approval, a lost write, a declined MCP
 elicitation), each with
-a `level` of `info` or `warn` and its `text`; it is empty when meka raised none. `compactions` lists
+a `level` of `info` or `warn` and its `text`; it is empty when Meka raised none. `compactions` lists
 the compactions the turn ran, each in the shape of the HTTP API's
 [`context.compacted`](http-api.md#event-types) event. The flag applies to
 `--oneshot` alone; a run without it is refused. `meka account usage`, `whoami` and `stats` take the
@@ -114,7 +114,7 @@ meka -c
 The answer goes to stdout and everything else to stderr, so `meka -p … 2>/dev/null | next-tool`
 hands the next tool only what you asked for. That holds for every command, not just this one.
 
-A reader that stops reading is its own decision, and meka exits `0` for it:
+A reader that stops reading is its own decision, and Meka exits `0` for it:
 
 ```bash
 meka -p "summarize this log" | head -20     # exits 0; head got its lines

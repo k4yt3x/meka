@@ -1054,7 +1054,7 @@ mod tests {
         assert_eq!(agent.auto_compact_ceiling(), Some(500_000));
         agent.options.context_ceiling_percent = 80;
 
-        // Not "a tiny window": a zero window means meka does not know the size, and a threshold of
+        // Not "a tiny window": a zero window means Meka does not know the size, and a threshold of
         // zero would compact on the very first turn, before there is anything to summarize.
         agent.set_context_window_for_test(0);
         assert_eq!(

@@ -377,7 +377,7 @@ pub(crate) fn fallback_names(value: &str) -> Vec<String> {
 fn unsettable_key_refusal(key: &str) -> anyhow::Error {
     match key {
         // A user who typed it did not typo, and "settable: model, effort, ..." alone would read
-        // as though meka had forgotten it rather than declined it.
+        // as though Meka had forgotten it rather than declined it.
         "account" => anyhow::anyhow!(
             "`account` names the credential every session on the profile bills; add a profile on \
              the other account instead"
@@ -590,7 +590,7 @@ fn add_flag(key: &str) -> String {
 
 /// Fill in whatever the flags didn't set, offering one opt-in prompt rather than three
 /// unconditional ones. Declining leaves every unset knob out of the profile, and says which
-/// defaults that implies, because these are settings meka never infers: nothing else will tell the
+/// defaults that implies, because these are settings Meka never infers: nothing else will tell the
 /// user they exist.
 fn resolve_tuning(
     flags: ProfileTuning,
@@ -865,11 +865,11 @@ mod tests {
             None,
             None,
         ) else {
-            panic!("a field meka writes was kept");
+            panic!("a field Meka writes was kept");
         };
         assert_eq!(
             refused.to_string(),
-            "profile 'oai': `parameters.stream` is written by meka on 'openai-chat-completions'; \
+            "profile 'oai': `parameters.stream` is written by Meka on 'openai-chat-completions'; \
              remove it"
         );
     }
@@ -965,7 +965,7 @@ mod tests {
 
     /// The defaults line names what is still unset, and nothing else.
     ///
-    /// It is the only thing that tells a user these settings exist: meka never infers them, so
+    /// It is the only thing that tells a user these settings exist: Meka never infers them, so
     /// nothing else in the run mentions them. Naming one the flags already pinned would state a
     /// default that contradicts the file being written in the same breath.
     #[test]
@@ -1113,7 +1113,7 @@ mod tests {
         );
 
         // Every key in the advertised list has an arm. A key listed but unhandled would fall to the
-        // catch-all and be refused as unknown, which reads as meka having forgotten its own field.
+        // catch-all and be refused as unknown, which reads as Meka having forgotten its own field.
         for key in SETTABLE_PROFILE_KEYS {
             let sample = match *key {
                 "context_window" | "max_output_tokens" | "thinking_budget"
@@ -1241,7 +1241,7 @@ mod tests {
     ///
     /// A user who typed it did not typo, so "settable: model, effort, …" on its own would read as
     /// an oversight rather than a decision, and the obvious next move would be to hand-edit the key
-    /// that meka is declining to change for them.
+    /// that Meka is declining to change for them.
     #[test]
     fn changing_a_profiles_account_is_refused_with_its_reason() {
         let error = parse_profile_change("account", Some("oai"))

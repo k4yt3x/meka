@@ -130,7 +130,7 @@ impl Permission {
     /// nobody watching.
     ///
     /// `Unrestricted` alone. A scheduled gate is spawned by `run_shell_probe` as a bare `sh -c`
-    /// with no `Confinement`, no sandbox and meka's full environment, so the level that authorizes
+    /// with no `Confinement`, no sandbox and Meka's full environment, so the level that authorizes
     /// it must be the one that promises no boundary.
     ///
     /// `Workspace` does not pass, tempting as it is on the reasoning that it is *safer* than the
@@ -218,7 +218,7 @@ impl From<Permission> for String {
 /// both an absent column and an unreadable one, because every caller has the same fallback for the
 /// two. What differs is that an unreadable value is *noticed*: spelling this
 /// `.and_then(|value| value.parse().ok())` collapses "this session never recorded a level" into
-/// "this session recorded a level meka cannot read" and resumes at the process default either way,
+/// "this session recorded a level Meka cannot read" and resumes at the process default either way,
 /// silently.
 ///
 /// Repeats. The scheduler reads a job's session level every time that job comes due, so a row it
@@ -234,7 +234,7 @@ pub(crate) fn parse_recorded_permission(
         Ok(permission) => Some(permission),
         Err(error) => {
             tracing::warn!(
-                "{subject} records permission level '{raw}', which meka does not recognize ({error}); \
+                "{subject} records permission level '{raw}', which Meka does not recognize ({error}); \
                  the row is read as recording no level"
             );
             None
@@ -269,7 +269,7 @@ impl EnabledPermissions {
     };
 
     /// Build an `EnabledPermissions` from any iterable of [`Permission`]s. Returns `None` if the
-    /// iterator yields no items. An empty enabled set is meaningless (meka would have no level to
+    /// iterator yields no items. An empty enabled set is meaningless (Meka would have no level to
     /// start in), so the caller has to handle that case explicitly (typically by falling back to
     /// [`Self::DEFAULT`]).
     pub(crate) fn from_levels<I: IntoIterator<Item = Permission>>(iter: I) -> Option<Self> {
@@ -760,7 +760,7 @@ mod tests {
         }
     }
 
-    /// The refusal names every level, so a user typing a level meka does not have learns what it
+    /// The refusal names every level, so a user typing a level Meka does not have learns what it
     /// does have without a second lookup.
     #[test]
     fn an_unknown_level_is_refused_and_the_refusal_names_the_four() {

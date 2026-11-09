@@ -324,7 +324,7 @@ pub(super) fn canonical_trigger_sql(sql: &str) -> String {
 ///
 /// The `sqlite_master` read sits outside the transaction, which is safe because
 /// [`crate::store::Store::initialize_schema`] holds an exclusive OS file lock across all
-/// schema work: no second meka process can be between this check and its replacement.
+/// schema work: no second Meka process can be between this check and its replacement.
 fn sync_triggers(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
     let existing: std::collections::HashMap<String, String> = {
         let mut statement = connection.prepare(
@@ -817,7 +817,7 @@ impl MemoryFilter {
     /// Empty for an empty filter.
     ///
     /// Stamps are compared as the RFC 3339 text the columns hold, which orders correctly because
-    /// every stamp meka writes is UTC with the same field widths; the parameters are strings so
+    /// every stamp Meka writes is UTC with the same field widths; the parameters are strings so
     /// the closure that binds them stays `Send`.
     fn clause(&self, table: &str, first: usize, now: SystemTime) -> (String, Vec<String>) {
         let (mut clause, mut parameters) = self.view.clause(table, first);
@@ -930,7 +930,7 @@ impl Ranking {
     ///
     /// The counterweight to a priority chosen once and never revised. Priorities drift toward 0
     /// over a long-lived instance until the index stops ranking anything; a memory opened forty
-    /// times is important whatever it was labeled two years ago, and that is a fact meka owns
+    /// times is important whatever it was labeled two years ago, and that is a fact Meka owns
     /// rather than one it has to guess.
     fn usage_weight(read_count: u32) -> f64 {
         if read_count == 0 {
@@ -1088,7 +1088,7 @@ fn references_column(references: &[String]) -> String {
 /// Reduce a stored tag to the characters a tag is allowed to hold.
 ///
 /// The same shape as [`clamp_priority`] and [`clamp_read_count`], and against the same threat: a
-/// row that reached this table without going through meka's write doors. Unlike the others, tags
+/// row that reached this table without going through Meka's write doors. Unlike the others, tags
 /// are *rendered*, into the tag histogram and the world-state diff, both of which reach the
 /// model's context and the operator's terminal. `split_whitespace` already stops a newline, but an
 /// ANSI escape, a bidi override or a zero-width character is not whitespace and goes through
@@ -1116,7 +1116,7 @@ fn keepable_tag(stored: &str) -> String {
     }
 }
 
-/// Clamp a stored priority into the band. Stored values come from meka's own validated write door,
+/// Clamp a stored priority into the band. Stored values come from Meka's own validated write door,
 /// so this is a guard against a hand-edited database rather than an expected path.
 fn clamp_priority(stored: i64) -> u8 {
     stored.clamp(0, i64::from(MAX_PRIORITY)) as u8
@@ -1129,7 +1129,7 @@ fn clamp_read_count(stored: i64) -> u32 {
 /// Parse a stored RFC 3339 stamp, falling back to the epoch.
 ///
 /// Every stamp this reads was written by [`crate::memory::render_stamp`], so the fallback is
-/// unreachable through meka's own doors. It exists because the alternative is failing a whole
+/// unreachable through Meka's own doors. It exists because the alternative is failing a whole
 /// query over one malformed cell in a database somebody edited by hand, and an epoch date renders
 /// as an obviously wrong age rather than as a plausible one.
 fn stamp_or_epoch(raw: &str) -> SystemTime {
@@ -1138,7 +1138,7 @@ fn stamp_or_epoch(raw: &str) -> SystemTime {
 
 /// Handle on the memory tables, sharing the one database `Store` owns.
 ///
-/// A handle rather than a second database file: meka has one database, and a second would be a new
+/// A handle rather than a second database file: Meka has one database, and a second would be a new
 /// thing to back up, lock, and explain for the sake of two tables. Cloneable and cheap; the
 /// underlying connection is shared, and a transaction is what serializes concurrent writers.
 pub(crate) struct MemoryStore {
@@ -1361,7 +1361,7 @@ impl MemoryStore {
     /// Deliberately *not* a write lock. [`Self::write`] is one immediate transaction, and SQLite
     /// serializes writers across processes, so nothing about correctness needs this. What
     /// needs it is the advisory check, which is a read followed by a report: a model emits several
-    /// tool calls in one message and meka runs them concurrently, so without this two
+    /// tool calls in one message and Meka runs them concurrently, so without this two
     /// `memory_write`s in one turn both query the store before either lands, each sees no
     /// duplicate, and the check that exists to catch exactly this says nothing. Observed live.
     ///
@@ -1615,8 +1615,8 @@ impl MemoryStore {
     /// Insert a row straight at the column, past every write door.
     ///
     /// Exists so a test can produce the state the read guards are for: a name, description or tag
-    /// that meka's own doors would have refused, which is what a row written by something other
-    /// than this build looks like. Nothing in meka can create one, so without this the guards would
+    /// that Meka's own doors would have refused, which is what a row written by something other
+    /// than this build looks like. Nothing in Meka can create one, so without this the guards would
     /// be unreachable from the test suite and rest on their comments alone.
     #[cfg(test)]
     pub(crate) async fn plant_row_for_test(&self, name: &str, description: &str) -> Result<()> {
@@ -1665,7 +1665,7 @@ impl MemoryStore {
 
     /// Rename a row straight at the column.
     ///
-    /// No meka door renames a memory, which is exactly why this exists: `memories_after_update`'s
+    /// No Meka door renames a memory, which is exactly why this exists: `memories_after_update`'s
     /// `WHEN` carries a `COLLATE BINARY` on `name` so a case-only rename fires against a
     /// `NOCASE` column, and without a seam that guarantee is unreachable from the suite and
     /// rests on its comment.
@@ -3140,7 +3140,7 @@ mod tests {
 
     /// A rename reaches the index, including one that changes only case.
     ///
-    /// Nothing in meka renames a memory today, so this is latent rather than live -- but dropping
+    /// Nothing in Meka renames a memory today, so this is latent rather than live -- but dropping
     /// the `name` arm from `memories_after_update`'s `WHEN` survived the whole suite, and a rename
     /// that never reaches the index is a search that cannot find a memory by the name it now
     /// has.
@@ -3999,7 +3999,7 @@ mod tests {
     /// Tags are read back through the same kind of guard the other stored values have.
     ///
     /// `clamp_priority` and `clamp_read_count` both exist against a row that reached this table
-    /// without going through meka's write doors; tags were the one field with none, and unlike
+    /// without going through Meka's write doors; tags were the one field with none, and unlike
     /// those two they are *rendered* -- into the tag histogram and the world-state diff, both of
     /// which reach the model's context and the operator's terminal. `split_whitespace` already
     /// stopped a newline, but an escape sequence or a bidi override is not whitespace.

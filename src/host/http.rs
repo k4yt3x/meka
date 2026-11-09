@@ -60,7 +60,7 @@ pub(crate) fn resolve_serve(
     Ok(serve)
 }
 
-/// Run meka as an HTTP server until the listener stops accepting (e.g. on SIGTERM after the
+/// Run Meka as an HTTP server until the listener stops accepting (e.g. on SIGTERM after the
 /// graceful-shutdown drain completes). The signature mirrors [`crate::host::acp::run_acp`] for
 /// consistency with the existing dispatch in `main::async_main`.
 pub(crate) async fn run_serve(
@@ -94,7 +94,7 @@ pub(crate) async fn run_serve(
         Arc::new(crate::host::build_shared_deps(Arc::new(config), store, mcp_manager).await?);
 
     if !serve.webhooks.is_empty() {
-        // Named at startup because an outbound request is the one thing meka does that leaves the
+        // Named at startup because an outbound request is the one thing Meka does that leaves the
         // machine unprompted, and an operator inheriting a config should not have to read it to
         // find out that it does.
         let configured = serve.webhooks.len();

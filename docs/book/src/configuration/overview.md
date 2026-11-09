@@ -1,9 +1,9 @@
 # Configuration overview
 
-meka is configured with named **accounts** and **profiles** in a config file at
+Meka is configured with named **accounts** and **profiles** in a config file at
 `~/.config/meka/config.toml`, plus secrets kept in the store. An account is where a request
-goes and who meka is when it arrives: a backend, an endpoint, and the credential a login produced. A
-profile is what meka asks that account for: a model and every model-tied setting. The quickest way
+goes and who Meka is when it arrives: a backend, an endpoint, and the credential a login produced. A
+profile is what Meka asks that account for: a model and every model-tied setting. The quickest way
 to get started is to let the two command suites write both for you:
 
 ```console
@@ -33,9 +33,9 @@ See [Config file](./config-file.md) for the full reference and the
 
 ## Required settings
 
-To run a turn, meka needs an active profile that names an account and a `model`, and a stored
+To run a turn, Meka needs an active profile that names an account and a `model`, and a stored
 credential for that account. If no profile can be selected, or the active profile's account has no
-credential, meka prints an error pointing at `meka profile add` / `meka account login`.
+credential, Meka prints an error pointing at `meka profile add` / `meka account login`.
 
 | Setting | Source | Named on the command line |
 |---------|--------|---------------------------|

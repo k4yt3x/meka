@@ -565,7 +565,7 @@ pub(crate) struct ForkSessionBody {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "A turn is in flight on the source; cancel first (`/errors/turn-in-flight`). Or another meka process holds the source (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 409, description = "A turn is in flight on the source; cancel first (`/errors/turn-in-flight`). Or another Meka process holds the source (`/errors/session-locked`)", body = ProblemDetail),
         (status = 412, description = "`If-Match` names a conversation that has since changed (`/errors/precondition-failed`); `position` carries the current one", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, `turn_id` names no turn the source's context holds, or the source is a sub-agent's conversation, whose copy is another sub-agent and so has no live session to hand back (`/errors/session-not-drivable`)", body = ProblemDetail),
@@ -1220,7 +1220,7 @@ async fn patch_dormant_session(
                 crate::error::MekaError::SessionLocked(_) => ProblemDetail::new(
                     ErrorKind::SessionLocked,
                     StatusCode::CONFLICT,
-                    "another meka process is running this session, so its profile or \
+                    "another Meka process is running this session, so its profile or \
                          project cannot be changed from here",
                 )
                 .with("session_id", id.to_string()),
@@ -1452,7 +1452,7 @@ async fn dormant_record(state: &ServerState, id: Uuid) -> Result<SessionResponse
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "A turn is in flight and the body names `working_directory`, `profile` or `project`; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session, so only that process may move it (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 409, description = "A turn is in flight and the body names `working_directory`, `profile` or `project`; cancel first (`/errors/turn-in-flight`). Or another Meka process holds the session, so only that process may move it (`/errors/session-locked`)", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, or the id names a sub-agent's conversation, whose permission, cwd and profile come from the terms its parent spawned it with (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -1860,7 +1860,7 @@ pub(crate) fn turn_in_flight_conflict(id: Uuid, doing: &'static str) -> ProblemD
         (status = 204, description = "Session deleted (idempotent, also returned for unknown ids)"),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another Meka process holds the session (`/errors/session-locked`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:w"]))

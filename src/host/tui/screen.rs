@@ -136,7 +136,7 @@ pub(crate) struct ScreenLaunch {
     pub(crate) shared_permission: SharedPermission,
     pub(crate) sandbox_state: crate::sandbox::SandboxState,
     pub(crate) cwd: crate::workspace::SharedCwd,
-    /// Where meka was started, which is what a bare `/cd` returns to.
+    /// Where Meka was started, which is what a bare `/cd` returns to.
     pub(crate) launch_cwd: PathBuf,
     /// What the status row shows, in order.
     pub(crate) status_row: Vec<crate::config::StatusFact>,
@@ -310,7 +310,7 @@ impl Elicitation {
     }
 }
 
-/// A server-supplied string on one row of meka's own, cut at `columns` the way every cut on the
+/// A server-supplied string on one row of Meka's own, cut at `columns` the way every cut on the
 /// screen is made: at the end, with the marker.
 fn one_line(text: &str, columns: usize) -> String {
     draw::cut_text(&crate::text::sanitize_to_line(text, usize::MAX), columns)
@@ -715,7 +715,7 @@ impl Screen {
         self.composer.suggest(&self.launch.completer);
     }
 
-    /// What a command has to say back in meka's voice that is not a fact of the session: a
+    /// What a command has to say back in Meka's voice that is not a fact of the session: a
     /// refusal, a failure, an empty list. The door every such answer the screen and the host say
     /// passes, so a sentence another surface shares, an error's above all, takes the screen's
     /// voice here ([`draw::screen_voice`]); see [`Self::answer`].
@@ -1181,7 +1181,7 @@ impl Screen {
         responder: tokio::sync::oneshot::Sender<ElicitationResponse>,
     ) {
         // Server-controlled strings are flattened to one line before they wrap: a newline in the
-        // message could paint rows that look like meka's own, enough to forge an approval block.
+        // message could paint rows that look like Meka's own, enough to forge an approval block.
         // Laid out a column short of the right edge, where the panel's body and the question's
         // stop, so both draw the rows as they are.
         let width =
@@ -3385,7 +3385,10 @@ fn log_item(line: crate::relay::LogLine) -> Item {
             level: crate::frontend::NoticeLevel::Warn,
             text: line.message,
         },
-        _ => Item::note(format!("{}: {}", line.target, line.message)),
+        _ => Item::Log {
+            target: line.target,
+            message: line.message,
+        },
     }
 }
 
@@ -3952,7 +3955,10 @@ mod tests {
         );
         assert_eq!(
             log_item(line(tracing::Level::INFO, "turn started")),
-            Item::note("meka::agent::turn: turn started")
+            Item::Log {
+                target: "meka::agent::turn".to_string(),
+                message: "turn started".to_string(),
+            }
         );
     }
 

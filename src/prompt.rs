@@ -149,7 +149,7 @@ impl MemoryIndexEntry {
 /// memory that fits again after a cleanup has a body the model has never seen, and mid-session the
 /// diff is the only channel that can carry it. `None` whenever the in-force inline bodies fit,
 /// which the store's write doors guarantee for anything they wrote; it is `Some` only for a store
-/// the budget was lowered under, or one written past meka's doors.
+/// the budget was lowered under, or one written past Meka's doors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InlineOverflow {
     total_bytes: usize,
@@ -343,7 +343,7 @@ impl WorldSnapshot {
     /// be read.
     ///
     /// The diff then compares that half against itself and reports nothing, which is the only
-    /// truthful answer available: meka does not know what the store holds, and "I could not read
+    /// truthful answer available: Meka does not know what the store holds, and "I could not read
     /// it" is not the same statement as "it is empty". Rendering the empty list instead would tell
     /// the model every memory it had was deleted, naming each one, and then announce the same
     /// memories as saved on the next turn that reads successfully: two false claims about its own
@@ -1025,7 +1025,7 @@ pub(crate) struct BackgroundTools {
     pub(crate) task_cancel: bool,
 }
 
-/// Build the session-level system prompt: what meka is, the permission model, the operator's
+/// Build the session-level system prompt: what Meka is, the permission model, the operator's
 /// standing instructions, the standing rules for tools, background work, scheduling and the
 /// context window, and environment info.
 pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
@@ -1042,13 +1042,13 @@ pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
         memory_write,
     } = inputs;
     let mut prompt = String::from(
-        "meka is the harness this conversation runs in: it runs the tools, enforces the \
+        "Meka is the harness this conversation runs in: it runs the tools, enforces the \
          permission levels and writes the context blocks described below.\n\n\
          ## Permissions\n\n\
          The latest `[Permission context]` states the current level and approvals. Tool schemas \
          describe calls, not permission to execute them.\n\n\
          - `none`: no tool calls without approval.\n\
-         - `read`: tools classified `read`, including updates to meka-managed memory, scratchpad \
+         - `read`: tools classified `read`, including updates to Meka-managed memory, scratchpad \
          entries, and the checklist.\n\
          - `workspace`: file and shell writes stay inside the workspace. An MCP tool that needs \
          more than `workspace` runs in its server's own process, which cannot be confined, so \
@@ -1188,7 +1188,7 @@ pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
 }
 
 /// The rules about the directories `[Environment context]` names, stated once here while the
-/// block carries only the values. meka's own directories are named by role, not by path: a read
+/// block carries only the values. Meka's own directories are named by role, not by path: a read
 /// refused under them says so, naming the directory, so the model can tell that refusal from a
 /// missing file without the paths sitting in every session's prompt.
 const WORKSPACE_SECTION: &str = "## Workspace\n\n\
@@ -1197,7 +1197,7 @@ const WORKSPACE_SECTION: &str = "## Workspace\n\n\
     rights, searched with it by default; and your additional readable directories, read-only, \
     searched only when named. Below `unrestricted` a read reaches the workspace, the readable \
     directories and the system directories (`/usr`, `/etc` and the like), or anywhere when the \
-    block says so. meka's own configuration and data directories are never readable; the skills \
+    block says so. Meka's own configuration and data directories are never readable; the skills \
     store under the first is.\n\n";
 
 /// Build the per-turn `[Permission context]` block: the current level and the approvals switch.
@@ -1356,7 +1356,7 @@ fn build_environment_context(
 /// thought, and `mid_turn` is what tells it the message landed while it was working, which is the
 /// difference between "answer this now" and "you may already have addressed this". The body is
 /// verbatim: a producer that relays untrusted text fences it itself, as the bridge does with its
-/// nonce, and meka adds nothing that could be mistaken for the producer's own framing.
+/// nonce, and Meka adds nothing that could be mistaken for the producer's own framing.
 pub(crate) fn render_inbox_item(item: &crate::store::inbox::InboxItem, mid_turn: bool) -> String {
     let arrived = crate::text::format_timestamp(item.created_at, crate::text::Precision::Minutes);
     let when = if mid_turn {
@@ -1382,7 +1382,7 @@ pub(crate) fn render_inbox_item(item: &crate::store::inbox::InboxItem, mid_turn:
 /// model's own words, so they ride as they are; what the message withholds is permission to stop.
 ///
 /// It says reasons are recorded and nothing stronger: a client over the HTTP API or a bridge may
-/// show neither the list nor the feed, so "the user will see" would be a promise meka cannot keep.
+/// show neither the list nor the feed, so "the user will see" would be a promise Meka cannot keep.
 pub(crate) fn render_checklist_nudge(
     state: &crate::checklist::ChecklistState,
     reported: &[crate::checklist::ReportedTask],
@@ -1605,11 +1605,11 @@ fn render_retention(window: std::time::Duration, now: chrono::DateTime<chrono::L
 
 /// Shown on the first turn after a conversation is restored from disk, and then never again.
 ///
-/// Deliberately teaches an inference rather than listing what was cleared. meka knows about its own
+/// Deliberately teaches an inference rather than listing what was cleared. Meka knows about its own
 /// read tracker, but it cannot enumerate what an arbitrary MCP server was holding: a loaded
 /// database, an authenticated session, a subscription. Naming only the known cases would leave the
 /// reader confident about every other one, and an agent that opened a database three turns ago
-/// would get an opaque "no database open" back from a server whose error text meka does not own,
+/// would get an opaque "no database open" back from a server whose error text Meka does not own,
 /// with nothing anywhere to distinguish a restart from a broken tool.
 ///
 /// "*May* have reconnected" is load-bearing rather than hedging. A `/session` switch re-hydrates
@@ -1636,7 +1636,7 @@ const RESUMED_SECTION: &str = "[Session resumed]\nThis conversation was loaded f
 pub(crate) struct ContextBudget {
     /// Input tokens behind the most recent request, provider-reported where possible.
     pub(crate) used: u64,
-    /// The model's total window. Zero when meka has no metadata for the model, which suppresses
+    /// The model's total window. Zero when Meka has no metadata for the model, which suppresses
     /// the section: a percentage of an unknown denominator is worse than silence.
     pub(crate) window: u64,
     /// Occupancy at which auto-compaction fires, or `None` when it is switched off.
@@ -4893,7 +4893,7 @@ mod tests {
     #[test]
     fn the_system_prompt_states_facts_and_leaves_conduct_to_the_operator() {
         let prompt = build_system_prompt(SystemPromptInputs::for_test(true, Some("Be brief.")));
-        assert!(prompt.starts_with("meka is the harness"), "{prompt}");
+        assert!(prompt.starts_with("Meka is the harness"), "{prompt}");
         for conduct in [
             "You are ",
             "Complete the user's task",
@@ -5410,7 +5410,7 @@ mod tests {
             context.starts_with("<context>\n[Session resumed]"),
             "{context}"
         );
-        // Both halves have to be there: meka's own cleared state, and the state it cannot
+        // Both halves have to be there: Meka's own cleared state, and the state it cannot
         // enumerate because it belongs to somebody else's process.
         assert!(context.contains("no longer recorded as read"), "{context}");
         assert!(

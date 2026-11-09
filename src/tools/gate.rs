@@ -108,7 +108,7 @@ impl GateToolset {
 }
 /// Stands in when the gate's resolution registry could not be built, so every built-in name
 /// resolves to "unavailable" rather than to a level nothing verified. Failing closed here costs a
-/// refused gate; failing open would run one on authority meka never established.
+/// refused gate; failing open would run one on authority Meka never established.
 pub(super) static EMPTY_GATE_REGISTRY: std::sync::LazyLock<ToolRegistry> =
     std::sync::LazyLock::new(ToolRegistry::new);
 #[async_trait]

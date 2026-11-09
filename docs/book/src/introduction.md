@@ -1,8 +1,8 @@
 # Introduction
 
-**meka** is a general-purpose AI agent harness, the layer that wraps a large language model with everything it needs to act as an autonomous agent: a tool set, working memory, context management, persistent sessions, a permission model, and several ways to drive it. You bring a model (Claude or OpenAI, API key or subscription); meka turns it into an agent that can read and edit files, run commands, fetch web pages, call MCP servers, and delegate to sub-agents to get real work done.
+**Meka** is a general-purpose AI agent harness, the layer that wraps a large language model with everything it needs to act as an autonomous agent: a tool set, working memory, context management, persistent sessions, a permission model, and several ways to drive it. You bring a model (Claude or OpenAI, API key or subscription); Meka turns it into an agent that can read and edit files, run commands, fetch web pages, call MCP servers, and delegate to sub-agents to get real work done.
 
-The name reflects the design: the model is the pilot, and meka is the mech it operates. The pilot (the model and the backend serving it) is swappable; the harness around it stays the same.
+The name reflects the design: the model is the pilot, and Meka is the mech it operates. The pilot (the model and the backend serving it) is swappable; the harness around it stays the same.
 
 ```text
 > find all Rust files in this project and count the lines of code
@@ -34,8 +34,8 @@ The same agent core is exposed through four front-ends:
 
 ## How it works
 
-1. You give meka a goal in natural language, interactively, one-shot, over ACP, or over HTTP.
-2. meka sends it to the configured model along with a system prompt, the tool schemas, and a context block describing the current permission level, working directory, tools, and skills.
+1. You give Meka a goal in natural language, interactively, one-shot, over ACP, or over HTTP.
+2. Meka sends it to the configured model along with a system prompt, the tool schemas, and a context block describing the current permission level, working directory, tools, and skills.
 3. The model decides which tools to call (if any) and returns text and/or tool calls.
-4. meka enforces the current permission level, executes the tool calls, and feeds the results back to the model.
+4. Meka enforces the current permission level, executes the tool calls, and feeds the results back to the model.
 5. The loop repeats until the model is done; the final response is returned (streamed as Markdown in the terminal).

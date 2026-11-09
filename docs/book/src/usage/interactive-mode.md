@@ -1,12 +1,12 @@
 # Interactive mode
 
-Start meka without `--oneshot` to open the interactive screen:
+Start Meka without `--oneshot` to open the interactive screen:
 
 ```bash
 meka
 ```
 
-The screen takes over the terminal, the way an editor does. A new session opens on meka's mark,
+The screen takes over the terminal, the way an editor does. A new session opens on Meka's mark,
 the `M` of its icon in the terminal's cyan, two columns in, beside three lines: the version, with
 the commit the binary was built from (`-dirty` for a tree with uncommitted changes) and `debug`
 for an unoptimized build beside it when they say more than the version does; then what the agent
@@ -38,7 +38,7 @@ question, and the row goes when the turn ends. A `!command` has the same row, as
 
 Everything on the transcript shares one left edge. Column 0 holds a glyph that says what a row is:
 `▎` a bar down what you sent, in the color of the permission level it ran under (red for a
-`!command`, gray while it waits for its turn), `•` something the agent or meka did (a tool call, a
+`!command`, gray while it waits for its turn), `•` something the agent or Meka did (a tool call, a
 thinking block, a notice, a command's outcome), `▸` a folded run of steps or a closed compaction and
 `▾` an open one, `!` a warning, `■` an error, and nothing for the answer itself. No glyph is an
 emoji, so none is drawn as a picture. The text of every row starts in column 2 and stops a column
@@ -85,7 +85,7 @@ A turn, its finished run of steps opened:
   Here is a quick overview of where things stand.
 ```
 
-The transcript is drawn from what meka knows, not written once and scrolled away, so what is on
+The transcript is drawn from what Meka knows, not written once and scrolled away, so what is on
 screen can be changed after the fact: a thinking block or a tool call is a block that expands and
 collapses, the whole transcript re-wraps when the window is resized, older turns load as you scroll
 up, and you can type while the agent works.
@@ -141,7 +141,7 @@ Under the call, behind a `└`, is the opening of what it produced: the lines up
 one, at most three, each cut at the edge, and a count of the rest, or the one line left where only
 one is. A listing shows its header and
 first row, and a file its first lines; what a tool wrote for the model after its payload is counted
-rather than shown, and the directions meka writes into a result for the model are left out. What a
+rather than shown, and the directions Meka writes into a result for the model are left out. What a
 tool said of a failure is red; a command's output is its output, however it exited, unless it was
 stopped before it exited.
 
@@ -207,12 +207,12 @@ run open until you fold it.
 
 An image goes with the next prompt. Paste or drag a path to an image file (`png`, `jpg`, `gif`,
 `webp` or `bmp`) onto the composer and the file is attached, or press **Ctrl+V** to attach the image
-on the clipboard. meka reads that from the operating system, since a terminal pastes text alone, so
-it needs a display on the machine meka runs on and does not work over SSH; a path does. Each
+on the clipboard. Meka reads that from the operating system, since a terminal pastes text alone, so
+it needs a display on the machine Meka runs on and does not work over SSH; a path does. Each
 attachment is a chip above the text, in the order attached, marked `reading` while the image is
 read beside the screen; **Backspace** on an empty composer drops the last one. **Enter** sends them
 with the words once every one is read; pressed before then, it sends nothing and the status row
-says an image is still being read. A photo is drawn the way up it was taken, and so is a copy meka
+says an image is still being read. A photo is drawn the way up it was taken, and so is a copy Meka
 makes of it for the model, shrunk or converted; one sent as it is keeps the orientation it records,
 for the provider to read. A skill or an MCP prompt typed with them takes them, and gives
 them back when it cannot run; any other command is refused while they are attached. The profile has
@@ -250,7 +250,7 @@ the turns a [rewind](#rewind) dropped are left out, and one row in their place s
 The screen captures the mouse so that the wheel, a click and a drag reach it. Dragging over the
 transcript selects the text it covers, and releasing copies it: to the terminal's own clipboard
 through the OSC 52 sequence, which works over SSH and inside tmux where they allow it, and to the
-system clipboard where meka can reach one. The status row says how many rows went. What is copied
+system clipboard where Meka can reach one. The status row says how many rows went. What is copied
 is the text, not the screen: each row from the text edge, without the gutter's marks, and a code
 block's code as it was written, a line folded at the edge coming back as one line, its indentation
 its own, and the block's shading adding nothing. The terminal's own selection still works with its modifier held (**Shift**; **Option** in iTerm2, **Fn** in
@@ -334,7 +334,7 @@ with their state, and **Enter** offers reconnect, login and logout for the picke
 | `/rewind [N]` | Drop the last N turns from the conversation (default 1) |
 | `/export` | Export the current session as Markdown |
 | `/fork` | Fork this session and continue in the copy |
-| `/cd [path]` | Change working directory (bare: back to where meka started) |
+| `/cd [path]` | Change working directory (bare: back to where Meka started) |
 | `/skill [name] [extra]` | Pick a skill to run, or run one by name with extra context |
 | `/memory [name]` | Pick a memory to show, or show one by name |
 | `/schedule [show\|cancel <id>]` | Pick a scheduled job to show; show or cancel one by id |
@@ -358,7 +358,7 @@ and the transcript shows `Running skill '<name>'` with those words under it, liv
 as it does `Running prompt '<server>:<prompt>'` for an MCP prompt;
 `/memory` lists memories most important first; `/mcp login <server>` puts the authorization URL
 as a question in the composer's place, with one field for the callback URL pasted from the
-browser's address bar when the browser cannot reach meka, and Esc on it ends the login.
+browser's address bar when the browser cannot reach Meka, and Esc on it ends the login.
 
 Typing `/` opens the list of commands above the composer, each with its description, and the list
 narrows as you type. **Up** and **Down** move the pick, **Enter** runs the picked command, **Tab**
@@ -402,7 +402,7 @@ and the `Thinking` mode. The rest are cumulative counters for the session.
 
 `Compactions` is how many times the conversation has been summarized, whether automatically, by `/compact` or at the agent's request. It is counted from the session's history, so it survives a resume, and each one puts the earliest detail one more summary away from the original.
 
-`cache hit` is the share of input tokens served from the prompt cache rather than re-sent at full price, on every backend that reports one (Anthropic's cache tiers, OpenAI's `cached_tokens`). It should climb and stay high: meka keeps everything that changes mid-session out of the cached prefix, so a steady session re-reads the cache instead of rewriting it. The figure is arithmetic as much as it is health: every new token (a tool result, the model's own reply) is written to the cache once and read on each later request, so the session-wide share starts at zero, passes 90% around the fifteenth request (each tool call is a request) and keeps climbing from there; a low figure on a short session is not a miss. Expect it to drop once after a `/compact` (which rewrites the head of the conversation) and to recover on the following turns. A profile with [`cache_control = false`](../configuration/config-file.md#cache_control) on an endpoint that caches only what is marked reads zero here by design.
+`cache hit` is the share of input tokens served from the prompt cache rather than re-sent at full price, on every backend that reports one (Anthropic's cache tiers, OpenAI's `cached_tokens`). It should climb and stay high: Meka keeps everything that changes mid-session out of the cached prefix, so a steady session re-reads the cache instead of rewriting it. The figure is arithmetic as much as it is health: every new token (a tool result, the model's own reply) is written to the cache once and read on each later request, so the session-wide share starts at zero, passes 90% around the fifteenth request (each tool call is a request) and keeps climbing from there; a low figure on a short session is not a miss. Expect it to drop once after a `/compact` (which rewrites the head of the conversation) and to recover on the following turns. A profile with [`cache_control = false`](../configuration/config-file.md#cache_control) on an endpoint that caches only what is marked reads zero here by design.
 
 `Redactions` reports any times an Anthropic backend had to drop the oldest tool-result image blocks because the request body would have exceeded the profile's `max_request_bytes` (30 MiB by default, held under Anthropic's own 32 MiB limit). A non-zero count indicates the cache prefix was invalidated for the redacted messages.
 
@@ -432,11 +432,11 @@ Every compaction, this command's and the automatic ones, leaves a boundary on th
 
 The dropped turns leave the screen too, now and whenever the session is resumed, and one row in their place says how many went. Nothing is deleted, though: like `/compact`, the turns stay in the event log on disk, and `meka session export` still shows them with a marker where the rewind happened.
 
-Use it to take back a prompt that sent the agent down the wrong path without paying for a summary, or to recover a session the provider has started rejecting. meka repairs a rejection it causes itself (see below), but content that entered the conversation earlier is out of its reach; rewinding past it is the way back. `meka session rewind <id>` does the same to a session you are not currently in.
+Use it to take back a prompt that sent the agent down the wrong path without paying for a summary, or to recover a session the provider has started rejecting. Meka repairs a rejection it causes itself (see below), but content that entered the conversation earlier is out of its reach; rewinding past it is the way back. `meka session rewind <id>` does the same to a session you are not currently in.
 
 ### Recovering from a rejected message
 
-Providers validate the whole conversation on every request, so one piece of content they reject would otherwise fail every later turn as well, permanently. When that happens, meka strips the offending content from what it added this turn, retries once, and hands the model the provider's own complaint as a failed tool result so it can adapt rather than silently losing the data. If the retry is rejected too, the original content goes back untouched and the turn reports the provider's error.
+Providers validate the whole conversation on every request, so one piece of content they reject would otherwise fail every later turn as well, permanently. When that happens, Meka strips the offending content from what it added this turn, retries once, and hands the model the provider's own complaint as a failed tool result so it can adapt rather than silently losing the data. If the retry is rejected too, the original content goes back untouched and the turn reports the provider's error.
 
 A mislabeled image already committed to the session is repaired when you resume it, without a provider round trip. For anything further back, use `/rewind`.
 
@@ -444,9 +444,9 @@ A mislabeled image already committed to the session is repaired when you resume 
 
 A refusal is one thing the provider says; a request that never got a usable reply at all is another. A connection that fails or is reset while the request is going out is retried with backoff (up to twice, waiting 1s then 2s), and so is a response body that could not be read back. The turn continues as if the failed attempt had not happened, and nothing about it enters the conversation. Only when the retries run out does the turn report the error.
 
-Worth knowing what a retry can cost. When the failure was a body that could not be read, the provider had already generated the response and billed you for it, so the retry pays a second time. meka does it anyway, because the alternative is losing the turn for content you have already been charged for once, but it is not free.
+Worth knowing what a retry can cost. When the failure was a body that could not be read, the provider had already generated the response and billed you for it, so the retry pays a second time. Meka does it anyway, because the alternative is losing the turn for content you have already been charged for once, but it is not free.
 
-One failure is not retried, because the next attempt is known not to be worth making: a request meka could not build, which points at whatever went into it, most often a `base_url` that is not a URL or a stored credential carrying a character that cannot go in a header. A redirect is never followed at all: the endpoint's answer is reported with where it pointed, and the fix is to set `base_url` to that endpoint. A reply, or one streamed event, larger than 64 MiB is refused for the same reason: an endpoint answering with something that size is not answering the request.
+One failure is not retried, because the next attempt is known not to be worth making: a request Meka could not build, which points at whatever went into it, most often a `base_url` that is not a URL or a stored credential carrying a character that cannot go in a header. A redirect is never followed at all: the endpoint's answer is reported with where it pointed, and the fix is to set `base_url` to that endpoint. A reply, or one streamed event, larger than 64 MiB is refused for the same reason: an endpoint answering with something that size is not answering the request.
 
 Retrying is bounded by time as well as by count, and the time bound is the one that usually decides. A failure that takes the full idle timeout to arrive costs five minutes, which spends the whole budget, so a stream that hung is reported rather than tried again: retrying is for a failure that was cheap, and a provider that went silent for five minutes has already taken more of your turn than a second silence is worth. Without the bound at all, three slow failures would be fifteen minutes of waiting on a turn that fails anyway.
 
@@ -483,13 +483,13 @@ The command runs in the session's working directory, so it follows `/cd`. Its ou
 and shown in the transcript, colors included, with a line naming the exit status when it failed.
 It runs beside the screen, which keeps drawing and counts the seconds on the working row; **Esc** or
 **Ctrl+C** kills it, with everything it started, and marks it `! Interrupted`; so does leaving
-meka, a hangup or SIGTERM included. (On Windows the shell alone is killed.) Its output keeps its
+Meka, a hangup or SIGTERM included. (On Windows the shell alone is killed.) Its output keeps its
 last 1 MiB and 10,000 lines, and a row says when more was let go. It reads nothing from the keyboard, and a command that needs the terminal itself (an editor, a pager) belongs in a
-shell beside meka.
+shell beside Meka.
 
 ## Exiting
 
-You can leave meka in any of these ways:
+You can leave Meka in any of these ways:
 
 - Type `/exit` or `/quit`
 - Type `exit` or `quit`

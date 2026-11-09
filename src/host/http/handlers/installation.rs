@@ -459,7 +459,7 @@ pub(crate) struct RenameRequest {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such account", body = ProblemDetail),
-        (status = 409, description = "A session or sub-agent running on this server may run on the account, or another meka is refreshing its credential, which refreshes under its name", body = ProblemDetail),
+        (status = 409, description = "A session or sub-agent running on this server may run on the account, or another Meka is refreshing its credential, which refreshes under its name", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid new name, or one in use; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -964,7 +964,7 @@ pub(crate) struct LoginStatus {
         (status = 404, description = "No such account", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "No key for a backend that takes one, or one for a backend that logs in through the browser; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
-        (status = 502, description = "The login produced no authorization URL in time; the reason is in the meka log", body = ProblemDetail),
+        (status = 502, description = "The login produced no authorization URL in time; the reason is in the Meka log", body = ProblemDetail),
         (status = 503, description = "The server is shutting down", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
@@ -1062,14 +1062,14 @@ async fn begin_browser_login(
             .await
             .map_err(|error| {
                 // The authorization server's own words are relayed as `[serve]
-                // relay_provider_errors` decides; an exchange that got no answer meka can read is
+                // relay_provider_errors` decides; an exchange that got no answer Meka can read is
                 // the endpoint's failure, with the reason in the log; every other failure is
-                // meka's own sentence about what the person did.
+                // Meka's own sentence about what the person did.
                 if error.downcast_ref::<account::ExchangeRejected>().is_some() {
                     refused(exchange_rejection(relay, &account, &error))
                 } else if error.downcast_ref::<account::ExchangeFailed>().is_some() {
                     tracing::warn!("the token exchange for '{account}' failed: {error}");
-                    upstream("the token exchange got no answer; the reason is in the meka log")
+                    upstream("the token exchange got no answer; the reason is in the Meka log")
                 } else {
                     tracing::warn!("the browser login for '{account}' ended: {error}");
                     refused(error.to_string())
@@ -1246,7 +1246,7 @@ where
                 }
                 return Err(upstream(format!(
                     "the login for {noun} '{subject}' produced no authorization URL within {}s; \
-                     the reason is in the meka log",
+                     the reason is in the Meka log",
                     LOGIN_URL_WAIT.as_secs()
                 )));
             }
@@ -1397,7 +1397,7 @@ pub(crate) struct CompleteLoginRequest {
         (status = 404, description = "No such login pending on the account, or one that lapsed", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "No code in what was pasted, another login's state, or an exchange the authorization server rejected; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
-        (status = 502, description = "The token exchange got no answer meka can read, or the login lapsed; the reason is in the meka log", body = ProblemDetail),
+        (status = 502, description = "The token exchange got no answer Meka can read, or the login lapsed; the reason is in the Meka log", body = ProblemDetail),
         (status = 503, description = "The server is shutting down", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
@@ -2334,7 +2334,7 @@ pub(crate) struct McpLoginRequest {
         (status = 404, description = "No such server", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "A secret the entry cannot present, both secrets at once, or a login the entry cannot run: a stdio server, or one holding a bearer; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
-        (status = 502, description = "The login did not begin: the server or its authorization server did not answer; the reason is in the meka log", body = ProblemDetail),
+        (status = 502, description = "The login did not begin: the server or its authorization server did not answer; the reason is in the Meka log", body = ProblemDetail),
         (status = 503, description = "The server is shutting down", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
@@ -2460,7 +2460,7 @@ fn mcp_login_problem(
         crate::error::MekaError::Database(_) | crate::error::MekaError::Io(_) => {
             ProblemDetail::internal_sanitized("the MCP login failed", error)
         }
-        _ => upstream("the login did not complete; the reason is in the meka log"),
+        _ => upstream("the login did not complete; the reason is in the Meka log"),
     }
 }
 
@@ -2513,7 +2513,7 @@ pub(crate) async fn mcp_login_status(
         (status = 404, description = "No such login pending on the server, or one that lapsed", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "No code in what was posted, another login's state, or a login that had already ended; or `config.toml` holds something startup would refuse, which refuses every write until it is repaired", body = ProblemDetail),
-        (status = 502, description = "The exchange at the authorization server failed; the reason is in the meka log", body = ProblemDetail),
+        (status = 502, description = "The exchange at the authorization server failed; the reason is in the Meka log", body = ProblemDetail),
         (status = 503, description = "The server is shutting down", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),

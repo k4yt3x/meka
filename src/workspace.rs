@@ -13,7 +13,7 @@ use std::{
 /// the screen prompt, the `/cd` slash command, and the per-turn environment-context block.
 /// `std::sync::RwLock` (rather than `tokio::sync::RwLock`) so the synchronous screen prompt can
 /// read it without entering an async context; reads/writes are microseconds (a `PathBuf` clone or
-/// replace), never held across `.await`. Poisoning is recovered through [`crate::sync`]: meka never
+/// replace), never held across `.await`. Poisoning is recovered through [`crate::sync`]: Meka never
 /// panics with this lock held, so a poisoned lock is a separate bug that already fired, and serving
 /// the stored path beats failing every later tool call.
 #[derive(Clone)]
@@ -54,7 +54,7 @@ pub(crate) fn resolve_against_cwd(cwd: &SharedCwd, input: impl AsRef<std::path::
 /// per the ACP spec.
 ///
 /// These expand discovery scope **and**, at [`crate::permission::Permission::Workspace`], the set
-/// of roots a write may land under ([`writable_roots`]). A client that hands meka a folder is
+/// of roots a write may land under ([`writable_roots`]). A client that hands Meka a folder is
 /// naming part of the workspace rather than somewhere to search, and a level that could read those
 /// folders but never write them would impose a boundary the client never asked for.
 ///
@@ -173,7 +173,7 @@ pub(crate) fn usable_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<Path
 /// Two refusals, each because a backend cannot express the boundary otherwise.
 ///
 /// **Not a directory.** Landlock's `PATH_BENEATH` rule is rejected with `EINVAL` when the parent is
-/// a regular file and the rule carries directory-class rights, which meka's full handled-access
+/// a regular file and the rule carries directory-class rights, which Meka's full handled-access
 /// mask does. `apply_landlock` then fails inside `pre_exec`, so every shell command in the
 /// session dies with `Invalid argument`, not just a write to that root. The other three backends
 /// accept a file root and quietly do something different with it.
@@ -217,12 +217,12 @@ fn is_usable_root(path: &Path) -> bool {
 /// are refused as whole subtrees because everything in them is the kind of socket being hidden.
 ///
 /// The list below is the authority. `/tmp` and `/var/tmp` are in it: "they hold no IPC socket
-/// meka's masks care about" is false on any ordinary desktop.
+/// Meka's masks care about" is false on any ordinary desktop.
 pub(crate) fn is_system_root(path: &Path) -> bool {
     is_masked_root(path, &private_directories())
 }
 
-/// meka's own directories: the config directory and the data directory holding the credential
+/// Meka's own directories: the config directory and the data directory holding the credential
 /// store.
 ///
 /// Every sandbox dialect that can hides these from a confined shell, and the write fence refuses a
@@ -241,7 +241,7 @@ pub(crate) fn private_directories() -> Vec<PathBuf> {
 }
 
 /// [`private_directories`] over the given candidates, so the rule can be tested without the
-/// environment deciding where meka's directories are.
+/// environment deciding where Meka's directories are.
 fn private_directories_among(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut directories: Vec<PathBuf> = Vec::new();
     for directory in candidates {
@@ -263,10 +263,10 @@ fn private_directories_among(candidates: impl IntoIterator<Item = PathBuf>) -> V
     directories
 }
 
-/// The part of the private directories that stays readable below `unrestricted`: meka's own
+/// The part of the private directories that stays readable below `unrestricted`: Meka's own
 /// skills store, less its dot-entries ([`is_dot_entry_under`]). A skill's bundled files are what
 /// its body tells the model to read, and the store sits under the config directory only because
-/// that is where meka keeps what the user authored; nothing secret lives there. The shell sandbox
+/// that is where Meka keeps what the user authored; nothing secret lives there. The shell sandbox
 /// still masks it, so the header a skill is served with says to read them with `file_read`.
 fn readable_within_private() -> Vec<PathBuf> {
     private_directories_among(crate::paths::skills_dir())
@@ -283,10 +283,10 @@ fn is_dot_entry_under(directory: &Path, path: &Path) -> bool {
         .is_some_and(|component| component.as_os_str().to_string_lossy().starts_with('.'))
 }
 
-/// The refusal for reading a canonical `target` at `permission` when it lies inside meka's own
+/// The refusal for reading a canonical `target` at `permission` when it lies inside Meka's own
 /// directories, with the private and readable directories taken as parameters: the rule
 /// [`ReadFence`] applies, exposed so the tests can state it without the environment deciding
-/// where meka's directories are.
+/// where Meka's directories are.
 #[cfg(test)]
 fn private_read_refusal_with(
     permission: crate::permission::Permission,
@@ -312,7 +312,7 @@ fn private_read_refusal_with(
 /// The system-wide files (`meminfo`, `cpuinfo`, `mounts`, `net/*`) stay readable: they carry no
 /// secret, and at `read` the shell is closed, so `file_read` is the only door to them. Every entry
 /// that does carry one is per process: `environ` holds what a process was given, which for an MCP
-/// server meka spawned is its credential and for meka itself every `${VAR}` `config.toml` names;
+/// server Meka spawned is its credential and for Meka itself every `${VAR}` `config.toml` names;
 /// `cmdline`, `fd`, `maps` and `mem` (readable for a child under the default ptrace scope) hold
 /// the rest. The sandboxed shell already sees no other process; this is the same line for the
 /// in-process readers.
@@ -333,7 +333,7 @@ fn is_process_proc_entry(target: &Path) -> bool {
     })
 }
 
-/// What a read below `unrestricted` may not reach: meka's own directories, less the part of them
+/// What a read below `unrestricted` may not reach: Meka's own directories, less the part of them
 /// that stays readable, and, when reads are confined, anything outside the readable directories.
 /// None
 /// of it at `unrestricted`, so a walk there resolves nothing.
@@ -351,7 +351,7 @@ pub(crate) struct ReadFence {
 }
 
 impl ReadFence {
-    /// The fence at `permission` with reads unconfined: meka's own directories alone.
+    /// The fence at `permission` with reads unconfined: Meka's own directories alone.
     pub(crate) fn at(permission: crate::permission::Permission) -> Self {
         if permission == crate::permission::Permission::Unrestricted {
             return Self {
@@ -411,7 +411,7 @@ impl ReadFence {
             .find(|directory| judged.starts_with(directory))
         {
             return Some(format!(
-                "'{}' is inside meka's own directory {}, which only `unrestricted` reads.",
+                "'{}' is inside Meka's own directory {}, which only `unrestricted` reads.",
                 shown.display(),
                 directory.display()
             ));
@@ -576,12 +576,12 @@ impl ReadBoundary {
     /// spelling would be bound and granted against whatever directory the child is in; when it
     /// does not resolve, as a workspace root is, since a boundary naming a directory that is not
     /// there should permit nothing rather than a name something could later be created at; and
-    /// when it is a directory the sandbox masks or one of meka's own ([`is_system_root`]), since
+    /// when it is a directory the sandbox masks or one of Meka's own ([`is_system_root`]), since
     /// Bubblewrap binds the readable paths after its masks and a later mount wins, so `/run`
     /// named here would hand the session bus back to a confined shell through a read-only bind.
     /// A skill root is judged the same way, silently when absent, since a configured root that is
     /// not there is already promised to leave no trace: a skill's bundled files are what its body
-    /// tells the model to read, which is why meka's own skills store stays readable too.
+    /// tells the model to read, which is why Meka's own skills store stays readable too.
     pub(crate) fn new(
         confined: bool,
         additional_readable_directories: &[PathBuf],
@@ -646,7 +646,7 @@ impl ReadBoundary {
         Self { confined, base }
     }
 
-    /// No boundary: reads reach everywhere but meka's own directories.
+    /// No boundary: reads reach everywhere but Meka's own directories.
     pub(crate) fn unconfined() -> Self {
         Self::default()
     }
@@ -876,7 +876,7 @@ impl ReadScope {
         }
     }
 
-    /// A scope that confines nothing but meka's own directories, for tools under test that are
+    /// A scope that confines nothing but Meka's own directories, for tools under test that are
     /// not exercising the boundary.
     #[cfg(test)]
     pub(crate) fn unconfined(permission: crate::permission::SharedPermission) -> Self {
@@ -933,7 +933,7 @@ pub(crate) fn pinned_ancestors(writable: &[PathBuf], private: &[PathBuf]) -> Vec
     pinned
 }
 
-/// [`is_system_root`] with meka's private directories taken as a parameter, so it can be tested
+/// [`is_system_root`] with Meka's private directories taken as a parameter, so it can be tested
 /// without the environment deciding where those are.
 ///
 /// A private directory refuses a root **at or under** it, not an ancestor of it. The system masks
@@ -960,7 +960,7 @@ fn is_masked_root(path: &Path, private: &[PathBuf]) -> bool {
         // which is a hole straight back out of the sandbox: measured, by reaching a tmux server
         // over a socket under `/tmp` from inside a confined shell and having it create a file in
         // `$HOME`, outside every workspace root. `/tmp` and `/var/tmp` are not admitted: "they hold
-        // no IPC socket meka's masks care about" is false on any ordinary desktop.
+        // no IPC socket Meka's masks care about" is false on any ordinary desktop.
         //
         // Refusing `/tmp` costs a session started with `cd /tmp` its write boundary, which is the
         // safe direction: the alternative is a boundary that reports itself as holding while the
@@ -1026,7 +1026,7 @@ pub(crate) static RUNTIME_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex:
 /// workspace while still refusing the ones outside it.
 ///
 /// Verbatim UNC paths are deliberately left alone: a network share cannot be a workspace root
-/// anyway, because meka has to own the directory to grant on it.
+/// anyway, because Meka has to own the directory to grant on it.
 ///
 /// `pub(crate)` because the tools canonicalize too, for the file they are about to open. This is
 /// the tree's one answer to what shape a path is in, so everything that produces one goes through
@@ -1549,7 +1549,7 @@ impl WriteScope {
             // deliberate difference from `Confinement::resolve`, whose catch-all is `ReadOnly` and
             // grants no write at all. The two are *not* the same decision:
             //
-            // - `Confinement::resolve` answers "what may a command meka did not write do", and the
+            // - `Confinement::resolve` answers "what may a command Meka did not write do", and the
             //   honest answer at `read` is nothing.
             // - This answers "where may a tool the operator deliberately lowered write", and a
             //   `file_write = "read"` override is a statement that the tool should be usable at
@@ -1601,7 +1601,7 @@ impl WriteScope {
         self.admit_with_private(level, cwd, shown, target, &private_directories())
     }
 
-    /// [`Self::admit_shown_at`] with meka's private directories taken as a parameter, so the
+    /// [`Self::admit_shown_at`] with Meka's private directories taken as a parameter, so the
     /// refusal can be tested without the environment deciding where those are.
     fn admit_with_private(
         &self,
@@ -1615,7 +1615,7 @@ impl WriteScope {
             return Ok(());
         };
         let candidate = normalize_lexically(target);
-        // meka's own store is never a workspace, whatever roots the session holds: a root at
+        // Meka's own store is never a workspace, whatever roots the session holds: a root at
         // `$HOME` contains `~/.config/meka`, and a confined agent that can rewrite `config.toml` or
         // `meka.db` has left every boundary that file describes. The sandbox masks the same
         // directories from the shell; this is the same rule at the in-process door.
@@ -1624,7 +1624,7 @@ impl WriteScope {
             .find(|directory| candidate.starts_with(directory))
         {
             return Err(format!(
-                "'{}' is inside meka's own directory {}, which no workspace root reaches. Only \
+                "'{}' is inside Meka's own directory {}, which no workspace root reaches. Only \
                  `unrestricted` writes there.",
                 shown.display(),
                 directory.display()
@@ -1722,11 +1722,11 @@ pub(crate) fn glob_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
     kept
 }
 
-/// Canonicalize a path the way meka does, for tests that compare against meka's own output.
+/// Canonicalize a path the way Meka does, for tests that compare against Meka's own output.
 ///
 /// `std::fs::canonicalize` hands back a `\\?\`-prefixed path on Windows, and every production
 /// caller runs the result through [`strip_verbatim`]. A test that skips that step asserts against
-/// the one spelling meka never produces, and passes everywhere `strip_verbatim` is the identity, so
+/// the one spelling Meka never produces, and passes everywhere `strip_verbatim` is the identity, so
 /// the failure is Windows-only. A named helper rather than a `.map(strip_verbatim)` a test can
 /// forget.
 #[cfg(test)]
@@ -2282,7 +2282,7 @@ mod tests {
         drop(held);
     }
 
-    /// The read door is the write fence's twin: below `unrestricted` nothing under meka's own
+    /// The read door is the write fence's twin: below `unrestricted` nothing under Meka's own
     /// directories is readable, whatever roots the session holds. Without it a session at `read`,
     /// the level whose contract is "cannot change the machine", read the credential store.
     #[test]
@@ -2293,7 +2293,7 @@ mod tests {
         for permission in [Permission::Read, Permission::Workspace, Permission::None] {
             let refusal = private_read_refusal_with(permission, store, &private, &[])
                 .unwrap_or_else(|| panic!("{permission:?} must refuse the store"));
-            assert!(refusal.contains("meka's own directory"), "{refusal}");
+            assert!(refusal.contains("Meka's own directory"), "{refusal}");
         }
         assert!(
             private_read_refusal_with(Permission::Unrestricted, store, &private, &[]).is_none(),
@@ -2357,11 +2357,11 @@ mod tests {
             &readable,
         )
         .expect("a dot-entry at the store's top level is hidden with the directory");
-        assert!(refusal.contains("meka's own directory"), "{refusal}");
+        assert!(refusal.contains("Meka's own directory"), "{refusal}");
     }
 
     /// A process's own `/proc` directory is refused below `unrestricted` by the same rule that
-    /// refuses meka's directories, whether named by pid, `self` or `thread-self`; the system-wide
+    /// refuses Meka's directories, whether named by pid, `self` or `thread-self`; the system-wide
     /// files beside them are not, since they carry no secret and are the one way to read them at
     /// `read`.
     #[test]
@@ -2401,7 +2401,7 @@ mod tests {
         assert!(!is_process_proc_entry(Path::new("/procfs/1234/environ")));
     }
 
-    /// The in-process write door refuses meka's own directories even when a workspace root
+    /// The in-process write door refuses Meka's own directories even when a workspace root
     /// contains them, the same rule the sandbox masks enforce for the shell.
     #[test]
     fn the_write_fence_refuses_meka_s_own_directories_under_a_containing_root() {
@@ -2436,7 +2436,7 @@ mod tests {
         let refusal = scope
             .admit_with_private(level, &cwd, &config, &config, &private)
             .expect_err("a path inside the store is refused although the root contains it");
-        assert!(refusal.contains("meka's own directory"), "{refusal}");
+        assert!(refusal.contains("Meka's own directory"), "{refusal}");
         assert!(
             scope
                 .admit_with_private(level, &cwd, &config, &config, &[])
@@ -3009,7 +3009,7 @@ mod tests {
 
     /// The read boundary: inside a root or a base path is admitted, outside is refused with the
     /// roots named, `unrestricted` disclaims it, and a scope without one admits everything but
-    /// meka's own directories.
+    /// Meka's own directories.
     #[test]
     fn a_confined_read_stays_within_the_roots_and_the_base_paths() {
         use crate::permission::{EnabledPermissions, Permission, SharedPermission};

@@ -356,7 +356,7 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
 /// would mean parsing YAML back out of it, which this store never does.
 pub(crate) async fn run_edit(store: &MemoryStore, name: &str, project: Option<&str>) -> Result<()> {
     // Validated before the name becomes a path, as every other door does. `run_export`'s comment
-    // records that rows carrying names meka would not accept exist in the wild, and this function
+    // records that rows carrying names Meka would not accept exist in the wild, and this function
     // joins the name onto a temp directory: `meka memory edit ../pwned` wrote the note's body to
     // `/tmp/pwned.md`, outside the directory the cleanup below removes, where it then stayed.
     memory::validate_memory_name(name).map_err(MekaError::Usage)?;
@@ -441,7 +441,7 @@ pub(crate) async fn run_edit(store: &MemoryStore, name: &str, project: Option<&s
             &original,
             format!("memory '{name}' was deleted while the editor was open"),
         )),
-        // Refused rather than merged or overwritten: meka cannot know which version is right, so it
+        // Refused rather than merged or overwritten: Meka cannot know which version is right, so it
         // keeps both and says where each one is.
         Ok(crate::store::memory::BodyWrite::ChangedUnderneath) => Err(unsaved_edit(
             &directory,
@@ -591,7 +591,7 @@ pub(crate) async fn run_remove(
     project: Option<&str>,
 ) -> Result<()> {
     // The lookup rule, not the write rule. Refusing to *delete* a name this store would not have
-    // written is what left a row nothing meka ships could remove.
+    // written is what left a row nothing Meka ships could remove.
     memory::validate_memory_lookup(name).map_err(MekaError::Usage)?;
     if store
         .delete(name, &MemoryView::for_operator(project))
@@ -645,7 +645,7 @@ pub(crate) async fn run_export(
 
     // Every memory checked before a single file is written, both for a name a filesystem cannot
     // take and for a description the file cannot carry: this is the one place a name becomes a
-    // path, and a row can carry one meka's own write doors would have refused, since anything
+    // path, and a row can carry one Meka's own write doors would have refused, since anything
     // writing straight to the column can land a `nul.md` or a `-old.md`.
     let unusable: Vec<String> = memories
         .iter()
@@ -775,7 +775,7 @@ pub(crate) async fn run_export(
 }
 
 /// `meka memory import <DIR>`: the reverse of [`run_export`], every memory file of the snapshot
-/// into the store in one transaction, with the manifest read first so a snapshot an older meka
+/// into the store in one transaction, with the manifest read first so a snapshot an older Meka
 /// wrote is brought forward, or refused, before a file is parsed.
 ///
 /// Every file is parsed and checked before the store is asked, so a refusal names the file and
@@ -807,7 +807,7 @@ pub(crate) async fn run_import(store: &MemoryStore, directory: &Path, force: boo
         let (frontmatter, body) = memory::split_memory_file(&text).map_err(refusal)?;
         let mut frontmatter: yaml_serde::Value = yaml_serde::from_str(frontmatter)
             .map_err(|error| refusal(format!("the frontmatter is not YAML: {error}")))?;
-        // Only the migration module knows what an older meka wrote, so a snapshot at another
+        // Only the migration module knows what an older Meka wrote, so a snapshot at another
         // version is handed over file by file and read back brought forward, or refused.
         if version != memory::MEMORY_EXPORT_FORMAT_VERSION
             && !crate::store::migrations::bring_memory_file_forward(

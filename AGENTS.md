@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Guidance for AI agents working in this repository. Three sections: general principles, Rust
-practice, then meka-specific rules.
+practice, then Meka-specific rules.
 
 ---
 
@@ -9,7 +9,7 @@ practice, then meka-specific rules.
 
 ## The better design over compatibility
 
-meka does not keep a stable interface. When the cleaner shape breaks a config key, a flag, a tool
+Meka does not keep a stable interface. When the cleaner shape breaks a config key, a flag, a tool
 name, a route, a wire value or a stored shape, take the cleaner shape: mark it `**Breaking:**` in
 the changelog, give the remedy in the upgrade guide, and convert stored data once in the migration
 module. Never keep a worse design to spare users an upgrade step.
@@ -110,11 +110,11 @@ assumption is the entire return, and it is lost the moment a second place tolera
 
 ## Prose style
 
-- American spelling everywhere meka owns the word: prose, comments, docs, strings, identifiers and
-  meka's own wire values (`canceled`, `color`, `catalog`, `behavior`). Only a name another protocol
+- American spelling everywhere Meka owns the word: prose, comments, docs, strings, identifiers and
+  Meka's own wire values (`canceled`, `color`, `catalog`, `behavior`). Only a name another protocol
   or crate defines keeps its spelling (ACP's `stopReason: "cancelled"`, MCP's
   `notifications/cancelled`, `serde::Serialize`), and a value a model emits may be accepted in both
-  spellings while meka writes one.
+  spellings while Meka writes one.
 - No em dashes (`—`). Prefer a colon, a comma or parentheses.
 - Sentence-case headings in the book; product names keep their case.
 
@@ -214,12 +214,17 @@ Command summaries take no trailing period; multi-sentence prose is punctuated no
 
 ---
 
-# meka
+# Meka
 
 ## Vocabulary
 
 One word per concept, everywhere it is written or read:
 
+- **Meka** wherever the product is named: prose, comments, every message, log and help line, and
+  a display-name field (an ACP or MCP handshake's `title`, the Windows product name and file
+  description, the name `--version` prints). `meka` is only an identifier: the command and a
+  command line, the binary's file name, the crate, paths and `meka.db`, a tracing target, and an
+  identifier on a wire (`meka-priority`, the `meka/<version>` user agent, a handshake's `name`).
 - **permission level**, never "mode": `level` in prose, `permission` in identifiers. ACP's own
   `set_mode` and `mode_id` keep their protocol names.
 - **profile**, **account**, **backend**. "Provider" is only the upstream service and the `Provider`
@@ -242,7 +247,7 @@ One word per concept, everywhere it is written or read:
   its answers are allow and deny.
 - **standing instructions** for the concept; "instructions file" only for the file on disk.
 - **id** lowercase; "UUID" only where the format is the point.
-- Refusal verbs: *refuse* is meka's own decision; *reject* is a remote party (a provider, an MCP
+- Refusal verbs: *refuse* is Meka's own decision; *reject* is a remote party (a provider, an MCP
   server); *deny* is the OS, a permission, or the user's answer; *decline* is a gate or the model.
 - Quoting in a message: backticks for keys, commands and code (`` `[permissions].default` ``,
   `` `meka profile use` ``); single quotes for values and names (`'work'`). An unknown name is
@@ -250,7 +255,7 @@ One word per concept, everywhere it is written or read:
   command is a typed `MekaError` variant (`ProfileDefaultStillNeeded`, `McpCredentialInTheWay`):
   its `Display` is the shell's sentence, and `ProblemDetail::for_error` words the route from its
   fields, the one place every HTTP route takes it from.
-- An empty list says "No <nouns>." on stderr. Every line meka says in its own voice, a status
+- An empty list says "No <nouns>." on stderr. Every line Meka says in its own voice, a status
   line, a notice, a stage direction, a turn's end row, a note printed on the way out, starts
   with a capital letter whatever its shape ("Background task 7f3a1c22 finished after 6s",
   "Checklist: 2 open items, continuing, nudge 1 of 3", "Interrupted"); a line that opens with a
@@ -260,6 +265,7 @@ One word per concept, everywhere it is written or read:
   whatever its shape ("Connected to 'exa'", "No skills"): the screen's own strings are written
   without one, and a row drawn from a sentence another surface shares (a notice, a stage
   direction, an error, a compaction's headline) loses it through `draw::without_closing_period`.
+  A `-v` log row is not said in Meka's voice and is drawn as written.
   One wording per event, live and on a replay of the log, so a resumed session reads as the live
   one did. The live screen may say more than the log records, news as it happens such as a
   checklist nudge's counts or how late a scheduled fire ran; the replay leaves that out and says
@@ -369,25 +375,25 @@ combination nobody configured and no field states the mismatch.
   when two models on one endpoint would state it the same, per "Whose fact is it". A profile field
   gets a `profile add` flag and a `profile set` key, never a global CLI flag, env var, or session
   column. `account` is not settable on a profile, because moving it moves every session on the
-  profile onto another credential; `device_id` is not settable at all, because meka resolves it.
+  profile onto another credential; `device_id` is not settable at all, because Meka resolves it.
 - **`backend` names the driver**, not a protocol: API-key backends are named for the protocol
   because `base_url` decides the endpoint, subscription backends for the product because the
   endpoint is fixed.
 
 ## Typed keys and `parameters`
 
-A profile shapes the request two ways. A **typed key** is meka's: a name meka defines and writes in
-each wire's own form. **`[profiles.<name>.parameters]`** is the provider's: fields meka copies
+A profile shapes the request two ways. A **typed key** is Meka's: a name Meka defines and writes in
+each wire's own form. **`[profiles.<name>.parameters]`** is the provider's: fields Meka copies
 into the request body without reading them, spelled as that provider documents them. A setting is a
 typed key only when it answers yes to one of three questions:
 
-1. **Is it meka's own?** meka acts on the value (computes from it, decides by it, or changes how it
+1. **Is it Meka's own?** Meka acts on the value (computes from it, decides by it, or changes how it
    builds, reads or replays the conversation), or sends the field unasked for a feature of its own,
    where the key is the switch an endpoint that refuses the field needs. `thinking`,
    `max_output_tokens` on a Messages wire, `encrypted_reasoning`, `reasoning_summary` and
-   `deferred_tools` are meka's own. Typed, on the backends where that holds.
+   `deferred_tools` are Meka's own. Typed, on the backends where that holds.
 2. **Does every backend have it?** One concept every wire states, under whatever names: `effort`,
-   `max_output_tokens`. Typed, as one name meka translates.
+   `max_output_tokens`. Typed, as one name Meka translates.
 3. **Does a subscription's official client offer it?** A subscription's request copies an official
    client's and takes no `parameters`, so a setting that client offers its user is a typed key on
    that backend alone, sent as the client sends it: `thinking_display` is Claude Code's display
@@ -400,7 +406,7 @@ Showing a value on `/status` is not acting on it, and translating a name is no r
 concept only some backends share is written in each one's spelling, or the typed set becomes a
 translation table that grows with every provider.
 
-Each top-level field of a request has one owner, so nothing overrides anything. meka reserves every
+Each top-level field of a request has one owner, so nothing overrides anything. Meka reserves every
 field it writes on a backend, whether or not a given profile makes it write that field, and a
 parameter naming one is refused at load and at every write door through one predicate, with the
 typed key to use when there is one. A server's synonym for a reserved field (`max_tokens` beside
@@ -414,7 +420,7 @@ load, which is a `**Breaking:**` change.
 `src/store/migrations.rs` is an append-only ledger applied on open inside the schema lock, in one
 transaction, behind an automatic backup. Four rules:
 
-1. **Only the migration module may know an older meka wrote the store.** No fallback readers, version
+1. **Only the migration module may know an older Meka wrote the store.** No fallback readers, version
    sniffing, or "this column used to be called X" branches anywhere else. If a reader seems to need
    one, a migration is missing.
 2. **A migration is frozen once any store has run it**, including a development store. `user_version`
@@ -426,7 +432,7 @@ transaction, behind an automatic backup. Four rules:
    objects by the names they had, so a step that renames or drops one a frozen step reads must also
    move the floor in `classify_by_shape`, which classifies an unversioned store past every step before
    the rename by a marker the rename leaves, so no replay reaches the name that is gone.
-4. **A migration may receive data it cannot work out, but may not call meka's own code** to get it.
+4. **A migration may receive data it cannot work out, but may not call Meka's own code** to get it.
    Only `rusqlite`, `serde_json` and the like. A function can change meaning years later; a `String`
    cannot. `Step::Contextual` takes plain data from the caller, and its `Context` is append-only for
    the same reason the ledger is.
@@ -511,7 +517,7 @@ change meaning with `action` is a family that wants splitting.
 Every tool reads its arguments by five rules, through the readers in `src/tools/util.rs`, never a
 raw `input.get(...)`. A model that fills every field it was shown sends `""` where it has nothing
 to say, which a strict schema spells `null`; both mean the field was left out, and no standard
-defines a blank, so meka does, once.
+defines a blank, so Meka does, once.
 
 - **A string.** Absent, `null` and blank (empty or whitespace alone) are "not given": omitted for an
   optional field (`optional_str`), missing for a required one (`require_str`, which refuses by
@@ -585,10 +591,10 @@ edge is by design, `tools/subagent` reaching up to `agent`, because a sub-agent 
 module fails the test until it is placed. Put new code where its callers already are: a type
 read by `store` and `host` belongs in `store` or below, never in `host`.
 
-meka ships as one crate. The provider layer serves meka's own wires and is not a library: the
+Meka ships as one crate. The provider layer serves Meka's own wires and is not a library: the
 Messages driver and the Claude subscription driver share one wire module, and the harness reads
 `config.toml` and the store. A library crate would need a contract a party outside this repository
-holds and pins, and none does; a program that wants meka drives it over the HTTP API.
+holds and pins, and none does; a program that wants Meka drives it over the HTTP API.
 
 ## Documentation
 

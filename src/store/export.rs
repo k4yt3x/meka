@@ -27,7 +27,7 @@ pub(crate) fn parse_session_export(raw: &[u8]) -> crate::error::Result<SessionEx
     if envelope.format_version == SESSION_EXPORT_FORMAT_VERSION {
         return serde_json::from_slice(raw).map_err(invalid);
     }
-    // Only the migration module knows what an older meka wrote, so this door hands the document
+    // Only the migration module knows what an older Meka wrote, so this door hands the document
     // over and reads the answer: brought forward, or not a version it knows.
     let mut document: serde_json::Value = serde_json::from_slice(raw).map_err(invalid)?;
     if !super::migrations::bring_archive_forward(
@@ -359,7 +359,7 @@ pub(crate) fn plan_import(
         }
     }
 
-    // A stamp meka did not write is refused ahead of any row: every listing reads them back, and
+    // A stamp Meka did not write is refused ahead of any row: every listing reads them back, and
     // a column cut from one has to be cut from a shape it knows.
     for session in &mut export.sessions {
         let id = session.id.clone();
@@ -475,7 +475,7 @@ pub(crate) fn plan_import(
                 .is_err()
             {
                 return Err(crate::error::MekaError::Usage(format!(
-                    "session {} in the archive records a turn source meka does not know: '{}'",
+                    "session {} in the archive records a turn source Meka does not know: '{}'",
                     session.id, turn.source
                 )));
             }
@@ -485,7 +485,7 @@ pub(crate) fn plan_import(
                 .is_err()
             {
                 return Err(crate::error::MekaError::Usage(format!(
-                    "session {} in the archive records a permission level meka does not know: \
+                    "session {} in the archive records a permission level Meka does not know: \
                      '{}'",
                     session.id, turn.permission
                 )));
@@ -494,7 +494,7 @@ pub(crate) fn plan_import(
                 && reason.parse::<crate::store::turns::CancelReason>().is_err()
             {
                 return Err(crate::error::MekaError::Usage(format!(
-                    "session {} in the archive records a cancel reason meka does not know: \
+                    "session {} in the archive records a cancel reason Meka does not know: \
                      '{reason}'",
                     session.id
                 )));
@@ -503,7 +503,7 @@ pub(crate) fn plan_import(
                 && status.parse::<crate::store::turns::TurnStatus>().is_err()
             {
                 return Err(crate::error::MekaError::Usage(format!(
-                    "session {} in the archive records a turn status meka does not know: '{status}'",
+                    "session {} in the archive records a turn status Meka does not know: '{status}'",
                     session.id
                 )));
             }
@@ -511,7 +511,7 @@ pub(crate) fn plan_import(
                 && crate::error::ErrorKind::from_name(error_type).is_none()
             {
                 return Err(crate::error::MekaError::Usage(format!(
-                    "session {} in the archive records an error type meka does not know: \
+                    "session {} in the archive records an error type Meka does not know: \
                      '{error_type}'",
                     session.id
                 )));
@@ -1287,7 +1287,7 @@ mod tests {
         }
     }
 
-    /// A turn's source is read back typed, so an archive naming one meka does not know is refused
+    /// A turn's source is read back typed, so an archive naming one Meka does not know is refused
     /// at the door rather than written into a row every listing of the session then fails on.
     #[test]
     fn an_archive_turn_with_an_unknown_source_is_refused() {
@@ -1357,7 +1357,7 @@ mod tests {
         .expect("a project the store has is planned");
     }
 
-    /// A stamp that is not RFC 3339 is refused ahead of any row: meka's own are, every listing
+    /// A stamp that is not RFC 3339 is refused ahead of any row: Meka's own are, every listing
     /// reads them back, and `scratchpad_list` cuts one for its column.
     #[test]
     fn an_archive_stamp_that_is_not_rfc_3339_is_refused() {

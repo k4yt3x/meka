@@ -39,7 +39,7 @@ use crate::text::{
 /// width it was handed -- stops being satisfiable at all. This leaves a few columns above that so
 /// each surface can still show a truncation marker rather than only its own prefix.
 ///
-/// A terminal this narrow wraps meka's chrome whatever the width says, so composing at the
+/// A terminal this narrow wraps Meka's chrome whatever the width says, so composing at the
 /// narrowest width that still works costs nothing that was not already lost.
 pub(crate) const MIN_OUTPUT_WIDTH: usize = 20;
 
@@ -196,7 +196,7 @@ fn code_theme() -> Theme {
         })
         .collect();
     Theme {
-        name: Some("meka terminal".to_string()),
+        name: Some("Meka terminal".to_string()),
         author: None,
         settings: ThemeSettings {
             foreground: Some(FOREGROUND),
@@ -634,7 +634,7 @@ mod tests {
 
     /// A variation selector changes the width of the character before it, so a budget measured
     /// before it is applied is wrong after. `\u{2800}\u{fe0f}` is the sharp case: measured as one
-    /// column by every measure meka has, drawn as two blank cells.
+    /// column by every measure Meka has, drawn as two blank cells.
     #[test]
     fn variation_selectors_are_stripped_before_anything_is_measured() {
         for probe in ["1\u{fe0f}", "\u{2800}\u{fe0f}", "a\u{fe00}b"] {
@@ -711,7 +711,7 @@ mod tests {
         );
     }
 
-    /// meka's measure has to be at least what the terminal paints, or a budget is a promise it
+    /// Meka's measure has to be at least what the terminal paints, or a budget is a promise it
     /// cannot keep. `unicode_width` merges an emoji and its skin-tone modifier into one two-column
     /// cluster; VTE paints two glyphs across four columns, so every skin-toned emoji in an argument
     /// was a two-times under-count. This pins the direction of the disagreement rather than a
@@ -725,7 +725,7 @@ mod tests {
         assert_eq!(super::display_width("\u{6F22}\u{5B57}"), 4);
     }
 
-    /// A character meka scores at zero columns and a terminal paints anyway is a way to push text
+    /// A character Meka scores at zero columns and a terminal paints anyway is a way to push text
     /// off a row while the budget says it fits -- and U+3164 paints *blank*, so the overrun is
     /// invisible. The rule is by measured width rather than by category, so it needs no list of
     /// which characters are currently known to behave this way.
@@ -946,7 +946,7 @@ mod tests {
     }
 
     /// `\r` needs no escape sequence to forge UI: it returns the cursor to column zero, so a model
-    /// can overwrite a line meka already printed. `\n` and `\t` are structural in markdown and only
+    /// can overwrite a line Meka already printed. `\n` and `\t` are structural in markdown and only
     /// ever move the cursor forward, so they stay.
     ///
     /// Asserted on the helper rather than on the renderer's buffer: `push_delta` flushes as soon as
@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!(rendered.lines().count(), 1, "{rendered}");
     }
 
-    /// Indentation is the only thing separating model text from meka's own chrome, and
+    /// Indentation is the only thing separating model text from Meka's own chrome, and
     /// `sanitize_for_display` keeps newlines on purpose. A key carrying one would put the rest of
     /// itself at column 0, where it can be shaped like a real indicator.
     #[test]

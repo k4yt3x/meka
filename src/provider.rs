@@ -217,7 +217,7 @@ impl TurnOrigin {
         }
     }
 
-    /// The same fact in meka's own words, as a turn's row and the HTTP API's `turn.started`
+    /// The same fact in Meka's own words, as a turn's row and the HTTP API's `turn.started`
     /// name who opened a turn.
     pub(crate) const fn source(self) -> crate::store::turns::TurnSource {
         use crate::store::turns::TurnSource;
@@ -285,7 +285,7 @@ pub(crate) struct WorkerIdentity {
 
 impl WorkerIdentity {
     /// Claude Code mints a sub-agent id as `a` and eight random bytes in hex, and its sanitizer
-    /// normalizes every form to that shape (2.1.284: `ad90b2c445429009b`). meka's comes from the
+    /// normalizes every form to that shape (2.1.284: `ad90b2c445429009b`). Meka's comes from the
     /// worker's session id instead, so it is stable across the worker's turns and follow-ups and
     /// a nested worker can name its spawner's without being told.
     pub(crate) fn agent_id_for(session_id: Uuid) -> String {
@@ -310,7 +310,7 @@ impl WorkerIdentity {
 /// facts through.
 ///
 /// Every field is optional in the same way the wire segment is: absent means the request genuinely
-/// has no such attribution, which is how meka's own side queries come out bare and how a
+/// has no such attribution, which is how Meka's own side queries come out bare and how a
 /// conversation's first request omits `cc_prev_req`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Attribution {
@@ -321,7 +321,7 @@ pub(crate) struct Attribution {
     /// Where the last response's id is kept, for `cc_prev_req`. Shared with the conversation that
     /// owns it, which is why it is a handle and not a value: turn two has to be able to name turn
     /// one's last response. Claude Code reads that off the last assistant message in its history
-    /// (`t0E`); meka's conversation doesn't carry request ids, so the provider deposits them here.
+    /// (`t0E`); Meka's conversation doesn't carry request ids, so the provider deposits them here.
     pub(crate) previous_request: Option<PreviousRequestSlot>,
     /// Where the last response's message id is kept, for `diagnostics.previous_message_id`, held
     /// the way [`Self::previous_request`] is. A compaction's requests carry copies of both slots:
@@ -1106,7 +1106,7 @@ mod tests {
     /// The whole function could be replaced with `None`, `Some(0)` or `Some(1)` with the suite
     /// green. Its one non-test caller is `GET /v1/sessions/{id}/context`, which answers with it for
     /// an evicted session, so a wrong number here is a percentage a client divides by, and `None`
-    /// specifically is the "meka cannot say" signal that stops a client inventing one.
+    /// specifically is the "Meka cannot say" signal that stops a client inventing one.
     #[tokio::test]
     async fn a_bindings_window_is_its_profiles_or_the_documented_default_or_nothing() {
         let mut profiles = profiles(&["stated", "silent"]);
@@ -1563,7 +1563,7 @@ mod tests {
 
     #[test]
     fn an_unconfigured_effort_is_omitted_so_the_provider_applies_its_own() {
-        // The whole policy: meka names a tier only when the profile did. It cannot know which tiers
+        // The whole policy: Meka names a tier only when the profile did. It cannot know which tiers
         // a given endpoint implements - `anthropic-messages` and `openai-chat-completions` reach
         // any compatible server - and an unimplemented tier is a rejected request, not a
         // graceful ignore.

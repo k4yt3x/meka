@@ -104,7 +104,7 @@ impl utoipa::ToSchema for ChecklistStatus {}
 
 /// What a model may set an item to: a state it then sits in, or a disposition that takes it off
 /// the list. The aliases are spellings a model emits for the same word, accepted so a near miss
-/// does not cost a round; meka writes one spelling.
+/// does not cost a round; Meka writes one spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum StatusWord {
@@ -174,7 +174,7 @@ impl std::fmt::Display for StatusWord {
 impl std::str::FromStr for StatusWord {
     type Err = String;
 
-    /// The word by its own spelling or an alias; refuses with the spellings meka writes.
+    /// The word by its own spelling or an alias; refuses with the spellings Meka writes.
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         Self::ALL
             .iter()
@@ -706,7 +706,7 @@ impl SharedChecklist {
 /// because [`is_open`] holds the turn to it. Plain text for the model alone, in the tool echo, the
 /// nudge and the compaction copy, so every list the model reads shows the item as the turn's end
 /// holds it; the terminal rendering is `render::render_checklist`. The tag stands between the id
-/// and the text so what meka says about the item comes ahead of the words the model wrote, which
+/// and the text so what Meka says about the item comes ahead of the words the model wrote, which
 /// may say anything, and the id is delimited whatever the text opens with.
 pub(crate) fn format_item(item: &ChecklistItem, reported: &[ReportedTask]) -> String {
     let tag = match item.status {
@@ -750,7 +750,7 @@ pub(crate) fn format_checklist(state: &ChecklistState, reported: &[ReportedTask]
 mod tests {
     use super::*;
 
-    /// A state and a status word each have one spelling, the one meka writes, and a word a model
+    /// A state and a status word each have one spelling, the one Meka writes, and a word a model
     /// emits for the same thing is read as it, never written.
     #[test]
     fn a_state_and_a_status_word_have_their_one_spelling() {
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(StatusWord::Canceled).expect("serializes"),
             serde_json::json!("canceled"),
-            "meka writes one spelling"
+            "Meka writes one spelling"
         );
     }
 

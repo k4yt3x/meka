@@ -1,21 +1,21 @@
-//! The one door for every process meka starts, and what each is handed on the way out: a place
-//! behind meka in the line for memory.
+//! The one door for every process Meka starts, and what each is handed on the way out: a place
+//! behind Meka in the line for memory.
 //!
 //! A command the model runs (an `ffmpeg`, a build, a script with a leak) can take every byte the
 //! machine or the service's cgroup has, and which process the operating system then takes is
 //! decided by scores and caps the parent sets before the child runs. Set at one door, a new spawn
 //! site cannot forget them; `tests/layering.rs` lists every file that starts a process and how
 //! this door reaches it. What the door sets is best effort on every platform: a child that could
-//! not be placed runs anyway, since refusing the command would not save meka from the next one.
+//! not be placed runs anyway, since refusing the command would not save Meka from the next one.
 //!
 //! - Linux: the child's `oom_score_adj` is raised to the ceiling between `fork` and `exec`. The
 //!   value is inherited, so the shell, the sandbox around it and everything either starts carry it,
-//!   and the kernel's OOM killer takes any of them ahead of meka in a cgroup and host-wide. A
+//!   and the kernel's OOM killer takes any of them ahead of Meka in a cgroup and host-wide. A
 //!   `pre_exec` step costs std's `posix_spawn` fast path, so every spawn forks: `posix_spawn` has
 //!   no attribute for the write, and a write from the parent after the spawn would miss a
 //!   grandchild forked before it.
 //! - Windows: the child is placed in a job object whose committed memory stops at the machine's
-//!   physical memory, so past it the command's own allocations fail and meka's never do, the only
+//!   physical memory, so past it the command's own allocations fail and Meka's never do, the only
 //!   way to lose first on a platform without an OOM killer. A job the door hands back ends with its
 //!   handle, so dropping the child ends every process it started.
 //! - macOS: no lever exists for one process over another; the system takes the largest footprint
@@ -329,7 +329,7 @@ fn place_in_job(
                 &ANNOUNCED,
                 &format!(
                     "failed to place a child in a job: {error}; a command that takes every byte \
-                     can take meka with it"
+                     can take Meka with it"
                 ),
             );
             None
@@ -358,7 +358,7 @@ fn cap_by_process_id(process_id: u32) -> Option<std::os::windows::io::OwnedHandl
             &ANNOUNCED,
             &format!(
                 "failed to open child {process_id} to place it in a job: {error}; a command that \
-                 takes every byte can take meka with it"
+                 takes every byte can take Meka with it"
             ),
         );
         return None;
@@ -411,7 +411,7 @@ mod tests {
     }
 
     /// A child the door started reads the kernel's ceiling, so an OOM kill in its cgroup or on
-    /// the host takes it ahead of meka whatever meka's own score is.
+    /// the host takes it ahead of Meka whatever Meka's own score is.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_child_runs_at_the_highest_oom_score() {

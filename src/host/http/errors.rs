@@ -22,7 +22,7 @@ use utoipa::ToSchema;
 use crate::error::{INTERNAL_SENTENCE, MekaError, bounded_upstream_body};
 
 /// RFC 9457 Problem Details body. The five core members (`type`, `title`, `status`, `detail`,
-/// `instance`) are first-class; meka-specific extension members ride in `extensions` and get
+/// `instance`) are first-class; Meka-specific extension members ride in `extensions` and get
 /// flattened into the top-level JSON object on serialization.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct ProblemDetail {
@@ -128,10 +128,10 @@ impl ProblemDetail {
     }
 }
 
-/// The longest `Retry-After` meka will relay from an upstream: one hour.
+/// The longest `Retry-After` Meka will relay from an upstream: one hour.
 ///
 /// Not a judgment about how long a client should wait, which is the upstream's to make, but a
-/// bound on what meka will repeat: `parse_retry_after` returns whatever the header said, and a
+/// bound on what Meka will repeat: `parse_retry_after` returns whatever the header said, and a
 /// header saying a year is a broken or hostile upstream steering every client of this server into a
 /// stall. An hour is far past any real rate-limit window and far short of that.
 const RELAYED_RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(60 * 60);
@@ -343,12 +343,12 @@ impl ProblemDetail {
     ///
     /// `relay_provider_errors` is `[serve] relay_provider_errors`, and it decides whether the four
     /// upstream arms attach the provider's own response as a `provider_response` extension member.
-    /// It does not touch `detail`, which is meka's own sentence and identical in both states. A
+    /// It does not touch `detail`, which is Meka's own sentence and identical in both states. A
     /// parameter rather than a `From` impl precisely so it cannot be forgotten: a `.into()` that
     /// silently picked one policy is how a deployment configured to withhold would have gone on
     /// publishing from whichever call site missed the memo.
     ///
-    /// Deliberately not extended to [`MekaError::McpTurnGated`], whose reasons are meka's own
+    /// Deliberately not extended to [`MekaError::McpTurnGated`], whose reasons are Meka's own
     /// subprocess text rather than a provider's response; see the key's own documentation.
     pub(crate) fn for_error(error: &MekaError, relay_provider_errors: bool) -> Self {
         let kind = error.kind();
@@ -373,7 +373,7 @@ impl ProblemDetail {
         }
         let mut problem = Self::new(kind, status_of(kind), api_wording(error));
         // An extension member rather than a replacement for `detail`, because the two carry
-        // different things and neither substitutes for the other. `detail` is meka's own sentence
+        // different things and neither substitutes for the other. `detail` is Meka's own sentence
         // and for a context overflow it is the entire remedy ("compact it before retrying"), which
         // relaying by overwrite would have deleted in exchange for a JSON blob. A client wanting to
         // branch on the upstream's error type also wants one well-known field, not prose to parse.
@@ -482,7 +482,7 @@ mod tests {
             let detail = withheld.detail.as_deref().unwrap_or_default().to_string();
             assert!(
                 !detail.is_empty(),
-                "every arm owes the caller a sentence of meka's own: {error}",
+                "every arm owes the caller a sentence of Meka's own: {error}",
             );
 
             // The whole body, not just `detail`: an arm that moved the text into an extension
@@ -497,7 +497,7 @@ mod tests {
             );
             assert_eq!(
                 relayed.detail, withheld.detail,
-                "relaying adds a member; it must not rewrite meka's own sentence, which for a \
+                "relaying adds a member; it must not rewrite Meka's own sentence, which for a \
                  context overflow is the entire remedy: {error}",
             );
         }
@@ -505,7 +505,7 @@ mod tests {
 
     /// A rejection the *upstream* issued is an upstream failure (502), not a complaint about the
     /// caller's own body (4xx). The name says "invalid request" and the status deliberately does
-    /// not agree with it: what was invalid is the conversation meka assembled, which the caller
+    /// not agree with it: what was invalid is the conversation Meka assembled, which the caller
     /// neither sent nor can fix by correcting its own payload. Whether the agent loop tried to
     /// repair it first is not part of the mapping: `/compact`'s summarizer has no repair path at
     /// all, so an `InvalidRequest` from there arrives having been tried exactly once.
@@ -522,7 +522,7 @@ mod tests {
     ///
     /// Falling through to the catch-all makes an exhausted 429 answer 500 and log itself as an
     /// unhandled internal fault, sending an operator to look in the wrong process for a failure
-    /// meka classified correctly.
+    /// Meka classified correctly.
     ///
     /// The type URI is asserted alongside the status because the two travel together: one error
     /// type answering with two different statuses is what a client keying on the type cannot
@@ -687,7 +687,7 @@ mod tests {
         );
         assert_eq!(
             silent.retry_after_seconds, None,
-            "a transport failure has no header to relay, so meka must not invent one"
+            "a transport failure has no header to relay, so Meka must not invent one"
         );
     }
 
@@ -776,7 +776,7 @@ mod tests {
     /// An installation fault is the operator's, so the caller gets the sanitized 500 and the
     /// sentence goes to the log.
     ///
-    /// It is meka's own sentence, which is what made it look like a `Config` refusal and land in
+    /// It is Meka's own sentence, which is what made it look like a `Config` refusal and land in
     /// the verbatim 422 arm: a `[web] ca_cert_file` that is not there answered `invalid-body` with
     /// the operator's filesystem path in `detail`, to a caller who cannot fix it and should not
     /// read it. Relaying is asked for here, so the switch cannot be what is hiding it.
@@ -798,7 +798,7 @@ mod tests {
         );
     }
 
-    /// meka's own request ceiling is the caller's to act on and has no upstream behind it, so it
+    /// Meka's own request ceiling is the caller's to act on and has no upstream behind it, so it
     /// must not be published as a 502 `provider` pointing at a provider response that never
     /// existed. The remedy is in `detail`, so `detail` is asserted rather than merely present.
     #[test]

@@ -2,7 +2,7 @@
 //! ([`crate::memory`]).
 //!
 //! All of them gate at [`Permission::Read`], matching `scratchpad_*` and `checklist_*`: these write
-//! to a store meka owns in its own database, not to the user's tree, and the motivating deployment
+//! to a store Meka owns in its own database, not to the user's tree, and the motivating deployment
 //! runs at read permission permanently. Gating them at `workspace` would mean an agent that can
 //! never remember anything, which defeats the feature.
 //!
@@ -1805,10 +1805,10 @@ mod tests {
         );
     }
 
-    /// `memory_read` opens a row whose name meka's own write door would have refused, for its
+    /// `memory_read` opens a row whose name Meka's own write door would have refused, for its
     /// character class or its length: a row that reached the column past the tools is listed to
     /// the model in the `[Memory]` index every turn, and applying the write rule here would leave
-    /// nothing meka ships able to open or remove it.
+    /// nothing Meka ships able to open or remove it.
     #[tokio::test]
     async fn memory_read_opens_a_name_its_write_door_would_have_refused() {
         let memories = store().await;
@@ -1836,7 +1836,7 @@ mod tests {
             "the long-named row must open: {opened}"
         );
 
-        // Straight at the column, which is the only way to produce this: meka's own write doors
+        // Straight at the column, which is the only way to produce this: Meka's own write doors
         // refuse this name, so only a hand-edited store or another tool can have put it there.
         memories
             .plant_row_for_test("hand.edited", "put here past the write doors")
@@ -2254,10 +2254,10 @@ mod tests {
         }
     }
 
-    /// `memory_delete` removes a row whose name meka would not have written, and reports a name it
+    /// `memory_delete` removes a row whose name Meka would not have written, and reports a name it
     /// simply does not hold as absent rather than malformed.
     ///
-    /// This door is the reason the lookup/write split exists: a name meka would not write must
+    /// This door is the reason the lookup/write split exists: a name Meka would not write must
     /// still be removable, or the row is unreachable through every door at once and only raw
     /// `sqlite3` gets it out.
     #[tokio::test]
@@ -2800,7 +2800,7 @@ mod tests {
         );
     }
 
-    /// A model emits several tool calls in one message and meka runs them concurrently, so two
+    /// A model emits several tool calls in one message and Meka runs them concurrently, so two
     /// `memory_write`s in one turn would both read the store before either lands and each see no
     /// duplicate. A compaction checkpoint saves several memories at once, which is when
     /// near-copies are most likely. Remove the write lock and this fails.

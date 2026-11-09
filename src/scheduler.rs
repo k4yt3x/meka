@@ -108,7 +108,7 @@ pub(crate) enum FireOutcome {
     ///
     /// The concrete case is a session whose recorded profile no longer resolves: running
     /// the turn would bill an account the row does not name, and the cause may be a configuration
-    /// error the user has yet to fix or a transient `SQLITE_BUSY` from another meka process.
+    /// error the user has yet to fix or a transient `SQLITE_BUSY` from another Meka process.
     Unrunnable,
 }
 /// What this process knows about a session's level that its row may not.
@@ -686,7 +686,7 @@ pub(crate) async fn prepare(
     // Claiming is a lease now, so nothing else stops a prompt that reliably kills the process from
     // being picked up on every expiry, forever. The row stays exactly where it is: listed,
     // cancelable, and reported as held on every surface, because destroying a user's job over a
-    // failure meka cannot diagnose would be worse than leaving it visible and inert.
+    // failure Meka cannot diagnose would be worse than leaving it visible and inert.
     if job.attempts >= MAX_CLAIM_ATTEMPTS {
         if memory.declined_for_permission_first_time(&job.id, "crashed") {
             let reason = job_withheld_reason(memory, &job, live_permission, tools)

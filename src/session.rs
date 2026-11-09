@@ -318,7 +318,7 @@ impl SessionCells {
         }
     }
 
-    /// What is in context as far as meka knows: the last measurement plus what tools have reserved
+    /// What is in context as far as Meka knows: the last measurement plus what tools have reserved
     /// since. The figure every check against the ceiling reads, and the one the gauge's headroom
     /// is the complement of.
     pub(crate) fn context_occupancy(&self) -> u64 {
@@ -1292,7 +1292,7 @@ mod tests {
 
     /// One id being refused must not cost the user the rest of the list.
     ///
-    /// Each id on the command line is a separate request, and a session another meka has open is a
+    /// Each id on the command line is a separate request, and a session another Meka has open is a
     /// refusal about that one. Returning at the first refusal would skip every id after it and
     /// swallow the count of what had been deleted on the way.
     #[tokio::test]
@@ -1551,7 +1551,7 @@ mod tests {
             })
         };
 
-        // An archive written by a meka that still had the field. The key is not modeled, so serde
+        // An archive written by a Meka that still had the field. The key is not modeled, so serde
         // ignores it rather than refusing the archive: an import that failed here would strand a
         // backup the user took a fortnight ago.
         let hostile: SessionExport =

@@ -283,7 +283,7 @@ pub(crate) fn render_inline_budget_refusal(
     largest: &[(String, usize)],
     project: Option<&str>,
 ) -> String {
-    // Names come from the table, not from the request: a row written past meka's doors can carry
+    // Names come from the table, not from the request: a row written past Meka's doors can carry
     // a newline, and a refusal is text the model reads.
     let named: Vec<String> = largest
         .iter()
@@ -404,7 +404,7 @@ pub(crate) fn parse_expiry(raw: &str) -> Result<SystemTime, String> {
 }
 
 /// Parse the window an `unverified` filter takes, `"90d"` or `"6months"`: the grammar every other
-/// duration meka reads uses, and one parser for the tool, the CLI and the HTTP route.
+/// duration Meka reads uses, and one parser for the tool, the CLI and the HTTP route.
 pub(crate) fn parse_unverified_window(raw: &str) -> Result<std::time::Duration, String> {
     humantime_serde::re::humantime::parse_duration(raw.trim())
         .map_err(|error| format!("'{raw}' is not a duration like '90d': {error}"))
@@ -500,7 +500,7 @@ pub(crate) fn validate_tags(tags: &[String]) -> Result<(), String> {
 /// Lowercase, sort, deduplicate and validate a tag list on its way to the store.
 ///
 /// Lowercased *before* validating, so the doors agree: search normalizes case anyway, and refusing
-/// `Infra` here would mean a label meka itself renders is one meka itself will not take back.
+/// `Infra` here would mean a label Meka itself renders is one Meka itself will not take back.
 /// Sorted before the dedup because `dedup` only removes *consecutive* duplicates, so the other
 /// order leaves `[a, b, a]` intact and the row ends up declaring `a` twice.
 pub(crate) fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
@@ -643,7 +643,7 @@ pub(crate) struct MemoryFrontmatter {
 
 /// Render one memory as a Markdown file: frontmatter followed by the body.
 ///
-/// The export format, and the only place meka writes YAML for this store. Frontmatter rather than
+/// The export format, and the only place Meka writes YAML for this store. Frontmatter rather than
 /// JSON because the point of an export is to be read and edited by a person, and to be greppable
 /// in a directory the way the rest of a notes tree is.
 ///
@@ -802,7 +802,7 @@ pub(crate) const MEMORY_EXPORT_MANIFEST: &str = "export.toml";
 
 /// The shape of an export directory this build writes and reads as it is. Bumped when a field
 /// changes name or meaning; a snapshot at an older version is brought forward by the migration
-/// module, the one place that may know what an older meka wrote.
+/// module, the one place that may know what an older Meka wrote.
 pub(crate) const MEMORY_EXPORT_FORMAT_VERSION: u32 = 1;
 
 /// The manifest's text.
@@ -971,7 +971,7 @@ pub(crate) fn render_age(created: SystemTime, now: SystemTime) -> String {
 mod tests {
     use super::*;
 
-    /// The refusal names the largest inline memories in one sentence, in meka's wording, and a
+    /// The refusal names the largest inline memories in one sentence, in Meka's wording, and a
     /// name from the table reaches it sanitized: a refusal is text the model reads.
     #[test]
     fn the_inline_budget_refusal_names_what_to_shorten() {

@@ -2,7 +2,7 @@
 
 Skills are knowledge packages that give the agent non-standard knowledge: manuals, procedures, tool-specific instructions, and experience the LLM doesn't have natively. Each skill is a directory containing a `SKILL.md` file with structured metadata.
 
-meka implements the [Agent Skills specification](https://agentskills.io/specification), so a skill written for meka works in other compliant clients and vice versa, and a skill meka writes passes the ecosystem's own `skills-ref validate`.
+Meka implements the [Agent Skills specification](https://agentskills.io/specification), so a skill written for Meka works in other compliant clients and vice versa, and a skill Meka writes passes the ecosystem's own `skills-ref validate`.
 
 Skills are normally authored by you. An agent can also be allowed to write its own; see [Letting the agent manage skills](#letting-the-agent-manage-skills), which is off by default.
 
@@ -12,7 +12,7 @@ Skills are normally authored by you. An agent can also be allowed to write its o
 - Each skill is a directory: `skills/<name>/SKILL.md`. A lowercase `skill.md` is accepted too.
 - Any entry whose name begins with `.` is skipped at discovery. This covers VCS metadata (`.git`), editor/IDE state (`.vscode`, `.idea`), filesystem artifacts (`.DS_Store`, `.Trash`), and any other dotfile or dotdir that may sit alongside your skills.
 - `SKILL.md` starts with a YAML frontmatter block declaring the skill's metadata, followed by Markdown body content.
-- On every prompt, meka discovers all valid skills and lists them in the per-turn context with their `description`.
+- On every prompt, Meka discovers all valid skills and lists them in the per-turn context with their `description`.
 - The agent invokes a skill by calling the `skill_read` tool with the skill name. The tool returns the full body, which the agent follows.
 - `skill_search` greps the full text of every installed skill, for when the one-line descriptions are not enough to tell which skill covers something.
 - Skills are available at **read**, **workspace** and **unrestricted** (not at **none**).
@@ -65,17 +65,17 @@ yt-dlp "https://example.com/video"
 | `name` | 1-64 characters, lowercase alphanumerics and hyphens; no leading, trailing or consecutive hyphens. Must match the directory name. "Alphanumeric" is Unicode-wide, as the spec and its reference validator define it, so a non-Latin name is valid. |
 | `description` | 1-1024 characters. What the skill does *and when to invoke it*. Shown to the model in the per-turn context, so fold the trigger condition into this one line. |
 
-A skill is **skipped, and the reason reported**, when it breaks a rule the spec states about its identity: a directory name outside the rules above, a `name` that disagrees with its directory, or a missing `description`. meka implements the Agent Skills specification, so a directory it cannot read as a conforming skill is not a skill it has, and saying so beats listing something no other client would accept.
+A skill is **skipped, and the reason reported**, when it breaks a rule the spec states about its identity: a directory name outside the rules above, a `name` that disagrees with its directory, or a missing `description`. Meka implements the Agent Skills specification, so a directory it cannot read as a conforming skill is not a skill it has, and saying so beats listing something no other client would accept.
 
 A skip is not silent. It appears in the [`[Skills]` index](#how-the-agent-uses-skills) the agent reads, in `skill_read`, in `meka skill get`, and in a warning on startup, each naming the directory and the reason. The directory stays where it is, so renaming it is all that is needed.
 
 Everything else loads: an over-long description (warned, since refusing would take the procedure with it), and frontmatter keys the spec does not define.
 
-A name containing characters meka cannot render (a newline, a zero-width space) is refused by the same rule, and additionally cannot be reached by `meka skill remove`: the name meka would echo back is a *different* directory, which may itself exist. Rename it in a shell.
+A name containing characters Meka cannot render (a newline, a zero-width space) is refused by the same rule, and additionally cannot be reached by `meka skill remove`: the name Meka would echo back is a *different* directory, which may itself exist. Rename it in a shell.
 
-Keys meka does not model are **kept, not dropped**. A skill carrying Claude Code's `when_to_use`, or a `source_url` naming where it was fetched from, still has them after an agent edits its description.
+Keys Meka does not model are **kept, not dropped**. A skill carrying Claude Code's `when_to_use`, or a `source_url` naming where it was fetched from, still has them after an agent edits its description.
 
-Frontmatter that is not valid YAML is **not** repaired. The client guide suggests quoting unquoted prose colons (`description: Extract text. Use when: the user mentions PDFs`) as a fallback, and meka deliberately does not: the reference implementation does no repair either, one repair rule is an arbitrary pick out of the many ways YAML can be malformed, and a file meka silently fixed on the way in is one that keeps working here and nowhere else. The skill is skipped instead, and [said so out loud](#how-the-agent-uses-skills) with the parser's own line and column. Fix the file once and every client can read it.
+Frontmatter that is not valid YAML is **not** repaired. The client guide suggests quoting unquoted prose colons (`description: Extract text. Use when: the user mentions PDFs`) as a fallback, and Meka deliberately does not: the reference implementation does no repair either, one repair rule is an arbitrary pick out of the many ways YAML can be malformed, and a file Meka silently fixed on the way in is one that keeps working here and nowhere else. The skill is skipped instead, and [said so out loud](#how-the-agent-uses-skills) with the parser's own line and column. Fix the file once and every client can read it.
 
 ### Optional frontmatter fields
 
@@ -83,12 +83,12 @@ Frontmatter that is not valid YAML is **not** repaired. The client guide suggest
 |-------|-------------|
 | `license` | The skill's license, as a name or a reference to a bundled file. Informational. |
 | `compatibility` | Up to 500 characters naming what the skill needs from its environment (`Requires Python 3.14+ and uv`). Shown to the model when the skill is activated, since it changes how the instructions should be carried out. |
-| `allowed-tools` | Tools the skill would like pre-approved. **meka reads and preserves this but never acts on it**; see [Why `allowed-tools` is ignored](#why-allowed-tools-is-ignored). Written as a space-separated string; a YAML list or a bare number is read too, rather than costing you the skill. |
+| `allowed-tools` | Tools the skill would like pre-approved. **Meka reads and preserves this but never acts on it**; see [Why `allowed-tools` is ignored](#why-allowed-tools-is-ignored). Written as a space-separated string; a YAML list or a bare number is read too, rather than costing you the skill. |
 | `metadata` | A map of extra properties. Where anything the spec has no field for belongs. |
 
 ### Metadata keys
 
-The spec reserves `metadata` for properties it does not define, and meka carries the whole map through untouched, including keys it has no meaning for, so a skill written elsewhere survives being edited here.
+The spec reserves `metadata` for properties it does not define, and Meka carries the whole map through untouched, including keys it has no meaning for, so a skill written elsewhere survives being edited here.
 
 That includes **values that are not strings**. The spec describes a map of string to string, but skills in the wild carry lists and nested maps under `metadata`, and an edit here keeps them as they were:
 
@@ -99,9 +99,9 @@ metadata:
     repo: example/skills # still a map
 ```
 
-meka renders such a value as text where it needs one (`meka skill list`, `meka skill get`), but the file keeps the original.
+Meka renders such a value as text where it needs one (`meka skill list`, `meka skill get`), but the file keeps the original.
 
-`metadata` itself must be a map, though. A skill whose `metadata:` is a string or a list still loads, lists and reads normally, but **rewriting it is refused**: meka would have nowhere spec-legal to record `meka-priority` or `author`, and doing something other than what the caller asked without saying so is worse than declining. Fix the file, or write to a different name.
+`metadata` itself must be a map, though. A skill whose `metadata:` is a string or a list still loads, lists and reads normally, but **rewriting it is refused**: Meka would have nowhere spec-legal to record `meka-priority` or `author`, and doing something other than what the caller asked without saying so is worse than declining. Fix the file, or write to a different name.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -109,35 +109,35 @@ meka renders such a value as text where it needs one (`meka skill list`, `meka s
 | `version` | none | Free-form version label (e.g. `"1.0"`, `"2024-03-14"`). The spec's own example key. |
 | `meka-priority` | `5` | Listing rank `0`-`9`, lower first. Orders the `[Skills]` index and decides which skills its cap drops. Not shown to the model; see [How the agent uses skills](#how-the-agent-uses-skills). |
 
-`meka-priority` carries a prefix because it is meka's own concept and the spec has nothing like it; another client could reasonably read a bare `priority` the opposite way round. `author` and `version` do not, because the spec demonstrates exactly those keys.
+`meka-priority` carries a prefix because it is Meka's own concept and the spec has nothing like it; another client could reasonably read a bare `priority` the opposite way round. `author` and `version` do not, because the spec demonstrates exactly those keys.
 
 ### Frontmatter written before the spec
 
-A `SKILL.md` written before meka followed the spec carries `author`, `version` and `priority` at the top level of the frontmatter, where the spec has no place for them. The [one-shot upgrade script](../getting-started/upgrading.md) moves all three under `metadata:`, and the three are not equally optional:
+A `SKILL.md` written before Meka followed the spec carries `author`, `version` and `priority` at the top level of the frontmatter, where the spec has no place for them. The [one-shot upgrade script](../getting-started/upgrading.md) moves all three under `metadata:`, and the three are not equally optional:
 
-- `author` and `version` keep their names, and meka reads either spelling permanently (see below), so moving them changes nothing but tidiness.
+- `author` and `version` keep their names, and Meka reads either spelling permanently (see below), so moving them changes nothing but tidiness.
 - `priority` is **renamed** to `meka-priority` as it moves, because that is the key a rank is read from and there is no other. A top-level `priority:` left where it is, or hand-moved under `metadata:` under its own name, is a key nothing reads: the skill takes the default rank of 5, the `[Skills]` index comes out in a different order, its cap drops different skills, and nothing says so. This is the part of the move that has to happen.
 
-meka does not rewrite a file it is only reading, so a skill it never writes to keeps the frontmatter you gave it until the script runs.
+Meka does not rewrite a file it is only reading, so a skill it never writes to keeps the frontmatter you gave it until the script runs.
 
-Reading a top-level `author` or `version` is permanent, not a transition. Claude Code's plugin skills declare `version` at the top level, and the skill that documents skill authoring tells authors to put it there, so a reader that looked only under `metadata:` would print a dash for a version the file plainly states. meka reads both spellings and writes only the spec's, which is what lets the move be a script you run once rather than something the binary does to your files behind your back.
+Reading a top-level `author` or `version` is permanent, not a transition. Claude Code's plugin skills declare `version` at the top level, and the skill that documents skill authoring tells authors to put it there, so a reader that looked only under `metadata:` would print a dash for a version the file plainly states. Meka reads both spellings and writes only the spec's, which is what lets the move be a script you run once rather than something the binary does to your files behind your back.
 
 ### Why `allowed-tools` is ignored
 
-`allowed-tools` is experimental in the spec, and the spec itself notes that support varies. meka parses it, preserves it across a rewrite, and shows it in `meka skill get`, but never grants anything from it. The spec defines the field as a space-separated string and that is what meka writes, so a skill that spelled it as a YAML list comes back joined: `[Read, Bash]` becomes `Read Bash`.
+`allowed-tools` is experimental in the spec, and the spec itself notes that support varies. Meka parses it, preserves it across a rewrite, and shows it in `meka skill get`, but never grants anything from it. The spec defines the field as a space-separated string and that is what Meka writes, so a skill that spelled it as a YAML list comes back joined: `[Read, Bash]` becomes `Read Bash`.
 
-Two things meka does not preserve across a rewrite, both worth knowing before you hand-edit a `SKILL.md` that meka will later write to:
+Two things Meka does not preserve across a rewrite, both worth knowing before you hand-edit a `SKILL.md` that Meka will later write to:
 
 - **A joined `allowed-tools` entry containing a space cannot be told apart from two entries.** `["Bash(git diff:*)", "Read"]` comes back as `Bash(git diff:*) Read`, which no longer says where one entry ends. Prefer the spec's string form for these.
 - **Comments in the frontmatter block are dropped.** The header is rebuilt through a YAML serializer, which does not carry them. Keys, values and nested structure all survive; `# notes` beside them do not. Put anything you need to keep in the body, which is passed through untouched.
 
-A skill file is content, and content does not get to widen what the agent may run. meka's [permission level](./permissions.md) is the authority for that, and a `SKILL.md` dropped into the skills directory (or synced from a repository, or written by an agent) must not be able to pre-approve `Bash(rm:*)` on its own say-so.
+A skill file is content, and content does not get to widen what the agent may run. Meka's [permission level](./permissions.md) is the authority for that, and a `SKILL.md` dropped into the skills directory (or synced from a repository, or written by an agent) must not be able to pre-approve `Bash(rm:*)` on its own say-so.
 
 ### Referencing bundled files
 
-Refer to files bundled alongside `SKILL.md` by relative path (e.g. `scripts/helper.sh`). Every skill body is prefixed with a header naming the skill's directory (see [How the agent uses skills](#how-the-agent-uses-skills)), so relative paths resolve against the skill rather than against the session's working directory. A skill in meka's own store sits under the config directory, which a shell command cannot see below `unrestricted`; `file_read` and `file_search` reach it at every level, and the header says so, so the agent reads a bundled script rather than running `cat` on it.
+Refer to files bundled alongside `SKILL.md` by relative path (e.g. `scripts/helper.sh`). Every skill body is prefixed with a header naming the skill's directory (see [How the agent uses skills](#how-the-agent-uses-skills)), so relative paths resolve against the skill rather than against the session's working directory. A skill in Meka's own store sits under the config directory, which a shell command cannot see below `unrestricted`; `file_read` and `file_search` reach it at every level, and the header says so, so the agent reads a bundled script rather than running `cat` on it.
 
-The body is passed to the model verbatim; meka does not rewrite anything inside it. Keeping skills free of host-specific placeholders is what lets the same `SKILL.md` run under meka and other Agent Skills hosts unchanged.
+The body is passed to the model verbatim; Meka does not rewrite anything inside it. Keeping skills free of host-specific placeholders is what lets the same `SKILL.md` run under Meka and other Agent Skills hosts unchanged.
 
 ## Storage location
 
@@ -147,11 +147,11 @@ The body is passed to the model verbatim; meka does not rewrite anything inside 
 | macOS | `~/Library/Application Support/meka/skills/<name>/SKILL.md` |
 | Windows | `%APPDATA%\meka\skills\<name>\SKILL.md` |
 
-This is the only directory meka ever *writes* to. It is created the first time something is written there, not at startup.
+This is the only directory Meka ever *writes* to. It is created the first time something is written there, not at startup.
 
 ## Reading skills from other directories
 
-`[skills] additional_directories` adds directories to scan. They are **read-only**: meka never creates them and never writes into them, so listing one costs nothing if it does not exist.
+`[skills] additional_directories` adds directories to scan. They are **read-only**: Meka never creates them and never writes into them, so listing one costs nothing if it does not exist.
 
 ```toml
 [skills]
@@ -160,13 +160,13 @@ additional_directories = ["~/.agents/skills", "~/src/team-skills/skills"]
 
 `~` is expanded. A relative path resolves against the process working directory.
 
-The default is empty. `~/.agents/skills` has emerged as a cross-client convention, so pointing at it makes skills installed by other Agent Skills clients visible to meka, but whether to read a directory outside meka's own namespace is your decision rather than a default.
+The default is empty. `~/.agents/skills` has emerged as a cross-client convention, so pointing at it makes skills installed by other Agent Skills clients visible to Meka, but whether to read a directory outside Meka's own namespace is your decision rather than a default.
 
-**Precedence.** meka's own store is searched first, then each `additional_directories` entry in order. When two directories hold the same skill name, the first wins and the shadowed one is logged.
+**Precedence.** Meka's own store is searched first, then each `additional_directories` entry in order. When two directories hold the same skill name, the first wins and the shadowed one is logged.
 
-**Writes never follow.** `skill_write`, `skill_edit`, `skill_delete`, `meka skill add`, `meka skill remove`, `PUT /v1/skills/{name}` and `DELETE /v1/skills/{name}` all target meka's own store. Asked to write a name that resolves to a skill in a read-only directory, they refuse, because writing would create a second copy that shadows the original instead of changing it; the refusal says to edit or remove it where it lives, and the CLI names the directory. This holds whether or not the file there is valid: a directory whose `SKILL.md` does not parse still claims that name, and shadowing a broken skill is the case worth refusing hardest, since nothing then reports the original at all.
+**Writes never follow.** `skill_write`, `skill_edit`, `skill_delete`, `meka skill add`, `meka skill remove`, `PUT /v1/skills/{name}` and `DELETE /v1/skills/{name}` all target Meka's own store. Asked to write a name that resolves to a skill in a read-only directory, they refuse, because writing would create a second copy that shadows the original instead of changing it; the refusal says to edit or remove it where it lives, and the CLI names the directory. This holds whether or not the file there is valid: a directory whose `SKILL.md` does not parse still claims that name, and shadowing a broken skill is the case worth refusing hardest, since nothing then reports the original at all.
 
-There is deliberately no automatic project-level scan. meka reads nothing from the working directory that config does not name, [instructions](./instructions.md#reading-a-projects-agentsmd) included, because a cloned repository that could silently add instructions to the agent's context is exactly the trust it never extends. Name a project's skills directory in `additional_directories` if you want it read.
+There is deliberately no automatic project-level scan. Meka reads nothing from the working directory that config does not name, [instructions](./instructions.md#reading-a-projects-agentsmd) included, because a cloned repository that could silently add instructions to the agent's context is exactly the trust it never extends. Name a project's skills directory in `additional_directories` if you want it read.
 
 ## Listing skills
 
@@ -179,7 +179,7 @@ deploy-service  Jane Doe  2         no        How to deploy the service. Use whe
 borrowed        -         5         yes       A skill another client installed.
 ```
 
-`External` is `yes` for a skill found under [`additional_directories`](#reading-skills-from-other-directories) rather than in meka's own store. It is always present, even when nothing is external, so a script's field offsets do not shift with the store's contents.
+`External` is `yes` for a skill found under [`additional_directories`](#reading-skills-from-other-directories) rather than in Meka's own store. It is always present, even when nothing is external, so a script's field offsets do not shift with the store's contents.
 
 `--paths` adds the on-disk `Path`, which is how you find out *where* an external skill lives. Nothing else goes in this table: `license`, `compatibility`, `allowed-tools`, `version` and arbitrary `metadata` keys are per-skill detail, and `meka skill get <name>` prints all of them.
 
@@ -247,7 +247,7 @@ A skill is the reusable unit of sub-agent instruction. Sub-agents do not receive
 
 ## Invoking a skill from the CLI
 
-Any skill can be triggered directly from the command line with `--skill <name>`. The rendered body becomes the first user turn, and meka drops into the screen after the turn finishes:
+Any skill can be triggered directly from the command line with `--skill <name>`. The rendered body becomes the first user turn, and Meka drops into the screen after the turn finishes:
 
 ```bash
 meka --skill download-videos -p "https://example.com/video"
@@ -301,7 +301,7 @@ agent_managed = true
 This is off by default because for an ordinary terminal session you author and curate skills, and an
 agent rewriting that store is not something you asked for. It earns its keep in the opposite
 deployment: a long-running agent acting as a dispatcher over a team of sub-agents. A skill is the
-only thing in meka that both outlives the session and can be handed to a sub-agent as its task, so
+only thing in Meka that both outlives the session and can be handed to a sub-agent as its task, so
 writing one is how such an agent gets a refined brief to the next sub-agent without routing the
 whole text through its own context window.
 
@@ -315,7 +315,7 @@ agent_spawn(skill: "triage-build-failure")
 
 Notes on how it behaves:
 
-- All three run at **read** permission, like `memory_write`. They write to meka's own config
+- All three run at **read** permission, like `memory_write`. They write to Meka's own config
   directory rather than to your working tree, and the deployment they exist for typically runs at
   read permission permanently. The config flag is the authorization, not the permission tier.
 - **Sub-agents never get them**, whatever this setting says. A sub-agent that inferred something from
@@ -328,21 +328,21 @@ Notes on how it behaves:
 - `skill_edit` replaces one exact string in the body and nothing else: the frontmatter is kept as
   it is, an `old_string` that matches more than once is refused unless `replace_all` is set, and
   an edit computed against a body that has since changed is refused rather than written over it.
-- Skills the agent *creates* are stamped `metadata.author: meka (agent-authored)`, so
+- Skills the agent *creates* are stamped `metadata.author: Meka (agent-authored)`, so
   `meka skill list` shows where an entry came from. An existing `author` is kept, so an agent
   refining a skill you wrote does not reassign it to itself. Informational, not a guard.
 - **Every other frontmatter key survives a rewrite**, including `license`, `compatibility` and any
-  `metadata` key meka has no meaning for, with its YAML type intact, so a `metadata` list stays a
+  `metadata` key Meka has no meaning for, with its YAML type intact, so a `metadata` list stays a
   list. An agent asked to sharpen an imported skill's description changes the description and
   nothing else.
 - The confirmation reports the rank the *file* ended up with, not the one the call asked for. The
-  two differ only when the skill's `metadata:` is not a map, which meka will not overwrite; the tool
+  two differ only when the skill's `metadata:` is not a map, which Meka will not overwrite; the tool
   says so rather than claiming a change that did not happen.
 - A file that exists at that name but is not a valid skill is **refused, not overwritten**. Such a
-  file is invisible everywhere else in meka, so nothing could tell you what was about to be lost.
+  file is invisible everywhere else in Meka, so nothing could tell you what was about to be lost.
 - A skill from a read-only [`additional_directories`](#reading-skills-from-other-directories) directory is
   **refused** by all three, since writing would shadow it rather than change it.
-- A hand-written skill in meka's own store is not protected from being rewritten. The flag being off
+- A hand-written skill in Meka's own store is not protected from being rewritten. The flag being off
   by default, and your config directory being in version control, is the safety net for that case.
 - `skill_delete` removes the whole skill directory, including any bundled files, matching
   `meka skill remove`.
@@ -352,9 +352,9 @@ Notes on how it behaves:
 ## Tips
 
 - Use short, unambiguous skill names (e.g. `setup-postgres`, not `pg`). The name is what the agent sees and calls, and the spec allows only lowercase alphanumerics and hyphens. Every door that takes a name also requires it to be one directory name as the platform reads it: no separator, no drive prefix, no parent.
-- **Anything meka lists, meka can remove**, and so is almost anything it refuses to load. A name the spec forbids (`My_Skill`, `two words`, `not.a.skill`) is skipped with the reason named, and `meka skill remove` still takes it so you can clean up. The one exception is a name meka cannot [render](#required-frontmatter-fields), which no command can address; rename it in a shell. One Windows reserves, like `con`, loads normally: that is meka's own write-time rule, not the spec's.
-- Every write door applies the same rules. `meka skill add`, `skill_write` and `PUT /v1/skills/{name}` all refuse a name or a description the spec rejects, and refuse a skill whose `name` is missing or disagrees with its directory, so a skill meka authors passes `skills-ref validate`. `--from-file` copies your bytes verbatim, so it can still carry a key the spec does not define (that is how an imported skill keeps its `when_to_use`), but it must still declare the required `name`. Run `uvx skills-ref validate <dir>` when you want the reference's own verdict on a file.
+- **Anything Meka lists, Meka can remove**, and so is almost anything it refuses to load. A name the spec forbids (`My_Skill`, `two words`, `not.a.skill`) is skipped with the reason named, and `meka skill remove` still takes it so you can clean up. The one exception is a name Meka cannot [render](#required-frontmatter-fields), which no command can address; rename it in a shell. One Windows reserves, like `con`, loads normally: that is Meka's own write-time rule, not the spec's.
+- Every write door applies the same rules. `meka skill add`, `skill_write` and `PUT /v1/skills/{name}` all refuse a name or a description the spec rejects, and refuse a skill whose `name` is missing or disagrees with its directory, so a skill Meka authors passes `skills-ref validate`. `--from-file` copies your bytes verbatim, so it can still carry a key the spec does not define (that is how an imported skill keeps its `when_to_use`), but it must still declare the required `name`. Run `uvx skills-ref validate <dir>` when you want the reference's own verdict on a file.
 - Write `description` concisely, and fold the "use when..." trigger into it. It is sent to the model and consumes tokens.
 - Keep each skill focused on a single topic or procedure. Spawn multiple skills rather than one giant one.
 - Bundle supporting files in the skill directory and reference them by relative path (`scripts/file.ext`).
-- Skills are re-discovered on every prompt, so you can add, edit, or remove skills mid-session without restarting meka.
+- Skills are re-discovered on every prompt, so you can add, edit, or remove skills mid-session without restarting Meka.

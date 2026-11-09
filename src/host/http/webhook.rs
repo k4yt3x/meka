@@ -180,7 +180,7 @@ impl WebhookDispatcher {
                 tracing::warn!("failed to stamp background outcomes as announced: {error}");
                 // The caller has to hold the batch. Delivering it anyway would stamp
                 // `delivered_at`, and the announce pool requires that to be NULL, so one
-                // `SQLITE_BUSY`, an ordinary thing with two meka processes on a store, would cost
+                // `SQLITE_BUSY`, an ordinary thing with two Meka processes on a store, would cost
                 // the webhook permanently. The delivered claim fails the same way.
                 return Announced::Failed;
             }
@@ -360,7 +360,7 @@ impl DeliveryTask {
                     // and they are what a receiver returns for precisely the traffic shape this
                     // module produces. Several jobs sharing a cron minute deliver as a burst, and
                     // dropping a rate-limited delivery would lose the 9am report to the one thing
-                    // the receiver was explicitly asking meka to wait out.
+                    // the receiver was explicitly asking Meka to wait out.
                     let retryable = matches!(
                         status,
                         reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -480,7 +480,7 @@ mod tests {
     /// A batch whose announcement could not be recorded is held, not delivered.
     ///
     /// The announce pool requires `delivered_at IS NULL`, so a caller that delivered anyway would
-    /// put the row outside it forever -- one `SQLITE_BUSY`, an ordinary thing with two meka
+    /// put the row outside it forever -- one `SQLITE_BUSY`, an ordinary thing with two Meka
     /// processes on a store, costing the webhook permanently. The delivered claim already fails
     /// this way; this is what lets the announce fail the same way.
     ///

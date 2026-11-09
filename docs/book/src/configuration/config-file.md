@@ -1,6 +1,6 @@
 # Config file
 
-meka looks for a TOML configuration file at a platform-specific location:
+Meka looks for a TOML configuration file at a platform-specific location:
 
 | Platform | Path |
 |----------|------|
@@ -8,9 +8,9 @@ meka looks for a TOML configuration file at a platform-specific location:
 | macOS | `~/Library/Application Support/meka/config.toml` |
 | Windows | `%APPDATA%\meka\config.toml` |
 
-The config file is optional. If it does not exist, meka silently skips it.
+The config file is optional. If it does not exist, Meka silently skips it.
 
-meka refuses unknown keys: a typo (`contex_window`) or a removed key (`reasoning_effort`) fails the load with an error naming the offending key, rather than being silently ignored. Fix or remove the key to continue.
+Meka refuses unknown keys: a typo (`contex_window`) or a removed key (`reasoning_effort`) fails the load with an error naming the offending key, rather than being silently ignored. Fix or remove the key to continue.
 
 The commands that *edit* the file are exempt, so a broken config can still be repaired from the CLI: `meka mcp add` / `remove` / `enable` / `disable`, `meka account remove` / `rename` and `meka profile remove` / `rename` work on the raw document and don't care about an unknown key elsewhere in it. Everything that *reads* config fails instead of answering from empty defaults, because "No MCP servers." over a file full of them is indistinguishable from the truth.
 
@@ -27,11 +27,11 @@ The directory holds two more things that are not config keys. Standing instructi
 └── skills/
 ```
 
-Write `instructions.md`, or split a large set across `instructions/*.md`, and meka reads it at startup into the `## Standing instructions` section of the system prompt; see [Instructions](../usage/instructions.md). To pass the text as a string instead (containers, CI), use `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, or `--instructions`. Files beyond that path, a project's `AGENTS.md` for one, are named under [`[instructions]`](#instructions).
+Write `instructions.md`, or split a large set across `instructions/*.md`, and Meka reads it at startup into the `## Standing instructions` section of the system prompt; see [Instructions](../usage/instructions.md). To pass the text as a string instead (containers, CI), use `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, or `--instructions`. Files beyond that path, a project's `AGENTS.md` for one, are named under [`[instructions]`](#instructions).
 
 Everything in that directory is content you put there, so it is safe to keep under version control. Commands that edit the config take a cross-process lock on the directory itself, as does claiming a skill store, so neither leaves a lock file behind; a write is published by renaming a short-lived `config.toml.<pid>.<seq>.tmp` over the target, so that name can appear for the duration of one write. If you are upgrading from a version that wrote `.config.toml.lock`, or `.meka-store.lock` inside a skill store, delete them: nothing reads or writes them any more.
 
-Windows still writes both, because its file locks are mandatory rather than advisory: a lock held on `config.toml` would make the file unreadable to the command holding it, and `LockFileEx` refuses a directory handle outright. If you keep a meka config directory under version control on Windows, ignore `.config.toml.lock` and `skills/.meka-store.lock`.
+Windows still writes both, because its file locks are mandatory rather than advisory: a lock held on `config.toml` would make the file unreadable to the command holding it, and `LockFileEx` refuses a directory handle outright. If you keep a Meka config directory under version control on Windows, ignore `.config.toml.lock` and `skills/.meka-store.lock`.
 
 The sections below are in the order a file is best written in: the blocks with many entries first (`default_profile`, accounts, profiles, MCP servers), then each single table from the most to the least consequential, and `[serve]` last.
 
@@ -75,14 +75,14 @@ model   = "llama3"
 
 ### Selecting the active profile
 
-For each run meka picks one profile using this precedence:
+For each run Meka picks one profile using this precedence:
 
 1. `--profile <name>` CLI flag.
 2. `default_profile` in the config file.
 3. The sole profile, if exactly one is configured.
 
 If none of these resolve (no profiles configured, or more than one with no `default_profile` /
-`--profile`), meka errors and points you at `meka profile add` / `meka profile use`. Resuming a
+`--profile`), Meka errors and points you at `meka profile add` / `meka profile use`. Resuming a
 session is the exception: it runs on the profile it recorded and never consults this, so an
 ambiguous default does not block `meka -c`. `meka serve` is the other: it starts, and refuses the
 `POST /v1/sessions` that names no profile with the same sentence, since each of its sessions may
@@ -154,47 +154,47 @@ The URL is used as given. An endpoint that answers with a redirect is refused, n
 it pointed to, rather than followed, so a credential never leaves the host you configured; set the
 final URL.
 
-**The two API families end their base URL in different places, and that is not meka's choice.** An
+**The two API families end their base URL in different places, and that is not Meka's choice.** An
 OpenAI-compatible base includes the version segment, which is why every provider documents one
-ending in `/v1` and why meka appends only `/chat/completions`. A Claude base is the host *root*,
-because meka reaches two different roots off it: `/v1/messages` for the turn, and `/api/oauth/...`
+ending in `/v1` and why Meka appends only `/chat/completions`. A Claude base is the host *root*,
+because Meka reaches two different roots off it: `/v1/messages` for the turn, and `/api/oauth/...`
 for the subscription usage and profile endpoints. A base ending at `/v1` could not reach the second
 set. The official SDKs draw the line the same way.
 
 A gateway that fronts both APIs therefore publishes two URLs, and its Anthropic one is often written
 with the `/v1` its OpenAI sibling needs (`https://api.synthetic.new/anthropic/v1`). Paste it as-is:
-for an `anthropic-messages` or `claude-subscription` account meka drops a trailing `/v1`, since it
+for an `anthropic-messages` or `claude-subscription` account Meka drops a trailing `/v1`, since it
 re-adds that segment on every request and the alternative is a request to `/v1/v1/messages`. Only a
 trailing one goes, so a base whose path legitimately contains `/v1` earlier
 (`https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/anthropic`) is left alone. Trailing
 slashes are trimmed for every backend.
 
 The reverse is not inferred: an `openai-chat-completions` base is used exactly as written, because a
-gateway serving `/chat/completions` at its root is legitimate and meka cannot tell that apart from a
+gateway serving `/chat/completions` at its root is legitimate and Meka cannot tell that apart from a
 missing `/v1`. If an OpenAI-compatible endpoint 404s, check that the base carries the version segment
 its documentation shows.
 
 ### `oauth_token_url`
 
-The OAuth token endpoint meka posts to, for the initial code exchange at `meka account add` /
+The OAuth token endpoint Meka posts to, for the initial code exchange at `meka account add` /
 `login` and for every refresh thereafter. Both, not just refreshes: it overrides a constant, so it
 overrides it everywhere that constant is used. Defaults:
 
 - `https://platform.claude.com/v1/oauth/token` for `claude-subscription`
 - `https://auth.openai.com/oauth/token` for `chatgpt-subscription`
 
-It exists because that endpoint is the provider's fact, not meka's, and a value baked into the
+It exists because that endpoint is the provider's fact, not Meka's, and a value baked into the
 binary either goes stale or sits on the far side of a proxy your network makes you use. Set it with
 `client_id` when your route out needs both.
 
-There is deliberately no `authorize_url` to go with it, and the asymmetry is not an oversight: meka
+There is deliberately no `authorize_url` to go with it, and the asymmetry is not an oversight: Meka
 never *requests* the authorization URL, it hands it to your browser, so an egress proxy is never in
-that path. The two legs meka makes itself are the code exchange and the refresh, and this covers
+that path. The two legs Meka makes itself are the code exchange and the refresh, and this covers
 both.
 
 ### `client_id`
 
-OAuth client id override (advanced; `claude-subscription` / `chatgpt-subscription` only). Leave unset to use meka's built-in default client ids.
+OAuth client id override (advanced; `claude-subscription` / `chatgpt-subscription` only). Leave unset to use Meka's built-in default client ids.
 
 ### `interleaved_thinking`
 
@@ -215,7 +215,7 @@ interleaved_thinking = false
 ### `prompt_cache_key`
 
 `openai-responses` only. Whether the request carries `prompt_cache_key`, OpenAI's hint for routing
-one conversation's requests to the cache holding its prefix; meka sends the session's id, as
+one conversation's requests to the cache holding its prefix; Meka sends the session's id, as
 `chatgpt-subscription` does. Unset is `true`, which is what OpenAI's own API takes. An endpoint
 that refuses the field sets it `false`; most servers ignore a field they do not know.
 
@@ -245,7 +245,7 @@ holds names to less states what it holds them to; at least 16, which a cut name 
 
 `claude-subscription` only. Stable per-device identifier embedded in `metadata.user_id` to mirror Claude Code's `~/.claude.json` device id (`getOrCreateUserID` in `utils/config.ts`).
 
-If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way, the resolved value is persisted back to the account under `[accounts.<name>].device_id`, the first time a process reads the account: at startup, or when `meka serve` serves the file after a write or a reload. This file write only happens for the `claude-subscription` backend; other backends don't need a device id.
+If unset, Meka first tries to adopt `userID` from `~/.claude.json` (so Meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, Meka generates a 64-character hex string. Either way, the resolved value is persisted back to the account under `[accounts.<name>].device_id`, the first time a process reads the account: at startup, or when `meka serve` serves the file after a write or a reload. This file write only happens for the `claude-subscription` backend; other backends don't need a device id.
 
 You can supply your own value if you want to control attribution explicitly:
 
@@ -265,7 +265,7 @@ says so.
 
 ### `model`
 
-The model identifier to send to the provider, forwarded verbatim. Optional in the file, but a session cannot run without one: a profile that names no model is refused by name when a session tries to run on it. meka does not gate which strings are valid, so an OpenAI-compatible endpoint accepts whatever that server exposes.
+The model identifier to send to the provider, forwarded verbatim. Optional in the file, but a session cannot run without one: a profile that names no model is refused by name when a session tries to run on it. Meka does not gate which strings are valid, so an OpenAI-compatible endpoint accepts whatever that server exposes.
 
 `meka profile add` suggests `claude-opus-5-5` for a profile on a Claude account and `gpt-6-astra` for one on an OpenAI account. For the current line-ups, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) and [OpenAI's models overview](https://platform.openai.com/docs/models); naming them here would go stale on someone else's schedule.
 
@@ -294,9 +294,9 @@ Change it with `meka profile set <name> fallbacks backup,last-resort` (comma-sep
 
 ### `context_window`
 
-The model's context window (total tokens it can hold), used for the `/status` gauge and auto-compaction. Takes precedence over [`[session].context_window`](#sessioncontext_window); when neither is set, meka assumes **1000000**.
+The model's context window (total tokens it can hold), used for the `/status` gauge and auto-compaction. Takes precedence over [`[session].context_window`](#sessioncontext_window); when neither is set, Meka assumes **1000000**.
 
-meka never infers this from the model name and never asks the provider for it, so this is where a model smaller than the default gets stated. It is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request, but leaving it at 1M for a smaller model means planned compaction never fires, and every compaction instead happens after the provider rejects the request as too large, costing a wasted round trip each time.
+Meka never infers this from the model name and never asks the provider for it, so this is where a model smaller than the default gets stated. It is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request, but leaving it at 1M for a smaller model means planned compaction never fires, and every compaction instead happens after the provider rejects the request as too large, costing a wasted round trip each time.
 
 The window belongs to the session, not to the process: each session is measured against the profile it recorded, so two sessions in one `meka serve` can sit on profiles with different windows.
 
@@ -318,7 +318,7 @@ Override the per-request output (completion) token cap. When unset, each backend
 | Claude, `off` | 32000 |
 | Every other backend | the endpoint's own |
 
-The Claude figures are meka's own defaults for the two Anthropic backends. The adaptive one is what Claude Code 2.1.310 sends for Opus 5.5, the model `meka profile add` suggests, and the most any model that takes adaptive thinking accepts; Claude Code's per-model catalog says the same for Sonnet 5.5 and Haiku 5.5 and 64000 for the rest of the line-up, and stating a figure here replaces the default. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
+The Claude figures are Meka's own defaults for the two Anthropic backends. The adaptive one is what Claude Code 2.1.310 sends for Opus 5.5, the model `meka profile add` suggests, and the most any model that takes adaptive thinking accepts; Claude Code's per-model catalog says the same for Sonnet 5.5 and Haiku 5.5 and 64000 for the rest of the line-up, and stating a figure here replaces the default. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
 
 Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget`](#thinkingbudget), else 16000). `meka profile add` and `meka profile set` both refuse a profile that fails this, and it is validated again at startup.
 
@@ -352,7 +352,7 @@ max_request_bytes = 8388608
 
 One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-subscription` under the `effort-2025-11-24` beta, `anthropic-messages` directly), `openai-chat-completions` as `reasoning_effort` (with `max_completion_tokens` for the output cap), and the two Responses backends as `reasoning.effort` (with `max_output_tokens`).
 
-**When unset the field is omitted, and the provider applies its own default. `claude-subscription` is the exception: it sends `medium`, Claude Code's default for Opus 5.5.** That is the point of leaving it unset: effort is a request parameter the provider owns, and omitting it is how you ask for whatever that provider considers right. meka picks no tier of its own, because it cannot know which tiers a given endpoint implements: `anthropic-messages` and `openai-chat-completions` reach any compatible server, including local ones serving weights that never had a reasoning knob, and a tier the backend doesn't implement is a rejected request rather than a graceful ignore.
+**When unset the field is omitted, and the provider applies its own default. `claude-subscription` is the exception: it sends `medium`, Claude Code's default for Opus 5.5.** That is the point of leaving it unset: effort is a request parameter the provider owns, and omitting it is how you ask for whatever that provider considers right. Meka picks no tier of its own, because it cannot know which tiers a given endpoint implements: `anthropic-messages` and `openai-chat-completions` reach any compatible server, including local ones serving weights that never had a reasoning knob, and a tier the backend doesn't implement is a rejected request rather than a graceful ignore.
 
 An explicit value is absolute: sent verbatim (trimmed and lowercased), with no validation or clamping, whatever model it is aimed at. You own correctness for your model and endpoint; an invalid value is rejected by the API. A blank value reads as unset.
 
@@ -414,7 +414,7 @@ Claude-only. How the request encodes extended thinking, and whether it asks for 
 | `budgeted` | `thinking: {"type": "enabled", "budget_tokens": N}`, with N from [`thinking_budget`](#thinking_budget), else [`[thinking].budget`](#thinkingbudget), else 16000. Required by pre-4.6 Claude, and the form most third-party Anthropic-compatible servers implement |
 | `off` | No `thinking` field |
 
-One knob rather than two: it replaces both the old on/off switch and the encoding meka used to infer from the model name. The right value depends on the model *and* on what the endpoint implements, which meka can't determine, so the profile states it, and a profile whose `model` later changes is yours to keep correct.
+One knob rather than two: it replaces both the old on/off switch and the encoding Meka used to infer from the model name. The right value depends on the model *and* on what the endpoint implements, which Meka can't determine, so the profile states it, and a profile whose `model` later changes is yours to keep correct.
 
 ```toml
 [profiles.local]
@@ -475,8 +475,8 @@ display modes:
 - `redacted`: the server withholds the text and may return opaque `redacted_thinking` blocks. Sent
   as the `redact-thinking-2026-02-12` beta with no display field.
 
-Every mode returns signed `thinking` blocks, which meka stores and replays verbatim, so multi-turn
-continuity holds in all three. With thinking off there is nothing to display, and meka sends the
+Every mode returns signed `thinking` blocks, which Meka stores and replays verbatim, so multi-turn
+continuity holds in all three. With thinking off there is nothing to display, and Meka sends the
 redaction beta as Claude Code does.
 
 ```toml
@@ -498,7 +498,7 @@ endpoint, `chatgpt-subscription` included, keeps its reasoning on that endpoint.
 ### `reasoning_summary`
 
 `openai-responses` only. Whether the request asks for `reasoning.summary`, the digest of the
-model's reasoning meka shows as its thinking. Defaults to `true`. A model or endpoint that refuses
+model's reasoning Meka shows as its thinking. Defaults to `true`. A model or endpoint that refuses
 the field sets it `false`, as a model that does not reason does on OpenAI's API, and the thinking
 then shows only what the endpoint streams unasked (vLLM and Ollama stream their reasoning text
 either way).
@@ -517,7 +517,7 @@ reasoning_summary   = false
 `access_programs.cyber`, which is what Codex sends with Daybreak on. The value is OpenAI's:
 `standard`, `daybreak_blue` or `daybreak_red`, trimmed and otherwise sent as written. Unset sends
 nothing, which leaves the program to the server. Which programs a model offers is the account's
-fact: Codex reads it off the account's model list, meka reads no such list, and the endpoint
+fact: Codex reads it off the account's model list, Meka reads no such list, and the endpoint
 rejects a program the model does not offer, naming the one to set. A Daybreak model such as `gpt-daybreak-blue-latest` runs on
 its own program with the key unset. The other backends never read it, and `meka profile add` and
 `set` refuse it on their profiles; on `openai-responses` the field is a parameter like any other,
@@ -532,11 +532,11 @@ cyber_access_program = "daybreak_blue"
 
 ### `parameters`
 
-`anthropic-messages`, `openai-chat-completions` and `openai-responses` only. Fields meka adds to
+`anthropic-messages`, `openai-chat-completions` and `openai-responses` only. Fields Meka adds to
 every request the profile makes, sent as written: sampling settings such as `temperature` and
 `top_p`, and anything else the endpoint accepts, a server's own extensions included. Each key is
 one top-level field of the request body, spelled as the provider's API reference spells it, and
-its value is any TOML value: a string, a number, a boolean, an array or a table. meka reads none
+its value is any TOML value: a string, a number, a boolean, an array or a table. Meka reads none
 of them, so a field the endpoint does not know is the endpoint's to refuse or ignore.
 
 ```toml
@@ -552,9 +552,9 @@ top_k       = 20
 provider    = { order = ["deepinfra"], allow_fallbacks = false }
 ```
 
-A setting meka understands is a profile field of its own, never a parameter: `effort` and
+A setting Meka understands is a profile field of its own, never a parameter: `effort` and
 `max_output_tokens` are sent under each backend's own name, and `thinking` decides fields of its
-own. So a field meka writes itself is refused when the config loads and by every command that
+own. So a field Meka writes itself is refused when the config loads and by every command that
 writes a profile, naming the profile field to set instead; each backend's page lists the fields
 it writes. A server's other name for one of them is not refused: on a server that reads
 `max_tokens` and not `max_completion_tokens`, leave `max_output_tokens` unset and send
@@ -598,7 +598,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `transport` | Yes | Transport type: `"stdio"` (spawn subprocess) or `"http"` (streamable HTTP). |
 | `command` | Stdio only | Path or name of the executable to spawn. On Windows, `npx` / `.cmd` / `.bat` / `.ps1` are auto-wrapped in `cmd /c`. |
 | `args` | No | Arguments to pass to the command. |
-| `env` | No | Environment variables to set for the spawned process (stdio only). The child does **not** inherit meka's environment; see below. |
+| `env` | No | Environment variables to set for the spawned process (stdio only). The child does **not** inherit Meka's environment; see below. |
 | `url` | HTTP only | URL of the MCP server endpoint. |
 | `headers` | No | Custom HTTP headers to include with every request (HTTP only). |
 | `headers_helper` | No | Path to an executable whose stdout (`Name: Value\n` lines) is merged over `headers` on every connect (HTTP only), so a request the server rejects as unauthorized reconnects once to fetch them again. Absolute, or relative to the directory `config.toml` is in; a bare name is not searched on `PATH`. Executed with `MEKA_MCP_SERVER_NAME` / `MEKA_MCP_SERVER_URL` in env; 15 s timeout. |
@@ -608,7 +608,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools`; tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
 | `eager_load_tools` | No | Raw tool names that ship **eager-loaded** whatever `deferral` says. Listed tools skip the `tool_load` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
 | `deferral` | No | How this server's other tools ship: `deferred` (listed under `[Tool discovery]`, schema on `tool_load`), `eager` (every tool declared from the first request) or `hidden` (not registered at all: not in the catalog, the request or the context gauge). Unset inherits `[mcp].deferral`. See [Deferred tools](../tools/overview.md#deferred-tools) for what each costs. |
-| `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name, same values as `permission`. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. A level meka does not have is refused at startup, naming the line. |
+| `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name, same values as `permission`. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. A level Meka does not have is refused at startup, naming the line. |
 | `trust_read_only_hint` | No | Whether this server's `readOnlyHint: true` may classify a tool as `read`. Defaults to `true`. Set `false` for a server you have not audited: its hints become advisory for display only, so its tools fall through to the strict `unrestricted` fallback, skipping `[mcp].default_permission` (a global convenience must not re-grant what a per-server audit decision refused). A `readOnlyHint: false` is still honored either way, since it only raises the requirement. See *Permission resolution* below. |
 | `disabled` | No | When `true`, the server is skipped entirely at startup: no process is spawned, no HTTP connect is attempted. Flip it back with `meka mcp enable <name>` or by editing the config. Unset means `false`. |
 | `required` | No | When `true`, a turn is refused while this enabled server is not `Connected` (a `disabled` server is never started, so it never gates). Over the HTTP API that refusal is a 503 `/errors/mcp-unavailable` naming the servers. When `false`, the session runs without it and its tools are simply absent. Unset inherits `[mcp].default_required` (itself `false`), so servers are optional unless they opt in. |
@@ -625,7 +625,7 @@ Every MCP tool's required permission is resolved through a five-step chain; the 
 
 User-supplied config (1, 2, 4) always beats the server's self-classification; if a server lies about a tool, you can override. But when no user config says anything, the server's hint is trusted for that specific tool so `readOnlyHint = false` destructive tools don't silently become Read-accessible just because the user opted into a lenient global default.
 
-**Hint spoofing**: `readOnlyHint` is asserted by the server and not verified by meka, and MCP tools run in the server's own process with **no sandbox**. A server that claims `readOnlyHint = true` for a tool that in fact writes therefore gets to write your tree while meka sits at `read`: MCP tools are outside the `read` filesystem boundary that covers meka's built-ins (see [Permissions](../usage/permissions.md#mcp-tools-are-the-exception)).
+**Hint spoofing**: `readOnlyHint` is asserted by the server and not verified by Meka, and MCP tools run in the server's own process with **no sandbox**. A server that claims `readOnlyHint = true` for a tool that in fact writes therefore gets to write your tree while Meka sits at `read`: MCP tools are outside the `read` filesystem boundary that covers Meka's built-ins (see [Permissions](../usage/permissions.md#mcp-tools-are-the-exception)).
 
 Three defenses, in increasing order of bluntness:
 
@@ -641,7 +641,7 @@ The hint is trusted by default because most servers annotate honestly and requir
 
 #### The stdio server's environment
 
-A stdio server is a child process that talks to the network, and it does **not** inherit meka's
+A stdio server is a child process that talks to the network, and it does **not** inherit Meka's
 environment. It receives the same curated base a shell at `read` gets (`PATH` so it can resolve its
 own binaries, `HOME`, locale, `TMPDIR`), plus whatever the server's own `env` table sets.
 
@@ -667,7 +667,7 @@ command = "my-tooling-server"
 env = { PYTHONPATH = "${PYTHONPATH}" }
 ```
 
-A server that genuinely needs a secret asks for it by name, and `${VAR}` still reads meka's
+A server that genuinely needs a secret asks for it by name, and `${VAR}` still reads Meka's
 environment at connect time:
 
 ```toml
@@ -681,7 +681,7 @@ env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
 
 #### Examples
 
-**Exa**: web search, which meka has no built-in tool for. The free tier works without an API key; paste a key into the `headers` table for the paid tier:
+**Exa**: web search, which Meka has no built-in tool for. The free tier works without an API key; paste a key into the `headers` table for the paid tier:
 ```bash
 # Free tier, no key required
 meka mcp add exa https://mcp.exa.ai/mcp
@@ -756,7 +756,7 @@ url = "https://mcp.github.com"
 headers = { X-Api-Key = "${GITHUB_MCP_TOKEN}" }
 ```
 
-`env`, `args` and `headers` may *contain* a secret, but they are not one: `env` sets a subprocess's whole environment, `args` carries connection strings, and `headers` carries `X-Tenant-Id` as readily as `X-Api-Key`. meka cannot tell which is which, so they stay in `config.toml` and `${VAR}` is how you keep a value out of it.
+`env`, `args` and `headers` may *contain* a secret, but they are not one: `env` sets a subprocess's whole environment, `args` carries connection strings, and `headers` carries `X-Tenant-Id` as readily as `X-Api-Key`. Meka cannot tell which is which, so they stay in `config.toml` and `${VAR}` is how you keep a value out of it.
 
 A bearer token and an OAuth client secret are unambiguously secrets, so they are not config at all. They live in the store and are set with `meka mcp add --auth-token-stdin` / `--client-secret-stdin`, or afterwards with `meka mcp login`. See [Credentials](../usage/mcp.md#credentials).
 
@@ -775,7 +775,7 @@ The client secret is not a field here. It is a secret, so it lives in the store:
 | `scopes` | No | OAuth scopes to request |
 | `signing_key_path` | JWT only | Path to PEM private key file |
 | `signing_algorithm` | No | JWT signing algorithm: `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384` |
-| `redirect_port` | No | Local port for OAuth authorization code callback. When omitted, meka binds to a random ephemeral port (recommended). `oauth` only. |
+| `redirect_port` | No | Local port for OAuth authorization code callback. When omitted, Meka binds to a random ephemeral port (recommended). `oauth` only. |
 
 ### Examples
 
@@ -882,7 +882,7 @@ scopes = ["admin"]
 
 #### HTTP server with OAuth authorization code flow
 
-On first connection, meka opens a browser for authorization and stores the token for future use.
+On first connection, Meka opens a browser for authorization and stores the token for future use.
 
 ```toml
 [[mcp.servers]]
@@ -897,7 +897,7 @@ scopes = ["repo", "user"]
 redirect_port = 8400
 ```
 
-If `client_id` is omitted, meka attempts [dynamic client registration](https://datatracker.ietf.org/doc/html/rfc7591) with the server.
+If `client_id` is omitted, Meka attempts [dynamic client registration](https://datatracker.ietf.org/doc/html/rfc7591) with the server.
 
 ## `[permissions]`
 
@@ -909,9 +909,9 @@ Controls which permission levels are reachable at runtime and which level the se
 | `enabled` | No | List of levels that can be reached at runtime via `/permission` and Shift+Tab. Default `["none", "read", "workspace", "unrestricted"]`. Disabled levels are skipped during Shift+Tab cycling and refused by `/permission` with an error. |
 | `approvals` | No | Whether a new session starts with [approvals](../usage/permissions.md#approvals) on: a tool call needing more than the session's level is put to you rather than refused. Default `false`. A session records its own switch afterwards, moved by `/approvals`, `PATCH /v1/sessions/{id}` or the ACP `approvals` config option. |
 | `confine_reads` | No | Whether a root session's reads below `unrestricted` are confined to its workspace, its additional readable directories and the directories a command needs to run, the way writes are confined to the workspace at `workspace`. Default `false`. Instance-wide, read at startup: every root session this process runs is bound by it, and `unrestricted` is the per-session escape. A sub-agent's reads are confined to its scope whatever this says. See [The read boundary](../usage/permissions.md#the-read-boundary). |
-| `network` | No | What a confined command and `web_fetch` may reach: `"host"`, the machine's network; `"remote"`, other machines but not this one; or `"none"`. Default `"host"`. `web_fetch`, which runs in the meka process where no sandbox reaches, holds every value itself: under `"none"` it is withheld from every session and listed by `meka tool list` as `disabled`; under `"remote"` it refuses this machine's own addresses (loopback, unspecified, and any address an interface here holds) at the URL, at every redirect and at the resolver, while a machine on the LAN stays reachable; with a proxy configured the proxy resolves the target and only the proxy's own name is judged, as under `[web].refuse_private_destinations`. A command holds what its backend can. Under `"none"`, Bubblewrap unshares the network namespace, Landlock refuses every TCP bind and connect and, from ABI v10 (kernel 7.2), every UDP bind and send, `sandbox-exec` withholds its outbound rule, and the Windows AppContainer grants no network capability. A value a backend cannot hold as such runs as the next narrower one it can, and startup says so once with the value to set that silences the warning: Bubblewrap, Landlock and `sandbox-exec` hold `"remote"` as `"none"`, and the AppContainer on schema 1.0 holds `"host"` as `"remote"`. The Windows restricted token has no say over a command's network, so a command under it reaches the host at every setting, which startup says once; `web_fetch` holds the setting there too. An MCP server is a separate process outside the sandbox and keeps its own network: a session that must not reach the network is also given no server that can, through `[[mcp.servers]]` or a sub-agent's `allow_servers`. `unrestricted` runs the shell unsandboxed, so the setting holds `web_fetch` alone there, and the scope lines say `Network: none (web_fetch)`. A sub-agent holds its parent's setting unless its spawn narrows it with [`network`](../tools/overview.md#agent_spawn), and the scope lines name what the shell and `web_fetch` each reach when either is narrowed. A boundary like `confine_reads`, reaching the in-process tool and the sandboxed shell alike, which is why it lives here and not under `[shell]`. |
+| `network` | No | What a confined command and `web_fetch` may reach: `"host"`, the machine's network; `"remote"`, other machines but not this one; or `"none"`. Default `"host"`. `web_fetch`, which runs in the Meka process where no sandbox reaches, holds every value itself: under `"none"` it is withheld from every session and listed by `meka tool list` as `disabled`; under `"remote"` it refuses this machine's own addresses (loopback, unspecified, and any address an interface here holds) at the URL, at every redirect and at the resolver, while a machine on the LAN stays reachable; with a proxy configured the proxy resolves the target and only the proxy's own name is judged, as under `[web].refuse_private_destinations`. A command holds what its backend can. Under `"none"`, Bubblewrap unshares the network namespace, Landlock refuses every TCP bind and connect and, from ABI v10 (kernel 7.2), every UDP bind and send, `sandbox-exec` withholds its outbound rule, and the Windows AppContainer grants no network capability. A value a backend cannot hold as such runs as the next narrower one it can, and startup says so once with the value to set that silences the warning: Bubblewrap, Landlock and `sandbox-exec` hold `"remote"` as `"none"`, and the AppContainer on schema 1.0 holds `"host"` as `"remote"`. The Windows restricted token has no say over a command's network, so a command under it reaches the host at every setting, which startup says once; `web_fetch` holds the setting there too. An MCP server is a separate process outside the sandbox and keeps its own network: a session that must not reach the network is also given no server that can, through `[[mcp.servers]]` or a sub-agent's `allow_servers`. `unrestricted` runs the shell unsandboxed, so the setting holds `web_fetch` alone there, and the scope lines say `Network: none (web_fetch)`. A sub-agent holds its parent's setting unless its spawn narrows it with [`network`](../tools/overview.md#agent_spawn), and the scope lines name what the shell and `web_fetch` each reach when either is narrowed. A boundary like `confine_reads`, reaching the in-process tool and the sandboxed shell alike, which is why it lives here and not under `[shell]`. |
 
-A level meka does not have is refused at parse, with the line. An `enabled` list that names nothing falls back to `read` alone, with a warning, rather than to the default set, so an empty list cannot widen authority. If `default` is not in `enabled`, meka logs a warning and falls back to `read` if it's enabled, otherwise the lowest enabled level (in `none → read → workspace → unrestricted` order). Same behavior if `--permission` or `MEKA_PERMISSION` selects a disabled level: meka warns and starts at the configured default rather than refusing to launch.
+A level Meka does not have is refused at parse, with the line. An `enabled` list that names nothing falls back to `read` alone, with a warning, rather than to the default set, so an empty list cannot widen authority. If `default` is not in `enabled`, Meka logs a warning and falls back to `read` if it's enabled, otherwise the lowest enabled level (in `none → read → workspace → unrestricted` order). Same behavior if `--permission` or `MEKA_PERMISSION` selects a disabled level: Meka warns and starts at the configured default rather than refusing to launch.
 
 ```toml
 [permissions]
@@ -945,16 +945,16 @@ The mechanism a confined command runs under. Each platform takes its own values,
 
 Linux takes `"bubblewrap"`, `"bubblewrap-landlock"` and `"landlock"`:
 
-- **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. On a kernel with Landlock ABI v6 (6.12) or newer the command also runs inside meka's Landlock ruleset, enacted by `meka confine` after the mounts, which closes the abstract namespace, signals and device ioctls, and from kernel 7.1 the sockets the masks do not cover. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
+- **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. On a kernel with Landlock ABI v6 (6.12) or newer the command also runs inside Meka's Landlock ruleset, enacted by `meka confine` after the mounts, which closes the abstract namespace, signals and device ioctls, and from kernel 7.1 the sockets the masks do not cover. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
 - **Bubblewrap with Landlock** (`"bubblewrap-landlock"`) is Bubblewrap with the Landlock layer inside required rather than added where the kernel allows: on a kernel below 6.12 the backend is unusable and `shell_execute` at `read` fails, so a pinned value guarantees the layer is applied. What the layer closes still follows the kernel: the abstract namespace, signals and device ioctls from 6.12, sockets on disk outside the masks from 7.1. Auto-detection never picks it; pin it on a host where that guarantee matters more than a working shell.
-- **Landlock** (`"landlock"`) uses the Landlock LSM to block filesystem writes, and requires **ABI v9 (kernel 7.1+)**: the first ABI that can refuse `connect()` to Unix sockets on disk, which is the dbus / systemd-user route out of the sandbox. On an older kernel meka reports the backend unusable rather than leave that door open; install Bubblewrap there. Closing it also costs socket-based clients like `docker` and `psql` at `read`. meka's own directories are hidden by per-sibling read grants, and each command gets a private temporary directory named by `TMPDIR`. No ABI mediates file metadata, so `chmod`, `chown`, `touch` and `setxattr` still succeed at `read`; that is what the startup warning names.
+- **Landlock** (`"landlock"`) uses the Landlock LSM to block filesystem writes, and requires **ABI v9 (kernel 7.1+)**: the first ABI that can refuse `connect()` to Unix sockets on disk, which is the dbus / systemd-user route out of the sandbox. On an older kernel Meka reports the backend unusable rather than leave that door open; install Bubblewrap there. Closing it also costs socket-based clients like `docker` and `psql` at `read`. Meka's own directories are hidden by per-sibling read grants, and each command gets a private temporary directory named by `TMPDIR`. No ABI mediates file metadata, so `chmod`, `chown`, `touch` and `setxattr` still succeed at `read`; that is what the startup warning names.
 
 Windows takes `"appcontainer"` and `"restricted-token"`:
 
-- **AppContainer** (`"appcontainer"`) runs the command inside a process security environment the OS enforces, on a Windows 11 build that has the API: 26H2, where meka measured it, and 24H2 and 25H2 from the August 2026 update, where Microsoft lists it. meka's config directory and store are denied, the read boundary holds for the shell as it does for the file tools, `network = "none"` cuts a command off, and nothing is written to your directories' ACLs. See [Shell](../tools/shell.md#windows-pick-a-backend) for what it covers and its limits.
-- **Restricted token** (`"restricted-token"`) runs the command under a token derived from meka's own: Low integrity at `read`, write-restricted to the workspace roots at `workspace`. It confines writes only: a command can read meka's store, `confine_reads` holds for the file tools alone, and `network = "none"` for `web_fetch` alone. That is what the startup warning names when it is the automatic choice.
+- **AppContainer** (`"appcontainer"`) runs the command inside a process security environment the OS enforces, on a Windows 11 build that has the API: 26H2, where Meka measured it, and 24H2 and 25H2 from the August 2026 update, where Microsoft lists it. Meka's config directory and store are denied, the read boundary holds for the shell as it does for the file tools, `network = "none"` cuts a command off, and nothing is written to your directories' ACLs. See [Shell](../tools/shell.md#windows-pick-a-backend) for what it covers and its limits.
+- **Restricted token** (`"restricted-token"`) runs the command under a token derived from Meka's own: Low integrity at `read`, write-restricted to the workspace roots at `workspace`. It confines writes only: a command can read Meka's store, `confine_reads` holds for the file tools alone, and `network = "none"` for `web_fetch` alone. That is what the startup warning names when it is the automatic choice.
 
-When omitted, meka probes the platform's stronger backend once at startup, Bubblewrap on Linux and AppContainer on Windows, and auto-picks it when usable; AppContainer counts as usable at schema 1.1, and a build whose API speaks 1.0 is named in the warning, since pinning `"appcontainer"` takes it there with `network = "host"` held as `"remote"`. Otherwise it auto-picks the fallback, Landlock or the restricted token, and emits a one-shot warning naming what the fallback gives up. Set the field explicitly, to the fallback included, to suppress that warning. No command writes this field; leave it unset to keep auto-detection.
+When omitted, Meka probes the platform's stronger backend once at startup, Bubblewrap on Linux and AppContainer on Windows, and auto-picks it when usable; AppContainer counts as usable at schema 1.1, and a build whose API speaks 1.0 is named in the warning, since pinning `"appcontainer"` takes it there with `network = "host"` held as `"remote"`. Otherwise it auto-picks the fallback, Landlock or the restricted token, and emits a one-shot warning naming what the fallback gives up. Set the field explicitly, to the fallback included, to suppress that warning. No command writes this field; leave it unset to keep auto-detection.
 
 If the configured backend can't be used at runtime (bwrap not installed, user namespaces denied, the AppContainer API missing on this build, a value from another platform), `shell_execute` at `read` hard-errors with a message naming the configured backend, the specific failure reason and the key to fix. `read` is not blocked for other tools; only `shell_execute` requires a usable sandbox.
 
@@ -971,7 +971,7 @@ sandbox_backend = "bubblewrap"  # Linux; "appcontainer" or "restricted-token" on
 
 ### `shell.additional_readable_directories`
 
-Directories every confined command may read beyond the system directories, wherever reads are confined: with [`permissions.confine_reads`](#permissions) on, and for every sub-agent, whose reads its scope confines. Additional beyond the system directories, as the flag [`--additional-readable-directory`](./cli-options.md#--additional-readable-directory-dir) is per run. The system directories are where the operating system keeps the programs, libraries and configuration a command needs to run at all, and the list is deliberately system-level: on Linux `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/dev`, `/nix/store` and `/run/current-system/sw`; on macOS `/bin`, `/sbin`, `/usr`, `/etc`, `/System`, `/Library/Apple`, `/Library/Preferences`, `/Library/Filesystems/NetFSPlugins`, `/var/db`, `/opt/homebrew`, `/Library/Developer` and `/dev`, plus the active developer directory `xcode-select` records, since the developer commands in `/usr/bin` are stubs that run the real binaries from there. Each is taken only where it exists. The skill directories [`[skills].additional_directories`](#skills) names are readable too. Add here what else this machine keeps system software under: `/opt`, `/snap`, a toolchain outside the home directory. An entry is warned about and dropped when it does not resolve, when it is relative, or when it is a directory the sandbox masks (`/tmp`, `/run`, the runtime directory, the filesystem root, meka's own directories), since Bubblewrap binds the readable directories after its masks and `/run` named here would hand the session bus back to a confined command. On Windows the system directories are the Windows directory, Program Files, Program Files (x86) and ProgramData, located by the environment; under the restricted token the shell's reads are not confined, so the list reaches the file tools alone there.
+Directories every confined command may read beyond the system directories, wherever reads are confined: with [`permissions.confine_reads`](#permissions) on, and for every sub-agent, whose reads its scope confines. Additional beyond the system directories, as the flag [`--additional-readable-directory`](./cli-options.md#--additional-readable-directory-dir) is per run. The system directories are where the operating system keeps the programs, libraries and configuration a command needs to run at all, and the list is deliberately system-level: on Linux `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/dev`, `/nix/store` and `/run/current-system/sw`; on macOS `/bin`, `/sbin`, `/usr`, `/etc`, `/System`, `/Library/Apple`, `/Library/Preferences`, `/Library/Filesystems/NetFSPlugins`, `/var/db`, `/opt/homebrew`, `/Library/Developer` and `/dev`, plus the active developer directory `xcode-select` records, since the developer commands in `/usr/bin` are stubs that run the real binaries from there. Each is taken only where it exists. The skill directories [`[skills].additional_directories`](#skills) names are readable too. Add here what else this machine keeps system software under: `/opt`, `/snap`, a toolchain outside the home directory. An entry is warned about and dropped when it does not resolve, when it is relative, or when it is a directory the sandbox masks (`/tmp`, `/run`, the runtime directory, the filesystem root, Meka's own directories), since Bubblewrap binds the readable directories after its masks and `/run` named here would hand the session bus back to a confined command. On Windows the system directories are the Windows directory, Program Files, Program Files (x86) and ProgramData, located by the environment; under the restricted token the shell's reads are not confined, so the list reaches the file tools alone there.
 
 Default: `[]`
 
@@ -982,7 +982,7 @@ additional_readable_directories = ["/opt", "/snap"]
 
 ## `[tools]`: built-in tool filters
 
-The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's built-in tools (`file_read`, `file_write`, `shell_execute`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.
+The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to Meka's built-in tools (`file_read`, `file_write`, `shell_execute`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.
 
 | Key | Purpose |
 |---|---|
@@ -990,7 +990,7 @@ The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's bui
 | `disabled_tools` | Block-list of built-in tool names. Applied **after** `allowed_tools`; a tool here is never registered even if it also appears in the allow-list. |
 | `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `workspace`, `unrestricted`; any other value is refused at startup, naming the line. |
 
-Stale entries (a name that matches no built-in) emit a `warn!` at startup. meka still starts; the warning just flags a likely typo or a tool the binary renamed.
+Stale entries (a name that matches no built-in) emit a `warn!` at startup. Meka still starts; the warning just flags a likely typo or a tool the binary renamed.
 
 Restrict a session to read-only inspection:
 ```toml
@@ -1075,7 +1075,7 @@ Controls the skill store. See the [Skills](../usage/skills.md) guide.
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Register `skill_read` / `skill_search` and render the skills index |
 | `agent_managed` | bool | `false` | Additionally register `skill_write`, `skill_edit` and `skill_delete` |
-| `additional_directories` | array | `[]` | Directories to scan beyond meka's own store, read-only |
+| `additional_directories` | array | `[]` | Directories to scan beyond Meka's own store, read-only |
 
 ```toml
 [skills]
@@ -1086,16 +1086,16 @@ Setting `enabled = false` keeps every skill tool's schema out of every request a
 
 `agent_managed = true` lets the agent author its own skills. It is off by default because you normally curate that store yourself; it exists for a long-running agent that dispatches sub-agents, where a skill is the only artifact that both survives the session and can be handed to a sub-agent as its task. Sub-agents never receive the authoring tools whatever this is set to. See [Letting the agent manage skills](../usage/skills.md#letting-the-agent-manage-skills).
 
-`additional_directories` adds directories to the scan beyond meka's own store. They are strictly read-only: meka never creates them and never writes into them, so an entry that does not exist is simply skipped and leaves nothing behind. A leading `~` is expanded. Where reads are confined, these directories stay readable, as meka's own skills store does, so a skill's bundled files can be read; see [the read boundary](../usage/permissions.md#the-read-boundary).
+`additional_directories` adds directories to the scan beyond Meka's own store. They are strictly read-only: Meka never creates them and never writes into them, so an entry that does not exist is simply skipped and leaves nothing behind. A leading `~` is expanded. Where reads are confined, these directories stay readable, as Meka's own skills store does, so a skill's bundled files can be read; see [the read boundary](../usage/permissions.md#the-read-boundary).
 
 ```toml
 [skills]
 additional_directories = ["~/.agents/skills"]
 ```
 
-`~/.agents/skills` is the cross-client convention, so pointing at it makes skills installed by other Agent Skills clients visible here. It is not a default: reading a directory outside meka's own namespace is your call. meka's own store is searched first and wins a name collision. There is no automatic project-level scan, for the same reason meka reads nothing from the working directory that config does not name, the files under [`[instructions]`](#instructions) included; name the path here if you want a project's skills read. See [Reading skills from other directories](../usage/skills.md#reading-skills-from-other-directories).
+`~/.agents/skills` is the cross-client convention, so pointing at it makes skills installed by other Agent Skills clients visible here. It is not a default: reading a directory outside Meka's own namespace is your call. Meka's own store is searched first and wins a name collision. There is no automatic project-level scan, for the same reason Meka reads nothing from the working directory that config does not name, the files under [`[instructions]`](#instructions) included; name the path here if you want a project's skills read. See [Reading skills from other directories](../usage/skills.md#reading-skills-from-other-directories).
 
-An entry that repeats an earlier one, or that names meka's own skills directory, is dropped with a warning: it would otherwise be scanned twice and every skill in it reported as shadowed by itself. An empty string is dropped too, since it would expand to your home directory.
+An entry that repeats an earlier one, or that names Meka's own skills directory, is dropped with a warning: it would otherwise be scanned twice and every skill in it reported as shadowed by itself. An empty string is dropped too, since it would expand to your home directory.
 
 ## `[memory]`
 
@@ -1113,7 +1113,7 @@ enabled = false
 
 Setting `enabled = false` keeps the five `memory_*` tool schemas out of every request and renders no memory section, which is worth doing for lean sessions that will never use it. Memories already stored are left untouched, and `meka memory` still reaches them.
 
-`inline_max_bytes` bounds what the agent carries whole in its context. The inline band is rendered into the opening message once per session and again after each compaction, so a larger budget costs prefix tokens the cache holds rather than tokens on every turn. A write that would take the inline tier past it is refused at every door, the operator's included, and a store already past it (the key lowered, or rows written past meka's doors) shows the bodies that fit and lists the rest by description until they are trimmed; see [The inline budget](../usage/memory.md#the-inline-budget). Zero is refused at startup.
+`inline_max_bytes` bounds what the agent carries whole in its context. The inline band is rendered into the opening message once per session and again after each compaction, so a larger budget costs prefix tokens the cache holds rather than tokens on every turn. A write that would take the inline tier past it is refused at every door, the operator's included, and a store already past it (the key lowered, or rows written past Meka's doors) shows the bodies that fit and lists the rest by description until they are trimmed; see [The inline budget](../usage/memory.md#the-inline-budget). Zero is refused at startup.
 
 There is deliberately no environment variable and no CLI flag here: whether an agent keeps memories is a property of the installation, not something to vary per run.
 
@@ -1187,9 +1187,9 @@ Delete sessions not updated for longer than this, at startup and then hourly for
 
 The screen's recall entries, the lines Up and Ctrl+R bring back, are swept with it: an entry older than this window, or than [`turn_retention`](#sessionturn_retention) when that is the shorter, is deleted, since what a person typed must not outlive the conversation it went into.
 
-Three kinds of session are spared whatever their timestamp says. A session another meka process has open is skipped, and the sweep reports how many: `updated_at` moves when the conversation changes, not when a session is opened, so an interactive session left open past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
+Three kinds of session are spared whatever their timestamp says. A session another Meka process has open is skipped, and the sweep reports how many: `updated_at` moves when the conversation changes, not when a session is opened, so an interactive session left open past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
 
-**Default: unset, meaning nothing is deleted.** `"0s"` is refused at startup, since it would delete everything on every launch. Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session remove --older-than-days <DAYS>` to prune manually instead.
+**Default: unset, meaning nothing is deleted.** `"0s"` is refused at startup, since it would delete everything on every launch. Conversation history isn't reproducible, so Meka keeps it until told otherwise. Use `meka session remove --older-than-days <DAYS>` to prune manually instead.
 
 ```toml
 [session]
@@ -1224,7 +1224,7 @@ auto_compact = false
 
 ### `session.context_ceiling_percent`
 
-The share of the context window meka lets the conversation fill on its own. Two things happen at the line: with `auto_compact` on, the conversation is compacted once past it; and a whole `scratchpad_read` that would carry the context past it is cut there and says where to continue, whether or not compaction is on. Refused outside 1 through 100.
+The share of the context window Meka lets the conversation fill on its own. Two things happen at the line: with `auto_compact` on, the conversation is compacted once past it; and a whole `scratchpad_read` that would carry the context past it is cut there and says where to continue, whether or not compaction is on. Refused outside 1 through 100.
 
 What is left above the line has to hold the reply and one round's growth past it, so keep at least your output budget plus a round free: the API refuses a request whose input and output cap together exceed the window. The default leaves 150k tokens on a 1M window against a Claude reply budget of 128000; on a small window it needs lowering, or `max_output_tokens` does.
 
@@ -1254,7 +1254,7 @@ compact_checkpoint = false
 
 Override the model's context window size (in tokens). Used for the context ceiling. A per-profile `[profiles.<name>].context_window` takes precedence over this.
 
-When neither is set, meka assumes **1000000**. It does not infer the window from the model name, query the provider's models API, or cache anything: the window is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request, and the user is the one who knows the truth.
+When neither is set, Meka assumes **1000000**. It does not infer the window from the model name, query the provider's models API, or cache anything: the window is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request, and the user is the one who knows the truth.
 
 1M suits the current flagship models and overshoots the smaller and older ones. Overshooting is survivable rather than free: planned compaction never fires, so those sessions compact only after the provider rejects an over-long request, paying a wasted round trip each time. Set the real window on any profile whose model is smaller.
 
@@ -1438,7 +1438,7 @@ Default: `false`
 
 ### `display.show_session_id_on_exit`
 
-Whether the screen shows the session id when meka exits.
+Whether the screen shows the session id when Meka exits.
 
 Default: `true`
 
@@ -1534,7 +1534,7 @@ bind = "0.0.0.0:8080"
 
 ### `serve.cors_allowed_origins`
 
-Browser origins allowed to call the API cross-origin, for a web application served from somewhere other than meka itself. Omitted or empty, the server sends no CORS headers at all, and a browser refuses every cross-origin call.
+Browser origins allowed to call the API cross-origin, for a web application served from somewhere other than Meka itself. Omitted or empty, the server sends no CORS headers at all, and a browser refuses every cross-origin call.
 
 | Type | Default |
 |------|---------|
@@ -1566,13 +1566,13 @@ Whether a 502's payload carries the provider's own response text, as a `provider
 alongside `detail`.
 
 On by default. The upstream's error type is the actionable part of a failed turn, and "consult the
-server log" is no answer to anyone driving a meka they do not operate. `meka acp` honors this key too: the same policy decides what a failed turn's `error.data` carries.
+server log" is no answer to anyone driving a Meka they do not operate. `meka acp` honors this key too: the same policy decides what a failed turn's `error.data` carries.
 
 What it can expose is usually the upstream's response body, which can name the *operator's*
 account with the provider and its rate-limit posture: a fact about your billing relationship rather than about
-the caller or the conversation, which is why this is a switch rather than a decision meka makes for
+the caller or the conversation, which is why this is a switch rather than a decision Meka makes for
 you. Not always, though. The member carries the failing call's error message, and for some failures
-that is meka's own sentence about the call rather than anything the provider sent.
+that is Meka's own sentence about the call rather than anything the provider sent.
 
 **It reaches `sessions:r`, not only `sessions:w`.** Submitting a turn takes the write scope, but the
 failure also rides the terminal `turn.failed` event, and `GET /v1/sessions/{id}/feed` replays that
@@ -1589,7 +1589,7 @@ context overflow keeps its "shorten it before retrying" remedy. Off, the member 
 and the text goes to the server log alone.
 
 Bounded to the provider's own response. A required MCP server that is down still reports only the
-server names under `/errors/mcp-unavailable`, because that reason is meka's own subprocess text and
+server names under `/errors/mcp-unavailable`, because that reason is Meka's own subprocess text and
 has carried a command line and its filesystem path. This key does not turn that on.
 
 | Type | Default |
@@ -1650,7 +1650,7 @@ How long a queued inbox item is retried for after a turn on it failed, from when
 |------|---------|
 | `string` (duration) | `"1h"` |
 
-The ceiling bounds the whole wait: a retry never lands past it, whatever the upstream said about when it would be back, so a deployment states its own patience here, and every item shows the deadline it sets as `retry_until`. Set `"0s"` to give an item up on its first failure, for a client that owns redelivery itself. A failure no retry would change, a rejected credential or a request the upstream judged wrong, gives the item up at once regardless; one waiting can change, the upstream unavailable, a required MCP server not ready, meka's own store or disk refusing, is retried within the ceiling. See [The inbox](../usage/http-api.md#the-inbox).
+The ceiling bounds the whole wait: a retry never lands past it, whatever the upstream said about when it would be back, so a deployment states its own patience here, and every item shows the deadline it sets as `retry_until`. Set `"0s"` to give an item up on its first failure, for a client that owns redelivery itself. A failure no retry would change, a rejected credential or a request the upstream judged wrong, gives the item up at once regardless; one waiting can change, the upstream unavailable, a required MCP server not ready, Meka's own store or disk refusing, is retried within the ceiling. See [The inbox](../usage/http-api.md#the-inbox).
 
 ### `serve.idle_timeout`
 
@@ -1749,7 +1749,7 @@ Scopes are flat: `memory:r` does not imply `memory:w`, and neither implies the o
 
 ### `[[serve.webhooks]]`
 
-Outbound endpoints meka POSTs to when something happens that no client is waiting on: a scheduled job firing, a background task finishing. Omit the block entirely and meka never makes an outbound request.
+Outbound endpoints Meka POSTs to when something happens that no client is waiting on: a scheduled job firing, a background task finishing. Omit the block entirely and Meka never makes an outbound request.
 
 ```toml
 [[serve.webhooks]]

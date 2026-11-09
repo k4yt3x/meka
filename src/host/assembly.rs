@@ -96,10 +96,10 @@ impl Unservable {
                 format!("config.toml fails to parse; repair it first: {sentence}")
             }
             Self::Entry(message) => format!(
-                "config.toml holds an MCP server entry meka refuses; repair it first: {message}"
+                "config.toml holds an MCP server entry Meka refuses; repair it first: {message}"
             ),
             Self::Startup(error) => format!(
-                "config.toml holds a setting meka refuses at startup; repair it first: {}",
+                "config.toml holds a setting Meka refuses at startup; repair it first: {}",
                 word(error)
             ),
         }
@@ -113,8 +113,8 @@ impl Unservable {
     ) -> String {
         let (what, sentence) = match self {
             Self::Parse(sentence) => ("fails to parse", sentence.clone()),
-            Self::Entry(message) => ("holds an MCP server entry meka refuses", message.clone()),
-            Self::Startup(error) => ("holds a setting meka refuses at startup", word(error)),
+            Self::Entry(message) => ("holds an MCP server entry Meka refuses", message.clone()),
+            Self::Startup(error) => ("holds a setting Meka refuses at startup", word(error)),
         };
         format!(
             "the change is written, but config.toml as it now stands {what}, so it is not served; \
@@ -339,7 +339,7 @@ impl SharedDeps {
             hook(&config_file);
         }
         // As at startup, so a session's first use of an account writes nothing into the file this
-        // read did not see; the write is meka's own and counts as read.
+        // read did not see; the write is Meka's own and counts as read.
         let wrote_device_ids = self.providers.preload_device_ids().await;
         let served = self
             .reconcile_servers(&wanted)
@@ -500,7 +500,7 @@ pub(crate) fn warn_on_stale_tool_config(
 /// for scheduled jobs alone.
 ///
 /// Nothing about a previous release is encoded here: a sub-agent session must not be driven this
-/// way on a store meka created a minute ago, and the check reads the same column either way.
+/// way on a store Meka created a minute ago, and the check reads the same column either way.
 ///
 /// [`crate::tools::subagent`]'s `agent_followup` is unaffected. It goes through `build_subagent`,
 /// which reads the spec and clamps the level against the parent's live one, and is the only thing
@@ -538,7 +538,7 @@ pub(crate) async fn refuse_a_spawned_session(
 ///
 /// **The row is the carrier, and the only one.** A host's own profile switch moves the agent
 /// itself, but the row is the billing record, and a turn that ran on another profile than the
-/// row names would bill an account the record does not. Another meka process may move a resident
+/// row names would bill an account the record does not. Another Meka process may move a resident
 /// row without its lock, as `meka profile rename` moves every row on the name, and a hand-edit may
 /// too, so the row is read where the data is read, on every host's turn doors, the out-of-band
 /// ones included, and a turn cannot run on, and bill, a profile the row has left.
@@ -732,7 +732,7 @@ pub(crate) async fn build_shared_deps(
         manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(&config));
     }
 
-    // A device id the preload wrote is meka's own write of the file this read saw, so the read
+    // A device id the preload wrote is Meka's own write of the file this read saw, so the read
     // takes the file's time after it rather than reporting the write as an edit unread.
     let whole_read = Arc::new(std::sync::Mutex::new(WholeRead {
         at: config.read_at,
@@ -1254,7 +1254,7 @@ pub(crate) async fn resolve_session_resume(
     } else {
         None
     };
-    // `--project` moves a session the user named, and filters a selection meka made: with `-r
+    // `--project` moves a session the user named, and filters a selection Meka made: with `-r
     // <id>` the row is repinned, with `-c` the project chose the session above and the row
     // already says so.
     let project_repin = match &config.request.session_resume {
@@ -1330,7 +1330,7 @@ pub(crate) async fn record_session_cwd(
         tracing::warn!("{error}");
     }
 }
-/// The directory a run opens in: the one its session recorded, or where meka was launched.
+/// The directory a run opens in: the one its session recorded, or where Meka was launched.
 ///
 /// A session's directory is its own, so a resume reopens it rather than adopting whatever shell
 /// started the process. At `workspace` that directory is also the writable boundary, and taking the
@@ -1547,7 +1547,7 @@ mod tests {
             "the refusal has to be the variant the HTTP layer answers 422 for: {error}"
         );
         // Both ids and the way through, because a client handed a sub-agent's id may not know what
-        // spawned it, and "no" without a remedy sends it looking for a bug in meka.
+        // spawned it, and "no" without a remedy sends it looking for a bug in Meka.
         let text = error.to_string();
         assert!(
             text.contains(&sub_agent.to_string())

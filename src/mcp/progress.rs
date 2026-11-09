@@ -80,7 +80,7 @@ impl ProgressRegistry {
     /// Called from `MekaClientHandler::on_progress` (the `ClientHandler` trait impl in
     /// `src/mcp/handler.rs`) with the server the notification came from. Looks up the registered
     /// context by server and token, forwards the update to the per-session frontend, and emits an
-    /// `info!` log line for the off-frontend audience (e.g. a tail on the meka stderr).
+    /// `info!` log line for the off-frontend audience (e.g. a tail on the Meka stderr).
     pub(crate) async fn dispatch(&self, server_name: &str, params: ProgressNotificationParam) {
         let key = Key {
             server_name: server_name.to_string(),

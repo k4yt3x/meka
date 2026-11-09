@@ -1,5 +1,5 @@
 //! The profiles in `[profiles.<name>]`, each naming an account and the model and every
-//! model-tied setting meka asks that account's endpoint for: the doors `meka profile` and
+//! model-tied setting Meka asks that account's endpoint for: the doors `meka profile` and
 //! `/v1/profiles` write through.
 //!
 //! A profile holds no secret and runs no login; that is the account's business, in `account.rs`,
@@ -88,7 +88,7 @@ pub(crate) async fn remove_profile(
     store: &crate::store::Store,
 ) -> crate::error::Result<()> {
     // `open_document` rather than the parsed config on purpose: `remove` must still run on a
-    // config.toml that meka can't deserialize, since it is one of the ways such a file gets
+    // config.toml that Meka can't deserialize, since it is one of the ways such a file gets
     // repaired. The guard is dropped before the `await` below, for the reason `account remove`
     // gives about `ConfigFileLock`'s thread-local depth counter.
     let (was_default, removed) = {
@@ -311,7 +311,7 @@ fn set_profile_field(
     }
     // A key `set` adds was appended, so it would otherwise sit wherever it landed. Sorting here
     // rather than only on the added key is what makes the order an invariant instead of a habit: a
-    // profile written by hand, or by a meka that ordered its keys differently, is normalized the
+    // profile written by hand, or by a Meka that ordered its keys differently, is normalized the
     // first time this command touches it.
     crate::config::sort_profile_keys(item);
     true
@@ -449,7 +449,7 @@ fn refuse_an_inert_key(
 
 /// What an edit of `[profiles.<name>]` changes: each key `meka profile set` writes, kept, removed
 /// or set. `account` is not here, because moving it moves every session on the profile onto
-/// another credential, and `device_id` is not, because meka resolves it. The shell's strings and a
+/// another credential, and `device_id` is not, because Meka resolves it. The shell's strings and a
 /// request's JSON both arrive as this, so the door reads a value once, in one way.
 #[derive(Debug, Default)]
 pub(crate) struct ProfileChanges {
@@ -743,7 +743,7 @@ pub(crate) fn refuse_unsendable_parameters(
     for (field, value) in fields {
         document.insert(field, toml_edit::Item::Value(value.clone()));
     }
-    // Every value here was parsed or built by `toml_edit`, so one that does not read back is meka's
+    // Every value here was parsed or built by `toml_edit`, so one that does not read back is Meka's
     // fault, never the user's.
     let table: toml::Table = toml::from_str(&document.to_string()).map_err(|error| {
         crate::error::MekaError::Internal(format!("failed to read parameters back: {error}"))
@@ -814,7 +814,7 @@ fn upsert_profile_document(
     tuning: &ProfileTuning,
 ) -> crate::error::Result<()> {
     let mut profile = toml_edit::Table::new();
-    // Written in [`config::ProfileConfig`]'s canonical order, so a profile meka authors reads the
+    // Written in [`config::ProfileConfig`]'s canonical order, so a profile Meka authors reads the
     // way the reference documents it.
     //
     // An unset knob is left out rather than written at its default, so the profile records only
@@ -1551,7 +1551,7 @@ mod tests {
     /// `set` edits one key and leaves the rest of the file exactly as the user wrote it.
     ///
     /// The whole reason this is not [`upsert_profile_document`]: replacing the table would rewrite
-    /// every key in meka's order and drop the comments beside them, so a user who ran `set` once
+    /// every key in Meka's order and drop the comments beside them, so a user who ran `set` once
     /// would find their annotated config quietly reformatted and their notes gone. Nothing else
     /// would fail, which is why the guard is here.
     ///
@@ -1614,7 +1614,7 @@ model = "untouched"
         );
         assert!(
             rendered.find("account").unwrap() < rendered.find("context_window").unwrap(),
-            "key order is the user's, not meka's: {rendered}"
+            "key order is the user's, not Meka's: {rendered}"
         );
     }
 
@@ -1913,7 +1913,7 @@ model = "m"
 
     /// `--unset` removes the key rather than writing an empty value.
     ///
-    /// The two are not the same: an absent key follows whatever meka's default becomes, which is
+    /// The two are not the same: an absent key follows whatever Meka's default becomes, which is
     /// the documented meaning of an unstated setting, while `model = ""` is a model named the empty
     /// string and would be sent as one.
     #[test]
@@ -2190,15 +2190,15 @@ model = "o"
             config::Backend::OpenAiChatCompletions,
             &fields("temperature", toml_edit::Value::from(0.6)),
         )
-        .expect("a field meka leaves alone");
+        .expect("a field Meka leaves alone");
         let message = refuse_unsendable_parameters(
             config::Backend::OpenAiChatCompletions,
             &fields("stream", toml_edit::Value::from(false)),
         )
-        .expect_err("a field meka writes")
+        .expect_err("a field Meka writes")
         .to_string();
         assert!(
-            message.contains("`parameters.stream` is written by meka on 'openai-chat-completions'"),
+            message.contains("`parameters.stream` is written by Meka on 'openai-chat-completions'"),
             "{message}"
         );
         let date = "1979-05-27"
@@ -2237,7 +2237,7 @@ model = "o"
         assert!(!document.to_string().contains("temperature"), "{document}");
     }
 
-    /// A field meka writes is refused by the check both write doors ask, before anything is
+    /// A field Meka writes is refused by the check both write doors ask, before anything is
     /// written, and a subscription refuses the table as a key it never sends.
     #[test]
     fn a_parameter_meka_writes_is_refused_by_both_write_doors() {
@@ -2245,12 +2245,12 @@ model = "o"
                     account = \"work\"\nmodel = \"m\"\n";
         let with = |parameters: &str| format!("{good}\n[profiles.work.parameters]\n{parameters}\n");
         refuse_a_profile_that_cannot_run(good, &with("temperature = 0.6"), "work")
-            .expect("a parameter meka leaves alone");
+            .expect("a parameter Meka leaves alone");
         let message = refuse_a_profile_that_cannot_run(good, &with("stream = false"), "work")
-            .expect_err("a field meka writes")
+            .expect_err("a field Meka writes")
             .to_string();
         assert!(
-            message.contains("`parameters.stream` is written by meka"),
+            message.contains("`parameters.stream` is written by Meka"),
             "{message}"
         );
 

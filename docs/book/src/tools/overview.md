@@ -67,11 +67,11 @@ Tools are grouped by the minimum permission level required:
 - `shell_execute` (sandboxed, filesystem write-protected)
 - `checklist_add`, `checklist_edit`, `checklist_read`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_steer`, `agent_delete`, `image_render`
 - All skill tools, including `skill_write`, `skill_edit` and `skill_delete` when they are enabled: like memory,
-  skills live in meka's own config directory, not your working tree
+  skills live in Meka's own config directory, not your working tree
 - `conversation_search`, `conversation_read`, `session_list`, `session_search`, `context_check`, `context_compact`, `context_replace`
 - Every scratchpad tool except `scratchpad_save_file`, which writes to a path you name and so sits at `workspace` with `file_write`
 - All memory tools. Writing a memory needs only read permission: memories live in the store,
-  which is meka's own, not your working tree.
+  which is Meka's own, not your working tree.
 
 **Workspace permission** (available at `workspace` and above; writes are confined to the workspace at `workspace`):
 - `file_edit`, `file_write`, `scratchpad_save_file`
@@ -92,9 +92,9 @@ Every string argument is read by one rule. A blank string, empty or whitespace a
 
 ## MCP tools
 
-When [MCP servers](../configuration/config-file.md#mcpservers) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the per-turn context catalog alongside the built-ins, with their resolved permission level annotated inline, and are called the same way. A name longer than the serving wire accepts (128 bytes on the Claude and Responses wires, 64 on Chat Completions, or the account's [`max_tool_name_bytes`](../configuration/config-file.md#max_tool_name_bytes) on an endpoint that holds names to less) reaches the model cut to fit, as its head, `_` and twelve hex digits of the whole name's SHA-256, and a call under it runs the tool by its whole name; everywhere meka records or shows a tool, the name is whole.
+When [MCP servers](../configuration/config-file.md#mcpservers) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the per-turn context catalog alongside the built-ins, with their resolved permission level annotated inline, and are called the same way. A name longer than the serving wire accepts (128 bytes on the Claude and Responses wires, 64 on Chat Completions, or the account's [`max_tool_name_bytes`](../configuration/config-file.md#max_tool_name_bytes) on an endpoint that holds names to less) reaches the model cut to fit, as its head, `_` and twelve hex digits of the whole name's SHA-256, and a call under it runs the tool by its whole name; everywhere Meka records or shows a tool, the name is whole.
 
-meka also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default; `tool_search` finds them, and `tool_load` with the exact name makes the schema available on the next model request within the same turn. A session on a `claude-subscription` profile has none of them: that endpoint refuses any tool named `mcp_<x>`, so they leave the request and the catalog there, and a load or a call of one says so. They return the moment the session moves to another profile:
+Meka also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default; `tool_search` finds them, and `tool_load` with the exact name makes the schema available on the next model request within the same turn. A session on a `claude-subscription` profile has none of them: that endpoint refuses any tool named `mcp_<x>`, so they leave the request and the catalog there, and a load or a call of one says so. They return the moment the session moves to another profile:
 
 | Tool | Permission | Description |
 |------|-----------|-------------|
@@ -119,7 +119,7 @@ The trade-off is that until a tool is loaded, the agent sees at most its name an
 Two behaviors exist so this never turns into a silent wrong answer:
 
 - Calling a deferred tool without loading it **works**. The agent may be confident about the required arguments, and forcing a round trip it doesn't need is worse than allowing it.
-- But when it does that and the tool has documented parameters it didn't pass, meka appends a note to the tool result naming them, with their types, defaults, and descriptions. A wrong default stops being invisible. The note is emitted once per tool per run.
+- But when it does that and the tool has documented parameters it didn't pass, Meka appends a note to the tool result naming them, with their types, defaults, and descriptions. A wrong default stops being invisible. The note is emitted once per tool per run.
 
 `tool_search` finds a tool by keyword across every registered tool's name and full description, deferred ones included. Matching is forgiving: a word in the name outranks one in the description, a whole word outranks a substring, and a near miss (`xerfs` for `xrefs`) still counts. Each result carries the tool's summary, whether it is deferred, and whether the session's current permission level and approvals switch allow a call, by the same rule dispatch applies, so the agent never loads a tool only to find the call refused at that door. A tool's own refusals once called (a shell with no sandbox at `workspace`, a path outside the roots) depend on the arguments and are not predicted. Up to ten results are shown, which is one `tool_load` batch.
 
@@ -137,7 +137,7 @@ Tools listed in a server's [`eager_load_tools`](../configuration/config-file.md#
 
 A server that changes its tool list mid-session (`tools/list_changed`) rewrites the prefix once under `eager`, since every tool of it sits in the array; under `hidden` a new tool does not appear until the config names it; under `deferred` it joins the catalog in the context block, and the array too on a `native` profile.
 
-**When writing a tool description for a server meka will consume**, put whatever a caller must know to use the tool correctly in the first two sentences. That may be all anyone ever sees.
+**When writing a tool description for a server Meka will consume**, put whatever a caller must know to use the tool correctly in the first two sentences. That may be all anyone ever sees.
 
 ## Background calls
 
@@ -147,11 +147,11 @@ With [`[background] enabled`](../configuration/config-file.md#background), the t
 shell_execute({"command": "cargo test --all", "background": true})
 ```
 
-Like `scratchpad`, `background` is meka's own: it is consumed by the agent loop and removed from the arguments before the tool, or a remote MCP server, ever sees it.
+Like `scratchpad`, `background` is Meka's own: it is consumed by the agent loop and removed from the arguments before the tool, or a remote MCP server, ever sees it.
 
-A tool that advertises `background` itself keeps it. meka does not splice its own parameter over a name a tool already uses, and does not strip or interpret one either, so a server with a `background` color or a detach flag of its own receives the argument untouched and the call does not detach.
+A tool that advertises `background` itself keeps it. Meka does not splice its own parameter over a name a tool already uses, and does not strip or interpret one either, so a server with a `background` color or a detach flag of its own receives the argument untouched and the call does not detach.
 
-These two are also the only parameters meka type-checks. A `background` that is not a boolean, or a `scratchpad` that is not a string, refuses the call and says what was expected, rather than being read as absent. Both decide what a call *does* rather than what it is called with, so ignoring a wrong type would silently turn a detached call into a blocking one, or drop output the agent asked to keep. A tool's own arguments are the tool's to validate: meka reports a mismatch as an advisory on the result and lets the call through, since a remote server is the authority on what it accepts. `null` counts as absent for both, which is what models emit for an optional argument they are not using.
+These two are also the only parameters Meka type-checks. A `background` that is not a boolean, or a `scratchpad` that is not a string, refuses the call and says what was expected, rather than being read as absent. Both decide what a call *does* rather than what it is called with, so ignoring a wrong type would silently turn a detached call into a blocking one, or drop output the agent asked to keep. A tool's own arguments are the tool's to validate: Meka reports a mismatch as an advisory on the result and lets the call through, since a remote server is the authority on what it accepts. `null` counts as absent for both, which is what models emit for an optional argument they are not using.
 
 ## Scratchpad parameter
 
@@ -174,7 +174,7 @@ results), `file_search` (100 matches) and `web_fetch` (`limit`). An explicit `li
 ## How tool calls work
 
 1. The agent receives your instruction and decides which tools to call
-2. For each tool call, meka checks the current permission level
+2. For each tool call, Meka checks the current permission level
 3. A call above the level is refused, or put to you for approval when approvals are on
 4. If permitted, the tool executes and its output is fed back to the agent
 5. The agent may make additional tool calls or respond with text

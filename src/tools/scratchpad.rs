@@ -95,7 +95,7 @@ pub(crate) fn large_output_preview(text: &str) -> Option<&str> {
 /// result stays inline, with the same refusal the tools give, so the model learns why.
 ///
 /// `inline` names the calls whose result is a word about the call rather than the tool's output
-/// ([`crate::tools::ToolOutput::is_output`]): meka's refusal, an argument error, an interruption,
+/// ([`crate::tools::ToolOutput::is_output`]): Meka's refusal, an argument error, an interruption,
 /// or a failure from a tool whose failed result is a complaint. Those stay inline whatever the
 /// call asked: the caller redirected the output, a sentence about the call is neither large nor
 /// sensitive, and redirected it tells the caller only that the call failed, with a read of the
@@ -325,7 +325,7 @@ async fn free_scratchpad_name(
 }
 
 /// The `Created` column: an RFC 3339 stamp's date and time without its offset. Cut by characters,
-/// since an imported archive may carry a stamp meka did not write.
+/// since an imported archive may carry a stamp Meka did not write.
 fn created_at_column(created_at: &str) -> String {
     created_at.chars().take(19).collect()
 }
@@ -1431,7 +1431,7 @@ impl Tool for ScratchpadSaveFileTool {
             Err(error) => {
                 return Ok(ToolOutput::text(
                     format!(
-                        "Error: '{path}' exists but could not be read ({error}), so meka cannot tell what \
+                        "Error: '{path}' exists but could not be read ({error}), so Meka cannot tell what \
                          saving would replace. Pass force=true to overwrite."
                     ),
                     true,
@@ -1458,8 +1458,8 @@ impl Tool for ScratchpadSaveFileTool {
                 message: format!("failed to write '{path}': {error}"),
             })?;
 
-        // Stamped like any other write meka performs, so the next `file_write` or `file_edit` on
-        // this path does not mistake meka's own bytes for someone else's. `FileRoute::Local`
+        // Stamped like any other write Meka performs, so the next `file_write` or `file_edit` on
+        // this path does not mistake Meka's own bytes for someone else's. `FileRoute::Local`
         // because this wrote to disk directly rather than through an editor delegate.
         super::file::record_write(
             &self.read_tracker,
@@ -1533,7 +1533,7 @@ mod tests {
     /// `&self.scope` with a fresh unconfined scope would leave them green, and this tool is
     /// described to the model as the scratchpad's `file_write`, so that would be a full write door
     /// outside the boundary at `workspace`. A save that is not recorded makes the next
-    /// `file_write`/`file_edit` on the same path refuse meka's own bytes as someone else's.
+    /// `file_write`/`file_edit` on the same path refuse Meka's own bytes as someone else's.
     #[tokio::test]
     async fn saving_a_file_is_fenced_by_its_scope_and_records_the_write() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1588,7 +1588,7 @@ mod tests {
             "a save outside the workspace must not land: {refused_text}"
         );
 
-        // Inside it: lands, and the tracker records that meka was the writer.
+        // Inside it: lands, and the tracker records that Meka was the writer.
         let inside = workspace.join("report.txt");
         tool.execute(
             serde_json::json!({
@@ -1661,7 +1661,7 @@ mod tests {
     }
 
     /// The column is cut by characters: an imported archive's stamp may put a multi-byte
-    /// character where meka's own stamps never have one, and a byte slice there panicked the
+    /// character where Meka's own stamps never have one, and a byte slice there panicked the
     /// listing and the turn with it.
     #[test]
     fn the_created_column_is_cut_by_characters() {
@@ -1915,7 +1915,7 @@ mod tests {
         );
     }
 
-    /// A window meka does not know sizes nothing, so the read bounds itself where the spill pass
+    /// A window Meka does not know sizes nothing, so the read bounds itself where the spill pass
     /// would bound any other tool's result, and on a line, so the model continues from one it has
     /// not seen. Marked as sized because the tool did the bounding: left to the spill pass, the
     /// notice after the lines would carry the reply over the bound and a read of a spill would be
@@ -2241,7 +2241,7 @@ mod tests {
                 .await
                 .expect("load"),
             None,
-            "meka's own refusal is not saved"
+            "Meka's own refusal is not saved"
         );
         assert!(
             text(1).contains("scratchpad_read") && !text(1).contains("No rule"),

@@ -2,7 +2,7 @@
 
 A project is a name a session is on. It groups the session with its sibling sessions and gives them a [memory tier](./memory.md#tiers) of their own beside the global one: the notes of that project, seen by every session on it and by no session off it.
 
-A project is an idea, not a directory. Nothing binds one to a path, nothing opens one because of where meka was started, and a session with nothing named is on no project. Everything the agent writes about a project while on it is filed under the project; everything it writes while on none is global.
+A project is an idea, not a directory. Nothing binds one to a path, nothing opens one because of where Meka was started, and a session with nothing named is on no project. Everything the agent writes about a project while on it is filed under the project; everything it writes while on none is global.
 
 ## Defining a project
 
@@ -21,7 +21,7 @@ meka project remove movie                 # refused while any session or memory 
 
 Every surface selects a project by name, and a session created from another session copies its project: a sub-agent spawned by `agent_spawn`, a fork, an imported archive. A sub-agent keeps following its parent: each `agent_followup` runs it in the project the parent is on then and records that on its row, as it does the parent's profile. A name no project has is refused at every one of these doors, with the names that exist, so a typo never opens an empty tier.
 
-On the command line, `--project <name>` opens a new session on the project, and beside `-c` or `-r` it follows one rule: it **filters a selection meka makes and moves a session you named**.
+On the command line, `--project <name>` opens a new session on the project, and beside `-c` or `-r` it follows one rule: it **filters a selection Meka makes and moves a session you named**.
 
 ```bash
 meka --project webdev                       # a new session on webdev
@@ -38,7 +38,7 @@ The projects themselves are managed over HTTP as they are on the command line, u
 
 Under ACP, a `project` entry in `configOptions` is offered whenever a project exists, with a "No project" value first; see [ACP](./acp.md#session-config-options).
 
-A session whose project is gone from the store, which only an edit outside meka can bring about since `project remove` refuses while a session is on it, is refused when it next runs, with the names that exist: add the project back, or move the session with `meka -r <id> --project <name>`.
+A session whose project is gone from the store, which only an edit outside Meka can bring about since `project remove` refuses while a session is on it, is refused when it next runs, with the names that exist: add the project back, or move the session with `meka -r <id> --project <name>`.
 
 ## What a project changes
 

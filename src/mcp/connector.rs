@@ -28,7 +28,7 @@ use crate::{
 pub(super) const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Ceiling on the retry delay. A server that is down for a long time is polled every five minutes
-/// rather than abandoned, because the alternative is a meka that stays broken until someone
+/// rather than abandoned, because the alternative is a Meka that stays broken until someone
 /// restarts it.
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(300);
 
@@ -428,7 +428,7 @@ pub(super) async fn build_mcp_tools(
     let policy = entry.config();
     let server_config = &*policy;
     // Bounded like every other `tools/list`. This one already sat inside the connect timeout, but
-    // the tool *count* is unbounded there too, and the cap belongs to meka rather than to the
+    // the tool *count* is unbounded there too, and the cap belongs to Meka rather than to the
     // server's pagination.
     let tools = entry.list_tools_bounded(timeout).await?;
 
@@ -527,8 +527,8 @@ pub(super) async fn build_mcp_tools(
     Ok((adapters, policy))
 }
 
-/// Drain a stdio MCP child's stderr line by line into meka's tracing stream. Many MCP servers log
-/// diagnostics to stderr; with rmcp's default inherited stderr those lines land directly on meka's
+/// Drain a stdio MCP child's stderr line by line into Meka's tracing stream. Many MCP servers log
+/// diagnostics to stderr; with rmcp's default inherited stderr those lines land directly on Meka's
 /// terminal and corrupt the screen. Emitting at `debug!` keeps them off the terminal at default
 /// verbosity while still surfacing under `-v` / `RUST_LOG`, tagged with the server name. The task
 /// is detached: it ends on its own when the child exits and stderr reaches EOF.
@@ -536,10 +536,10 @@ fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr
     use tokio::io::AsyncReadExt;
 
     // Split into lines by hand rather than with `BufReader::lines`, which grows one `String` until
-    // it finds a newline: a child that emits none hands meka an unbounded allocation fed by a pipe
+    // it finds a newline: a child that emits none hands Meka an unbounded allocation fed by a pipe
     // it controls. Splitting here caps what one line may cost without capping how much the child
     // may log over its life, which a `take` on the whole stream would do, and a full pipe blocks
-    // the child rather than meka.
+    // the child rather than Meka.
     const MAX_STDERR_LINE_BYTES: usize = 4096;
 
     fn emit(server_name: &str, line: &[u8], overlong: bool) {
@@ -674,13 +674,13 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
                 // Scrub the environment before layering the server's own `env` on top.
                 //
                 // A stdio MCP server is a child process that talks to the network, and an
-                // inherited environment hands it every variable meka was started with:
+                // inherited environment hands it every variable Meka was started with:
                 // `ANTHROPIC_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, the lot. Configuring a server is a
                 // decision to run its code, not a decision to hand it every credential on the
                 // machine. What survives is the same curated base a shell confined at `read` gets
                 // (`PATH`, `HOME`, locale), so servers still resolve their own binaries; a server
                 // that genuinely needs a secret asks for it by name, and `${VAR}` in the `env`
-                // table still reads it from meka's environment.
+                // table still reads it from Meka's environment.
                 command.env_clear();
                 command.envs(crate::sandbox::sandbox_child_env());
                 if let Some(env) = &config.env {
@@ -689,7 +689,7 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
                 // The child dies with its transport, synchronously. rmcp's own guard kills it from
                 // a task it spawns, which a runtime in teardown never runs, and a transport dropped
                 // there is otherwise the one way a server that ignores a closed stdin outlives
-                // meka.
+                // Meka.
                 command.kill_on_drop(true);
                 // rmcp makes the spawn, so the door's two halves are called here, around it.
                 crate::process::prepare(&mut command);
@@ -704,7 +704,7 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
                 // Revisit when rmcp exposes the read length.
                 //
                 // Stderr is piped rather than inherited because an MCP server that logs to
-                // stderr would otherwise write straight onto meka's terminal and corrupt the
+                // stderr would otherwise write straight onto Meka's terminal and corrupt the
                 // screen display.
                 let (transport, stderr) = rmcp::transport::TokioChildProcess::builder(command)
                     .stderr(std::process::Stdio::piped())

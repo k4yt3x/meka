@@ -44,7 +44,7 @@ pub(crate) fn normalize_claude_base_url(url: &str) -> String {
             // logged `url` -> `trimmed`, so quoting the original again would read as two unrelated
             // rewrites of the same string rather than one chain.
             tracing::debug!(
-                "dropped the trailing '/v1' from Claude base URL '{trimmed}'; meka appends it per request"
+                "dropped the trailing '/v1' from Claude base URL '{trimmed}'; Meka appends it per request"
             );
             without_version.to_string()
         }
@@ -113,7 +113,7 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// `max_tokens <= thinking.budget_tokens`).
 ///
 /// The encoding comes from the profile rather than from the model name: this is what a request
-/// reaching an arbitrary Anthropic-compatible endpoint needs, since meka cannot tell which of the
+/// reaching an arbitrary Anthropic-compatible endpoint needs, since Meka cannot tell which of the
 /// two forms that endpoint implements.
 ///
 /// `display` is the backend's to add, through [`with_display`]: `claude-subscription` sends Claude
@@ -125,7 +125,7 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// model `profile add` suggests, and the most every model that takes adaptive thinking accepts;
 /// 32000 otherwise, raised to twice the budget under budgeted thinking when that is more. Claude
 /// Code reads the figure off a per-model catalog, which says 64000 for the rest of the line-up;
-/// meka carries one figure rather than that catalog, and the profile's `max_output_tokens` is
+/// Meka carries one figure rather than that catalog, and the profile's `max_output_tokens` is
 /// where a user states another. The API requires the field, so omitting it is not a way to ask
 /// for a default.
 pub(super) fn insert_thinking_fields(
@@ -193,7 +193,7 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
 /// The allowlist direction is the point: an unrecognized model, which in practice means one newer
 /// than this list, resolves to `false` and the parameter is omitted. A denylist would instead send
 /// `temperature` to every future model and earn a 400 until the list was updated. Matching is by
-/// family + [`parse_model_version`] rather than Claude Code's exact string equality because meka
+/// family + [`parse_model_version`] rather than Claude Code's exact string equality because Meka
 /// accepts date-stamped ids (`claude-haiku-4-5-20251001`) as well as canonical ones.
 pub(super) fn model_supports_temperature(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
@@ -249,8 +249,8 @@ pub(super) fn model_supports_effort(model: &str) -> bool {
 ///
 /// One constant, and deliberately not a transcription of that table. A per-model figure would be a
 /// fact about someone else's data that goes stale on their release schedule with nothing in the
-/// build to notice, and it would buy nothing: the server cannot tell a default meka chose from a
-/// value the user configured, so the only thing a wrong entry could produce is meka quietly asking
+/// build to notice, and it would buy nothing: the server cannot tell a default Meka chose from a
+/// value the user configured, so the only thing a wrong entry could produce is Meka quietly asking
 /// for the wrong tier. Anyone who wants a different one sets `effort` on the profile.
 pub(super) const DEFAULT_EFFORT: &str = "medium";
 
@@ -283,7 +283,7 @@ pub(super) fn model_supports_per_turn_effort(model: &str) -> bool {
 /// `mid_conv_tool_change` capability off its bundled catalog, which withholds it from the Claude
 /// 3.x line, Opus 4.0 through 4.7, Sonnet 4.0 through 5.0 and Haiku 4.5, and sends the beta to a
 /// model the catalog does not list. An unrecognized name here is one *newer* than the list, which
-/// Claude Code sends the beta to, and withholding it would silently drop the tool changes meka
+/// Claude Code sends the beta to, and withholding it would silently drop the tool changes Meka
 /// relies on. Safe only because this gate has exactly one caller, `claude-subscription`, whose
 /// endpoint is always Anthropic's, so an unrecognized name there is necessarily a real Claude. Do
 /// not reach for it from a backend a `base_url` can point anywhere.
@@ -637,7 +637,7 @@ pub(super) fn declare_deferred_tools(body: &mut serde_json::Value, deferred: &[T
     }
 }
 
-/// A Claude `stop_reason` as meka's own.
+/// A Claude `stop_reason` as Meka's own.
 pub(super) fn parse_claude_stop_reason(reason: &str) -> StopReason {
     match reason {
         "end_turn" => StopReason::EndTurn,
@@ -1077,7 +1077,7 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     delta.get("stop_reason").and_then(|reason| reason.as_str())
                 {
                     // The stop reason is what ends a message; `message_stop` is
-                    // the framing around it. Requiring the frame would make meka
+                    // the framing around it. Requiring the frame would make Meka
                     // strictly less tolerant than the wire format needs: a gateway
                     // named by `base_url` that forwards the deltas and closes
                     // without the final event delivers a complete answer, and
@@ -1554,7 +1554,7 @@ mod tests {
     }
 
     /// A turn's two blocks reach this wire as two text blocks in order, the context ahead of the
-    /// words, so the model reads what meka injected before what the user typed.
+    /// words, so the model reads what Meka injected before what the user typed.
     #[test]
     fn the_context_block_precedes_the_words() {
         let message = Message::user_turn("[Permission context]", "hello", Vec::new());
@@ -1641,7 +1641,7 @@ mod tests {
     /// A gateway that forwards every delta and closes without Anthropic's final framing event has
     /// delivered a complete message: `message_delta` already carried the stop reason.
     ///
-    /// Requiring `message_stop` itself made meka stricter than the format needs and broke every
+    /// Requiring `message_stop` itself made Meka stricter than the format needs and broke every
     /// turn through such a shim, for a check whose actual subject -- a response cut mid-content --
     /// never reaches a stop reason at all.
     #[tokio::test]

@@ -15,10 +15,10 @@ use super::{
     errors::{ErrorKind, ProblemDetail},
 };
 
-/// Every scope meka recognizes.
+/// Every scope Meka recognizes.
 ///
 /// Session-scoped operations (turns, compaction, rewind, export, background tasks) sit under
-/// `sessions:*`, because the thing being read or changed is one conversation. The stores meka owns
+/// `sessions:*`, because the thing being read or changed is one conversation. The stores Meka owns
 /// process-wide get their own pairs, so an operator can hand a bridge the ability to run turns
 /// without also handing it the ability to empty the memory store.
 ///
@@ -201,7 +201,7 @@ fn admitted(principal: &Principal, scopes: &[&str]) -> Result<(), ProblemDetail>
 /// The configured scopes no handler will ever demand, each said with the scopes there are.
 ///
 /// Said rather than refused, in both directions: refusing would mean a config written for a newer
-/// meka cannot start an older binary, and staying silent would mean a plausible typo like
+/// Meka cannot start an older binary, and staying silent would mean a plausible typo like
 /// `sessions:write` grants nothing at all while looking like it grants everything.
 pub(crate) fn unknown_scopes(scopes: &[String]) -> Vec<String> {
     scopes

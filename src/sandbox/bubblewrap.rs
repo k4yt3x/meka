@@ -85,7 +85,7 @@ pub(super) fn trusted_to_confine(candidate: &std::path::Path, directory: &std::p
 ///
 /// Checking ownership rather than hardcoding a list keeps the distributions that put it elsewhere
 /// working (NixOS serves it out of a root-owned `/nix/store` path). A rejected candidate is
-/// `warn!`ed rather than skipped silently, because "bubblewrap is installed but meka fell back to
+/// `warn!`ed rather than skipped silently, because "bubblewrap is installed but Meka fell back to
 /// Landlock" is otherwise indistinguishable from "bubblewrap is not installed".
 pub(super) fn bwrap_on_path() -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;

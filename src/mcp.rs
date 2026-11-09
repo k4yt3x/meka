@@ -56,10 +56,10 @@ pub(crate) const MAX_MCP_IMAGE_BYTES: usize = 10 * crate::text::MIB;
 /// Tools one MCP server may advertise before the list is cut.
 ///
 /// `list_all_tools` pages until the server stops offering a cursor, so a server that keeps offering
-/// one keeps meka reading, and every tool it returns costs a `ToolDefinition` resident for the
+/// one keeps Meka reading, and every tool it returns costs a `ToolDefinition` resident for the
 /// session plus a line in the catalog the model reads on every turn. The cap is far above any
 /// real server (the largest published ones advertise dozens) and exists so the ceiling belongs to
-/// meka rather than to whatever is on the other end of the socket.
+/// Meka rather than to whatever is on the other end of the socket.
 pub(crate) const MAX_MCP_TOOLS_PER_SERVER: usize = 512;
 
 /// Keep at most [`MAX_MCP_TOOLS_PER_SERVER`] of what a server advertised, warning when it bites.
@@ -115,7 +115,7 @@ const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 ///
 /// A connect runs its future on a blocking thread, which nothing can drop from outside: at exit
 /// the thread is detached and the process ends with the child it was spawning still owned by a
-/// transport nobody dropped, so the child outlives meka. Every connect path selects on the token
+/// transport nobody dropped, so the child outlives Meka. Every connect path selects on the token
 /// and counts itself here, so a shutdown can end them all and know when the last has unwound.
 pub(crate) struct Connects {
     stopping: CancellationToken,
@@ -228,7 +228,7 @@ fn settle_entry(
     (config, unresolved)
 }
 
-/// One server's entry, validated: the name is one a tool prefix can carry and meka does not
+/// One server's entry, validated: the name is one a tool prefix can carry and Meka does not
 /// reserve, `${VAR}` is expanded once, and a secret the environment did not supply fails the
 /// entry closed. The one builder, so a server added while the process runs is held to what
 /// startup holds one to.
@@ -569,7 +569,7 @@ pub(crate) struct BackgroundRetry {
 /// sent a challenge, as an unexpected response naming the status when it sent none, and as the
 /// client's own status error on the requests it checks that way. Never read from what an error
 /// says in words, which a tool's own failure or a URL's port can say too. A 401 whose body is a
-/// JSON-RPC error reaches meka as that error with the status gone, and is not seen.
+/// JSON-RPC error reaches Meka as that error with the status gone, and is not seen.
 pub(crate) fn rejected_as_unauthorized(error: &ServiceError) -> bool {
     use rmcp::transport::streamable_http_client::StreamableHttpError;
     let ServiceError::TransportSend(error) = error else {
@@ -692,7 +692,7 @@ pub(crate) struct ServerEntry {
     pub(crate) background_retry: OnceLock<BackgroundRetry>,
     /// How many tools the last `tools/list` dropped to stay under [`MAX_MCP_TOOLS_PER_SERVER`].
     /// Recorded so the cap is *disclosed* rather than only logged: a tool that vanished between
-    /// what the server offers and what meka registered is indistinguishable, from the outside,
+    /// what the server offers and what Meka registered is indistinguishable, from the outside,
     /// from a tool the server never had.
     pub(crate) dropped_tools: std::sync::atomic::AtomicUsize,
     /// This server's tool listings, one at a time; see [`McpClientManager::list_and_register`].
@@ -1597,7 +1597,7 @@ impl McpClientManager {
     }
 
     /// Why a `mcp__<server>__<tool>` name isn't callable, when the reason is the server rather
-    /// than the tool. `None` means this is not an MCP name, or names a server meka has never heard
+    /// than the tool. `None` means this is not an MCP name, or names a server Meka has never heard
     /// of: both genuinely "unknown tool".
     ///
     /// Exists because a server that never connected registers no tools, so its names fall through
@@ -1694,7 +1694,7 @@ impl McpClientManager {
     /// answered at once, `pending` (or `disabled`, or `failed` for a secret the environment did
     /// not supply), and the connect runs as the startup connector's would, retried on a
     /// cold-start failure. `credential_generation` is the server's, read before this is asked. A
-    /// name in use, or one meka reserves, is refused.
+    /// name in use, or one Meka reserves, is refused.
     pub(crate) fn add_server(
         self: &Arc<Self>,
         config: &McpServerConfig,
@@ -1868,7 +1868,7 @@ impl McpClientManager {
     ///
     /// Split on the first `__`, like [`Self::unavailable_tool_reason`]: a server name cannot
     /// contain one (`sanitize::normalize_server_name`), so the first occurrence separates server
-    /// from tool. A name with no `__` after the prefix is not one meka minted and answers `false`.
+    /// from tool. A name with no `__` after the prefix is not one Meka minted and answers `false`.
     pub(crate) async fn server_is_still_connecting(&self, namespaced_tool: &str) -> bool {
         let Some((server, _tool)) = namespaced_tool
             .strip_prefix("mcp__")
@@ -1931,7 +1931,7 @@ impl McpClientManager {
     /// The repair a *reconnect* needs. A fresh `initialize` produces no `tools/list_changed` (the
     /// client is expected to list), so a server redeployed with a different tool set is invisible
     /// until something asks again. Errors propagate rather than publishing an empty set: a failed
-    /// list means meka does not know what the server has, which is not the same as knowing it has
+    /// list means Meka does not know what the server has, which is not the same as knowing it has
     /// nothing.
     pub(crate) async fn refresh_server_tools(&self, entry: &Arc<ServerEntry>) -> Result<usize> {
         self.list_and_register(entry, self.request_timeout()).await
@@ -2327,7 +2327,7 @@ pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
 
 /// Bound one MCP round-trip in time and against the turn's cancellation.
 ///
-/// Every helper below is a request to a process meka does not control, over a transport that can
+/// Every helper below is a request to a process Meka does not control, over a transport that can
 /// accept and then go quiet. Without this a server that never answers parks the tool call, and with
 /// it the turn, for the life of the process, and pressing stop does not reach it either, because
 /// the token the tool was handed goes unused.
@@ -2572,7 +2572,7 @@ mod tests {
         );
     }
 
-    /// meka sits at `read`, because MCP tools run in the server's process with no sandbox.
+    /// Meka sits at `read`, because MCP tools run in the server's process with no sandbox.
     #[test]
     fn a_declined_read_only_hint_cannot_reach_the_read_tier() {
         let mut server = McpServerConfig::for_test("s");
@@ -3004,7 +3004,7 @@ mod tests {
     /// `runs_outside_confinement()`. The trait default is the *permissive* answer (`false`), so the
     /// three-line override on `McpToolAdapter` is the only thing making a real MCP call qualify --
     /// delete it and the gate never fires, and `workspace` again forwards unannotated calls to a
-    /// server process meka spawns but does not sandbox.
+    /// server process Meka spawns but does not sandbox.
     ///
     /// Nothing asserted it. The agent-side test builds its own fixture tool with its own override,
     /// so it exercises the gate's logic and never touches the adapter that feeds it.
@@ -3025,7 +3025,7 @@ mod tests {
         }));
         assert!(
             adapter.runs_outside_confinement(),
-            "an MCP call runs in the server's own process, which meka does not sandbox; the \
+            "an MCP call runs in the server's own process, which Meka does not sandbox; the \
              `workspace` gate depends on this being true"
         );
     }
@@ -4027,7 +4027,7 @@ mod tests {
     ///
     /// Driven against a real peer, because the whole claim is about what happens on the wire. The
     /// stub serves one `tools/list` and exits, which both delivers the first tool set and closes
-    /// the transport under meka, and it re-reads its state file on every request, so the second
+    /// the transport under Meka, and it re-reads its state file on every request, so the second
     /// connection advertises the second set.
     #[cfg(unix)]
     #[tokio::test]
@@ -5305,7 +5305,7 @@ mod tests {
     }
 
     /// A tool is reported as still connecting only while its server's first connect is pending,
-    /// and never for a name meka did not mint; and no server speaks instructions before it is
+    /// and never for a name Meka did not mint; and no server speaks instructions before it is
     /// connected.
     #[cfg(unix)]
     #[tokio::test]
@@ -5545,7 +5545,7 @@ mod tests {
         assert_eq!(stub.sent("prompts/get"), 2);
     }
 
-    /// A modern server pushes nothing on its own: its tool changes arrive on the stream meka
+    /// A modern server pushes nothing on its own: its tool changes arrive on the stream Meka
     /// opened at connect, and reach the registry the way a legacy server's notification does.
     #[cfg(unix)]
     #[tokio::test]
@@ -5689,7 +5689,7 @@ mod tests {
         .expect("subscribed");
         assert_eq!(stub.sent("resources/subscribe"), 1);
 
-        // A second listing is the stub's cue to exit, which closes the transport under meka.
+        // A second listing is the stub's cue to exit, which closes the transport under Meka.
         let _closing = stub
             .entry
             .list_tools_bounded(std::time::Duration::from_secs(5))
@@ -5946,7 +5946,7 @@ mod tests {
 
     /// A connect that lands once the shutdown has begun is refused at the one door onto
     /// `Connected`, and the child it brought up dies with its service: the shutdown's own loop
-    /// may already have passed the entry, and a server brought up behind it would outlive meka.
+    /// may already have passed the entry, and a server brought up behind it would outlive Meka.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_connect_that_lands_after_the_shutdown_began_is_refused() {
@@ -6040,7 +6040,7 @@ mod tests {
 
     /// A modern server may end the stream it was asked for, as one about to restart does, and a
     /// proxy may cut the long request it rides on; the connection stands either way, and the
-    /// server sends nothing again until asked, so meka asks again and the changes keep arriving.
+    /// server sends nothing again until asked, so Meka asks again and the changes keep arriving.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_stream_the_server_ends_is_opened_again_while_the_connection_lives() {

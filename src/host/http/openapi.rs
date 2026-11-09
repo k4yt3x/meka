@@ -21,9 +21,9 @@ use crate::host::http::{handlers, state::ServerState};
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "meka HTTP API",
+        title = "Meka HTTP API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Service-to-service API for driving meka agent turns programmatically. \
+        description = "Service-to-service API for driving Meka agent turns programmatically. \
                        Mirrors the wire format described in the HTTP API docs. A field that has \
                        no value is omitted from every response and event, never sent as `null`.",
         license(name = "AGPL-3.0-or-later")

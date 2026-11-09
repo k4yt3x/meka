@@ -1,14 +1,14 @@
 //! `meka acp` subcommand. Speaks the Agent Client Protocol (ACP) on stdio so editor / web /
-//! messenger clients can drive a meka turn end to end.
+//! messenger clients can drive a Meka turn end to end.
 //!
 //! The advertised capability surface, the delegation rules and the wire shapes are documented in
 //! `docs/book/src/usage/acp.md`.
 //!
 //! **`shell_execute` is never delegated to the client's `terminal/*`**, whatever it advertises
-//! and whatever the permission level. meka owns the process so its Landlock / bwrap / sandbox-exec
+//! and whatever the permission level. Meka owns the process so its Landlock / bwrap / sandbox-exec
 //! / Low-Integrity jail, env scrub, cwd resolution and process-group kill keep applying; the
 //! client's terminal offers no equivalent, so routing through it would run a command unsandboxed at
-//! a level meka treats as sandboxed.
+//! a level Meka treats as sandboxed.
 //!
 //! Any number of sessions coexist in one process, each with its own cwd, permission cell,
 //! conversation, cancellation token, `Agent` and `AcpFrontend`, over process-wide dependencies held
@@ -103,16 +103,16 @@ fn invalid_params_error(message: impl ToString) -> agent_client_protocol::Error 
 ///   *operator's* account with the provider and its rate-limit posture, and an editor is a client
 ///   like any other. Bounded by [`crate::error::bounded_upstream_body`], the same bound the HTTP
 ///   host applies, since a misconfigured `base_url` can answer with megabytes.
-/// - An MCP connector's reason never travels. It is meka's own subprocess text and has carried a
+/// - An MCP connector's reason never travels. It is Meka's own subprocess text and has carried a
 ///   spawn failure complete with its command line and path; the server *names* do travel, which is
 ///   the part an operator acts on.
-/// - `Database` and `Io` never travel: they name meka's own store path or the operator's
+/// - `Database` and `Io` never travel: they name Meka's own store path or the operator's
 ///   filesystem. Logged, and answered with the sentence that says where the detail went.
 ///
 /// Every arm logs what it withholds, so nothing is lost, only moved.
 fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client_protocol::Error {
     // Closured rather than repeated per arm, for the reason `for_error`'s `attach` is: the arms
-    // must not drift into disagreeing about what relaying means. `sentence` is meka's own and is
+    // must not drift into disagreeing about what relaying means. `sentence` is Meka's own and is
     // identical either way, so a client reading only the message is unaffected by the switch.
     let withhold_or_relay = |sentence: &str, upstream: &str| {
         tracing::warn!("{sentence}: {upstream}");
@@ -154,15 +154,15 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
         _ if matches!(error, MekaError::Installation(_)) => {
             tracing::error!("installation error: {error}");
             agent_client_protocol::util::internal_error(
-                "meka is misconfigured; the detail is in the meka log",
+                "Meka is misconfigured; the detail is in the Meka log",
             )
         }
         // A store path, a filesystem path, or a fault nobody classified. The `Display` names
-        // meka's own directories either way.
+        // Meka's own directories either way.
         _ => {
             tracing::error!("agent error reported to the client: {error}");
             agent_client_protocol::util::internal_error(
-                "meka could not complete this request; the detail is in the meka log",
+                "Meka could not complete this request; the detail is in the Meka log",
             )
         }
     }
@@ -196,13 +196,13 @@ fn build_failure_error(
         None => {
             tracing::error!("{context}: {error:#}");
             agent_client_protocol::util::internal_error(format!(
-                "{context}; the detail is in the meka log"
+                "{context}; the detail is in the Meka log"
             ))
         }
     }
 }
 
-/// Run meka as an ACP agent over stdio. Returns (and the process then exits) when the client
+/// Run Meka as an ACP agent over stdio. Returns (and the process then exits) when the client
 /// disconnects (stdin EOF) or a termination signal arrives.
 pub(crate) async fn run_acp(
     config: ResolvedConfig,
@@ -290,14 +290,14 @@ pub(crate) async fn run_acp(
                         .resume(Some(SessionResumeCapabilities::new()))
                         .fork(Some(SessionForkCapabilities::new()))
                         .close(Some(SessionCloseCapabilities::new()));
-                    // meka accepts `text`, `resource_link`, and embedded `resource` (@-mention)
+                    // Meka accepts `text`, `resource_link`, and embedded `resource` (@-mention)
                     // blocks in `session/prompt`, so `embedded_context` is advertised true. `image`
                     // follows the process default profile's `vision` flag; a session on another
                     // profile answers for itself at `session/prompt`. `audio` stays false. Each
                     // field is set explicitly so the contract is visible in the initialize response
                     // and a future SDK default change cannot quietly flip it.
                     //
-                    // `mcp_capabilities` is omitted: meka sources MCP servers from its own config
+                    // `mcp_capabilities` is omitted: Meka sources MCP servers from its own config
                     // file and ignores `session/new`'s `mcpServers`, so advertising `{ http: true,
                     // sse: true }` would be false.
                     let capabilities = AgentCapabilities::new()
@@ -314,7 +314,9 @@ pub(crate) async fn run_acp(
                     // stamped with the same, so the handler echoes what it was handed.
                     let response = InitializeResponse::new(request.protocol_version)
                         .agent_capabilities(capabilities)
-                        .agent_info(Implementation::new("meka", env!("CARGO_PKG_VERSION")));
+                        .agent_info(
+                            Implementation::new("meka", env!("CARGO_PKG_VERSION")).title("Meka"),
+                        );
                     responder.respond(response)
                 }
             },
@@ -538,7 +540,7 @@ pub(crate) async fn run_acp(
                     // lock an in-flight turn holds.
                     //
                     // Handler callbacks run on the SDK's dispatch loop, and that loop is also what
-                    // routes *responses to meka's own outgoing requests*. A turn blocked on
+                    // routes *responses to Meka's own outgoing requests*. A turn blocked on
                     // `fs/read_text_file` cannot release the runtime mutex until its response
                     // arrives, and the response cannot arrive while the loop is parked inside this
                     // handler waiting for that same mutex. Running inline deadlocked every session
@@ -621,7 +623,7 @@ pub(crate) async fn run_acp(
         .await;
 
     // The connection has unwound, so nothing will issue another tool call. An editor that quits
-    // takes meka's stdio with it but not the grandchildren meka spawned, which is what this closes.
+    // takes Meka's stdio with it but not the grandchildren Meka spawned, which is what this closes.
     if let Some(manager) = &state.shared.mcp_manager {
         manager.shutdown_within(crate::mcp::SHUTDOWN_BUDGET).await;
     }
@@ -712,7 +714,7 @@ mod tests {
         );
     }
 
-    /// A refusal the editor can act on is `InvalidParams` with meka's sentence, whichever variant
+    /// A refusal the editor can act on is `InvalidParams` with Meka's sentence, whichever variant
     /// carries it: the kind decides, so one added after this host was written is not reported as
     /// an internal error.
     #[test]
@@ -733,7 +735,7 @@ mod tests {
 
     /// What an editor may read of a failed turn, per class.
     ///
-    /// "The caller can act on it" and "meka wrote the sentence" are not the same question: an
+    /// "The caller can act on it" and "Meka wrote the sentence" are not the same question: an
     /// upstream body names the *operator's* account with the provider, an MCP connector's reason
     /// can carry a spawn command line and its path, a `Database` error names the store, and an
     /// installation fault names a file in someone else's `config.toml`. The HTTP host answers all
@@ -804,7 +806,7 @@ mod tests {
             assert_eq!(
                 withheld.data,
                 Some(serde_json::Value::from(error.sentence())),
-                "withheld, the client gets meka's sentence alone"
+                "withheld, the client gets Meka's sentence alone"
             );
 
             let relayed = acp_error_for(&error, true);
@@ -826,10 +828,10 @@ mod tests {
         );
     }
 
-    /// meka's own request ceiling is the caller's to act on, so it keeps its sentence and its code.
+    /// Meka's own request ceiling is the caller's to act on, so it keeps its sentence and its code.
     ///
     /// `InvalidParams` rather than `InternalError` for the reason every other refusal in that list
-    /// gets it: nothing in meka failed, and the remedy is in the message.
+    /// gets it: nothing in Meka failed, and the remedy is in the message.
     #[test]
     fn the_request_ceiling_reaches_the_client_as_a_refusal_it_can_act_on() {
         let error = MekaError::RequestTooLarge(
@@ -971,7 +973,7 @@ mod tests {
             "deferred is still open"
         );
         assert_eq!(entries[2].content, "third (deferred: waiting on Sam)");
-        // meka tracks no per-item priority, so every entry is Medium.
+        // Meka tracks no per-item priority, so every entry is Medium.
         assert!(
             entries
                 .iter()
@@ -1752,7 +1754,7 @@ mod tests {
     }
 
     /// A profile that states no model must not acquire one here: the description is shown to the
-    /// user as a fact about the profile, and meka does not know what an unstated model resolves to.
+    /// user as a fact about the profile, and Meka does not know what an unstated model resolves to.
     #[test]
     fn a_provider_option_describes_only_a_stated_model() {
         let profiles = profiles_for_test(&[("work", Some("claude-opus-5-5")), ("personal", None)]);

@@ -2,11 +2,11 @@
 
 The checklist is the list the agent keeps of what it has committed to do, and the rule that a turn
 cannot end while an item on it is open. The agent adds items as it commits to them, checks them
-off as it finishes them, and if it tries to stop with an item still open, meka sends it back to
+off as it finishes them, and if it tries to stop with an item still open, Meka sends it back to
 the list instead of ending the turn.
 
 It exists for one failure: an agent that plans five steps, does three, and reports back as if it
-were done. The list is the agent's own words, so meka never has to judge the work; it only has to
+were done. The list is the agent's own words, so Meka never has to judge the work; it only has to
 hold the agent to what it said.
 
 ## How it works
@@ -26,7 +26,7 @@ it off the list: `completed`, and `canceled`, which needs a `reason`. Completed 
 leave the list at once; the conversation keeps what was done and why.
 
 **A turn cannot end while an item is pending or in progress.** When the agent replies without
-calling a tool and such an item remains, meka appends a message listing the open items and the
+calling a tool and such an item remains, Meka appends a message listing the open items and the
 ways out, and the agent answers again. It can keep working, complete the items, cancel them with
 a reason, or defer them with a reason. The turn ends once every item is disposed of. Each nudge is
 announced as a notice, so a turn that keeps working after its answer does not look like a hang:
@@ -36,7 +36,7 @@ item, continuing, nudge 1 of 3`, and on the HTTP feed as a `notice` with the sam
 **Deferral is the honest way to stop.** A deferred item does not hold the turn. It is for an item
 that cannot proceed now because it waits on a person, an event, or an explicit "later", never
 because it is hard or tedious; the tool descriptions and the nudge both say so, and the reason is
-recorded. A deferred item stays deferred until the agent or you pick it up again: meka does not
+recorded. A deferred item stays deferred until the agent or you pick it up again: Meka does not
 guess when a person has answered. The one case it can see is a background task. An item deferred
 with the `task` it waits on reopens once the task's outcome has been reported, however the task
 ended. The report lands as a turn of its own, or at the next round boundary of a turn that is

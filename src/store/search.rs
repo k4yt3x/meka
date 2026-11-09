@@ -60,7 +60,7 @@ const INDEXED_WORDS_DEFINITION: u32 = 5;
 /// compares against exactly what it will write. A delete reaches the index through the first,
 /// which covers a cascade from `sessions`. An in-place rewrite of a row's content drops its entry
 /// through the second, so the count check finds the row to index again from whatever door
-/// rewrote it, a migration step included. An insert has no trigger because the words are meka's
+/// rewrote it, a migration step included. An insert has no trigger because the words are Meka's
 /// reading of the row, which SQL cannot make: [`insert_message`] is the insert. Every trigger on
 /// `messages` is compared, so a trigger another feature adds to the table has to be added here,
 /// or every open rebuilds the index.
@@ -101,7 +101,7 @@ fn indexed_words(kind: &str, content: &str, copy_of: Option<i64>) -> String {
     space_unspaced_scripts(&spoken_words_of_row(kind, content))
 }
 
-/// What the user or the model said in a row, and nothing meka or a tool wrote. Empty for every
+/// What the user or the model said in a row, and nothing Meka or a tool wrote. Empty for every
 /// other kind of row, which is still indexed as an empty document so the index holds one row per
 /// message and [`reconcile_index`] can compare counts.
 fn spoken_words_of_row(kind: &str, content: &str) -> String {
@@ -187,7 +187,7 @@ fn tiered_expressions(words: &[String]) -> Vec<String> {
     expressions
 }
 
-/// The words of a message the index holds: for a person's, what they sent and not what meka put
+/// The words of a message the index holds: for a person's, what they sent and not what Meka put
 /// beside it, by the one rule the title reads by ([`ContentBlock::spoken_words`]); for the
 /// model's, its `Text` blocks through the block-to-text function the `conversation_search` tool
 /// reads through, so what the index finds the tool can find.
@@ -320,7 +320,7 @@ pub(super) struct NewMessage<'a> {
 /// index now needs. Otherwise, does the index hold one row per message? If not, the rows without
 /// an entry are indexed and the entries without a row dropped. The first open after the index was
 /// introduced takes the first path, which is also why the ledger step leaves it empty: the words
-/// are meka's reading of a row, and a migration may not call meka.
+/// are Meka's reading of a row, and a migration may not call Meka.
 ///
 /// Cheap when nothing is wrong, which is every open but the first: one `sqlite_master` read and
 /// two counts.
@@ -851,7 +851,7 @@ mod tests {
         );
     }
 
-    /// What meka wrote to send the model back to work is nobody's words: a search for a word the
+    /// What Meka wrote to send the model back to work is nobody's words: a search for a word the
     /// nudge quoted from the list must not find the session by the nudge.
     #[tokio::test]
     async fn a_nudges_words_are_not_a_persons() {
@@ -927,7 +927,7 @@ mod tests {
         assert_eq!(found.len(), 2);
     }
 
-    /// What meka wrote into a user message is not what the person said: a harness note and the
+    /// What Meka wrote into a user message is not what the person said: a harness note and the
     /// header above an inbox item are not indexed, while the item's own words are.
     #[tokio::test]
     async fn what_meka_wrote_beside_the_users_words_is_not_indexed() {
@@ -1087,7 +1087,7 @@ mod tests {
     }
 
     /// The index follows the table through every door: an appended message is found, a deleted
-    /// session is not, and an index emptied behind meka's back is refilled on the next open.
+    /// session is not, and an index emptied behind Meka's back is refilled on the next open.
     #[tokio::test]
     async fn the_index_follows_the_table_and_is_refilled_on_open() {
         let store = Store::for_test().await;
@@ -1276,7 +1276,7 @@ mod tests {
             (
                 "user",
                 format!(
-                    "{} a stand-in meka wrote",
+                    "{} a stand-in Meka wrote",
                     crate::conversation::HARNESS_NOTE
                 ),
             ),
@@ -1353,7 +1353,7 @@ mod tests {
                 }]),
             ),
             (
-                // A nudge, meka's words in a block of their own, which contributes nothing.
+                // A nudge, Meka's words in a block of their own, which contributes nothing.
                 "user_blocks",
                 blocks(vec![ContentBlock::Nudge {
                     kind: crate::conversation::NudgeKind::Checklist,

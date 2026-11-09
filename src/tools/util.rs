@@ -339,7 +339,7 @@ pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex
 }
 
 /// Admit one read of `path`, as the model spelled it, against the session's read boundary, and
-/// hand back the canonical path every later I/O uses: meka's own directories are refused below
+/// hand back the canonical path every later I/O uses: Meka's own directories are refused below
 /// `unrestricted`, and with reads confined so is anything outside the readable roots.
 ///
 /// Judged twice. First as spelled, with the components that exist resolved, ahead of any step that

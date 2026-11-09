@@ -358,7 +358,7 @@ pub(crate) struct SessionMetaRow {
     pub(crate) updated_at: String,
     pub(crate) cwd: Option<PathBuf>,
     /// The level the row records, parsed once here; `None` for a row that records none or one
-    /// meka cannot read, which the read warns about.
+    /// Meka cannot read, which the read warns about.
     pub(crate) permission: Option<Permission>,
     /// Whether calls above the level are submitted for approval.
     pub(crate) approvals: bool,
@@ -495,7 +495,7 @@ pub(crate) struct RunOnName {
     pub(crate) pinned_under: Vec<Uuid>,
 }
 
-/// The ids an `UPDATE … RETURNING id` answers, each refused unless it is one meka wrote.
+/// The ids an `UPDATE … RETURNING id` answers, each refused unless it is one Meka wrote.
 fn ids_returned(
     transaction: &rusqlite::Transaction<'_>,
     sql: &str,
@@ -631,7 +631,7 @@ pub(crate) struct SessionSummary {
     /// The level the session runs at: written by every door that creates a row and by every
     /// surface that moves it, so a resume and a scheduled gate read the same answer. Parsed once,
     /// here, so no reader handles the column as text. `None` for a row no host wrote, or one whose
-    /// value meka cannot read (warned about at the read), which the scheduler treats as a level at
+    /// value Meka cannot read (warned about at the read), which the scheduler treats as a level at
     /// which nothing runs and a host resumes at its configured default.
     pub(crate) permission: Option<Permission>,
     /// Whether a call above the level is submitted for approval rather than refused. Recorded
@@ -679,7 +679,7 @@ pub(crate) struct SessionSummary {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionSweep {
     pub(crate) deleted: u64,
-    /// Sessions that matched but were left alone, because another meka process has them open or
+    /// Sessions that matched but were left alone, because another Meka process has them open or
     /// because their lock could not be established either way.
     pub(crate) attached_elsewhere: u64,
 }
@@ -933,7 +933,7 @@ pub(super) const COMPACT_BOUNDARY_KIND: &str = "compact_boundary";
 /// The `kind` for a `Role::User` message that carries non-text blocks: every turn's message, whose
 /// context block comes first, and any input images. Its full `Vec<ContentBlock>` is stored as JSON,
 /// because flattening to `text_content()` (as the plain `user` kind does) would drop them. A
-/// text-only user message, which is one meka authored (a nudge, a summary), stays plaintext under
+/// text-only user message, which is one Meka authored (a nudge, a summary), stays plaintext under
 /// `user`. Mirrors [`COMPACT_BOUNDARY_KIND`].
 pub(super) const USER_BLOCKS_KIND: &str = "user_blocks";
 /// The `kind` for `Event::Repair` rows, mirroring [`COMPACT_BOUNDARY_KIND`]. The superseded
@@ -951,7 +951,7 @@ pub(super) const UNSIGN_KIND: &str = "unsign";
 /// person's words, a `text` block, an `inbox` item's body, a `scheduled` fire's prompt or an
 /// `invocation`, which always names what it invoked
 /// ([`crate::conversation::ContentBlock::spoken_words`] spelled in SQL), so an image sent alone
-/// does not leave the session unlabeled once words follow. Blank text and a stand-in meka wrote
+/// does not leave the session unlabeled once words follow. Blank text and a stand-in Meka wrote
 /// do not count as words in either shape, which is [`crate::conversation::is_harness_stand_in`]
 /// spelled in SQL. A compaction summary is under its
 /// own kind and is never selected. This is [`crate::conversation::Conversation::title`]'s
@@ -1591,7 +1591,7 @@ pub(super) fn encode_additional_roots(roots: &[PathBuf]) -> Result<Option<String
 pub(super) fn decode_additional_roots(json: Option<&str>) -> Vec<PathBuf> {
     match json.map(serde_json::from_str::<Vec<PathBuf>>) {
         Some(Ok(roots)) => roots,
-        // A column meka wrote is JSON; one that is not was hand-edited or damaged, and the
+        // A column Meka wrote is JSON; one that is not was hand-edited or damaged, and the
         // session runs with no extra roots rather than not at all. Said, since a root that
         // silently stopped applying is a fence a user believes is there.
         Some(Err(error)) => {
@@ -1603,7 +1603,7 @@ pub(super) fn decode_additional_roots(json: Option<&str>) -> Vec<PathBuf> {
 }
 
 /// A session id as a column holds it, or `None` with a warning for one that is not an id: every
-/// id meka writes parses, so a row that does not was hand-edited or damaged, and a reader that
+/// id Meka writes parses, so a row that does not was hand-edited or damaged, and a reader that
 /// dropped it silently would list a tree short a member with nothing said.
 pub(super) fn session_id_in(raw: &str) -> Option<Uuid> {
     match Uuid::parse_str(raw) {
@@ -1949,7 +1949,7 @@ impl Store {
     ///
     /// `None` means the session is gone. Every other answer is a profile name that resolved when it
     /// was written: every door that mints a session resolves one first and refuses without it, so
-    /// there is no such thing as a session this meka created with none. The empty string is still
+    /// there is no such thing as a session this Meka created with none. The empty string is still
     /// reachable, on a carried-forward row the migration could resolve no profile for, and needs no
     /// branch here: like a name that has since left `config.toml`, it is refused by
     /// [`crate::provider::ProviderRegistry::settings`], by name.
@@ -2003,7 +2003,7 @@ impl Store {
     ) -> std::result::Result<FileLock, MekaError> {
         self.lock_session(session_id).inspect_err(|error| {
             tracing::warn!(
-                "failed to lock session {session_id} as it was created: {error}; another meka process could \
+                "failed to lock session {session_id} as it was created: {error}; another Meka process could \
                  attach to it or sweep it mid-turn"
             );
         })
@@ -4773,7 +4773,7 @@ impl Store {
     }
 
     /// Sweep sessions no turn has touched inside the retention window, leaving alone any that
-    /// another meka process currently has open.
+    /// another Meka process currently has open.
     ///
     /// The lock check is not a nicety. `updated_at` is bumped by turns only, and resuming a session
     /// does not touch it, so a screen left sitting at its prompt past the window is a perfect
@@ -5286,7 +5286,7 @@ impl Store {
         Ok(())
     }
 
-    /// Erase a row's level, which no door does: the shape an older meka left behind, for the tests
+    /// Erase a row's level, which no door does: the shape an older Meka left behind, for the tests
     /// that need one.
     #[cfg(test)]
     pub(crate) async fn erase_recorded_permission(&self, session_id: Uuid) -> Result<()> {
@@ -5424,7 +5424,7 @@ impl Store {
         Ok(held)
     }
 
-    /// Delete every session no other meka process has open, and report what was left behind.
+    /// Delete every session no other Meka process has open, and report what was left behind.
     ///
     /// Roots alone, each locked and deleted with its sub-agents: the cascade takes them anyway,
     /// and a child listed on its own would be counted as left open and then taken with its root.
@@ -5552,7 +5552,7 @@ mod tests {
     /// says how it ended once it has, from the listing and the summary alike. A row is named by
     /// its writer, not by the table: a repair written between turns names none even while a turn
     /// a dead process left open is still on the table. A failure is stored under its catalog type
-    /// and meka's sentence, never under the provider's text.
+    /// and Meka's sentence, never under the provider's text.
     #[tokio::test]
     async fn a_turn_is_a_row_its_messages_name() {
         use crate::conversation::{Event, Message};
@@ -9445,7 +9445,7 @@ mod tests {
         );
     }
 
-    /// A session another meka process has open is not one this process may delete.
+    /// A session another Meka process has open is not one this process may delete.
     ///
     /// `meka session remove <id>` against a live screen exited 0 having said nothing at all: the
     /// count goes through `tracing::info!`, invisible at the default level. The row and its
@@ -12944,7 +12944,7 @@ mod tests {
         assert_eq!(info(plain).await, "");
     }
 
-    /// A moved row whose id is not one meka wrote fails the rename rather than going unannounced:
+    /// A moved row whose id is not one Meka wrote fails the rename rather than going unannounced:
     /// the ids answered are the rows moved.
     #[tokio::test]
     async fn a_profile_rename_refuses_a_session_row_whose_id_is_not_an_id() {

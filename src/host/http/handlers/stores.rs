@@ -1,4 +1,4 @@
-//! The on-disk Markdown stores meka owns: skills and memories.
+//! The on-disk Markdown stores Meka owns: skills and memories.
 //!
 //! Both are process-wide rather than per-session, which is why they carry their own scopes
 //! (`skills:r` / `skills:w`, `memory:r` / `memory:w`) instead of riding on `sessions:*`. A bridge
@@ -44,7 +44,7 @@ fn not_found(noun: &str, name: &str) -> ProblemDetail {
     )
 }
 
-/// The store is switched off, or meka failed to resolve its config directory.
+/// The store is switched off, or Meka failed to resolve its config directory.
 ///
 /// `not-found` rather than `invalid-body`: nothing is wrong with the request, there is simply
 /// nowhere to write. A client switching on `type` would read `invalid-body` as "fix your JSON" and
@@ -53,7 +53,7 @@ fn store_disabled(noun: &str) -> ProblemDetail {
     ProblemDetail::new(
         ErrorKind::NotFound,
         StatusCode::NOT_FOUND,
-        format!("{noun} is disabled, or meka failed to resolve its config directory"),
+        format!("{noun} is disabled, or Meka failed to resolve its config directory"),
     )
 }
 
@@ -171,7 +171,7 @@ pub(crate) async fn put_skill(
     let existing = installed.find(&name);
 
     // A skill discovered under a read-only `additional_directories` root is not this endpoint's to
-    // change: the write would land in meka's own store and *shadow* it, so the caller would be
+    // change: the write would land in Meka's own store and *shadow* it, so the caller would be
     // told it updated a skill while the file every other client reads stayed as it was. Unlike
     // the module note above about an operator's deliberate choices, nobody chooses a silent
     // fork.

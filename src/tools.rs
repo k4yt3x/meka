@@ -60,20 +60,20 @@ pub(crate) const SCRATCHPAD_PARAMETER: &str = "scratchpad";
 /// arrives. See [`crate::background`].
 pub(crate) const BACKGROUND_PARAMETER: &str = "background";
 
-/// Whether `background` in this call means the *tool's* `background`, not meka's.
+/// Whether `background` in this call means the *tool's* `background`, not Meka's.
 ///
 /// [`offer_background`] refuses to shadow a name the tool already advertises, so a tool whose
-/// schema declares `background` at all never received meka's splice and owns the name outright.
+/// schema declares `background` at all never received Meka's splice and owns the name outright.
 /// The consumption side has to ask the same question: an image tool with `background:
 /// "transparent"`, or an exec server with a detach flag of its own, would otherwise have its
-/// argument eaten before dispatch and the call quietly detached meka's way instead.
+/// argument eaten before dispatch and the call quietly detached Meka's way instead.
 fn tool_owns_background(schema: &serde_json::Value) -> bool {
     declared_type(schema, BACKGROUND_PARAMETER).is_some()
 }
 
 /// Whether `scratchpad` in this call means the tool's own parameter.
 ///
-/// A weaker test than [`tool_owns_background`], because it has to be: meka's builtins declare
+/// A weaker test than [`tool_owns_background`], because it has to be: Meka's builtins declare
 /// `scratchpad` themselves, as a string, so its presence in a schema proves nothing. Only a
 /// different declared *type* says the tool means something else by the name.
 fn tool_owns_scratchpad(schema: &serde_json::Value) -> bool {
@@ -94,9 +94,9 @@ fn declared_type<'a>(schema: &'a serde_json::Value, name: &str) -> Option<&'a st
     )
 }
 
-/// Reject a call whose meka-owned parameters are the wrong type, naming what was expected.
+/// Reject a call whose Meka-owned parameters are the wrong type, naming what was expected.
 ///
-/// These two are validated where every other argument is left to the tool because meka is the one
+/// These two are validated where every other argument is left to the tool because Meka is the one
 /// that consumes them, and both change what a call *does* rather than what it is called with:
 /// `background` decides whether the turn waits for the result, `scratchpad` decides whether the
 /// output is kept. Reading a wrong type as "absent" makes each of those a silent no-op, so the
@@ -110,7 +110,7 @@ fn declared_type<'a>(schema: &'a serde_json::Value, name: &str) -> Option<&'a st
 ///
 /// A tool's *own* arguments are deliberately not checked here. The tool, or a remote MCP server, is
 /// the authority on what it accepts, and refusing a call the server would have honored would take
-/// away capability to enforce a schema meka does not own. Those get an advisory instead; see
+/// away capability to enforce a schema Meka does not own. Those get an advisory instead; see
 /// [`schema_disagreement`]. That includes these two names when the tool turns out to own them: see
 /// [`tool_owns_background`] and [`tool_owns_scratchpad`].
 ///
@@ -169,7 +169,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 /// it asked to be detached.
 ///
 /// Removing rather than ignoring is the point: the property is spliced in by
-/// [`ToolRegistry::active_tools`] and is meka's, so forwarding it would hand an
+/// [`ToolRegistry::active_tools`] and is Meka's, so forwarding it would hand an
 /// MCP server a key it never advertised.
 ///
 /// Unless the tool advertised it first, in which case the argument is passed straight through and
@@ -235,7 +235,7 @@ pub(crate) fn admit_arguments(
     Ok((input, detach))
 }
 
-/// A call's arguments as a built-in that does not own `background` received them: the flag meka
+/// A call's arguments as a built-in that does not own `background` received them: the flag Meka
 /// spliced is stripped ahead of dispatch, so a reader of the recorded call, the checklist's
 /// replay, reads what the tool read rather than refusing a key the tool never saw.
 pub(crate) fn without_background_flag(input: &serde_json::Value) -> serde_json::Value {
@@ -260,7 +260,7 @@ pub(crate) fn effective_permission(
 /// `scratchpad` is: one insertion point, config-gated in one place, and it reaches MCP tools too,
 /// which matters because a slow MCP call is exactly the kind worth detaching. That is a deliberate
 /// exception to passing an MCP server's `input_schema` through verbatim (see `crate::mcp`): the
-/// property is meka's own, and [`take_background_flag`] strips it before the adapter forwards the
+/// property is Meka's own, and [`take_background_flag`] strips it before the adapter forwards the
 /// arguments.
 fn offer_background(parameters: &mut serde_json::Value) -> bool {
     let Some(object) = parameters.as_object_mut() else {
@@ -337,7 +337,7 @@ pub(crate) fn schema_disagreement(
         .iter()
         .copied()
         .filter(|key| !properties.contains_key(*key))
-        // `scratchpad` and `background` are meka's own, consumed by the agent loop rather than by
+        // `scratchpad` and `background` are Meka's own, consumed by the agent loop rather than by
         // the tool. Neither appears in the raw definition this function reads, so flagging them
         // would fire on documented features.
         .filter(|key| *key != SCRATCHPAD_PARAMETER && *key != BACKGROUND_PARAMETER)
@@ -561,7 +561,7 @@ pub(crate) enum Admission {
 /// confinement read the same cell, so approval never widens reach, it only turns a refusal into a
 /// question.
 ///
-/// `unconfinable` is the door `Permission::allows` cannot provide for a tool meka cannot confine.
+/// `unconfinable` is the door `Permission::allows` cannot provide for a tool Meka cannot confine.
 /// `allows` treats `workspace` and `unrestricted` as equal on purpose, so a tool requiring
 /// `unrestricted` dispatches at `workspace` with no prompt; every built-in that matters has its
 /// own door downstream (the write fence, or `shell_execute`'s refusal when it cannot be
@@ -594,7 +594,7 @@ pub(crate) fn admit_tool_call(
         }
         return Admission::Refuse(Box::new(ToolOutput::text(
             format!(
-                "'{name}' runs inside its MCP server's own process, which meka does not sandbox, so \
+                "'{name}' runs inside its MCP server's own process, which Meka does not sandbox, so \
                  `workspace` cannot confine what it writes. Ask the user for `unrestricted`, or \
                  grant it explicitly with `[mcp.servers.*].tool_permissions` in the config."
             ),
@@ -650,7 +650,7 @@ impl ReadStamp {
             .map(|metadata| Self::from_metadata(&metadata))
     }
 
-    /// The stamp for text the frontend served, or that meka wrote back through it.
+    /// The stamp for text the frontend served, or that Meka wrote back through it.
     pub(crate) fn of_delegated(text: &str) -> Self {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -727,7 +727,7 @@ pub(crate) struct ToolOutput {
     /// where there is no fence to confuse it.
     pub(crate) structured: Option<serde_json::Value>,
     /// Whether this is the tool's output, which the `scratchpad` parameter may redirect, as
-    /// opposed to a word about the call, which stays inline whatever the call asked: meka's own
+    /// opposed to a word about the call, which stays inline whatever the call asked: Meka's own
     /// (a refusal, an argument error, an interruption, a panic, a background start notice) or the
     /// tool's, a failure it reports, unless [`Tool::reports_failure_as_output`] makes that failure
     /// its output. Set at
@@ -862,10 +862,10 @@ pub(crate) trait Tool: Send + Sync {
     ) -> Option<ToolOutput> {
         None
     }
-    /// Whether this tool's work happens in a process meka does not confine.
+    /// Whether this tool's work happens in a process Meka does not confine.
     ///
-    /// True only for MCP adapters today: the call is forwarded to a server meka spawned but does
-    /// not sandbox, so no boundary meka can express reaches it. The dispatch gate needs this
+    /// True only for MCP adapters today: the call is forwarded to a server Meka spawned but does
+    /// not sandbox, so no boundary Meka can express reaches it. The dispatch gate needs this
     /// because `Permission::allows` deliberately treats `Workspace` and `Unrestricted` as equal
     /// (scope is enforced at the write door, and the tools array must stay byte-identical across
     /// level toggles for the prompt cache), which works for built-ins, which have a door; an MCP
@@ -1067,10 +1067,10 @@ pub(crate) fn builtin_change_params(name: &str) -> &'static [&'static str] {
 /// The argument a tool call is shown by beside its name, on every surface and in the approval
 /// prompt: the one the built-in map names for a built-in, and for an MCP tool, whose arguments are
 /// authored upstream, the call's first argument that is text, else its first that reads as text
-/// (a number, a flag, a list), other than meka's own `background` and `scratchpad`: a limit or a
+/// (a number, a flag, a list), other than Meka's own `background` and `scratchpad`: a limit or a
 /// switch written ahead of the query says nothing of what the call is for. Read off the call
 /// alone, so a call replayed from the log, where no tool's schema is at hand, is shown as it was
-/// live; meka's two are told from a tool's own by their type, a flag and a name, which a tool that
+/// live; Meka's two are told from a tool's own by their type, a flag and a name, which a tool that
 /// owns either name declares otherwise.
 pub(crate) fn resolve_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
     if registry::server_of_tool(name).is_some() {
@@ -1563,7 +1563,7 @@ mod tests {
     /// family missing from the registry would otherwise go unexamined.
     #[tokio::test]
     async fn every_tool_with_arguments_can_show_a_primary_param() {
-        // meka's own universal parameters. A tool whose schema is only these takes no argument of
+        // Meka's own universal parameters. A tool whose schema is only these takes no argument of
         // its own and has nothing to display.
         const UNIVERSAL: &[&str] = &[SCRATCHPAD_PARAMETER, BACKGROUND_PARAMETER];
 
@@ -1966,8 +1966,8 @@ mod tests {
         assert!(schema.get("properties").is_none());
     }
 
-    /// A schema for a tool that declares neither of meka's parameters, which is the ordinary case
-    /// and the one where meka owns both names.
+    /// A schema for a tool that declares neither of Meka's parameters, which is the ordinary case
+    /// and the one where Meka owns both names.
     fn plain_schema() -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -1975,7 +1975,7 @@ mod tests {
         })
     }
 
-    /// The flag is meka's, so it must never reach the tool, least of all a remote MCP server that
+    /// The flag is Meka's, so it must never reach the tool, least of all a remote MCP server that
     /// never advertised the key.
     #[test]
     fn take_background_flag_removes_it_from_the_arguments() {
@@ -2028,10 +2028,10 @@ mod tests {
             }
         });
 
-        // Not spliced, so the model never saw meka's version.
+        // Not spliced, so the model never saw Meka's version.
         let mut offered = owned.clone();
         offer_background(&mut offered);
-        assert_eq!(offered, owned, "meka must not shadow the tool's parameter");
+        assert_eq!(offered, owned, "Meka must not shadow the tool's parameter");
 
         // Not stripped, not detached, and not refused for being the wrong type for a flag it is
         // not.
@@ -2045,7 +2045,7 @@ mod tests {
         assert_eq!(meka_parameter_error(&call, &owned), None);
     }
 
-    /// The same question for `scratchpad`, which needs a weaker test: meka's own builtins declare
+    /// The same question for `scratchpad`, which needs a weaker test: Meka's own builtins declare
     /// it, as a string, so presence proves nothing and only a conflicting *type* means the tool
     /// has its own idea of the name.
     #[test]
@@ -2057,7 +2057,7 @@ mod tests {
         let complaint = meka_parameter_error(&serde_json::json!({"scratchpad": 7}), &builtin_style);
         assert!(
             complaint.is_some(),
-            "a tool declaring it as a string agrees with meka, so the check still applies",
+            "a tool declaring it as a string agrees with Meka, so the check still applies",
         );
 
         let someone_elses = serde_json::json!({
@@ -2072,7 +2072,7 @@ mod tests {
     }
 
     /// Some models emit every argument as a string whatever the schema says; GLM does it through
-    /// OpenRouter, which is where this came up. Both of meka's own parameters decide what a call
+    /// OpenRouter, which is where this came up. Both of Meka's own parameters decide what a call
     /// does rather than what it is called with, so the answer is to say so and let the model retry,
     /// not to read the wrong type as absent (a silent no-op) or to guess at it (a contract where
     /// `"true"` works and `"yes"` does not).
@@ -2121,7 +2121,7 @@ mod tests {
             serde_json::json!({"command": "make", "scratchpad": "build-log"}),
             serde_json::json!({"command": "make", "scratchpad": null}),
             serde_json::json!({"command": "make"}),
-            // The tool's own arguments, wrong-typed on purpose: not meka's to police.
+            // The tool's own arguments, wrong-typed on purpose: not Meka's to police.
             serde_json::json!({"command": 12, "timeout": "30"}),
             serde_json::json!("not an object at all"),
         ] {
@@ -2171,7 +2171,7 @@ mod tests {
             decide(Permission::Unrestricted, Permission::Unrestricted, true),
             "run"
         );
-        // `workspace` runs a tool that requires `unrestricted` when meka can confine it; the
+        // `workspace` runs a tool that requires `unrestricted` when Meka can confine it; the
         // approval question is never asked for a call the level already covers.
         assert_eq!(
             decide(Permission::Unrestricted, Permission::Workspace, true),
@@ -2179,7 +2179,7 @@ mod tests {
         );
     }
 
-    /// A tool meka cannot confine is the one case where `workspace` covers the requirement and
+    /// A tool Meka cannot confine is the one case where `workspace` covers the requirement and
     /// still cannot deliver it: refused, or asked about when the switch is on.
     #[test]
     fn an_unconfinable_call_at_workspace_is_asked_about_when_approvals_are_on() {
@@ -2226,7 +2226,7 @@ mod tests {
         assert!(output.is_error);
         assert!(text.contains("requires `workspace`"), "{text}");
         assert!(text.contains("the session is at `read`"), "{text}");
-        // meka's own decision is a refusal; "denied" is the user's answer at the prompt.
+        // Meka's own decision is a refusal; "denied" is the user's answer at the prompt.
         assert!(!text.contains("denied"), "{text}");
     }
 
@@ -2917,7 +2917,7 @@ mod tests {
             }))
             .as_deref(),
             Some("ratatui"),
-            "meka's own arguments and a blank one are not the call's to be shown by"
+            "Meka's own arguments and a blank one are not the call's to be shown by"
         );
         assert_eq!(
             shown(serde_json::json!({"background": "#fff"})).as_deref(),
@@ -2927,7 +2927,7 @@ mod tests {
     }
 
     /// A built-in is shown by the argument its rule names, never by whichever came first: the map
-    /// is the whole rule for the names meka owns.
+    /// is the whole rule for the names Meka owns.
     #[test]
     fn a_built_in_is_shown_by_its_rule_alone() {
         let input = serde_json::json!({"path": "/ignored", "command": "ls -la"});

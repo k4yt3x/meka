@@ -685,7 +685,7 @@ pub(crate) async fn delete_sessions(
     let mut refused = Vec::new();
     for session_id in session_ids {
         // The refusing door, not the plain one: this is a session this process has never had open,
-        // and deleting one another meka is mid-conversation on cascades its messages away
+        // and deleting one another Meka is mid-conversation on cascades its messages away
         // underneath a live agent, which then fails every remaining turn on a foreign-key
         // violation.
         match store.delete_session_unless_attached(*session_id).await {
@@ -714,7 +714,7 @@ pub(crate) async fn delete_sessions(
     // success. The per-id reasons are already on stderr; this is what a script reads.
     if !refused.is_empty() {
         // Does not name a cause. Every `Err` lands here, and `delete_session_unless_attached`
-        // returns a database error as readily as a lock refusal, so claiming "another meka has
+        // returns a database error as readily as a lock refusal, so claiming "another Meka has
         // them open" would report a full disk as a busy session. The per-id lines above carry the
         // real reason; this is the summary a script reads.
         anyhow::bail!(
@@ -733,7 +733,7 @@ pub(crate) async fn delete_sessions(
 pub(crate) fn report_sessions_left_open(sweep: crate::store::SessionSweep) {
     if sweep.attached_elsewhere > 0 {
         tracing::warn!(
-            "left {attached} session(s) alone: another meka process has them open; close it and \
+            "left {attached} session(s) alone: another Meka process has them open; close it and \
              run this again",
             attached = sweep.attached_elsewhere
         );
@@ -768,7 +768,7 @@ pub(crate) fn hold_still_for_a_copy(
 fn cannot_copy_while_written(error: crate::error::MekaError) -> anyhow::Error {
     match error {
         crate::error::MekaError::SessionLocked(_) => anyhow::anyhow!(
-            "{error}: a conversation cannot be copied while it is being written; close the meka \
+            "{error}: a conversation cannot be copied while it is being written; close the Meka \
              that has it open and try again"
         ),
         other => other.into(),

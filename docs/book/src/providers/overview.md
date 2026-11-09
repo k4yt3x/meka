@@ -1,6 +1,6 @@
 # Providers overview
 
-A backend is how meka reaches an LLM inference service. meka ships with five, each selectable as an account's `backend`:
+A backend is how Meka reaches an LLM inference service. Meka ships with five, each selectable as an account's `backend`:
 
 | Backend | Protocol | Endpoint | Auth |
 |---------|----------|----------|------|
@@ -89,7 +89,7 @@ Every API-key account takes a `base_url`, so the protocol you pick is independen
 
 Where a server offers both OpenAI protocols, prefer [`openai-responses`](./openai-responses.md): it is what OpenAI recommends for new work and what the agent tooling ecosystem has moved to. Use `openai-chat-completions` for a server that does not serve Responses.
 
-Note that several of these also expose a **legacy `/v1/completions`** endpoint. That is a third, different protocol: a bare `prompt` string in, `choices[].text` out, no tool calling. meka does not speak it. It cannot: the agent loop needs tool calls, which that protocol has no representation for.
+Note that several of these also expose a **legacy `/v1/completions`** endpoint. That is a third, different protocol: a bare `prompt` string in, `choices[].text` out, no tool calling. Meka does not speak it. It cannot: the agent loop needs tool calls, which that protocol has no representation for.
 
 ## anthropic-messages vs claude-subscription
 
@@ -110,7 +110,7 @@ The first two differ by protocol; the last two differ only by auth and endpoint.
 
 ## Streaming vs non-streaming
 
-By default, meka uses streaming mode: tokens appear in the terminal as they are generated. Use `--no-stream` to wait for the complete response before displaying it.
+By default, Meka uses streaming mode: tokens appear in the terminal as they are generated. Use `--no-stream` to wait for the complete response before displaying it.
 
 Streaming is recommended for interactive use. Non-streaming may be useful for scripting or when the provider does not support SSE. On the Claude and Responses wires it changes what the terminal shows, not the request: the reply is streamed and folded before it is shown.
 

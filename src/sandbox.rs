@@ -2,7 +2,7 @@
 //!
 //! On Linux there are two backends. Bubblewrap (`bwrap --ro-bind /` plus tmpfs masks) is preferred
 //! whenever it is installed and its user-namespace smoke test passes, and on a kernel with a usable
-//! Landlock the command inside it also runs under meka's Landlock ruleset, enacted by `meka
+//! Landlock the command inside it also runs under Meka's Landlock ruleset, enacted by `meka
 //! confine` after bwrap's mounts, so the sockets the masks do not cover and every device ioctl are
 //! refused too. Landlock LSM alone is the fallback, and requires ABI v9 (kernel 7.1+), the first
 //! with a right over pathname Unix sockets (see
@@ -313,7 +313,7 @@ fn resolve_linux_backend(configured: Option<SandboxBackend>) -> SandboxResolutio
     // Probe Bubblewrap only when its result is load-bearing for the resolution: either the user
     // pinned it explicitly, or no value was configured (so the probe decides whether to auto-pick
     // it). When the user pinned Landlock, the Bubblewrap smoke test would be pure waste
-    // (~500 ms on every meka start).
+    // (~500 ms on every Meka start).
     let (backend, auto_resolved, cached_bubblewrap_probe) = match configured {
         Some(explicit) => (explicit, false, None),
         None => {
@@ -399,7 +399,7 @@ fn resolve_windows_backend(
 #[derive(Debug, Clone)]
 pub(crate) enum SandboxCapability {
     /// Linux: filesystem-write restriction via Landlock LSM at ABI v9 (kernel 7.1) or newer, with
-    /// meka's own directories hidden by never being covered by a rule and a private scratch
+    /// Meka's own directories hidden by never being covered by a rule and a private scratch
     /// directory per command. v9 is the first ABI with a right over `connect(2)` on a *pathname*
     /// Unix socket; it is handled and granted nowhere, so dbus and systemd-user are out of reach,
     /// which also costs socket-based clients like `docker` and `psql`. An older kernel is refused
@@ -412,7 +412,7 @@ pub(crate) enum SandboxCapability {
     /// `/var/tmp`, and `$XDG_RUNTIME_DIR`. Blocks filesystem writes, metadata changes and the
     /// socket-on-disk IPC under the masks; network is unrestricted. `landlock_abi` is the kernel's
     /// Landlock ABI when it clears the layer's own floor (v6, kernel 6.12): the command then also
-    /// runs under meka's ruleset, enacted inside the sandbox by `meka confine`, which closes the
+    /// runs under Meka's ruleset, enacted inside the sandbox by `meka confine`, which closes the
     /// abstract namespace and signals, and from v9 the sockets outside the masks too.
     #[cfg(target_os = "linux")]
     Bubblewrap {
@@ -424,15 +424,15 @@ pub(crate) enum SandboxCapability {
     /// launchd, pasteboard, LaunchServices, etc.); network is unrestricted.
     #[cfg(target_os = "macos")]
     SandboxExec,
-    /// Windows: the child runs under a token derived from meka's own, dropped to Low integrity at
+    /// Windows: the child runs under a token derived from Meka's own, dropped to Low integrity at
     /// `read` and `WRITE_RESTRICTED` to the workspace roots at `workspace`. Blocks writes outside
-    /// those surfaces; it confines neither reads nor the network and cannot hide meka's store,
+    /// those surfaces; it confines neither reads nor the network and cannot hide Meka's store,
     /// which is what the startup warning says when it is the automatic choice.
     #[cfg(target_os = "windows")]
     RestrictedToken,
     /// Windows: the child runs inside a process security environment the OS enforces from a
-    /// policy meka encodes per command (`appcontainer`): reads and writes where the policy grants
-    /// them, meka's directories denied, the network as the policy's tables say, and the UI
+    /// policy Meka encodes per command (`appcontainer`): reads and writes where the policy grants
+    /// them, Meka's directories denied, the network as the policy's tables say, and the UI
     /// restrictions in the spec. `minor` is the negotiated schema minor under major 1. Compiled
     /// everywhere because the policy and `held_network` are judged by it on every platform in
     /// tests.
@@ -447,7 +447,7 @@ pub(crate) enum SandboxCapability {
 }
 
 /// Result of probing a specific sandbox backend at config-resolution time. The probe is run once
-/// per meka launch (twice when the resolver needs to consider both Landlock and Bubblewrap for
+/// per Meka launch (twice when the resolver needs to consider both Landlock and Bubblewrap for
 /// auto-pick) and cached on `ResolvedConfig.backend_probe`.
 #[derive(Debug, Clone)]
 pub(crate) enum BackendProbe {
@@ -509,7 +509,7 @@ impl SandboxState {
     }
 }
 
-/// Where in the meka lifecycle the sandbox-state check is happening. The "stronger sandbox
+/// Where in the Meka lifecycle the sandbox-state check is happening. The "stronger sandbox
 /// available" nudge (Warn 2) only fires at startup; "backend unavailable" (Warn 1) fires at every
 /// relevant boundary because the user needs to know shell at `read` is broken right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -633,9 +633,9 @@ fn fallback_warning(backend: SandboxBackend, fallback_from: Option<&PassedOver>)
         )
     } else if cfg!(windows) && backend == SandboxBackend::RestrictedToken {
         // Integrity levels stop a Low-integrity process writing up, not reading up, so the token
-        // cannot hide meka's own store from a command at `read` the way the AppContainer deny list
+        // cannot hide Meka's own store from a command at `read` the way the AppContainer deny list
         // and the Bubblewrap and Seatbelt masks do, and it has no say over reads or the network.
-        let gives_up = "the token cannot hide meka's store, confine a command's reads or cut a \
+        let gives_up = "the token cannot hide Meka's store, confine a command's reads or cut a \
                         command off the network";
         Some(match fallback_from.map(|passed| &passed.probe) {
             Some(BackendProbe::Ok(SandboxCapability::AppContainer { minor })) => format!(
@@ -824,7 +824,7 @@ pub(crate) fn detect() -> SandboxCapability {
     {
         // Routed through the probe rather than the raw syscall so the `MIN_LANDLOCK_ABI` policy is
         // applied in exactly one place: a test asking "what sandbox does this host have?" must get
-        // the same answer production would act on, or it would happily exercise an ABI meka
+        // the same answer production would act on, or it would happily exercise an ABI Meka
         // refuses.
         if let BackendProbe::Ok(capability) = probe_landlock() {
             return capability;
@@ -1095,7 +1095,7 @@ pub(crate) fn is_sensitive_env_name(name: &str) -> bool {
         // implement one policy. They are not credentials; they are ways to make an ordinary
         // command run something else: `NODE_OPTIONS` takes `--require`, `PYTHONPATH` /
         // `NODE_PATH` prepend an import path, and `PIP_INDEX_URL` redirects where a package is
-        // fetched from. The values come from meka's own parent environment, so this is not an
+        // fetched from. The values come from Meka's own parent environment, so this is not an
         // escalation the agent can drive, but the sandboxed child is exactly the place where "the
         // same command, quietly doing something else" is worth refusing.
         "NODE_OPTIONS",
@@ -1178,7 +1178,7 @@ mod tests {
 
     /// The Landlock masks are pinned per ABI, bit for bit.
     ///
-    /// These two functions are the whole of what meka asks the kernel to police. The end-to-end
+    /// These two functions are the whole of what Meka asks the kernel to police. The end-to-end
     /// boundary test only catches the subset that stops a write, and it cannot catch the rest,
     /// because `&` binds tighter than `|` in Rust: flipping
     /// a middle operator drops only the two adjacent bits and leaves the write flags standing.
@@ -1406,7 +1406,7 @@ mod tests {
         let unpinned = startup_warnings(&state(true, missing.clone()));
         assert!(
             unpinned.contains("because AppContainer is unavailable")
-                && unpinned.contains("cannot hide meka's store")
+                && unpinned.contains("cannot hide Meka's store")
                 && unpinned.contains("to silence this warning"),
             "an unpinned fallback names the cause, the cost and the remedy: {unpinned:?}"
         );
@@ -2088,7 +2088,7 @@ mod tests {
     /// wrong does not fail loudly: it changes which subpath the rule matches. The assertion that
     /// no root's text appears in the profile body is the one that would catch a future rewrite
     /// deciding interpolation is simpler. The private denies come after the write allows: SBPL
-    /// takes the last matching rule, so a root that contains meka's store must not win over the
+    /// takes the last matching rule, so a root that contains Meka's store must not win over the
     /// mask on it.
     #[test]
     fn the_profile_denies_meka_s_own_directories_after_the_write_allows() {
@@ -2189,7 +2189,7 @@ mod tests {
         assert_eq!(status.code(), Some(0), "{slave} opened under the sandbox");
     }
 
-    /// Every directory between a writable root and meka's store is denied a write as itself,
+    /// Every directory between a writable root and Meka's store is denied a write as itself,
     /// which is what a rename of it is, after the write allow it has to beat. The directories
     /// inside stay writable: the deny is a literal, not a subpath.
     #[test]
@@ -2228,7 +2228,7 @@ mod tests {
     }
 
     /// End to end through `sandbox-exec`: a confined command cannot rename a directory on the way
-    /// from its writable root down to meka's store, and still writes inside it.
+    /// from its writable root down to Meka's store, and still writes inside it.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_seatbelted_shell_cannot_move_meka_s_store_from_under_its_deny() {
@@ -2309,7 +2309,7 @@ mod tests {
     /// The parameter is built as an `OsString` and the path pushed whole, so there is no UTF-8
     /// requirement to fail. A `to_str()` with a `continue` drops such a root silently from the
     /// allow-list and runs the command with it still read-only, a boundary quietly narrower than
-    /// the one meka reported.
+    /// the one Meka reported.
     #[test]
     #[cfg(unix)]
     fn a_non_utf8_root_still_becomes_a_seatbelt_parameter() {
@@ -2430,7 +2430,7 @@ mod tests {
 
     /// Below ABI v9 the ruleset has no right over pathname Unix sockets, so a sandboxed child can
     /// still hand its work to D-Bus or `systemd-run --user`, whatever the filesystem rules say.
-    /// meka documents `read` as "this command cannot change the machine", so the only honest
+    /// Meka documents `read` as "this command cannot change the machine", so the only honest
     /// answer on such a kernel is to report the backend unusable and let the shell tool
     /// hard-error, rather than to sandbox with a ruleset that leaves that door open.
     #[cfg(target_os = "linux")]

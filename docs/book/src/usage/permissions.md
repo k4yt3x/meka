@@ -1,6 +1,6 @@
 # Permissions
 
-meka uses a four-level permission system to control what tools the agent can use, and one switch,
+Meka uses a four-level permission system to control what tools the agent can use, and one switch,
 **approvals**, that decides what happens to a call the level does not cover. Together they give you
 control over the agent's capabilities and prevent accidental modifications.
 
@@ -55,7 +55,7 @@ directory inside the session's.
 `--additional-workspace-directory` and `--additional-readable-directory` belong to the process and
 reach the screen, a one-shot run, and an ACP session. `meka serve` refuses both: the HTTP API is
 single-directory, so a session there is confined to its own `working_directory` and nothing else. Extra directories supplied by an ACP client apply to that
-client's session only, and meka does not report your flags back to the client as though the client
+client's session only, and Meka does not report your flags back to the client as though the client
 had asked for them.
 
 Because they belong to the process, they are not recorded on the session either, and resuming a
@@ -86,7 +86,7 @@ promise. Below `unrestricted`, a read, by a file tool or by a command, may then 
 - the system directories, where the operating system keeps the programs, libraries and
   configuration a command needs to run at all, and anything [`[shell].additional_readable_directories`](../configuration/config-file.md#shelladditional_readable_directories) adds. The home directory is not among them: that is the point;
 - the skill directories [`[skills].additional_directories`](../configuration/config-file.md#skills) names, so a
-  skill's bundled files stay readable, as meka's own skills store does.
+  skill's bundled files stay readable, as Meka's own skills store does.
 
 The switch is instance-wide and read at startup, so every root session the process runs is bound
 by it; `unrestricted` remains the per-session way out, since it disclaims every boundary. The same
@@ -138,14 +138,14 @@ is worse than an error that says so. Use `unrestricted` for those turns.
 
 Four limits, stated plainly because none of them is visible from the inside:
 
-- **MCP servers are not sandboxed.** They run in their own process, which meka does not confine, so
-  a tool from an MCP server can write anywhere the server can, and no boundary meka can express
-  reaches it. A tool with no permission annotation falls back to `unrestricted`, and meka **refuses**
+- **MCP servers are not sandboxed.** They run in their own process, which Meka does not confine, so
+  a tool from an MCP server can write anywhere the server can, and no boundary Meka can express
+  reaches it. A tool with no permission annotation falls back to `unrestricted`, and Meka **refuses**
   it at `workspace` rather than dispatching it, because `Permission::allows` treats `workspace` and
   `unrestricted` as equal and would otherwise let it straight through. To use one from `workspace`,
   name it in `[mcp.servers.*].tool_permissions` at a level you are willing to grant, turn approvals
   on so the call is put to you, or switch to `unrestricted`.
-- **meka's own stores are outside the boundary and always writable**: the store under
+- **Meka's own stores are outside the boundary and always writable**: the store under
   `MEKA_DATA_DIR`, memories included, and skills under `MEKA_CONFIG_DIR`. They are governed by their own
   config keys, not by this one.
 - **Reads are not confined unless `[permissions].confine_reads` is on.** The boundary alone is
@@ -164,27 +164,27 @@ Four limits, stated plainly because none of them is visible from the inside:
 | Platform | Backend | Confines the shell's writes | Confines the shell's reads, with `confine_reads` on |
 |----------|---------|-----------------------------|-----------------------------------------------------|
 | Linux | Bubblewrap (preferred) | Yes: read-only root bind, plus a writable bind per workspace directory, with the Landlock ruleset inside where the kernel has one | Yes: an empty root with only the readable paths bound into it, read-only, the roots read-write; what is not bound is absent |
-| Linux | Landlock (fallback) | Yes: one path-beneath rule per workspace directory, or one per sibling where it contains meka's directories | Yes: read and execute rules on the readable paths instead of on `/`; names and sizes outside stay visible to `stat` |
+| Linux | Landlock (fallback) | Yes: one path-beneath rule per workspace directory, or one per sibling where it contains Meka's directories | Yes: read and execute rules on the readable paths instead of on `/`; names and sizes outside stay visible to `stat` |
 | macOS | `sandbox-exec` | Yes: writable subpath per workspace directory | Yes: data reads and executable mappings per readable path instead of everywhere; existence and metadata stay global so paths resolve |
-| Windows | AppContainer (preferred) | Yes: a read-write grant per workspace directory in the environment, meka's directories denied | Yes: read-only grants on the readable paths instead of on every drive; a path outside is neither readable nor listable |
+| Windows | AppContainer (preferred) | Yes: a read-write grant per workspace directory in the environment, Meka's directories denied | Yes: read-only grants on the readable paths instead of on every drive; a path outside is neither readable nor listable |
 | Windows | restricted token (fallback) | Yes: writes are permitted only where a workspace capability has an ACE | No: the file tools hold the boundary, a command reads anywhere, and the fallback warning says so |
 
 Under Bubblewrap, `/tmp`, `/run` and `/var/tmp` are masked with a tmpfs, so paths there are not
 merely unwritable but invisible. A workspace directory under `/tmp` is bound after the mask and stays
 reachable.
 
-meka's own directories are hidden too: the config directory and the data directory holding
+Meka's own directories are hidden too: the config directory and the data directory holding
 `meka.db` and every account credential. Bubblewrap masks them
 after every workspace bind and `sandbox-exec` denies them last, so a confined command cannot read
 the credential store even from a workspace directory at `$HOME` that contains it, and the in-process
 `file_write` and `file_edit` refuse a target under them whatever directories the session holds. The
 in-process read tools (`file_read`, `file_search`, `file_find`, `scratchpad_load_file`) refuse
-them below `unrestricted` too, and a search from a directory above them steps around them. The one exception is meka's own skills store, `skills/` under the config directory, which those readers reach at every level: a skill's bundled files are what its body tells the agent to read, and nothing secret lives there; a dot-entry at the store's top level (`.git` and the like, which discovery skips too) stays hidden with the rest. The same
+them below `unrestricted` too, and a search from a directory above them steps around them. The one exception is Meka's own skills store, `skills/` under the config directory, which those readers reach at every level: a skill's bundled files are what its body tells the agent to read, and nothing secret lives there; a dot-entry at the store's top level (`.git` and the like, which discovery skips too) stays hidden with the rest. The same
 readers refuse a process's own `/proc` directory (`/proc/<pid>`, `/proc/self`,
 `/proc/thread-self`), whose `environ`, `cmdline`, `fd` and `mem` carry what the process was given,
-meka's own environment and an MCP server's credential included; the system-wide files beside them
+Meka's own environment and an MCP server's credential included; the system-wide files beside them
 (`/proc/meminfo`, `/proc/cpuinfo`, `/proc/mounts`) stay readable. Landlock
-rules only add access, so meka hides them there by never covering them: reading files is granted
+rules only add access, so Meka hides them there by never covering them: reading files is granted
 per sibling along the path to each, which keeps their names and sizes visible and their bytes
 not, and a workspace directory above them is split the same way, at the cost that a new file under
 such a directory can land only in one of its subdirectories. The Windows AppContainer denies both
@@ -201,21 +201,21 @@ included, from the program it was typed to. Bubblewrap gives each command a `/de
 Landlock leaves `/dev/pts`, `/dev/input`, the raw keyboard devices (`/dev/hidraw*`) and the
 virtual consoles, their terminals (`/dev/tty0` and on) and screens (`/dev/vcs*`), out of what it
 grants, and `sandbox-exec` refuses `/dev/ttys*` but for a pty the command opened itself.
-A command meka runs has no terminal to need: it starts in a session of its own with stdin closed.
+A command Meka runs has no terminal to need: it starts in a session of its own with stdin closed.
 
 The Windows restricted token works differently enough to be worth stating; none of this applies
 under the AppContainer backend, where the environment grants the workspace directories and nothing
-is written to your ACLs. meka mints a deterministic capability SID per workspace directory, adds an
+is written to your ACLs. Meka mints a deterministic capability SID per workspace directory, adds an
 inheritable write ACE for it on that directory, and runs the shell under a `WRITE_RESTRICTED` token
 carrying that capability. Three consequences:
 
 - **It writes to your directory's ACL.** The grant is real, standing state, visible in `icacls` as
-  an `S-1-4-…` entry. meka takes it back when the process exits, including on Ctrl+C, and logs how
+  an `S-1-4-…` entry. Meka takes it back when the process exits, including on Ctrl+C, and logs how
   to remove it by hand if revocation fails. The next run re-adds it, which costs one pass over the
   tree.
 
   **A crash or a kill still strands it.** Nothing runs on those paths, so the ACE outlives them. It
-  grants nothing to anyone but a meka run in that same directory, and is reused rather than
+  grants nothing to anyone but a Meka run in that same directory, and is reused rather than
   duplicated next time, but if you want it gone:
   `icacls "<directory>" /remove:g *<the S-1-4-… from icacls>`.
 
@@ -223,7 +223,7 @@ carrying that capability. Three consequences:
   share one ACE, and it is released when the process exits rather than when any one of them ends.
   Under `meka serve` that means the ACE stands for the lifetime of the server.
 - **It needs you to own the directory.** Ownership supplies `WRITE_DAC` implicitly, which is what lets
-  meka grant without elevation. A network share or another user's folder cannot be a workspace directory.
+  Meka grant without elevation. A network share or another user's folder cannot be a workspace directory.
 - **Writes are restricted; nothing else is.** A `WRITE_RESTRICTED` token intersects write accesses
   only. Anything carrying an explicit `Everyone: Write` ACE stays writable even outside the
   workspace, which has no Unix analog.
@@ -232,36 +232,36 @@ carrying that capability. Three consequences:
   or PowerShell cannot start: the .NET runtime fails to initialize with `E_ACCESSDENIED` before it
   evaluates anything, so every shell command dies. Measured both ways on Windows 11: dropping
   `Everyone` closes the hole and takes the entire shell with it. Writes inside the workspace, to
-  files new and pre-existing, and to meka's own output pipe all behave the same either way, so a
+  files new and pre-existing, and to Meka's own output pipe all behave the same either way, so a
   filesystem-only test makes the change look free. Files carrying an explicit `Everyone: Write` ACE
   are rare and usually a misconfiguration in their own right; a `workspace` level that cannot run a
   command is not a usable level.
 
-- **The confined child shares meka's console and integrity level.** `read` gets a private
-  console and a Low-integrity token, so Windows' UI privilege isolation stands between it and meka.
+- **The confined child shares Meka's console and integrity level.** `read` gets a private
+  console and a Low-integrity token, so Windows' UI privilege isolation stands between it and Meka.
   A `workspace` child gets neither: a restricted token cannot create a console, only inherit one,
   and the integrity label is deliberately left alone so ordinary tooling keeps working. The child
-  can therefore write to the terminal outside meka's own rendering, and window messages between the
+  can therefore write to the terminal outside Meka's own rendering, and window messages between the
   two are not blocked. It is confined on the filesystem, which is what the level promises, and it is
-  not isolated from the meka process itself.
+  not isolated from the Meka process itself.
 
-- **A `workspace` command can read meka's process memory, and a `read` command cannot.** This is
+- **A `workspace` command can read Meka's process memory, and a `read` command cannot.** This is
   the one axis on which `workspace` is *weaker* than the level below it, so it is worth stating
   plainly. `WRITE_RESTRICTED` intersects the restricting SIDs for write access only, and the
   integrity label is left alone, so nothing stops a `workspace` child calling `OpenProcess` with
-  `PROCESS_VM_READ` against meka and reading whatever the process is holding, **including your
+  `PROCESS_VM_READ` against Meka and reading whatever the process is holding, **including your
   account credentials**. Measured on real hardware: a native probe run at `workspace` read a
-  canary string straight out of meka's heap, while the identical probe at `read` failed at
+  canary string straight out of Meka's heap, while the identical probe at `read` failed at
   `OpenProcess` with `ERROR_ACCESS_DENIED`, because Low integrity refuses the handle. There is no
   clean fix inside the current design. Dropping the `workspace` child to Low integrity would
   confine it to the Low-integrity surface and take the workspace write grant with it, and a deny
-  ACE on meka's own process would have to name a SID the child carries but meka does not, which
+  ACE on Meka's own process would have to name a SID the child carries but Meka does not, which
   the restricted token does not provide. Treat `workspace` on Windows as protecting your files
-  from the agent, not as protecting meka's secrets from a command the agent runs.
+  from the agent, not as protecting Meka's secrets from a command the agent runs.
 
 - **PowerShell runs in ConstrainedLanguage mode.** The restricted token triggers it, and `read` and
   `unrestricted` are unaffected (both report `FullLanguage`). Scripts that construct .NET types or
-  set properties on them will fail at `workspace` where they work at `unrestricted`. meka's own
+  set properties on them will fail at `workspace` where they work at `unrestricted`. Meka's own
   UTF-8 output preamble is skipped rather than run there, so non-ASCII output at `workspace` is
   decoded with the host's legacy code page and may be mangled.
 
@@ -285,14 +285,14 @@ You can change the start level with:
 - Environment variable: `export MEKA_PERMISSION=workspace`
 - Config file: `[permissions] default = "workspace"`; see [Config file](../configuration/config-file.md#permissions)
 
-If `--permission` or `MEKA_PERMISSION` selects a level that isn't in `[permissions].enabled`, meka
+If `--permission` or `MEKA_PERMISSION` selects a level that isn't in `[permissions].enabled`, Meka
 logs a warning and starts at the configured default instead of refusing to launch. A session whose
 recorded level has since left `[permissions].enabled` is treated the same way wherever it is
 reopened (a resume, `meka serve` re-attaching it, ACP `session/load`): it starts at the configured
 default, with one warning naming the session, rather than at authority the configuration withdrew.
 
-A level meka does not have in `[permissions].enabled` or `default` is refused at parse, with the
-line. An `enabled` list that names nothing is different: meka warns and falls back to **`read`
+A level Meka does not have in `[permissions].enabled` or `default` is refused at parse, with the
+line. An `enabled` list that names nothing is different: Meka warns and falls back to **`read`
 alone**, not to the default set. An empty list asks for nothing, and answering it with four levels
 including `unrestricted` would resolve to more authority than you wrote.
 
@@ -310,7 +310,7 @@ surface says which of the two replaced it:
 silently re-pointing the name at the narrower level would have admitted tools a rung earlier than
 their author intended. A hard failure at every door is the safe direction.
 
-Anything meka persisted for itself (a sub-agent's saved spec, a scheduled job's gate) needs the
+Anything Meka persisted for itself (a sub-agent's saved spec, a scheduled job's gate) needs the
 one-shot migration script; those values were never typed by you and cannot be fixed by hand.
 
 ## Changing permissions at runtime
@@ -434,15 +434,15 @@ mean such a value lands in your scrollback.
 
 ## How permissions work
 
-When the agent attempts to use a tool, meka checks whether the current permission level allows it:
+When the agent attempts to use a tool, Meka checks whether the current permission level allows it:
 
 - If allowed, the tool executes normally.
 - If not, and approvals are on, you are prompted to approve or deny.
-- If not, and approvals are off, meka returns an error message to the agent explaining which level is required and suggests asking you to raise it.
+- If not, and approvals are off, Meka returns an error message to the agent explaining which level is required and suggests asking you to raise it.
 
 ### Telling the agent the current level
 
-meka lists **every registered tool** in the per-turn `<context>` block with its required permission level inline (nothing is filtered out), and the same block carries a compact `[Permission context]` section:
+Meka lists **every registered tool** in the per-turn `<context>` block with its required permission level inline (nothing is filtered out), and the same block carries a compact `[Permission context]` section:
 
 ```text
 <context>
@@ -499,12 +499,12 @@ Commands like `ls`, `cat`, `git log`, `df`, `ps`, and `uname` work normally. Com
 
 Two things the sandbox deliberately does **not** restrict, on every backend:
 
-- **Reads**, on a root session unless [`[permissions].confine_reads`](#the-read-boundary) is on. A sandboxed command can otherwise read anything your user can, including `~/.ssh` and `~/.aws/credentials`, and on Windows under the restricted token meka's own store. `read` protects the machine from being *changed*, not from being *read*. A sub-agent's reads are confined to its scope whatever the switch says.
+- **Reads**, on a root session unless [`[permissions].confine_reads`](#the-read-boundary) is on. A sandboxed command can otherwise read anything your user can, including `~/.ssh` and `~/.aws/credentials`, and on Windows under the restricted token Meka's own store. `read` protects the machine from being *changed*, not from being *read*. A sub-agent's reads are confined to its scope whatever the switch says.
 - **The network**, unless [`[permissions].network`](../configuration/config-file.md#permissions) narrows it: `none` cuts a command off, which Bubblewrap, Landlock, `sandbox-exec` and the Windows AppContainer hold and the Windows restricted token cannot; `remote` keeps it off this machine alone, which the AppContainer holds and the others hold as `none`, cutting the command off whole. Open, a command at `read` can still send what it read. Provider API keys are scrubbed from the child's environment, but that is one vector, not a boundary.
 
-On Windows under the restricted token, `workspace` extends that first point to meka's own process. Its `WRITE_RESTRICTED` token restricts writes only, and unlike `read` it deliberately leaves the integrity label at the parent's level, so a confined command can open meka with `PROCESS_VM_READ` and read its memory. Measured on Windows 11: `OpenProcess` succeeds and `ReadProcessMemory` returns data. This is the one respect in which `workspace` confines less than `read`, whose Low-integrity token Windows blocks from opening a medium-integrity process at all. It grants nothing that reading `meka.db` would not, which a command at either level can already do, but it is worth knowing if you were treating `workspace` as strictly wider than `read` in every direction. They are not ordered that way; see the ladder note above.
+On Windows under the restricted token, `workspace` extends that first point to Meka's own process. Its `WRITE_RESTRICTED` token restricts writes only, and unlike `read` it deliberately leaves the integrity label at the parent's level, so a confined command can open Meka with `PROCESS_VM_READ` and read its memory. Measured on Windows 11: `OpenProcess` succeeds and `ReadProcessMemory` returns data. This is the one respect in which `workspace` confines less than `read`, whose Low-integrity token Windows blocks from opening a medium-integrity process at all. It grants nothing that reading `meka.db` would not, which a command at either level can already do, but it is worth knowing if you were treating `workspace` as strictly wider than `read` in every direction. They are not ordered that way; see the ladder note above.
 
-If no sandbox backend is usable, shell commands at `read` **fail** rather than running unconfined. On Linux that means Bubblewrap (preferred whenever `bwrap` is installed) or Landlock at ABI v9 or newer. Landlock below v9 cannot refuse a `connect()` to a Unix socket on disk, so a "read-only" command could still reach D-Bus and `systemd-run --user` and have them act on its behalf, and meka refuses it rather than promise a protection the kernel is not enforcing. Kernels below 7.1 therefore need `bwrap` installed for the shell at `read`; `meka` says so at startup.
+If no sandbox backend is usable, shell commands at `read` **fail** rather than running unconfined. On Linux that means Bubblewrap (preferred whenever `bwrap` is installed) or Landlock at ABI v9 or newer. Landlock below v9 cannot refuse a `connect()` to a Unix socket on disk, so a "read-only" command could still reach D-Bus and `systemd-run --user` and have them act on its behalf, and Meka refuses it rather than promise a protection the kernel is not enforcing. Kernels below 7.1 therefore need `bwrap` installed for the shell at `read`; `meka` says so at startup.
 
 If you ask the agent to modify a file:
 
@@ -516,7 +516,7 @@ The agent will explain that it cannot write files at `read` and suggest switchin
 
 #### What `read` still writes
 
-`read` means the agent cannot modify **your tree**. It can still write to stores meka owns, because otherwise an agent at read permission could never remember anything:
+`read` means the agent cannot modify **your tree**. It can still write to stores Meka owns, because otherwise an agent at read permission could never remember anything:
 
 | Store | Location | Tools |
 |-------|----------|-------|
@@ -530,13 +530,13 @@ A directory you asked for is not always one you get. `--additional-workspace-dir
 
 #### MCP tools are the exception
 
-Tools from MCP servers are not built-ins and are not covered by that boundary. They execute inside the server's own process, which meka does not sandbox, so what an MCP tool may do is bounded by the server, not by meka's permission level.
+Tools from MCP servers are not built-ins and are not covered by that boundary. They execute inside the server's own process, which Meka does not sandbox, so what an MCP tool may do is bounded by the server, not by Meka's permission level.
 
-What decides whether such a tool is reachable at read is the permission meka resolves for it, and by default a server's own `readOnlyHint: true` annotation is enough to classify it as `read`. That hint is asserted by the server and not verified. A server that advertises it for a tool that in fact writes therefore gets to write your tree while meka sits at `read`.
+What decides whether such a tool is reachable at read is the permission Meka resolves for it, and by default a server's own `readOnlyHint: true` annotation is enough to classify it as `read`. That hint is asserted by the server and not verified. A server that advertises it for a tool that in fact writes therefore gets to write your tree while Meka sits at `read`.
 
 For a server you have not audited, either pin its tools explicitly with [`tool_permissions`](../configuration/config-file.md#mcp) or set [`trust_read_only_hint = false`](../configuration/config-file.md#mcp) on it, which makes the hint advisory for display only and drops its tools to the strict `unrestricted` fallback, past `[mcp].default_permission`.
 
-So the honest statement of `read`'s filesystem guarantee is: your tree is safe from meka's built-in tools, plus whichever MCP servers you have chosen to trust.
+So the honest statement of `read`'s filesystem guarantee is: your tree is safe from Meka's built-in tools, plus whichever MCP servers you have chosen to trust.
 
 > **Note:** The read-only sandbox uses Bubblewrap or Landlock (ABI v9+, kernel 7.1+) on Linux, `sandbox-exec` on macOS, and an AppContainer or a restricted token on Windows. See [Shell](../tools/shell.md#read-only-sandbox) for what each backend covers. Where no backend is usable, shell commands are not available at `read` or `workspace`. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config file](../configuration/config-file.md)), which makes `shell_execute` require `unrestricted` instead.
 

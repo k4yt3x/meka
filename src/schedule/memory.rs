@@ -225,7 +225,7 @@ impl SchedulerMemory {
     /// needs `unrestricted`" have different remedies, and keyed by job alone a move between them
     /// would arrive silently because the entry was already there.
     ///
-    /// Entries are dropped when the job is authorized again or when it stops being a job meka can
+    /// Entries are dropped when the job is authorized again or when it stops being a job Meka can
     /// see, because a long-lived `meka serve` has no other bound on them.
     pub(crate) fn declined_for_permission_first_time(&self, job_id: &str, reason: &str) -> bool {
         let mut held = crate::sync::lock(&self.permission_declined);

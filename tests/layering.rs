@@ -71,7 +71,7 @@ const RANKS: &[(&str, u32)] = &[
     ("permission", 17),
     ("checklist", 17),
     ("image", 17),
-    // Leaves. `process` is the one door for every process meka starts, below `sandbox`, which
+    // Leaves. `process` is the one door for every process Meka starts, below `sandbox`, which
     // takes its job definition from it.
     ("fs", 18),
     ("process", 18),
@@ -413,7 +413,7 @@ const TEMP_DIRECTORY_USERS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Below `unrestricted`, the meka process writes to its store and nothing else. Production code
+/// Below `unrestricted`, the Meka process writes to its store and nothing else. Production code
 /// names the temp directory only where [`TEMP_DIRECTORY_USERS`] says, and the platform cache
 /// directory nowhere. A new use of either is a new door out of the store, and has to be argued for
 /// in the ledger rather than slipped in as a fallback.
@@ -643,8 +643,8 @@ fn tool_arguments_are_read_through_the_shared_readers() {
 }
 
 /// Every file that starts a process, with how the door in `src/process.rs` reaches what it
-/// starts. The door is what puts a child behind meka in the line for memory, so a spawn it does
-/// not reach is a command that can take meka down with it.
+/// starts. The door is what puts a child behind Meka in the line for memory, so a spawn it does
+/// not reach is a command that can take Meka down with it.
 const PROCESS_STARTERS: &[(&str, &str)] = &[
     (
         "src/tools/shell.rs",

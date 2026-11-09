@@ -9,7 +9,7 @@ use crate::{
     skills,
 };
 
-/// Ceiling on the author column: attribution is free text from a file meka may not have written,
+/// Ceiling on the author column: attribution is free text from a file Meka may not have written,
 /// shown for information.
 const AUTHOR_TRUNCATE: usize = 20;
 
@@ -62,7 +62,7 @@ pub(crate) fn list(
 /// field offsets a script reads. `External` is therefore always present and always `yes` or `no`,
 /// even in the common case where every row says `no`.
 ///
-/// `native_root` is meka's own store, the only directory anything writes to. A skill from anywhere
+/// `native_root` is Meka's own store, the only directory anything writes to. A skill from anywhere
 /// else came from `[skills] additional_directories`, which is what `External` reports; `paths`
 /// answers the question that raises, by naming where each one actually is.
 ///
@@ -123,7 +123,7 @@ fn render_list(skills: &[skills::Skill], native_root: Option<&Path>, paths: bool
 
 /// `meka skill get <name>`: the frontmatter as `key: value` lines.
 ///
-/// Every key the file carries, not only the ones meka models: the unmodeled ones are preserved
+/// Every key the file carries, not only the ones Meka models: the unmodeled ones are preserved
 /// across a rewrite, and this is the command that shows they were.
 pub(crate) fn run_get(
     name: &str,
@@ -166,7 +166,7 @@ fn get_fields(skill: &skills::Skill, body_bytes: u64) -> Vec<(Cow<'static, str>,
             optional(skill.allowed_tools.as_deref()),
         ),
     ];
-    // Both halves sanitized: a key is arbitrary YAML text from a file meka may not have written,
+    // Both halves sanitized: a key is arbitrary YAML text from a file Meka may not have written,
     // and an escape or a newline in one reaches the terminal or fakes an extra output line.
     let sanitized = |value: &yaml_serde::Value| {
         crate::entry::sanitize_stored_description(&skills::yaml_value_to_string(value))
@@ -180,7 +180,7 @@ fn get_fields(skill: &skills::Skill, body_bytes: u64) -> Vec<(Cow<'static, str>,
                 ));
             }
         }
-        // Whatever the file put there instead. Shown rather than skipped: meka keeps it verbatim
+        // Whatever the file put there instead. Shown rather than skipped: Meka keeps it verbatim
         // across a rewrite, so a command that hid it would hide the thing being preserved.
         None => {
             if let Some(value) = skill.metadata.as_ref() {
@@ -300,7 +300,7 @@ fn prepare_add(
         )));
     }
     // `name` is required by the spec, and every *other* write door renders `name:` from the
-    // directory. This one copies bytes, and meka reads identity from the directory, so nothing
+    // directory. This one copies bytes, and Meka reads identity from the directory, so nothing
     // else would miss the key. A mismatched `name` is `parse_skill_definition`'s to refuse, above.
     //
     // Deliberately narrow: a key the spec does not define, such as a Claude Code `when_to_use`, is
@@ -385,10 +385,10 @@ pub(crate) async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> 
     let written = crate::render::write_stdout_line(skill_md.display());
 
     // Released before the editor runs. The lock exists to protect the *write*, which is finished;
-    // holding it across an interactive session blocked every other meka skill write in every other
-    // process for as long as the editor stayed open, and made a concurrent `PUT /v1/skills` wait
-    // 16 seconds. `lock_store`'s own justification for blocking rather than failing is that "the
-    // contended window is one small file write", which is only true if this drop happens.
+    // holding it across an interactive session blocked every other `meka skill` write in every
+    // other process for as long as the editor stayed open, and made a concurrent `PUT /v1/skills`
+    // wait 16 seconds. `lock_store`'s own justification for blocking rather than failing is that
+    // "the contended window is one small file write", which is only true if this drop happens.
     drop(_store_lock);
 
     if args.edit {
@@ -528,7 +528,7 @@ fn parse_metadata(pairs: &[String]) -> Result<BTreeMap<String, String>> {
     Ok(metadata)
 }
 
-/// A metadata value for a table cell: sanitized, since these come from a file meka may not have
+/// A metadata value for a table cell: sanitized, since these come from a file Meka may not have
 /// written and land straight in a terminal, with `-` for absent so the column stays aligned.
 fn display_metadata(value: Option<&str>) -> String {
     value.map_or_else(
@@ -539,7 +539,7 @@ fn display_metadata(value: Option<&str>) -> String {
 
 /// A filesystem path for display: the same sanitization every other cell gets.
 ///
-/// A path is not meka's own text. Its leaf is a directory name chosen by whoever installed the
+/// A path is not Meka's own text. Its leaf is a directory name chosen by whoever installed the
 /// skill, so it can carry a newline, a terminal escape or a bidi override, and both callers write
 /// it straight to a terminal, one of them into a column table.
 fn display_path(path: &Path) -> String {
@@ -673,7 +673,7 @@ mod tests {
     /// `meka skill add` refuses an over-length description, like every other write door.
     ///
     /// This path renders its own bytes and writes them directly rather than going through
-    /// `write_skill`, so it inherits none of that function's guards. Without the cap meka's own
+    /// `write_skill`, so it inherits none of that function's guards. Without the cap Meka's own
     /// create command would author a skill the reference validator rejects on sight, and that
     /// `skill_write` and `PUT /v1/skills` would have refused outright.
     #[tokio::test]
@@ -764,9 +764,9 @@ mod tests {
     /// `--from-file` may not install a skill that declares no `name` at all.
     ///
     /// The spec makes `name` required, and every other write door satisfies that by construction:
-    /// they render `name:` from the directory. This one copies bytes, and meka reads identity from
+    /// they render `name:` from the directory. This one copies bytes, and Meka reads identity from
     /// the directory, so a missing key cost nothing *here* and produced a file `skills-ref
-    /// validate` rejects for a missing required field. meka's own store is the one place its
+    /// validate` rejects for a missing required field. Meka's own store is the one place its
     /// conformance claim has to hold.
     #[tokio::test]
     async fn add_from_file_refuses_a_file_that_declares_no_name() {
@@ -1093,7 +1093,7 @@ mod tests {
     ///
     /// Both halves were untested, and the second was wrong: the check read the *loaded* skills, so
     /// a broken `SKILL.md` in an `additional_directories` root was a name nothing had an opinion
-    /// about. The add went through, meka's own store won precedence forever after, and nothing
+    /// about. The add went through, Meka's own store won precedence forever after, and nothing
     /// said a word, which is the worst case to shadow silently, because the original is not
     /// reported anywhere either.
     #[tokio::test]
@@ -1129,7 +1129,7 @@ mod tests {
             );
             assert!(
                 !temp.path().join("skills").join(name).exists(),
-                "{name}: nothing may be created in meka's own store"
+                "{name}: nothing may be created in Meka's own store"
             );
         }
     }
@@ -1137,7 +1137,7 @@ mod tests {
     /// The same rule on the delete door, for a foreign file that does not parse.
     ///
     /// `run_remove` compared against the loaded skills too, so this answered "not found at
-    /// <meka's own store>", pointing at a directory that was never the one holding the file.
+    /// <Meka's own store>", pointing at a directory that was never the one holding the file.
     #[tokio::test]
     async fn removing_a_broken_skill_in_a_read_only_root_names_where_it_lives() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1351,7 +1351,7 @@ mod tests {
     #[test]
     fn a_long_author_cannot_widen_the_whole_table() {
         let native = std::path::PathBuf::from("/config/skills");
-        let long = "Anthropic (claude-security plugin), ported to meka";
+        let long = "Anthropic (claude-security plugin), ported to Meka";
         let rendered = render(
             &[sample_skill("security-review", &native, long)],
             Some(&native),
@@ -1372,7 +1372,7 @@ mod tests {
         }
     }
 
-    /// A frontmatter key the file chose cannot overwrite a line meka wrote: the file's own
+    /// A frontmatter key the file chose cannot overwrite a line Meka wrote: the file's own
     /// `priority` and `body` arrive under `extra.`, beside the modeled ones rather than in place
     /// of them.
     #[test]

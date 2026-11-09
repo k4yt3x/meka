@@ -88,7 +88,7 @@ pub(crate) async fn sweep_expired_sessions(
     // was in use.
     if sweep.attached_elsewhere > 0 {
         let spared = sweep.attached_elsewhere;
-        tracing::info!("spared {spared} session(s) another meka process has open");
+        tracing::info!("spared {spared} session(s) another Meka process has open");
     }
     Ok(())
 }
@@ -346,7 +346,7 @@ pub(crate) const COMMANDS: &[HostCommand] = &[
     },
     HostCommand {
         name: "cd",
-        help: "Change working directory (bare: back to where meka started)",
+        help: "Change working directory (bare: back to where Meka started)",
         arg_hint: "[path]",
         editor_help: None,
     },
@@ -455,10 +455,10 @@ pub(crate) async fn format_status(
 /// How a reader shows a running command's output, which decides what one update carries.
 ///
 /// The two modes are not cosmetic variants of each other. In [`Self::Terminal`] the reader owns a
-/// scrollback that meka appends to, so an update carries only the bytes not yet sent and the whole
+/// scrollback that Meka appends to, so an update carries only the bytes not yet sent and the whole
 /// output is available at the far end: an ACP client rendering agent-owned terminals, or the HTTP
 /// feed's `tool_call.output_delta`. In [`Self::Text`] the reader can only replace a block of text,
-/// so meka keeps the running output itself and re-sends a window of it: an ACP client without
+/// so Meka keeps the running output itself and re-sends a window of it: an ACP client without
 /// terminal rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveOutputMode {

@@ -1,7 +1,7 @@
 //! The `skill_*` tools: the agent's access to the installed skill store ([`crate::skills`]).
 //!
 //! All five gate at [`Permission::Read`], for the reason spelled out on [`crate::tools::memory`]:
-//! `workspace` in meka means "may modify the user's tree", and these write to a store meka owns
+//! `workspace` in Meka means "may modify the user's tree", and these write to a store Meka owns
 //! under its own config directory. `agent_spawn` is a read-tier tool too, so the dispatcher
 //! deployment these exist for runs at read permission permanently; gating them at `workspace` would
 //! withhold them from the only configuration that wants them.
@@ -72,7 +72,7 @@ impl Tool for SkillReadTool {
 
         let skill = match skills.find(&name) {
             Some(skill) => skill,
-            // "No such skill" and "it is right there and meka cannot read it" call for opposite
+            // "No such skill" and "it is right there and Meka cannot read it" call for opposite
             // responses: collapsed into "not found", a model handed a procedure whose file has a
             // typo in its frontmatter improvises one.
             None => {
@@ -141,7 +141,7 @@ fn reject_unreadable(
     native_root: &std::path::Path,
 ) -> Option<ToolOutput> {
     // A skill that loaded is not here, and that is [`skills::SkillIndex`]'s disjointness invariant
-    // rather than a check of this function's own: a working `deploy` in meka's store beside a
+    // rather than a check of this function's own: a working `deploy` in Meka's store beside a
     // broken `deploy/` in a read-only root would otherwise put the name in both halves, and
     // re-checking `find` here would leave the other readers of `skipped` to each remember it.
     //
@@ -151,7 +151,7 @@ fn reject_unreadable(
     let reason = installed.skip_reason(name)?;
     let remedy = match installed.location(name) {
         Some((root, source_dir)) if root != native_root => format!(
-            "It lives at {}, which meka reads but does not write to, so ask the user to fix or \
+            "It lives at {}, which Meka reads but does not write to, so ask the user to fix or \
              remove it there.",
             source_dir.display()
         ),
@@ -474,7 +474,7 @@ impl Tool for SkillWriteTool {
 /// wrote does not quietly reassign it. Informational only, using a field skills already had. It
 /// exists so `meka skill list` is legible about where an entry came from, not as a guard: nothing
 /// branches on it.
-const AGENT_AUTHOR: &str = "meka (agent-authored)";
+const AGENT_AUTHOR: &str = "Meka (agent-authored)";
 
 pub(super) struct SkillEditTool {
     pub(crate) skills: Arc<SkillCache>,
@@ -1127,10 +1127,10 @@ mod tests {
         );
         assert!(
             !native.join("borrowed").exists(),
-            "a shadowing copy must not be created in meka's own root"
+            "a shadowing copy must not be created in Meka's own root"
         );
 
-        // A name meka does own is unaffected.
+        // A name Meka does own is unaffected.
         let result = run(
             &write,
             serde_json::json!({"name": "ours", "description": "d", "body": "b"}),
@@ -1145,7 +1145,7 @@ mod tests {
     /// Compared against the loaded skills alone, an unparseable file in an `additional_directories`
     /// root is a name nothing has an opinion about and gets shadowed silently, the worst case
     /// to shadow since the original is then reported nowhere; and `meka skill remove` answers
-    /// "not found" for a file meka does not own.
+    /// "not found" for a file Meka does not own.
     #[tokio::test]
     async fn a_broken_skill_in_a_read_only_root_is_neither_shadowed_nor_misdirected() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1182,7 +1182,7 @@ mod tests {
             "an unparseable foreign skill must not be shadowed either"
         );
 
-        // A broken skill meka *does* own still gets the remedy that works for it.
+        // A broken skill Meka *does* own still gets the remedy that works for it.
         write_skill(&native, "ours-wrecked", "no frontmatter\n");
         skills.invalidate().await;
         let result = run(
@@ -1202,7 +1202,7 @@ mod tests {
 
     /// A name that loaded is writable, whatever a shadowed copy of it elsewhere looks like.
     ///
-    /// Roots merge first-wins and the skip list records every failure, so meka's own working
+    /// Roots merge first-wins and the skip list records every failure, so Meka's own working
     /// `deploy` and a broken `deploy/` in a read-only root would put one name in both halves of
     /// the index, and `reject_unreadable` answering from the skipped half alone would refuse every
     /// write and delete of a skill plainly in the index.
@@ -1243,7 +1243,7 @@ mod tests {
             std::fs::read_to_string(native.join("deploy/SKILL.md"))
                 .expect("still there")
                 .contains("MINE2"),
-            "the write must land in meka's own root"
+            "the write must land in Meka's own root"
         );
         assert!(
             std::fs::read_to_string(shared.join("deploy/SKILL.md"))
@@ -1258,7 +1258,7 @@ mod tests {
         };
         let result = run(&delete, serde_json::json!({"name": "deploy"})).await;
         assert!(!result.is_error, "{}", result.text_content());
-        assert!(!native.join("deploy").exists(), "removed from meka's store");
+        assert!(!native.join("deploy").exists(), "removed from Meka's store");
         assert!(shared.join("deploy").exists(), "left alone elsewhere");
     }
 
@@ -1884,7 +1884,7 @@ mod tests {
         );
         assert!(
             !native.join("borrowed").exists(),
-            "a shadowing copy must not be created in meka's own root"
+            "a shadowing copy must not be created in Meka's own root"
         );
 
         let broken = run(

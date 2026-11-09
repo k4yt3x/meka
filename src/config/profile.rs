@@ -31,9 +31,9 @@ pub(crate) enum Backend {
     OpenAiResponses,
 }
 
-/// The context window meka assumes when a profile doesn't state one.
+/// The context window Meka assumes when a profile doesn't state one.
 ///
-/// meka does not look this up, probe for it, or cache it. The window is a local budgeting number
+/// Meka does not look this up, probe for it, or cache it. The window is a local budgeting number
 /// (it drives compaction timing, the keep-budget and the `/status` gauge, and is never sent on the
 /// wire), so a wrong value cannot fail a request, and the user can state the real one via
 /// `[profiles.<name>].context_window`.
@@ -52,14 +52,14 @@ pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 /// redacted before they are posted. The OpenAI wires apply none, since their endpoints' caps are
 /// the endpoints' own facts; [`Backend::default_max_request_bytes`] says which is which.
 pub(crate) const ANTHROPIC_MAX_REQUEST_BYTES: usize = 30 * crate::text::MIB;
-/// One named account from `[accounts.<name>]`: where a request goes and who meka is when it
+/// One named account from `[accounts.<name>]`: where a request goes and who Meka is when it
 /// arrives. Holds only non-secret settings; the credential (API key or OAuth bundle) is stored in
 /// the DB keyed by the account name and is acquired via `meka account add` / `login`.
 ///
 /// **Field order is canonical and load-bearing**, and every surface that lists these keys repeats
 /// it: [`ACCOUNT_KEY_ORDER`], `upsert_account_document`, the `account add` flags, and the
 /// `config.toml` reference. Widest reach first, ending with the narrowest: `backend` leads and
-/// `device_id` closes as the one key meka writes rather than the user.
+/// `device_id` closes as the one key Meka writes rather than the user.
 ///
 /// The division from [`ProfileConfig`] is the one "Whose fact is it" draws, which is why a new
 /// field has an obvious home: would two models on one account state it differently? Then it
@@ -106,7 +106,7 @@ where
         .map(|bytes| crate::config::check_tool_name_bytes(bytes).map_err(D::Error::custom))
         .transpose()
 }
-/// One named profile from `[profiles.<name>]`: which account it bills, and what meka asks that
+/// One named profile from `[profiles.<name>]`: which account it bills, and what Meka asks that
 /// account's endpoint for and how.
 ///
 /// **Field order is canonical and load-bearing**, and every surface that lists these keys repeats
@@ -132,7 +132,7 @@ pub(crate) struct ProfileConfig {
     pub(crate) fallbacks: Vec<String>,
     /// The model's context window (total tokens it can hold), used for the context gauge and
     /// auto-compaction. Falls back to `[session].context_window`, then to
-    /// [`DEFAULT_CONTEXT_WINDOW`]. meka never infers this from the model name or
+    /// [`DEFAULT_CONTEXT_WINDOW`]. Meka never infers this from the model name or
     /// asks the provider for it, so this is where a model smaller than the default gets stated.
     pub(crate) context_window: Option<u64>,
     /// Override the per-request output (completion) token cap. When unset, each backend keeps its
@@ -144,7 +144,7 @@ pub(crate) struct ProfileConfig {
     pub(crate) max_request_bytes: Option<u64>,
     /// The reasoning-effort knob for every backend: Claude's `output_config.effort` and OpenAI's
     /// `reasoning.effort`. Passed through verbatim (trimmed and lowercased); when unset the field
-    /// is omitted entirely, which is how meka asks for the provider's own default. meka picks no
+    /// is omitted entirely, which is how Meka asks for the provider's own default. Meka picks no
     /// tier of its own; see [`crate::provider::resolve_effort_level`].
     pub(crate) effort: Option<String>,
     /// Whether this profile's model accepts image input. Defaults to `true`; set `false` to stop
@@ -156,7 +156,7 @@ pub(crate) struct ProfileConfig {
     pub(crate) deferred_tools: Option<crate::config::DeferredTools>,
     /// Claude-only: how this profile encodes extended thinking, `adaptive`, `budgeted`, or `off`.
     /// Defaults to `adaptive`. The right value depends on the model *and* on what the endpoint
-    /// implements, which meka can't infer, so it is stated rather than guessed; a profile that
+    /// implements, which Meka can't infer, so it is stated rather than guessed; a profile that
     /// later changes `model` is the user's to keep correct.
     pub(crate) thinking: Option<crate::config::ThinkingMode>,
     /// How many tokens `thinking = "budgeted"` asks the model to spend reasoning. Falls back to
@@ -170,7 +170,7 @@ pub(crate) struct ProfileConfig {
     pub(crate) thinking_budget: Option<u64>,
     /// `anthropic-messages` only: whether the request carries the moving `cache_control`
     /// breakpoint. Defaults to `true`, which is what Anthropic's own API needs to cache the prefix
-    /// incrementally. What an endpoint does with the breakpoint is the endpoint's fact, which meka
+    /// incrementally. What an endpoint does with the breakpoint is the endpoint's fact, which Meka
     /// cannot know from `base_url`, and it varies by model on a gateway: one that turns it into a
     /// full explicit cache of the prompt bills a write on every turn, and such a profile sets it
     /// `false` to leave the endpoint's own implicit caching to work.
@@ -184,7 +184,7 @@ pub(crate) struct ProfileConfig {
     /// carries for a reasoning model; a model or endpoint that refuses the field sets it `false`.
     pub(crate) encrypted_reasoning: Option<bool>,
     /// `openai-responses` only: whether a request asks for `reasoning.summary`, the digest of the
-    /// model's reasoning meka shows as its thinking. Defaults to `true`; a model or endpoint that
+    /// model's reasoning Meka shows as its thinking. Defaults to `true`; a model or endpoint that
     /// refuses the field sets it `false`.
     pub(crate) reasoning_summary: Option<bool>,
     /// `chatgpt-subscription` only: the cyber access program a request asks for, sent as
@@ -193,9 +193,9 @@ pub(crate) struct ProfileConfig {
     /// programs a model offers an account is the server's to say, and it rejects one the model
     /// does not. Unset sends nothing, which leaves the program to the server.
     pub(crate) cyber_access_program: Option<String>,
-    /// Request body fields meka sends as written and never reads, spelled as the provider
+    /// Request body fields Meka sends as written and never reads, spelled as the provider
     /// documents them: `temperature`, `top_p`, a server's own extensions. Each is one top-level
-    /// field, and one meka writes itself is refused, so nothing overrides anything; see
+    /// field, and one Meka writes itself is refused, so nothing overrides anything; see
     /// [`request_parameters`]. Read by the API-key backends alone, since a subscription's request
     /// copies an official client's.
     pub(crate) parameters: Option<toml::Table>,
@@ -255,7 +255,7 @@ pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
 /// [`ProfileConfig`]'s field order, as the key names a `config.toml` profile table carries.
 ///
 /// The list exists because the order is *enforced* rather than merely produced: every writer runs
-/// [`sort_profile_keys`] before saving, so a profile meka has touched is in this order however it
+/// [`sort_profile_keys`] before saving, so a profile Meka has touched is in this order however it
 /// got there, written whole by `profile add` or edited one key at a time by `profile set`.
 pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
     "account",
@@ -291,7 +291,7 @@ pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
 /// Takes a [`toml_edit::Item`] rather than a `TableLike`, which is the shape every caller has,
 /// because only the concrete types carry a comparator-taking sort and their comparators differ
 /// (`Table` compares `Item`s, `InlineTable` compares `Value`s). Both are reachable: a table is
-/// ordinarily its own section, but `profiles` written as one inline table is a shape meka has had
+/// ordinarily its own section, but `profiles` written as one inline table is a shape Meka has had
 /// to handle before.
 fn sort_keys(item: &mut toml_edit::Item, order: &[&str]) {
     let rank = |key: &str| -> (usize, String) {
@@ -377,7 +377,7 @@ pub(crate) struct ProfileSettings {
     /// Resolved with the default already applied, unlike [`Self::context_window`]. No caller needs
     /// to tell "unset" from "16000": the budget is only ever sent as a number, whereas an absent
     /// window is what [`crate::provider::profile_context_window`] reports rather than dividing by
-    /// a figure meka has no reason to believe.
+    /// a figure Meka has no reason to believe.
     pub(crate) thinking_budget: u64,
     /// See [`ProfileConfig::cache_control`]; resolved to the default here.
     pub(crate) cache_control: bool,
@@ -414,7 +414,7 @@ pub(crate) struct ProfileSettings {
 /// profiles are gone" are indistinguishable to a caller with no `validate()` behind it.
 ///
 /// The ledger is the sharpest instance of that. It stamps whatever this returns onto every session
-/// that predates meka recording a profile, once and irreversibly, so swallowing a parse error here
+/// that predates Meka recording a profile, once and irreversibly, so swallowing a parse error here
 /// converted one typo in `config.toml` into every session permanently recorded against no profile,
 /// with `default_profile` naming a perfectly good one three lines above the typo. Nothing said so:
 /// the store was stamped at head, the step never ran again, and the command exited 0.
@@ -567,9 +567,9 @@ fn check_parameter(
     {
         return Err(match decided_by {
             Some(setting) => format!(
-                "`parameters.{field}` is written by meka on '{backend}'; set {setting} instead"
+                "`parameters.{field}` is written by Meka on '{backend}'; set {setting} instead"
             ),
-            None => format!("`parameters.{field}` is written by meka on '{backend}'; remove it"),
+            None => format!("`parameters.{field}` is written by Meka on '{backend}'; remove it"),
         });
     }
     Ok((
@@ -641,7 +641,7 @@ pub(crate) fn resolve_device_id(
 ///
 /// Unconditional on the name, including the empty one a store carried forward from before this
 /// column existed: that row is the migration's to explain, and a branch here would be this reader
-/// knowing an older meka wrote the store.
+/// knowing an older Meka wrote the store.
 pub(crate) fn require_profile<'a>(
     name: &str,
     profiles: &'a std::collections::BTreeMap<String, ProfileConfig>,
@@ -682,7 +682,7 @@ pub(crate) fn require_model<'a>(
 /// about a profile `meka profile list` shows; documented for users at
 /// `docs/book/src/configuration/overview.md` § "When edits take effect".
 /// The credential behind an account is *not* snapshotted (see `CachedProvider` in the provider
-/// registry), because that one has a writer meka owns.
+/// registry), because that one has a writer Meka owns.
 #[derive(Debug, Clone)]
 pub(crate) struct ProfileCatalog {
     pub(crate) accounts: std::collections::BTreeMap<String, AccountConfig>,
@@ -798,7 +798,7 @@ pub(crate) fn select_profile(
     }
 }
 /// Refuse profile `name` when it cannot run: its account is not configured or names a backend
-/// meka does not have, it names no model, or its output cap does not exceed the thinking budget
+/// Meka does not have, it names no model, or its output cap does not exceed the thinking budget
 /// it reasons under. The one check every door that writes a profile, a run's startup and a host
 /// serving the file ask of each profile, so no surface serves one a turn would then refuse.
 pub(crate) fn refuse_an_unrunnable_profile(
@@ -886,7 +886,7 @@ pub(crate) mod device_id {
     use super::{config_file_path, write_file_atomic};
 
     /// Lookup order: configured → Claude Code's `~/.claude.json` userID → freshly generated. The
-    /// claude.json fallback lets meka and Claude Code on the same machine share a device identity.
+    /// claude.json fallback lets Meka and Claude Code on the same machine share a device identity.
     /// A freshly seeded value is persisted into the account's `[accounts.<name>].device_id` so it
     /// stays stable across runs.
     pub(crate) fn resolve(
@@ -991,7 +991,7 @@ pub(crate) mod device_id {
             return Ok(());
         };
         table.insert("device_id", toml_edit::value(id));
-        // `insert` appends, so without this the one key meka writes for itself would trail whatever
+        // `insert` appends, so without this the one key Meka writes for itself would trail whatever
         // the table already held. Sorting is cheap and leaves the file in the order the reference
         // documents, which is what every other writer guarantees.
         super::sort_account_keys(item);
@@ -1065,23 +1065,23 @@ mod tests {
 
         let refused = |backend: Backend, field: &str| {
             request_parameters(backend, Some(&parameters(&format!("{field} = 1"))))
-                .expect_err("a field meka writes")
+                .expect_err("a field Meka writes")
         };
         assert_eq!(
             refused(Backend::OpenAiChatCompletions, "max_completion_tokens"),
-            "`parameters.max_completion_tokens` is written by meka on 'openai-chat-completions'; \
+            "`parameters.max_completion_tokens` is written by Meka on 'openai-chat-completions'; \
              set the profile's `max_output_tokens` instead"
         );
         assert_eq!(
             refused(Backend::OpenAiResponses, "reasoning"),
-            "`parameters.reasoning` is written by meka on 'openai-responses'; set the profile's \
+            "`parameters.reasoning` is written by Meka on 'openai-responses'; set the profile's \
              `effort` and `reasoning_summary` instead"
         );
         assert_eq!(
             refused(Backend::AnthropicMessages, "stream"),
-            "`parameters.stream` is written by meka on 'anthropic-messages'; remove it"
+            "`parameters.stream` is written by Meka on 'anthropic-messages'; remove it"
         );
-        // A server's synonym for a field meka writes is the server's to read.
+        // A server's synonym for a field Meka writes is the server's to read.
         assert!(
             request_parameters(
                 Backend::OpenAiChatCompletions,
@@ -1776,7 +1776,7 @@ mod tests {
 
     #[test]
     fn read_user_id_from_empty_string_returns_none() {
-        // An empty `userID` in claude.json shouldn't override meka's own random-generation
+        // An empty `userID` in claude.json shouldn't override Meka's own random-generation
         // fallback; treat it as "not configured".
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("claude.json");

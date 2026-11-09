@@ -1,13 +1,13 @@
 # Upgrading
 
-Most upgrades are a binary swap: stop every meka process on the store (a `meka serve` unit, an open screen, an editor's `meka acp`), replace the executable, and carry on. An upgrade that changes the store's schema migrates it on the first open, and refuses while another meka process of 0.87 or later has the store open, since that process would go on writing the shape the migration replaced; an older process goes unseen, which is why it is stopped first. This page covers the upgrades that are more than a swap.
+Most upgrades are a binary swap: stop every Meka process on the store (a `meka serve` unit, an open screen, an editor's `meka acp`), replace the executable, and carry on. An upgrade that changes the store's schema migrates it on the first open, and refuses while another Meka process of 0.87 or later has the store open, since that process would go on writing the shape the migration replaced; an older process goes unseen, which is why it is stopped first. This page covers the upgrades that are more than a swap.
 
 ## Copying a store
 
 The store under `MEKA_DATA_DIR` runs in WAL mode, so the most recent writes, including a schema
 migration, can sit in `meka.db-wal` beside `meka.db` until SQLite checkpoints them. A copy that
 takes `meka.db` alone can therefore carry a schema version its tables have not caught up with.
-meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
+Meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
 ## 0.90 to 0.91
@@ -38,7 +38,7 @@ under the turn and time of the compaction that wrote it. 0.88 refuses a store
 compaction kept records where it was said; a 0.88 archive (21) imports as it is, and 0.88 refuses a
 22.
 
-**The problem `type` URIs moved to `meka.bot`.** Every error document meka returns now names a
+**The problem `type` URIs moved to `meka.bot`.** Every error document Meka returns now names a
 `type` under `https://meka.bot/errors/` where it used to sit under `https://meka.run/errors/`, and
 the store moves the error an inbox item recorded the same way. The identifier after the last slash
 is unchanged, as are the HTTP status, the `title` and every other member of the document. A client
@@ -133,15 +133,15 @@ refuses a store 0.88 has opened; downgrading means restoring the backup the upgr
 conversions need nothing from you:
 
 - Every turn records the permission level it ran under. A turn written before takes the level
-  the first of its own messages that names one told the model, its opening in a turn meka wrote;
-  one where none does takes its session's level, or `read` on a session at a level meka does not
+  the first of its own messages that names one told the model, its opening in a turn Meka wrote;
+  one where none does takes its session's level, or `read` on a session at a level Meka does not
   know.
 - A tool result written before records nothing of how the screen draws it, so a resumed session
   draws those calls as 0.87 did: an edit's diff from its arguments, a write with none, and a
   failed command as `failed`, its exit code in its output.
 - A compaction written before records no checkpoint turn, so its row opens to the memories its
   checkpoint wrote, by name, and its summary. The summary is read out of the message the
-  compaction wrote, up to the first section meka adds after it, so a summary that held one of
+  compaction wrote, up to the first section Meka adds after it, so a summary that held one of
   those headings itself shows only what came before it.
 
 Session archives are `format_version` 21. A 0.87 archive imports as it is, its turns and
@@ -187,7 +187,7 @@ and `prompt_cache_key = false` in the account's table of `config.toml`.
 (`stream_options.include_usage`), where it asked only some endpoints. An endpoint that refuses the
 field is answered by `stream_usage = false` in the account's table of `config.toml`.
 
-**A relative `MEKA_CONFIG_DIR` or `MEKA_DATA_DIR` is refused.** meka stops at startup naming the
+**A relative `MEKA_CONFIG_DIR` or `MEKA_DATA_DIR` is refused.** Meka stops at startup naming the
 variable, where it used to fall back to the platform directory with a warning and so ran against
 the real store. Set each to an absolute path.
 
@@ -329,7 +329,7 @@ warning, as pinning `landlock` does on Linux, and on a schema 1.0 build pinning
 
 **A Windows 11 build with the process security environment API runs commands in an AppContainer.**
 On 26H2, and on 24H2 and 25H2 from the August 2026 update as Microsoft lists them, `read` and
-`workspace` now confine a command through the OS's own environment: meka's config directory and
+`workspace` now confine a command through the OS's own environment: Meka's config directory and
 store are unreadable, `confine_reads` and `network` hold for the shell as they do for the file
 tools, and no ACE is written to your directories. Four limits of the mechanism come with it: `cd`
 into a read-only directory fails (git's `-C` and Python's `os.chdir` included; the initial
@@ -407,7 +407,7 @@ Nothing is renamed and no key is refused; two things change what a running deplo
 2026-07-28; one that does not gets the `initialize` handshake it had. A stdio server from before
 the probe existed may swallow it and answer nothing afterwards, so such a server is given up to
 ten seconds, or half of [`[mcp].connect_timeout`](../configuration/config-file.md#mcp-top-level-table)
-when that is less, on its first connect in a meka process before a fresh child gets `initialize`;
+when that is less, on its first connect in a Meka process before a fresh child gets `initialize`;
 the verdict is kept for the process, so later connects pay nothing. See
 [Connection lifecycle](../usage/mcp.md#connection-lifecycle).
 
@@ -506,13 +506,13 @@ by stating no scope.
 | Export archive | `format_version` 9 | `format_version` 11 |
 | Store | `sessions.cwd`, `sessions.additional_roots_json` | `working_directory`, `additional_workspace_directories_json` |
 
-**What meka relays into a user message has its own block.** An inbox item, a scheduled job's fire
+**What Meka relays into a user message has its own block.** An inbox item, a scheduled job's fire
 and a background report were `text` blocks, or for a report a section of the `turn_context`
 block; they are `inbox`, `scheduled` and `background_report` blocks now, on `GET /messages`, in a
 blocking turn's `messages` and in an archive, each carrying `text` as the model read it and the
 facts a client labels it by. The store converts what it holds on the first open, and a resumed
 screen shows an item as the labeled prompt it was and a fire or a report as the stage direction
-the live screen said, where it used to show meka's header as something you typed.
+the live screen said, where it used to show Meka's header as something you typed.
 
 **The account views take the account.** `meka account usage`, `whoami` and `stats` take the
 account by name, as `login` does, and lose `--profile`; named nothing, they ask the account the
@@ -537,7 +537,7 @@ reads it from the JSON report instead.
 `[thinking].show_content` chose what a tool call or a thinking block showed before you expanded it.
 The screen expands and collapses either on a click or a key, so a call starts with its summary and
 a thinking block collapsed, and a one-shot run shows neither. `[display].max_width` capped the width
-meka laid text out at; the screen uses its window and a one-shot run its terminal. Delete the three
+Meka laid text out at; the screen uses its window and a one-shot run its terminal. Delete the three
 from `config.toml`.
 
 **`[display].show_token_usage` is a fact of `turn_end_summary`.** The screen now closes every turn
@@ -573,7 +573,7 @@ the bottom, and you can type while the agent works. What that changes for an exi
   `--oneshot`. A harness that drove the old prompt through pipes drives `--oneshot` or the HTTP
   API instead.
 - **`!command` output is captured** into the transcript rather than the child taking the
-  terminal. A command that needs a terminal of its own runs in a shell beside meka.
+  terminal. A command that needs a terminal of its own runs in a shell beside Meka.
 - **The syntect and raw views are gone.** The screen renders markdown; a thinking block or a tool
   call expands to its whole content on a click or a key, so the source views have nothing left to
   show that the screen cannot.
@@ -613,7 +613,7 @@ carries only what the agent or a provider said. See
 
 The HTTP API changes shape in the places below. The store gains a table of turns and a column
 naming each message's turn, the three todo tools become the checklist tools, every compaction
-boundary takes a checklist, and the message meka writes to send the model back to work (after a
+boundary takes a checklist, and the message Meka writes to send the model back to work (after a
 reply with no visible text, or with checklist items open) becomes a block of its own; the
 migration runs on open and needs nothing from you, and an older archive converts on import.
 
@@ -694,7 +694,7 @@ these fields now fail closed as `env` and `headers` always did. Set the variable
 default with `${VAR:-default}`. A reference the grammar does not accept (an unclosed `${`, an empty
 name, a default that opens another reference) is refused the same way in every field that reaches
 the other side. To hand a child shell a variable it expands itself, write it without braces
-(`args = ["-c", "srv --token $MY_TOKEN"]`); meka leaves that alone.
+(`args = ["-c", "srv --token $MY_TOKEN"]`); Meka leaves that alone.
 
 **`[serve]` values take `${VAR:-default}` and no longer take `$$`.** The one `${VAR}` grammar
 serves every field of `config.toml`; `$$` in a `[serve]` value is now two dollar signs, and
@@ -725,7 +725,7 @@ submits already holds `sessions:w`; a dashboard that only reads keeps reading re
 `environ`, `cmdline`, `fd` and `mem` carry what a process was given; the system-wide files
 (`/proc/meminfo`, `/proc/cpuinfo`, `/proc/mounts`) stay readable.
 
-**A skill's bundled files in meka's own store are readable at every level.** `file_read` and
+**A skill's bundled files in Meka's own store are readable at every level.** `file_read` and
 `file_search` reach `skills/` under the config directory below `unrestricted`, where they refused
 it; the rest of the directory stays private, and the shell sandbox still masks all of it, which the
 header a skill is served with now says.
@@ -757,7 +757,7 @@ because nobody numbered those; every session created from now on does.
 ## 0.65 to 0.66
 
 **A shell under Landlock alone has no temporary directory.** 0.65 gave each Landlock-confined
-command a private directory under `/tmp`, named by `TMPDIR`. That was the one thing meka wrote
+command a private directory under `/tmp`, named by `TMPDIR`. That was the one thing Meka wrote
 outside its own store below `unrestricted`, and it is gone: `mktemp`, Python's `tempfile`, `gcc`
 and `patch` fail at `read` under Landlock as they did through 0.64. Install `bubblewrap`, whose
 private `/tmp` is a tmpfs inside the sandbox and touches nothing real, or add the directory a tool
@@ -773,10 +773,10 @@ can be deleted. A command killed at its timeout now keeps what it printed before
 
 **Landlock on its own needs ABI v9 (kernel 7.1).** Below that the kernel cannot refuse a
 `connect()` to a Unix socket on disk, so a shell at `read` could reach D-Bus and `systemd-run
---user` and have them act on its behalf. meka now reports the backend unusable on such a kernel
+--user` and have them act on its behalf. Meka now reports the backend unusable on such a kernel
 instead of warning, and shell commands at `read` fail until a usable backend exists. Install
 `bubblewrap`, which works on any kernel with user namespaces; on a kernel of 6.12 or newer the
-command also runs inside meka's Landlock ruleset there. Affected as of this release: Debian 13,
+command also runs inside Meka's Landlock ruleset there. Affected as of this release: Debian 13,
 RHEL 10, Ubuntu 24.04 and 26.04 LTS without Bubblewrap.
 
 **Session archives are `format_version` 5.** Every field is written, and the ones that used to
@@ -818,7 +818,7 @@ again.
 ## 0.62 to 0.63
 
 **An inbox item's `source` is optional.** An item posted to `POST /v1/sessions/{id}/inbox` without
-a `source` used to be given one by meka: the token's `description`, else `client`. It now has none.
+a `source` used to be given one by Meka: the token's `description`, else `client`. It now has none.
 `GET /v1/sessions/{id}/inbox` omits the field for such an item, so a client that reads `source` as
 required must treat it as optional; a client that sends one sees no change. The model reads such an
 item under `[Message arrived <time>]` rather than `[Message from <source>, arrived <time>]`, and
@@ -889,12 +889,12 @@ model's unknown-tool reply suggest the new name when the old one is a reordering
 
 ## 0.58 to 0.59
 
-**meka is licensed under the GNU Affero General Public License, version 3 or later.** Releases up
-to 0.58.0 were published under MIT and remain so. From 0.59.0 on, conveying meka or a modified
+**Meka is licensed under the GNU Affero General Public License, version 3 or later.** Releases up
+to 0.58.0 were published under MIT and remain so. From 0.59.0 on, conveying Meka or a modified
 copy, and offering a modified copy to users over a network, carries the AGPL's obligation to make
 the corresponding source available.
 
-**The problem `type` URIs moved to `meka.run`.** Every error document meka returns now names a
+**The problem `type` URIs moved to `meka.run`.** Every error document Meka returns now names a
 `type` under `https://meka.run/errors/` where it used to sit under `https://meka.so/errors/`. The
 identifier after the last slash is unchanged, as are the HTTP status, the `title` and every other
 member of the document. A client that matches the whole URI must update its table; one that reads
@@ -936,7 +936,7 @@ webhook carry `tool` and `scratchpad_entry` in place of `tool_name` and `scratch
 memory's creation stamp is `created_at` on `GET /v1/memory` and in `--format json`, and `created`
 in a file `meka memory export` writes. A session archive holds its scratchpad entries under
 `scratchpad_entries` rather than `tool_outputs` and is `format_version` 3; `meka session import`
-refuses an older archive, so export it again from the meka that wrote it, or rename the key and set
+refuses an older archive, so export it again from the Meka that wrote it, or rename the key and set
 the version in the file by hand.
 
 ## 0.52 to 0.53
@@ -955,7 +955,7 @@ request, so its first turn back may compact.
 
 **The container image is gone.** `ghcr.io/k4yt3x/meka` receives no new tags, and the Dockerfile
 went with it. What the image was for, running the agent unrestricted against a disposable
-filesystem, is what [`mekabox`](./installation.md#mekabox) does with the meka installed on the
+filesystem, is what [`mekabox`](./installation.md#mekabox) does with the Meka installed on the
 host, inside a stock `archlinux:latest` container with your config mounted read-only; install the
 binary from the release archive or with Cargo and run the wrapper. The wrapper itself moves from
 `contrib/container/mekabox` to `scripts/mekabox`, so a link or `PATH` entry that named the old
@@ -976,7 +976,7 @@ plural did. The HTTP route `/v1/sessions/{id}/tasks` is unchanged.
 
 **`search_web` is gone.** It scraped DuckDuckGo's HTML and was turned away by the bot detection more
 often than not. Web search now comes from an MCP server, which packages one engine's key, quota and
-response shape without meka embedding any of them:
+response shape without Meka embedding any of them:
 
 ```bash
 meka mcp add exa https://mcp.exa.ai/mcp
@@ -990,7 +990,7 @@ that called it resume unchanged: their tool results are text, and nothing re-run
 The store migrates itself, as every release since 0.43 has. **`config.toml` does not**, and this
 release changes its shape: a `[providers.<name>]` profile is now an `[accounts.<name>]` table plus
 a `[profiles.<name>]` table, `default_provider` is `default_profile`, and the `ask` permission
-level is gone. A config in the old shape is refused at startup, naming the first key meka does not
+level is gone. A config in the old shape is refused at startup, naming the first key Meka does not
 know, rather than read with a guess at what it meant. The conversion is a one-shot script,
 `migrate-0.45-to-0.46.py`, attached as an asset to the 0.46 release.
 
@@ -1011,7 +1011,7 @@ lists for anything you automated.
    python3 migrate-0.45-to-0.46.py --apply    # rewrites config.toml in place
    ```
 
-   It finds meka's config the way meka does, honoring `MEKA_CONFIG_DIR`; `--config PATH` points
+   It finds Meka's config the way Meka does, honoring `MEKA_CONFIG_DIR`; `--config PATH` points
    it at a copy instead. `--self-test` checks the script against its own fixture and exits.
 2. **Install 0.46 and launch it once.** The store migrates on that open, behind an automatic copy
    beside it named for the schema version it came from (`meka.db.v9.bak` for a store 0.45 left),
@@ -1060,7 +1060,7 @@ Every profile becomes one account and one profile of the same name, so nothing y
 its name and every session still resolves. Two old profiles on one login stay two accounts with two
 copies of the credential; merge them by hand if you like, by pointing both profiles' `account` at
 one and running `meka account remove` on the other once nothing names it. A key the script does not
-know is carried into the profile table and reported, where meka will refuse it by name; a duration
+know is carried into the profile table and reported, where Meka will refuse it by name; a duration
 key whose value is not a whole number is left under its old name and reported, with the same result.
 
 ### What else changed
@@ -1086,7 +1086,7 @@ key whose value is not a whole number is left under its old name and reported, w
   `termimad`, `syntect` or `raw` (`rich` is gone). The flags and the config key refuse anything
   else; the two variables warn and fall through to the next source, as they always have. The
   undocumented `text` spelling of `--format plain` is gone too.
-- **A `[permissions].default` or `enabled` entry naming a level meka does not have is refused at
+- **A `[permissions].default` or `enabled` entry naming a level Meka does not have is refused at
   startup**, with the line, the way an unknown key is, instead of being dropped with a warning. The
   script rewrites `ask`; anything else you spelled yourself.
 - **The `ask` permission level is gone**, replaced by the `approvals` switch beside the level: a
@@ -1097,7 +1097,7 @@ key whose value is not a whole number is left under its old name and reported, w
   `ask` did. An approved call now runs *at the session's level*, so an approved write at `read`
   lands only under the workspace roots where `ask` wrote anywhere; raise the level if an approved
   call needs the reach. See [Permissions](../usage/permissions.md#approvals).
-- **A user message is two blocks.** What meka injects ahead of the words for a turn (permission
+- **A user message is two blocks.** What Meka injects ahead of the words for a turn (permission
   and environment context, todos, catalog changes, background outcomes, the resume notice) is its
   own `turn_context` content block, first, and the words are a `text` block. `GET
   /v1/sessions/{id}/messages` returns the block typed, so a client reading `content[0].text` as the
@@ -1125,7 +1125,7 @@ key whose value is not a whole number is left under its old name and reported, w
   `session export` and `GET /v1/sessions/{id}/export` drop the `md` alias of `markdown`, `mcp add
   --auth` takes `oauth`, `client_credentials` or `client_credentials_jwt` as the `[auth]` block
   spells them (the hyphenated forms are gone), and `[mcp].default_permission`, a server's
-  `permission` and `tool_permissions`, and `[tools].tool_permissions` refuse a level meka does not
+  `permission` and `tool_permissions`, and `[tools].tool_permissions` refuse a level Meka does not
   have at startup, naming the line, where they warned and ignored it.
 - **HTTP API**: an unloaded session whose row records no level omits `permission` (it sent `""`);
   every optional field is omitted rather than `null`, `display_summary` included; `GET
@@ -1133,11 +1133,11 @@ key whose value is not a whole number is left under its old name and reported, w
   `permission_required` event carries `input` and stays answerable for 30 minutes (was 60 seconds);
   a body that fails to parse says which field on every endpoint; `POST
   /v1/sessions/{id}/responses/{request_id}` at a sub-agent's id answers 422 `session-not-drivable`;
-  a fork of a session another meka process holds answers 409 `session-locked`; a session's `title`
+  a fork of a session another Meka process holds answers 409 `session-locked`; a session's `title`
   is the first user words with whitespace collapsed, cut at 80 characters, and `meka session show`
   labels it `title` (was `opening`). Four status codes move: a `[web]` or `base_url`
   misconfiguration is a sanitized 500 (was a 422 naming the operator's path), and a session lock
-  meka cannot open is 500 (was 409 `session-locked`); meka's own request-ceiling refusal is 422
+  Meka cannot open is 500 (was 409 `session-locked`); Meka's own request-ceiling refusal is 422
   with the new `type` `request-too-large` (was 502 `provider`); `GET` and `PATCH
   /v1/sessions/{id}` answer 404 or 500 for a row they cannot read (was 200 with `profile: ""`);
   and `POST /v1/sessions/{id}/schedule` with scheduling disabled is 404 (was 422).
@@ -1153,10 +1153,10 @@ key whose value is not a whole number is left under its old name and reported, w
   name (`read_file`, not `ReadFile`); the prompt is headed `[approval]` and takes `always` and
   `never`.
 - **Skills you wrote** that name a renamed tool parameter (next table) or the old `[ask]` prompt
-  must be edited by hand; meka does not rewrite skill files.
+  must be edited by hand; Meka does not rewrite skill files.
 - **A gate's pointer test is `not_empty`** (was `not-empty`) in `schedule_create`, `POST
   /v1/sessions/{id}/schedule` and `meka schedule add`; stored jobs are converted by the store.
-- **`canceled`, one `l`, on every wire meka owns.** Match `turn.canceled` as the SSE terminal event,
+- **`canceled`, one `l`, on every wire Meka owns.** Match `turn.canceled` as the SSE terminal event,
   `https://meka.bot/errors/turn-canceled` as the problem `type`, and `status == "canceled"` in task
   views (`GET /v1/sessions/{id}/tasks`, `DELETE .../tasks/{task_id}`), `task_list` output and
   `schedule.fired` webhook bodies; the `reason` values are unchanged. The store rewrites its stored
@@ -1181,7 +1181,7 @@ A call spelling the old name is missing its required parameter (`glob`, `id`) or
 parameter was optional, has it ignored in favor of the default. `search_contents` gains a `limit`
 (1 to 100, default 100) beside its unchanged `pattern`.
 
-meka does not rewrite what names these. A skill under the skills directory
+Meka does not rewrite what names these. A skill under the skills directory
 (`~/.config/meka/skills/<name>/SKILL.md`) that spells out a `find_files` or `agent_followup` call
 must be edited by hand, and a scheduled job whose gate calls one of these tools with the old
 argument must be recreated. Past calls in a session's history keep the old names, which is
@@ -1195,7 +1195,7 @@ The sections below predate 0.46 and use its old names: `--provider` is `--profil
 
 A binary swap, and the store migrates itself as promised below, **unless you authenticate an MCP
 server with `auth_token` or `client_secret`**, which are no longer config keys. Read the next
-section first if you do; meka will refuse to start otherwise. Then the behavior changes below,
+section first if you do; Meka will refuse to start otherwise. Then the behavior changes below,
 worth reading before you resume an existing session or run a scripted `meka`, several of which apply
 only if you run `meka serve` or `meka acp`.
 
@@ -1204,7 +1204,7 @@ only if you run `meka serve` or `meka acp`.
 and sync; they now live in the store beside the OAuth tokens, which is where the login
 credentials have always been.
 
-meka cannot move them for you. The store migrates itself because it has a ledger recording what it
+Meka cannot move them for you. The store migrates itself because it has a ledger recording what it
 has already done; `config.toml` has none and may be older or newer than the binary at any moment, so
 a key left behind is a parse error naming the key and the line rather than a value silently ignored:
 
@@ -1212,7 +1212,7 @@ a key left behind is a parse error naming the key and the line rather than a val
 $ meka mcp list
 Error: database error: schema migration 3 ('sessions_name_their_provider') failed: Invalid
 parameter name: cannot record a provider for 4 carried-forward session(s) while config.toml
-cannot be read; fix the file and start meka again. The store is unchanged
+cannot be read; fix the file and start Meka again. The store is unchanged
 ```
 
 The parse error itself is a warning just above it, naming the key and the line:
@@ -1292,7 +1292,7 @@ What this closes is that a sub-agent's restrictions live in its spawn record, wh
 never read: the `[subagents]` denials it was created under, its memory and instruction grants, and
 the permission ceiling its spawn call set. Driving one from a host therefore ran a conversation that
 was *deliberately given narrow tools* with the full built-in set at the host's level. `agent_followup`
-was and remains the door that reconstructs those terms, so nothing meka does for you changes.
+was and remains the door that reconstructs those terms, so nothing Meka does for you changes.
 
 Reading a sub-agent is untouched: `meka session export`, `GET /v1/sessions/{id}/messages` and
 `meka session list --include-children` all still serve it.
@@ -1310,7 +1310,7 @@ the text out rather than expecting a command to promote it.
 **`meka session list --long` is gone**, along with the columns it showed. If a script parses that
 output, it needs updating; the default columns are unchanged.
 
-**`/cd` with no argument returns to the directory meka was launched from**, not `$HOME`. `/cd ~`
+**`/cd` with no argument returns to the directory Meka was launched from**, not `$HOME`. `/cd ~`
 still goes home. The old behavior made a bare `/cd` a surprising way to leave the project you were
 working in.
 
@@ -1356,7 +1356,7 @@ If you were using it to drop a stale token from a server that also has a stored 
 secret, you will now need to store that again with `meka mcp login`.
 
 **A scheduled job is refused on a sub-agent session.** `POST /v1/sessions/{id}/schedule` answers 422
-if the session was spawned by another. Sub-agents never had the `schedule_*` tools, so no job meka
+if the session was spawned by another. Sub-agents never had the `schedule_*` tools, so no job Meka
 created can be affected; what this closes is a client planting one directly, which would have woken
 the sub-agent without the tool restrictions or memory grants it was spawned under.
 
@@ -1382,7 +1382,7 @@ stays fully readable, and importing a *whole tree* (the root and its sub-agents 
 unaffected, since each child keeps its parent.
 
 **This upgrade deletes the pre-migration copy 0.43 left, and keeps one from now on.** Before it
-migrates, meka copies the store aside; until now nothing removed those, so a full duplicate of your
+migrates, Meka copies the store aside; until now nothing removed those, so a full duplicate of your
 whole history accumulated per schema-changing release. From 0.44 a fresh copy supersedes the one
 before it. In practice that means `meka.db.v1.bak` in your data directory, the copy of your
 pre-0.43 store, is removed on this upgrade and replaced by a copy of your pre-0.44 one. **If you
@@ -1435,7 +1435,7 @@ relay_provider_errors = false`. Nothing else changes: `detail` carries the same 
 and with the key off the member is simply absent.
 
 The `503` for a required MCP server that is down is not affected and still reports only the server
-names. That reason is meka's own subprocess text and has carried a command line and its filesystem
+names. That reason is Meka's own subprocess text and has carried a command line and its filesystem
 path, which is a different disclosure and not one this key governs.
 
 **`GET /v1/info` no longer returns `provider` or `model`.** Read them from `GET /v1/providers`
@@ -1470,7 +1470,7 @@ meka provider set work effort --unset
 ```
 
 Or make a second profile and select it with `--provider`, which is now the only provider flag on a
-run. `meka provider add` has a flag for every profile field except `device_id`, which meka resolves
+run. `meka provider add` has a flag for every profile field except `device_id`, which Meka resolves
 and persists itself, so one command creates a whole profile (0.44 syntax):
 
 ```bash
@@ -1508,7 +1508,7 @@ This is the first release that migrates its own store, and from here on that is 
 
 What it changes, if you want to know what happened. A scheduled job's gate used to be two columns, `gate_command` and `gate_fire`; it is now `gate_kind` plus a JSON `gate_spec`, which is what lets a gate call a read-only tool instead of a shell command. And a due job is now claimed by *leasing* it rather than by consuming its row, which adds `claimed_by`, `claimed_until` and `attempts`, so a host that crashes mid-delivery no longer loses the occurrence, or for a one-shot the whole job. Each gate's stored baseline is preserved, so a `changed` gate does not fire spuriously on its first evaluation afterwards.
 
-Before it writes anything, meka copies the store to `meka.db.v1.bak` beside it. That doubles the space the store takes until you delete it, which is worth knowing if yours is large. Start with `-v` once if you want the exact path in the log; the copy is otherwise silent. It records the version it was taken at, so if you ever restore it, the next start migrates it again correctly rather than mistaking it for a store that is already current.
+Before it writes anything, Meka copies the store to `meka.db.v1.bak` beside it. That doubles the space the store takes until you delete it, which is worth knowing if yours is large. Start with `-v` once if you want the exact path in the log; the copy is otherwise silent. It records the version it was taken at, so if you ever restore it, the next start migrates it again correctly rather than mistaking it for a store that is already current.
 
 The whole thing is one transaction, so an interruption leaves the store exactly as it was rather than half-converted. Running two hosts at once is fine: the first takes the schema lock and the second waits, then finds nothing to do.
 
@@ -1516,7 +1516,7 @@ The whole thing is one transaction, so an interruption leaves the store exactly 
 
 ### A gate that cannot be read
 
-Rare, and worth knowing the shape of. If a job's gate was already unreadable under 0.42 (a hand-edited row, or a `gate_fire` value meka never wrote), it cannot be converted, because there is nothing to convert it *from*. Such a job never fired under 0.42, and it does not fire under 0.43 either: the migration leaves it in the same refused state rather than guessing at what it meant or deleting it. It is logged once, by id, at `warn`.
+Rare, and worth knowing the shape of. If a job's gate was already unreadable under 0.42 (a hand-edited row, or a `gate_fire` value Meka never wrote), it cannot be converted, because there is nothing to convert it *from*. Such a job never fired under 0.42, and it does not fire under 0.43 either: the migration leaves it in the same refused state rather than guessing at what it meant or deleting it. It is logged once, by id, at `warn`.
 
 The consequence is that the row stays inert and invisible, as it already was: it will not appear in `meka schedule list` and `meka schedule cancel` cannot reach it. Recreate the job if you still want it. The original row is in the backup 0.43 took, `meka.db.v1.bak`. Note that from 0.44 a later schema-changing upgrade deletes that file, so put a copy somewhere of your own if you want to keep it.
 
@@ -1543,7 +1543,7 @@ The dry run is the only place to read that. Its per-class counts and its warning
 
 Between steps 2 and 3 the store is live but incomplete: memories are absent from the agent's index, and any session affected by conversion E below is already broken. Step 3 is part of the upgrade rather than cleanup to get to later.
 
-The script finds meka's own directories by default, honoring `MEKA_CONFIG_DIR` and `MEKA_DATA_DIR`; `--root`, `--skills-root` and `--database` point it at a copy instead. `--self-test` checks the script against its own fixtures and exits, touching nothing of yours.
+The script finds Meka's own directories by default, honoring `MEKA_CONFIG_DIR` and `MEKA_DATA_DIR`; `--root`, `--skills-root` and `--database` point it at a copy instead. `--self-test` checks the script against its own fixtures and exits, touching nothing of yours.
 
 ### What it converts
 
@@ -1551,7 +1551,7 @@ The script finds meka's own directories by default, honoring `MEKA_CONFIG_DIR` a
 |---|---|---|
 | **A.** Memories | The Markdown files under `<config>/memory/` become rows in the store's `memories` table, which is where 0.42 reads memories from. The files are read, never written or deleted. | The memories are simply not there. The files are untouched on disk, so nothing is lost and the import still works whenever you get to it. |
 | **B.** Thinking blocks | A stored block's bare `signature` becomes an `opaque` object naming which provider it belongs to: `signed` for a Claude signature, `sealed` for OpenAI's encrypted reasoning. 0.41 wrote both to the same field and recorded nothing about which was which, so the script tells them apart by the shape of the blob and **reports the counts before it writes**. A blob it does not recognize is left exactly as it is. | The block loses its opaque half, so that reasoning stops being replayed to the provider. The session still loads and still runs; it just resumes without the chain of thought behind those turns. |
-| **C.** A skill's `version:` / `author:` | Both move from the top level of a `SKILL.md`'s frontmatter under `metadata:`, keeping their names, which is where the Agent Skills spec puts them. | Nothing. meka reads a top-level `version:` and `author:` permanently, because Claude Code's plugin skills declare `version:` there. This conversion is cosmetic. |
+| **C.** A skill's `version:` / `author:` | Both move from the top level of a `SKILL.md`'s frontmatter under `metadata:`, keeping their names, which is where the Agent Skills spec puts them. | Nothing. Meka reads a top-level `version:` and `author:` permanently, because Claude Code's plugin skills declare `version:` there. This conversion is cosmetic. |
 | **D.** A skill's `priority:` | Moves under `metadata:` **and is renamed** to `meka-priority:`. | The skill silently drops to the default rank of 5. A rank is read from `metadata.meka-priority` and nowhere else, so the `[Skills]` index comes out in a different order and its cap drops different skills. Nothing warns. |
 | **E.** A stored `tool_result` | Content held as a bare JSON string becomes a list of typed blocks, `[{"type": "text", "text": ...}]`. | The affected session breaks. The row will not deserialize, so it is dropped as the session loads, which orphans the `tool_use` it answered, and the provider then refuses the next turn. |
 

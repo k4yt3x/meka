@@ -95,7 +95,7 @@ pub(crate) fn classify_bytes(bytes: &[u8]) -> ImageHandling {
 
 /// The most memory one image decode may allocate.
 ///
-/// A payload meka accepts is capped at a few megabytes, but compression ratio is not bounded: a
+/// A payload Meka accepts is capped at a few megabytes, but compression ratio is not bounded: a
 /// small PNG can describe a 60000x60000 canvas and decode to gigabytes. `image` allocates
 /// optimistically unless told otherwise, so this is the only thing standing between a crafted image
 /// in a tool result and the process. 128 MiB is a 5792x5792 RGBA image, far past any real
@@ -218,10 +218,10 @@ fn decode_under_ceiling(
 ///
 /// `Err` means the payload is broken and must not be sent. `Ok` means one of two things, and they
 /// are deliberately the same answer: it decoded, or decoding it would have cost more than
-/// [`MAX_DECODE_ALLOC_BYTES`] and meka declined to find out.
+/// [`MAX_DECODE_ALLOC_BYTES`] and Meka declined to find out.
 ///
 /// Treating the limit as a pass is not a hole in the check. That ceiling exists to stop a crafted
-/// image exhausting *meka's* memory, and refusing to decode achieves that whether or not the bytes
+/// image exhausting *Meka's* memory, and refusing to decode achieves that whether or not the bytes
 /// are then forwarded; the provider does its own decoding either way. Refusing outright would
 /// instead reject legitimate images, because the ceiling is a pixel count rather than a file size:
 /// a 6000x6000 screenshot compresses to a few hundred kilobytes and is well inside every provider's
@@ -250,7 +250,7 @@ fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String
 /// `set_strict_mode(false)` at every site and exposes no way to change it, so `ImageReader::decode`
 /// answers `Ok` for a JPEG truncated to a *tenth* of its bytes: the decoder fills the missing scan
 /// with what it has and returns a picture. A guard that passes that is not a guard, and JPEG is the
-/// format most likely to arrive truncated, so meka drives the same decoder itself with strict mode
+/// format most likely to arrive truncated, so Meka drives the same decoder itself with strict mode
 /// on. Measured: strict refuses truncation at every fraction from 10% to 99% and refuses a
 /// corrupted scan, while accepting baseline, progressive, optimized, 4:4:4 and grayscale JPEGs
 /// unchanged.
@@ -270,7 +270,7 @@ fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String
 ///
 /// Those same caps then permit 16384x16384x3, about 805 MB, against a ceiling of 128 MiB.
 /// `output_buffer_size` is computed from the frame header and allocated in one go, so it is the
-/// exact analog of a PNG's `IHDR` and is checked the same way: over the ceiling means meka
+/// exact analog of a PNG's `IHDR` and is checked the same way: over the ceiling means Meka
 /// declines to find out, which is a pass, not a refusal (see [`refuse_if_undecodable`]).
 fn refuse_undecodable_jpeg(bytes: &[u8]) -> Result<(), String> {
     let options = zune_core::options::DecoderOptions::default()
@@ -517,7 +517,7 @@ pub(crate) fn classify_base64_prefix(data: &str) -> ImageHandling {
 
 /// Where an image's bytes are.
 ///
-/// `Base64` is how an image travels on every wire and how it enters meka; `Blob` is how it rests in
+/// `Base64` is how an image travels on every wire and how it enters Meka; `Blob` is how it rests in
 /// the store and travels in an export, a reference into the `blobs` table by content hash. A
 /// conversation is hydrated with every reference resolved back to `Base64`, so everything that
 /// builds a request sees bytes, and the store turns bytes back into references as it writes.
@@ -884,7 +884,7 @@ mod tests {
         assert_eq!(media_type, "image/jpeg");
         assert_eq!(payload, tall, "forwarded unaltered");
 
-        // Over the alloc ceiling (8000 x 6000 x 3 = 144 MB), so meka must decline to decode it at
+        // Over the alloc ceiling (8000 x 6000 x 3 = 144 MB), so Meka must decline to decode it at
         // all. Truncated on purpose: a *valid* oversized JPEG passes whether or not the ceiling is
         // honored, so it cannot tell "declined" from "decoded anyway". This one is refused the
         // moment anything actually decodes it, which makes the pass evidence that nothing did.
@@ -923,7 +923,7 @@ mod tests {
     /// The check must separate "this is broken" from "I declined to spend the memory finding out".
     /// A 6000x6000 screenshot is a few hundred kilobytes, is inside every provider's dimension cap,
     /// and decodes to more than [`MAX_DECODE_ALLOC_BYTES`]; refusing it would break a working case
-    /// to defend meka's memory, which declining to decode already does.
+    /// to defend Meka's memory, which declining to decode already does.
     #[test]
     fn prepare_forwards_an_image_too_large_to_decode_under_the_ceiling() {
         let huge = synthesize_image_bytes_sized(ImageFormat::Png, 6000, 6000);

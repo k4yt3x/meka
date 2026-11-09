@@ -6,7 +6,7 @@
 //! differ only in how they authenticate and whose client they look like. The wire format is shared
 //! through [`super::shared`].
 //!
-//! The key comes from the profile's stored credential, never from the environment: meka reads no
+//! The key comes from the profile's stored credential, never from the environment: Meka reads no
 //! provider env vars at all, so an ambient key cannot silently rebind which account a profile
 //! bills.
 
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn a_claude_base_url_is_normalized_at_construction() {
-        // The shape a gateway publishes for its Anthropic endpoint; meka appends `/v1/messages`
+        // The shape a gateway publishes for its Anthropic endpoint; Meka appends `/v1/messages`
         // itself, so leaving this would request `/v1/v1/messages`.
         let versioned = provider_with_base(
             "claude-sonnet-4-20250514",
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn an_unconfigured_profile_sends_no_output_config_whatever_the_model() {
         // No model name earns an effort tier. `anthropic-messages` reaches any Anthropic-compatible
-        // endpoint, so meka cannot know which tiers the far side implements; omitting the field is
+        // endpoint, so Meka cannot know which tiers the far side implements; omitting the field is
         // how it asks for whatever that endpoint's default is.
         for model in [
             "claude-opus-4-8",
@@ -538,8 +538,8 @@ mod tests {
                 provider(model, None).build_request_body("s", &[Message::user("hi")], &[], false);
             assert!(body.get("output_config").is_none(), "{model}");
         }
-        // A configured value is absolute: sent verbatim on any model, including one meka has never
-        // heard of, because the user knows their endpoint and meka does not.
+        // A configured value is absolute: sent verbatim on any model, including one Meka has never
+        // heard of, because the user knows their endpoint and Meka does not.
         for model in ["claude-opus-4-8", "hf.co/bartowski/Qwen3.8-27B-GGUF:Q8_0"] {
             let body = provider(model, Some("medium")).build_request_body(
                 "s",
@@ -622,7 +622,7 @@ mod tests {
     /// `DegradeTier::ToolExchanges` empties a refused call in place, which leaves its `input` no
     /// longer matching the tool's declared schema. That is only safe because a replayed `tool_use`
     /// is a record of what happened rather than a request to validate, so nothing on the way out
-    /// should be checking it. This pins meka's half of that: whatever the repair wrote is what gets
+    /// should be checking it. This pins Meka's half of that: whatever the repair wrote is what gets
     /// sent. The other half, that the provider accepts it, is the provider's and cannot be asserted
     /// here.
     #[test]

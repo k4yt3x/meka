@@ -17,7 +17,7 @@ pub(crate) enum GateProbe {
     /// A tool call, by the same name the model would use (`mcp__server__tool`, or a built-in).
     ///
     /// Deliberately *not* held to `unrestricted`: a structured call to a server the operator
-    /// configured is not a bare `sh -c` with meka's environment, so the bar is the tool's own
+    /// configured is not a bare `sh -c` with Meka's environment, so the bar is the tool's own
     /// level. See [`gate_probe_is_authorized`].
     Tool {
         name: String,
@@ -158,7 +158,7 @@ impl GateProbe {
     /// Parse the `check` half of a gate request.
     ///
     /// Hand-written rather than derived because the request shape and the stored shape answer to
-    /// different readers. Storage is meka talking to itself and uses serde's tagging; a request is
+    /// different readers. Storage is Meka talking to itself and uses serde's tagging; a request is
     /// authored by a model or typed into a `curl`, so it reads `{"command": ...}` rather than
     /// `{"shell": {"command": ...}}`, and a wrong one has to say what was wrong.
     pub(crate) fn parse_request(
@@ -343,7 +343,7 @@ pub(crate) struct GateSpec {
 impl Gate {
     /// The `gate_spec_json` column: probe and predicate as one JSON value.
     pub(crate) fn spec(&self) -> String {
-        // Both halves are meka's own types, so the only way this fails is a serde bug. An empty
+        // Both halves are Meka's own types, so the only way this fails is a serde bug. An empty
         // spec would decode as a corrupt row and refuse the gate, which is the safe direction.
         serde_json::to_string(&GateSpec {
             probe: self.probe.clone(),
@@ -384,7 +384,7 @@ impl Gate {
 /// payload; anything past this is truncated so a runaway command cannot push the prompt over the
 /// context window.
 pub(crate) const GATE_OUTPUT_BYTES: usize = 8 * crate::text::KIB;
-/// Ceiling on a probe result meka will parse as JSON, which is a different question from how much
+/// Ceiling on a probe result Meka will parse as JSON, which is a different question from how much
 /// of it the turn is shown.
 ///
 /// Separate from [`GATE_OUTPUT_BYTES`] because the two bound different costs. That one bounds the
@@ -431,7 +431,7 @@ impl ProbeOutcome {
         // Applied to a value the caller already parsed, not only to the fallback below: an MCP
         // server's `structuredContent` arrives as a `Value`. Serializing to measure happens once,
         // here, against a predicate that would otherwise re-serialize the same value on every
-        // evaluation; the MCP layer parsed it before meka saw it, so the bound is on what meka
+        // evaluation; the MCP layer parsed it before Meka saw it, so the bound is on what Meka
         // keeps and keeps re-doing.
         let structured = structured.filter(|value| {
             serde_json::to_string(value).is_ok_and(|rendered| rendered.len() <= GATE_PARSE_BYTES)
@@ -765,7 +765,7 @@ mod tests {
                 gate.last_output.clone(),
                 gate.permission,
             )
-            .expect("a gate meka wrote must be one meka can read");
+            .expect("a gate Meka wrote must be one Meka can read");
             assert_eq!(restored.probe, probe);
             assert_eq!(restored.predicate, predicate);
             assert_eq!(restored.last_output.as_deref(), Some("baseline"));
@@ -946,7 +946,7 @@ mod tests {
     }
 
     /// The shell bar is unchanged, and unchanged for its own reason: a bare `sh -c` on a timer with
-    /// meka's environment is not made safer by the probe split.
+    /// Meka's environment is not made safer by the probe split.
     #[test]
     fn a_shell_gate_still_needs_unrestricted() {
         let probe = GateProbe::Shell {

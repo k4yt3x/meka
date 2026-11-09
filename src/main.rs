@@ -71,8 +71,8 @@ use crate::{config::ResolvedConfig, store::Store};
 
 fn main() -> anyhow::Result<()> {
     let mut cli = cli::Cli::parse();
-    // `meka confine` is the inside of the Bubblewrap sandbox: bwrap execs meka so the Landlock
-    // ruleset can be enacted after its mounts, and meka then becomes the command. Ahead of tracing
+    // `meka confine` is the inside of the Bubblewrap sandbox: bwrap execs Meka so the Landlock
+    // ruleset can be enacted after its mounts, and Meka then becomes the command. Ahead of tracing
     // and the runtime, because `landlock_restrict_self` binds the calling thread and `execve`
     // replaces the process, so nothing started here would outlive it either way.
     #[cfg(target_os = "linux")]
@@ -218,7 +218,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
             //
             // Two readers, and the difference matters. The ledger takes the one `default_profile`
             // picks, ignoring `--profile`: it stamps a profile onto every session that predates
-            // meka recording one, once and irreversibly, and that must not turn on a flag the first
+            // Meka recording one, once and irreversibly, and that must not turn on a flag the first
             // invocation after an upgrade happened to carry. `meka session import` takes the flag
             // itself beside that default and the configured profiles, and settles per run in
             // `plan_import`, where choosing per run is exactly what `--profile` is for. An
@@ -442,7 +442,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     runtime.block_on(async_main(config, skill_invocation, acp_mode, serve_mode))
 }
 
-/// Build the `tracing` filter for meka.
+/// Build the `tracing` filter for Meka.
 ///
 /// `RUST_LOG` is honored verbatim. Otherwise the `-v` level is the floor, with three library log
 /// sites that fire in ordinary use quieted:
@@ -494,7 +494,7 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
 }
 
 /// What the screen keeps for `/log`: everything the user asked to see, and at least `info` from
-/// everywhere and `debug` from meka's own modules, so the pane has the lines a `-v` would have
+/// everywhere and `debug` from Meka's own modules, so the pane has the lines a `-v` would have
 /// shown without a restart. Added after the user's directives, so a more specific one of theirs
 /// still wins for its target.
 fn build_screen_log_filter(
@@ -574,7 +574,7 @@ async fn async_main(
         #[cfg(not(feature = "serve"))]
         {
             let _ = (config, store, mcp_manager);
-            anyhow::bail!("this meka was built without the `serve` feature, so it has no HTTP API");
+            anyhow::bail!("this Meka was built without the `serve` feature, so it has no HTTP API");
         }
     }
     if acp_mode {

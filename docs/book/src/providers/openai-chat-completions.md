@@ -2,7 +2,7 @@
 
 The **Chat Completions API** (`POST {base_url}/chat/completions`) with an API key. Works against OpenAI and any endpoint implementing that format: Ollama, vLLM, LM Studio, OpenRouter, Synthetic, LiteLLM.
 
-This is *not* the legacy `/v1/completions` endpoint, which is a different protocol: a bare `prompt` string in, `choices[].text` out, no tool calling. Several of those same servers also expose it; meka does not implement it.
+This is *not* the legacy `/v1/completions` endpoint, which is a different protocol: a bare `prompt` string in, `choices[].text` out, no tool calling. Several of those same servers also expose it; Meka does not implement it.
 
 For the same key against OpenAI's newer protocol, see [`openai-responses`](./openai-responses.md).
 
@@ -43,7 +43,7 @@ model   = "gpt-6-astra"
 
 ## Supported models
 
-Any model reachable over the Chat Completions API that supports tool calling. For OpenAI's current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models); `meka profile add` suggests `gpt-6-astra` for a profile on an OpenAI account. Against a compatible endpoint the valid names are that server's: whatever Ollama, vLLM, LM Studio or OpenRouter serves. meka forwards the model string verbatim and doesn't gate which strings are valid.
+Any model reachable over the Chat Completions API that supports tool calling. For OpenAI's current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models); `meka profile add` suggests `gpt-6-astra` for a profile on an OpenAI account. Against a compatible endpoint the valid names are that server's: whatever Ollama, vLLM, LM Studio or OpenRouter serves. Meka forwards the model string verbatim and doesn't gate which strings are valid.
 
 ## Custom base URL
 
@@ -92,7 +92,7 @@ model   = "llama3"
 
 **Tool results:** Sent back as messages with `role: "tool"` and the corresponding `tool_call_id`.
 
-**Body fields meka writes:** `model`, `messages`, `tools`, `stream`, `stream_options` (see Usage below), `reasoning_effort` (when `effort` is set) and `max_completion_tokens` (when `max_output_tokens` is set). Any other field goes in the profile's [`parameters`](../configuration/config-file.md#parameters), as [OpenAI's API reference](https://platform.openai.com/docs/api-reference/chat/create) names it or as the server names its own (`top_k`, `min_p`, `repetition_penalty`, OpenRouter's `provider`), and one of the fields above is refused there. A server that reads `max_tokens` and not `max_completion_tokens` takes it there, with `max_output_tokens` left unset. With `n` above 1, meka reads the first answer.
+**Body fields Meka writes:** `model`, `messages`, `tools`, `stream`, `stream_options` (see Usage below), `reasoning_effort` (when `effort` is set) and `max_completion_tokens` (when `max_output_tokens` is set). Any other field goes in the profile's [`parameters`](../configuration/config-file.md#parameters), as [OpenAI's API reference](https://platform.openai.com/docs/api-reference/chat/create) names it or as the server names its own (`top_k`, `min_p`, `repetition_penalty`, OpenRouter's `provider`), and one of the fields above is refused there. A server that reads `max_tokens` and not `max_completion_tokens` takes it there, with `max_output_tokens` left unset. With `n` above 1, Meka reads the first answer.
 
 **Streaming:** Uses Server-Sent Events (SSE) with `data: {...}` lines. The stream ends with `data: [DONE]`.
 

@@ -730,7 +730,7 @@ pub(super) const SKIP_REASON_MAX_CHARS: usize = 120;
 /// Per-entry cap on a skipped directory's name.
 ///
 /// Both fields go through [`elide`], which is doing more than shortening here: it collapses
-/// whitespace, and these are the one part of the section meka did not author. A directory name is
+/// whitespace, and these are the one part of the section Meka did not author. A directory name is
 /// whatever the filesystem accepted, which on Unix is any byte but `/` and NUL, so an unelided one
 /// could carry newlines straight into the block and break the one-line-per-entry shape the reader
 /// and the budget both assume.
@@ -752,7 +752,7 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
     // summary is all the model has to decide whether the tool is worth a `tool_load` round trip.
     // A late-connecting MCP server can announce eighty tools at once, and eighty bare names are
     // not a catalog. Newly *callable* tools need no summary here because their full schema ships
-    // in the API tools array; only the permission, which is meka's own concept, has to be stated.
+    // in the API tools array; only the permission, which is Meka's own concept, has to be stated.
     let newly_deferred: Vec<(&String, &Facts)> = current
         .tools
         .iter()

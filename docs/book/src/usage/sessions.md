@@ -4,7 +4,7 @@ Sessions persist your conversation so you can resume later. Each session has an 
 
 ## How sessions work
 
-- A session is **not** created when meka starts. It is created lazily when you send the first message.
+- A session is **not** created when Meka starts. It is created lazily when you send the first message.
 - Its id is printed to stderr when it is created, resumed and left, so you can note it for later. Each banner has a switch under [`[display]`](../configuration/config-file.md#displayshow_session_id_on_create); the creation banner is off by default.
 - Sessions include the full conversation: your inputs, the agent's responses, and tool call results.
 
@@ -45,14 +45,14 @@ its profile.
 
 ### By id prefix
 
-If the value passed to `-r` isn't a whole id, meka treats it as a leading prefix and looks up sessions whose id starts with it. This avoids having to copy the entire id:
+If the value passed to `-r` isn't a whole id, Meka treats it as a leading prefix and looks up sessions whose id starts with it. This avoids having to copy the entire id:
 
 ```bash
 meka -r 550e            # works if exactly one session starts with `550e`
-meka -r 5               # likely ambiguous; meka lists matching ids and exits
+meka -r 5               # likely ambiguous; Meka lists matching ids and exits
 ```
 
-When a prefix matches multiple sessions, meka prints the matching ids (most-recent first) so you can disambiguate. Type a few more characters until the prefix is unique.
+When a prefix matches multiple sessions, Meka prints the matching ids (most-recent first) so you can disambiguate. Type a few more characters until the prefix is unique.
 
 ### What a resume restores
 
@@ -91,24 +91,24 @@ longer sees the reasoning recorded under the old profile, for the reason above.
 `--additional-workspace-directory` and `--additional-readable-directory` are not restored, because
 they belong to the process rather than the session; pass them again. See [permissions](./permissions.md) for why recording it would be wrong.
 
-**A resumed session opens in the directory it recorded**, not the one your shell is in. `meka -c` from anywhere reopens the session where it was working, and `/cd` is the only thing that moves it. This is deliberate: at [`workspace`](./permissions.md) the working directory *is* the writable boundary, so adopting the shell's would silently widen it: resume a project session from `$HOME` and the whole home directory becomes writable, with a [scheduled job](./scheduling.md) able to fire before you could react. If the recorded directory has since been removed, meka warns and opens where you are. To get back to your shell's directory, run `/cd` with no argument.
+**A resumed session opens in the directory it recorded**, not the one your shell is in. `meka -c` from anywhere reopens the session where it was working, and `/cd` is the only thing that moves it. This is deliberate: at [`workspace`](./permissions.md) the working directory *is* the writable boundary, so adopting the shell's would silently widen it: resume a project session from `$HOME` and the whole home directory becomes writable, with a [scheduled job](./scheduling.md) able to fire before you could react. If the recorded directory has since been removed, Meka warns and opens where you are. To get back to your shell's directory, run `/cd` with no argument.
 
 A resume restores the conversation, not the world it ran in. The messages come back verbatim, which means the agent reads its own earlier tool calls and can reasonably assume their effects still hold. Two kinds of state do not survive the process that made them:
 
-- **Which files have been read.** meka tracks reads in memory so `file_edit` can refuse to write over a file the agent has not seen. A new process starts with that record empty, so the first edit to any file asks for a `file_read` first.
-- **Anything an MCP server was holding.** A loaded database, an authenticated session, a subscription: these belong to the server's process, not to the conversation, and a reconnect drops them. meka has no way to model what a given server keeps open.
+- **Which files have been read.** Meka tracks reads in memory so `file_edit` can refuse to write over a file the agent has not seen. A new process starts with that record empty, so the first edit to any file asks for a `file_read` first.
+- **Anything an MCP server was holding.** A loaded database, an authenticated session, a subscription: these belong to the server's process, not to the conversation, and a reconnect drops them. Meka has no way to model what a given server keeps open.
 
 Everything else is restated in the per-turn context on every turn regardless (permission level, working directory, tool catalog), the [checklist](checklist.md) is read back from the conversation, and background tasks that were running deliver an `interrupted` outcome, so none of those can go stale unnoticed.
 
-Because the second kind is unknowable from meka's side, the first turn after a resume carries a `[Session resumed]` note telling the agent to re-establish rather than assume. It appears once and is not repeated. There is nothing to configure.
+Because the second kind is unknowable from Meka's side, the first turn after a resume carries a `[Session resumed]` note telling the agent to re-establish rather than assume. It appears once and is not repeated. There is nothing to configure.
 
 ## Session locking
 
-Only one meka instance can be attached to a session at a time. This prevents race conditions from concurrent writes.
+Only one Meka instance can be attached to a session at a time. This prevents race conditions from concurrent writes.
 
 - The lock is taken the moment the session row exists, which for a brand-new session is at the start of its first turn rather than the end. A second invocation launched while that turn is still running is refused like any other.
-- If you try to resume a session that is locked by a running meka process, you will get an error.
-- If the locking process has exited (crashed or was killed), meka detects this and allows you to take over the lock.
+- If you try to resume a session that is locked by a running Meka process, you will get an error.
+- If the locking process has exited (crashed or was killed), Meka detects this and allows you to take over the lock.
 - Under ACP (`meka acp`), the lock is released as soon as the editor disconnects: closing the connection (stdin EOF) or sending SIGTERM/Ctrl-C makes `meka acp` exit, so the session can be reopened immediately.
 
 ## Fallback profiles
@@ -183,16 +183,16 @@ Sessions live in the store, a SQLite file at a platform-specific location:
 ### What else is in that directory
 
 `meka.db-wal` and `meka.db-shm` are SQLite's own companions to the open store, not backups. The
-`locks/` subdirectory holds the lock files meka uses to keep two processes off one session and off
+`locks/` subdirectory holds the lock files Meka uses to keep two processes off one session and off
 one schema change; it is empty of anything worth reading.
 
-You may also find one `meka.db.v<version>.bak`. meka copies the store aside before it changes the
+You may also find one `meka.db.v<version>.bak`. Meka copies the store aside before it changes the
 schema, and keeps exactly one such copy: the next schema-changing upgrade takes a fresh one and
 removes the one before it, so the copies do not accumulate. Expect the data directory to settle at
 roughly twice the size of the store, and to peak higher than that during an upgrade, since the new
 copy is written before the old one goes.
 
-To restore one, stop every meka process and copy it over `meka.db`. It records the schema version it
+To restore one, stop every Meka process and copy it over `meka.db`. It records the schema version it
 was taken at, so the next start brings it forward again rather than mistaking it for a current store.
 Because only the newest is kept, restoring undoes the most recent schema-changing upgrade and
 nothing before it; move a copy of your own aside if you want to go back further.
@@ -200,7 +200,7 @@ nothing before it; move a copy of your own aside if you want to go back further.
 An interrupted upgrade can leave a `meka.db.v<version>.bak.partial` behind. That is a copy that never
 finished, so it is not restorable and nothing removes it; delete it whenever you like.
 
-Anything else you put in this directory is yours and meka leaves it alone, including a file whose
+Anything else you put in this directory is yours and Meka leaves it alone, including a file whose
 name merely resembles the above.
 
 ## Store schema
@@ -249,7 +249,7 @@ process's PID and lock a session forever.
 |--------|------|-------------|
 | `id` | INTEGER | Auto-incrementing primary key |
 | `session_id` | TEXT (UUID) | Foreign key to `sessions.id` |
-| `kind` | TEXT | `user_blocks` (a turn: its `turn_context` and `text` blocks and any images), `user` (a plain text message meka wrote), `assistant`, `tool_results`, `compact_boundary`, `repair`, `redact`, or `unsign` |
+| `kind` | TEXT | `user_blocks` (a turn: its `turn_context` and `text` blocks and any images), `user` (a plain text message Meka wrote), `assistant`, `tool_results`, `compact_boundary`, `repair`, `redact`, or `unsign` |
 | `content` | TEXT | Message content (plain text or JSON) |
 | `created_at` | TEXT (RFC 3339) | When the message was saved |
 
@@ -266,7 +266,7 @@ Scratchpad entries are scoped to a session. Two sessions can have entries with t
 
 ## History retention
 
-**meka never deletes sessions unless you ask it to.** Conversation history isn't reproducible, so there is no default cleanup by age and none at all by size.
+**Meka never deletes sessions unless you ask it to.** Conversation history isn't reproducible, so there is no default cleanup by age and none at all by size.
 
 If you do want a time window, set it explicitly:
 
@@ -275,7 +275,7 @@ If you do want a time window, set it explicitly:
 retention = "30d"   # delete sessions not updated in 30 days
 ```
 
-With that set, meka deletes matching sessions when the agent starts, and then every hour for as long as `meka serve`, `meka acp` or the screen stays up, and says so at `warn` level, so a deletion you configured is still a deletion you see. A session another meka process has open is spared, and so is the one you are resuming with `-c` or `-r`, however old it is; so is a [pinned](#pinning-a-session) session, and one with a scheduled job ahead of it. Unset (the default) keeps everything forever.
+With that set, Meka deletes matching sessions when the agent starts, and then every hour for as long as `meka serve`, `meka acp` or the screen stays up, and says so at `warn` level, so a deletion you configured is still a deletion you see. A session another Meka process has open is spared, and so is the one you are resuming with `-c` or `-r`, however old it is; so is a [pinned](#pinning-a-session) session, and one with a scheduled job ahead of it. Unset (the default) keeps everything forever.
 
 To prune on demand instead, remove on your own schedule:
 
@@ -289,7 +289,7 @@ Removing a session takes its messages, scratchpad entries, and any sub-agent chi
 
 A session is locked from the moment it exists: the lock is taken before the row is written, so a sweep in another terminal cannot catch it in between. That holds for new sessions, for sub-agent sessions, for forks made from any surface, and for the root of an imported archive while it is written. Copying a conversation holds it still too: every fork door (`meka session fork`, `/fork`, `POST /v1/sessions/{id}/fork`, ACP `session/fork`) and `meka session export` refuse a session another process has open, because a copy taken mid-turn ends on a user message the model never answered and restores as an unusable session. `meka session rewind` has always done this.
 
-No deletion touches a session another meka process has open. Naming one by id fails and says so; `--all`, `--older-than-days` and the startup sweep skip it and report how many they left behind. This matters most for the startup sweep, because only turns bump a session's timestamp (resuming does not), so a screen left at its prompt past the window looks expired while somebody is sitting in front of it.
+No deletion touches a session another Meka process has open. Naming one by id fails and says so; `--all`, `--older-than-days` and the startup sweep skip it and report how many they left behind. This matters most for the startup sweep, because only turns bump a session's timestamp (resuming does not), so a screen left at its prompt past the window looks expired while somebody is sitting in front of it.
 
 ### Turn retention
 
@@ -322,7 +322,7 @@ The kept tail is written after the summary as copies the model alone reads. Ever
 
 Whoever writes the summary, it has four sections: the rules and authorizations the user stated, in their words; each commitment and its state (done, pending, blocked, or superseded) and what must happen before the next; the facts established, each with its source; and the next action. A `/compact <instructions>` focus adds emphasis within those sections and never drops one.
 
-The messages received during the summarized turns are not left to the summary. meka copies the most recent ones into the summary message as they were written, newest first within a third of the verbatim budget, oldest first when read, each quoted line by line; the kept tail takes the other two thirds, or the whole budget when there is nothing to copy. A message relayed from the inbox keeps the header naming who sent it. The one that overflows the budget keeps its beginning; `conversation_read` reaches all of it. Nothing already in the kept tail is copied twice, and a summary's own quotes are never quoted again by the next compaction. The reason is the one loss an agent cannot notice: a restriction stated in a later turn and left out of a summary is gone from the window, and the agent cannot search for a rule it does not know it lost.
+The messages received during the summarized turns are not left to the summary. Meka copies the most recent ones into the summary message as they were written, newest first within a third of the verbatim budget, oldest first when read, each quoted line by line; the kept tail takes the other two thirds, or the whole budget when there is nothing to copy. A message relayed from the inbox keeps the header naming who sent it. The one that overflows the budget keeps its beginning; `conversation_read` reaches all of it. Nothing already in the kept tail is copied twice, and a summary's own quotes are never quoted again by the next compaction. The reason is the one loss an agent cannot notice: a restriction stated in a later turn and left out of a summary is gone from the window, and the agent cannot search for a rule it does not know it lost.
 
 By default the summary is written by **the agent itself**, in a *checkpoint turn* that runs before anything is discarded. The agent gets its real system prompt, its memory index, the full conversation with its images, and the turn's own tool list, and is told its context is about to be replaced. The request is the turn's request with the checkpoint instruction appended, so the provider answers it from the turn's prompt cache rather than reading the conversation again. It saves whatever must outlive the window (`memory_write` for facts and decisions that should still be true in a future session, the scratchpad for working material), then calls `context_replace` with the summary.
 
@@ -353,7 +353,7 @@ Internally, compaction does not delete pre-compaction rows from the store. It ap
 A standalone summarizer, with no tools and none of the standing instructions, is the fallback. It runs when:
 
 - The compaction is an **emergency** one, i.e. the provider has already rejected the request for exceeding the window. A checkpoint turn re-sends that same conversation, so it would be refused identically; the summarizer strips images and truncates long blocks, which is what lets it get through.
-- The checkpoint turn **fails or ends without calling `context_replace`**. `tool_choice` isn't available across meka's backends, so the call can't be forced, and a turn that ends on prose instead is not trusted to have written a summary: that prose is as often an answer to the conversation, or a sentence cut off at the checkpoint's round limit, as a summary, and nothing can tell which. Memories the checkpoint wrote before it ended are kept either way.
+- The checkpoint turn **fails or ends without calling `context_replace`**. `tool_choice` isn't available across Meka's backends, so the call can't be forced, and a turn that ends on prose instead is not trusted to have written a summary: that prose is as often an answer to the conversation, or a sentence cut off at the checkpoint's round limit, as a summary, and nothing can tell which. Memories the checkpoint wrote before it ended are kept either way.
 - `compact_checkpoint` is off.
 
 The summarizer runs under the profile's thinking setting, as every request does. A summary that comes back with no text, its whole reply thinking, is asked for once more with the nudge a turn gets; a second empty one fails the compaction.
@@ -367,7 +367,7 @@ Turning it off leaves the standalone summarizer to write every summary, which sa
 
 ### Auto-compact
 
-When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation once it is past `context_ceiling_percent` of the context window (default: 85%). The check runs at three points. At the start of a turn it reads the last reported usage, which a resumed session takes from its row, so the first turn after a resume is checked against the real number. Before the first request it projects the request from an estimate, so a turn whose own input jumps over the ceiling is compacted before it is sent. And after every round of tool results inside a turn it reads that round's reported usage, so a long tool loop overshoots the line by one round rather than by the whole loop; the turn's most recent rounds may be kept verbatim within the budget, its earlier ones are summarized with the history, the request the turn is answering is quoted after the summary as the user wrote it, and one crossing is answered once, until a later measurement reads under the line again. As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
+When `auto_compact` is enabled (default: `true`), Meka automatically compacts the conversation once it is past `context_ceiling_percent` of the context window (default: 85%). The check runs at three points. At the start of a turn it reads the last reported usage, which a resumed session takes from its row, so the first turn after a resume is checked against the real number. Before the first request it projects the request from an estimate, so a turn whose own input jumps over the ceiling is compacted before it is sent. And after every round of tool results inside a turn it reads that round's reported usage, so a long tool loop overshoots the line by one round rather than by the whole loop; the turn's most recent rounds may be kept verbatim within the budget, its earlier ones are summarized with the history, the request the turn is answering is quoted after the summary as the user wrote it, and one crossing is answered once, until a later measurement reads under the line again. As a last resort, if the provider still rejects a request for exceeding the context window, Meka compacts once and retries the turn instead of failing.
 
 ```toml
 [session]
@@ -619,7 +619,7 @@ Recreate a session from a JSON export:
 meka session import session-550e8400-e29b-41d4-a716-446655440000.json
 ```
 
-meka assigns the imported session (and any sub-agent children) **new** ids so they can't collide with existing sessions, then prints the new root session id. Resume it like any other session:
+Meka assigns the imported session (and any sub-agent children) **new** ids so they can't collide with existing sessions, then prints the new root session id. Resume it like any other session:
 
 ```bash
 meka -r <new-id>
@@ -658,7 +658,7 @@ like any other. A fork of a *sub-agent* is the exception: it keeps that sub-agen
 spawn terms, so the copy is a sibling under the same parent rather than a promotion to a session of
 its own, and it is continued through `agent_followup` like any other sub-agent.
 
-Forking copies what has been committed to the store, and only between turns. A session another meka process has open is refused rather than copied (see [Session locking](#session-locking)), and so is one with a turn in flight in the process that holds it: `POST /v1/sessions/{id}/fork` answers `409` `turn-in-flight` and ACP `session/fork` answers `InvalidParams`. The user message is persisted before the model is called, so a copy taken mid-turn would end on a prompt with no reply and restore as an unusable session. Cancel the turn or wait for it.
+Forking copies what has been committed to the store, and only between turns. A session another Meka process has open is refused rather than copied (see [Session locking](#session-locking)), and so is one with a turn in flight in the process that holds it: `POST /v1/sessions/{id}/fork` answers `409` `turn-in-flight` and ACP `session/fork` answers `InvalidParams`. The user message is persisted before the model is called, so a copy taken mid-turn would end on a prompt with no reply and restore as an unusable session. Cancel the turn or wait for it.
 
 The same operation is available from the screen as `/fork`, which switches you into the copy and leaves the original where you branched (an `always` or `never` given at an approval prompt stays with the original; see [Permissions](permissions.md#approvals)); over HTTP as `POST /v1/sessions/{id}/fork`, whose `turn_id` branches the copy before a turn; and over ACP as `session/fork`.
 
@@ -666,7 +666,7 @@ The same operation is available from the screen as `/fork`, which switches you i
 
 Both produce a runnable copy under a new id. Reach for `fork` to branch a conversation you're working on, and for `export` + `import` to move a session between machines or keep an archive. Export/import also copies sub-agent transcripts and preserves `created_at`, because an archive should restore whole.
 
-Both copy a long session in short transactions, so another meka process writing to the store meanwhile is not held up for the length of the copy. The copy appears in listings, searches and `meka -c` only once it is whole. One that a crash interrupted is deleted the next time a meka host starts, unless another process still holds it.
+Both copy a long session in short transactions, so another Meka process writing to the store meanwhile is not held up for the length of the copy. The copy appears in listings, searches and `meka -c` only once it is whole. One that a crash interrupted is deleted the next time a Meka host starts, unless another process still holds it.
 
 ## Rewinding a session
 
@@ -683,23 +683,23 @@ The command takes the session lock, so it refuses to run while a screen, `meka s
 
 Its main use is recovering a session a provider has started rejecting. A provider validates the whole conversation on every request, so one piece of content it rejects fails every later turn too.
 
-meka repairs a rejection caused by content added since the last request the provider accepted, and repairs a mislabeled image on resume, but anything older than that needs rewinding past. That window is usually the current turn, and it reaches back into the previous one when a turn failed mid-tool-loop and left it unaccepted. A compaction widens it to the whole conversation, because a compaction replaces that conversation wholesale and nothing in the result has been accepted yet. The repair escalates: first it removes the attachments the turn added and leaves everything else alone, and only if that is refused as well does it empty the turn's tool calls, moving each call's arguments into the result that reports it and replacing the result's body with an explanation. The second step exists because a tool result is usually text, which the first step cannot touch, and because a call's own arguments can be what the provider objected to. A step the provider then accepts is not counted as spent, so the cheap one stays available if the turn is refused again later.
+Meka repairs a rejection caused by content added since the last request the provider accepted, and repairs a mislabeled image on resume, but anything older than that needs rewinding past. That window is usually the current turn, and it reaches back into the previous one when a turn failed mid-tool-loop and left it unaccepted. A compaction widens it to the whole conversation, because a compaction replaces that conversation wholesale and nothing in the result has been accepted yet. The repair escalates: first it removes the attachments the turn added and leaves everything else alone, and only if that is refused as well does it empty the turn's tool calls, moving each call's arguments into the result that reports it and replacing the result's body with an explanation. The second step exists because a tool result is usually text, which the first step cannot touch, and because a call's own arguments can be what the provider objected to. A step the provider then accepts is not counted as spent, so the cheap one stays available if the turn is refused again later.
 
 Neither step changes the shape of the conversation: a tool call stays a tool call and its result stays its result, marked as an error. That is deliberate. Removing one half of a pair is the one thing every provider refuses outright, so a repair that could do it might turn a recoverable rejection into a permanent one. The model sees a failed tool call, which it already knows how to read, with the arguments it sent quoted in the failure so it can tell which call not to repeat.
 
 Nothing a repair removes is deleted. The log is append-only (within [turn retention](#turn-retention), when set), so the superseded messages stay on disk and [`meka session export`](#exporting-a-session) renders them above a marker saying what replaced them. Use `--format json` to get a removed attachment back: the markdown export writes each message as a person said it, an invoked skill or prompt as the invocation rather than the body it expanded to and an attached file by its mention, and leaves image blocks out. Only the conversation the model sees is changed.
 
-Whatever is removed is restored untouched if the retry carrying it is refused too. That restore is what bounds the risk, and it bounds it only in that direction: each step spends a fresh retry sequence rather than a single request, and a step whose retry *succeeds* keeps the loss, so the trigger is deliberately narrow. The words you typed are never rewritten by either step, though an image you attached to that prompt is exactly what the first one removes, replacing it with a note. Notes meka inserts into a conversation are prefixed `[meka harness]`.
+Whatever is removed is restored untouched if the retry carrying it is refused too. That restore is what bounds the risk, and it bounds it only in that direction: each step spends a fresh retry sequence rather than a single request, and a step whose retry *succeeds* keeps the loss, so the trigger is deliberately narrow. The words you typed are never rewritten by either step, though an image you attached to that prompt is exactly what the first one removes, replacing it with a note. Notes Meka inserts into a conversation are prefixed `[meka harness]`.
 
-Both steps run whether the provider answered `400` or spent every retry on a `5xx`. A gateway in front of a model reports a payload its own decoder choked on as a server error, which is indistinguishable from being overloaded, so meka honors the retries in full and treats a refusal that outlives them as one the content may explain.
+Both steps run whether the provider answered `400` or spent every retry on a `5xx`. A gateway in front of a model reports a payload its own decoder choked on as a server error, which is indistinguishable from being overloaded, so Meka honors the retries in full and treats a refusal that outlives them as one the content may explain.
 
-On the `5xx` path it does one thing more before touching anything. The retry sequence is short by design (two attempts across three seconds of backoff), which an ordinary overload outlasts, so meka waits eight seconds and sends the *same* request one last time. If that succeeds the outage was the whole story and nothing is lost; if it fails too, the reading that the body is the problem has been earned rather than assumed. The wait is paid only by a turn that was otherwise about to start deleting things, and only once per run of consecutive failures: a request the provider accepts makes it available again, since a later refusal is about work the earlier wait never saw. A `400` skips it, because the provider has already read the body and said no.
+On the `5xx` path it does one thing more before touching anything. The retry sequence is short by design (two attempts across three seconds of backoff), which an ordinary overload outlasts, so Meka waits eight seconds and sends the *same* request one last time. If that succeeds the outage was the whole story and nothing is lost; if it fails too, the reading that the body is the problem has been earned rather than assumed. The wait is paid only by a turn that was otherwise about to start deleting things, and only once per run of consecutive failures: a request the provider accepts makes it available again, since a later refusal is about work the earlier wait never saw. A `400` skips it, because the provider has already read the body and said no.
 
 Nothing outside those two shapes degrades at all, because a degraded retry that succeeds only because the network came back would keep the loss. Excluded, then: a dropped connection, which never delivered the request for anything to judge; a `429`, which is a statement about rate rather than about what was sent; a failure that arrives partway through a stream, after some of the answer has reached you, both because re-sending would print it twice and because the stream cannot tell an overload from anything else; and anything at all once the retries have *not* been exhausted. If a step it did try does not help, it says so and points here before the turn fails.
 
-One cause of that refusal has its own fix. A session recorded by 0.41 can hold a `tool_result` whose content is a bare JSON string, a shape meka does not read: the row is dropped as the session loads, which leaves the `tool_use` it answered unanswered, and the provider rejects the next turn over the mismatch. Run the [one-shot upgrade script](../getting-started/upgrading.md), which converts those rows in place, rather than rewinding past a turn you wanted to keep.
+One cause of that refusal has its own fix. A session recorded by 0.41 can hold a `tool_result` whose content is a bare JSON string, a shape Meka does not read: the row is dropped as the session loads, which leaves the `tool_use` it answered unanswered, and the provider rejects the next turn over the mismatch. Run the [one-shot upgrade script](../getting-started/upgrading.md), which converts those rows in place, rather than rewinding past a turn you wanted to keep.
 
-One rejection reaches past the window those steps work in, and meka answers it on its own. Claude ties each thinking block to the conversation ahead of it, the tool list included, and on the accounts where Anthropic enforces that check it rejects a request that sends a block back after that conversation changed: most changes to the tool list, a compaction that keeps recent turns verbatim behind its summary, or a repair above can each make every later request fail. When Claude rejects a thinking block that way, or one whose signature it cannot verify at all, meka sends the conversation again without its thinking, back to the last compaction. The model no longer gets that reasoning back, and the turn goes on. Nothing on disk is rewritten: an accepted resend is recorded in the log as the point the thinking stopped being sent, so a resume sends the same, and an export marks that point and still shows the reasoning's readable text. A rejected one restores the thinking, and the steps above take their turn. A compaction does the same for its own requests, the checkpoint's and the summarizer's. On an account that does not enforce the check the rejection never comes, and nothing changes.
+One rejection reaches past the window those steps work in, and Meka answers it on its own. Claude ties each thinking block to the conversation ahead of it, the tool list included, and on the accounts where Anthropic enforces that check it rejects a request that sends a block back after that conversation changed: most changes to the tool list, a compaction that keeps recent turns verbatim behind its summary, or a repair above can each make every later request fail. When Claude rejects a thinking block that way, or one whose signature it cannot verify at all, Meka sends the conversation again without its thinking, back to the last compaction. The model no longer gets that reasoning back, and the turn goes on. Nothing on disk is rewritten: an accepted resend is recorded in the log as the point the thinking stopped being sent, so a resume sends the same, and an export marks that point and still shows the reasoning's readable text. A rejected one restores the thinking, and the steps above take their turn. A compaction does the same for its own requests, the checkpoint's and the summarizer's. On an account that does not enforce the check the rejection never comes, and nothing changes.
 
 ## Removing sessions
 
@@ -737,7 +737,7 @@ pinned ones included.
 
 ## Recall
 
-Separate from your saved conversations, meka keeps a rolling list of the prompts you *type* on the screen, its recall, so **Up-arrow** recall and **Ctrl+R** reverse-search work across runs (shell-style). This is distinct from a session (a stored conversation), which the screen reads back as you scroll up.
+Separate from your saved conversations, Meka keeps a rolling list of the prompts you *type* on the screen, its recall, so **Up-arrow** recall and **Ctrl+R** reverse-search work across runs (shell-style). This is distinct from a session (a stored conversation), which the screen reads back as you scroll up.
 
 List recent recall entries (oldest first; `-n 0` shows all), one per line, or as
 `{"recall": [...]}` with `--format json`; an empty list says `No recall entries.` on stderr:

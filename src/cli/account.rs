@@ -135,7 +135,7 @@ async fn run_add(
         None => {
             // Shows the endpoint an empty answer accepts. An empty answer writes nothing: pinning
             // the default into the account would freeze it, and this is the one setting where
-            // meka's own value is the right one for almost everybody.
+            // Meka's own value is the right one for almost everybody.
             let prompt = format!(
                 "API base URL [{}]: ",
                 crate::provider::default_base_url(backend)
@@ -289,7 +289,7 @@ fn report_account_problems(
     Ok(())
 }
 
-/// Accounts whose `backend` is not one meka knows, each with the parser's refusal.
+/// Accounts whose `backend` is not one Meka knows, each with the parser's refusal.
 ///
 /// `[accounts.<name>]` keeps `backend` as written, so a hand-edited typo loads and lists, and fails
 /// only when a session on the account is built. A listing is where the user comes to check, so it
@@ -424,7 +424,7 @@ fn prompt_secret(prompt: &str) -> io::Result<String> {
             }
         }
         // `warn!`, not `debug!`: this is a secret about to appear on screen, and the doc above
-        // promises meka says so rather than quietly echoing it.
+        // promises Meka says so rather than quietly echoing it.
         tracing::warn!("failed to disable terminal echo; the API key will be visible as typed");
     }
     prompt_line(prompt)

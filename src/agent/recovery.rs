@@ -351,7 +351,7 @@ impl TurnRecovery {
             .cells
             .frontend
             .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
-                // Says what meka did, not why the provider did what it did: on the 5xx path the
+                // Says what Meka did, not why the provider did what it did: on the 5xx path the
                 // provider judged nothing, and this is the turn's last guess at the cause.
                 //
                 // No provider body here: `reason` is the verbatim rejection text, and this notice
@@ -766,7 +766,7 @@ pub(super) fn degrade_rejected_content(
 /// orphan the provider rejects in a *new* way, and dropping the `tool_use` itself is worse still:
 /// the tool has already run, side effects and all, so erasing the record invites the model to run
 /// it again. Instead the `tool_result` keeps its `tool_use_id` and is marked `is_error`, which is
-/// exactly the shape meka already uses for a tool that failed outright, so the model needs no new
+/// exactly the shape Meka already uses for a tool that failed outright, so the model needs no new
 /// concept to understand it and no frontend needs new rendering.
 pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Option<Vec<Message>> {
     let mut changed = false;
@@ -840,7 +840,7 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
 /// What a neutralized `tool_use` carries in place of the arguments it was refused with.
 ///
 /// A breadcrumb rather than `{}`, because an empty object is a false record: it reads as a call the
-/// model made with no arguments at all, rather than one whose arguments meka took.
+/// model made with no arguments at all, rather than one whose arguments Meka took.
 pub(super) fn neutralized_arguments() -> serde_json::Value {
     serde_json::json!({
         crate::conversation::HARNESS_NOTE: "arguments removed; they are quoted in this call's \
@@ -941,7 +941,7 @@ pub(super) fn neutralize_tool_exchanges(
 }
 /// Make a provider's rejection text safe to put inside a `[meka harness]` note.
 ///
-/// The note is meka's own voice to the model, and the marker is what tells a model that the
+/// The note is Meka's own voice to the model, and the marker is what tells a model that the
 /// sentence around it comes from the harness rather than from the tool or the provider, so nothing
 /// interpolated into it may forge that; `render_error_body` only trims and [`elide`] only
 /// truncates.
@@ -1045,7 +1045,7 @@ mod tests {
         session::CompactRequest,
     };
 
-    /// A provider's rejection text cannot forge meka's own marker inside a degrade note.
+    /// A provider's rejection text cannot forge Meka's own marker inside a degrade note.
     ///
     /// The marker is what tells a model that the sentence around it comes from the harness rather
     /// than from the tool or the provider, so nothing interpolated into the note may reproduce it.
@@ -1062,7 +1062,7 @@ mod tests {
         let scrubbed = scrub_for_harness_note(&forged);
         assert!(
             !scrubbed.contains(HARNESS_NOTE),
-            "an echoed marker must not survive into meka's own voice: {scrubbed}"
+            "an echoed marker must not survive into Meka's own voice: {scrubbed}"
         );
         assert!(
             scrubbed.contains("bad request"),
@@ -1742,7 +1742,7 @@ mod tests {
                     "the arguments must not stay on the call: {input}"
                 );
                 // Not `{}`, which would be a false record: it reads as a call the model made with
-                // no arguments at all, rather than one whose arguments meka moved.
+                // no arguments at all, rather than one whose arguments Meka moved.
                 assert!(
                     input
                         .to_string()
@@ -2053,7 +2053,7 @@ mod tests {
         ));
         assert!(
             refusal_may_blame_content(&MekaError::RequestTooLarge("x".to_string()), false),
-            "meka's own budget refusal is answered by degrading the newest content"
+            "Meka's own budget refusal is answered by degrading the newest content"
         );
         // The same exclusion, on the variant whose classifier cannot reach it today. The rule is
         // about what the user has already seen, not about which variant carried the news, so a

@@ -142,7 +142,7 @@ impl Store {
     /// `context` carries the facts a migration cannot work out for itself; see
     /// [`migrations::Context`]. It is a parameter rather than something read here because this
     /// function must not know what a profile is: the ledger is the only place allowed to
-    /// act on an older meka's store, and config is the only place that knows which profile is the
+    /// act on an older Meka's store, and config is the only place that knows which profile is the
     /// default. A caller with nothing to carry forward passes the default, which every test does
     /// because a store it just created has no sessions to carry.
     pub(crate) async fn open(path: Option<&Path>, context: &migrations::Context) -> Result<Self> {
@@ -219,7 +219,7 @@ impl Store {
             .call(|connection| -> rusqlite::Result<_> {
                 // Restated rather than established: `rusqlite::Connection::open` already installs a
                 // five-second busy timeout before any of this runs, so this pragma pins the value
-                // meka wants against a future change in that default rather than supplying one.
+                // Meka wants against a future change in that default rather than supplying one.
                 // Ordered before the WAL conversion below because that is where it would matter if
                 // it were ever the only source.
                 connection.execute_batch(
@@ -230,7 +230,7 @@ impl Store {
                 // database to WAL takes an exclusive lock, and SQLite does not always route *that*
                 // pragma's acquisition through the busy handler, so with a handler installed and
                 // waiting the conversion can still return `database is locked` outright when
-                // several meka processes start together. An already-WAL database takes no
+                // several Meka processes start together. An already-WAL database takes no
                 // exclusive lock here and never contends, so this only ever bites a first run on a
                 // fresh install (a systemd unit and a shell coming up together, which is the
                 // ordinary case).
@@ -368,7 +368,7 @@ impl Store {
                         Ok(()) => {}
                         Err(std::fs::TryLockError::WouldBlock) => {
                             return Err(MekaError::Database(
-                                "another meka process is using the store; stop it, then run \
+                                "another Meka process is using the store; stop it, then run \
                                  this again to upgrade the store"
                                     .to_string(),
                             ));
@@ -412,7 +412,7 @@ impl Store {
                 })?;
                 // The session search index, for the same reason, and after the ledger for one
                 // more: its first fill is this pass, since the step that created it may not read
-                // a row the way meka does.
+                // a row the way Meka does.
                 crate::store::search::reconcile_index(connection).map_err(|error| {
                     MekaError::Database(format!(
                         "failed to reconcile the session search index: {error}"
@@ -505,7 +505,7 @@ impl Store {
     }
 
     /// Handle on the memory store. See [`crate::store::memory`] for why it shares this database
-    /// rather than owning one: meka has one database, and a second would be a new thing to back
+    /// rather than owning one: Meka has one database, and a second would be a new thing to back
     /// up, lock and explain for the sake of two tables.
     pub(crate) fn memory_store(
         &self,
@@ -561,7 +561,7 @@ mod tests {
 
     /// `MEKA_DATA_DIR` has to be absolute, for a sharper version of the reason `MEKA_CONFIG_DIR`
     /// does: `meka.db` holds every provider credential, so a relative value would give one store
-    /// per directory meka is launched from, and falling back to the platform's would act on the
+    /// per directory Meka is launched from, and falling back to the platform's would act on the
     /// real one the user asked to be kept out of. It resolves no store at all.
     #[tokio::test]
     async fn a_relative_data_dir_resolves_no_store() {
@@ -733,7 +733,7 @@ mod tests {
             panic!("a store another holder has open was migrated under it");
         };
         assert!(
-            refused.to_string().contains("another meka process"),
+            refused.to_string().contains("another Meka process"),
             "{refused}"
         );
 

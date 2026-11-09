@@ -1,7 +1,7 @@
 //! The `schedule_*` tools: the agent arranging its own future turns ([`crate::schedule`]).
 //!
 //! Creating and listing gate at [`Permission::Read`], matching `memory_*` and `scratchpad_*`: a
-//! scheduled prompt writes to a store meka owns, and the turn it eventually produces is permission
+//! scheduled prompt writes to a store Meka owns, and the turn it eventually produces is permission
 //! -checked when it runs, so scheduling one grants nothing the session did not already have.
 //!
 //! The `gate` field is the exception, and is checked inside [`ScheduleCreateTool::execute`]
@@ -79,7 +79,7 @@ impl Tool for ScheduleCreateTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "schedule_create".to_string(),
-            description: "Schedule a self-contained prompt for this session. Give exactly one of `at`, `every`, or `cron`. A running scheduler must serve the session for the job to fire; a saved job alone does not keep meka running. Write the prompt as an unattended instruction, including the context it needs.".to_string(),
+            description: "Schedule a self-contained prompt for this session. Give exactly one of `at`, `every`, or `cron`. A running scheduler must serve the session for the job to fire; a saved job alone does not keep Meka running. Write the prompt as an unattended instruction, including the context it needs.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

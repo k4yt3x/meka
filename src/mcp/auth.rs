@@ -534,7 +534,7 @@ pub(super) async fn connect_http_with_oauth(
 
     let auth_manager = match auth_config {
         McpAuthConfig::ClientCredentials { client_id, scopes } => {
-            // Required for this flow, and there is nothing to fall back to: without it meka cannot
+            // Required for this flow, and there is nothing to fall back to: without it Meka cannot
             // prove which client it is and the token endpoint will refuse.
             let secret = client_secret.as_deref().ok_or_else(|| MekaError::McpAuth {
                 server_name: server_name.to_string(),
@@ -757,7 +757,7 @@ fn parse_jwt_signing_algorithm(
     }
 }
 
-/// What an authorization-code login is for: the server, and the client meka presents itself as.
+/// What an authorization-code login is for: the server, and the client Meka presents itself as.
 struct OAuthLogin<'a> {
     server_name: &'a str,
     url: &'a str,
@@ -825,7 +825,7 @@ async fn authenticate_oauth_authorization_code(
 
     // Bound here, once a login is going to run, and not at the top: every connect of an OAuth
     // server comes through this function, and binding first would refuse a server with a good
-    // stored bundle whenever the port is taken, by another meka or by a second server sharing
+    // stored bundle whenever the port is taken, by another Meka or by a second server sharing
     // `redirect_port`. Bound before the URL is built so a random port (`redirect_port = None`) can
     // be learned and put in `redirect_uri`.
     let bind_port = redirect_port.unwrap_or(0);
@@ -911,7 +911,7 @@ async fn authenticate_oauth_authorization_code(
     } else {
         let request = rmcp::transport::auth::AuthorizationRequest::new(redirect_uri.clone())
             .with_scopes(scope_strings.clone())
-            .with_client_name("meka");
+            .with_client_name("Meka");
         oauth_state
             .start_authorization(request)
             .await
@@ -978,7 +978,7 @@ pub(crate) const OAUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Durati
 /// Wait for the authorization code.
 ///
 /// The common case is the authorization server redirecting the user's browser to the localhost
-/// listener, and the code is read out of that request. When meka runs on a different host than
+/// listener, and the code is read out of that request. When Meka runs on a different host than
 /// the browser (SSH sessions, containers) the browser cannot reach back, so the TCP accept is
 /// raced against a prompt that takes the full callback URL pasted from the browser's address bar,
 /// which shows it even when the connection is refused. Paste mode is only offered when the prompt
@@ -1079,7 +1079,7 @@ async fn accept_http_callback(
                 tracing::warn!("OAuth state mismatch; refusing the callback");
                 let response_body = "<!DOCTYPE html><html><body>\
                     <h1>Authorization refused</h1>\
-                    <p>This callback is not the login meka is waiting for.</p>\
+                    <p>This callback is not the login Meka is waiting for.</p>\
                     </body></html>";
                 let response = format!(
                     "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1094,8 +1094,8 @@ async fn accept_http_callback(
             Ok(callback) => {
                 // No claim of success: the exchange comes after this page, and may still fail.
                 let response_body = "<!DOCTYPE html><html><body>\
-                    <h1>Return to meka</h1>\
-                    <p>The authorization was received; meka is completing the login. \
+                    <h1>Return to Meka</h1>\
+                    <p>The authorization was received; Meka is completing the login. \
                     You can close this tab.</p>\
                     </body></html>";
                 let response = format!(
@@ -1382,7 +1382,7 @@ impl SqliteCredentialStore {
 
 #[async_trait]
 impl CredentialStore for SqliteCredentialStore {
-    /// Held across rmcp's load, token request and save, so two meka processes on one server do not
+    /// Held across rmcp's load, token request and save, so two Meka processes on one server do not
     /// both spend its refresh token, which an issuer that rotates them refuses as reuse: the second
     /// loads what the first stored and refreshes from that.
     async fn acquire_refresh_guard(
@@ -1510,7 +1510,7 @@ impl CredentialStore for SqliteCredentialStore {
         // issuer changes, meaning the tokens it holds are bound to an issuer that is no longer the
         // right one, which is a statement about the tokens and nothing else. A confidential
         // client's `client_secret` is not bound to an issuer, was typed by the user, and
-        // after this change meka is its only holder, so clearing every kind here would send
+        // after this change Meka is its only holder, so clearing every kind here would send
         // them back to the provider to reissue one that was never invalid.
         self.token_store
             .clear_mcp_credentials_of_kind(
@@ -1825,7 +1825,7 @@ mod tests {
     /// rmcp calls `clear` when the authorization server's issuer changes. That is a statement
     /// about the tokens it holds, not about the client secret they were obtained with.
     ///
-    /// The secret was typed by the user and, since it stopped being a config key, meka is its only
+    /// The secret was typed by the user and, since it stopped being a config key, Meka is its only
     /// holder. Clearing every kind here would make an issuer migration at the provider silently
     /// cost the user a credential that was never invalid, discovered only when the next login
     /// fails for want of it.

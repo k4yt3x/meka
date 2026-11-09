@@ -1,9 +1,9 @@
-//! The schema ledger: the only place in meka that knows a previous version of the store existed.
+//! The schema ledger: the only place in Meka that knows a previous version of the store existed.
 //!
 //! `AGENTS.md`'s "Schema and migrations" section states the four rules and what they buy. What
 //! follows is what enforcing them looks like here.
 //!
-//! **Nothing outside this module may know that an older meka existed.** No fallback reader for a
+//! **Nothing outside this module may know that an older Meka existed.** No fallback reader for a
 //! superseded shape, no `#[serde(alias)]` for a renamed field, no branch whose condition is "was
 //! this row written by an older release". Every other reader assumes the current schema
 //! unconditionally, and may do so because [`apply`] has already run by the time it sees the store.
@@ -13,7 +13,7 @@
 //! store stamped between the hole and the new head skips a step it never ran and then stamps itself
 //! current.
 //!
-//! **A migration may not call meka's own code.** [`gates_become_kind_and_spec`] builds its JSON by
+//! **A migration may not call Meka's own code.** [`gates_become_kind_and_spec`] builds its JSON by
 //! hand rather than through `Gate::spec`, because a borrowed function starts meaning something else
 //! the day the gate types are refactored, years after the users it ran for could notice. It may
 //! *receive* a fact it cannot work out: that is [`Context`], and a `String` cannot change meaning
@@ -88,7 +88,7 @@ pub(crate) struct Context {
     /// caller could not read `config.toml` at all.
     ///
     /// The two are not the same answer and must not produce the same write. "Nothing resolved" is
-    /// a fact about a config meka read; "could not read it" is meka knowing nothing, and
+    /// a fact about a config Meka read; "could not read it" is Meka knowing nothing, and
     /// stamping every existing session against no profile on the strength of a parse error is
     /// irreversible, since the step runs once and `user_version` moves with it. So a step that
     /// would act on the value refuses instead, which aborts the transaction and leaves the
@@ -222,7 +222,7 @@ const MIGRATIONS: &[Migration] = &[
         step: Step::Sql(PROMPT_HISTORY_0_46),
     },
     // 0.46 split a provider profile into an account and a profile. A session names the profile,
-    // as it always did; the column takes the word the rest of meka now uses for it.
+    // as it always did; the column takes the word the rest of Meka now uses for it.
     Migration {
         name: "sessions_record_their_profile",
         step: Step::Rust(sessions_record_their_profile),
@@ -241,7 +241,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_carry_approvals",
         step: Step::Contextual(sessions_carry_approvals),
     },
-    // 0.46 stores the per-turn context meka injects as its own content block ahead of the words.
+    // 0.46 stores the per-turn context Meka injects as its own content block ahead of the words.
     Migration {
         name: "user_turns_carry_their_context_as_a_block",
         step: Step::Rust(user_turns_carry_their_context_as_a_block),
@@ -252,7 +252,7 @@ const MIGRATIONS: &[Migration] = &[
         step: Step::Rust(images_live_in_blobs),
     },
     // 0.46 names every column and index by one rule; the JSON held in two of them follows the
-    // serde shapes the rest of meka writes.
+    // serde shapes the rest of Meka writes.
     Migration {
         name: "columns_follow_one_naming_rule",
         step: Step::Rust(columns_follow_one_naming_rule),
@@ -271,8 +271,8 @@ const MIGRATIONS: &[Migration] = &[
         name: "root_rows_take_the_default_level_once_the_config_reads",
         step: Step::Contextual(root_rows_take_the_default_level_once_the_config_reads),
     },
-    // The reader accepts one spelling of a task status, the American one meka now writes; a task
-    // stopped on request under an earlier meka recorded the other.
+    // The reader accepts one spelling of a task status, the American one Meka now writes; a task
+    // stopped on request under an earlier Meka recorded the other.
     Migration {
         name: "background_tasks_spell_canceled_with_one_l",
         step: Step::Sql(BACKGROUND_TASKS_CANCELED),
@@ -384,7 +384,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "subagent_specs_name_their_network",
         step: Step::Rust(subagent_specs_name_their_network),
     },
-    // 0.76 gives the text meka wrote into a user message on another's behalf its own block, as a
+    // 0.76 gives the text Meka wrote into a user message on another's behalf its own block, as a
     // nudge took one in 0.70: an inbox item, a scheduled job's fire and a background report.
     Migration {
         name: "inbox_items_fires_and_reports_are_blocks",
@@ -830,7 +830,7 @@ fn sealed_reasoning_names_its_endpoint(
         // `InvalidParameterName` for the reason the 0.44 step gives.
         return Err(rusqlite::Error::InvalidParameterName(format!(
             "cannot record where {count} message(s)' sealed reasoning was sealed while \
-             config.toml cannot be read; fix the file and start meka again",
+             config.toml cannot be read; fix the file and start Meka again",
             count = updates.len()
         )));
     }
@@ -926,7 +926,7 @@ fn background_tasks_name_their_subagent(
 /// tokenizer's default folds only the common Latin ones: `viet` did not find `Việt`. A virtual
 /// table's tokenizer cannot be altered, so each is dropped and created again. The memory index
 /// reads its words from the `memories` table, so FTS5's own `rebuild` refills it here and the
-/// open that follows finds it whole; the session index's words are meka's reading of a row, which
+/// open that follows finds it whole; the session index's words are Meka's reading of a row, which
 /// a migration may not call for, so it is left empty for `crate::store::search::reconcile_index`
 /// to fill, the pass that fills a fresh store's. Safe to replay: a second run drops, creates and
 /// refills the same tables.
@@ -1447,13 +1447,13 @@ impl Plan {
 pub(crate) fn plan(connection: &rusqlite::Connection) -> Result<Plan> {
     let head = MIGRATIONS.len() as u32;
     let stored = user_version(connection)?;
-    // A store from a newer meka. Refused rather than migrated, because the steps that would bring
+    // A store from a newer Meka. Refused rather than migrated, because the steps that would bring
     // it here do not exist in this binary and running the ones that do would be inventing a
     // downgrade.
     if stored > head {
         return Err(MekaError::Database(format!(
-            "{} is at schema version {} and this meka only knows {}, so it was written by a newer \
-             release. Nothing has been changed. Upgrade meka",
+            "{} is at schema version {} and this Meka only knows {}, so it was written by a newer \
+             release. Nothing has been changed. Upgrade Meka",
             store_name(connection),
             stored,
             head
@@ -1497,7 +1497,7 @@ pub(crate) fn plan(connection: &rusqlite::Connection) -> Result<Plan> {
 
 /// Every table the ledger owns at head, which is what the fingerprint describes. Only these: a
 /// digest of everything in `sqlite_master` refused a store the moment another tool added a table
-/// beside meka's (a replication tool's sequence table, a hand-made one), and the refusal
+/// beside Meka's (a replication tool's sequence table, a hand-made one), and the refusal
 /// prescribed a `-wal` remedy that could not apply. A table missing from this list digests as
 /// empty, so a store that lost one is still refused. The two FTS indexes and their shadow tables
 /// are left out: `store::memory::reconcile_index` and `store::search::reconcile_index` bring each
@@ -1666,14 +1666,14 @@ fn with_foreign_keys_suspended<T>(
     // dropping this one silently would hide that the connection is now unsafe as well.
     if let Err(error) = &restored {
         tracing::error!(
-            "failed to re-enable foreign keys after the schema migration: {error}; restart meka"
+            "failed to re-enable foreign keys after the schema migration: {error}; restart Meka"
         );
     }
     let outcome = outcome?;
     restored.map_err(|error| {
         MekaError::Database(format!(
             "the schema migration committed but failed to re-enable foreign keys on this \
-             connection: {error}; restart meka"
+             connection: {error}; restart Meka"
         ))
     })?;
     Ok(outcome)
@@ -1790,10 +1790,10 @@ fn set_user_version(transaction: &rusqlite::Transaction<'_>, version: u32) -> Re
 /// Name the file a refusal is about.
 ///
 /// Every refusal here is a *stop*, and the reader's next move is to go look at the store. Saying
-/// "this store" leaves them to work out which file that is, and the answer is not obvious: meka
+/// "this store" leaves them to work out which file that is, and the answer is not obvious: Meka
 /// creates one on any invocation while `config.toml` appears only once a provider is added, so a
-/// machine that ran an old meka once and was never configured has a store the user has no reason to
-/// believe in. Told "this store is in the 0.41 shape" there, the honest reading is that meka is
+/// machine that ran an old Meka once and was never configured has a store the user has no reason to
+/// believe in. Told "this store is in the 0.41 shape" there, the honest reading is that Meka is
 /// wrong. Named, it is a file they can look at.
 ///
 /// `Connection::path` is rusqlite's own, so this stays inside what a migration may call. An
@@ -1813,7 +1813,7 @@ fn store_name(connection: &rusqlite::Connection) -> &str {
 /// version knowledge everywhere else costs nothing.
 ///
 /// Markers first, each the column or table that the release in question introduced. `sessions` has
-/// existed for as long as meka has had a store, so its absence means there is nothing of meka's
+/// existed for as long as Meka has had a store, so its absence means there is nothing of Meka's
 /// here. `gate_permission` is what 0.42 added, so a `scheduled_jobs` without it is exactly 0.41.
 ///
 /// Then completeness, because returning `1` asserts that *everything* the baseline creates is
@@ -1824,7 +1824,7 @@ fn store_name(connection: &rusqlite::Connection) -> &str {
 /// last. Without the check such a store is stamped at head with a table still missing, which
 /// nothing will ever revisit. Refusing names what is wrong instead.
 fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
-    // Not a meka store: an empty file, or one carrying tables meka did not write. Nothing to carry
+    // Not a Meka store: an empty file, or one carrying tables Meka did not write. Nothing to carry
     // forward either way, so build the schema alongside whatever is already there, which is what
     // every release before this one did to such a file too.
     if table_columns(connection, "sessions")?.is_empty() {
@@ -1833,7 +1833,7 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
     let columns = table_columns(connection, "scheduled_jobs")?;
     if columns.is_empty() {
         return Err(MekaError::Database(format!(
-            "{} has tables but no `scheduled_jobs`, so it predates 0.42 and this meka cannot bring \
+            "{} has tables but no `scheduled_jobs`, so it predates 0.42 and this Meka cannot bring \
              it forward. Nothing has been changed. Run the 0.42 release against it once, then this \
              one",
             store_name(connection)
@@ -1841,7 +1841,7 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
     }
     if !columns.iter().any(|column| column == "gate_permission") {
         return Err(MekaError::Database(format!(
-            "{} is in the 0.41 shape, which this meka cannot bring forward. Nothing has been \
+            "{} is in the 0.41 shape, which this Meka cannot bring forward. Nothing has been \
              changed. Run `migrate-0.41-to-0.42.py`, attached to the 0.42 release, once; every \
              upgrade after that is automatic",
             store_name(connection)
@@ -1866,7 +1866,7 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
             }
         }
         // Reported under the baseline's own name. A store that reaches here has none of the later
-        // ones either, and naming a table this meka would create under a different name would send
+        // ones either, and naming a table this Meka would create under a different name would send
         // the reader looking for the wrong thing in their backup.
         if !found && let Some(baseline) = names.first() {
             missing.push(*baseline);
@@ -1876,7 +1876,7 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
         return Err(MekaError::Database(format!(
             "{} is missing {}, which every release from 0.42 creates, so it was probably left \
              half-built by an interrupted first run. Nothing has been changed. Move it aside and \
-             let meka build a new one",
+             let Meka build a new one",
             store_name(connection),
             missing.join(", ")
         )));
@@ -2108,7 +2108,7 @@ const BASELINE_0_42: &str = "
 
 /// 0.43: a gate becomes `gate_kind` plus a JSON `gate_spec`, and a due occurrence is leased.
 ///
-/// Both old values were written only by meka, so the predicate mapping is a rename rather than a
+/// Both old values were written only by Meka, so the predicate mapping is a rename rather than a
 /// guess.
 fn gates_become_kind_and_spec(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     let columns: Vec<String> = {
@@ -2272,7 +2272,7 @@ fn sessions_name_their_provider(
             // one variant available without enabling a rusqlite feature for a single error path.
             return Err(rusqlite::Error::InvalidParameterName(format!(
                 "cannot record a provider for {} carried-forward session(s) while config.toml \
-                 cannot be read; fix the file and start meka again",
+                 cannot be read; fix the file and start Meka again",
                 carried
             )));
         }
@@ -2317,7 +2317,7 @@ fn sessions_name_their_provider(
     // the rest learn to skip.
     if adopting > 0 {
         tracing::info!(
-            "recorded provider profile '{}' on {} session(s) that predate meka recording one. \
+            "recorded provider profile '{}' on {} session(s) that predate Meka recording one. \
              Resume any that ran on a different profile once with --provider <name> to correct it",
             adopted,
             adopting
@@ -2698,7 +2698,7 @@ fn sessions_carry_approvals(
 
 /// The turn's context block becomes its own content block on every stored user turn.
 ///
-/// Until 0.46 a turn's user message was one text: meka's `<context>…</context>` preamble, a blank
+/// Until 0.46 a turn's user message was one text: Meka's `<context>…</context>` preamble, a blank
 /// line, then the words as typed, and every reader that wanted the words cut the preamble off
 /// again by looking for the closing tag. The block is typed now, and the split is made once here: a
 /// text that opens with the preamble is divided at its closing tag into a `turn_context` block and
@@ -2847,7 +2847,7 @@ fn move_inline_images(
         serde_json::Value::Object(map) => {
             // Only the `source` of an image block. A tool call's arguments or a text block could
             // carry an object of the same shape, and those are the model's words, not an image
-            // meka stored: rewriting them would leave a reference no reader ever resolves.
+            // Meka stored: rewriting them would leave a reference no reader ever resolves.
             let is_image = map.get("type").and_then(|kind| kind.as_str()) == Some("image");
             let inline = is_image
                 && map.get("source").is_some_and(|source| {
@@ -2904,7 +2904,7 @@ fn move_inline_images(
 }
 
 /// Three columns and four indexes take the names one rule gives them, and the JSON in two columns
-/// takes the serde shapes the rest of meka writes.
+/// takes the serde shapes the rest of Meka writes.
 ///
 /// `gate_spec` holds JSON and takes the `_json` suffix its siblings carry; `claimed_until` names an
 /// instant and takes `_at`; `memories.recorded_at` is the row's creation stamp and is `created_at`
@@ -3078,7 +3078,7 @@ fn respell_pointer_tests(transaction: &rusqlite::Transaction<'_>) -> rusqlite::R
 /// "messages":[..]}}`, and the messages it carries keep the thinking blocks of the rounds they
 /// replaced. Left tagged `kind`, the row no longer decodes, `load_events` drops it, and the
 /// conversation replays the very messages the provider had rejected. A `compact_boundary` row's
-/// summary is a user message meka wrote and carries no thinking; a `redact` row carries no
+/// summary is a user message Meka wrote and carries no thinking; a `redact` row carries no
 /// messages at all.
 ///
 /// The same rule one level down, restated rather than shared: the step that first applied it is
@@ -4142,7 +4142,7 @@ const ARCHIVE_FORMAT_0_88: u64 = 21;
 /// only in the words they were answered with.
 const ARCHIVE_FORMAT_0_90: u64 = 22;
 
-/// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
+/// How the text Meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
 /// without one, above a scheduled job's fire, and above a report of one task and of several.
 /// Frozen here, since the renderers may move on and this step converts what they wrote then.
@@ -4235,7 +4235,7 @@ fn report_in_context_0_76(context: &str) -> Option<(String, String)> {
 }
 
 /// Give the blocks of a user message their 0.76 kinds, reporting whether any changed: a `text`
-/// block meka wrote on another's behalf becomes its own kind, and a context block carrying a
+/// block Meka wrote on another's behalf becomes its own kind, and a context block carrying a
 /// report has the report moved out behind it. A block already typed matches nothing, so a replay
 /// changes nothing.
 #[allow(
@@ -4323,7 +4323,7 @@ fn type_user_events_0_76(document: &mut serde_json::Value) {
     }
 }
 
-/// Every user row holding text meka wrote on another's behalf takes 0.76's blocks: a `user` row
+/// Every user row holding text Meka wrote on another's behalf takes 0.76's blocks: a `user` row
 /// that is such a text becomes a `user_blocks` row holding the one block, and a `user_blocks` or
 /// `tool_results` row has each such `text` block typed and a report moved out of its context
 /// block. A short id the text carried is resolved against the session's own rows where one row
@@ -4557,7 +4557,7 @@ fn type_repairs_and_name_report_tasks_0_76(document: &mut serde_json::Value) {
     }
 }
 
-/// Every `repair` row holding text meka wrote on another's behalf takes 0.76's blocks in the
+/// Every `repair` row holding text Meka wrote on another's behalf takes 0.76's blocks in the
 /// messages it holds in place of the ones it replaced, as those rows took them: the view a
 /// replay reads is the repair's, so a block typed in the row it superseded and not in the repair
 /// would still be shown as words a person typed.
@@ -4659,7 +4659,7 @@ pub(crate) fn bring_memory_file_forward(
     from == current
 }
 
-/// Bring a session archive written by an older meka to the current shape, reporting whether it
+/// Bring a session archive written by an older Meka to the current shape, reporting whether it
 /// was one. `current` is the version this build writes, handed in as data the way a [`Context`]
 /// is. An archive is not the store, so the ledger never reaches it; this is the archive's one
 /// conversion, and the numbers of the versions it converts live here and nowhere else.
@@ -5485,7 +5485,7 @@ fn gate_tools_take_their_class_first_names(
 /// 0.64: `title` and `pinned_at` on `sessions`, and the contentless full-text index over the
 /// conversation's words that `meka session search` reads.
 ///
-/// The index is created empty and never filled here. What a message's words are is meka's own
+/// The index is created empty and never filled here. What a message's words are is Meka's own
 /// reading of the row, which a migration may not call, so `crate::store::search::reconcile_index`
 /// indexes every row it finds missing on the open that follows this step. A later step that
 /// rewrites `messages.content` must `DELETE FROM messages_fts`, and that same pass re-indexes
@@ -5545,7 +5545,7 @@ fn root_rows_take_the_default_level_once_the_config_reads(
         // an arbitrary message without enabling a rusqlite feature for a single error path.
         return Err(rusqlite::Error::InvalidParameterName(format!(
             "cannot record a level for {bare} root session(s) while config.toml cannot be read; \
-             fix the file and start meka again"
+             fix the file and start Meka again"
         )));
     }
     if !context.default_permission.is_empty() {
@@ -5593,7 +5593,7 @@ fn mcp_credentials_name_their_endpoint(
         // `InvalidParameterName` for the reason the 0.44 step gives.
         return Err(rusqlite::Error::InvalidParameterName(format!(
             "cannot bind {unbound} MCP credential(s) to their servers while config.toml cannot be \
-             read; fix the file and start meka again"
+             read; fix the file and start Meka again"
         )));
     }
     for (server, endpoint) in &context.mcp_endpoints {
@@ -5615,7 +5615,7 @@ fn mcp_credentials_name_their_endpoint(
                 if held > 0 {
                     return Err(rusqlite::Error::InvalidParameterName(format!(
                         "cannot bind {held} MCP credential(s) to '{server}' while its `url` does \
-                         not resolve: {why}; start meka again where it does"
+                         not resolve: {why}; start Meka again where it does"
                     )));
                 }
             }
@@ -5659,7 +5659,7 @@ pub(crate) fn create_for_test(connection: &mut rusqlite::Connection) -> Result<(
     apply(connection, plan, &Context::default())
 }
 
-/// The baseline DDL, for a test that needs to plant a store shaped the way an older meka left one.
+/// The baseline DDL, for a test that needs to plant a store shaped the way an older Meka left one.
 #[cfg(test)]
 pub(crate) fn baseline_for_test() -> &'static str {
     BASELINE_0_42
@@ -5903,7 +5903,7 @@ mod tests {
 
     /// A store stamped above head is refused, not migrated.
     ///
-    /// This fires for a store a *newer* meka wrote, and that is the only thing it is for. 0.44
+    /// This fires for a store a *newer* Meka wrote, and that is the only thing it is for. 0.44
     /// briefly relied on it for something else: `sessions_record_their_model_overrides` was deleted
     /// rather than reversed, on the reasoning that an unreleased entry belongs to nobody, and this
     /// refusal was supposed to catch the development stores that shortening the list left stranded
@@ -5920,7 +5920,7 @@ mod tests {
         let head = MIGRATIONS.len() as u32;
         connection
             .execute_batch(&format!("PRAGMA user_version = {};", head + 1))
-            .expect("stamp it as a newer meka would");
+            .expect("stamp it as a newer Meka would");
 
         let error = plan(&connection).expect_err("a store from the future must not be migrated");
         let message = error.to_string();
@@ -5989,7 +5989,7 @@ mod tests {
         );
     }
 
-    /// A table meka did not create is not meka's shape. Digesting every table in `sqlite_master`
+    /// A table Meka did not create is not Meka's shape. Digesting every table in `sqlite_master`
     /// refused a store beside which a replication tool kept its own bookkeeping, and told the user
     /// to copy a `-wal` that would have changed nothing.
     #[test]
@@ -6058,7 +6058,7 @@ mod tests {
         const SHIPPED: &[(&str, u64)] = &[
             ("baseline_0_42", 9890918125805624612_u64),
             ("gates_become_kind_and_spec", 10824300382461519644_u64),
-            ("sessions_name_their_provider", 10660157190827296968_u64),
+            ("sessions_name_their_provider", 17838913510850573512_u64),
             (
                 "sessions_record_their_model_overrides",
                 16447649218508969861_u64,
@@ -6085,12 +6085,12 @@ mod tests {
                 "user_turns_carry_their_context_as_a_block",
                 753895093100704199_u64,
             ),
-            ("images_live_in_blobs", 5999372279988225783_u64),
+            ("images_live_in_blobs", 8613966599644656087_u64),
             ("columns_follow_one_naming_rule", 6989040896223063432_u64),
             ("repair_rows_retag_their_thinking", 3721487409980884821_u64),
             (
                 "root_rows_take_the_default_level_once_the_config_reads",
-                7649120122176690823_u64,
+                14930254625248649959_u64,
             ),
             (
                 "background_tasks_spell_canceled_with_one_l",
@@ -6187,13 +6187,13 @@ mod tests {
             ),
             (
                 "mcp_credentials_name_their_endpoint",
-                400404944289461485_u64,
+                10686759914084055085_u64,
             ),
             ("messages_record_unsigned_thinking", 5083750834782537321_u64),
             ("scheduled_jobs_name_their_zone", 11818223669390445530_u64),
             (
                 "sealed_reasoning_names_its_endpoint",
-                12275967669795080019_u64,
+                6113827880568241459_u64,
             ),
             (
                 "messages_hold_invocations_and_resources",
@@ -6375,7 +6375,7 @@ mod tests {
     /// else the day those types are refactored.
     ///
     /// `super::` is checked as well as `crate::`, and that is not belt-and-braces. This module is a
-    /// child of `session`, so every item in meka is reachable as `super::super::…`; a scan for
+    /// child of `session`, so every item in Meka is reachable as `super::super::…`; a scan for
     /// `crate::` alone accepts `super::super::schedule::Gate::spec`, which is precisely the call
     /// the module docs single out as forbidden. Verified against the earlier form of this test,
     /// which passed it.
@@ -6405,7 +6405,7 @@ mod tests {
             }
             assert_eq!(
                 code, "use crate::error::{MekaError, Result};",
-                "a migration may not reach into meka's own code, by any path; see the module docs"
+                "a migration may not reach into Meka's own code, by any path; see the module docs"
             );
         }
     }
@@ -7320,7 +7320,7 @@ mod tests {
         );
     }
 
-    /// Words that open the way meka's own text did before 0.76 typed it are a person's in an
+    /// Words that open the way Meka's own text did before 0.76 typed it are a person's in an
     /// archive written since, and stay as typed: only the formats that held the old shape are read
     /// by its opening words.
     #[test]
@@ -7706,7 +7706,7 @@ mod tests {
         );
         plant_message(&connection, "s", "user", "no image here");
         // A tool call whose arguments happen to be shaped like an image source: the model's words,
-        // not an image meka stored, so they must be left exactly as they were.
+        // not an image Meka stored, so they must be left exactly as they were.
         let arguments = format!(
             "[{{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"scratchpad_write\",\"input\":{inline}}}]"
         );
@@ -8866,10 +8866,10 @@ mod tests {
         assert!(message.contains("Nothing has been changed"), "{message}");
     }
 
-    /// A refusal has to name the file it is about. meka creates a store on any invocation while
-    /// `config.toml` appears only once a provider is added, so a machine that ran an old meka once
+    /// A refusal has to name the file it is about. Meka creates a store on any invocation while
+    /// `config.toml` appears only once a provider is added, so a machine that ran an old Meka once
     /// and was never configured holds a store its owner has no reason to believe exists. Told only
-    /// that "this store" is in the 0.41 shape, the honest reading there is that meka is wrong about
+    /// that "this store" is in the 0.41 shape, the honest reading there is that Meka is wrong about
     /// a database that was never set up.
     ///
     /// Every refusal, not only the one that prompted this: each ends with the reader going to look
@@ -8956,7 +8956,7 @@ mod tests {
 
     /// The bug [`RETIRED_INITIALIZED_FLAG`] exists for, found by running against a real store.
     ///
-    /// Every meka up to 0.41 stamped `user_version = 1` on a store it had finished initializing, so
+    /// Every Meka up to 0.41 stamped `user_version = 1` on a store it had finished initializing, so
     /// a 0.41 store in the wild carries it. Taking that at face value skipped the shape probe,
     /// which is where this refusal lives; the gate conversion then ran against a table with no
     /// `gate_permission`, dropped the columns it had read, committed, and stamped head. Reproduced
@@ -9020,7 +9020,7 @@ mod tests {
         assert_eq!(user_version(&connection).expect("version"), 99);
     }
 
-    /// A file meka did not write is not a store to carry forward. Every release before this one
+    /// A file Meka did not write is not a store to carry forward. Every release before this one
     /// created its tables alongside whatever was already there, and so does this.
     #[test]
     fn a_database_that_is_not_a_meka_store_is_built_rather_than_refused() {
@@ -9031,7 +9031,7 @@ mod tests {
         let plan = plan(&connection).expect("classified as new");
         assert_eq!(
             plan.from, 0,
-            "there is nothing of meka's here to carry forward"
+            "there is nothing of Meka's here to carry forward"
         );
         apply(&mut connection, plan, &Context::default()).expect("the schema is built");
         assert!(
@@ -9060,7 +9060,7 @@ mod tests {
                 "INSERT INTO sessions (id, created_at, updated_at) VALUES \
                  ('11111111-1111-4111-8111-111111111111', '2020-01-01', '2020-01-01')",
             )
-            .expect("a session that predates meka recording a provider");
+            .expect("a session that predates Meka recording a provider");
         let before = fingerprint(&carrying);
 
         let carrying_plan = plan(&carrying).expect("classified");
@@ -9194,8 +9194,8 @@ mod tests {
         );
     }
 
-    /// A task an earlier meka stopped on request recorded `cancelled`, and the reader accepts only
-    /// the spelling meka writes now. Replayed, the step finds nothing left to rewrite.
+    /// A task an earlier Meka stopped on request recorded `cancelled`, and the reader accepts only
+    /// the spelling Meka writes now. Replayed, the step finds nothing left to rewrite.
     #[test]
     fn a_task_status_spelled_with_two_ls_reads_back_as_canceled() {
         let mut store = store_as_0_42_left_it();
@@ -9963,7 +9963,7 @@ mod tests {
         );
     }
 
-    /// 0.76's last step types what meka wrote into a user message on another's behalf: a `user`
+    /// 0.76's last step types what Meka wrote into a user message on another's behalf: a `user`
     /// row that is an inbox item becomes a `user_blocks` row holding the item's block, with the
     /// source and the words the header carried and neither an id nor a class, which it never
     /// held; a `text` block that is a scheduled fire or a report takes its kind, the job's and the
@@ -10125,7 +10125,7 @@ mod tests {
     }
 
     /// A format-10 archive, the one 0.76's development builds wrote, takes the blocks 0.76 gives
-    /// what meka relayed, with a task or a job named by the short id the text carried, since an
+    /// what Meka relayed, with a task or a job named by the short id the text carried, since an
     /// archive has no rows to resolve it against; a replay is a no-op, and the converted archive
     /// reads.
     #[test]
@@ -10769,7 +10769,7 @@ mod tests {
     }
 
     /// A turn from before 0.88 records the level its opening message told the model; one whose
-    /// opening told none takes its session's level, and one on a session at a level meka does not
+    /// opening told none takes its session's level, and one on a session at a level Meka does not
     /// know takes `read`. A turn that recorded its level keeps it, and a replay changes nothing.
     /// Through `Store::open` and `load_turns`, because the level is required at read.
     #[tokio::test]
@@ -11427,7 +11427,7 @@ mod tests {
                         ('note', 'sometimes', 5, '2024-02-01T00:00:00+00:00',
                          '2024-06-01T00:00:00+00:00');",
             )
-            .expect("two rows an older meka wrote");
+            .expect("two rows an older Meka wrote");
 
         let pending = plan(&connection).expect("plan");
         assert_eq!(pending.from as usize, step);
@@ -11885,7 +11885,7 @@ mod tests {
                  INSERT INTO sessions (id, created_at, updated_at, working_directory)
                  VALUES ('s1', '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00', '/w');",
             )
-            .expect("rows an older meka wrote");
+            .expect("rows an older Meka wrote");
 
         let pending = plan(&connection).expect("plan");
         assert_eq!(

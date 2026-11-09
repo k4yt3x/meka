@@ -8,7 +8,7 @@ use crate::streams::write_stderr_line;
 ///
 /// `print!` and `println!` panic when the write fails, which is the wrong answer for the one stream
 /// a caller is meant to pipe: `meka --oneshot … | head` closes it mid-answer, and where every other
-/// tool exits, meka crashes. Every write of an answer goes through this or [`write_stdout_line`],
+/// tool exits, Meka crashes. Every write of an answer goes through this or [`write_stdout_line`],
 /// which is what makes the `io::Result` the truth about what reached the terminal rather than a
 /// formality.
 pub(crate) fn write_stdout(text: impl std::fmt::Display) -> io::Result<()> {
@@ -70,7 +70,7 @@ impl Stream {
 }
 /// The payload marking a broken pipe as *this process's stdout* rather than any other.
 ///
-/// A reader that stops reading is its own decision and meka exits 0 for it, but that has to mean
+/// A reader that stops reading is its own decision and Meka exits 0 for it, but that has to mean
 /// the reader of the stream the command was writing its answer to. A `BrokenPipe` reaching the same
 /// place from somewhere else -- `session export --output <fifo>`, where the user named a
 /// destination and the data did not land -- is a failure, and answering 0 to it reports success
@@ -124,7 +124,7 @@ pub(crate) fn render_error(error: &dyn std::fmt::Display) {
 /// A stage direction about the output rather than output of its own: `(interrupted)`.
 ///
 /// Yellow, not red. None of these is a failure -- an interrupt is the user's own doing, and the
-/// background-task notices describe meka doing as it was asked. [`Color::Red`] belongs to
+/// background-task notices describe Meka doing as it was asked. [`Color::Red`] belongs to
 /// [`render_error`] alone, and is worth keeping at one meaning. Yellow already carries "worth
 /// noticing, nothing went wrong" here: it is the `read` permission indicator and an in-progress
 /// checklist item. Not [`Color::DarkGrey`] either, which is the right *class* but is what thinking
@@ -132,10 +132,10 @@ pub(crate) fn render_error(error: &dyn std::fmt::Display) {
 /// musings -- spotting it in scrollback is the whole point, since at the time you already knew.
 ///
 /// Parenthesised and lowercase because it annotates the transcript rather than speaking:
-/// `Interrupted.` reads as meka saying something, `(interrupted)` as a note on the answer that
+/// `Interrupted.` reads as Meka saying something, `(interrupted)` as a note on the answer that
 /// stopped, in the same register as `(truncated)`.
 ///
-/// Every caller passes one of meka's own strings, so there is nothing here to sanitize.
+/// Every caller passes one of Meka's own strings, so there is nothing here to sanitize.
 pub(crate) fn render_annotation(note: &str) {
     write_stderr_line(colored_for_stderr(
         format!("({})", rows_of(note)),

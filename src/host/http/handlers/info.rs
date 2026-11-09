@@ -255,7 +255,7 @@ pub(crate) async fn mcp_tools(
                 ErrorKind::Provider,
                 StatusCode::BAD_GATEWAY,
                 format!(
-                    "MCP server '{name}' could not list its tools; the reason is in the meka log"
+                    "MCP server '{name}' could not list its tools; the reason is in the Meka log"
                 ),
             )
             .with("server", name.clone())
@@ -286,7 +286,7 @@ pub(crate) struct McpReconnectResponse {
     pub(crate) server: String,
     /// Where the server stands now: `connected`, `failed`, or `pending`.
     ///
-    /// A 200 says meka acted on the request, not that the server came back, so read this to find
+    /// A 200 says Meka acted on the request, not that the server came back, so read this to find
     /// out which. `pending` means no attempt was made because one was already under way. A
     /// `disabled` server is a 422 and never appears here.
     pub(crate) state: String,
@@ -363,7 +363,7 @@ pub(crate) async fn mcp_reconnect(
                 kind,
                 status,
                 format!(
-                    "MCP server '{name}' did not reconnect; it is {}; the reason is in the meka log",
+                    "MCP server '{name}' did not reconnect; it is {}; the reason is in the Meka log",
                     state_before.label()
                 ),
             )

@@ -122,6 +122,13 @@ pub(crate) enum Item {
         level: NoticeLevel,
         text: String,
     },
+    /// A log line quieter than a warning, which only `-v` lets onto the screen: the module that
+    /// wrote it and its message, drawn as written, since a log line is not said in the screen's
+    /// voice.
+    Log {
+        target: String,
+        message: String,
+    },
     Error(String),
     /// What `!command` printed, escapes included.
     ShellOutput(String),
@@ -160,7 +167,11 @@ impl Item {
     fn keeps_banner(&self) -> bool {
         matches!(
             self,
-            Item::Banner { .. } | Item::Notice { .. } | Item::Error(_) | Item::Compaction { .. }
+            Item::Banner { .. }
+                | Item::Notice { .. }
+                | Item::Log { .. }
+                | Item::Error(_)
+                | Item::Compaction { .. }
         )
     }
 
@@ -726,7 +737,7 @@ impl Transcript {
                 ran_under: RanUnder::Shell,
                 ..
             } => true,
-            Item::Error(_) | Item::Notice { .. } => !entry.left_to_replay,
+            Item::Error(_) | Item::Notice { .. } | Item::Log { .. } => !entry.left_to_replay,
             _ => false,
         });
         self.open_text = None;
@@ -1393,7 +1404,7 @@ impl Transcript {
                 });
             }
             // The message a turn opens with, whichever door opened it. The person's own words are
-            // drawn as they are typed and the context block is meka's; a fire and a report are
+            // drawn as they are typed and the context block is Meka's; a fire and a report are
             // said as the stage directions a replay of the log says, so the two read alike.
             // A fire says how late it ran, news as it happens, which a replay of the log does
             // not know.
@@ -1904,7 +1915,7 @@ impl Transcript {
                     }
                     // Folded into the words around it by `conversation::mentions_inline`.
                     ContentBlock::Resource { .. } => {}
-                    // meka's words: a replay says the stage direction the live screen said.
+                    // Meka's words: a replay says the stage direction the live screen said.
                     ContentBlock::Scheduled { job_id, prompt, .. } => {
                         let entry = self.entry(Item::note(crate::render::fire_direction(
                             job_id, prompt, None,
@@ -1916,7 +1927,7 @@ impl Transcript {
                             self.entry(Item::note(self.replayed_report_direction(task_ids)));
                         out.push(entry);
                     }
-                    // meka's own words for the turn; a replay shows what was typed.
+                    // Meka's own words for the turn; a replay shows what was typed.
                     ContentBlock::TurnContext { .. } | ContentBlock::Nudge { .. } => {}
                     ContentBlock::Image { source } => {
                         let entry = self.entry(Item::Image(self.picture_of(source)));
@@ -2079,7 +2090,7 @@ fn edge_turns(page: &crate::store::LogPage) -> (Option<Uuid>, Option<Uuid>) {
     )
 }
 
-/// The readable part of a tool result, tail-capped, and how many images it carried. What meka
+/// The readable part of a tool result, tail-capped, and how many images it carried. What Meka
 /// wrote into a result for the model alone is left out or said for a reader: the line naming a
 /// file read as an image, which the count says; the tools a load made callable, which its row
 /// names; the directions around a large output kept in the scratchpad. The notice of a call sent
@@ -3160,7 +3171,7 @@ mod tests {
         );
     }
 
-    /// What meka wrote into a result for the model alone is left out of the screen or said for
+    /// What Meka wrote into a result for the model alone is left out of the screen or said for
     /// a reader: the line naming an image, the tools a load made callable, the directions around
     /// a large output and around a call sent to the background.
     #[test]
@@ -3570,6 +3581,10 @@ mod tests {
         let mut transcript = transcript();
         transcript.push(banner());
         transcript.push(Item::note("sandbox: bubblewrap not found"));
+        transcript.push(Item::Log {
+            target: "meka::sandbox".into(),
+            message: "probing bubblewrap".into(),
+        });
         assert!(matches!(items(&transcript)[0], Item::Banner { .. }));
         transcript.push(Item::Prompt {
             text: "hi".into(),
@@ -3579,9 +3594,10 @@ mod tests {
             ran_under: RanUnder::Level(crate::permission::Permission::Read),
         });
         let shown = items(&transcript);
-        assert_eq!(shown.len(), 2, "{shown:#?}");
+        assert_eq!(shown.len(), 3, "{shown:#?}");
         assert!(matches!(shown[0], Item::Notice { .. }));
-        assert!(matches!(shown[1], Item::Prompt { .. }));
+        assert!(matches!(shown[1], Item::Log { .. }));
+        assert!(matches!(shown[2], Item::Prompt { .. }));
 
         let mut resumed = self::tests::transcript();
         resumed.set_log_end(Some(1));
@@ -3852,7 +3868,7 @@ mod tests {
         ]);
         assert!(
             !shown.iter().any(|item| matches!(item, Item::Prompt { text, .. } if text.contains("[Scheduled") || text.contains("[Background"))),
-            "nothing meka wrote is shown as a prompt: {shown:?}"
+            "nothing Meka wrote is shown as a prompt: {shown:?}"
         );
     }
 
@@ -4175,7 +4191,7 @@ mod tests {
     }
     /// The message a turn opens with is said as the stage directions a replay of the log says:
     /// what reported, then the fire with its lateness, which only the live announcement knows.
-    /// The person's words are drawn as typed and the context block is meka's, so neither says
+    /// The person's words are drawn as typed and the context block is Meka's, so neither says
     /// anything here.
     #[test]
     fn a_turn_s_opening_says_its_report_and_its_fire_as_directions() {
@@ -4929,12 +4945,20 @@ mod tests {
     fn a_reset_lets_go_of_what_a_turn_said_and_keeps_what_was_said_between_turns() {
         let mut transcript = transcript();
         transcript.push(Item::note("Connected to 'exa'"));
+        transcript.push(Item::Log {
+            target: "meka::mcp".into(),
+            message: "listed 4 tools".into(),
+        });
         transcript.apply(FrontendEvent::TurnStarted {
             turn_id: Uuid::new_v4(),
         });
         transcript.push(Item::Notice {
             level: NoticeLevel::Warn,
             text: "Interrupted".into(),
+        });
+        transcript.push(Item::Log {
+            target: "meka::agent::turn".into(),
+            message: "turn started".into(),
         });
         transcript.push(Item::Error("provider error: down".into()));
         transcript.push(Item::Prompt {
@@ -4948,7 +4972,15 @@ mod tests {
         transcript.reset(None);
         let shown = items(&transcript);
         assert!(
-            matches!(shown[..], [Item::Notice { .. }, Item::Prompt { .. }]),
+            matches!(shown[..], [
+                Item::Notice { .. },
+                Item::Log { .. },
+                Item::Prompt { .. }
+            ]),
+            "{shown:?}"
+        );
+        assert!(
+            matches!(shown[1], Item::Log { message, .. } if message == "listed 4 tools"),
             "{shown:?}"
         );
         assert!(

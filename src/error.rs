@@ -69,12 +69,12 @@ pub(crate) enum MekaError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
-    /// meka's own refusal to send a body still over the profile's `max_request_bytes` once every
+    /// Meka's own refusal to send a body still over the profile's `max_request_bytes` once every
     /// older image has been redacted.
     ///
     /// Not [`Self::InvalidRequest`], which means the *provider* refused a body and is published
     /// with the provider's response beside it: this request never left the process and the
-    /// sentence is meka's own, naming the ceiling and the remedy, so every host relays it verbatim
+    /// sentence is Meka's own, naming the ceiling and the remedy, so every host relays it verbatim
     /// as the caller's to act on. The agent loop answers it as it answers `InvalidRequest`, by
     /// degrading what the turn appended, because once the older images are gone the newest content
     /// is what is left to blame.
@@ -164,7 +164,7 @@ pub(crate) enum MekaError {
     #[error("agent interrupted by user")]
     Interrupted,
 
-    /// A logic invariant in meka itself was violated. Used in place of `.expect()` for cases where
+    /// A logic invariant in Meka itself was violated. Used in place of `.expect()` for cases where
     /// a bug in our own code (not user input or I/O) is the only path to the error.
     #[error("internal error: {0}")]
     Internal(String),
@@ -275,9 +275,9 @@ pub(crate) enum MekaError {
     )]
     AccountCredentialLeftOver { account: String },
 
-    /// Another meka is refreshing the account's credential, which a rename would move from under
+    /// Another Meka is refreshing the account's credential, which a rename would move from under
     /// it. Nothing is wrong with what was asked; asked again shortly, it goes through.
-    #[error("account '{account}' is refreshing its credential in another meka; retry shortly")]
+    #[error("account '{account}' is refreshing its credential in another Meka; retry shortly")]
     AccountRefreshing { account: String },
 
     /// A profile a door would write, or a run would use, names no model. The display is the
@@ -549,7 +549,7 @@ pub(crate) enum ErrorKind {
     /// somebody else's.
     TurnMismatch,
     /// The named skill lives under a read-only root from `[skills] additional_directories`, so
-    /// writing it here would create a shadowing copy in meka's own store rather than change the
+    /// writing it here would create a shadowing copy in Meka's own store rather than change the
     /// file.
     ///
     /// Distinct from [`Self::InvalidBody`]: the request is well-formed and the remedy is to pick
@@ -561,7 +561,7 @@ pub(crate) enum ErrorKind {
     /// one's is unsetting the source in charge.
     InstructionsOverridden,
     /// The account's credential refreshes under its name while something holds it, a session
-    /// resident on this server or another meka refreshing it now: renamed under it, the next
+    /// resident on this server or another Meka refreshing it now: renamed under it, the next
     /// refresh would write to a row that is gone.
     AccountInUse,
     /// The server has begun shutting down and takes nothing on that would outlive it, such as a
@@ -592,33 +592,33 @@ pub(crate) enum ErrorKind {
     /// conversation that is no longer the one the server holds. The remedy is to read it again and
     /// decide again, which `position` on the detail supports.
     PreconditionFailed,
-    /// The conversation meka assembled still exceeds the profile's `max_request_bytes` after every
-    /// older image was redacted, so meka refused to send it.
+    /// The conversation Meka assembled still exceeds the profile's `max_request_bytes` after every
+    /// older image was redacted, so Meka refused to send it.
     ///
-    /// meka's own refusal, which is why it is a 422 and not one of the 502s: nothing was sent and
+    /// Meka's own refusal, which is why it is a 422 and not one of the 502s: nothing was sent and
     /// no provider judged it, so there is no upstream response to relay and `detail` is the whole
     /// answer. Distinct from [`Self::PayloadTooLarge`], which is `max_body_bytes` on the HTTP
-    /// request rather than the profile's ceiling on what meka may send, and from
+    /// request rather than the profile's ceiling on what Meka may send, and from
     /// [`Self::ContextOverflow`], which is the model's window and comes back from the provider.
     ///
     /// Resending the same turn will be refused identically; the remedy is in `detail`.
     RequestTooLarge,
     PayloadTooLarge,
     ConcurrencyLimit,
-    /// An upstream call failed for a reason meka could not place in one of the classes below.
+    /// An upstream call failed for a reason Meka could not place in one of the classes below.
     ///
     /// **A catch-all, not a "permanent" bucket, and the difference is worth stating because the
     /// obvious reading of the name is the wrong one.** It is the `else` arm of
     /// [`provider_http_error`] plus every site that builds a bare [`MekaError::Provider`], so a
     /// revoked credential lands here, and so do a 408, a 425, a 200 whose body was replaced by a
     /// proxy's HTML, and any mid-stream error type outside the retryable allowlists. Several of
-    /// those are transient; meka simply did not recognize them as such.
+    /// those are transient; Meka simply did not recognize them as such.
     ///
     /// So it means "not classified as transient", which is weaker than "will fail again", and the
     /// docs must not promise the stronger thing. [`Self::ProviderUnavailable`] is the positive
     /// signal and this is its absence.
     Provider,
-    /// The upstream failed in a way meka's own classifier had already labeled transient.
+    /// The upstream failed in a way Meka's own classifier had already labeled transient.
     ///
     /// A 502 like [`Self::Provider`], and a distinct `type` for the reason
     /// [`Self::ContextOverflow`] is one: the remedies differ. This one is worth sending again after
@@ -629,11 +629,11 @@ pub(crate) enum ErrorKind {
     /// header is absent from most of this variant's own instances: a transport failure has no
     /// response to carry one, a mid-stream `overloaded_error` has no headers to read, and
     /// [`parse_retry_after`] reads only the delta-seconds form, so an upstream answering with an
-    /// HTTP date sends none meka can use. An overload would otherwise arrive byte-identical to a
+    /// HTTP date sends none Meka can use. An overload would otherwise arrive byte-identical to a
     /// dead credential, and a client would have to choose between retrying that credential
     /// forever and dropping turns a second attempt would have completed.
     ///
-    /// Claims a *class*, never an outcome, and says nothing about how many attempts meka made.
+    /// Claims a *class*, never an outcome, and says nothing about how many attempts Meka made.
     /// `should_retry_provider_error` declines to retry at all once any output has reached the
     /// stream or the retry budget is spent, so this can arrive after three attempts or after none.
     ProviderUnavailable,
@@ -645,7 +645,7 @@ pub(crate) enum ErrorKind {
     /// a shorter conversation. Nothing changes until the reset, which rides as `Retry-After` when
     /// the upstream stated one.
     ProviderExhausted,
-    /// The conversation no longer fits the model's context window, and meka could not compact it
+    /// The conversation no longer fits the model's context window, and Meka could not compact it
     /// down far enough (or `auto_compact` is off).
     ///
     /// A 502 like [`Self::Provider`], because the upstream is what refused the turn, but a distinct
@@ -656,16 +656,16 @@ pub(crate) enum ErrorKind {
     /// remedy is to shorten the conversation: `POST /v1/sessions/{id}/compact`, or `/rewind`, or a
     /// smaller message.
     ///
-    /// Not [`Self::PayloadTooLarge`], which is meka's own `max_body_bytes` on the HTTP request and
+    /// Not [`Self::PayloadTooLarge`], which is Meka's own `max_body_bytes` on the HTTP request and
     /// has nothing to do with the model's window; a request well under one limit routinely exceeds
     /// the other.
     ContextOverflow,
     /// A server marked `[mcp.servers.<name>] required` was not connected when a turn asked for it,
     /// so the turn was refused before anything reached the provider.
     ///
-    /// A 503 rather than a 502: the dependency that is unwell is one meka manages rather than the
+    /// A 503 rather than a 502: the dependency that is unwell is one Meka manages rather than the
     /// model provider, and the caller's request was never forwarded to anything. Distinct from
-    /// [`Self::Internal`], which reads as "meka broke" and sends an operator to the wrong log: meka
+    /// [`Self::Internal`], which reads as "Meka broke" and sends an operator to the wrong log: Meka
     /// classified this one correctly, and the fault is in a subprocess or a remote MCP server.
     McpUnavailable,
     Internal,
@@ -752,7 +752,7 @@ impl ErrorKind {
         }
     }
 
-    /// The `type` URI a Problem Detail carries: [`Self::name`] under meka's error namespace.
+    /// The `type` URI a Problem Detail carries: [`Self::name`] under Meka's error namespace.
     pub(crate) const fn type_uri(self) -> &'static str {
         match self {
             Self::Auth => "https://meka.bot/errors/auth",
@@ -867,7 +867,7 @@ impl MekaError {
             // and the remedy is to wait, not to change it.
             Self::AccountRefreshing { .. } => ErrorKind::AccountInUse,
             // Same status as the three above, different `type`, because the remedies do not
-            // overlap: meka's own ceiling, refused before anything was sent, and a permanent
+            // overlap: Meka's own ceiling, refused before anything was sent, and a permanent
             // property of the id itself.
             Self::RequestTooLarge(_) => ErrorKind::RequestTooLarge,
             Self::SessionNotDrivable(_) => ErrorKind::SessionNotDrivable,
@@ -875,7 +875,7 @@ impl MekaError {
             // `else`, so a revoked credential lands here and so does a 408, a 425 and any
             // mid-stream error type outside the retryable allowlists. `InvalidRequest` belongs
             // here despite naming a 400: what the upstream called invalid is the conversation
-            // meka assembled, which the caller neither sent nor can fix by correcting its own
+            // Meka assembled, which the caller neither sent nor can fix by correcting its own
             // payload, and sending it again unchanged gets the same 400 back.
             Self::Provider(_) | Self::InvalidRequest(_) => ErrorKind::Provider,
             // The transient class, recovered from the branch the retry classifier took rather
@@ -888,7 +888,7 @@ impl MekaError {
             Self::ProviderExhausted { .. } => ErrorKind::ProviderExhausted,
             Self::ContextOverflow(_) => ErrorKind::ContextOverflow,
             // A fully classified pre-flight refusal: answering "internal server error" would send
-            // an operator looking for a bug in meka instead of at the subprocess that did not
+            // an operator looking for a bug in Meka instead of at the subprocess that did not
             // start.
             Self::McpTurnGated { .. }
             | Self::McpLoginRequired { .. }
@@ -914,7 +914,7 @@ impl MekaError {
         }
     }
 
-    /// What meka says about this error to a caller: what happened and, where there is exactly
+    /// What Meka says about this error to a caller: what happened and, where there is exactly
     /// one, the remedy. Never the upstream's own text, which [`Self::upstream_body`] carries for
     /// the one surface configured to relay it, and never an installation fault's path, which is
     /// the operator's to read in the log.
@@ -966,7 +966,7 @@ impl MekaError {
             // can carry a spawn failure complete with the command line and its path; the names
             // are the operator's own configuration and the only part a caller can act on.
             Self::McpTurnGated { servers } => format!(
-                "required MCP server(s) not ready: {}; each server's reason is in the meka log",
+                "required MCP server(s) not ready: {}; each server's reason is in the Meka log",
                 servers
                     .iter()
                     .map(|(name, _)| name.as_str())
@@ -1056,10 +1056,10 @@ pub(crate) const THINKING_BINDING_REJECTION_FOR_TEST: &str = "API returned statu
     \\\"drop_block\\\". The `tools` list differs from the one this block was created with.\"},\
     \"request_id\":\"req_011CgWJHoMS32WKHmmHBhMZz\"}";
 
-/// A failure whose message has already been printed in meka's own format.
+/// A failure whose message has already been printed in Meka's own format.
 ///
 /// Returning the error itself would print it twice, since `main`'s `anyhow::Result` prints whatever
-/// it is given; returning `Ok(())` tells every supervisor and wrapper script that a session meka
+/// it is given; returning `Ok(())` tells every supervisor and wrapper script that a session Meka
 /// refused to open was a successful run. This carries the exit status and nothing else, so the host
 /// keeps its own rendering (color, and the provider hint underneath) and still fails.
 #[derive(Debug)]
@@ -1144,7 +1144,7 @@ pub(crate) enum ProviderRequest {
     /// turn content. (`crate::store::memory` constructs the variant too, for a different reason;
     /// its errors are absorbed into a tool result and never reach the agent loop's repair arm.)
     Completion,
-    /// Anything else meka asks a provider: a usage or identity probe, a history fetch.
+    /// Anything else Meka asks a provider: a usage or identity probe, a history fetch.
     ///
     /// Not an OAuth token exchange, which looks like it belongs here and does not:
     /// [`oauth_refresh_error`] judges those, because a spent grant needs a remedy attached and this
@@ -1279,7 +1279,7 @@ pub(crate) fn provider_transport_error(
     }
 }
 
-/// The most of one reply, or of one streamed event, meka holds in memory; past it the request ends
+/// The most of one reply, or of one streamed event, Meka holds in memory; past it the request ends
 /// with an error. A whole completion runs to a megabyte or two at the largest output caps and a
 /// streamed event to a fraction of that, so nothing legitimate comes near. What it bounds is an
 /// endpoint reached through `base_url` answering with something else, which would otherwise be read
@@ -1306,7 +1306,7 @@ pub(crate) async fn read_whole_reply(
 ///
 /// A declared length past the bound is refused before a byte of the body is read; a body of no
 /// declared length is refused the moment it passes it. Decoded as UTF-8 with replacement, which is
-/// what every API meka speaks sends and what a reply that is not JSON gets cut to anyway.
+/// what every API Meka speaks sends and what a reply that is not JSON gets cut to anyway.
 async fn read_whole_reply_within(
     response: reqwest::Response,
     max_bytes: usize,
@@ -1544,10 +1544,10 @@ pub(crate) fn provider_stream_error_object(
 }
 
 /// Classify an OAuth token exchange the authorization server *answered*, whether by rejecting it or
-/// by returning a success meka failed to read back.
+/// by returning a success Meka failed to read back.
 ///
 /// A refresh consumes its request: under RFC 9700 rotation the refresh token is single-use, so once
-/// the server has read it, it is spent and its replacement is in a response meka may not be
+/// the server has read it, it is spent and its replacement is in a response Meka may not be
 /// holding. Sending it again is a replay, and §4.14.2 has the server revoke the whole token family
 /// on one, which costs a browser login rather than a round trip. So the split is by what the answer
 /// implies about the token, not by whether one arrived: a 429 was refused before the grant was
@@ -1557,7 +1557,7 @@ pub(crate) fn provider_stream_error_object(
 /// is terminal too: the server accepted the token, so it is certainly spent.
 ///
 /// A transport failure stays with [`provider_transport_error`]: the token's fate is unknown, and a
-/// token spent without meka seeing the replacement is already dead, so retrying is right when the
+/// token spent without Meka seeing the replacement is already dead, so retrying is right when the
 /// request never landed and no worse than inaction when it did. Not [`provider_http_error`] with
 /// [`ProviderRequest::Auxiliary`] either: that one sniffs the body for context-window phrases,
 /// which is meaningless from a token endpoint, and has no remedy to attach.
@@ -2359,7 +2359,7 @@ mod tests {
         }
     }
 
-    /// A request meka could not build is not retried, because it will not build next time either.
+    /// A request Meka could not build is not retried, because it will not build next time either.
     ///
     /// Three shapes of the same fault, all of which reqwest reports as a builder error before a
     /// socket is ever opened: no host, no scheme, and a scheme reqwest does not speak.
@@ -2380,7 +2380,7 @@ mod tests {
                     provider_transport_error("HTTP request failed", &error, None),
                     MekaError::Provider(_)
                 ),
-                "'{url}' is meka's fault and retrying it changes nothing"
+                "'{url}' is Meka's fault and retrying it changes nothing"
             );
         }
     }
@@ -2391,7 +2391,7 @@ mod tests {
     /// generating". A server that accepts and then says nothing does produce that pattern, but
     /// `is_timeout` matches any `io::ErrorKind::TimedOut` anywhere in the source chain, so a write
     /// that times out on a pooled connection matches it too, having delivered nothing. Whether
-    /// meka retries cannot rest on it.
+    /// Meka retries cannot rest on it.
     ///
     /// Loopback only: a blackholed TEST-NET-3 address needs a default route that silently drops
     /// packets, and offline CI or `--network=none` answers `ENETUNREACH` at once instead.
@@ -2679,7 +2679,7 @@ mod tests {
     /// The overflow phrases are read on a 4xx and nowhere else.
     ///
     /// Consulting the body before the status classifies a 500 mentioning the context window as an
-    /// overflow. The body is not meka's to trust that far. A server that fails while echoing the
+    /// overflow. The body is not Meka's to trust that far. A server that fails while echoing the
     /// request back (which providers do) turns a transient 500 into an emergency compaction, so a
     /// turn whose text merely discussed `context_length_exceeded` has its context destroyed to
     /// answer a blip, and skips both the retry and the outage reprieve on the way.
@@ -2688,7 +2688,7 @@ mod tests {
     /// 400-shaped overflow every backend actually sends.
     ///
     /// `429` is asserted alongside the 5xx rather than left to the sibling test, because it is the
-    /// same rule and was fixed one release later than the 5xx was: a rate limit says how often meka
+    /// same rule and was fixed one release later than the 5xx was: a rate limit says how often Meka
     /// is asking, never how large the request is. It is also the likeliest status to carry an
     /// echoed body, since a busy session meets it first. The existing `429` tests use bodies with
     /// no overflow phrase in them, so they pass whichever way this goes and cover nothing here.

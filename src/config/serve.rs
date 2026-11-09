@@ -25,17 +25,17 @@ pub(crate) struct ServeConfig {
     /// Request body size limit (bytes). Default 10 MiB.
     pub(crate) max_body_bytes: Option<usize>,
     /// Whether a 502 carries the failing provider call's error text, as a `provider_response`
-    /// extension member. Default `true`. `detail` is meka's own sentence and is identical either
+    /// extension member. Default `true`. `detail` is Meka's own sentence and is identical either
     /// way.
     ///
     /// On, because the upstream's error type is the actionable part of a failed turn and "consult
-    /// the server log" is no answer to anyone running against a meka they do not operate. `meka
+    /// the server log" is no answer to anyone running against a Meka they do not operate. `meka
     /// acp` honors this key too: the same policy decides what a failed turn's `error.data`
     /// carries.
     ///
     /// **What it can expose.** Usually the upstream's response body, which can name the
     /// *operator's* account with the provider and its rate-limit posture. Not always, though: the
-    /// member carries the failing call's error message, and for some failures that is meka's own
+    /// member carries the failing call's error message, and for some failures that is Meka's own
     /// sentence about the call rather than anything the provider sent.
     ///
     /// **Who can read it.** `sessions:r`, not just `sessions:w`. Submitting a turn takes the write
@@ -44,7 +44,7 @@ pub(crate) struct ServeConfig {
     ///
     /// Turn it off where read-only tokens go to people who may watch a session but are not
     /// entitled to the account behind it. `/errors/mcp-unavailable` is not covered either way: it
-    /// reports server names only, and that reason is meka's own subprocess text.
+    /// reports server names only, and that reason is Meka's own subprocess text.
     pub(crate) relay_provider_errors: Option<bool>,
     /// Whether to serve the OpenAPI document at `/v1/openapi.json`. Default `false`.
     ///
@@ -96,7 +96,7 @@ pub(crate) struct ServeConfig {
     /// Bearer tokens configured for this deployment. An empty list is refused at startup: `meka
     /// serve` exits rather than binding a port nothing can authenticate against.
     pub(crate) tokens: Option<Vec<ServeTokenConfig>>,
-    /// Outbound webhook endpoints. Empty (the default) means meka never makes an outbound request.
+    /// Outbound webhook endpoints. Empty (the default) means Meka never makes an outbound request.
     pub(crate) webhooks: Option<Vec<WebhookConfig>>,
 }
 /// One entry in `[[serve.webhooks]]`.

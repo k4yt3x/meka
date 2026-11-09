@@ -871,12 +871,12 @@ impl FileRoute {
     fn write_disclosure(self) -> &'static str {
         match self {
             FileRoute::LocalUnservable => {
-                "\n\nNote: your editor declined to serve this path, so meka wrote it directly to \
+                "\n\nNote: your editor declined to serve this path, so Meka wrote it directly to \
                  disk. The change is in the diff for this tool call, but not in the editor's \
                  buffer or undo history."
             }
             FileRoute::LocalWriteUnsupported => {
-                "\n\nNote: your editor serves this file but does not accept writes, so meka wrote \
+                "\n\nNote: your editor serves this file but does not accept writes, so Meka wrote \
                  it directly to disk. If you have the file open with unsaved changes, they now \
                  differ from what is on disk."
             }
@@ -1759,7 +1759,7 @@ impl Tool for WriteFileTool {
         // would never recognize the case. The read is unambiguous: a file that does not exist yet
         // inside the project still maps to a project path, so it comes back as `Ok("")` rather
         // than as not-found. `degraded_pre_read` is set by the arm below: the write still goes to
-        // the delegate, but the `old_text` meka reasons from came off disk.
+        // the delegate, but the `old_text` Meka reasons from came off disk.
         let mut degraded_pre_read = false;
         let (old_text, route) = match context.frontend.delegate_fs_read(&target, None, None).await {
             // As in `file_edit`: the write lands on disk, so disk is what it is judged against.
@@ -1825,7 +1825,7 @@ impl Tool for WriteFileTool {
             Err(error) => {
                 return Ok(ToolOutput::text(
                     format!(
-                        "Error: '{path}' exists but could not be read ({error}), so meka cannot tell \
+                        "Error: '{path}' exists but could not be read ({error}), so Meka cannot tell \
                          whether it changed since you read it. Pass force to overwrite."
                     ),
                     true,
@@ -2129,7 +2129,7 @@ mod tests {
         );
     }
 
-    /// `file_read` at `read` refuses meka's own config directory; only `unrestricted` reads it. The
+    /// `file_read` at `read` refuses Meka's own config directory; only `unrestricted` reads it. The
     /// sandbox and the write fence had this rule and the in-process read tools did not, so a
     /// prompt-injected turn at `read` could read the credential store and `web_fetch` it out.
     #[tokio::test]
@@ -2177,7 +2177,7 @@ mod tests {
 
         let error = refused.expect_err("read refuses the store");
         assert!(
-            error.to_string().contains("meka's own directory"),
+            error.to_string().contains("Meka's own directory"),
             "{error}"
         );
         assert!(
@@ -2757,7 +2757,7 @@ mod tests {
         );
     }
 
-    /// A client may advertise `fs.readTextFile` without `fs.writeTextFile`: it reads for meka but
+    /// A client may advertise `fs.readTextFile` without `fs.writeTextFile`: it reads for Meka but
     /// leaves the write to it, and its buffer does not follow what lands on disk. Each edit is
     /// computed from disk, where the last one landed, so the second keeps the first, and each
     /// result says the editor's buffer now differs.
@@ -5565,7 +5565,7 @@ mod tests {
     /// parent directory hands out: a file its owner had explicitly denied a principal comes back
     /// permitting them, and the tool reports success. `ReplaceFileW` is the Win32 call whose whole
     /// purpose is to keep the replaced file's security descriptor, and this is the assertion that
-    /// meka is actually using it.
+    /// Meka is actually using it.
     ///
     /// Uses `icacls` rather than the security API: this asserts what an administrator auditing the
     /// file would see, and reading it back through the same API that set it would prove less.
@@ -5580,7 +5580,7 @@ mod tests {
         // A *grant* to a principal that a temp directory would never hand down, spelled by SID so
         // the assertion does not depend on the display locale. `S-1-5-32-546` is BUILTIN\\Guests.
         //
-        // Deliberately not a deny ACE: `Everyone` includes meka, and a deny wins over every grant,
+        // Deliberately not a deny ACE: `Everyone` includes Meka, and a deny wins over every grant,
         // so denying write to prove the ACE survives locks the writer out of the file it is meant
         // to be writing. The question here is only whether an explicit entry is carried across.
         let granted = std::process::Command::new("icacls")

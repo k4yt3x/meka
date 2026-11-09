@@ -1,7 +1,7 @@
 //! Tool names as a wire carries them.
 //!
-//! Every wire caps a tool name, and meka's own names, an MCP server's prefixed tools above all, can
-//! pass the cap. meka keeps a tool's whole name everywhere it records one: configuration, history,
+//! Every wire caps a tool name, and Meka's own names, an MCP server's prefixed tools above all, can
+//! pass the cap. Meka keeps a tool's whole name everywhere it records one: configuration, history,
 //! sub-agent specs, task rows. This is the one place a request's names are cut to the serving
 //! wire's cap and a reply's are given back, so a session moves between wires with its history
 //! intact. A cut name is the head of the whole name, `_`, and the first twelve hex digits of the
@@ -302,7 +302,7 @@ mod tests {
     }
 
     /// The wire sees only cut names, in the catalog and in the history, and the call the model
-    /// makes under one comes back under the whole name the rest of meka knows.
+    /// makes under one comes back under the whole name the rest of Meka knows.
     #[tokio::test]
     async fn a_request_carries_cut_names_and_the_reply_comes_back_whole() {
         let long = format!("mcp__server__{}", "x".repeat(80));

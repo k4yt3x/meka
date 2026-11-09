@@ -895,7 +895,7 @@ fn fork_during_an_in_flight_turn_is_refused_with_409() {
     assert_eq!(fork.status(), 201, "a source between turns forks");
 }
 
-/// A path as meka records it: canonical, without the `\\?\` prefix Windows' `canonicalize` adds.
+/// A path as Meka records it: canonical, without the `\\?\` prefix Windows' `canonicalize` adds.
 fn canonical_spelling(path: &std::path::Path) -> String {
     std::fs::canonicalize(path)
         .expect("canonicalize")
@@ -3701,7 +3701,7 @@ fn turn_with_neither_message_nor_images_returns_422() {
 
 /// A payload that is valid base64 *and* sniffs as a PNG, but does not decode.
 ///
-/// This is the one the decode guard exists for, and the door meka does not control: a client can
+/// This is the one the decode guard exists for, and the door Meka does not control: a client can
 /// post anything. The sibling below stops at base64, which fails a line earlier and never reaches
 /// the decode, so before this the whole HTTP layer could lose that guard and stay green.
 #[test]
@@ -4907,7 +4907,7 @@ fn answering_a_prompt_at_a_worker_id_is_refused_as_undrivable() {
 
 /// A session whose row records no level omits `permission` rather than answering `""`.
 ///
-/// No door of this meka writes such a row, so the test makes one by hand, on a session the GC has
+/// No door of this Meka writes such a row, so the test makes one by hand, on a session the GC has
 /// evicted: while a session is resident the level comes from its cells and the column is never
 /// read. An empty string is not a level, and a client that parsed it as one got a value nothing
 /// ever ran at.
@@ -4964,7 +4964,7 @@ fn a_row_that_records_no_level_omits_permission() {
 
 /// A session whose row records no working directory omits `cwd` rather than answering `null`.
 ///
-/// Every door of this meka records one, so the test erases it by hand on an evicted session, the
+/// Every door of this Meka records one, so the test erases it by hand on an evicted session, the
 /// state an archive that carried no `cwd` imports into. The row's fields are one shape shared with
 /// `meka session show --format json`, and this is the rule that shape keeps for every optional.
 #[test]
@@ -6885,7 +6885,7 @@ fn context_endpoint_measures_the_context_and_the_record_what_was_spent() {
 /// The failure this guards is silent and expensive: `agent_options` is built once per process from
 /// the default profile, so a session pinned to a 32k model was measured against the default's
 /// window. Auto-compaction never reached its threshold and the provider rejected the turn for
-/// exceeding a context meka thought was 97% free.
+/// exceeding a context Meka thought was 97% free.
 #[test]
 fn context_window_follows_the_session_profile_not_the_server_default() {
     let harness = ServeTestHarness::spawn_with_prelude(
@@ -8854,7 +8854,7 @@ fn skill_write_read_and_delete_round_trip() {
 /// deletable here, and both refusals arrive as 409 `store-read-only` naming where the file actually
 /// is.
 ///
-/// Writing would not update that skill: it would put a second copy in meka's own store which wins
+/// Writing would not update that skill: it would put a second copy in Meka's own store which wins
 /// precedence, so the caller is told it edited a procedure while every other client goes on reading
 /// the original. Both branches, the new [`ErrorKind::StoreReadOnly`] and its documented 409, had no
 /// test at all: deleting either check left the whole suite green.
@@ -10491,7 +10491,7 @@ fn an_inbox_item_on_an_idle_session_starts_a_turn_and_the_feed_reports_its_deliv
         .expect("body");
     assert!(
         transcript.contains("[Message arrived "),
-        "the item opened the turn under meka's header, which names nobody when the client named \
+        "the item opened the turn under Meka's header, which names nobody when the client named \
          nobody: {transcript}"
     );
     assert!(
@@ -12297,7 +12297,7 @@ struct CapturedDelivery {
 /// A minimal blocking HTTP listener that records one POST and answers `204`.
 ///
 /// Hand-rolled rather than pulled from a crate because the whole point is to observe the exact
-/// bytes and headers meka put on the wire; anything that parses and re-serializes would hide the
+/// bytes and headers Meka put on the wire; anything that parses and re-serializes would hide the
 /// thing under test.
 fn spawn_webhook_listener() -> (u16, std::sync::mpsc::Receiver<CapturedDelivery>) {
     spawn_webhook_listener_rejecting(0, "")
@@ -12406,7 +12406,7 @@ fn turn_finished_webhook_is_delivered_and_signed() {
 
 /// 429 says "not now", not "not ever". Several jobs sharing a cron minute deliver as a burst,
 /// which is exactly when a receiver rate-limits; dropping those would lose the 9am report to the
-/// one rejection the receiver was explicitly asking meka to wait out.
+/// one rejection the receiver was explicitly asking Meka to wait out.
 #[test]
 fn a_rate_limited_webhook_is_retried() {
     let (port, rx) = spawn_webhook_listener_rejecting(
@@ -12457,7 +12457,7 @@ fn a_rate_limited_webhook_is_retried() {
     }
 }
 
-/// The other half of the policy: a receiver saying the request itself is malformed is telling meka
+/// The other half of the policy: a receiver saying the request itself is malformed is telling Meka
 /// something retrying cannot fix, and hammering it would turn one bad delivery into `max_retries`.
 #[test]
 fn a_webhook_rejected_as_malformed_is_not_retried() {
@@ -13766,7 +13766,7 @@ fn context_counters_are_wired_to_the_handles_the_agent_writes() {
          `config.session_context_window` instead would have reported nothing at all: {body}"
     );
 
-    // And the configured value actually reaches the agent. Since meka never infers a window
+    // And the configured value actually reaches the agent. Since Meka never infers a window
     // from the model name or probes for it, this config key is the *only* way to state the real
     // one, so a call site that dropped it would silently budget every session against the default.
     let configured =
@@ -14987,7 +14987,7 @@ fn a_compaction_during_a_streaming_turn_emits_context_compacted() {
 
 /// A malformed body is answered as malformed, even while the session is busy.
 ///
-/// If `TurnGuard::acquire` ran before the body was validated, a request meka was going to refuse
+/// If `TurnGuard::acquire` ran before the body was validated, a request Meka was going to refuse
 /// anyway would be admitted first; on a session already running a turn `acquire` fails, so the
 /// caller would be told 409 `turn-in-flight` about a request whose real problem is that it has no
 /// message in it. Retrying that (which is what a 409 invites) reproduces it forever.
@@ -16060,7 +16060,7 @@ scopes = ["sessions:r", "sessions:w"]
         support::Started::Exited(status, logs) => {
             assert!(
                 !status.success(),
-                "a configuration meka cannot build a client from must fail the run: {logs}"
+                "a configuration Meka cannot build a client from must fail the run: {logs}"
             );
             assert!(
                 logs.contains("[web].ca_cert_file"),
@@ -16079,10 +16079,10 @@ scopes = ["sessions:r", "sessions:w"]
     }
 }
 
-/// A lock file meka cannot open is a server fault, not another process holding the session.
+/// A lock file Meka cannot open is a server fault, not another process holding the session.
 ///
 /// Both dormant write paths mapped every `lock_session` failure to `409 session-locked` with the
-/// error's text in `detail`, so an unreadable lock file answered "another meka process is running
+/// error's text in `detail`, so an unreadable lock file answered "another Meka process is running
 /// this session" -- advice no retry ever satisfies -- and published the lock directory's path while
 /// doing it. Only the variant that means what the 409 says keeps it.
 ///
@@ -16136,7 +16136,7 @@ fn an_unopenable_lock_is_a_server_fault_rather_than_a_conflict() {
         let problem: serde_json::Value = response.json().expect("parse");
         assert_eq!(
             status, 500,
-            "{method} {path}: a lock meka cannot open is meka's problem, not another process's: \
+            "{method} {path}: a lock Meka cannot open is Meka's problem, not another process's: \
              {problem}"
         );
         assert_eq!(
@@ -16156,7 +16156,7 @@ fn an_unopenable_lock_is_a_server_fault_rather_than_a_conflict() {
 /// A skill whose file stops being readable between the catalog and the turn is a sanitized 500.
 ///
 /// The reason names the file, so composing it into `detail` published the skills directory -- and
-/// meka's config directory with it -- to whoever holds `sessions:w`. It is a server fault either
+/// Meka's config directory with it -- to whoever holds `sessions:w`. It is a server fault either
 /// way; the operator reads the reason in the log.
 #[cfg(unix)]
 #[test]
@@ -16272,7 +16272,7 @@ fn a_resident_session_whose_row_vanished_is_a_404_rather_than_an_empty_profile()
 /// entirely, would leave every other test green.
 ///
 /// `detail` is asserted equal across the two runs, which is the property that makes this member
-/// additive. Relaying by overwriting `detail` would have deleted meka's own sentence -- and on a
+/// additive. Relaying by overwriting `detail` would have deleted Meka's own sentence -- and on a
 /// context overflow that sentence is the entire remedy.
 #[test]
 fn relay_provider_errors_decides_whether_the_upstream_body_reaches_the_caller() {
@@ -16324,7 +16324,7 @@ fn relay_provider_errors_decides_whether_the_upstream_body_reaches_the_caller() 
     }
     assert_eq!(
         details[0], details[1],
-        "the key adds a member; it must not rewrite meka's own sentence"
+        "the key adds a member; it must not rewrite Meka's own sentence"
     );
 }
 
@@ -16848,7 +16848,7 @@ fn no_read_sandbox(text: &str) -> bool {
 }
 
 /// A shell at `read` under the Landlock backend cannot read the credential store, through the real
-/// server and the real spawn: the ruleset the tool plans has to name meka's directories as the
+/// server and the real spawn: the ruleset the tool plans has to name Meka's directories as the
 /// ones to step around, and nothing short of a whole turn exercises that wiring. The control read
 /// proves the refusal is the store's alone. Skips loudly where the kernel has no usable Landlock.
 #[cfg(target_os = "linux")]
@@ -20785,7 +20785,7 @@ fn accounts_and_profiles_are_managed_over_http() {
     assert_eq!(body["fallbacks"], serde_json::json!(["main"]));
     assert_eq!(body["context_window"], 40000);
 
-    // `parameters` is replaced whole and removed with `null`; a field meka writes, a value TOML
+    // `parameters` is replaced whole and removed with `null`; a field Meka writes, a value TOML
     // cannot hold, and a subscription's are refused before anything is written.
     let parameters = serde_json::json!({"temperature": 0.6, "provider": {"order": ["x"]}});
     let (status, body) = send(
@@ -20801,7 +20801,7 @@ fn accounts_and_profiles_are_managed_over_http() {
     for (payload, expected) in [
         (
             serde_json::json!({"parameters": {"max_tokens": 10}}),
-            "`parameters.max_tokens` is written by meka on 'anthropic-messages'; set the \
+            "`parameters.max_tokens` is written by Meka on 'anthropic-messages'; set the \
              profile's `max_output_tokens` instead",
         ),
         (
@@ -21406,7 +21406,7 @@ fn a_codex_login_completes_from_the_loopback_listener_or_a_posted_callback() {
         .send()
         .expect("the listener answers the browser");
     assert_eq!(landed.status(), 200);
-    assert!(landed.text().unwrap().contains("Return to meka"));
+    assert!(landed.text().unwrap().contains("Return to Meka"));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let status = status_of(&login_id);
@@ -22282,7 +22282,7 @@ fn an_mcp_oauth_login_over_http_ends_in_a_connected_server() {
         .send()
         .expect("the listener answers the browser");
     assert_eq!(landed.status(), 200);
-    assert!(landed.text().unwrap().contains("Return to meka"));
+    assert!(landed.text().unwrap().contains("Return to Meka"));
 
     wait_for("the login completing", &mut || {
         get(&format!("/v1/mcp/remote/login/{login_id}")).1["status"] == "completed"
@@ -22489,7 +22489,7 @@ fn an_mcp_login_commits_only_against_the_connection_it_began_on() {
     );
 }
 
-/// meka's own write of a device id into `config.toml`, for a `claude-subscription` account the
+/// Meka's own write of a device id into `config.toml`, for a `claude-subscription` account the
 /// file states none for, at startup and whenever the file is served after, is not an edit unread.
 #[test]
 fn a_device_id_meka_writes_is_not_an_unread_edit() {
@@ -22629,7 +22629,7 @@ fn a_reload_refuses_what_startup_refuses_and_names_what_waits_for_a_restart() {
         assert_eq!(status, 422, "{method} {route}: {body}");
         let detail = body["detail"].as_str().unwrap_or_default();
         assert!(
-            detail.starts_with("config.toml holds a setting meka refuses at startup")
+            detail.starts_with("config.toml holds a setting Meka refuses at startup")
                 && detail.contains("ghost"),
             "{method} {route}: {body}"
         );

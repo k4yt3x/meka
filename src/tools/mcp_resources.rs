@@ -717,7 +717,7 @@ impl Tool for SubscribeMcpResourceTool {
             name: "mcp_resource_subscribe".to_string(),
             description: "Subscribe to change notifications for an MCP resource. After \
                           subscribing, the server will send resources/updated notifications \
-                          that meka records; query them with `mcp_resource_updates_list`."
+                          that Meka records; query them with `mcp_resource_updates_list`."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

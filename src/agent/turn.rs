@@ -295,7 +295,7 @@ impl TurnInput {
     }
 }
 
-/// The block an inbox item takes in the conversation: what the model reads, the header meka
+/// The block an inbox item takes in the conversation: what the model reads, the header Meka
 /// writes with the item's words under it, beside the item's own facts, so every reader shows the
 /// words as the person's without reading the header back.
 fn inbox_block(item: &crate::store::inbox::InboxItem, mid_turn: bool) -> ContentBlock {
@@ -2948,7 +2948,7 @@ impl Agent {
     ///
     /// The shape depends on what streamed. Text that did is kept as the assistant's message,
     /// without the tool calls that never ran, and the items follow it as the next user message.
-    /// Nothing kept means the items join the user message that was cut, since meka never sends
+    /// Nothing kept means the items join the user message that was cut, since Meka never sends
     /// two user turns in a row: it is withdrawn and appended again with them in one write. That
     /// leaves the log ending on an appended turn opening, so a turn cut before the provider
     /// accepted anything still withdraws its prompt if it then fails, and the items with it.
@@ -3227,7 +3227,7 @@ impl Agent {
                 StreamEvent::ThinkingDelta(text) => {
                     // Marked like `StreamEvent::TextDelta` marks its first chunk, and for the same
                     // reason: this is model output a consumer now holds, and a retry would send it
-                    // again. Not the `Notice` exemption, since a notice is meka's own advisory,
+                    // again. Not the `Notice` exemption, since a notice is Meka's own advisory,
                     // queued before the request is even sent.
                     //
                     // Asked of the frontend rather than assumed, because reasoning is the *first*
@@ -3283,7 +3283,7 @@ impl Agent {
                 StreamEvent::RedactedThinking { .. } => {
                     progress.content_started = true;
                     // Delta then block, like every other block carrying visible text. The marker is
-                    // meka's own words rather than the model's, but a frontend that reads the
+                    // Meka's own words rather than the model's, but a frontend that reads the
                     // deltas would otherwise be the only one that never hears about a redacted
                     // block at all.
                     self.cells
@@ -5411,7 +5411,7 @@ mod tests {
         ))
     }
 
-    /// The case that motivated this: meka up, provider unreachable, a job firing on its interval
+    /// The case that motivated this: Meka up, provider unreachable, a job firing on its interval
     /// for the length of the outage. Each fire persists its prompt before the call and then fails,
     /// so without withdrawal the conversation collects one unanswered message per fire.
     #[tokio::test]
@@ -5503,7 +5503,7 @@ mod tests {
     /// This is the arm the sibling above cannot reach: `pop_unsaved` runs only when the eager
     /// persist failed, so a healthy store never gets there, and popping would take a delivered
     /// background outcome out of the conversation as well as off disk, its row already stamped and
-    /// never handed out again. `SQLITE_BUSY` with a second meka on the store is the ordinary way
+    /// never handed out again. `SQLITE_BUSY` with a second Meka on the store is the ordinary way
     /// in.
     ///
     /// The store is broken by dropping the table under a live connection, the same way
@@ -7162,7 +7162,7 @@ mod tests {
     /// A thinking-only reply is answered with a nudge, which is itself a plain `User` message
     /// carrying no tool result, so from the outside it looks exactly like a turn-opening prompt.
     /// If the retry then fails, withdrawal must not take the nudge: doing so leaves the prompt (the
-    /// message the feature exists to remove) while retracting one meka had just committed.
+    /// message the feature exists to remove) while retracting one Meka had just committed.
     #[tokio::test]
     async fn a_failure_after_a_thinking_only_nudge_withdraws_nothing() {
         use crate::provider::mock::MockStopReason;
@@ -7911,8 +7911,8 @@ mod tests {
             "a compaction that cannot help must not be retried"
         );
 
-        // And the one attempt carried the turn meka meant to send, which is what distinguishes
-        // "the provider refused a real request" from "meka sent something malformed and the
+        // And the one attempt carried the turn Meka meant to send, which is what distinguishes
+        // "the provider refused a real request" from "Meka sent something malformed and the
         // overflow was incidental".
         let attempt = &requests[0];
         assert!(
@@ -8219,7 +8219,7 @@ mod tests {
         assert_eq!(persisted.input_tokens, 1234, "and it reached the row");
     }
 
-    /// What a turn stores: one user message of two blocks, the context meka injected and the words
+    /// What a turn stores: one user message of two blocks, the context Meka injected and the words
     /// as typed, in that order, so a reader of the row can take the words alone.
     #[tokio::test]
     async fn a_turn_stores_its_context_and_its_words_as_two_blocks() {
@@ -8600,7 +8600,7 @@ mod tests {
         );
     }
 
-    /// The whole point of the feature: a rejection of content meka just appended must not end the
+    /// The whole point of the feature: a rejection of content Meka just appended must not end the
     /// turn, and the repair must be persisted so a resume doesn't walk back into it.
     #[tokio::test]
     async fn run_turn_degrades_rejected_content_and_continues() {
@@ -11030,7 +11030,7 @@ mod tests {
             .await;
     }
 
-    /// `background` is meka's own. A tool must never see it, least of all a remote MCP server that
+    /// `background` is Meka's own. A tool must never see it, least of all a remote MCP server that
     /// never advertised the key.
     #[tokio::test]
     async fn the_background_flag_never_reaches_the_tool() {
@@ -11162,7 +11162,7 @@ mod tests {
 
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
-            "a call meka could not read must not run at all, least of all in the foreground",
+            "a call Meka could not read must not run at all, least of all in the foreground",
         );
         let results: String = messages
             .iter()
@@ -13096,6 +13096,7 @@ mod tests {
                     Item::Image(_) => "image".to_string(),
                     Item::Banner { .. }
                     | Item::SessionId { .. }
+                    | Item::Log { .. }
                     | Item::Error(_)
                     | Item::ShellOutput(_) => return None,
                 };

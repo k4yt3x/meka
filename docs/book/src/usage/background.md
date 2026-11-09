@@ -105,9 +105,9 @@ Every task ends in one of four states, and every one of them is reported: inside
 | `completed` | The tool returned successfully |
 | `failed` | The tool returned an error |
 | `canceled` | Stopped on request, via `task_cancel`, `/task cancel`, or a second Ctrl+C |
-| `interrupted` | The session holding it went away: meka exited or was signaled, or the client closed the session |
+| `interrupted` | The session holding it went away: Meka exited or was signaled, or the client closed the session |
 
-`interrupted` is the one that matters most. A task in flight when meka lets go of its session cannot be resumed, so it is stopped and recorded as interrupted on the way out, and reported the next time something takes ownership of that session: a screen resume, a `meka serve` reattach, or an ACP `session/load`. A process that dies writes nothing; the *next* owner does the retiring then, because holding the session lock is what proves the previous owner is gone. Without this the agent would wait forever on a result it had usually already promised someone.
+`interrupted` is the one that matters most. A task in flight when Meka lets go of its session cannot be resumed, so it is stopped and recorded as interrupted on the way out, and reported the next time something takes ownership of that session: a screen resume, a `meka serve` reattach, or an ACP `session/load`. A process that dies writes nothing; the *next* owner does the retiring then, because holding the session lock is what proves the previous owner is gone. Without this the agent would wait forever on a result it had usually already promised someone.
 
 Large output is written to a [scratchpad](../tools/scratchpad.md) entry and the delivered turn carries the beginning plus the entry name, so a long build log does not occupy the conversation permanently. A call that names a `scratchpad` entry has its whole output saved there instead, whatever its size, and the delivered turn says where it went rather than carrying it; a task stopped before its work came back writes nothing there. A report carries text alone, so an image the tool returned (an MCP screenshot, a fetched picture) is saved to a scratchpad entry of its own, which `image_render` shows, and the report names the entry where the image was.
 
@@ -153,7 +153,7 @@ what was recorded.
 
 This is the shell's contract, where Ctrl+C signals the foreground process group and `&`-ed jobs survive. Losing a twenty-minute build to a keystroke aimed at the answer on screen is unrecoverable, and it is not what the keystroke meant.
 
-meka prints what survived so nothing is hidden:
+Meka prints what survived so nothing is hidden:
 
 ```text
 ! Interrupted
@@ -177,7 +177,7 @@ Sub-agents (`agent_spawn`) deliberately cannot start background tasks. A sub-age
 
 ## Concurrent edits
 
-Background tasks make it ordinary for two agents to work in one directory at once. meka does not lock anything: coordination is the orchestrating agent's job, exactly as it is between two people on one machine.
+Background tasks make it ordinary for two agents to work in one directory at once. Meka does not lock anything: coordination is the orchestrating agent's job, exactly as it is between two people on one machine.
 
 What it does do is make a lost race **visible**. `file_edit` records what a file looked like when it was read, and refuses an edit against a file that changed since:
 

@@ -101,7 +101,7 @@ pub(crate) const DEFAULT_INBOX_RETRY_CEILING: std::time::Duration =
 
 /// Whether waiting can change the answer a failed inbox turn got: the upstream could not serve the
 /// profile and may again (an outage, a dropped stream, a quota that resets), a required MCP
-/// server was not ready and may reconnect, or meka's own store or disk refused (a lock another
+/// server was not ready and may reconnect, or Meka's own store or disk refused (a lock another
 /// process holds, a disk that is full) and may not next time. Anything else, a rejected
 /// credential, a request the upstream judged wrong, a session its profile cannot read, fails the
 /// same way on every attempt, so the item is given up on at once and the sender is told now.
@@ -1057,7 +1057,7 @@ mod tests {
     }
 
     /// Only a failure waiting can change is retried: the upstream's unavailability, a quota
-    /// refusal, a required MCP server not ready and meka's own store or disk refusing; a rejected
+    /// refusal, a required MCP server not ready and Meka's own store or disk refusing; a rejected
     /// credential, a bad request, a configuration refusal and an overflow fail the item at once.
     #[test]
     fn only_a_failure_waiting_can_change_is_retried() {
@@ -1153,7 +1153,7 @@ mod tests {
     ///
     /// What it defends: `list_undelivered_background_tasks` filters on `delivered_at IS NULL`, so a
     /// stamped batch has no re-delivery path. Stamping first lets a provider lookup that comes back
-    /// `SQLITE_BUSY`, an ordinary occurrence with a second meka process on the store, destroy a
+    /// `SQLITE_BUSY`, an ordinary occurrence with a second Meka process on the store, destroy a
     /// report the user was waiting on, with one `warn!` and nothing else.
     #[test]
     fn a_background_outcome_is_stamped_only_once_its_turn_can_run() {

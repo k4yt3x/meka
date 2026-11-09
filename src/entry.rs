@@ -1,4 +1,4 @@
-//! Shared plumbing for the two entry stores meka owns: skills
+//! Shared plumbing for the two entry stores Meka owns: skills
 //! (`~/.config/meka/skills/<name>/SKILL.md`, [`crate::skills`]) and memories (the `memories` table
 //! in `MEKA_DATA_DIR`, [`crate::memory`]).
 //!
@@ -84,7 +84,7 @@ pub(crate) fn yaml_scalar(text: &str) -> String {
     // unquoted, a description beginning `[` produces a file with an unterminated flow sequence,
     // which `meka memory export` reports as success and a read back then refuses, so a backup
     // silently loses a memory. `null`, `true`, `~` and anything numeric are quoted for the
-    // adjacent reason: unquoted they come back as a type rather than a string, so meka and every
+    // adjacent reason: unquoted they come back as a type rather than a string, so Meka and every
     // real YAML tool disagree about the same file.
     let looks_typed = matches!(
         text.to_ascii_lowercase().as_str(),
@@ -164,17 +164,17 @@ pub(crate) fn normalize_description(description: &str) -> String {
     description.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The most of a description meka will carry into every session's `<context>`.
+/// The most of a description Meka will carry into every session's `<context>`.
 ///
 /// A description is a one-line label, and the index that renders it is read by the model on every
-/// turn. A file meka did not author (a skill pulled from a repository, a memory synced from another
+/// turn. A file Meka did not author (a skill pulled from a repository, a memory synced from another
 /// machine) can carry a thousand-line one.
 const MAX_DESCRIPTION_CHARS: usize = 500;
 
 /// Make a description read from disk safe to render, whoever wrote the file.
 ///
 /// The write path normalizes through [`normalize_description`]; without the same normalization on
-/// the way in, a file authored by anything other than meka reaches the `[Skills]` / `[Memory]`
+/// the way in, a file authored by anything other than Meka reaches the `[Skills]` / `[Memory]`
 /// index verbatim. That index is prose the model reads every turn, so an embedded newline lets a
 /// description open what looks like a new section, and a control character reaches the terminal
 /// that renders it. Normalizing on the way in makes the file's provenance stop mattering.
@@ -238,7 +238,7 @@ pub(crate) const MAX_ENTRY_NAME_CHARS: usize = 64;
 /// wedges. A row whose name reached the column past the tools is listed to the model in the
 /// `[Memory]` index and then refused by `memory_read`, `memory_delete`, `meka memory remove` and
 /// `DELETE /v1/memories/{name}` alike, while `meka memory export` refuses the whole run on its
-/// account. Nothing meka ships could remove it; the only exit was raw `sqlite3`, which is what this
+/// account. Nothing Meka ships could remove it; the only exit was raw `sqlite3`, which is what this
 /// store was built to stop needing.
 ///
 /// There is deliberately no length cap, so no stored name can be beyond reach.
@@ -427,7 +427,7 @@ mod tests {
         assert!(check_case_collision("other", existing.into_iter(), "memory").is_ok());
     }
 
-    /// The write path normalizes a description; the read path did not, so a file meka did not
+    /// The write path normalizes a description; the read path did not, so a file Meka did not
     /// author reached the index the model reads every turn verbatim.
     #[test]
     fn a_description_read_from_disk_cannot_inject_lines_or_escapes() {

@@ -38,12 +38,12 @@ const CC_SYSTEM_PROMPT_PREFIX: &str = "You are Claude Code, Anthropic's official
 const CC_SUBAGENT_PROMPT_PREFIX: &str =
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
-/// Opens the block that carries meka's own prompt. The identity line this wire requires is the
+/// Opens the block that carries Meka's own prompt. The identity line this wire requires is the
 /// first thing the model reads about itself, and a model that believes it names this session
 /// behaves like a coding CLI; naming the line for what it is here keeps the prompt module free of
 /// any provider's wire.
 const CC_IDENTITY_NOTE: &str = "The identity line above is what this API requires of its clients; \
-                                it does not describe this session. The harness is meka, whose \
+                                it does not describe this session. The harness is Meka, whose \
                                 system prompt follows.";
 
 /// The window at which a profile asks for the 1M-context beta.
@@ -206,7 +206,7 @@ impl ClaudeSubscriptionProvider {
     ///
     /// `context-1m-2025-08-07` is sent when the profile's `context_window` is a million tokens or
     /// more. Claude Code sends it for the `[1m]` model variant its user selected, and the profile's
-    /// window is where a meka user states the same choice.
+    /// window is where a Meka user states the same choice.
     ///
     /// `redact-thinking-2026-02-12` and `thinking-display-updates-2026-08-18` are the two halves
     /// of Claude Code's display switch; see [`Self::sends_redaction_beta`] and
@@ -214,14 +214,14 @@ impl ClaudeSubscriptionProvider {
     ///
     /// `has_tools` gates `advanced-tool-use-2025-11-20`. Claude Code's own gate is narrower (it
     /// sends that beta when its *tool search* is active rather than merely when tools are present),
-    /// but tool search is on for every agentic CLI turn, so the wire is the same, and meka has
+    /// but tool search is on for every agentic CLI turn, so the wire is the same, and Meka has
     /// tools on every turn anyway.
     ///
     /// `fallback-credit-2026-06-01` goes on a compaction's requests alone. Claude Code arms it
     /// on a turn only while its UI shows a fallback model, which 2.1.284 never did in the same
     /// scenario that 2.1.280 armed on every turn, and on a compaction whenever the model has a
     /// refusal fallback in its catalog; the beta only advertises that the server may answer
-    /// with a fallback credit, and meka sends no `fallbacks` or `fallback_credit_token` of its
+    /// with a fallback credit, and Meka sends no `fallbacks` or `fallback_credit_token` of its
     /// own, exactly like the captured compaction that carries it.
     ///
     /// `cache-diagnosis-2026-04-07` is sent unconditionally too, paired with the body's
@@ -595,7 +595,7 @@ impl ClaudeSubscriptionProvider {
         }
 
         // Only a conversation turn carries the field, `null` on its first request and after a
-        // resume: Claude Code sends nothing here on its side queries, and meka's compaction is one.
+        // resume: Claude Code sends nothing here on its side queries, and Meka's compaction is one.
         if attribution.is_conversation_turn() {
             body.insert(
                 "diagnostics".to_string(),
@@ -707,7 +707,7 @@ impl Provider for ClaudeSubscriptionProvider {
 
     /// The endpoint answers a request declaring a tool named `mcp_<x>` with 400 "You're out of
     /// extra usage", whatever the tool's definition carries, while a server's
-    /// `mcp__<server>__<tool>` names pass; so meka's MCP meta-tools are never put on this wire.
+    /// `mcp__<server>__<tool>` names pass; so Meka's MCP meta-tools are never put on this wire.
     /// Established by replaying captured requests with the name as the one variable, 2026-10-16.
     fn refuses_tool_name(&self, name: &str) -> bool {
         name.starts_with("mcp_") && !name.starts_with("mcp__")
@@ -977,7 +977,7 @@ mod tests {
 
     /// The body's keys in the order they will be serialized, which is the order they go on the
     /// wire: `serde_json`'s `preserve_order` feature makes `Map` insertion-ordered, and Claude
-    /// Code's own order is what meka reproduces.
+    /// Code's own order is what Meka reproduces.
     fn claude_code_key_order(body: &serde_json::Value) -> Vec<&str> {
         body.as_object()
             .expect("body is an object")
@@ -1148,7 +1148,7 @@ mod tests {
         assert!(system[1].get("cache_control").is_none());
 
         assert_eq!(system[2]["type"], "text");
-        // The wire's identity line is named for what it is ahead of meka's prompt, in the same
+        // The wire's identity line is named for what it is ahead of Meka's prompt, in the same
         // block, so the array keeps the captured three-block shape.
         assert_eq!(
             system[2]["text"],
@@ -1167,7 +1167,7 @@ mod tests {
             "system",
             "metadata",
             "max_tokens",
-            // No `thinking`: this profile has it off, and meka omits the key where Claude Code
+            // No `thinking`: this profile has it off, and Meka omits the key where Claude Code
             // would send `{"type":"disabled"}`. See `insert_thinking_fields`, which is shared
             // with the `anthropic-messages` backend and its arbitrary endpoints.
             "temperature",
@@ -1455,7 +1455,7 @@ mod tests {
             "tools",
             "metadata",
             "max_tokens",
-            // No `thinking`: this profile has it off, and meka omits the key where Claude Code
+            // No `thinking`: this profile has it off, and Meka omits the key where Claude Code
             // would send `{"type":"disabled"}`. See `insert_thinking_fields`, which is shared
             // with the `anthropic-messages` backend and its arbitrary endpoints.
             "temperature",
@@ -1906,7 +1906,7 @@ mod tests {
     #[test]
     fn the_1m_context_beta_is_not_sent_without_a_1m_window() {
         // Claude Code sends `context-1m-2025-08-07` only for the `[1m]` variant its user picked,
-        // and meka only for a profile whose window is a million or more; these profiles state no
+        // and Meka only for a profile whose window is a million or more; these profiles state no
         // window, so the beta is absent across the lineup.
         for model in [
             "claude-opus-4-8",
@@ -1928,7 +1928,7 @@ mod tests {
 
     #[test]
     fn betas_extended_cache_ttl_always_present() {
-        // meka always sends a 1h cache TTL, so the extended-cache-ttl beta is unconditional.
+        // Meka always sends a 1h cache TTL, so the extended-cache-ttl beta is unconditional.
         for model in [
             "claude-opus-4-6-20250514",
             "claude-sonnet-4-20250514",
@@ -2024,7 +2024,7 @@ mod tests {
     #[test]
     fn an_unconfigured_profile_sends_claude_codes_default_effort() {
         // Claude Code never leaves `output_config.effort` to the server on a model that takes one:
-        // it resolves a default and sends that. meka sends one value for all of them, and that
+        // it resolves a default and sends that. Meka sends one value for all of them, and that
         // uniformity is the assertion -- a per-model table would pass a laxer version of this test
         // while adding a fact about Anthropic's data that nothing here would notice going stale.
         for model in [
@@ -2033,8 +2033,8 @@ mod tests {
             "claude-opus-5",
             "claude-opus-5-5",
             "claude-sonnet-5",
-            // Claude Code's bundled table happens to give this one `xhigh`. meka does not carry
-            // per-model figures: the server cannot tell meka's default from a configured value, so
+            // Claude Code's bundled table happens to give this one `xhigh`. Meka does not carry
+            // per-model figures: the server cannot tell Meka's default from a configured value, so
             // a table would only add something to go stale.
             "claude-opus-4-7",
         ] {
@@ -2118,7 +2118,7 @@ mod tests {
 
     #[test]
     fn temperature_omitted_when_model_rejects_it() {
-        // Opus 4.8 rejects `temperature` (400); meka must omit it even with thinking off.
+        // Opus 4.8 rejects `temperature` (400); Meka must omit it even with thinking off.
         let provider = provider_with("claude-opus-4-8", false);
         let body = provider.build_request_body(
             "system prompt",
@@ -2192,7 +2192,7 @@ mod tests {
     #[test]
     fn a_model_newer_than_the_denylist_still_gets_mid_conversation_tool_changes() {
         // The direction of the gate, not a fact about these names: Claude Code sends the beta to
-        // a model its catalog does not list, so a model meka has never heard of has to come out
+        // a model its catalog does not list, so a model Meka has never heard of has to come out
         // on the sending side. Flipping the gate to an allowlist passes every other test in this
         // file and silently drops the beta the first time Anthropic ships a model.
         for model in [
@@ -2307,7 +2307,7 @@ mod tests {
         let provider = provider_for_test();
         let messages = vec![Message::user("hi")];
 
-        // Outside a turn there is no prompt and no previous response to name, which is how meka's
+        // Outside a turn there is no prompt and no previous response to name, which is how Meka's
         // own side queries go out -- matching the Claude Code path that passes neither.
         let bare = provider.build_request_body(
             "system prompt",
@@ -2625,7 +2625,7 @@ mod tests {
     }
 
     /// Claude Code sends the 1M beta for the `[1m]` model variant its user picked; the profile's
-    /// window is where a meka user states the same choice.
+    /// window is where a Meka user states the same choice.
     #[test]
     fn the_1m_context_beta_follows_the_profiles_window() {
         let with_window = |window: Option<u64>| {
@@ -4383,7 +4383,7 @@ mod tests {
                 false,
                 false,
             ),
-            // A success meka cannot read back: the grant is spent and only a login recovers it.
+            // A success Meka cannot read back: the grant is spent and only a login recovers it.
             ("200 OK", r#"{"access_token":"#, true, false),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4738,7 +4738,7 @@ mod tests {
 
     /// A 401 is the backend saying the stored expiry is wrong. The token is refreshed once and the
     /// same call sent again on the new one, so a revoked or shortened token costs one round trip
-    /// rather than every turn until the expiry meka believed in has passed.
+    /// rather than every turn until the expiry Meka believed in has passed.
     #[tokio::test]
     async fn a_rejected_token_is_refreshed_once_and_the_call_sent_again() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

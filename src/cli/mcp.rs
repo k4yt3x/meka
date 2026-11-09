@@ -385,7 +385,7 @@ pub(crate) async fn run_tools(
                 tool.resolved_permission.to_string(),
                 // A declined hint has to say so here, because this table is where a user checks
                 // what `trust_read_only_hint = false` moved, and the winning source alone cannot
-                // tell "the server offered nothing" from "the server offered and meka refused".
+                // tell "the server offered nothing" from "the server offered and Meka refused".
                 if tool.read_only_hint_declined {
                     format!(
                         "{} (readOnlyHint declined)",
@@ -416,7 +416,7 @@ pub(crate) async fn run_tools(
     Ok(())
 }
 
-/// A tool meka dropped to stay under the per-server ceiling is, from here, indistinguishable from
+/// A tool Meka dropped to stay under the per-server ceiling is, from here, indistinguishable from
 /// one the server never offered. Say so: this listing is where someone goes to find out why the
 /// model cannot call something the server's own docs advertise, and a `tracing::warn!` at connect
 /// time is not where they will be looking.
@@ -1114,7 +1114,7 @@ pub(crate) async fn run_mcp_subcommand(
             | crate::cli::McpAction::Enable { .. }
             | crate::cli::McpAction::Disable { .. }
     ) {
-        // The raw-document editors run on a file meka cannot parse, since they are how it gets
+        // The raw-document editors run on a file Meka cannot parse, since they are how it gets
         // repaired; `main` has already noted the failure once.
     } else {
         config.require_readable_config()?;

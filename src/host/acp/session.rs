@@ -5,7 +5,7 @@ use super::*;
 
 /// Validate a client's `additionalDirectories`, rejecting any relative entry.
 ///
-/// The spec requires each to be absolute, and meka has no defensible base to resolve a relative one
+/// The spec requires each to be absolute, and Meka has no defensible base to resolve a relative one
 /// against: joining to `cwd` would invent a root the client never named. Failing the request is the
 /// honest answer, and it matches how `cwd` itself is validated.
 pub(super) fn validate_additional_roots(

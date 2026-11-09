@@ -163,7 +163,7 @@ pub(crate) async fn server_detail(
 /// The document as it will be written, refused ahead of the write when the edit would leave it
 /// unreadable. A file that already fails the typed read is written as edited: these doors reach
 /// only the entry they name, which they read as typed, and they are how such a file is repaired,
-/// as `account remove` and `profile remove` are, so a key meka does not know elsewhere in it is
+/// as `account remove` and `profile remove` are, so a key Meka does not know elsewhere in it is
 /// not theirs to refuse.
 fn reparsed_edit(before: &str, document: &toml_edit::DocumentMut) -> Result<String> {
     let after = document.to_string();
@@ -259,7 +259,7 @@ pub(crate) async fn logout_server(
     let revocation = crate::mcp::auth::stored_revocation(token_store, name).await?;
 
     // Named, because the kinds are not equally replaceable: an OAuth bundle is reobtained by
-    // logging in again, while a bearer or a client secret was typed by the user and meka is now its
+    // logging in again, while a bearer or a client secret was typed by the user and Meka is now its
     // only holder. `logout` still clears them all, but says which of the user's own secrets went.
     let cleared: Vec<&str> = {
         let mut found = Vec::new();
@@ -564,7 +564,7 @@ async fn commit_login_against(
 
 /// Log a server in at a terminal: [`obtain_login`], then [`commit_login`] against the entry as
 /// the file states it once the person is done. The entry alone is read, off the raw document, as
-/// `meka mcp add` wrote it: a key meka does not know elsewhere in the file is not this door's
+/// `meka mcp add` wrote it: a key Meka does not know elsewhere in the file is not this door's
 /// business, as it is not the add's.
 pub(crate) async fn login_server(
     servers: &[McpServerConfig],
@@ -629,7 +629,7 @@ pub(crate) struct ServerSecrets {
     pub(crate) client_secret: Option<String>,
 }
 
-/// Refuse a name no tool prefix can carry, one meka reserves, or none: the rule the running
+/// Refuse a name no tool prefix can carry, one Meka reserves, or none: the rule the running
 /// manager holds an entry to, asked ahead of the write so the file never holds an entry the next
 /// start refuses.
 fn validate_server_name(name: &str) -> Result<()> {
@@ -776,7 +776,7 @@ pub(crate) async fn add_server(
     tracing::info!("added '{name}' to {path}", path = path.display());
 
     // Released before anything that talks to a network or waits on a human: `lock_config_file`
-    // blocks with no timeout, so holding it across the OAuth flow would hang every other meka
+    // blocks with no timeout, so holding it across the OAuth flow would hang every other Meka
     // launch that touches `config.toml` (`device_id::persist` does, on an ordinary start) for as
     // long as the browser login takes. `purge_server` takes the lock again for the rollback below.
     drop(config_lock);
@@ -849,7 +849,7 @@ pub(crate) async fn edit_server(
         let (_config_lock, path, mut document) = super::account::open_document()?;
         let before = document.to_string();
         // The entry alone is read as typed, off the raw document: this door is one a shell
-        // repairs a file with, so a key meka does not know elsewhere in it is not its business.
+        // repairs a file with, so a key Meka does not know elsewhere in it is not its business.
         let known = server_names(&document);
         let unknown = || usage_err(crate::text::unknown_name("MCP server", name, known.iter()));
         let entry_table = document
@@ -1811,7 +1811,7 @@ mod tests {
     }
 
     /// The entry a terminal login commits against is read alone, as `meka mcp add` wrote it: a key
-    /// meka does not know elsewhere in the file does not throw away a login the person finished.
+    /// Meka does not know elsewhere in the file does not throw away a login the person finished.
     #[tokio::test]
     async fn the_entry_a_login_commits_against_is_read_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1834,7 +1834,7 @@ mod tests {
         assert!(absent.expect("read").is_none());
     }
 
-    /// The edit door reaches only the entry it changes: a key meka does not know elsewhere in the
+    /// The edit door reaches only the entry it changes: a key Meka does not know elsewhere in the
     /// file, which a shell is repairing, does not stop `meka mcp enable|disable` from touching the
     /// server, as the reference promises of every editor; the entry's own sub-tables are read.
     #[tokio::test]
@@ -2033,7 +2033,7 @@ mod tests {
     ///
     /// The naming matters because the kinds are not equally replaceable: an OAuth bundle is
     /// reobtained by logging in again, while a bearer or a client secret was typed by the user and
-    /// meka is now its only holder. A logout that took those away in silence would send them back
+    /// Meka is now its only holder. A logout that took those away in silence would send them back
     /// to the provider with nothing on screen to explain why.
     #[tokio::test]
     async fn logout_clears_every_kind_and_names_them() {
@@ -2081,7 +2081,7 @@ mod tests {
     }
 
     /// `remove` is the only command that clears an MCP credential, so requiring a config entry
-    /// would leave a hand-deleted server's OAuth bundle unreachable from every surface meka has.
+    /// would leave a hand-deleted server's OAuth bundle unreachable from every surface Meka has.
     #[tokio::test]
     async fn remove_clears_credentials_for_a_server_no_longer_in_config() {
         let dir = tempfile::tempdir().expect("tempdir");

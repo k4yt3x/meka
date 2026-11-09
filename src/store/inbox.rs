@@ -60,7 +60,7 @@ pub(crate) struct InboxItem {
     pub(crate) class: InboxClass,
     /// Who sent it, as the header names them: what the client said, or `your parent agent`.
     /// `None` when the client named nobody, and the header then names nobody: who sent a message
-    /// is the client's fact, not one meka guesses from the token that carried it.
+    /// is the client's fact, not one Meka guesses from the token that carried it.
     pub(crate) source: Option<String>,
     pub(crate) body: String,
     pub(crate) created_at: DateTime<Utc>,
@@ -180,7 +180,7 @@ impl InboxStore {
     }
 
     /// Record an item. A key already used on this session by the same token answers the earlier
-    /// row rather than a second one, so a client that retries across a meka restart enqueues once.
+    /// row rather than a second one, so a client that retries across a Meka restart enqueues once.
     pub(crate) async fn enqueue(&self, item: NewInboxItem) -> Result<Enqueued> {
         let id = Uuid::new_v4();
         let created_at = Utc::now().to_rfc3339();
@@ -495,7 +495,7 @@ impl InboxStore {
             .map_err(|error| MekaError::Database(format!("failed to defer inbox items: {error}")))
     }
 
-    /// Take a pending item back, from outside or because meka gave up on it.
+    /// Take a pending item back, from outside or because Meka gave up on it.
     pub(crate) async fn withdraw(
         &self,
         id: Uuid,

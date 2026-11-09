@@ -173,8 +173,8 @@ fn remove_temporary(temporary_path: &Path) {
 
 /// Write `content` to `path` atomically: serialize to a `<name>.<pid>.<seq>.tmp` beside it,
 /// `sync_all` the fd, then `rename` over the target. Also creates the parent directory (0700 on
-/// Unix, unless a symlink redirected the write out of meka's own tree) and holds the final file to
-/// at most 0600 on Unix. meka's own secrets live in the database, but an MCP server's `headers` and
+/// Unix, unless a symlink redirected the write out of Meka's own tree) and holds the final file to
+/// at most 0600 on Unix. Meka's own secrets live in the database, but an MCP server's `headers` and
 /// `env` are the user's to fill and may hold one verbatim, so the file is kept off-limits to group
 /// and other regardless of the user's umask or of what mode the target already had.
 ///
@@ -199,11 +199,11 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     // Only the link itself is resolved, not the whole path: `canonicalize` would also resolve
     // symlinked parent directories, which changes where the temp file lands for no benefit here.
     let resolved = resolve_symlink_target(path);
-    // Whether the write is still landing inside meka's own tree. The 0700 tightening below is a
-    // statement about a directory meka owns, and following a link takes the write somewhere it does
+    // Whether the write is still landing inside Meka's own tree. The 0700 tightening below is a
+    // statement about a directory Meka owns, and following a link takes the write somewhere it does
     // not: with a dotfile manager's `~/dotfiles/config.toml`, one `meka mcp disable` would re-mode
     // the whole repository directory to 0700, leaving every unrelated file in it newly hidden, a
-    // permission fact meka never established and cannot restore. Consulted only by the Unix
+    // permission fact Meka never established and cannot restore. Consulted only by the Unix
     // mode-tightening branch below; there is no mode to tighten elsewhere, so computing it on
     // those targets is dead work the compiler rightly flags.
     #[cfg(unix)]
@@ -294,10 +294,10 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     // An existing file keeps whatever mode it had, *narrowed* to at most 0600.
     //
     // Two failures meet here and only this rule avoids both. Handing the target the temp's fresh
-    // 0600 unconditionally re-modes a file meka did not create, which is wrong for a `config.toml`
+    // 0600 unconditionally re-modes a file Meka did not create, which is wrong for a `config.toml`
     // a dotfile manager owns. But simply carrying the existing mode across is worse: it leaves a
     // hand-written `headers = { Authorization = "Bearer sk-..." }` sitting in a world-readable file
-    // after any ordinary `meka mcp` edit, because the write follows the symlink out of meka's 0700
+    // after any ordinary `meka mcp` edit, because the write follows the symlink out of Meka's 0700
     // directory and the group and other bits came along. Narrowing keeps a deliberately *tighter*
     // mode like 0400 and refuses to publish a looser one.
     //
@@ -478,21 +478,21 @@ pub(crate) fn lock_store(root: &std::path::Path) -> std::io::Result<StoreLock> {
 ///
 /// [`crate::entry::validate_entry_name`] keeps a *name* from escaping the root, but it cannot see
 /// what is already on disk under that name: a symlink planted at `<root>/<entry>` redirects the
-/// write wherever it points, while the path meka checked still looks local. Archives preserve
+/// write wherever it points, while the path Meka checked still looks local. Archives preserve
 /// symlinks, so unpacking a downloaded skill bundle is enough to plant one, with no code execution
 /// involved.
 ///
 /// This matters because the skill store is writable at [`crate::permission::Permission::Read`],
-/// whose whole contract is that nothing outside meka's own directory changes. Following a symlink
+/// whose whole contract is that nothing outside Meka's own directory changes. Following a symlink
 /// out of the store breaks exactly that. Checked with `symlink_metadata`, which does not follow the
 /// link.
 pub(crate) fn reject_symlinked_path(path: &Path, noun: &str) -> std::result::Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             // Warned as well as returned. The error reaches the model, which will recover by
-            // picking another name and say nothing more about it; but a symlink inside meka's own
+            // picking another name and say nothing more about it; but a symlink inside Meka's own
             // config directory is something the person running it should hear about once, since
-            // they did not put it there by using meka.
+            // they did not put it there by using Meka.
             tracing::warn!(
                 "refusing to write through the symlinked {noun} path {path}",
                 path = path.display()
@@ -513,8 +513,8 @@ pub(crate) fn reject_symlinked_path(path: &Path, noun: &str) -> std::result::Res
 /// closes the FD, which causes the kernel to release the `flock`/`LockFileEx` lock automatically.
 /// There is no "stale lock" failure mode; even `SIGKILL` is safe.
 ///
-/// Two things are locked this way: a session, so only one meka is ever attached to a conversation,
-/// and an account's credential, so only one meka at a time is rotating its refresh token.
+/// Two things are locked this way: a session, so only one Meka is ever attached to a conversation,
+/// and an account's credential, so only one Meka at a time is rotating its refresh token.
 ///
 /// Closing the descriptor is what releases the lock, so holding the file is holding the claim.
 pub(crate) struct FileLock {
@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(mode(&root), 0o700);
     }
     /// Claiming a store must not put anything inside it. Users keep skill stores in a git
-    /// repository, and a lock file there is a working-tree change meka had no reason to make.
+    /// repository, and a lock file there is a working-tree change Meka had no reason to make.
     #[cfg(unix)]
     #[test]
     fn locking_a_store_leaves_nothing_behind_in_it() {
@@ -815,9 +815,9 @@ mod tests {
     /// An existing file's mode is preserved, but never left looser than 0600.
     ///
     /// Two failures meet here. Handing the target the temp's fresh 0600 unconditionally re-modes a
-    /// file meka did not create. Carrying the existing mode across verbatim is worse: it leaves a
+    /// file Meka did not create. Carrying the existing mode across verbatim is worse: it leaves a
     /// hand-written `Authorization` header in a world-readable `config.toml` after any ordinary
-    /// `meka mcp` edit, because the write follows a dotfile manager's symlink out of meka's 0700
+    /// `meka mcp` edit, because the write follows a dotfile manager's symlink out of Meka's 0700
     /// directory and the group and other bits came with it. Narrowing keeps a deliberately tighter
     /// mode and refuses a looser one.
     #[cfg(unix)]
@@ -847,7 +847,7 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).expect("read"), "new\n");
         }
 
-        // A file meka creates still gets the restrictive mode.
+        // A file Meka creates still gets the restrictive mode.
         let fresh = dir.path().join("fresh.toml");
         write_file_atomic(&fresh, "new\n").expect("create");
         assert_eq!(
@@ -859,7 +859,7 @@ mod tests {
             0o600
         );
     }
-    /// Following a link out of meka's tree must not re-mode the directory it lands in.
+    /// Following a link out of Meka's tree must not re-mode the directory it lands in.
     ///
     /// One `meka mcp disable` against a `config.toml` symlinked into `~/dotfiles` set that whole
     /// directory to 0700, hiding every unrelated file in it. Observed.
@@ -891,7 +891,7 @@ mod tests {
                 .mode()
                 & 0o777,
             0o755,
-            "a directory meka was redirected into is not one it owns"
+            "a directory Meka was redirected into is not one it owns"
         );
     }
     // Unix-only: the body calls `std::os::unix::fs::symlink`, so without this the file does not

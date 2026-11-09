@@ -48,7 +48,7 @@ fn version_flag_prints_version_and_exits_zero() {
     let output = meka()
         .arg("--version")
         .output()
-        .expect("failed to spawn meka");
+        .expect("failed to spawn Meka");
     assert!(
         output.status.success(),
         "meka --version exited non-zero: {:?}",
@@ -56,14 +56,14 @@ fn version_flag_prints_version_and_exits_zero() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.starts_with("meka "),
-        "expected version output to start with 'meka ', got: {stdout}"
+        stdout.starts_with("Meka "),
+        "expected version output to start with 'Meka ', got: {stdout}"
     );
 }
 
 #[test]
 fn help_flag_lists_subcommands() {
-    let output = meka().arg("--help").output().expect("failed to spawn meka");
+    let output = meka().arg("--help").output().expect("failed to spawn Meka");
     assert!(output.status.success(), "meka --help exited non-zero");
     let stdout = String::from_utf8_lossy(&output.stdout);
     for expected in ["account", "profile", "session", "recall", "mcp", "acp"] {
@@ -79,7 +79,7 @@ fn session_subcommand_help_lists_actions() {
     let output = meka()
         .args(["session", "--help"])
         .output()
-        .expect("failed to spawn meka");
+        .expect("failed to spawn Meka");
     assert!(
         output.status.success(),
         "meka session --help exited non-zero"
@@ -98,7 +98,7 @@ fn recall_subcommand_help_lists_actions() {
     let output = meka()
         .args(["recall", "--help"])
         .output()
-        .expect("failed to spawn meka");
+        .expect("failed to spawn Meka");
     assert!(
         output.status.success(),
         "meka recall --help exited non-zero"
@@ -139,10 +139,10 @@ fn unknown_subcommand_exits_nonzero() {
     let output = meka()
         .arg("--definitely-not-a-flag")
         .output()
-        .expect("failed to spawn meka");
+        .expect("failed to spawn Meka");
     assert!(
         !output.status.success(),
-        "meka accepted an unknown flag without erroring"
+        "Meka accepted an unknown flag without erroring"
     );
 }
 
@@ -605,10 +605,10 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
         }
     }
 
-    let status = child.wait().expect("wait on meka");
+    let status = child.wait().expect("wait on Meka");
     assert!(
         !status.success(),
-        "meka should exit non-zero after SIGINT during auto-login"
+        "Meka should exit non-zero after SIGINT during auto-login"
     );
     assert!(
         captured.contains("interrupted") && captured.contains("rolling back"),
@@ -756,7 +756,7 @@ fn skill_remove_waits_for_a_store_lock_another_process_holds() {
     )
     .expect("seed");
 
-    // Hold the lock the way another meka would: the store root itself, or on Windows the sidecar
+    // Hold the lock the way another Meka would: the store root itself, or on Windows the sidecar
     // that `LockFileEx` needs because it refuses a directory handle.
     #[cfg(unix)]
     let lock_file = std::fs::File::open(&skills).expect("open the store root");
@@ -809,7 +809,7 @@ fn resolve_config(install: &Install, config: &str, args: &[&str]) -> std::proces
         .unwrap_or_else(|err| panic!("failed to spawn meka {args:?}: {err}"))
 }
 
-/// A level meka does not have fails at every door it can be spelled at, and never resolves quietly.
+/// A level Meka does not have fails at every door it can be spelled at, and never resolves quietly.
 ///
 /// `Permission` is read as a grant *and* as a requirement, so a surface that quietly mapped an
 /// unknown string onto some level would admit tools at authority nobody chose. The value of
@@ -824,7 +824,7 @@ fn a_level_meka_does_not_have_is_refused_at_the_flag_and_in_the_config_file() {
     let stderr = String::from_utf8_lossy(&flag.stderr);
     assert!(
         stderr.contains("workspace") && stderr.contains("unrestricted"),
-        "the refusal has to list the levels meka does have: {stderr}"
+        "the refusal has to list the levels Meka does have: {stderr}"
     );
 
     // The file is refused where it is parsed, the way an unknown key is, rather than warned about
@@ -836,12 +836,12 @@ fn a_level_meka_does_not_have_is_refused_at_the_flag_and_in_the_config_file() {
     );
     assert!(
         !file.status.success(),
-        "a config naming a level meka does not have must not start"
+        "a config naming a level Meka does not have must not start"
     );
     let stderr = String::from_utf8_lossy(&file.stderr);
     assert!(
         stderr.contains("elevated") && stderr.contains("unrestricted"),
-        "the refusal names the value and the levels meka does have: {stderr}"
+        "the refusal names the value and the levels Meka does have: {stderr}"
     );
 }
 
@@ -998,7 +998,7 @@ fn the_long_lived_hosts_refuse_the_flags_that_name_one_session() {
     }
 }
 
-/// A `config.toml` meka cannot parse must not stop the commands that exist to repair one.
+/// A `config.toml` Meka cannot parse must not stop the commands that exist to repair one.
 ///
 /// `meka mcp remove` and `meka profile remove` edit the raw document through `toml_edit` and never
 /// parse it into a `ConfigFile`, which is exactly what makes them the way out of a config an
@@ -1038,7 +1038,7 @@ fn an_unparseable_config_still_lets_the_commands_that_repair_it_run() {
     );
 
     // The readers are the other half of the split and must keep refusing: answering "No MCP servers
-    // configured" out of a file meka could not read would state something false.
+    // configured" out of a file Meka could not read would state something false.
     // `run_mcp_subcommand` branches on exactly this, and the two halves are what let a broken
     // config be both survivable and repairable.
     //
@@ -1135,7 +1135,7 @@ fn a_oneshot_run_connects_a_configured_mcp_server() {
     );
     let output = scripted_command(&install, &["-p", "hi", "--oneshot"])
         .output()
-        .expect("run meka");
+        .expect("run Meka");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
@@ -1164,7 +1164,7 @@ fn a_terminal_login_refuses_a_stale_paste_and_reads_again() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn meka");
+        .expect("spawn Meka");
     {
         use std::io::Write;
         let mut stdin = child.stdin.take().expect("piped stdin");
@@ -1172,7 +1172,7 @@ fn a_terminal_login_refuses_a_stale_paste_and_reads_again() {
             .write_all(b"abc#wrongstate\n")
             .expect("write the paste");
     }
-    let output = child.wait_with_output().expect("wait for meka");
+    let output = child.wait_with_output().expect("wait for Meka");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     assert!(
@@ -1192,13 +1192,13 @@ fn the_prompt_can_be_read_from_stdin() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn meka");
+        .expect("spawn Meka");
     {
         use std::io::Write;
         let mut stdin = child.stdin.take().expect("piped stdin");
         stdin.write_all(b"from a pipe\n").expect("write the prompt");
     }
-    let output = child.wait_with_output().expect("wait for meka");
+    let output = child.wait_with_output().expect("wait for Meka");
     assert!(
         output.status.success(),
         "{}",
@@ -1225,7 +1225,7 @@ fn an_empty_stdin_prompt_is_refused() {
     let output = scripted_command(&install, &["-p", "-", "--oneshot"])
         .stdin(std::process::Stdio::null())
         .output()
-        .expect("spawn meka");
+        .expect("spawn Meka");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("read nothing from stdin"), "{stderr}");
@@ -1282,7 +1282,7 @@ fn an_interrupted_oneshot_run_exits_130_and_keeps_what_was_written() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn meka");
+        .expect("spawn Meka");
     let mut stderr = child.stderr.take().expect("piped stderr");
     let mut chrome = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -1300,7 +1300,7 @@ fn an_interrupted_oneshot_run_exits_130_and_keeps_what_was_written() {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);
     }
     stderr.read_to_end(&mut chrome).expect("drain stderr");
-    let status = child.wait().expect("wait for meka");
+    let status = child.wait().expect("wait for Meka");
     let mut answer = String::new();
     child
         .stdout
@@ -1336,7 +1336,7 @@ fn an_interrupted_json_oneshot_run_still_reports() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn meka");
+        .expect("spawn Meka");
     // The row is written as the turn begins, after the interrupt handler is installed, so it is
     // the signal that a SIGINT now lands on a live turn rather than on a process still starting.
     support::wait_until(
@@ -1355,7 +1355,7 @@ fn an_interrupted_json_oneshot_run_still_reports() {
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);
     }
-    let output = child.wait_with_output().expect("wait for meka");
+    let output = child.wait_with_output().expect("wait for Meka");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(130), "{stderr}");
     assert!(stderr.contains("interrupted"), "{stderr}");
@@ -1408,7 +1408,7 @@ fn an_interrupted_wait_stops_the_background_task_it_was_waiting_for() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn meka");
+        .expect("spawn Meka");
     // The command is running by the time the report is out, since the turn that started it is
     // over; checked ahead of the read so the press follows the report with nothing in between.
     support::wait_until(
@@ -1431,7 +1431,7 @@ fn an_interrupted_wait_stops_the_background_task_it_was_waiting_for() {
         report.contains("\"stop_reason\":\"end_turn\""),
         "the turn ended before the wait: {report}"
     );
-    let output = child.wait_with_output().expect("wait for meka");
+    let output = child.wait_with_output().expect("wait for Meka");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("stopping 1 background task"),
@@ -1755,7 +1755,7 @@ fn instructions_show_and_path_read_the_listed_files_from_the_current_directory()
     std::fs::create_dir_all(&project).expect("project dir");
     // The child reports its working directory as the OS spells it, which on macOS resolves the
     // temp directory's symlink into `/private`, so the expected paths are built from that spelling,
-    // minus the `\\?\` prefix Windows' `canonicalize` adds and meka never prints.
+    // minus the `\\?\` prefix Windows' `canonicalize` adds and Meka never prints.
     let project = std::path::PathBuf::from(
         std::fs::canonicalize(&project)
             .expect("canonical")
@@ -2037,7 +2037,7 @@ fn resuming_a_session_whose_profile_is_gone_exits_nonzero() {
         "the hint should give the command that repins this session: {stderr}"
     );
     // And it adds nothing else. `profile add` here would have to invent the deleted profile's
-    // account and `--model`, which meka never saw: `ghost` may have been on another account and
+    // account and `--model`, which Meka never saw: `ghost` may have been on another account and
     // another model, so the command would create a different profile under the name the session
     // wants. The refusal above already says to restore it from config.toml, which is the honest
     // version of the same advice.
@@ -2517,7 +2517,7 @@ fn a_sub_agent_placed_in_a_directory_writes_only_there() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("exactly one worker row");
-    // meka records the canonical path without Windows' verbatim `\\?\` prefix, which
+    // Meka records the canonical path without Windows' verbatim `\\?\` prefix, which
     // `std::fs::canonicalize` includes there.
     let expected = std::fs::canonicalize(&sub).expect("canonical");
     let expected = expected
@@ -2801,7 +2801,7 @@ fn a_reader_that_hangs_up_mid_answer_does_not_abort_the_run() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn meka");
+        .expect("spawn Meka");
 
     // One read, then hang up: `head -1` in process form. Reading first is what makes the close land
     // mid-stream rather than before the first write.
@@ -2813,7 +2813,7 @@ fn a_reader_that_hangs_up_mid_answer_does_not_abort_the_run() {
             panic!("reading one byte from the child failed: {error}");
         }
     }
-    let status = child.wait().expect("wait for meka");
+    let status = child.wait().expect("wait for Meka");
 
     use std::os::unix::process::ExitStatusExt as _;
     assert!(
@@ -2862,7 +2862,7 @@ fn a_stdout_that_will_not_take_the_answer_fails_the_run_once() {
         .meka(&["--oneshot", "-p", "write something long"])
         .stdout(std::process::Stdio::from(full))
         .output()
-        .expect("spawn meka");
+        .expect("spawn Meka");
 
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(
@@ -3017,7 +3017,7 @@ fn no_command_dies_because_its_reader_stopped_reading() {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap_or_else(|error| panic!("spawn meka {args:?}: {error}"));
-        let status = child.wait().expect("wait for meka");
+        let status = child.wait().expect("wait for Meka");
 
         use std::os::unix::process::ExitStatusExt as _;
         assert!(
@@ -3075,7 +3075,7 @@ fn a_named_destination_that_goes_away_is_still_a_failure() {
 
     // Opened before the child and non-blocking, so neither side can wait on the other: opening a
     // fifo for writing blocks until a reader arrives, and for reading until a writer does. A thread
-    // that blocks in `open` would hang the suite instead of failing it whenever meka exits before
+    // that blocks in `open` would hang the suite instead of failing it whenever Meka exits before
     // it gets that far -- an unknown session, an unreadable config, a refused lock.
     use std::os::unix::fs::OpenOptionsExt as _;
     let reader = std::fs::OpenOptions::new()
@@ -3090,7 +3090,7 @@ fn a_named_destination_that_goes_away_is_still_a_failure() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn meka");
+        .expect("spawn Meka");
 
     // Take a little and hang up, so the export breaks partway rather than never starting.
     {
@@ -3105,7 +3105,7 @@ fn a_named_destination_that_goes_away_is_still_a_failure() {
         }
         drop(reader);
     }
-    let run = run.wait_with_output().expect("wait for meka");
+    let run = run.wait_with_output().expect("wait for Meka");
 
     assert!(
         !run.status.success(),
@@ -3855,7 +3855,7 @@ fn history_is_no_command() {
     let output = meka()
         .args(["history", "list"])
         .output()
-        .expect("failed to spawn meka");
+        .expect("failed to spawn Meka");
     assert!(!output.status.success(), "meka history must be refused");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
@@ -4031,7 +4031,7 @@ fn confine_refuses_writes_outside_the_roots_and_allows_them_inside() {
     let probe = meka()
         .args(["confine", "--", "true"])
         .output()
-        .expect("spawn meka");
+        .expect("spawn Meka");
     if !probe.status.success() {
         let stderr = String::from_utf8_lossy(&probe.stderr);
         assert_eq!(
@@ -4060,7 +4060,7 @@ fn confine_refuses_writes_outside_the_roots_and_allows_them_inside() {
         .arg(&work)
         .args(["--", "sh", "-c", &script])
         .status()
-        .expect("spawn meka");
+        .expect("spawn Meka");
     match status.code() {
         Some(0) => {}
         Some(3) => panic!("the write inside the root was refused"),
@@ -4075,7 +4075,7 @@ fn confine_refuses_writes_outside_the_roots_and_allows_them_inside() {
     let failed = meka()
         .args(["confine", "--", "/nonexistent/meka-probe"])
         .output()
-        .expect("spawn meka");
+        .expect("spawn Meka");
     assert_eq!(failed.status.code(), Some(126));
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(

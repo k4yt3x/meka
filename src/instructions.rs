@@ -1,4 +1,4 @@
-//! User-authored instructions: standing guidance appended to meka's own system prompt.
+//! User-authored instructions: standing guidance appended to Meka's own system prompt.
 //!
 //! Content, not configuration. Like [`crate::skills`] and [`crate::memory`], it lives at a
 //! conventional path under the config directory rather than behind a key in `config.toml`, because
@@ -119,7 +119,7 @@ pub(crate) fn discover() -> Option<Instructions> {
 
 /// Read one explicit path, for `MEKA_INSTRUCTIONS_FILE`. A directory is accepted and concatenated
 /// the same way the conventional one is, so a ConfigMap mounted as a directory of keys works
-/// without the caller having to know which shape meka expects.
+/// without the caller having to know which shape Meka expects.
 ///
 /// Unlike [`discover`] a missing or unreadable path is an error rather than silence: the user named
 /// it explicitly, so failing quietly would leave the agent running without the guidance they
@@ -127,7 +127,7 @@ pub(crate) fn discover() -> Option<Instructions> {
 pub(crate) fn read_explicit(path: &Path) -> crate::error::Result<Instructions> {
     if path.is_dir() {
         // Any regular file counts here, not just `*.md`. The user named this directory and nothing
-        // else lives in it, whereas the conventional `instructions/` sits among meka's other
+        // else lives in it, whereas the conventional `instructions/` sits among Meka's other
         // content and has to be choosier. It also happens to be what containers need: a
         // ConfigMap key is often just `instructions`, and requiring an extension would turn a
         // naming choice made elsewhere into a startup failure inside a pod.

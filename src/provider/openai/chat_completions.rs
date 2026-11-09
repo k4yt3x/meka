@@ -4,7 +4,7 @@
 //! `POST {base_url}/chat/completions`, reaching OpenAI and anything implementing that format
 //! (Ollama, vLLM, LM Studio, OpenRouter, Synthetic, LiteLLM, local proxies). This is *not* the
 //! legacy `/v1/completions`, a different protocol with no tool calling that several of those same
-//! servers also expose and that meka does not implement.
+//! servers also expose and that Meka does not implement.
 //!
 //! The protocol sibling is [`super::responses`], which takes the same key against OpenAI's newer
 //! format; unlike the Responses pair, Chat Completions has one implementation here and shares no
@@ -1567,7 +1567,7 @@ mod tests {
         let refused = with_ceiling(Some(4_000))
             .request_body_within_budget("", &messages, &[], false)
             .expect_err("the newest message's image cannot be redacted, so the ceiling refuses");
-        // meka's own ceiling, so `RequestTooLarge` rather than the provider's `InvalidRequest`;
+        // Meka's own ceiling, so `RequestTooLarge` rather than the provider's `InvalidRequest`;
         // both arm the degrade-and-retry, and only one of them claims an upstream judged this.
         assert!(
             matches!(refused, MekaError::RequestTooLarge(_)),
@@ -1674,7 +1674,7 @@ mod tests {
     #[test]
     fn an_unconfigured_profile_sends_no_reasoning_effort_whatever_the_model() {
         // Recognized reasoning model or local weights, the answer is the same: OpenAI owns the
-        // default and meka asks for it by omitting the field.
+        // default and Meka asks for it by omitting the field.
         for model in ["gpt-6-astra", "o3", "llama3.1"] {
             let provider = {
                 let api_key: String = "test-key".to_string();
@@ -1694,7 +1694,7 @@ mod tests {
             let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
             assert!(body.get("reasoning_effort").is_none(), "{model}");
         }
-        // A configured value is absolute, including on a model meka does not recognize.
+        // A configured value is absolute, including on a model Meka does not recognize.
         let configured = {
             let api_key: String = "test-key".to_string();
             OpenAiChatCompletionsProvider::from_settings(

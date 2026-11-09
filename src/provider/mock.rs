@@ -119,7 +119,7 @@ pub(crate) enum MockEvent {
     /// Synthetic *malformed-request* failure. The stream returns
     /// `Err(MekaError::InvalidRequest(message))` immediately, exercising `Agent::run_turn`'s
     /// degrade-and-retry path. Each attempt consumes one round, so
-    /// `[FailInvalidRequest, ..success events..]` simulates "the provider rejected the content meka
+    /// `[FailInvalidRequest, ..success events..]` simulates "the provider rejected the content Meka
     /// just appended, the retry without it succeeds".
     FailInvalidRequest {
         message: String,

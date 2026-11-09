@@ -51,7 +51,7 @@ request, so a test can change what the server does between two requests to it. T
       "log": "/path/requests.jsonl"         every request appended as one JSON line
     }
 
-`exit_after` is how a test closes the transport under meka without needing the child's pid.
+`exit_after` is how a test closes the transport under Meka without needing the child's pid.
 """
 
 import json

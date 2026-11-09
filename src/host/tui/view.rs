@@ -36,7 +36,7 @@ const COMPACTION_ICON: &str = "→←";
 const COMPACTION_LABEL: &str = "Context compacted";
 /// What the gap row says while the view is scrolled up from the bottom.
 pub(crate) const BACK_TO_BOTTOM: &str = "↓ back to bottom";
-/// meka's mark, the slanted `M` of its icon in quadrant-block pixels with a shadow one pixel to
+/// Meka's mark, the slanted `M` of its icon in quadrant-block pixels with a shadow one pixel to
 /// its right: three rows of runs, one beside each of the banner's lines.
 const BANNER_MARK: [&[(&str, MarkTone)]; 3] = [
     &[
@@ -456,7 +456,7 @@ fn tool_body(item: &Item, expanded: bool, width: usize) -> Vec<Line<'static>> {
                 text = output.trim_end_matches('\n');
             }
             let mut lines = draw::ansi_lines(without_leading_blank_lines(text), wrap);
-            // What a tool or meka said of a failure is the failure, in red; what a program wrote
+            // What a tool or Meka said of a failure is the failure, in red; what a program wrote
             // is its output, however it exited.
             let color = if failed && exit_code.is_none() {
                 Color::Red
@@ -636,6 +636,13 @@ pub(crate) fn entry_lines(
                 }
             }
         }
+        Item::Log { target, message } => draw::glyph_text_rows(
+            ACT_GLYPH,
+            gray(),
+            &format!("{target}: {}", message.trim_end()),
+            gray(),
+            width,
+        ),
         Item::Error(text) => {
             let red = Style::default().fg(Color::Red);
             draw::glyph_text_rows(ERROR_GLYPH, red, &draw::screen_voice(text), red, width)
@@ -690,7 +697,7 @@ pub(crate) fn entry_lines(
             };
             let title = vec![
                 Span::styled(
-                    "meka".to_string(),
+                    "Meka".to_string(),
                     Style::default()
                         .fg(draw::WHITE)
                         .add_modifier(Modifier::BOLD),
@@ -2435,8 +2442,9 @@ mod tests {
     }
 
     /// Every kind of item puts its glyph in column 0 and its text at the edge, so the whole
-    /// transcript shares one left margin, and a line in meka's voice starts with a capital and
-    /// ends in no period, whatever the sentence it was drawn from.
+    /// transcript shares one left margin. A line in Meka's voice starts with a capital and ends in
+    /// no period, whatever the sentence it was drawn from; a log row is drawn as written, less
+    /// its trailing whitespace.
     #[test]
     fn every_item_keeps_its_glyph_in_the_gutter_and_its_text_at_the_edge() {
         let cases: Vec<(Item, &str)> = vec![
@@ -2484,7 +2492,20 @@ mod tests {
             (Item::interrupted(), "! Interrupted"),
             (Item::Error("provider error".into()), "■ Provider error"),
             (Item::note("file_write allowed"), "• file_write allowed"),
-            (Item::note("meka stopped 2 tasks"), "• meka stopped 2 tasks"),
+            (
+                Item::Log {
+                    target: "meka::agent::turn".into(),
+                    message: "turn started".into(),
+                },
+                "• meka::agent::turn: turn started",
+            ),
+            (
+                Item::Log {
+                    target: "meka".into(),
+                    message: "resolved the config.".into(),
+                },
+                "• meka: resolved the config.",
+            ),
             (Item::note("Rewound 1 turn."), "• Rewound 1 turn"),
             (Item::note("Still going..."), "• Still going..."),
             (Item::note("Approvals on"), "• Approvals on"),
@@ -2515,6 +2536,12 @@ mod tests {
             60,
         );
         assert_eq!(warning[0].spans[0].style.fg, Some(Color::Yellow));
+        let log = Item::Log {
+            target: "meka".into(),
+            message: "kept\n  ".into(),
+        };
+        let rows = plain(&lines_at(&entry(log, false), 60));
+        assert_eq!(rows, ["• meka: kept"], "{rows:?}");
     }
 
     /// No row an item lays out is wider than the width it was laid out at, whatever the content,
@@ -2627,6 +2654,10 @@ mod tests {
                 text: format!("{token}\t!"),
             },
             Item::Error(format!("{token}\t{address}")),
+            Item::Log {
+                target: address.clone(),
+                message: format!("{token}\t{address}"),
+            },
             Item::ShellOutput(format!("\x1b[32m{token}\x1b[0m\n\t{address}")),
             Item::SessionId {
                 label: token.clone(),
@@ -4087,7 +4118,7 @@ mod tests {
         );
     }
 
-    /// The banner is meka's mark beside three lines, two columns in from the edge under a blank
+    /// The banner is Meka's mark beside three lines, two columns in from the edge under a blank
     /// row: the letter in cyan with its shadow in a deep blue, which lies under a glyph where the
     /// two share a cell and never under a space; then the name bold and white with the version
     /// and the build dimmed beside it, then what the agent can do and what it knows a step down
@@ -4106,7 +4137,7 @@ mod tests {
         let lines = lines_at(&entry(item, false), 80);
         assert_eq!(plain(&lines), vec![
             "",
-            "   ██▖ ▗██▌  meka v0.72.0 (a1b2c3d-dirty, debug)",
+            "   ██▖ ▗██▌  Meka v0.72.0 (a1b2c3d-dirty, debug)",
             "  ▐█▝▙▟▘█▌   2 MCP servers · 1 skill",
             "  █▌ ▀▘▐█▌   48 memories · 3 instructions",
         ]);
@@ -4141,7 +4172,7 @@ mod tests {
         let spans = &lines[1].spans;
         let at = spans
             .iter()
-            .position(|span| span.content == "meka")
+            .position(|span| span.content == "Meka")
             .expect("the name");
         let name = &spans[at];
         assert_eq!(name.style.fg, Some(draw::WHITE));
@@ -4177,7 +4208,7 @@ mod tests {
             60,
         );
         assert_eq!(plain(&release)[1..], [
-            "   ██▖ ▗██▌  meka v0.72.0",
+            "   ██▖ ▗██▌  Meka v0.72.0",
             "  ▐█▝▙▟▘█▌   0 MCP servers · 0 skills",
             "  █▌ ▀▘▐█▌   1 memory · 0 instructions",
         ]);

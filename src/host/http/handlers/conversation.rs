@@ -52,7 +52,7 @@ pub(crate) struct CompactRequestBody {
     /// <instructions>`. Reaches the checkpoint turn and the fallback summarizer alike.
     #[serde(default)]
     pub(crate) instructions: Option<String>,
-    /// Whether to keep the most recent turns verbatim after the summary. Omit to let meka decide;
+    /// Whether to keep the most recent turns verbatim after the summary. Omit to let Meka decide;
     /// the checkpoint turn overrides this when it knows better, having just read the conversation.
     #[serde(default)]
     pub(crate) keep_recent: Option<bool>,
@@ -70,10 +70,10 @@ pub(crate) struct CompactRequestBody {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another Meka process holds the session (`/errors/session-locked`)", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, nothing to compact, or the id names a sub-agent's conversation (`/errors/session-not-drivable`), which no payload makes acceptable", body = ProblemDetail),
-        (status = 502, description = "The provider rejected or failed the summarizing turn. Read `type`: `/errors/provider-unavailable` is worth resending after a pause, `/errors/provider` covers everything meka does not classify, and `/errors/context-overflow` here means the conversation will not fit even to summarize it", body = ProblemDetail),
+        (status = 502, description = "The provider rejected or failed the summarizing turn. Read `type`: `/errors/provider-unavailable` is worth resending after a pause, `/errors/provider` covers everything Meka does not classify, and `/errors/context-overflow` here means the conversation will not fit even to summarize it", body = ProblemDetail),
         (status = 503, description = "An MCP server the checkpoint turn needed was unavailable (`/errors/mcp-unavailable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
@@ -327,7 +327,7 @@ pub(crate) struct ContextResponse {
     /// divides by `window`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) used: Option<u64>,
-    /// The model's context window, omitted when meka has no metadata for it. A percentage of an
+    /// The model's context window, omitted when Meka has no metadata for it. A percentage of an
     /// unknown denominator is worse than silence, so clients should suppress occupancy rather than
     /// assume a default.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -433,7 +433,7 @@ pub(crate) async fn context(
                         .with("session_id", id.to_string())
                 })?;
             // `None` for a session whose row is gone, and for one whose profile no longer resolves.
-            // Both answer "meka cannot say", which `window` already encodes; the server default
+            // Both answer "Meka cannot say", which `window` already encodes; the server default
             // would be a number about a different profile.
             recorded.and_then(|profile| {
                 crate::provider::profile_context_window(&state.shared.providers, &profile)
@@ -481,7 +481,7 @@ pub(crate) struct RewindRequestBody {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session, as a running sub-agent's parent does (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another Meka process holds the session, as a running sub-agent's parent does (`/errors/session-locked`)", body = ProblemDetail),
         (status = 412, description = "`If-Match` names a conversation that has since changed (`/errors/precondition-failed`); `position` carries the current one", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, or `turn_id` names no turn the context holds", body = ProblemDetail),
@@ -723,7 +723,7 @@ async fn rewind_dormant_session(
             crate::error::MekaError::SessionLocked(_) => ProblemDetail::new(
                 ErrorKind::SessionLocked,
                 StatusCode::CONFLICT,
-                "another meka process is running this session, so its conversation cannot be \
+                "another Meka process is running this session, so its conversation cannot be \
              rewound from here",
             )
             .with("session_id", id.to_string()),

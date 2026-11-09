@@ -45,7 +45,7 @@ fn bwrap_masks() -> Vec<std::path::PathBuf> {
 /// applies operations onto the new root in sequence and the last one to touch a path wins, so a
 /// bind placed before the tmpfs masks is silently undone by them. A workspace under `/tmp` (where
 /// every test fixture and a fair number of real scratch directories live) would come out read-only
-/// with no error from bwrap, no error from meka, and a level that quietly confines the shell to
+/// with no error from bwrap, no error from Meka, and a level that quietly confines the shell to
 /// nothing.
 #[cfg(target_os = "linux")]
 fn bwrap_args(
@@ -154,7 +154,7 @@ fn bwrap_args(
         args.push(directory.into());
     }
 
-    // meka's own directories, masked after every bind so they stay hidden under a writable root
+    // Meka's own directories, masked after every bind so they stay hidden under a writable root
     // that contains them: later mounts win, which is what would otherwise let a root at `$HOME`
     // hand `~/.config/meka` and the credential store beside it to a confined shell. See
     // `workspace::private_directories` for what is in the list and why.
@@ -171,7 +171,7 @@ fn bwrap_args(
     args
 }
 
-/// The command Bubblewrap execs when the kernel has a usable Landlock: meka itself, reached as
+/// The command Bubblewrap execs when the kernel has a usable Landlock: Meka itself, reached as
 /// `program`, which enacts the ruleset after bwrap's mounts and then becomes the shell.
 ///
 /// The workspace roots are writable; every mask and `/dev` are scratch. The masks because bwrap
@@ -223,7 +223,7 @@ fn inner_layer_executable() -> Result<std::fs::File> {
     opened.map_err(|error| MekaError::ToolExecution {
         tool_name: "shell_execute".to_string(),
         message: format!(
-            "failed to open meka's own executable for the sandbox's Landlock layer: {error}"
+            "failed to open Meka's own executable for the sandbox's Landlock layer: {error}"
         ),
     })
 }
@@ -458,7 +458,7 @@ impl ExecuteCommandTool {
         let cancellation = context.cancellation.clone();
         let sandboxed = confinement.is_sandboxed();
 
-        // Windows + AppContainer: the policy is meka's own model of this call, encoded per
+        // Windows + AppContainer: the policy is Meka's own model of this call, encoded per
         // command, and the OS enforces it; no ACE is written and no token derived.
         #[cfg(windows)]
         if sandboxed
@@ -535,7 +535,7 @@ impl ExecuteCommandTool {
                             tool_name: "shell_execute".to_string(),
                             message: format!(
                                 "failed to make '{}' writable for the sandboxed shell: {}; a \
-                                 workspace root on Windows must be a directory meka owns",
+                                 workspace root on Windows must be a directory Meka owns",
                                 root.display(),
                                 error
                             ),
@@ -693,7 +693,7 @@ impl ExecuteCommandTool {
             // async-signal-safe.
             // No scratch paths: Landlock alone offers a command no temporary directory, because
             // the only one it could offer is a real directory under the real `/tmp`, and below
-            // `unrestricted` meka writes to nothing but its store. Bubblewrap's tmpfs is the
+            // `unrestricted` Meka writes to nothing but its store. Bubblewrap's tmpfs is the
             // answer for a tool that needs one.
             #[cfg(target_os = "linux")]
             let grants: Vec<crate::sandbox::LandlockGrant> = match landlock_abi {
@@ -718,7 +718,7 @@ impl ExecuteCommandTool {
                     return Err(std::io::Error::last_os_error());
                 }
                 // The layer's executable rides into Bubblewrap on its descriptor, which stays
-                // close-on-exec until here so no other child of meka inherits it. `fcntl(2)`
+                // close-on-exec until here so no other child of Meka inherits it. `fcntl(2)`
                 // is async-signal-safe.
                 #[cfg(target_os = "linux")]
                 if let Some(executable) = &inner_executable
@@ -870,7 +870,7 @@ async fn finish_command(
     Ok(output.with_metadata(command_exit_metadata(&status)))
 }
 
-/// The result of a command meka killed, at its timeout or at the output bound: the reason, then
+/// The result of a command Meka killed, at its timeout or at the output bound: the reason, then
 /// everything it printed up to the kill. A frontend rendering a terminal shows "terminated" rather
 /// than an exit code.
 fn killed_command_output(drained: &DrainedOutput, reason: &str) -> ToolOutput {
@@ -1056,7 +1056,7 @@ impl OutputRelay {
     }
 }
 
-/// How much a command may print, stdout and stderr together, before meka stops it.
+/// How much a command may print, stdout and stderr together, before Meka stops it.
 ///
 /// Every byte under the bound is kept: in memory while the command runs, then in the scratchpad
 /// when the result is too large for the conversation. So a bound is the only thing standing between
@@ -1269,7 +1269,7 @@ fn signal_name(number: i32) -> String {
     }
 }
 
-/// Exit status for a command meka killed, at its timeout or at the output bound. The child is torn
+/// Exit status for a command Meka killed, at its timeout or at the output bound. The child is torn
 /// down without its status being reaped, so there is nothing to read it from. On Unix the kill
 /// really is a signal ([`kill_child_tree`]); Windows has no signals, and claiming one there would
 /// put a name in the client's terminal that never existed on that platform.
@@ -1607,7 +1607,7 @@ mod tests {
         );
     }
 
-    /// A real signal kill and meka's own timeout kill must spell the same signal the same way; a
+    /// A real signal kill and Meka's own timeout kill must spell the same signal the same way; a
     /// client's terminal shows this string, and `SIG9` next to `SIGKILL` for the same event reads
     /// as two different failures.
     #[cfg(unix)]
@@ -2526,7 +2526,7 @@ mod tests {
             );
             assert!(
                 !outside.join("escaped.txt").exists(),
-                "a write outside every root must be refused by the token, not by meka: {result:?}"
+                "a write outside every root must be refused by the token, not by Meka: {result:?}"
             );
 
             tool.windows_grants.revoke_all();
@@ -2605,13 +2605,13 @@ mod tests {
             println!("{PROBE_VERDICT_PREFIX}{verdict}");
         }
 
-        /// A `workspace` child can read meka's own process memory; a `read` child cannot.
+        /// A `workspace` child can read Meka's own process memory; a `read` child cannot.
         ///
         /// The two levels are compared in one test because either result alone is uninformative: a
         /// token that denied everything would pass a "refused" assertion on its own merits, and a
         /// host where the probe simply failed to run would look like confinement.
         ///
-        /// **The `read` leg is the guard.** Low integrity has to deny `OpenProcess` against meka,
+        /// **The `read` leg is the guard.** Low integrity has to deny `OpenProcess` against Meka,
         /// and nothing else in the suite defends that. **The `workspace` leg is a tripwire on the
         /// documentation.** It asserts the measured weakness still exists, so hardening the spawn
         /// path fails this test and forces `docs/book/src/usage/permissions.md` to be corrected
@@ -2619,7 +2619,7 @@ mod tests {
         ///
         /// Why the weakness exists: `WRITE_RESTRICTED` intersects the restricting SIDs for write
         /// access only, and the `workspace` path deliberately leaves the integrity label alone so
-        /// ordinary tooling keeps working. Neither restricts a *read*, and meka's memory holds
+        /// ordinary tooling keeps working. Neither restricts a *read*, and Meka's memory holds
         /// provider credentials. Measured on hardware 2026-08-24: `workspace` returned the canary,
         /// `read` returned `ERROR_ACCESS_DENIED`.
         ///
@@ -2688,7 +2688,7 @@ mod tests {
                     _ => assert!(
                         reported.contains("OPEN_FAILED"),
                         "`{label}` runs at Low integrity, which must refuse OpenProcess against \
-                         meka: {reported}"
+                         Meka: {reported}"
                     ),
                 }
             }
@@ -3072,7 +3072,7 @@ mod tests {
         /// The level `shell_execute` needs depends on whether a sandbox can actually confine it.
         ///
         /// `read` only when the sandbox is both enabled *and* backed by a working backend;
-        /// otherwise `unrestricted`, because a command meka cannot confine is a command only the
+        /// otherwise `unrestricted`, because a command Meka cannot confine is a command only the
         /// boundary-free level may authorize. The conjunction is the whole rule: flipped to `||`,
         /// the tool would be offered at `read` with `[shell].sandbox = false`, or with the sandbox
         /// on but no usable backend. The runtime guard in `execute` still refuses the command in
@@ -3099,7 +3099,7 @@ mod tests {
                     );
                 };
 
-            // Nothing can confine: either meka was told not to, or the host offers no backend.
+            // Nothing can confine: either Meka was told not to, or the host offers no backend.
             check(
                 true,
                 SandboxCapability::Unavailable,
@@ -3114,7 +3114,7 @@ mod tests {
             // Which backend is available does not enter the rule, and the variants are
             // per-platform, so the positive leg uses whatever this host actually has.
             // Skipped rather than faked where there is none: an invented variant would
-            // assert against a state meka cannot reach here.
+            // assert against a state Meka cannot reach here.
             let available = crate::sandbox::detect();
             if matches!(available, SandboxCapability::Unavailable) {
                 eprintln!("skipping the confined leg: no sandbox backend on this host");
@@ -3364,7 +3364,7 @@ mod tests {
             let _ = std::fs::remove_file(&outside);
         }
 
-        /// The masks over meka's own directories come after every bind, so a writable root that
+        /// The masks over Meka's own directories come after every bind, so a writable root that
         /// contains the store does not hand it back: later mounts win.
         #[test]
         fn meka_s_own_directories_are_masked_after_every_writable_bind() {
@@ -3569,7 +3569,7 @@ mod tests {
         }
 
         /// Every mount a confined command sees is read-only, in both forms of the root, unless
-        /// it is the workspace, a mask, meka's own directory, `/dev` or `/proc`: the sandbox's
+        /// it is the workspace, a mask, Meka's own directory, `/dev` or `/proc`: the sandbox's
         /// whole promise rests on no bind landing read-write by mistake, and a regression fails
         /// here rather than in an audit.
         #[test]
@@ -3587,7 +3587,7 @@ mod tests {
             }
             let base = crate::workspace::ReadBoundary::new(true, &[], &[]).base;
             let confined: Vec<PathBuf> = std::iter::once(root.clone()).chain(base).collect();
-            // Writable by design: the masks and meka's directory are empty tmpfs, `/dev` and
+            // Writable by design: the masks and Meka's directory are empty tmpfs, `/dev` and
             // `/proc` are the sandbox's own, and so is the empty root when reads are confined.
             let scratch: Vec<PathBuf> = super::bwrap_masks()
                 .into_iter()
@@ -3843,7 +3843,7 @@ mod tests {
             }) = a_backend_detect_does_not_name()
             else {
                 eprintln!(
-                    "skipping: bwrap, the built meka binary and a usable Landlock are all needed"
+                    "skipping: bwrap, the built Meka binary and a usable Landlock are all needed"
                 );
                 return;
             };
@@ -3895,7 +3895,7 @@ mod tests {
             }) = a_backend_detect_does_not_name()
             else {
                 eprintln!(
-                    "skipping: bwrap, the built meka binary and a usable Landlock are all needed"
+                    "skipping: bwrap, the built Meka binary and a usable Landlock are all needed"
                 );
                 return;
             };
@@ -3943,7 +3943,7 @@ mod tests {
         }
 
         /// The layer is reached through a descriptor of the running image, not a path, so the
-        /// binary being replaced or deleted under a running meka changes nothing: an upgrade
+        /// binary being replaced or deleted under a running Meka changes nothing: an upgrade
         /// under `meka serve` must not break every sandboxed command until a restart.
         #[cfg(target_os = "linux")]
         #[tokio::test]
@@ -3954,7 +3954,7 @@ mod tests {
             }) = a_backend_detect_does_not_name()
             else {
                 eprintln!(
-                    "skipping: bwrap, the built meka binary and a usable Landlock are all needed"
+                    "skipping: bwrap, the built Meka binary and a usable Landlock are all needed"
                 );
                 return;
             };
@@ -3983,7 +3983,7 @@ mod tests {
         }
 
         /// A shell under Landlock alone has no temporary directory: `TMPDIR` is not set for it and
-        /// `mktemp` is refused at `read`. Below `unrestricted` meka writes to nothing but its
+        /// `mktemp` is refused at `read`. Below `unrestricted` Meka writes to nothing but its
         /// store, and a real directory under the real `/tmp` was the one thing the Landlock dialect
         /// wrote outside it.
         #[cfg(target_os = "linux")]
@@ -4019,11 +4019,11 @@ mod tests {
             let text = super::text_of(&result);
             assert!(result.is_error, "mktemp is refused: {text}");
             // The scrubbed environment passes the parent's own `TMPDIR` through when there is one,
-            // so the child sees exactly that and never a directory meka made for it.
+            // so the child sees exactly that and never a directory Meka made for it.
             let inherited = std::env::var("TMPDIR").unwrap_or_else(|_| "unset".to_string());
             assert!(
                 text.contains(&format!("TMPDIR={inherited}\n")),
-                "no temporary directory of meka's is offered: {text}"
+                "no temporary directory of Meka's is offered: {text}"
             );
             assert!(!text.contains("CREATED"), "{text}");
         }

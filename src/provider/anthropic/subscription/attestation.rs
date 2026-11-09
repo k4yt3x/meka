@@ -6,7 +6,7 @@
 //! than guessed, and each is re-checked against a fresh capture when the pinned version moves. To
 //! recapture, point the real client at a logging reverse proxy and set
 //! `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1`, which is what re-enables the attestation through
-//! a host that is not `api.anthropic.com`; then diff one of its requests against one of meka's.
+//! a host that is not `api.anthropic.com`; then diff one of its requests against one of Meka's.
 //!
 //! Claude Code ships minified, so nothing here cites a line in its source. What it cites instead is
 //! the minified symbol a reader can actually grep the binary for.
@@ -46,8 +46,8 @@ fn compute_fingerprint(message_text: &str, version: &str) -> String {
     hex[..3].to_string()
 }
 
-/// The text of the first user message as the model read it, past meka's context block: the words
-/// as typed, or the inbox item, scheduled fire or background report meka relayed in their place.
+/// The text of the first user message as the model read it, past Meka's context block: the words
+/// as typed, or the inbox item, scheduled fire or background report Meka relayed in their place.
 /// A session opened on an item or a fire has no typed words, and the fingerprint has to hold
 /// still across its turns, so the relayed block counts as the words do.
 fn extract_first_user_message_text(messages: &[Message]) -> String {
@@ -85,7 +85,7 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
 /// The optional segments follow in the order Claude Code's builder emits them (2.1.241 through
 /// 2.1.310, verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`,
 /// `cc_prev_req`, `cc_prompt_id`, `cc_turn_origin`, and since 2.1.284 the pair `cc_prompt_index`
-/// and `cc_turn_index`, which go together or not at all. meka never has a workload, so that one
+/// and `cc_turn_index`, which go together or not at all. Meka never has a workload, so that one
 /// is always absent; the rest appear exactly when their source does.
 pub(super) fn generate_billing_header(
     messages: &[Message],
@@ -531,7 +531,7 @@ fn stainless_os() -> &'static str {
 /// `attribution` adds what Claude Code says about the request itself; the OAuth account
 /// endpoints pass `None`, since a GET there has no request to classify.
 ///
-/// Two parts of it are outside meka's reach and stay different. Header *names* go out lowercased
+/// Two parts of it are outside Meka's reach and stay different. Header *names* go out lowercased
 /// (`http::HeaderName` normalizes, and HTTP/2 requires it anyway, so this is invisible on the real
 /// wire), and `reqwest` places `Accept-Encoding` first because its decompression layer installs it
 /// before any per-request header.
@@ -595,7 +595,7 @@ pub(super) fn apply_headers(
 /// A worker's requests name the worker by id, and a nested worker's name its spawner too, the way
 /// Claude Code's sub-agent context does on every request the sub-agent makes. A worker's turn
 /// names its agent type as `general-purpose`: an `Agent` call with no custom agent definition
-/// runs Claude Code's built-in general-purpose agent, which is what a meka worker is (2.1.284
+/// runs Claude Code's built-in general-purpose agent, which is what a Meka worker is (2.1.284
 /// sub-agent capture). Its compaction names no type, the way Claude Code's `compact` query
 /// source has none.
 ///

@@ -34,7 +34,7 @@ Check what is actually in effect at any time:
 
 ```bash
 meka instructions show     # the resolved text, plus where it came from
-meka instructions path     # the paths meka checks, and whether each exists
+meka instructions path     # the paths Meka checks, and whether each exists
 ```
 
 `show` prints the text on stdout and the source on stderr, so `meka instructions show 2>/dev/null` pipes cleanly. Under `--format json`, `show` prints one object, `{"source", "files", "content"}`, each field left out when there is nothing to say, and `path` prints `{"paths": [{"path", "exists"}]}`.
@@ -52,7 +52,7 @@ A file is the right shape on a workstation, but not everywhere. When the channel
 
 Resolution stops at the first one set, in that order.
 
-This matters most for containers. The [`mekabox`](https://github.com/k4yt3x/meka/blob/master/scripts/mekabox) wrapper mounts your config directory into the container **read-only** and then replaces the instructions with container-specific ones, which is a single `-e MEKA_INSTRUCTIONS=…`. Requiring a path would mean writing a temp file on the host and bind-mounting it, and the read-only mount means it could not simply write the file where meka looks.
+This matters most for containers. The [`mekabox`](https://github.com/k4yt3x/meka/blob/master/scripts/mekabox) wrapper mounts your config directory into the container **read-only** and then replaces the instructions with container-specific ones, which is a single `-e MEKA_INSTRUCTIONS=…`. Requiring a path would mean writing a temp file on the host and bind-mounting it, and the read-only mount means it could not simply write the file where Meka looks.
 
 `MEKA_INSTRUCTIONS_FILE` covers the case where a file exists but you do not control where it is mounted, such as a Kubernetes ConfigMap or a Docker secret. It accepts a directory too, since a ConfigMap mounts as a directory of keys, and in that case takes any regular file rather than only `*.md`: a ConfigMap key is often just `instructions`, and a naming choice made in someone else's YAML should not become a startup failure inside a pod.
 

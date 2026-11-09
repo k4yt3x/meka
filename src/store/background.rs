@@ -930,7 +930,7 @@ mod tests {
     /// Two managers over one file on disk, not two clones of one store: a clone shares an
     /// `Arc<Connection>` and therefore one worker thread, so the two claims cannot interleave and
     /// the test proves only that the statement is atomic against itself. Separate connections are
-    /// what a second meka process actually is.
+    /// what a second Meka process actually is.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn only_one_of_two_racing_claimers_takes_each_outcome() {
         let directory = tempfile::tempdir().expect("tempdir");

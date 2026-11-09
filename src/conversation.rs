@@ -437,7 +437,7 @@ impl Conversation {
     /// Read from the log rather than the view, because a compaction replaces the view's first user
     /// message with its summary and a label that changed when the session was reopened would name
     /// nothing. The words are the first block of a user `Append` that carries a person's words by
-    /// [`ContentBlock::spoken_words`]: typed text that is not a stand-in meka wrote
+    /// [`ContentBlock::spoken_words`]: typed text that is not a stand-in Meka wrote
     /// ([`is_harness_stand_in`]), an inbox item's body, a fire's prompt, an invocation's words or
     /// name; a turn's context block carries none. The store's `title_of_first_user_row` selects the
     /// same row in SQL. A log pruned by [`Self::prune_compacted_events`] starts at its last
@@ -1233,7 +1233,7 @@ pub(crate) fn rewinds<Stamp: Clone>(events: &[(Stamp, Event)]) -> Vec<Rewind<Sta
         .collect()
 }
 
-/// Prefix on every note meka writes *into the conversation itself*, as opposed to onto the screen.
+/// Prefix on every note Meka writes *into the conversation itself*, as opposed to onto the screen.
 ///
 /// It answers one question the surrounding blocks cannot: who wrote this. A note replacing a tool
 /// result sits where the tool's own output would be, and one replacing an attachment sits in the
@@ -1241,20 +1241,20 @@ pub(crate) fn rewinds<Stamp: Clone>(events: &[(Stamp, Event)]) -> Vec<Rewind<Sta
 /// said it, or something between them did.
 ///
 /// Names the harness in words rather than only by product, because a bare `[meka]` is legible only
-/// to a model that recalls what meka is from the system prompt and infers the rest. `[system]`
+/// to a model that recalls what Meka is from the system prompt and infers the rest. `[system]`
 /// would read better still and is the wrong choice: nothing strips markers out of a tool result, so
 /// a fetched page or an MCP server's output can contain any string this does, and a marker models
 /// already obey on sight is the worst one to make load-bearing.
 pub(crate) const HARNESS_NOTE: &str = "[meka harness]";
 
-/// Whether `text` is something meka put into a user message in place of the user's own content:
+/// Whether `text` is something Meka put into a user message in place of the user's own content:
 /// the placeholder a redaction leaves or a harness note. Both are `Text` blocks, because that is
 /// the one shape every provider renders, so a reader after what the user typed has to ask.
 pub(crate) fn is_harness_stand_in(text: &str) -> bool {
     text == IMAGE_REDACTION_PLACEHOLDER || text.starts_with(HARNESS_NOTE)
 }
 
-/// How the header meka writes above an inbox item's body begins when the client named the sender:
+/// How the header Meka writes above an inbox item's body begins when the client named the sender:
 /// `[Message from <source>, arrived <time>]`, then a newline, then the body verbatim. Rendered by
 /// `prompt::render_inbox_item`; read back only by the migration that types an item recorded
 /// before [`ContentBlock::Inbox`] existed.
@@ -1440,7 +1440,7 @@ impl Role {
     /// Every value, in the order a refusal lists them.
     pub(crate) const ALL: [Role; 2] = [Self::User, Self::Assistant];
 
-    /// The role's one spelling, in the log, in an archive and on meka's own surfaces.
+    /// The role's one spelling, in the log, in an archive and on Meka's own surfaces.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::User => "user",
@@ -1970,7 +1970,7 @@ impl InvocationKind {
 
 /// A user message's words with each resource an editor attached among them shown as its mention,
 /// `@name`, in the words' block: an editor sends the words around a mention as blocks of their
-/// own, and drawn apart they would read as separate prompts. A stand-in meka wrote stays a block
+/// own, and drawn apart they would read as separate prompts. A stand-in Meka wrote stays a block
 /// of its own, as it is drawn without resources.
 pub(crate) fn mentions_inline(content: &[ContentBlock]) -> Vec<ContentBlock> {
     let mut joined: Vec<ContentBlock> = Vec::new();
@@ -2014,7 +2014,7 @@ pub(crate) enum ContentBlock {
     Text {
         text: String,
     },
-    /// Words meka wrote into the model's own turn in the user's role: the nudge after a reply
+    /// Words Meka wrote into the model's own turn in the user's role: the nudge after a reply
     /// that stopped too soon. Its own block, so a nudge is known by its shape rather than its
     /// words, every provider renders it as text, every reader that shows what a person said can
     /// skip it, and an inbox item that arrives while the nudged round runs can ride behind it as a
@@ -2023,14 +2023,14 @@ pub(crate) enum ContentBlock {
         kind: NudgeKind,
         text: String,
     },
-    /// What meka injected ahead of the user's words for this turn: the permission and environment
+    /// What Meka injected ahead of the user's words for this turn: the permission and environment
     /// context, world state, budget, background outcomes and the resume notice. Its own
     /// block, so every reader that shows what the user typed can skip it, and every provider
     /// renders it as text ahead of the words. A user message carries zero or one of these, first.
     TurnContext {
         text: String,
     },
-    /// An inbox item as the model read it: `text` is the header meka wrote with the person's
+    /// An inbox item as the model read it: `text` is the header Meka wrote with the person's
     /// words under it, `body` the words alone. Its own block, so every reader shows the words as
     /// the person's, labeled by `class` and `source` rather than read back from the header, and a
     /// replay builds the prompt the live screen showed. `item_id` and `class` are absent on an
@@ -2133,7 +2133,7 @@ impl ContentBlock {
     }
 
     /// The block as one searchable string, labeled by what it is where it is not plain text, or
-    /// `None` for a block that holds no words: an image, and the context block meka writes ahead
+    /// `None` for a block that holds no words: an image, and the context block Meka writes ahead
     /// of a turn. The one definition of a block's text for search, read by the
     /// `conversation_search` tool over every block; the session search index reads the person's
     /// words alone, by [`Self::spoken_words`].
@@ -2172,9 +2172,9 @@ impl ContentBlock {
     }
 
     /// The words a person sent in this block, for a title and the search index: typed text, an
-    /// inbox item's body under the header meka wrote, a scheduled job's prompt under its fire
+    /// inbox item's body under the header Meka wrote, a scheduled job's prompt under its fire
     /// header, the words typed with an invocation (a file attached among them by its mention, as
-    /// the editor showed it) or, with none, the name it invoked. `None` for what meka wrote, a
+    /// the editor showed it) or, with none, the name it invoked. `None` for what Meka wrote, a
     /// stand-in it put where content was included, a resource block of its own, and for a block
     /// that holds no words.
     pub(crate) fn spoken_words(&self) -> Option<&str> {
@@ -2223,7 +2223,7 @@ impl Message {
                 .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
     }
 
-    /// Whether this message is a nudge: words meka wrote into the model's own turn, answering a
+    /// Whether this message is a nudge: words Meka wrote into the model's own turn, answering a
     /// reply that stopped too soon, with no visible text or with checklist items open. Known by
     /// its shape, a [`ContentBlock::Nudge`] first, whatever else rides behind it.
     pub(crate) fn is_nudge(&self) -> bool {
@@ -2288,7 +2288,7 @@ impl Message {
         Self::turn_opening(context, spoken.into_iter().collect(), images)
     }
 
-    /// The user message a turn appends: meka's context block, then what follows it as blocks, a
+    /// The user message a turn appends: Meka's context block, then what follows it as blocks, a
     /// background report and the words as typed or a scheduled job's fire, each absent when the
     /// turn has none, then any input images. The words are left out when there are none, so
     /// [`Self::text_content`] stays what the user typed.
@@ -2381,7 +2381,7 @@ impl Message {
     }
 
     /// The `Text` blocks as paragraphs, a blank line between them. A user message's second `Text`
-    /// block is a stand-in meka put where an attachment was, and glued to the words it would read
+    /// block is a stand-in Meka put where an attachment was, and glued to the words it would read
     /// as part of them. For the wires that take a user message as one string and for the Markdown
     /// export; assistant text keeps [`Self::text_content`]'s join, since its blocks are one answer
     /// split around tool calls.
@@ -2690,17 +2690,17 @@ pub(crate) fn write_message_markdown(
 
     match message.role {
         crate::conversation::Role::User => {
-            // A `User` message is a turn, a nudge meka wrote into one, or a tool-results envelope;
+            // A `User` message is a turn, a nudge Meka wrote into one, or a tool-results envelope;
             // the blocks say which. An inbox item that rode a nudge or a round's results is the
-            // person's, under its own heading after what it rode; a background report is meka's,
-            // under meka's heading wherever it sits.
+            // person's, under its own heading after what it rode; a background report is Meka's,
+            // under Meka's heading wherever it sits.
             let mut reports = message.content.iter().filter_map(|block| match block {
                 crate::conversation::ContentBlock::BackgroundReport { text, .. } => Some(text),
                 _ => None,
             });
             let opens_a_turn = message.opens_turn();
             if let Some((_, text)) = message.nudge() {
-                writeln!(output, "## meka\n").ok();
+                writeln!(output, "## Meka\n").ok();
                 writeln!(output, "{text}\n").ok();
             } else if message.carries_tool_results() {
                 for block in &message.content {
@@ -2725,7 +2725,7 @@ pub(crate) fn write_message_markdown(
             }
             let mut reported = false;
             for report in reports.by_ref() {
-                writeln!(output, "## meka\n").ok();
+                writeln!(output, "## Meka\n").ok();
                 writeln!(output, "{report}\n").ok();
                 reported = true;
             }
@@ -2739,7 +2739,7 @@ pub(crate) fn write_message_markdown(
                 // nothing is what it would otherwise leave.
                 writeln!(
                     output,
-                    "*meka opened this turn with no words from the user.*\n"
+                    "*Meka opened this turn with no words from the user.*\n"
                 )
                 .ok();
             }
@@ -2798,7 +2798,7 @@ pub(crate) fn resolve_large_output_tags(
 /// Stands in for a block whose text the server withheld, under Claude's `redact-thinking` beta or
 /// display updates.
 ///
-/// meka's own words rather than the model's, but rendered down the same path so there is one way a
+/// Meka's own words rather than the model's, but rendered down the same path so there is one way a
 /// thinking block reaches the terminal. It survives CommonMark unchanged: a bracketed run is a
 /// shortcut reference link only when a matching definition exists, and none does.
 pub(crate) const REDACTED_THINKING: &str = "[redacted thinking]";
@@ -3098,7 +3098,7 @@ mod tests {
         assert!(!markdown.contains("fn a() {}"), "{markdown}");
     }
 
-    /// A session opened on an inbox item is named by the message, not by the header meka wrote
+    /// A session opened on an inbox item is named by the message, not by the header Meka wrote
     /// above it.
     #[test]
     fn a_title_skips_the_header_above_an_inbox_item() {
@@ -3127,7 +3127,7 @@ mod tests {
         assert_eq!(unnamed.title(), "What is 6+6?");
     }
 
-    /// What meka put in place of an attachment is a `Text` block like the words, and is not a
+    /// What Meka put in place of an attachment is a `Text` block like the words, and is not a
     /// title: a first turn that carried only an image has none, whether the image was redacted by
     /// the budget or replaced by a harness note, until a user says something.
     #[test]
@@ -3208,7 +3208,7 @@ mod tests {
 
     /// What rode a round's results or a nudge is the person's, under its own heading after what
     /// it rode: the results the model read first, then the words it read with them; the nudge
-    /// as meka's, then the words.
+    /// as Meka's, then the words.
     #[test]
     fn an_inbox_item_that_rode_a_round_or_a_nudge_exports_after_what_it_rode() {
         let mut envelope = user_with_tool_result("call_1");
@@ -3232,8 +3232,8 @@ mod tests {
         let mut output = String::new();
         write_message_markdown(&mut output, &nudge, &std::collections::HashMap::new());
         let nudge_at = output
-            .find("## meka\n\n[Checklist: open]")
-            .expect("meka's words");
+            .find("## Meka\n\n[Checklist: open]")
+            .expect("Meka's words");
         let words_at = output
             .find("## User\n\n[Message from a client")
             .expect("the words");
@@ -3250,7 +3250,7 @@ mod tests {
             &std::collections::HashMap::new(),
         );
         assert!(
-            output.contains("## User\n\n*meka opened this turn with no words"),
+            output.contains("## User\n\n*Meka opened this turn with no words"),
             "{output}"
         );
     }

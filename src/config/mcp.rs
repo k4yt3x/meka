@@ -9,7 +9,7 @@ pub(crate) struct McpConfig {
     /// Fallback permission for MCP tools when nothing more specific applies (no `tool_permissions`
     /// override, no server-level `permission`, no `readOnlyHint` from the server). If this is also
     /// unset the hardcoded fallback is `Unrestricted`, i.e. strict. Typed, like `[permissions]`,
-    /// so a level meka does not have is refused where the file is parsed.
+    /// so a level Meka does not have is refused where the file is parsed.
     pub(crate) default_permission: Option<Permission>,
     /// What becomes of a tool that no `eager_load_tools` entry names, on every server that states
     /// no `deferral` of its own. Unset is `deferred`.
@@ -59,7 +59,7 @@ pub(crate) struct McpServerConfig {
     /// exit fails the connect.
     pub(crate) headers_helper: Option<String>,
     pub(crate) auth: Option<McpAuthConfig>,
-    /// Server-wide permission override. Typed, like `[permissions]`, so a level meka does not have
+    /// Server-wide permission override. Typed, like `[permissions]`, so a level Meka does not have
     /// is refused where the file is parsed rather than when the server connects.
     #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
     pub(crate) permission: Option<Permission>,
@@ -88,9 +88,9 @@ pub(crate) struct McpServerConfig {
     /// Whether this server's `readOnlyHint` annotation may classify a tool as `read`. Defaults to
     /// true, so a server that says a tool only reads is believed.
     ///
-    /// The hint is asserted by the server, not verified by meka, and MCP tools execute in the
+    /// The hint is asserted by the server, not verified by Meka, and MCP tools execute in the
     /// server's own process with no sandbox. A server that advertises `readOnlyHint: true` for a
-    /// tool that in fact writes therefore gets to write while meka sits at `read`. That is the
+    /// tool that in fact writes therefore gets to write while Meka sits at `read`. That is the
     /// reason this knob exists: setting it to `false` makes the hint advisory for display only, so
     /// the tool falls through to the strict `Unrestricted` fallback, and nothing from this server
     /// is reachable at `read` without an explicit [`Self::tool_permissions`] or
@@ -105,7 +105,7 @@ pub(crate) struct McpServerConfig {
     ///
     /// Defaulting to true keeps existing configurations working and keeps the `read` level useful
     /// with well-behaved servers; the trade is that the `read` level's filesystem guarantee covers
-    /// meka's built-in tools plus whichever MCP servers the user has chosen to trust.
+    /// Meka's built-in tools plus whichever MCP servers the user has chosen to trust.
     pub(crate) trust_read_only_hint: Option<bool>,
     /// When true, this server is skipped at startup: no process is spawned, no HTTP connect
     /// attempt is made. Lets users mute a flaky or in-development server without removing the

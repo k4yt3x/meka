@@ -21,13 +21,13 @@ pub(crate) struct AccountUsage {
 /// knob (Claude `output_config.effort`, OpenAI `reasoning.effort`).
 ///
 /// Effort is a request parameter the *provider* owns: leaving the field off is not a degraded
-/// setting, it is how you ask for the provider's own default. meka therefore sends it only when the
+/// setting, it is how you ask for the provider's own default. Meka therefore sends it only when the
 /// profile asks for one. A configured value is passed through verbatim (trimmed + lowercased) and
 /// is **absolute**: never clamped, never dropped, whatever model it is aimed at; the user owns
 /// correctness for their model and endpoint. A blank value (empty or whitespace-only) reads as
 /// unset.
 ///
-/// meka deliberately picks no default of its own. It cannot know what tiers a given endpoint
+/// Meka deliberately picks no default of its own. It cannot know what tiers a given endpoint
 /// implements (`anthropic-messages` and `openai-chat-completions` reach any compatible server,
 /// including local ones serving weights that never had an effort knob), and a tier the backend
 /// does not implement is a rejected request rather than a graceful ignore.
@@ -40,9 +40,9 @@ pub(crate) fn resolve_effort_level(configured: Option<&str>) -> Option<String> {
 /// Add a profile's `parameters` to a request `body`, each as the top-level field it names.
 ///
 /// Called by each API-key backend's one body builder, so the request-size budget counts them and a
-/// streamed and a whole request both carry them. A field meka writes was refused at load (see
+/// streamed and a whole request both carry them. A field Meka writes was refused at load (see
 /// [`crate::config::Backend::reserved_request_fields`]); one that reached here anyway is a list
-/// out of step with its builder, and meka's own value stays, since the conversation depends on it.
+/// out of step with its builder, and Meka's own value stays, since the conversation depends on it.
 pub(crate) fn add_parameters(
     body: &mut serde_json::Map<String, serde_json::Value>,
     parameters: &serde_json::Map<String, serde_json::Value>,
@@ -50,12 +50,12 @@ pub(crate) fn add_parameters(
     for (field, value) in parameters {
         debug_assert!(
             !body.contains_key(field),
-            "`{field}` is written by meka and missing from its backend's reserved fields"
+            "`{field}` is written by Meka and missing from its backend's reserved fields"
         );
         body.entry(field.clone()).or_insert_with(|| value.clone());
     }
 }
-/// The parameters each builder test sends: a number and an object, beside meka's own fields.
+/// The parameters each builder test sends: a number and an object, beside Meka's own fields.
 #[cfg(test)]
 pub(crate) fn parameters_for_test() -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::from_iter([
@@ -183,7 +183,7 @@ pub(crate) enum DeferredToolDelivery {
     Referenced,
     /// Every deferred tool is declared with `defer_loading`, and the endpoint's own `tool_search`
     /// with client execution both finds and loads, answered by a `tool_search_output` carrying
-    /// the definitions; meka's two discovery tools are not declared beside it. OpenAI's
+    /// the definitions; Meka's two discovery tools are not declared beside it. OpenAI's
     /// Responses endpoints.
     Searched,
 }
@@ -217,7 +217,7 @@ pub(crate) fn is_discovery_tool(name: &str) -> bool {
     name == LOAD_TOOL_NAME || name == SEARCH_TOOL_NAME
 }
 
-/// The parameters of the search tool, as the wire declares them. Where meka declares the function,
+/// The parameters of the search tool, as the wire declares them. Where Meka declares the function,
 /// `query` alone and required: `tool_load` is what loads. Under
 /// [`DeferredToolDelivery::Searched`] the endpoint's own search item is the one door that
 /// registers a definition, so it takes `names` beside `query`, and the dispatch of its calls is

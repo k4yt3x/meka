@@ -142,7 +142,7 @@ fn search_with_grep(
     file_glob: Option<&str>,
     max_results: usize,
     budget: &WalkBudget,
-    // meka's own directories at this permission, which a named root may not be inside and the
+    // Meka's own directories at this permission, which a named root may not be inside and the
     // walk steps around; see `crate::workspace::private_read_refusal`.
     fence: &crate::workspace::ReadFence,
 ) -> Result<String> {
@@ -350,7 +350,7 @@ struct SearchScope<'a> {
     glob_pattern: &'a Option<glob::Pattern>,
     max_results: usize,
     budget: &'a WalkBudget,
-    /// meka's own directories at this permission, which the walk steps around; see
+    /// Meka's own directories at this permission, which the walk steps around; see
     /// `crate::workspace::private_read_refusal`.
     fence: &'a crate::workspace::ReadFence,
 }
@@ -380,7 +380,7 @@ fn walk_directory(
     let mut pending: Vec<std::path::PathBuf> = vec![directory.to_path_buf()];
 
     while let Some(dir) = pending.pop() {
-        // Stepped around, like the dot-directories below: a root above meka's directories is a
+        // Stepped around, like the dot-directories below: a root above Meka's directories is a
         // legitimate workspace, and what lies inside them is not this walk's to read. Resolved
         // per directory, since the root itself need not be canonical.
         if fence.hides(&dir) {
@@ -439,7 +439,7 @@ fn walk_directory(
                     continue;
                 }
                 // A symlink is the one way a file under a permitted directory resolves into
-                // meka's own; a regular file cannot, since the walk never descends a symlinked
+                // Meka's own; a regular file cannot, since the walk never descends a symlinked
                 // directory and every directory it does enter was judged above.
                 if file_type.is_symlink() && fence.hides(&path) {
                     continue;
@@ -463,7 +463,7 @@ mod tests {
 
     use super::*;
 
-    /// `file_search` below `unrestricted` refuses a `path` inside meka's own directories, and a
+    /// `file_search` below `unrestricted` refuses a `path` inside Meka's own directories, and a
     /// walk from a root above them neither enters them nor follows a symlink into them. The
     /// database is searched as bytes, so a pattern for a key prefix pulled runs out of `meka.db`.
     #[tokio::test]
@@ -520,7 +520,7 @@ mod tests {
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
         let error = named.expect_err("a root inside the store is refused");
-        assert!(error.to_string().contains("meka's own"), "{error}");
+        assert!(error.to_string().contains("Meka's own"), "{error}");
         let walked = walked.expect("a root above it is searched").text_content();
         assert!(walked.contains("sk-public-value"), "{walked}");
         assert!(

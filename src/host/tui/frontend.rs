@@ -102,7 +102,7 @@ pub(crate) enum UiEvent {
     },
     /// Each configured MCP server with its state, for the picker a bare `/mcp` opens.
     McpServers(Vec<McpServerRow>),
-    /// What a command the host answered says in meka's voice: a refusal, a failure, an empty
+    /// What a command the host answered says in Meka's voice: a refusal, a failure, an empty
     /// list. Shown as the screen shows its own answers, nothing on the transcript; see
     /// [`Ui::reply`].
     Reply(String),
@@ -213,7 +213,7 @@ impl Ui {
         self.send(UiEvent::Switched);
     }
 
-    /// What a command says in meka's voice: a refusal, a failure, an empty list. In a panel until
+    /// What a command says in Meka's voice: a refusal, a failure, an empty list. In a panel until
     /// Esc, or on the status row while a question is open, and nothing on the transcript; a line
     /// that ends in a period loses it, as every line on the screen does.
     pub(crate) fn reply(&self, message: impl Into<String>) {

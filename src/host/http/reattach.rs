@@ -30,14 +30,14 @@ use crate::{
 /// How a failed [`crate::host::build_session_agent`] reaches the caller.
 ///
 /// Something the caller can fix is the caller's to fix, not a server fault, and its message is
-/// meka's own rather than an upstream provider's, so it goes back verbatim. Three cases: a session
+/// Meka's own rather than an upstream provider's, so it goes back verbatim. Three cases: a session
 /// pinned to a profile that has since left `config.toml`, a profile that is configured but has no
 /// stored credential, and a session another one spawned, which only its parent can drive. All three
 /// name what to do about it, and sanitizing them to "internal server error; consult server logs"
 /// left the one actionable sentence in a file the caller cannot read.
 ///
-/// **Caller-remediable, which is narrower than "meka's own words".**
-/// [`crate::error::MekaError::Installation`] is meka's own sentence too and is deliberately absent
+/// **Caller-remediable, which is narrower than "Meka's own words".**
+/// [`crate::error::MekaError::Installation`] is Meka's own sentence too and is deliberately absent
 /// from the list: it names the operator's `ca_cert_file`, proxy or `base_url`, which no caller can
 /// act on and none should read. It falls to the sanitized arm below, as every other server fault
 /// does.
@@ -488,7 +488,7 @@ mod tests {
 
     /// A sub-agent's refusal reaches the client as its own words, not as "consult server logs".
     ///
-    /// The refusal names the parent and `agent_followup`, and every sentence of that is meka's
+    /// The refusal names the parent and `agent_followup`, and every sentence of that is Meka's
     /// own; sanitizing it would leave a `sessions:w` holder with a 500 and no way to learn that
     /// the id it used names a sub-agent. 422 rather than 403 for the reason [`agent_build_problem`]
     /// gives generally: no token and no permission level lifts it, so routing it as an auth
@@ -519,8 +519,8 @@ mod tests {
     /// An installation fault is not a refusal the caller can act on, so it does not go back
     /// verbatim.
     ///
-    /// It arrives here the same way a `Config` refusal does -- from a builder, in meka's own words
-    /// -- which is exactly why the list has to be by variant rather than by "is this meka's own
+    /// It arrives here the same way a `Config` refusal does -- from a builder, in Meka's own words
+    /// -- which is exactly why the list has to be by variant rather than by "is this Meka's own
     /// sentence". A `[web]` client that cannot be built named the operator's `ca_cert_file` in a
     /// 422 `invalid-body`, telling a client to correct a payload that was never wrong.
     #[test]
@@ -593,7 +593,7 @@ mod tests {
         );
     }
 
-    /// A configuration refusal is the caller's to fix and its message is meka's own, so it goes
+    /// A configuration refusal is the caller's to fix and its message is Meka's own, so it goes
     /// back verbatim with a 422. Sanitizing it to a 500 hides where a fresh `meka serve` lands
     /// first: the profile is configured but has no credential, and the one sentence saying so goes
     /// to a log file the caller cannot read.

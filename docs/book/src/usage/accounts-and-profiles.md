@@ -13,11 +13,11 @@ store, never the config file.
 
 | Command | Action |
 |---|---|
-| `meka account add <name> [--backend B] [--base-url U] [--client-id ID] [--oauth-token-url U] [--interleaved-thinking BOOL] [--prompt-cache-key BOOL] [--stream-usage BOOL] [--max-tool-name-bytes BYTES] [--api-key-stdin]` | Add an account. Prompts for the backend and base URL when not flagged, then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--backend` as a flag too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. `--client-id` and `--oauth-token-url` are refused on an API-key backend, which never reads them, and each of `--interleaved-thinking`, `--prompt-cache-key` and `--stream-usage` on every backend but the one that reads it, as `--max-tool-name-bytes` is on the two subscription backends. `device_id` has no flag, because meka resolves and persists it itself. |
+| `meka account add <name> [--backend B] [--base-url U] [--client-id ID] [--oauth-token-url U] [--interleaved-thinking BOOL] [--prompt-cache-key BOOL] [--stream-usage BOOL] [--max-tool-name-bytes BYTES] [--api-key-stdin]` | Add an account. Prompts for the backend and base URL when not flagged, then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--backend` as a flag too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. `--client-id` and `--oauth-token-url` are refused on an API-key backend, which never reads them, and each of `--interleaved-thinking`, `--prompt-cache-key` and `--stream-usage` on every backend but the one that reads it, as `--max-tool-name-bytes` is on the two subscription backends. `device_id` has no flag, because Meka resolves and persists it itself. |
 | `meka account list` | List configured accounts with backend, base URL, and whether each has a stored credential; `--format json` prints the same as one document. Also names any stored credential that no account claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka account login <name> [--api-key-stdin]` | Re-acquire the secret for an existing account (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). `--api-key-stdin` reads the key from stdin for scripted rotation, and is refused on the subscription backends, which have no key to read. Every setting on the account is kept. |
 | `meka account remove <name>` | Remove the `[accounts.<name>]` entry from the config file, then delete the stored credential from the store. Refused while any profile names the account, naming the profiles: remove or repoint those first. Works on a name with only one of the two halves, so it can clean up after a hand-edit, or after a removal whose credential failed to delete. |
-| `meka account rename <name> <new-name>` | Rename the account in place. The `[accounts.<name>]` table keeps its position and comments, every profile naming it follows, and its stored credential moves with it, so no login is needed. Refused when the new name is taken, a leftover credential is stored under it, or another meka is refreshing the account's token at that moment. Stop running hosts first: a session a host already runs on the account refreshes its token under the old name, and that token is dropped rather than saved. `meka serve` refuses the rename itself while one may. |
+| `meka account rename <name> <new-name>` | Rename the account in place. The `[accounts.<name>]` table keeps its position and comments, every profile naming it follows, and its stored credential moves with it, so no login is needed. Refused when the new name is taken, a leftover credential is stored under it, or another Meka is refreshing the account's token at that moment. Stop running hosts first: a session a host already runs on the account refreshes its token under the old name, and that token is dropped rather than saved. `meka serve` refuses the rename itself while one may. |
 | `meka account usage` / `whoami` / `stats` | The read-only account views; see [Account info](./account.md). |
 
 `--api-key-stdin` reads the key from standard input instead of prompting, for scripted setup:
@@ -57,7 +57,7 @@ scope, and serves what it wrote without a restart; see
 setting keeps its value, and every comment you wrote above or beside a key stays attached to that
 key. This is how a profile's model changes, since there is no per-run flag for it.
 
-Keys are left in the order [Profile fields](../configuration/config-file.md#profile-fields) documents, so a profile meka has
+Keys are left in the order [Profile fields](../configuration/config-file.md#profile-fields) documents, so a profile Meka has
 written to is in that order whatever order it was in before. That is deliberate rather than
 incidental: every writer normalizes, so the file does not depend on which command last touched it,
 and there is one shape to read rather than one per history. Comments move with their keys, so an
@@ -69,7 +69,7 @@ $ meka profile set work context_window 200000
 $ meka profile set work effort --unset
 ```
 
-`--unset` removes the key so the profile falls back to meka's default for it, and an absent key
+`--unset` removes the key so the profile falls back to Meka's default for it, and an absent key
 follows whatever the documented default later becomes. An empty value on a string key (`effort`,
 `cyber_access_program`) removes it the same way. `model` is the one key with no default to fall
 back to, so `--unset model` and an empty `model` are both refused.
@@ -126,7 +126,7 @@ can leave behind a profile the other would have declined:
   `client_id` and `oauth_token_url` follow the same rule on `meka account add`, which refuses them
   for an API-key backend. [`parameters`](../configuration/config-file.md#parameters) is the same
   on the two subscription backends, which send none.
-- **A parameter meka writes itself**, such as `stream` or `max_completion_tokens`. Each field of
+- **A parameter Meka writes itself**, such as `stream` or `max_completion_tokens`. Each field of
   the request has one owner, so the refusal names the profile field that decides it, where one
   does; the config is refused at load the same way.
 - **A [`max_output_tokens`](../configuration/config-file.md#max_output_tokens) that does not exceed the thinking budget**, under
@@ -141,9 +141,9 @@ Adding an account by hand works: write an `[accounts.<name>]` block, then run `m
 store keyed by account name, so removing the block takes the settings away and leaves the API
 key or OAuth refresh token behind, still valid.
 
-Nothing deletes it on your behalf. meka will not sweep the store against the config at startup:
+Nothing deletes it on your behalf. Meka will not sweep the store against the config at startup:
 `MEKA_CONFIG_DIR` and `MEKA_DATA_DIR` are independent, so a config read from the wrong place, or one
-meka could not parse, would present as "no accounts configured" against a real store and take
+Meka could not parse, would present as "no accounts configured" against a real store and take
 every credential with it. Losing an OAuth refresh token that way means redoing the browser login for
 each account.
 

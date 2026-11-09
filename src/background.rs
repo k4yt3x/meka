@@ -176,7 +176,7 @@ impl BackgroundTasks {
     /// [`Self::cancel_all`] only fires the tokens, and firing a token is not the same as the task
     /// acting on it. A task parked at an await is dropped without ever being polled again when the
     /// runtime goes, so it reaches neither `kill_child_tree` (leaving the `setsid()`-ed child
-    /// running with no meka process tracking it) nor `finish_background_task` (leaving the row
+    /// running with no Meka process tracking it) nor `finish_background_task` (leaving the row
     /// `running` for the next session open to sweep to `interrupted`).
     ///
     /// Callers should bound this: canceling asks, and a task that does not answer must not hold

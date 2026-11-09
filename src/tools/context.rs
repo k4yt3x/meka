@@ -118,7 +118,7 @@ pub(crate) struct ContextGauge {
     /// `used` because it is the part compaction *cannot* reclaim, which is what makes it worth
     /// reporting.
     pub(crate) overhead: Arc<AtomicU64>,
-    /// The model's window, or zero when meka has no metadata for it.
+    /// The model's window, or zero when Meka has no metadata for it.
     ///
     /// A handle rather than a value because a session can move onto another profile mid-run, and a
     /// window frozen when the tools were registered would report the previous profile's size to

@@ -707,10 +707,10 @@ fn codex_window_label(limit_window_seconds: Option<i64>, fallback: &str) -> Stri
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatGptBaseUrlShape {
     /// A root whose path has neither a `backend-api` nor a `codex` segment (`https://chatgpt.com`,
-    /// or a proxy forwarding from any other prefix): meka appends `/backend-api/codex/responses`
+    /// or a proxy forwarding from any other prefix): Meka appends `/backend-api/codex/responses`
     /// for turns and `/backend-api/wham/...` for the account endpoints.
     Root,
-    /// A path ending in `/backend-api/codex`, the Codex client's own layout: meka appends
+    /// A path ending in `/backend-api/codex`, the Codex client's own layout: Meka appends
     /// `/responses` for turns and reaches the account endpoints beside `codex`.
     CodexRoot,
 }
@@ -1139,7 +1139,7 @@ mod tests {
     #[test]
     fn an_unconfigured_profile_sends_no_reasoning_effort() {
         // Effort belongs to the provider: unset means the Responses API applies its own default,
-        // which meka asks for by omitting the field rather than by naming a tier.
+        // which Meka asks for by omitting the field rather than by naming a tier.
         let unconfigured = ChatGptSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,

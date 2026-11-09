@@ -5,7 +5,7 @@
 //! [`MekaError::RequestTooLarge`], which the turn answers by degrading its own attachments. The
 //! Anthropic backends run this against a default ceiling, Anthropic's cap less headroom; the OpenAI
 //! backends run it only when the profile states one, because their endpoints' caps are the
-//! endpoints' own facts and meka will not guess at a number it would then send against. Without
+//! endpoints' own facts and Meka will not guess at a number it would then send against. Without
 //! this on those backends, a window that has accumulated a few image reads ships a body of tens
 //! of megabytes on every turn with nothing to say so.
 
@@ -204,7 +204,7 @@ where
         build(redacted.as_ref())?
     };
 
-    // `RequestTooLarge`, meka's own refusal: the request never left the process, so publishing it
+    // `RequestTooLarge`, Meka's own refusal: the request never left the process, so publishing it
     // as a provider failure would tell a caller to look in the server log for a provider response
     // that does not exist. Not `Provider` either, and for a reason the turn depends on: the
     // refusal is deterministic on the body and about its newest content, since every older image
@@ -257,7 +257,7 @@ mod tests {
         }
     }
 
-    /// A body that will not fit is meka's own refusal, not a provider failure.
+    /// A body that will not fit is Meka's own refusal, not a provider failure.
     ///
     /// The distinction is the whole point of the variant: nothing was sent, so a host publishing
     /// this as a provider error sends its caller to a server log for an upstream response that
@@ -275,7 +275,7 @@ mod tests {
         .expect_err("a body over the ceiling must be refused");
         assert!(
             matches!(error, MekaError::RequestTooLarge(_)),
-            "meka's own ceiling is not a provider failure: {error:?}"
+            "Meka's own ceiling is not a provider failure: {error:?}"
         );
         let sentence = error.to_string();
         assert!(

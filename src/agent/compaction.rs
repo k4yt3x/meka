@@ -209,7 +209,7 @@ fn quote_request(words: &str) -> String {
 /// tail carries is copied a second time, and neither is `request`, which [`request_section`]
 /// quotes.
 ///
-/// Copied by code rather than asked of the model, because what a person sent is a fact meka holds,
+/// Copied by code rather than asked of the model, because what a person sent is a fact Meka holds,
 /// and a summary that restates it is a guess made where the truth was at hand. The loss it guards
 /// against is the one the agent cannot notice: a rule left out of a summary is a rule it does not
 /// know to search for.
@@ -316,7 +316,7 @@ fn split_and_retain(
 }
 
 /// The text blocks of `message` a person sent, or none for an assistant message, a tool-result
-/// carrier with no inbox item beside the results, or text meka wrote in a user message's place: a
+/// carrier with no inbox item beside the results, or text Meka wrote in a user message's place: a
 /// stand-in, a nudge, or an earlier compaction's summary, whose own quotes must not be quoted
 /// again. An inbox item keeps the header above it, which is what tells
 /// the reader it was relayed and by whom; without it a relayed message would read as the
@@ -469,7 +469,7 @@ fn bounded_argument(value: &serde_json::Value) -> serde_json::Value {
 /// A normal turn spills anything larger to the scratchpad
 /// ([`crate::tools::scratchpad::persist_oversized_results`]), but that runs in `run_turn` and the
 /// checkpoint loop is not a turn. Without a bound here the checkpoint would be the one place in
-/// meka where a tool result enters the conversation at unlimited size, and it would do so at the
+/// Meka where a tool result enters the conversation at unlimited size, and it would do so at the
 /// worst possible moment: the window is near full, which is why compaction is running at all. A
 /// single `file_read` could then overflow the request, and the only visible consequence would be a
 /// warn line and a silent fall back to the summarizer.
@@ -1319,7 +1319,7 @@ impl Agent {
                         .await
                     }
                     // Names the constraint rather than reporting the tool as missing, which would
-                    // read as "meka has no such tool" and invite the model to look for a synonym.
+                    // read as "Meka has no such tool" and invite the model to look for a synonym.
                     None => crate::tools::ToolOutput::text(
                         format!(
                             "'{name}' is not available during a checkpoint. A checkpoint can save what \
@@ -1997,7 +1997,7 @@ mod tests {
         assert_eq!(
             calls[0].1,
             serde_json::json!({"name": "note"}),
-            "meka's own parameter is taken out at the checkpoint door too"
+            "Meka's own parameter is taken out at the checkpoint door too"
         );
     }
 
@@ -3791,7 +3791,7 @@ mod tests {
         assert_eq!(text, "short");
     }
 
-    /// A compaction must not inflate the turn count `/status` reports: it is work meka did on
+    /// A compaction must not inflate the turn count `/status` reports: it is work Meka did on
     /// its own, not a turn the user asked for. The matching "the tokens *are* billed" half
     /// lives in `crate::stats`, which can observe a non-zero usage the mock cannot produce.
     #[tokio::test]
@@ -4015,7 +4015,7 @@ mod tests {
         );
     }
 
-    /// Text meka wrote in a user message's place was not sent by anyone, and an earlier summary's
+    /// Text Meka wrote in a user message's place was not sent by anyone, and an earlier summary's
     /// quotes are not quoted again; an inbox item is kept with the header that says who sent it,
     /// even when it rode a tool-result message.
     #[test]
@@ -4029,7 +4029,7 @@ mod tests {
                  quoted before\n{RETAINED_MESSAGES_END}"
             )),
             Message::assistant_text("continuing"),
-            Message::user(format!("{HARNESS_NOTE} something meka said")),
+            Message::user(format!("{HARNESS_NOTE} something Meka said")),
             Message::assistant_text("ok"),
             Message::nudge_message(
                 crate::conversation::NudgeKind::VisibleReply,
@@ -4750,7 +4750,7 @@ mod tests {
     }
 
     /// A redaction the summarizer's request reports is counted on the session like one during
-    /// a turn, or `/status` under-reports on exactly the largest requests meka sends.
+    /// a turn, or `/status` under-reports on exactly the largest requests Meka sends.
     #[tokio::test]
     async fn a_redaction_during_compaction_is_counted() {
         let provider = Arc::new(MockProvider::from_rounds(vec![vec![

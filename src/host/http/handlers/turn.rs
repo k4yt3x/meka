@@ -123,7 +123,7 @@ pub(crate) struct TurnOptions {
     pub(crate) unanswered_message: crate::conversation::PromptRetention,
 }
 
-/// A turn a request held to its end: its record, what it wrote, and what meka said about it.
+/// A turn a request held to its end: its record, what it wrote, and what Meka said about it.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct TurnResponse {
     #[serde(flatten)]
@@ -163,7 +163,7 @@ pub(crate) struct UsageView {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "A turn is already in flight (`/errors/turn-in-flight`), the Idempotency-Key was used with another body or is in flight on a concurrent request (`/errors/idempotency`), or another meka process holds the session (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 409, description = "A turn is already in flight (`/errors/turn-in-flight`), the Idempotency-Key was used with another body or is in flight on a concurrent request (`/errors/idempotency`), or another Meka process holds the session (`/errors/session-locked`)", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, the id names a sub-agent's conversation, or the request still exceeds the profile's `max_request_bytes` after redaction. Read `type`: `/errors/invalid-body` is worth resending with a corrected payload, `/errors/request-too-large` with a smaller one or after `/compact`, `/errors/session-not-drivable` never is", body = ProblemDetail),
         (status = 429, description = "Concurrency limit reached or idempotency-key cache full", body = ProblemDetail),
@@ -319,7 +319,7 @@ pub(crate) async fn submit_turn(
     .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?
     .retaining(body.options.unanswered_message);
 
-    // Taken only once the request is known to be one meka will act on. The guard marks the
+    // Taken only once the request is known to be one Meka will act on. The guard marks the
     // session as busy, and a request rejected above never runs a turn, so acquiring first made a
     // malformed body answer 409 on the session's own PATCH, DELETE, compact and rewind for as long
     // as the guard lived, and answered 409 to a malformed body whenever a real turn was running.
@@ -1524,7 +1524,7 @@ pub(crate) fn message_withdrawn(recorder: &Recorder) -> Option<bool> {
 }
 
 /// What a held turn answers with once it has ended: its record and what it wrote, read back from
-/// the store, beside what only the run knows, the refusal's words and the notices meka said.
+/// the store, beside what only the run knows, the refusal's words and the notices Meka said.
 async fn turn_response(
     store: &crate::store::Store,
     session_id: Uuid,
@@ -1582,7 +1582,7 @@ async fn turn_response(
     })
 }
 
-/// The refusal's words, on a refusal that gave any, and the notices meka said during the turn.
+/// The refusal's words, on a refusal that gave any, and the notices Meka said during the turn.
 fn reply_parts(outcome: &TurnOutcome, recorder: &Recorder) -> (Option<String>, Vec<NoticeView>) {
     let refusal_text = match outcome {
         TurnOutcome::Refusal(text) if !text.is_empty() => Some(text.clone()),
@@ -1714,7 +1714,7 @@ pub(crate) struct StreamQuery {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "Another meka process holds the session (`/errors/session-locked`), the token may only read and the session is not loaded (`/errors/session-not-loaded`), or the id names a sub-agent this process is not running (`/errors/subagent-not-running`)", body = ProblemDetail),
+        (status = 409, description = "Another Meka process holds the session (`/errors/session-locked`), the token may only read and the session is not loaded (`/errors/session-not-loaded`), or the id names a sub-agent this process is not running (`/errors/subagent-not-running`)", body = ProblemDetail),
         (status = 422, description = "`attend` on a sub-agent's feed, which is read-only (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
@@ -2194,7 +2194,7 @@ mod tests {
         assert_eq!(data["session_id"], session_id.to_string());
     }
 
-    /// The notices meka said reach the response, and a refusal's words are kept apart from the
+    /// The notices Meka said reach the response, and a refusal's words are kept apart from the
     /// reply and said only on a refusal.
     #[test]
     fn a_reply_carries_its_notices_and_only_a_refusal_its_words() {

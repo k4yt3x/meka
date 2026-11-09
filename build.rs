@@ -8,7 +8,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     {
         let mut resource = winres::WindowsResource::new();
-        resource.set_icon("assets/meka.ico");
+        resource
+            .set_icon("assets/meka.ico")
+            .set("ProductName", "Meka")
+            .set("FileDescription", "Meka");
         resource.compile()?;
     }
     Ok(())

@@ -2,7 +2,7 @@
 //! browser login that acquires one: the doors `meka account` and `/v1/accounts` write through,
 //! and the shared editor of `config.toml` every door in this module tree uses.
 //!
-//! An account is where a request goes and who meka is when it arrives: a backend, an endpoint, and
+//! An account is where a request goes and who Meka is when it arrives: a backend, an endpoint, and
 //! the OAuth settings a login needs. What is asked of it is a profile's business, in `profile.rs`.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -34,7 +34,7 @@ const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_REDIRECT_PORT: u16 = 1455;
 const CODEX_SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
-/// The two OAuth overrides an account may state. Both are flag-only: they replace values meka has
+/// The two OAuth overrides an account may state. Both are flag-only: they replace values Meka has
 /// to hardcode but does not own, and almost nobody states them.
 #[derive(Default)]
 pub(crate) struct OAuthSettings {
@@ -52,7 +52,7 @@ pub(crate) async fn remove_account(
     // to work on one whose `[accounts.<name>]` block was deleted by hand. Both sides are read
     // before either is touched, so a typo fails instead of reporting a removal that removed
     // nothing. `open_document` rather than the parsed config, because `remove` is one of the
-    // ways a config.toml meka cannot deserialize gets repaired.
+    // ways a config.toml Meka cannot deserialize gets repaired.
     //
     // Whether the row is *there*, not whether it parses: `load_account_credential` fails on a row
     // it cannot deserialize, and the one surface that removes a corrupt row must not refuse it for
@@ -148,7 +148,7 @@ fn remove_account_under_lock(name: &str) -> crate::error::Result<bool> {
 }
 
 /// The profiles naming `account`, read off the raw document so `remove` can refuse on a config
-/// meka cannot otherwise parse.
+/// Meka cannot otherwise parse.
 fn profiles_on_account(document: &toml_edit::DocumentMut, account: &str) -> Vec<String> {
     document
         .get("profiles")
@@ -187,7 +187,7 @@ pub(crate) async fn rename_account(
     // secret nobody configured: refused by name rather than overwritten.
     refuse_a_leftover_credential(token_store, new_name).await?;
 
-    // Held until the row and the file both carry the new name. A refresh in flight in another meka
+    // Held until the row and the file both carry the new name. A refresh in flight in another Meka
     // stores its result against the row it read, and with that row moved it finds nothing to
     // update and drops the rotated token, leaving the moved row holding a refresh token the issuer
     // has already spent.
@@ -341,7 +341,7 @@ pub(crate) fn unknown_account(name: &str, configured: &[String], orphaned: &[Str
 /// something: `meka account remove <name>` then clears it.
 ///
 /// Safe to compute here only because the caller already failed on an unreadable config. An empty
-/// account map that came from a config meka could not parse would report every credential in the
+/// account map that came from a config Meka could not parse would report every credential in the
 /// database as an orphan.
 pub(crate) async fn orphaned_accounts(
     token_store: &TokenStore,
@@ -355,7 +355,7 @@ pub(crate) async fn orphaned_accounts(
         .collect())
 }
 
-/// The backend `value` names, or the refusal naming the ones meka has.
+/// The backend `value` names, or the refusal naming the ones Meka has.
 pub(crate) fn validate_backend(value: &str) -> crate::error::Result<config::Backend> {
     value.parse::<config::Backend>().map_err(super::refusal)
 }
@@ -463,7 +463,7 @@ pub(super) fn ensure_section_table<'a>(
 /// The names under `[<section>]`, whichever way the section is spelled.
 ///
 /// `as_table_like` rather than `as_table` because an inline `accounts = { … }` deserializes and so
-/// is a config meka runs on; a probe that could not see it reported entries as absent while they
+/// is a config Meka runs on; a probe that could not see it reported entries as absent while they
 /// were in the file.
 pub(super) fn table_names(document: &toml_edit::DocumentMut, section: &str) -> Vec<String> {
     document
@@ -480,7 +480,7 @@ pub(super) fn table_names(document: &toml_edit::DocumentMut, section: &str) -> V
 /// so an unrelated defect anywhere in it would otherwise be reported as something this command
 /// did; asking whether it already failed is the difference between naming the line the user must
 /// fix and blaming an edit that had nothing to do with it. It stays a refusal either way, because
-/// writing on top of a file meka cannot read would strand the rest of its contents.
+/// writing on top of a file Meka cannot read would strand the rest of its contents.
 pub(super) fn reparse_after_edit(
     before: &str,
     after: &str,
@@ -975,7 +975,7 @@ const TOKEN_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// A token exchange the authorization server rejected, told apart from every other way a login
 /// fails: what it says is the server's, which a surface decides whether to relay, where a timeout
-/// or a listener's failure is meka's own sentence.
+/// or a listener's failure is Meka's own sentence.
 #[derive(Debug)]
 pub(crate) struct ExchangeRejected(anyhow::Error);
 
@@ -987,7 +987,7 @@ impl std::fmt::Display for ExchangeRejected {
 
 impl std::error::Error for ExchangeRejected {}
 
-/// A token exchange that got no answer meka can read: the endpoint unreachable, silent past its
+/// A token exchange that got no answer Meka can read: the endpoint unreachable, silent past its
 /// bound, or replying with something that is not a token. Told apart from [`ExchangeRejected`]
 /// because the remedy is the endpoint's, not the person's.
 #[derive(Debug)]
@@ -1265,7 +1265,7 @@ async fn accept_codex_callback(
                 tracing::warn!("OAuth state mismatch; refusing the callback");
                 let body = b"<!DOCTYPE html><html><body>\
                     <h1>Authorization refused</h1>\
-                    <p>This callback is not the login meka is waiting for.</p>\
+                    <p>This callback is not the login Meka is waiting for.</p>\
                     </body></html>";
                 let response = format!(
                     "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1281,8 +1281,8 @@ async fn accept_codex_callback(
             }
             CodexCallback::Match { code, state } => {
                 let body = b"<!DOCTYPE html><html><body>\
-                    <h1>Return to meka</h1>\
-                    <p>The authorization was received; meka is completing the login. \
+                    <h1>Return to Meka</h1>\
+                    <p>The authorization was received; Meka is completing the login. \
                     You can close this tab.</p>\
                     </body></html>";
                 let response = format!(
@@ -1498,7 +1498,7 @@ fn extract_jwt_expiration_millis(jwt: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
-    /// A config meka cannot read must never be treated as a config that is empty: `open_document`
+    /// A config Meka cannot read must never be treated as a config that is empty: `open_document`
     /// hands its result to `write_file_atomic`, so "" here truncates the user's real file.
     #[test]
     fn open_document_refuses_an_unreadable_config() {
@@ -1687,7 +1687,7 @@ mod tests {
     }
 
     /// `remove` is the only path that deletes a credential, so requiring a configured account would
-    /// leave a hand-deleted account's secret unreachable from every surface meka has.
+    /// leave a hand-deleted account's secret unreachable from every surface Meka has.
     #[tokio::test]
     async fn remove_deletes_a_credential_whose_account_is_gone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2283,7 +2283,7 @@ mod tests {
     #[test]
     fn a_backend_name_parses_only_when_meka_has_it() {
         assert_eq!(
-            validate_backend("claude-subscription").expect("a backend meka has"),
+            validate_backend("claude-subscription").expect("a backend Meka has"),
             config::Backend::ClaudeSubscription
         );
         assert!(validate_backend("bogus").is_err());

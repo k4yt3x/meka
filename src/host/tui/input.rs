@@ -1159,7 +1159,7 @@ fn shorten_under_home(path: &std::path::Path, homes: Option<&HomeSpellings>) -> 
 /// [`crate::paths::expand_user_path`] makes of it. `None` only when a tilde needs the home
 /// directory and it cannot be determined.
 ///
-/// A bare `/cd` returns to the directory meka was started in, where a shell's `cd` would go home.
+/// A bare `/cd` returns to the directory Meka was started in, where a shell's `cd` would go home.
 /// A resumed session opens in the directory it recorded, so "take me back to my shell" is the
 /// move a user wants here, and at `workspace` the working directory is the writable boundary,
 /// which makes `$HOME` the widest possible default. `~` still spells home.

@@ -1,6 +1,6 @@
 //! Scheduled wakeups: the agent arranging to be prompted again later.
 //!
-//! Every other turn meka runs originates outside the agent: a human typing, an editor sending
+//! Every other turn Meka runs originates outside the agent: a human typing, an editor sending
 //! `session/prompt`, a client calling `POST /v1/sessions/{id}/turns`. This module supplies the one
 //! trigger nothing else can, a timer: the agent's ability to say "wake me at 09:00" and have that
 //! survive the process it was said in.
@@ -350,7 +350,7 @@ impl Schedule {
             }
             Self::Cron(cron, zone) => {
                 // Cron patterns are wall-clock expressions: "0 9 * * *" means 09:00 in the job's
-                // zone, so the search runs there and the result converts back to the UTC meka
+                // zone, so the search runs there and the result converts back to the UTC Meka
                 // stores. A job naming no zone is read in the machine's, looked up now, so a
                 // machine that changes zone takes its jobs with it.
                 let zone = zone
@@ -2732,7 +2732,7 @@ mod tests {
             timezone: None,
         };
 
-        // A value no build of meka resolves.
+        // A value no build of Meka resolves.
         let unreadable = row(Some("elevated"))
             .decode()
             .expect("the row still decodes");
@@ -2752,7 +2752,7 @@ mod tests {
             crate::permission::Permission::None
         );
 
-        // The control: a level meka still reads survives intact.
+        // The control: a level Meka still reads survives intact.
         let current = row(Some("unrestricted")).decode().expect("decodes");
         assert_eq!(
             current.gate.expect("gate").permission,
@@ -3174,7 +3174,7 @@ mod tests {
     /// The counterpart the lease requires. A lease hands the same occurrence back every time, so
     /// without a ceiling a prompt that kills the process is claimed again on every sweep, forever.
     /// The row is kept rather than deleted: it stays listed, cancelable, and reported as held,
-    /// because meka cannot tell a poisonous prompt from an unlucky one and destroying a user's job
+    /// because Meka cannot tell a poisonous prompt from an unlucky one and destroying a user's job
     /// on that guess would be worse.
     #[tokio::test]
     async fn a_job_that_keeps_crashing_its_host_is_parked_rather_than_retried_forever() {
@@ -4142,13 +4142,13 @@ mod tests {
         );
     }
 
-    /// A parked job is not accused of crashing meka when nothing knows that it did.
+    /// A parked job is not accused of crashing Meka when nothing knows that it did.
     ///
     /// `attempts` is on the row; the reason it rose is in a process-global map. A restart is
     /// exactly what an operator does once a job has gone inert, and `meka schedule list` is a
     /// separate process that never had the map at all, so the commonest way to read this message
     /// is with the cause missing. Asserting the likelier cause from that absence would tell someone
-    /// whose MCP server was misconfigured that their prompt takes meka down, with a remedy aimed at
+    /// whose MCP server was misconfigured that their prompt takes Meka down, with a remedy aimed at
     /// the wrong thing, in the model's own `[Scheduled]` block.
     ///
     /// The row still settles it one way: no gate means no probe that could have failed.
@@ -4674,7 +4674,7 @@ mod tests {
         );
     }
 
-    /// The fallback arm of [`SAME_OCCURRENCE`]. Every writer in meka renders the column with
+    /// The fallback arm of [`SAME_OCCURRENCE`]. Every writer in Meka renders the column with
     /// `to_rfc3339`, so the textual comparison matches in practice, but a row that reached the
     /// database any other way must still be claimable. The failure this guards against is the
     /// quietest one available: a compare-and-swap that matches nothing on every sweep, forever,
@@ -4690,7 +4690,7 @@ mod tests {
             )
             .await;
         let store = harness.manager.schedule_store();
-        // The same instant, written the way something that is not meka would write it.
+        // The same instant, written the way something that is not Meka would write it.
         let raw = planted
             .next_fire_at
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -4716,7 +4716,7 @@ mod tests {
                 )
                 .await
                 .expect("claim"),
-            "a job whose timestamp is not in meka's own shape must still be claimable"
+            "a job whose timestamp is not in Meka's own shape must still be claimable"
         );
     }
 

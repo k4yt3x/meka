@@ -65,7 +65,7 @@ pub(crate) fn format_session_status(
     // cumulative "Input tokens" total below, which sums every turn's usage for the whole session.
     //
     // Shown from turn zero, at `0 / <window>`, rather than waiting for occupancy to be non-zero.
-    // The window is the profile's `context_window` or a documented default, and meka neither probes
+    // The window is the profile's `context_window` or a documented default, and Meka neither probes
     // for it nor checks it against the model, which makes this the only place a user can confirm
     // the number their session budgets against. Getting it wrong is otherwise invisible until
     // compaction misbehaves several turns in.
@@ -258,7 +258,7 @@ pub(crate) struct MissingSessionProfile<'a> {
 /// One line, because the error above it has already said everything else. When the session's own
 /// profile is what could not be resolved, the session id is the single fact that error cannot
 /// reach, and `-r <id> --profile <name>` is the only command that rewrites a row's binding, so
-/// that is what this adds. No line suggests recreating the missing profile: meka never saw it, so
+/// that is what this adds. No line suggests recreating the missing profile: Meka never saw it, so
 /// any account or model it named would be invented.
 ///
 /// Nothing in any other case: the error above names its own remedy, whether a credential to log in
@@ -452,7 +452,7 @@ mod tests {
         );
     }
 
-    /// `/status` reports what the request actually carries, not what meka happens to hold.
+    /// `/status` reports what the request actually carries, not what Meka happens to hold.
     ///
     /// Both of these lines are conditional for the same reason: `effort` is omitted when the
     /// profile sets none, because the provider then picks its own, and `thinking` is omitted on a

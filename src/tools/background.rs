@@ -1,7 +1,7 @@
 //! The `task_*` tools: the agent watching and stopping its own background work
 //! ([`crate::background`]).
 //!
-//! Both gate at [`Permission::Read`]. Neither runs anything: listing reads meka's own store, and
+//! Both gate at [`Permission::Read`]. Neither runs anything: listing reads Meka's own store, and
 //! canceling only signals a token belonging to work whose permission was already checked when it
 //! was dispatched. Requiring `unrestricted` to stop something the agent itself started would leave
 //! it unable to clean up after a call it had every right to make.
@@ -84,7 +84,7 @@ impl Tool for TaskListTool {
             ));
         }
 
-        // The same column layout every other listing in meka uses (`scratchpad_list`, `meka session
+        // The same column layout every other listing in Meka uses (`scratchpad_list`, `meka session
         // list`, `meka mcp list`), so a reader who has seen one has seen them all.
         let rows: Vec<Vec<String>> = tasks
             .iter()

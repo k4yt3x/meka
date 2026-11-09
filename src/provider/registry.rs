@@ -236,7 +236,7 @@ impl ProviderBuilder {
     /// No default in its place: the registry is the one authority on which row a profile's
     /// credential lives in, and a builder that fell back to the backend name would write refreshed
     /// tokens to a row no account names, leaving the real one stale and `account list` reporting an
-    /// orphan. Only meka's own code reaches a build, so a missing name is a defect here, not a
+    /// orphan. Only Meka's own code reaches a build, so a missing name is a defect here, not a
     /// configuration error.
     pub(super) fn resolve_credential_key(&self) -> Result<String> {
         self.credential_key.clone().ok_or_else(|| {
@@ -511,7 +511,7 @@ impl ProviderRegistry {
     ///
     /// [`Self::settings`] is synchronous and resolves an id it has not seen on the spot, which for
     /// an account that states none writes `config.toml` under the config lock: a `flock` that
-    /// waits on whatever other meka holds it, then two fsyncs, all on whichever runtime thread
+    /// waits on whatever other Meka holds it, then two fsyncs, all on whichever runtime thread
     /// happened to ask and while holding the registry's mutex. Done once here, every later ask
     /// is a map read. An account whose `backend` does not parse is skipped; `settings` reports
     /// it. Answers whether an account stated no id, so one was written into `config.toml`.
@@ -988,7 +988,7 @@ pub(crate) async fn resolved_profile(
     let (provider, settings) = providers.resolve(&profile).await?;
     Ok(ResolvedProfile {
         provider,
-        // The documented default, not a guess at the model: meka does not infer a window from a
+        // The documented default, not a guess at the model: Meka does not infer a window from a
         // model name, so a profile that states none gets the one value the docs name.
         context_window: settings
             .context_window
@@ -1004,7 +1004,7 @@ pub(crate) async fn resolved_profile(
 ///
 /// `None` for a profile that cannot resolve, which is not the same as the documented default: that
 /// session's next turn is going to be refused by name, and answering `1000000` beside a refusal
-/// invites a client to divide by a number meka has no reason to believe.
+/// invites a client to divide by a number Meka has no reason to believe.
 pub(crate) fn profile_context_window(providers: &ProviderRegistry, profile: &str) -> Option<u64> {
     providers.settings(profile).ok().map(|settings| {
         settings

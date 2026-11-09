@@ -111,7 +111,7 @@ impl Frontend for PlainFrontend {
     }
 }
 
-/// A notice as a log line at its own level: what meka has to say about the turn is not the answer,
+/// A notice as a log line at its own level: what Meka has to say about the turn is not the answer,
 /// and the default level shows a warning.
 fn log_notice(notice: &Notice) {
     let text = &notice.text;

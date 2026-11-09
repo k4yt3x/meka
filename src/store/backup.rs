@@ -8,7 +8,7 @@ use super::*;
 /// defragmented image rather than one that may span a live WAL, and carries `user_version` across,
 /// so restoring the copy yields a store that identifies itself as the version it was and migrates
 /// once when next opened. Lives here rather than in [`migrations`] because it is a question about
-/// the store *file* (a path, a mode) and because that module is deliberately kept clear of meka's
+/// the store *file* (a path, a mode) and because that module is deliberately kept clear of Meka's
 /// own code.
 ///
 /// Kept rather than cleaned up on success. It is the user's undo, and deleting it the moment the
@@ -140,7 +140,7 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 ///
 /// Only names this module could have produced are touched; see [`is_backup_name`], which matches
 /// what [`free_backup_path`] emits rather than "some digits". A `meka.db.mine.bak` someone parked
-/// beside the store is not meka's to delete. Names are compared through
+/// beside the store is not Meka's to delete. Names are compared through
 /// [`std::ffi::OsStr::as_encoded_bytes`] rather than `to_string_lossy`, because lossy conversion
 /// maps distinct names onto one string; every byte tested is ASCII, which cannot occur inside a
 /// multi-byte sequence, so splitting on it is sound on both platforms.
@@ -203,12 +203,12 @@ pub(super) fn prune_older_backups(database_path: &Path, keep: &Path) {
 /// that function can actually emit rather than against "some digits", because the two differ and
 /// the difference is deletions: a `version` it renders through `Display` from a `u32` it is only
 /// ever called with above zero, and a `suffix` from `1..1000`. So `.v0.`, `.v01.`, `.bak.0` and
-/// `.bak.1000` are all shapes meka cannot write, and a `meka.db.v1.bak.0` is somebody's own
+/// `.bak.1000` are all shapes Meka cannot write, and a `meka.db.v1.bak.0` is somebody's own
 /// zero-indexed archive rather than a copy this module left.
 ///
 /// **One shape, tracking the writer.** If [`free_backup_path`] ever names copies differently, this
 /// follows it and matches only the new name. Keeping the old one alongside would be a reader
-/// tolerating what an older meka wrote, which is the arrangement `migrations` exists to make
+/// tolerating what an older Meka wrote, which is the arrangement `migrations` exists to make
 /// unnecessary, and there is no ledger for files sitting beside the store to convert them with. The
 /// honest price of such a rename is that copies already on disk stop being recognized and are left
 /// where they are, which errs toward keeping a file rather than deleting one.
@@ -290,7 +290,7 @@ pub(super) fn remove_partial_backup(staging: &Path) {
 /// **Both halves of the pair have to be free.** The copy is staged at `<name>.partial` and renamed
 /// into place, so an abnormal exit between the two leaves a `.partial` behind. Checking only the
 /// target then chooses that same name again, and `create_new` fails `EEXIST` on every subsequent
-/// start: one interrupted upgrade wedges meka permanently, which is the opposite of what staging
+/// start: one interrupted upgrade wedges Meka permanently, which is the opposite of what staging
 /// is for.
 ///
 /// Exhaustion is an error rather than a fallback to the unsuffixed name. Returning the occupied
@@ -408,7 +408,7 @@ mod tests {
     /// The copy is staged at `<name>.partial`, so a crash between creating it and renaming it into
     /// place leaves that file behind. Checking only the target name then reused it, `create_new`
     /// failed `EEXIST`, and *every* later start refused with the store still unmigrated: one Ctrl-C
-    /// during an upgrade would brick meka permanently.
+    /// during an upgrade would brick Meka permanently.
     #[test]
     fn a_staging_file_left_by_a_crash_does_not_block_the_next_attempt() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -539,7 +539,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let database_path = temp_dir.path().join("meka.db");
         {
-            // A store as an older meka left one: the baseline shape, and nothing in `user_version`.
+            // A store as an older Meka left one: the baseline shape, and nothing in `user_version`.
             let connection = rusqlite::Connection::open(&database_path).expect("open");
             connection
                 .execute_batch(crate::store::migrations::baseline_for_test())
@@ -599,7 +599,7 @@ mod tests {
     ///
     /// The cheapest guard on the whole change, and the one that matters most: everything else
     /// decides *when* to prune, and this decides *what*. A match that is too generous deletes a
-    /// file meka did not write, which is the one outcome the feature must never have.
+    /// file Meka did not write, which is the one outcome the feature must never have.
     ///
     /// `meka.db.vault.bak` earns its row. It is the near-miss the digit requirement exists for:
     /// drop that requirement and `.v` followed by anything at all becomes a backup.
@@ -638,7 +638,7 @@ mod tests {
             "other.db.v1.bak",
             "notes.txt",
         ] {
-            assert!(!matches(name), "{name} is not meka's to delete");
+            assert!(!matches(name), "{name} is not Meka's to delete");
         }
     }
 
@@ -722,7 +722,7 @@ mod tests {
             assert_eq!(
                 std::fs::read(&path).expect("still there").as_slice(),
                 name.as_bytes(),
-                "{name} is not meka's to delete"
+                "{name} is not Meka's to delete"
             );
         }
         assert!(
@@ -878,7 +878,7 @@ mod tests {
 
     /// A backup protects data that already exists, so neither a first run nor a subsequent one
     /// leaves a copy: the first has nothing to lose, and the second has nothing to do. Copying on
-    /// every start would double the store on disk and make opening meka cost more as the
+    /// every start would double the store on disk and make opening Meka cost more as the
     /// conversation grows.
     #[tokio::test]
     async fn a_store_with_nothing_to_preserve_is_not_backed_up() {

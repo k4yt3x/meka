@@ -197,7 +197,7 @@ pub(super) fn resolve_tool_permission_with_source(
     // ever *raises* the requirement to Unrestricted, so believing it costs nothing and it is always
     // honored. A hint of `true` *lowers* the requirement to Read, and that is the direction in
     // which a wrong or dishonest hint matters: MCP tools run in the server's own process with no
-    // sandbox, so a tool wrongly classified Read can write the user's tree while meka sits at
+    // sandbox, so a tool wrongly classified Read can write the user's tree while Meka sits at
     // `read`. `trust_read_only_hint = false` withholds exactly that, leaving the hint advisory for
     // display and dropping the tool through to the strict fallback, past the global default, for
     // the reason step 4 gives.
@@ -232,7 +232,7 @@ pub(super) fn resolve_tool_permission_with_source(
     // 5. Hardcoded strict fallback.
     //
     // `Unrestricted`, never `Workspace`, and this is load-bearing rather than incidental. An MCP
-    // tool runs inside the server's own process, which meka does not sandbox and cannot confine to
+    // tool runs inside the server's own process, which Meka does not sandbox and cannot confine to
     // a workspace root, so an unannotated tool reachable from `workspace` would make that level's
     // central promise false for every MCP user while looking exactly like it worked. The rung has
     // to be the one that promises no boundary, because that is the only one this tool honors.

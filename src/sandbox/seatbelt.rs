@@ -202,7 +202,7 @@ const HOST_TERMINALS_RULE: &str = r#"
 /// `readable` given, the profile reads nothing by default and one `(allow file-read*
 /// file-map-executable (subpath (param "MEKA_READABLE_n")))` clause is appended per readable path.
 /// Then one `(allow file-write* (subpath (param "MEKA_WRITABLE_n")))` clause per writable root.
-/// After those, one `(deny ...)` clause per directory in `private` hides meka's own config and
+/// After those, one `(deny ...)` clause per directory in `private` hides Meka's own config and
 /// store from the command; SBPL takes the last matching rule, so a deny appended last beats both
 /// a read allow and a write allow for a root that happens to contain it.
 ///
@@ -212,7 +212,7 @@ const HOST_TERMINALS_RULE: &str = r#"
 /// A parameter is passed out of band and needs no quoting at all.
 ///
 /// Compiled on every platform, and gated only at the call site in `tools::shell`: nothing in here
-/// touches a macOS API, and gating the function would leave the one piece of macOS logic meka can
+/// touches a macOS API, and gating the function would leave the one piece of macOS logic Meka can
 /// check on any host unchecked. `sandbox-exec` itself stays macOS-only and unverified elsewhere.
 #[cfg_attr(
     not(target_os = "macos"),
@@ -250,7 +250,7 @@ pub(crate) fn sandbox_profile_for(
         ));
         // The value is assembled as an `OsString` and the path pushed in whole, so a root that is
         // not valid UTF-8 is passed through byte-for-byte rather than being dropped. `Command::arg`
-        // takes an `OsStr`, so nothing downstream needs it to be text. Only the key, which meka
+        // takes an `OsStr`, so nothing downstream needs it to be text. Only the key, which Meka
         // authors itself, is built as a string.
         let mut param = std::ffi::OsString::from(&key);
         param.push("=");

@@ -170,7 +170,7 @@ impl AcpTestHarnessBuilder {
 }
 
 /// A fixture path in the harness's work directory, which sits beside `config_dir`. A file *under*
-/// the config dir is inside meka's own directory, which `file_read` refuses below `unrestricted`.
+/// the config dir is inside Meka's own directory, which `file_read` refuses below `unrestricted`.
 /// The directory sessions from [`AcpTestHarness::new_session`] work in, from inside a `pre_spawn`
 /// closure that is handed the config directory beside it. An approved write at `read` lands only
 /// under the workspace roots, so a script that expects its write to succeed targets this.
@@ -220,14 +220,14 @@ impl AcpTestHarness {
         self.install.config_dir()
     }
 
-    /// The directory sessions from [`Self::new_session`] work in: a project directory, not meka's
+    /// The directory sessions from [`Self::new_session`] work in: a project directory, not Meka's
     /// own config directory, which the write fence refuses at `workspace`.
     fn work_dir(&self) -> std::path::PathBuf {
         self.install.work_dir()
     }
 
     /// The store the spawned process is using, for a test that has to act as a *second* writer of a
-    /// row meka reads. See `tests/multiprocess.rs` for the same reasoning at length.
+    /// row Meka reads. See `tests/multiprocess.rs` for the same reasoning at length.
     fn database(&self) -> std::path::PathBuf {
         self.install.database()
     }
@@ -266,14 +266,14 @@ impl AcpTestHarness {
         writeln!(self.stdin, "{notification}").expect("write notification");
     }
 
-    /// Block until the response for `id` arrives. Side-channel notifications + meka-issued requests
+    /// Block until the response for `id` arrives. Side-channel notifications + Meka-issued requests
     /// on the same connection are silently dropped (the latter is the right call only when the test
     /// isn't expected to provoke any).
     fn await_response(&mut self, id: u64) -> serde_json::Value {
         self.await_response_with_dispatch(id, |_| None)
     }
 
-    /// Block until the response for `id` arrives, dispatching any meka-issued requests through
+    /// Block until the response for `id` arrives, dispatching any Meka-issued requests through
     /// `handler`. The handler returns `Some(response)` to answer, or `None` to ignore.
     fn await_response_with_dispatch<F>(&mut self, id: u64, mut handler: F) -> serde_json::Value
     where
@@ -299,13 +299,13 @@ impl AcpTestHarness {
         })
     }
 
-    /// Drain every `session/update` for `session_id` that meka has already emitted, with no prompt
+    /// Drain every `session/update` for `session_id` that Meka has already emitted, with no prompt
     /// outstanding.
     ///
     /// Every other update helper is keyed to a pending `session/prompt`; a scheduled turn has none,
     /// which is the property under test. Termination comes from a `session/list` sent afterwards:
     /// stdio preserves order, so its response cannot arrive before the notifications queued ahead
-    /// of it, and waiting on a reply meka is guaranteed to send means a regression fails the
+    /// of it, and waiting on a reply Meka is guaranteed to send means a regression fails the
     /// test instead of blocking the suite on a `read_line` that never returns.
     fn drain_unsolicited_updates(&mut self, session_id: &str) -> Vec<serde_json::Value> {
         let id = self.send_request("session/list", serde_json::json!({}));
@@ -328,7 +328,7 @@ impl AcpTestHarness {
 
     /// Collect every `session/update` notification for `session_id` plus the eventual response for
     /// `id`. Captures everything the agent emits during a prompt turn, which is the single most
-    /// reused pattern in the existing test file. Side-channel meka-issued requests are silently
+    /// reused pattern in the existing test file. Side-channel Meka-issued requests are silently
     /// ignored; if a test expects them, use [`Self::collect_updates_with_dispatch`] instead.
     fn collect_updates(
         &mut self,
@@ -338,7 +338,7 @@ impl AcpTestHarness {
         self.collect_updates_with_dispatch(session_id, id, |_| None)
     }
 
-    /// As [`Self::collect_updates`], but dispatch meka-issued requests via `handler`. Used by tests
+    /// As [`Self::collect_updates`], but dispatch Meka-issued requests via `handler`. Used by tests
     /// that watch the session/update stream *and* answer fs / terminal delegation.
     ///
     /// The free [`read_until_with_dispatch`] only invokes its dispatch closure on JSON-RPC
@@ -443,7 +443,7 @@ impl AcpTestHarness {
 
 /// Returns `true` when `line` is the response (or error) message for the given `id` needle. Used by
 /// [`AcpTestHarness`] helpers that stop reading once the awaited response arrives. The secondary
-/// check on `result` / `error` filters out incoming meka-issued *requests* that happen to share an
+/// check on `result` / `error` filters out incoming Meka-issued *requests* that happen to share an
 /// id with our response we're awaiting (the dispatch loop renumbers those, but
 /// belt-and-suspenders).
 fn response_matches(line: &str, needle: &str) -> bool {
@@ -497,10 +497,10 @@ where
     lines
 }
 
-/// Variant of [`read_until`] that also answers incoming JSON-RPC *requests* from meka. Any line
-/// that parses to a JSON object with both a `method` and an `id` field is treated as a meka-issued
+/// Variant of [`read_until`] that also answers incoming JSON-RPC *requests* from Meka. Any line
+/// that parses to a JSON object with both a `method` and an `id` field is treated as a Meka-issued
 /// request; `dispatch` is invoked with the parsed value and its `Some(response)` return value is
-/// written back to meka's stdin. Tests use this to play the client side of the `fs/*` and
+/// written back to Meka's stdin. Tests use this to play the client side of the `fs/*` and
 /// `terminal/*` round-trips.
 fn read_until_with_dispatch<W, D, F>(
     reader: &mut support::TimedLines,
@@ -551,7 +551,7 @@ model = "claude-sonnet-4-5"
         .pre_spawn(|config_dir| {
             // Target file for the scripted `file_read` call. Real tool runs against this path, so
             // it must exist. In the work directory beside the config dir: `file_read` refuses
-            // meka's own directory below `unrestricted`.
+            // Meka's own directory below `unrestricted`.
             let target = fixture_beside(config_dir, "target.txt");
             std::fs::write(&target, "hello from mock test\n").expect("write target");
             serde_json::json!([
@@ -784,7 +784,7 @@ fn acp_prompt_response_carries_token_usage() {
             "expected {field} on the usage object; usage: {usage}"
         );
     }
-    // Omitted deliberately: meka doesn't meter reasoning separately from output.
+    // Omitted deliberately: Meka doesn't meter reasoning separately from output.
     assert!(usage["thoughtTokens"].is_null(), "usage: {usage}");
 }
 
@@ -964,7 +964,7 @@ enabled = ["read", "workspace", "unrestricted"]
         .config(config_toml)
         .pre_spawn(move |config_dir| {
             // The session's cwd is the harness's work directory beside the config dir, so this one
-            // is inside the boundary. Not the config dir itself: meka's own directories are
+            // is inside the boundary. Not the config dir itself: Meka's own directories are
             // refused at `workspace` whatever the roots are.
             let inside = config_dir
                 .parent()
@@ -1181,7 +1181,7 @@ model = "claude-sonnet-4-5"
 "#;
     install.write_config(config_toml);
 
-    // Beside the config dir, not in it: `file_read` refuses meka's own directory below
+    // Beside the config dir, not in it: `file_read` refuses Meka's own directory below
     // `unrestricted`.
     let target = install.root().join("target.txt");
     std::fs::write(&target, "hello from reload test\n").expect("write target");
@@ -1356,7 +1356,7 @@ model = "claude-sonnet-4-5"
                     let text = update["content"]["text"].as_str().unwrap_or_default();
                     assert!(
                         !text.starts_with("[Checklist:"),
-                        "the nudge is meka's words, never replayed as the user's: {line}"
+                        "the nudge is Meka's words, never replayed as the user's: {line}"
                     );
                 }
                 Some("agent_message_chunk") => {
@@ -2475,7 +2475,7 @@ model = "claude-sonnet-4-5"
 
     assert!(
         saw_fs_read_request,
-        "expected a fs/read_text_file request from meka",
+        "expected a fs/read_text_file request from Meka",
     );
 
     // The on-disk file is untouched (we only wrote `ON DISK` once before the test). The delegate
@@ -2531,9 +2531,9 @@ enabled = ["read", "unrestricted"]
         .build();
     // `file_write` canonicalizes the parent directory before handing the path to the delegate, so
     // the expected path matches `/private/var/...` on macOS rather than the `/var/...` tempdir
-    // returns from `config_dir()`. Stripped of the `\\?\` prefix the way meka strips it, because
-    // this is compared against a path meka reports rather than one the test constructs.
-    // `canonicalize` alone yields the verbatim spelling, which is the one meka never emits, so the
+    // returns from `config_dir()`. Stripped of the `\\?\` prefix the way Meka strips it, because
+    // this is compared against a path Meka reports rather than one the test constructs.
+    // `canonicalize` alone yields the verbatim spelling, which is the one Meka never emits, so the
     // mismatch is Windows-only.
     let target_dir = {
         let canonical = std::fs::canonicalize(harness.config_dir()).expect("canonicalize tempdir");
@@ -2587,7 +2587,7 @@ enabled = ["read", "unrestricted"]
     // No local file on disk; the delegate handled the write.
     assert!(
         !target.exists(),
-        "meka wrote a local file despite delegating: {}",
+        "Meka wrote a local file despite delegating: {}",
         target.display(),
     );
 }
@@ -2653,7 +2653,7 @@ enabled = ["read", "unrestricted"]
 
 /// The capabilities Zed advertises, in the shape that matters here: `terminal` says it implements
 /// `terminal/*` requests, and the separate `_meta.terminal_output` key says it renders agent-owned
-/// terminals from meka's `_meta` frames. Only the latter gates the terminal rendering.
+/// terminals from Meka's `_meta` frames. Only the latter gates the terminal rendering.
 fn zed_shaped_capabilities() -> serde_json::Value {
     serde_json::json!({
         "terminal": true,
@@ -2661,7 +2661,7 @@ fn zed_shaped_capabilities() -> serde_json::Value {
     })
 }
 
-/// `shell_execute` always runs in meka's own (sandboxed) child process, never in the client's
+/// `shell_execute` always runs in Meka's own (sandboxed) child process, never in the client's
 /// terminal, whatever the permission level and whatever the client advertises. `unrestricted` is
 /// the level where delegating would be tempting, and `read` is the level where it would be a
 /// sandbox bypass. Guards both by asserting no `terminal/*` traffic and that the output is the
@@ -2724,12 +2724,12 @@ enabled = ["read", "unrestricted"]
 
         assert!(
             terminal_methods.is_empty(),
-            "{level} level must run shell_execute inside meka; saw {terminal_methods:?}",
+            "{level} level must run shell_execute inside Meka; saw {terminal_methods:?}",
         );
         // Either terminal status will do. Whether the command *succeeds* is a property of the
         // host's sandbox, not of this test: on a runner where the platform sandbox rejects the
         // profile, a run at `read` legitimately reports `failed`. What must hold everywhere
-        // is that the call reached a terminal state without leaving meka.
+        // is that the call reached a terminal state without leaving Meka.
         let status = updates
             .iter()
             .map(|u| &u["params"]["update"])
@@ -2744,7 +2744,7 @@ enabled = ["read", "unrestricted"]
             "{level}: unexpected terminal status {status:?}",
         );
 
-        // When it did run, the output must be meka's own shell rather than a delegated one.
+        // When it did run, the output must be Meka's own shell rather than a delegated one.
         if status == "completed" {
             let streamed: String = updates
                 .iter()
@@ -2934,7 +2934,7 @@ fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
 
 /// `terminal: true` alone must not trigger terminal rendering. That capability means "I implement
 /// `terminal/*` requests", which is about running commands *in the client*; a client can offer it
-/// and have no idea what meka's `_meta` terminal frames mean. Sending a terminal content block to
+/// and have no idea what Meka's `_meta` terminal frames mean. Sending a terminal content block to
 /// such a client resolves to nothing and displays no output at all, which is the exact failure the
 /// terminal path exists to fix. Only `_meta.terminal_output` licenses it.
 #[test]
@@ -4357,7 +4357,7 @@ model = "claude-sonnet-4-5"
 "#;
 
 /// `session/prompt` against an unknown `sessionId` must error with `InvalidParams`. An `audio`
-/// content block likewise: meka accepts `text` / `resource_link` / `resource` / `image` (when
+/// content block likewise: Meka accepts `text` / `resource_link` / `resource` / `image` (when
 /// vision is on) but never `audio`, so it is a client contract violation.
 #[test]
 fn acp_session_prompt_rejects_unknown_session_and_audio_block() {
@@ -4389,7 +4389,7 @@ fn acp_session_prompt_rejects_unknown_session_and_audio_block() {
     assert_invalid_params(&bad_block, "prompt with audio content block");
 }
 
-/// With `vision = false` on the selected profile, meka advertises `image: false` and rejects image
+/// With `vision = false` on the selected profile, Meka advertises `image: false` and rejects image
 /// content blocks with `InvalidParams` (the rejection happens during parsing, before any turn).
 #[test]
 fn acp_session_prompt_rejects_image_when_vision_disabled() {
@@ -4531,7 +4531,7 @@ enabled = ["read"]
     assert_invalid_params(&disabled, "set_mode with disabled mode");
 }
 
-/// A version meka does not speak is answered with the latest it does: `0`, which no client sends,
+/// A version Meka does not speak is answered with the latest it does: `0`, which no client sends,
 /// and one from the future, which arrives in the newer shape where the client names itself under
 /// `info`. The negotiation is the SDK's, and the number is what a client checks, so it is pinned
 /// here: when a stable V2 ships this test moves with it.
@@ -4547,6 +4547,17 @@ fn acp_initialize_answers_a_version_it_does_not_speak_with_the_latest() {
             "{params} must be answered with the latest version; got: {response}"
         );
     }
+}
+
+/// The agent names itself twice: `name` is the identifier a client keys on, `title` the name it
+/// shows.
+#[test]
+fn acp_initialize_gives_the_agent_an_identifier_and_a_display_name() {
+    let response = initialize_by_hand(serde_json::json!({ "protocolVersion": 1 }));
+    let info = &response["result"]["agentInfo"];
+    assert_eq!(info["name"], "meka", "{response}");
+    assert_eq!(info["title"], "Meka", "{response}");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"), "{response}");
 }
 
 /// `initialize` with `params`, sent to a fresh `meka acp` outside the harness, which sends its own
@@ -4803,7 +4814,7 @@ fn acp_session_prompt_surfaces_provider_error_as_jsonrpc_error() {
         .unwrap_or_else(|| panic!("error.data must carry the detail string: {response}"));
     assert!(
         data.contains("the provider rejected or failed this turn"),
-        "error.data should carry meka's own sentence about the failure; got: {data}",
+        "error.data should carry Meka's own sentence about the failure; got: {data}",
     );
     assert!(
         data.contains("scripted provider failure"),
@@ -4819,7 +4830,7 @@ fn acp_session_prompt_surfaces_provider_error_as_jsonrpc_error() {
 /// relay_provider_errors` said -- and a deployment that had turned it off believed the text was
 /// withheld everywhere, because the only surface it had checked was the HTTP one.
 ///
-/// Both settings, because only one of them is the default. meka's own sentence is asserted in both,
+/// Both settings, because only one of them is the default. Meka's own sentence is asserted in both,
 /// which is what makes the member additive rather than a replacement for it.
 #[test]
 fn an_acp_turn_failure_relays_the_upstream_only_when_the_operator_asked() {
@@ -4842,7 +4853,7 @@ fn an_acp_turn_failure_relays_the_upstream_only_when_the_operator_asked() {
         });
         assert!(
             data.contains("the provider rejected or failed this turn"),
-            "meka's own sentence is the same either way: {data}"
+            "Meka's own sentence is the same either way: {data}"
         );
         assert_eq!(
             data.contains(secret),
@@ -4868,7 +4879,7 @@ fn an_acp_turn_failure_relays_the_upstream_only_when_the_operator_asked() {
 /// `config.toml`, an account with no stored credential -- came back an error having already
 /// repointed the session. `cwd` is the writable boundary at `workspace` and the directory a
 /// scheduled gate is re-checked in, so the next process to open that session ran it somewhere the
-/// user never asked for, on the strength of a request meka had declined.
+/// user never asked for, on the strength of a request Meka had declined.
 ///
 /// The refusal used here is the profile leaving `config.toml`, moved by a second connection to the
 /// store, which is what `an_acp_scheduled_fire_refuses_a_profile_the_row_no_longer_names` uses for
@@ -5218,7 +5229,7 @@ fn acp_fs_read_text_file_fetches_the_whole_document_and_windows_locally() {
 
 // === V2 protocol conformance ========================================
 
-/// `ContentBlock::ResourceLink` is part of the ACP baseline, so meka flattens the link into a tag
+/// `ContentBlock::ResourceLink` is part of the ACP baseline, so Meka flattens the link into a tag
 /// the model can see rather than refusing it with `InvalidParams`.
 #[test]
 fn acp_session_prompt_accepts_resource_link_baseline() {
@@ -5252,7 +5263,7 @@ fn acp_session_prompt_accepts_resource_link_baseline() {
 }
 
 /// An embedded `resource` block (an @-mention's inlined contents) is accepted and flattened into a
-/// `<resource>` tag, not rejected. meka advertises `embeddedContext: true`.
+/// `<resource>` tag, not rejected. Meka advertises `embeddedContext: true`.
 #[test]
 fn acp_session_prompt_accepts_embedded_resource() {
     let script = serde_json::json!([[
@@ -5295,7 +5306,7 @@ fn acp_session_prompt_accepts_image_with_vision() {
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
     let session_id = harness.new_session();
-    // A 1x1 transparent PNG, base64-encoded, and it has to be a real one: meka decodes every
+    // A 1x1 transparent PNG, base64-encoded, and it has to be a real one: Meka decodes every
     // attachment before forwarding it, so a hand-mangled PNG with a bad IDAT checksum would be
     // refused here rather than exercise the path.
     let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -5743,7 +5754,7 @@ fn acp_session_prompt_refusal_stop_reason() {
 }
 
 /// An *empty* refusal: Claude streams `stop_reason: "refusal"` with no body (as fable-5 does after
-/// a search surfaces disallowed content). meka must still surface a visible stand-in message
+/// a search surfaces disallowed content). Meka must still surface a visible stand-in message
 /// instead of a blank turn. Regression for session fad3ed41, where the turn rendered nothing and
 /// persisted an empty `[]` assistant message.
 #[test]
@@ -5769,7 +5780,7 @@ fn acp_empty_refusal_surfaces_standin_message() {
 /// Regression: tool calls must run off the *presence* of `tool_use` blocks, not the reported stop
 /// reason. Providers mislabel it - OpenAI Codex reports `completed` for a tool turn, and Claude
 /// occasionally reports `end_turn` with `tool_use` present. Here the mock emits a complete
-/// `file_read` call but ends the turn with `stop_reason: "end_turn"`; meka must still execute the
+/// `file_read` call but ends the turn with `stop_reason: "end_turn"`; Meka must still execute the
 /// tool (and the turn completes normally) instead of orphaning the call and breaking the next
 /// request.
 #[test]
@@ -5785,7 +5796,7 @@ model = "claude-sonnet-4-5"
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
-            // In the work directory beside the config dir: `file_read` refuses meka's own
+            // In the work directory beside the config dir: `file_read` refuses Meka's own
             // directory below `unrestricted`.
             let target = fixture_beside(config_dir, "target.txt");
             std::fs::write(&target, "hello from mock test\n").expect("write target");
@@ -5824,7 +5835,7 @@ model = "claude-sonnet-4-5"
 
 /// The capability is the switch that makes a multi-root client send anything at all: Zed reads
 /// `sessionCapabilities.additionalDirectories` and, when it's absent, silently drops every
-/// workspace folder but the first before it ever reaches meka.
+/// workspace folder but the first before it ever reaches Meka.
 #[test]
 fn acp_advertises_additional_directories_capability() {
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
@@ -5933,7 +5944,7 @@ fn acp_session_new_accepts_a_cwd_only_as_an_existing_directory_spelled_canonical
     }
 }
 
-/// The spec requires absolute paths, and meka has no defensible base to resolve a relative one
+/// The spec requires absolute paths, and Meka has no defensible base to resolve a relative one
 /// against: joining to `cwd` would invent a root the client never named.
 #[test]
 fn acp_session_new_rejects_relative_additional_directory() {
@@ -6670,7 +6681,7 @@ fn a_client_without_the_compaction_entry_sees_a_compaction_as_a_card() {
 
 /// A client that advertised `session.compaction` gets the compaction as an entry of its own: an
 /// `in_progress` update when it begins and a `completed` one carrying the summary when it lands,
-/// under one id, with meka's facts in `_meta`. The card is for clients without the entry, so it is
+/// under one id, with Meka's facts in `_meta`. The card is for clients without the entry, so it is
 /// not sent beside it.
 #[test]
 fn acp_renders_a_compaction_entry_for_a_client_that_advertises_it() {
@@ -7490,7 +7501,7 @@ enabled = ["read", "unrestricted"]
 ///
 /// The row is moved here by a second connection to the store rather than through
 /// `session/set_config_option`, for the reason `tests/multiprocess.rs` gives at length: what is
-/// being checked is that meka reads a change it did not make itself, which is exactly the position
+/// being checked is that Meka reads a change it did not make itself, which is exactly the position
 /// the out-of-band entry points are in.
 ///
 /// `/status` is the observation because it reports the model off `runtime.agent`'s own binding, and
@@ -7621,7 +7632,7 @@ fn agent_text(updates: &[serde_json::Value]) -> String {
 ///
 /// The row is moved here by a second connection to the store, exactly as
 /// `an_acp_turn_follows_the_provider_its_row_names` does and for the same reason: what is being
-/// checked is that meka reads a change it did not make in this process.
+/// checked is that Meka reads a change it did not make in this process.
 #[test]
 fn an_acp_prompt_judges_an_image_against_the_profile_its_row_names() {
     let config_toml = r#"

@@ -1,4 +1,4 @@
-//! Landlock: the ABI probe, the ruleset meka builds for a write scope, and the raw syscall bindings
+//! Landlock: the ABI probe, the ruleset Meka builds for a write scope, and the raw syscall bindings
 //! it needs.
 
 use std::path::{Path, PathBuf};
@@ -36,12 +36,12 @@ pub(super) fn landlock_probe_from_abi(abi: Result<i32, i32>) -> BackendProbe {
         },
     }
 }
-/// Lowest Landlock ABI meka will sandbox with on its own.
+/// Lowest Landlock ABI Meka will sandbox with on its own.
 ///
 /// v9 (Linux 7.1) is where `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` arrives. Below it no right governs
 /// `connect(2)` on a pathname Unix socket, so a "read-only" child can still reach the D-Bus buses
 /// and `systemd-run --user`, and have a privileged daemon write on its behalf: not a gap in the
-/// filesystem boundary but a way around the whole of it. meka documents `read` as "this command
+/// filesystem boundary but a way around the whole of it. Meka documents `read` as "this command
 /// cannot change the machine", so accepting an older ABI would be promising a boundary the kernel
 /// is not enforcing. The truncate right of v3 and the ioctl and scope rights of v5 and v6 come
 /// with it.
@@ -70,7 +70,7 @@ pub(crate) fn layer_landlock_abi() -> Option<i32> {
         .ok()
         .filter(|abi| *abi >= MIN_LAYER_LANDLOCK_ABI)
 }
-/// Raw kernel ABI probe. Reports what the kernel supports, not what meka will accept: the
+/// Raw kernel ABI probe. Reports what the kernel supports, not what Meka will accept: the
 /// [`MIN_LANDLOCK_ABI`] policy lives in [`probe_landlock`] so the "too old" case can be reported
 /// differently from "no Landlock at all". `Err` carries the `errno` the kernel answered with.
 pub(super) fn landlock_abi_or_errno() -> Result<i32, i32> {
@@ -137,7 +137,7 @@ pub(super) const ACCESS_FILE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
     | LANDLOCK_ACCESS_FS_IOCTL_DEV
     | LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
 /// The rules for a confinement: read and execute everywhere, or beneath each readable path alone,
-/// but never inside meka's own directories; every handled right beneath each writable root, every
+/// but never inside Meka's own directories; every handled right beneath each writable root, every
 /// right but socket resolution beneath each scratch directory, and `/dev/null` writable in every
 /// confinement.
 ///
@@ -191,9 +191,9 @@ pub(crate) fn landlock_grants(
         &std::fs::canonicalize(dev_null).unwrap_or_else(|_| dev_null.to_path_buf()),
         LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE,
     );
-    // The host's input is hidden from reads as meka's own directories are: opening another
+    // The host's input is hidden from reads as Meka's own directories are: opening another
     // terminal's pty, or the keyboard's device, takes what is typed there, a password at a prompt
-    // included, from the program it was typed to. A command meka runs has no terminal of its own
+    // included, from the program it was typed to. A command Meka runs has no terminal of its own
     // (it is started in a session of its own with stdin closed), so nothing it needs is there.
     let mut hidden_from_reads = private.to_vec();
     hidden_from_reads.extend(host_input());
@@ -406,7 +406,7 @@ pub(crate) unsafe fn apply_landlock(
 ///
 /// Bubblewrap has no Landlock support of its own, and a domain that handles any filesystem right
 /// refuses `mount(2)`, so the ruleset cannot be applied ahead of bwrap's mounts. The one place left
-/// is a program bwrap execs, and that program is meka itself, reached through a descriptor the
+/// is a program bwrap execs, and that program is Meka itself, reached through a descriptor the
 /// spawn lets the sandbox inherit.
 ///
 /// The ABI is probed here rather than passed in: it is the same kernel the parent probed, and
@@ -604,7 +604,7 @@ mod tests {
     }
 
     /// With reads confined, nothing is granted on `/`: each readable path gets read and
-    /// execution whole, or listing and execution with reads per sibling where meka's directories
+    /// execution whole, or listing and execution with reads per sibling where Meka's directories
     /// lie beneath it, and the writable roots keep every right.
     #[test]
     fn a_confined_read_set_grants_nothing_on_the_root() {
@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(
             grants.get(&home),
             Some(&(super::LANDLOCK_ACCESS_FS_EXECUTE | super::LANDLOCK_ACCESS_FS_READ_DIR)),
-            "a readable path above meka's directory lists but reads per sibling"
+            "a readable path above Meka's directory lists but reads per sibling"
         );
         assert_eq!(
             grants.get(&home.join(".config")),
@@ -710,7 +710,7 @@ mod tests {
         }
     }
 
-    /// End-to-end proof that the kernel honors the workspace boundary, not just that meka computed
+    /// End-to-end proof that the kernel honors the workspace boundary, not just that Meka computed
     /// it: a real `sh` under a real Landlock ruleset, checked by what lands on disk.
     #[test]
     fn a_confined_shell_writes_inside_the_root_and_is_refused_outside() {
@@ -746,7 +746,7 @@ mod tests {
         );
         assert!(
             !outside.join("escaped.txt").exists(),
-            "a write outside every root must be refused by the kernel, not merely by meka"
+            "a write outside every root must be refused by the kernel, not merely by Meka"
         );
     }
 

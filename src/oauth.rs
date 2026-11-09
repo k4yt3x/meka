@@ -598,7 +598,7 @@ pub(crate) struct SubscriptionCredential {
     ///
     /// A rejection is the backend saying the stored expiry is wrong: the token was revoked, or its
     /// issuer shortened lifetimes. The expiry alone would keep presenting the dead token until it
-    /// passed, which can be hours or, for an expiry meka had to assume, a full lifetime. The
+    /// passed, which can be hours or, for an expiry Meka had to assume, a full lifetime. The
     /// token's identity rather than a flag, because a flag was spent by whichever read came first:
     /// two requests refused in the same window left one of them re-sending the dead bearer and
     /// failing with the login remedy while the other's refresh succeeded beside it. Recorded only
@@ -757,7 +757,7 @@ impl SubscriptionCredential {
         let _refreshing = self.refresh_gate.lock().await;
 
         // And the same thing one layer out. `refresh_gate` is a `tokio::sync::Mutex`, so it
-        // serializes the tasks in *this* process and says nothing about the meka in the next
+        // serializes the tasks in *this* process and says nothing about the Meka in the next
         // terminal, which is holding the same refresh token and is just as due. Bounded, and
         // advisory: the compare-and-swap on the write is what makes the outcome correct whether or
         // not this is held.
@@ -767,7 +767,7 @@ impl SubscriptionCredential {
         };
 
         // Re-read the latest credential from the store. Refresh tokens rotate on each successful
-        // refresh, and a sibling meka process may have rotated this one since startup; without
+        // refresh, and a sibling Meka process may have rotated this one since startup; without
         // the re-read a stale refresh token is posted and the issuer rejects it with
         // `invalid_grant`.
         //
@@ -950,7 +950,7 @@ pub(crate) trait LoginPrompt: Send + Sync {
     /// Say what completes the login now that the URL is out.
     fn awaiting(&self, completion: Completion);
     /// Whether a pasted line can be read beside a listener: a terminal on stdin, for a browser
-    /// that cannot reach the listener because meka runs on another host. A login with no
+    /// that cannot reach the listener because Meka runs on another host. A login with no
     /// listener reads one regardless, since nothing else can complete it.
     fn accepts_paste(&self) -> bool;
     /// One pasted line. `Ok(None)` means nothing will ever be pasted (stdin closed), which leaves

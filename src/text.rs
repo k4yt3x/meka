@@ -82,7 +82,7 @@ pub(crate) fn sanitize_text(input: &str) -> String {
 fn is_safe_char(ch: char) -> bool {
     // Only the two whitespace controls that cannot move the cursor back pass. `\r` is deliberately
     // not among them: it returns the cursor to column zero without advancing a line, which is
-    // enough to overwrite a line meka has already printed using no escape sequence at all. A
+    // enough to overwrite a line Meka has already printed using no escape sequence at all. A
     // server progress message of `"\r[approval] shell_execute\n  command: ls\nAllow? (Y/n) "`
     // would otherwise repaint a convincing approval block at column zero, and everything that
     // renders server text (the elicitation banner, the form labels, the progress line) trusts this
@@ -197,13 +197,13 @@ pub(crate) fn as_log_line(text: &str) -> String {
     }
 }
 
-/// Make a model-supplied string safe to place on one line of meka's own UI.
+/// Make a model-supplied string safe to place on one line of Meka's own UI.
 ///
 /// [`sanitize_for_display`] drops escapes and control characters but deliberately keeps `\n`, `\r`
 /// and `\t`, which is right for text meant to span lines and wrong everywhere a string is being
-/// slotted into a line meka composed. A kept `\n` walks out of an indented block and lands
+/// slotted into a line Meka composed. A kept `\n` walks out of an indented block and lands
 /// attacker-chosen text at column 0; a kept `\r` returns the cursor and overwrites the label that
-/// was supposed to introduce the value. Both forge meka's chrome without needing an escape
+/// was supposed to introduce the value. Both forge Meka's chrome without needing an escape
 /// sequence, so every such site flattens them to spaces and caps the result.
 ///
 /// A tab is expanded rather than flattened. It cannot move the cursor left or up, so it forges
@@ -214,13 +214,13 @@ pub(crate) fn as_log_line(text: &str) -> String {
 /// The cap is in terminal columns, not characters: a line of CJK or emoji is twice as wide as its
 /// character count suggests, and a cap that misses that lets a "capped" line wrap into rows.
 pub(crate) fn sanitize_to_line(text: &str, max_columns: usize) -> String {
-    // Every character meka cannot measure is dropped, which `char::is_control` does not cover.
+    // Every character Meka cannot measure is dropped, which `char::is_control` does not cover.
     // The rule is one line below (a character worth zero columns does not survive), and it is
     // deliberately wider than the classes that motivated it:
     //
     // `unicode_width` scores U+00AD SOFT HYPHEN and U+3164 HANGUL FILLER as zero columns
     // while a terminal following `wcwidth` draws one and two. A run of either passes any
-    // column budget unmeasured, which is how a model pushes its own text onto a row meka believes
+    // column budget unmeasured, which is how a model pushes its own text onto a row Meka believes
     // is empty, and the filler draws blank, so the overrun is invisible padding.
     //
     // A variation selector (U+FE00-FE0F) changes the width of the character *before* it, so a
@@ -508,7 +508,7 @@ pub(crate) fn sanitize_for_display(text: &str) -> String {
 ///
 /// `\r` is excluded because it is the forgery primitive that needs no escape sequence at all. It
 /// returns the cursor to column zero without advancing a line, so a model that has read attacker
-/// text can overwrite a line meka already printed (including the tail of an approval prompt)
+/// text can overwrite a line Meka already printed (including the tail of an approval prompt)
 /// using nothing but ordinary characters. `\n` and `\t` stay: they are structural in markdown and
 /// can only move the cursor forward.
 ///
@@ -522,7 +522,7 @@ pub(crate) fn sanitize_for_display(text: &str) -> String {
 /// else entirely. `char` boundaries are safe per delta because these are single scalars.
 ///
 /// Only the bidi set, unlike [`sanitize_to_line`] and [`sanitize_text`], which drop
-/// the whole `Cf` category. Those two render *server*-controlled strings into one row of meka's own
+/// the whole `Cf` category. Those two render *server*-controlled strings into one row of Meka's own
 /// chrome, where nothing in `Cf` has a legitimate use. This is prose the model wrote for the user,
 /// and most of `Cf` is ordinary content there: ZWJ builds emoji families and profession sequences,
 /// ZWNJ spells ordinary Persian and Arabic words, and both drive Indic conjuncts. Stripping the
@@ -585,7 +585,7 @@ const REMAINDER_MINIMUM: usize = 24;
 /// How wide a column of a listing may be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Width {
-    /// Its widest cell, never cut: an identifier the reader retypes elsewhere, or a fact meka
+    /// Its widest cell, never cut: an identifier the reader retypes elsewhere, or a fact Meka
     /// composes and so bounds itself.
     Content,
     /// Its widest cell up to a ceiling, cut past it: text shown for information, whose full form
@@ -617,7 +617,7 @@ pub(crate) struct Column {
 }
 
 impl Column {
-    /// A column shown in full: an identifier the reader retypes, or a fact meka composes.
+    /// A column shown in full: an identifier the reader retypes, or a fact Meka composes.
     pub(crate) const fn content(header: &'static str) -> Self {
         Self {
             header,
@@ -742,7 +742,7 @@ pub(crate) fn format_table(columns: &[Column], rows: &[Vec<String>]) -> String {
 }
 /// How much of an id a row shows before anything forces it wider: a UUID's first segment.
 pub(crate) const ID_PREFIX: usize = 8;
-/// Whether `prefix` could be a prefix of an id meka printed.
+/// Whether `prefix` could be a prefix of an id Meka printed.
 ///
 /// Every resolver asks this before matching, because `id.starts_with("")` is true of every id: an
 /// unset shell variable in `meka schedule cancel "$JOB"` otherwise reads as "the only job", and
@@ -759,7 +759,7 @@ pub(crate) fn is_usable_id_prefix(prefix: &str) -> bool {
 }
 /// An id prefix as the resolvers compare it.
 ///
-/// Every id meka stores and prints is a lowercase UUID, but the resolvers would otherwise disagree
+/// Every id Meka stores and prints is a lowercase UUID, but the resolvers would otherwise disagree
 /// about case: sessions go through SQL `LIKE`, which is ASCII-case-insensitive, while jobs and
 /// tasks use `str::starts_with`, so a pasted `4D71EECA` would resolve a session and be reported as
 /// no such job, a clean answer from one command and a false miss from its sibling. Folded once,
@@ -952,7 +952,7 @@ pub(crate) fn horizon_before<Zone: chrono::TimeZone>(
         .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC.with_timezone(&now.timezone()))
 }
 
-/// Binary units, because every size meka caps or reports is a memory or body size: a provider's
+/// Binary units, because every size Meka caps or reports is a memory or body size: a provider's
 /// request limit, a decode allocation, a read ceiling, all stated in MiB by the systems that impose
 /// them.
 pub(crate) const KIB: usize = 1 << 10;
@@ -962,7 +962,7 @@ pub(crate) const MIB: usize = 1 << 20;
 ///
 /// One decimal rather than integer division, which truncates: every body from 2.0 to just under 3.0
 /// MiB would report as "2 MiB", and the figure is what a user quotes when asking why a request was
-/// refused. Every size meka prints comes through here, so a ceiling and the body measured against
+/// refused. Every size Meka prints comes through here, so a ceiling and the body measured against
 /// it are stated in the same unit to the same precision.
 pub(crate) fn format_size(bytes: usize) -> String {
     if bytes >= MIB {
@@ -977,7 +977,7 @@ pub(crate) fn format_size(bytes: usize) -> String {
 /// How much of an instant a surface shows.
 ///
 /// Every precision renders in the reader's local time with the numeric UTC offset. Local, because a
-/// clock with no zone reads as the reader's own and every instant meka stores is UTC; the offset,
+/// clock with no zone reads as the reader's own and every instant Meka stores is UTC; the offset,
 /// because the same store is read from more than one machine and a rendering pasted into a report
 /// has to say which clock it was on. chrono prints an offset for `%Z` too, never a zone name, so
 /// the offset is spelled as the offset it is.
@@ -1280,7 +1280,7 @@ mod tests {
         assert_eq!(table, "Priority  Name\n5         x\n");
     }
 
-    /// Every cell reaches a terminal, so every cell is flattened and stripped, the ones meka wrote
+    /// Every cell reaches a terminal, so every cell is flattened and stripped, the ones Meka wrote
     /// included; a row short of cells is padded rather than misaligned.
     #[test]
     fn every_cell_is_sanitized_and_a_short_row_is_padded() {

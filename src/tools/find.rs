@@ -93,7 +93,7 @@ impl Tool for FindFilesTool {
         let fence = self.site.read_scope().fence(&self.site.cwd);
         let mut full_patterns: Vec<String> = Vec::with_capacity(base_paths.len());
         for base in &base_paths {
-            // A root the caller named inside meka's own directories, or outside the readable
+            // A root the caller named inside Meka's own directories, or outside the readable
             // roots, is refused, as `file_search` refuses it; a walk that reaches either from
             // above skips what it finds there in `run_walk`.
             if let Some(message) = fence.refusal(base) {
@@ -105,7 +105,7 @@ impl Tool for FindFilesTool {
             // Normalized through the type rather than by trimming a character:
             // `trim_end_matches('/')` leaves a Windows `C:\work\` alone and yields `C:\work\/*.md`,
             // whose meaning then depends on `glob`'s separator handling rather than on anything
-            // meka decided. Re-collecting the components drops a trailing separator on both
+            // Meka decided. Re-collecting the components drops a trailing separator on both
             // platforms. A trailing separator is reachable: `resolve_against_cwd` preserves one,
             // and an ACP client may send it in `additionalDirectories`.
             let base: std::path::PathBuf = base.components().collect();

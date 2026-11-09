@@ -511,7 +511,7 @@ mod tests {
         );
     }
 
-    /// A moved row whose id is not one meka wrote fails the rename rather than going unannounced:
+    /// A moved row whose id is not one Meka wrote fails the rename rather than going unannounced:
     /// the ids answered are the rows moved.
     #[tokio::test]
     async fn a_rename_refuses_a_session_row_whose_id_is_not_an_id() {

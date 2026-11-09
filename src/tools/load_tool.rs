@@ -310,7 +310,7 @@ impl Tool for LoadToolTool {
 /// one door for both.
 pub(super) struct ToolSearchTool {
     /// The loader this search answers `names` through, and whose handles it searches with: the
-    /// Responses wire's search item takes `names` where meka's function tool takes `tool_load`.
+    /// Responses wire's search item takes `names` where Meka's function tool takes `tool_load`.
     pub(super) loader: LoadToolTool,
 }
 
@@ -404,7 +404,7 @@ fn deferred_names(deferred: &DeferredSet) -> HashSet<String> {
 /// What the permission door says about a call of `name` now, in one clause: the decision is
 /// `admit_tool_call`'s, the same door dispatch and the checkpoint use. Only the wording
 /// distinguishes the door's two reasons, by the same `allows` it consulted: a level the call is
-/// above, or a boundary `workspace` cannot apply to a tool that runs outside meka's confinement.
+/// above, or a boundary `workspace` cannot apply to a tool that runs outside Meka's confinement.
 ///
 /// "Allowed" and "would need", not "runs" and "is submitted": a tool may still refuse on its own
 /// terms once called (a shell with no sandbox, a path outside the roots), and those doors take the
@@ -1102,7 +1102,7 @@ mod tests {
         assert!(
             function["properties"].get("names").is_none()
                 && function["required"] == serde_json::json!(["query"]),
-            "meka's own function takes a query and nothing else: {function}"
+            "Meka's own function takes a query and nothing else: {function}"
         );
         let by_names = serde_json::json!({"names": ["fixture_alpha"]});
         assert!(
@@ -1114,7 +1114,7 @@ mod tests {
                 )
                 .await
                 .is_err(),
-            "names load nothing where the function is meka's: the query is required"
+            "names load nothing where the function is Meka's: the query is required"
         );
 
         deliver(&fixture, crate::provider::DeferredToolDelivery::Searched);

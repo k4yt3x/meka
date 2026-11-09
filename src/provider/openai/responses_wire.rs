@@ -7,7 +7,7 @@
 //! not two dialects of one.
 //!
 //! Nothing here may assume which endpoint is on the other end. `store: false` is set
-//! unconditionally because meka replays the whole conversation every turn and never uses
+//! unconditionally because Meka replays the whole conversation every turn and never uses
 //! server-side state, which also happens to be all the stateless implementations (Ollama, vLLM)
 //! support. Anything that *is* endpoint-specific (the encrypted-reasoning `include`, auth
 //! headers, the URL) belongs to the backend, not here.
@@ -33,7 +33,7 @@ use crate::{
     stats::TokenUsage,
 };
 
-/// Build the JSON body POSTed to `/responses`. Translates the meka internal `Message` /
+/// Build the JSON body POSTed to `/responses`. Translates the Meka internal `Message` /
 /// `ContentBlock` shape into Responses API `input` items (`message`, `function_call`,
 /// `function_call_output`).
 ///
@@ -45,7 +45,7 @@ use crate::{
 /// afterwards; see [`include_encrypted_reasoning`].
 ///
 /// Under [`DeferredToolDelivery::Searched`] the endpoint's own `tool_search` is declared with
-/// client execution in place of meka's two discovery tools, `deferred_tools` ride with
+/// client execution in place of Meka's two discovery tools, `deferred_tools` ride with
 /// `defer_loading`, a recorded `tool_search` call replays as the endpoint's `tool_search_call`
 /// item, and its result as a `tool_search_output` carrying the definitions the result referenced,
 /// since only that item registers a definition on this wire. Under the other deliveries nothing
@@ -201,7 +201,7 @@ fn input_image_part(source: &crate::image::ImageSource) -> serde_json::Value {
 
 /// The ids of the `tool_search` calls a conversation recorded, which replay as the endpoint's own
 /// search item under [`DeferredToolDelivery::Searched`]; empty under every other delivery, where
-/// the same name is meka's function tool.
+/// the same name is Meka's function tool.
 fn searched_call_ids(
     delivery: DeferredToolDelivery,
     messages: &[Message],
@@ -236,7 +236,7 @@ fn function_declaration(tool: &ToolDefinition, deferred: bool) -> serde_json::Va
     serde_json::Value::Object(declaration)
 }
 
-/// The endpoint's own search item, declared with client execution so meka answers it. One door
+/// The endpoint's own search item, declared with client execution so Meka answers it. One door
 /// for finding by keyword and loading by name, because only its output registers a definition on
 /// this wire.
 fn tool_search_declaration() -> serde_json::Value {
@@ -424,7 +424,7 @@ fn flush_assistant_text(pending: &mut String, input: &mut Vec<serde_json::Value>
 
 /// Whether anything this encoder will actually emit follows `index` in the same turn.
 ///
-/// A reasoning item left dangling is a rejected request, and meka's own history reaches that shape
+/// A reasoning item left dangling is a rejected request, and Meka's own history reaches that shape
 /// without any help from the model: [`Message::without_tool_use`] drops an interrupted turn's calls
 /// but keeps its thinking, and a rewind can cut anywhere.
 ///
@@ -441,7 +441,7 @@ fn an_emitted_item_follows(content: &[ContentBlock], index: usize) -> bool {
 
 /// A `reasoning` item, shaped as the server sent it so it can be replayed verbatim.
 ///
-/// meka flattens a multi-part summary into one string as it streams (the parts are display
+/// Meka flattens a multi-part summary into one string as it streams (the parts are display
 /// sections, separated by a blank line), and does not try to reconstruct the original parts here:
 /// splitting back on the separator would invent boundaries wherever a single part contained a
 /// paragraph break. The whole text goes back as one part, which preserves what was said.
@@ -479,14 +479,14 @@ fn encode_tools(
     let mut declared = Vec::with_capacity(tools.len() + deferred_tools.len() + 1);
     // The endpoint's search item rides while there is something for it to find, or while the
     // history replays a search it answered; with neither it is a tool the model can only call
-    // for nothing, as meka's own discovery tools would be.
+    // for nothing, as Meka's own discovery tools would be.
     if searched && (!deferred_tools.is_empty() || replays_a_search) {
         declared.push(tool_search_declaration());
     }
     declared.extend(
         tools
             .iter()
-            // The endpoint's search item does both jobs here; meka's two function tools would
+            // The endpoint's search item does both jobs here; Meka's two function tools would
             // be a second door whose results register nothing.
             .filter(|tool| {
                 !(searched && (tool.name == LOAD_TOOL_NAME || tool.name == SEARCH_TOOL_NAME))
@@ -539,7 +539,7 @@ fn frame_name<'a>(data: &'a serde_json::Value, event_name: &'a str) -> &'a str {
 }
 
 /// Pure SSE-event handler. Inspects the named event and parsed JSON payload, updates `state`, and
-/// returns the meka-level [`StreamEvent`]s to forward to the agent. Returns `Err` when the server
+/// returns the Meka-level [`StreamEvent`]s to forward to the agent. Returns `Err` when the server
 /// reports a fatal stream error; the driver propagates this back to the caller.
 pub(super) fn process_event(
     event_name: &str,
@@ -569,7 +569,7 @@ pub(super) fn process_event(
 
         // A reasoning summary arrives as several parts, each its own section with its own heading,
         // and the deltas carry no separator of their own. Codex renders a break here
-        // (`on_reasoning_section_break`); meka's thinking is flat text, so the break is a blank
+        // (`on_reasoning_section_break`); Meka's thinking is flat text, so the break is a blank
         // line. The first part opens the block rather than separating anything, which is what
         // `in_reasoning` distinguishes.
         "response.reasoning_summary_part.added" => {
@@ -589,7 +589,7 @@ pub(super) fn process_event(
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                // The endpoint's search item has no name of its own; it dispatches as meka's
+                // The endpoint's search item has no name of its own; it dispatches as Meka's
                 // search tool, which answers both a query and a list of names.
                 let name = if item_type == "tool_search_call" {
                     SEARCH_TOOL_NAME.to_string()
@@ -1422,7 +1422,7 @@ mod tests {
     /// Found against OpenRouter, which sends bare `data:` frames. That is valid SSE and the
     /// Responses spec's own discriminator is the payload's `type`; the `event:` line is an optional
     /// convenience. Keying off the event name alone worked only while ChatGPT and OpenAI -- which
-    /// send both -- were the only endpoints meka reached, and failed the moment an API-key backend
+    /// send both -- were the only endpoints Meka reached, and failed the moment an API-key backend
     /// could point anywhere. The symptom was total: every frame looked unhandled, so a turn that
     /// streamed perfectly well died with "stream ended before a terminal response event".
     ///
@@ -2333,7 +2333,7 @@ mod tests {
     }
 
     /// On a searched wire the endpoint's own search item is declared with client execution in
-    /// place of meka's two discovery tools, and every deferred tool rides with `defer_loading`.
+    /// place of Meka's two discovery tools, and every deferred tool rides with `defer_loading`.
     /// A referenced wire declares the deferred tools and keeps the discovery tools; an appending
     /// wire sends the array as built.
     #[test]
@@ -2530,7 +2530,7 @@ mod tests {
         );
     }
 
-    /// The endpoint's search item arrives whole on its done frame and dispatches as meka's search
+    /// The endpoint's search item arrives whole on its done frame and dispatches as Meka's search
     /// tool, which answers both a query and a list of names.
     #[test]
     fn a_tool_search_call_item_dispatches_as_the_search_tool() {
@@ -2576,7 +2576,7 @@ mod tests {
             .clone()
     }
 
-    /// The whole point of the `include`: reasoning meka asked the server to encrypt has to go back
+    /// The whole point of the `include`: reasoning Meka asked the server to encrypt has to go back
     /// out on the next request, or the model restarts its chain of thought at every tool call.
     #[test]
     fn encrypted_reasoning_is_replayed_on_the_next_request() {
@@ -2751,7 +2751,7 @@ mod tests {
     }
 
     /// Without this the model still reasons and the user sees nothing, which reads as a hang.
-    /// Codex asks for `auto`; so does meka, on the one backend whose endpoint is always OpenAI.
+    /// Codex asks for `auto`; so does Meka, on the one backend whose endpoint is always OpenAI.
     #[test]
     fn the_two_asks_compose_into_a_reasoning_block_even_with_no_effort_set() {
         let mut body = build_request_body("gpt-5", "", &[], &[], None, None, true);

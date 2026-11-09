@@ -42,7 +42,7 @@ model   = "claude-opus-5-5"
 
 ### `effort`
 
-meka sends the reasoning-effort control as `output_config.effort` in the request body. Unlike `claude-subscription`, no beta header is needed: the parameter is generally available on the direct Messages API. When `effort` is unset the field is omitted entirely, which is how you ask for Anthropic's own default. See the [`effort`](../configuration/config-file.md#effort) config reference for the levels.
+Meka sends the reasoning-effort control as `output_config.effort` in the request body. Unlike `claude-subscription`, no beta header is needed: the parameter is generally available on the direct Messages API. When `effort` is unset the field is omitted entirely, which is how you ask for Anthropic's own default. See the [`effort`](../configuration/config-file.md#effort) config reference for the levels.
 
 ### `thinking`
 
@@ -50,7 +50,7 @@ meka sends the reasoning-effort control as `output_config.effort` in the request
 
 ## Supported models
 
-Any model available through the Claude Messages API; meka forwards the model string verbatim and doesn't gate which strings are valid. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview); `meka profile add` suggests `claude-opus-5-5` for a profile on a Claude account.
+Any model available through the Claude Messages API; Meka forwards the model string verbatim and doesn't gate which strings are valid. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview); `meka profile add` suggests `claude-opus-5-5` for a profile on a Claude account.
 
 ## Custom base URL
 
@@ -62,7 +62,7 @@ meka account add gateway --backend anthropic-messages \
 meka profile add gateway --account gateway --model claude-opus-5-5
 ```
 
-A trailing `/v1` is dropped, since meka appends it per request: publish `https://gateway.example.com/anthropic` or `https://gateway.example.com/anthropic/v1`, either works.
+A trailing `/v1` is dropped, since Meka appends it per request: publish `https://gateway.example.com/anthropic` or `https://gateway.example.com/anthropic/v1`, either works.
 
 ### Anthropic-compatible endpoints
 
@@ -77,7 +77,7 @@ Nothing in the request is tuned to Claude unless you ask for it, with one except
 
 The exception is the prompt-cache breakpoint, which goes out by default because Anthropic's own API caches nothing without it. An endpoint that ignores it loses nothing, but a gateway may turn it into a paid cache of the whole prompt on every turn (OpenRouter does for Gemini), and a profile on such a model sets [`cache_control = false`](../configuration/config-file.md#cache_control) to send none and leave the endpoint's own implicit caching to work.
 
-The one setting worth stating is the context window. meka never probes for it, so an unset profile budgets against the 1M default; on a smaller model that means compaction only fires once the backend itself rejects the request:
+The one setting worth stating is the context window. Meka never probes for it, so an unset profile budgets against the 1M default; on a smaller model that means compaction only fires once the backend itself rejects the request:
 
 ```toml
 [profiles.local]
@@ -112,4 +112,4 @@ thinking = "budgeted"   # only if the endpoint rejects the adaptive form
 
 **Streaming:** Server-Sent Events with named event types (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`, `ping`). A non-streaming call (`--no-stream`, a compaction's checkpoint or summary) is the same stream folded in place, so every request has one shape and reads one cache; a gateway can keep a separate cache per shape.
 
-**Body fields meka writes:** `model`, `system` (when non-empty), `messages`, `tools`, `stream`, `max_tokens`, `thinking` (unless `thinking = "off"`) and `output_config` (when `effort` is set). Any other field, such as `temperature`, `top_p` or `top_k`, goes in the profile's [`parameters`](../configuration/config-file.md#parameters) as [Anthropic's API reference](https://docs.claude.com/en/api/messages) names it, and one of the fields above is refused there. Which sampling fields a model takes, and how thinking narrows them, is the API's to say, and its error names the field.
+**Body fields Meka writes:** `model`, `system` (when non-empty), `messages`, `tools`, `stream`, `max_tokens`, `thinking` (unless `thinking = "off"`) and `output_config` (when `effort` is set). Any other field, such as `temperature`, `top_p` or `top_k`, goes in the profile's [`parameters`](../configuration/config-file.md#parameters) as [Anthropic's API reference](https://docs.claude.com/en/api/messages) names it, and one of the fields above is refused there. Which sampling fields a model takes, and how thinking narrows them, is the API's to say, and its error names the field.

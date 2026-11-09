@@ -46,7 +46,7 @@ pub(crate) struct SessionView {
     #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
     pub(crate) working_directory: Option<PathBuf>,
     /// The session's permission level (`none`, `read`, `workspace`, `unrestricted`). Omitted when
-    /// the row records no level: every door of this meka records one, so a bare row is an outside
+    /// the row records no level: every door of this Meka records one, so a bare row is an outside
     /// hand's, and inventing a value for it would state a level the session never ran at.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
@@ -237,7 +237,7 @@ pub(crate) struct AccountView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tool_name_bytes: Option<usize>,
     /// `yes`, `no`, or `unreadable`: the same three answers as the plain column, because a row
-    /// meka cannot deserialize is neither logged in nor logged out.
+    /// Meka cannot deserialize is neither logged in nor logged out.
     pub(crate) authenticated: &'static str,
 }
 
@@ -849,13 +849,13 @@ impl From<&Skill> for SkillView {
 pub(crate) struct InstalledSkillView {
     #[serde(flatten)]
     pub(crate) skill: SkillView,
-    /// Found under `[skills] additional_directories` rather than in meka's own store.
+    /// Found under `[skills] additional_directories` rather than in Meka's own store.
     pub(crate) external: bool,
     pub(crate) source_dir: PathBuf,
 }
 
 impl InstalledSkillView {
-    /// The view of one installed skill; `native_root` is meka's own store, the only directory
+    /// The view of one installed skill; `native_root` is Meka's own store, the only directory
     /// anything writes to, so a skill from anywhere else is external.
     pub(crate) fn new(skill: &Skill, native_root: Option<&Path>) -> Self {
         Self {
@@ -876,7 +876,7 @@ pub(crate) struct SkillDetail {
     /// The Agent Skills `license` field, verbatim. Informational.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) license: Option<String>,
-    /// The Agent Skills `allowed-tools` field, verbatim. meka never acts on it; see the skills
+    /// The Agent Skills `allowed-tools` field, verbatim. Meka never acts on it; see the skills
     /// guide.
     #[serde(rename = "allowed-tools", skip_serializing_if = "Option::is_none")]
     pub(crate) allowed_tools: Option<String>,

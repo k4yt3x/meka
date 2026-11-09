@@ -1199,7 +1199,12 @@ fn profile_set_about() -> String {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "meka", version, about = "A general-purpose AI agent harness")]
+#[command(
+    name = "meka",
+    display_name = "Meka",
+    version,
+    about = "A general-purpose AI agent harness"
+)]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
@@ -1411,7 +1416,7 @@ impl crate::oauth::LoginPrompt for TerminalLogin {
     }
 
     fn paste_refused(&self, reason: &str) {
-        // Said as a line of meka's own, which starts with a capital whatever the refusal does.
+        // Said as a line of Meka's own, which starts with a capital whatever the refusal does.
         let mut line = reason.to_string();
         if let Some(first) = line.get(..1) {
             line.replace_range(..1, &first.to_ascii_uppercase());
@@ -1712,7 +1717,7 @@ mod tests {
         ));
     }
 
-    /// A level meka does not have must fail *loudly* at the CLI rather than resolve to anything.
+    /// A level Meka does not have must fail *loudly* at the CLI rather than resolve to anything.
     ///
     /// This is the surface where an invocation is most likely to be automated, and a hard exit is
     /// the good outcome there: a nonzero status stops a script, where quietly picking a level would

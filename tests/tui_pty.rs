@@ -1,6 +1,6 @@
 //! The interactive screen, driven through a real pseudo-terminal.
 //!
-//! Everything else in `tests/` runs meka with pipes, which the screen refuses: it draws on the
+//! Everything else in `tests/` runs Meka with pipes, which the screen refuses: it draws on the
 //! alternate screen and reads the keyboard. This owns the master side of a pty, feeds keys whenever
 //! the child goes quiet, and reads the screen back through a terminal emulator, so a test asserts
 //! on rows as a person would see them rather than on escape sequences.
@@ -85,7 +85,7 @@ fn drive_run(install: &Install, inputs: &[&str], kitty: bool) -> Run {
     drive_run_with(install, &["-c"], inputs, kitty)
 }
 
-/// [`drive_run`], with `args` on meka's command line in place of the `-c` every other test runs
+/// [`drive_run`], with `args` on Meka's command line in place of the `-c` every other test runs
 /// with.
 fn drive_run_with(install: &Install, args: &[&str], inputs: &[&str], kitty: bool) -> Run {
     drive_run_sized(install, args, inputs, kitty, COLUMNS)
@@ -189,7 +189,7 @@ impl PreparedExec {
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "xterm-256color")
             // The sandbox advisories are facts about the kernel the suite runs on, and would be
-            // rows of their own on the screen. The two `rmcp` directives are meka's defaults,
+            // rows of their own on the screen. The two `rmcp` directives are Meka's defaults,
             // restated because `RUST_LOG` replaces the filter outright.
             .env(
                 "RUST_LOG",
@@ -1169,7 +1169,7 @@ fn leaving_during_a_turn_stops_it() {
     let run = drive_run(&install, &["go", "/exit"], false);
     assert!(
         run.exit.is_some(),
-        "meka was still running the turn after the screen left: {:#?}",
+        "Meka was still running the turn after the screen left: {:#?}",
         run.screens
     );
 }
@@ -2013,7 +2013,7 @@ fn a_host_command_typed_during_a_turn_is_refused() {
     );
 }
 
-/// A new session opens on the banner: meka's mark beside the version and the build, then what
+/// A new session opens on the banner: Meka's mark beside the version and the build, then what
 /// the agent carries, at the top under a blank row. The first prompt takes it down.
 #[test]
 fn a_new_session_opens_on_the_banner() {
@@ -2022,7 +2022,7 @@ fn a_new_session_opens_on_the_banner() {
     let opening = &screens[0];
     // The binary under test is an unoptimized build from this checkout, so the build follows the
     // version; its commit is whatever the checkout is at.
-    let version = format!("   ██▖ ▗██▌  meka v{} (", env!("CARGO_PKG_VERSION"));
+    let version = format!("   ██▖ ▗██▌  Meka v{} (", env!("CARGO_PKG_VERSION"));
     assert!(
         opening[1].starts_with(&version) && opening[1].ends_with("debug)"),
         "{opening:#?}"
@@ -2042,7 +2042,7 @@ fn a_new_session_opens_on_the_banner() {
         "the prompt is on the transcript: {rows:#?}"
     );
     assert!(
-        !rows.iter().any(|row| row.contains("  meka v")),
+        !rows.iter().any(|row| row.contains("  Meka v")),
         "the banner goes once the conversation starts: {rows:#?}"
     );
 }
@@ -2496,7 +2496,7 @@ fn a_run_without_a_terminal_is_refused_and_names_oneshot() {
         .current_dir(install.work_dir())
         .stdin(std::process::Stdio::null())
         .output()
-        .expect("run meka");
+        .expect("run Meka");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

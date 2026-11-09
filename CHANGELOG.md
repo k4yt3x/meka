@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The ACP and MCP handshakes carry Meka as the `title` beside the identifier `meka`.
+
+### Changed
+
+- Meka is written with a capital wherever a person reads it; the command and its paths stay `meka`.
+- `meka --version` prints `Meka <version>`.
+
 ## [0.91.0] - 2026-11-08
 
 ### Added

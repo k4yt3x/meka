@@ -26,7 +26,7 @@ model   = "gpt-6-astra"
 
 ### `base_url`
 
-Defaults to `https://api.openai.com/v1`. meka appends `/responses`, so pass the base URL the server
+Defaults to `https://api.openai.com/v1`. Meka appends `/responses`, so pass the base URL the server
 publishes and nothing more:
 
 ```toml
@@ -50,7 +50,7 @@ applies its own default. See the [`effort`](../configuration/config-file.md#effo
 | OpenRouter | `https://openrouter.ai/api/v1` | Beta |
 | Synthetic | not served | **Not supported**; use [`openai-chat-completions`](./openai-chat-completions.md) or [`anthropic-messages`](./anthropic-messages.md) |
 
-Only the non-stateful flavor is needed. meka replays the whole conversation every turn and sends
+Only the non-stateful flavor is needed. Meka replays the whole conversation every turn and sends
 `store: false`, so it never uses `previous_response_id` or server-side conversation state, which is
 also all the local runtimes implement.
 
@@ -66,7 +66,7 @@ the server implements and which one you want:
   a great many of them.
 
 Neither is the legacy `/v1/completions` endpoint, which is a third protocol with no tool calling that
-meka does not implement.
+Meka does not implement.
 
 ## API details
 
@@ -75,22 +75,22 @@ meka does not implement.
 **Streaming:** SSE, always. `complete` folds the stream internally rather than issuing a separate
 non-streaming request.
 
-Request body fields meka sets: `model`, `input`, `instructions` (the system prompt, when non-empty),
+Request body fields Meka sets: `model`, `input`, `instructions` (the system prompt, when non-empty),
 `tools`, `tool_choice: auto`, `store: false`, `stream: true`, `reasoning.effort` (only when `effort`
 is set), and `max_output_tokens` (only when `max_output_tokens` is set), and the three in the table
 below. Any other field goes in the profile's
 [`parameters`](../configuration/config-file.md#parameters), as
 [OpenAI's API reference](https://platform.openai.com/docs/api-reference/responses/create) names it
-(`temperature`, `service_tier`, `text = { verbosity = "low" }`), and one meka sets is refused there.
+(`temperature`, `service_tier`, `text = { verbosity = "low" }`), and one Meka sets is refused there.
 
 OpenAI's own fields go out too, as `chatgpt-subscription` sends them, each with a switch for an
 endpoint or a model that refuses it:
 
 | Field | What it does | Switch |
 |---|---|---|
-| `include: ["reasoning.encrypted_content"]` | Returns the model's reasoning sealed, which meka sends back on the turn's later requests so the model reasons on between its own tool calls | the profile's [`encrypted_reasoning`](../configuration/config-file.md#encrypted_reasoning) |
-| `reasoning.summary: "auto"` | Asks for the digest meka shows as the model's thinking | the profile's [`reasoning_summary`](../configuration/config-file.md#reasoning_summary) |
-| `prompt_cache_key` | Routes one conversation's requests to the cache holding its prefix; meka sends the session's id | the account's [`prompt_cache_key`](../configuration/config-file.md#prompt_cache_key) |
+| `include: ["reasoning.encrypted_content"]` | Returns the model's reasoning sealed, which Meka sends back on the turn's later requests so the model reasons on between its own tool calls | the profile's [`encrypted_reasoning`](../configuration/config-file.md#encrypted_reasoning) |
+| `reasoning.summary: "auto"` | Asks for the digest Meka shows as the model's thinking | the profile's [`reasoning_summary`](../configuration/config-file.md#reasoning_summary) |
+| `prompt_cache_key` | Routes one conversation's requests to the cache holding its prefix; Meka sends the session's id | the account's [`prompt_cache_key`](../configuration/config-file.md#prompt_cache_key) |
 
 Most servers ignore a field they do not know, and one that refuses names the field in its error,
 which is the switch to turn off. Sealed reasoning goes back only to the endpoint that sealed it, so

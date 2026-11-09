@@ -109,7 +109,7 @@ impl SessionStats {
     ///
     /// Separate from [`Self::record_turn`] only because that also increments the turn counter, and
     /// a compaction is not a turn the user asked for. The tokens are real spend and belong in the
-    /// totals regardless: compaction is the most expensive thing meka does without being asked,
+    /// totals regardless: compaction is the most expensive thing Meka does without being asked,
     /// and leaving it out makes `/status` disagree with the provider's bill by exactly the amount
     /// the user would most want explained.
     pub(crate) fn record_untracked_tokens(&self, usage: &TokenUsage) {

@@ -463,7 +463,7 @@ impl ScheduleStore {
     /// through.
     ///
     /// Exists so a test can plant the shape [`SAME_OCCURRENCE`]'s second arm is for. Nothing in
-    /// meka can produce a timestamp in any other form, so without this the fallback would be
+    /// Meka can produce a timestamp in any other form, so without this the fallback would be
     /// unreachable from the test suite and its guarantee would rest on the comment alone.
     #[cfg(test)]
     pub(crate) async fn set_next_fire_at_verbatim_for_test(
@@ -485,7 +485,7 @@ impl ScheduleStore {
             .map_err(|error| MekaError::Database(format!("failed to plant a timestamp: {error}")))
     }
 
-    /// Drop a job nobody is delivering, for the one-shot whose moment passed while meka was not
+    /// Drop a job nobody is delivering, for the one-shot whose moment passed while Meka was not
     /// running. Returns whether this call is the one that removed it.
     ///
     /// Scoped to the occurrence so that several hosts noticing the same expired job produce one

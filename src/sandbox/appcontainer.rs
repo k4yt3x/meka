@@ -1,4 +1,4 @@
-//! The AppContainer sandbox backend: the policy meka describes and the process security
+//! The AppContainer sandbox backend: the policy Meka describes and the process security
 //! environment Windows enforces from it. What does not touch the OS, the policy, its encoding and
 //! the UI restrictions, is compiled and tested everywhere; the API itself is Windows-only.
 //!
@@ -90,7 +90,7 @@ pub(crate) const SCHEMA_MAJOR: u16 = 1;
 /// The first minor with the ingress table, whose loopback exemption is what lets a command reach
 /// this machine's own addresses: what `host` needs, so auto-pick requires it.
 pub(crate) const SCHEMA_MINOR_WITH_INGRESS: u16 = 1;
-/// `QueryProcessSecurityEnvironmentSupport` flag: `fs_deny` is honored. Without it meka's
+/// `QueryProcessSecurityEnvironmentSupport` flag: `fs_deny` is honored. Without it Meka's
 /// directories cannot be hidden, so the probe refuses the backend.
 pub(crate) const SUPPORT_FILESYSTEM_DENY: u64 = 0x1;
 
@@ -100,7 +100,7 @@ pub(crate) const SUPPORT_FILESYSTEM_DENY: u64 = 0x1;
 /// DNS included.
 const NETWORK_CAPABILITIES: [&str; 2] = ["internetClient", "privateNetworkClientServer"];
 
-/// What the environment enforces for one command, in meka's own terms, encoded by [`encode`].
+/// What the environment enforces for one command, in Meka's own terms, encoded by [`encode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Policy {
     /// Schema major and minor.
@@ -114,7 +114,7 @@ pub(crate) struct Policy {
     /// Where the command reads: every drive root where reads are not confined, else the readable
     /// paths. A root grant cascades over the whole drive, measured.
     pub(crate) read_only: Vec<String>,
-    /// What the command cannot reach even under a grant above it: meka's own directories. A deny
+    /// What the command cannot reach even under a grant above it: Meka's own directories. A deny
     /// beats a read-only grant and hides the listing, measured.
     pub(crate) deny: Vec<String>,
     /// The egress and ingress tables.
@@ -122,7 +122,7 @@ pub(crate) struct Policy {
 }
 
 /// The network policy's two tables. Egress is default-allow or default-deny with no rules, since
-/// meka's setting is all or nothing; ingress exists from schema 1.1 and is what carries the
+/// Meka's setting is all or nothing; ingress exists from schema 1.1 and is what carries the
 /// loopback exemption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NetworkTables {
@@ -137,7 +137,7 @@ pub(crate) struct Ingress {
     pub(crate) host_loopback: bool,
 }
 
-/// What a policy is built from: the confinement's paths, the machine's drives, meka's own
+/// What a policy is built from: the confinement's paths, the machine's drives, Meka's own
 /// directories and the network the backend holds (`sandbox::held_network`), with the negotiated
 /// schema version and the build's UI mask.
 pub(crate) struct PolicyInputs<'a> {
@@ -152,7 +152,7 @@ pub(crate) struct PolicyInputs<'a> {
 }
 
 /// The policy for one command: writes beneath the workspace roots alone, reads everywhere or
-/// beneath the readable paths, meka's directories denied either way, and the network as held.
+/// beneath the readable paths, Meka's directories denied either way, and the network as held.
 ///
 /// A path a read-write root covers is left off the read-only list: the readable set carries the
 /// workspace roots too, and the environment holds a path named on both lists as read-only
@@ -452,7 +452,7 @@ mod tests {
     }
 
     /// `read` reads every drive and writes nowhere, `workspace` writes beneath its roots, a
-    /// confined read boundary replaces the drive roots with the readable paths, and meka's
+    /// confined read boundary replaces the drive roots with the readable paths, and Meka's
     /// directories are denied at every level.
     #[test]
     fn the_policy_follows_the_level_and_the_read_boundary() {
@@ -767,7 +767,7 @@ mod tests {
     }
 
     /// The blobs mxc's generated encoder produces for the same four policies (the spike's
-    /// `spec-tool dump`), decoded by the same reader, carry the same fields as meka's: the two
+    /// `spec-tool dump`), decoded by the same reader, carry the same fields as Meka's: the two
     /// encoders agree on the schema's slots, enums and defaults, whatever bytes they lay them
     /// out in.
     #[test]
@@ -798,7 +798,7 @@ pub(crate) fn drive_roots_from(mask: u32) -> Vec<PathBuf> {
 
 /// Whether a window station needs the AppContainer grant: every one but the interactive
 /// `WinSta0`, which already carries the ALL APPLICATION PACKAGES access and the Low label a
-/// confined child needs to load `user32`, and which meka never touches.
+/// confined child needs to load `user32`, and which Meka never touches.
 pub(crate) fn needs_window_station_grant(name: &str) -> bool {
     !name.eq_ignore_ascii_case("WinSta0")
 }
@@ -1010,7 +1010,7 @@ pub(crate) fn probe() -> super::BackendProbe {
     };
     if support & SUPPORT_FILESYSTEM_DENY == 0 {
         return missing(format!(
-            "this build does not honor fs_deny (support flags 0x{support:x}), so meka's store \
+            "this build does not honor fs_deny (support flags 0x{support:x}), so Meka's store \
              could not be hidden"
         ));
     }

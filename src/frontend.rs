@@ -96,7 +96,7 @@ pub(crate) trait Frontend: Send + Sync {
     /// **[`DelegateFailure::UnservablePath`] means the local filesystem is the only route and is
     /// used; anything else means the frontend may own the file, and the operation fails rather
     /// than routing around it.** Which paths a frontend will serve is its own business and differs
-    /// between editors, so meka models none of them -- it asks per path and believes the answer.
+    /// between editors, so Meka models none of them -- it asks per path and believes the answer.
     ///
     /// `line` and `limit` follow ACP's 1-based line / line-count convention.
     async fn delegate_fs_read(
@@ -239,7 +239,7 @@ impl StickyApprovals {
 /// Why a delegated operation failed, in the only distinction the routing rule turns on.
 ///
 /// Editors differ in which paths they will serve -- some only the project they have open, some
-/// anything absolute -- so meka does not model any editor's rule. It asks, and this is the answer.
+/// anything absolute -- so Meka does not model any editor's rule. It asks, and this is the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DelegateFailure {
     /// The frontend will not serve this path at all (ACP `ResourceNotFound`). It holds no buffer
@@ -427,7 +427,7 @@ pub(crate) enum FrontendEvent {
     /// text. Emitted at that request rather than when the text was appended, so whoever enqueued
     /// an item learns when it was read and not merely written down.
     InboxDelivered { item_ids: Vec<Uuid> },
-    /// A message meka wrote into the turn in the user's role: the nudge after a reply with no
+    /// A message Meka wrote into the turn in the user's role: the nudge after a reply with no
     /// visible text or with checklist items open. The conversation holds it, so a client that
     /// mirrors the conversation from the feed needs it, and the blocking turn's messages carry it
     /// where `GET /history` does; the screen says it as a stage direction and never shows the
@@ -436,7 +436,7 @@ pub(crate) enum FrontendEvent {
         kind: crate::conversation::NudgeKind,
         text: String,
     },
-    /// Finished background work meka wrote into the turn in the user's role, at a round boundary
+    /// Finished background work Meka wrote into the turn in the user's role, at a round boundary
     /// behind that round's own blocks: the tasks, for a frontend that says what reported, and
     /// `text`, what the model reads, for one that mirrors the conversation. A session with no turn
     /// running is reported to by a turn of its own instead, which the host announces.
@@ -581,11 +581,11 @@ pub(crate) enum FrontendEvent {
     /// End-of-turn token-usage summary.
     TokenUsage(TokenUsage),
     /// What is in context now: every input tier plus the output of the round the provider last
-    /// accepted, or meka's estimate after a rewrite (a compaction, a rewind, a resume). `window`
+    /// accepted, or Meka's estimate after a rewrite (a compaction, a rewind, a resume). `window`
     /// is the profile's, zero while unknown. Emitted where the gauge is recorded, so a client that
     /// follows it moves once per provider round and on every turn, failed ones included.
     ContextMeasured { used: u64, window: u64 },
-    /// User-visible advisory raised by meka itself or by the provider layer (e.g. image redaction
+    /// User-visible advisory raised by Meka itself or by the provider layer (e.g. image redaction
     /// when the request body would exceed the API limit). The terminal frontends render it in the
     /// color its [`NoticeLevel`] asks for; `AcpFrontend` sends it as a `notice` to a client that
     /// advertised `session.notices`, and otherwise as an `AgentMessageChunk` with a `[meka] ` or
@@ -713,7 +713,7 @@ pub(crate) struct PermissionRequest {
     pub(crate) primary_param: Option<String>,
     /// Every argument the tool was called with, plus `background` when the call would detach.
     ///
-    /// `background` is meka's own parameter and is taken out before any tool sees it, but it
+    /// `background` is Meka's own parameter and is taken out before any tool sees it, but it
     /// decides whether the call outlives the turn, so it is put back for the asking.
     ///
     /// `primary_param` alone is not enough to authorize a call. It resolves to the *destination*
@@ -843,7 +843,7 @@ impl Frontend for PermissionForwardingFrontend {
     async fn emit(&self, event: FrontendEvent) {
         match event {
             // Provider advisories about the sub-agent's request belong in the user's primary UI.
-            // A stage direction does not: it says what meka did with the sub-agent's reply, in
+            // A stage direction does not: it says what Meka did with the sub-agent's reply, in
             // the register of the turn it belongs to, and shown in the parent's transcript it
             // would read as a note on the parent's own turn and its own list.
             FrontendEvent::Notice(ref notice) => {
@@ -1008,11 +1008,11 @@ impl From<Notice> for NoticeView {
 /// level and the text alone; this is for the terminal, which sets the two apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoticeKind {
-    /// meka or a provider saying something to the user: a hint or a warning, printed as chrome
+    /// Meka or a provider saying something to the user: a hint or a warning, printed as chrome
     /// between the model's blocks.
     Advisory,
     /// A note on the transcript about the turn itself, in the register of `(interrupted)`: the
-    /// model's reply ended and meka did something with it. A block of its own, set off from what
+    /// model's reply ended and Meka did something with it. A block of its own, set off from what
     /// it annotates on both sides, because it marks a boundary between rounds.
     StageDirection,
 }

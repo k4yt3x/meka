@@ -277,7 +277,7 @@ impl Ended {
     fn of(end: Option<&SubscriptionEnd>) -> Self {
         let (what, by_the_server) = match end {
             Some(SubscriptionEnd::Lagged { capacity }) => (
-                format!("sent notifications faster than meka read them ({capacity} buffered)"),
+                format!("sent notifications faster than Meka read them ({capacity} buffered)"),
                 false,
             ),
             Some(SubscriptionEnd::Graceful(_)) => {
@@ -302,7 +302,7 @@ impl Ended {
 
 /// Feed one stream's notifications where the handler feeds a legacy server's, until `stop` says a
 /// later stream has taken over. A stream that ends while its connection lives, whether the server
-/// closed it, meka fell behind on it, or a proxy cut the long request it rides on, is replaced by
+/// closed it, Meka fell behind on it, or a proxy cut the long request it rides on, is replaced by
 /// another for the set as it now stands: the server sends nothing again until asked. One that
 /// ended with its connection is left to the next connection, whose adoption opens its own.
 async fn drain(entry: Arc<ServerEntry>, mut subscription: Subscription, stop: CancellationToken) {
@@ -535,7 +535,7 @@ mod tests {
     use super::*;
 
     /// The filter asks for every list-changed kind whatever the set holds, since the stream is
-    /// how a modern server's tool changes reach meka at all, and names the URIs only when there
+    /// how a modern server's tool changes reach Meka at all, and names the URIs only when there
     /// are some: an empty `resourceSubscriptions` is a request a server may answer with nothing.
     #[test]
     fn the_filter_asks_for_every_change_kind_and_the_uris_it_was_given() {
@@ -588,7 +588,7 @@ mod tests {
     }
 
     /// The server's own end of a stream is its prerogative and reads as such; a stream cut
-    /// without a final result, or one meka fell behind on, reads as what happened to it, never as
+    /// without a final result, or one Meka fell behind on, reads as what happened to it, never as
     /// a debug rendering of the enum.
     #[test]
     fn an_end_is_told_in_words_and_the_server_s_own_is_no_warning() {

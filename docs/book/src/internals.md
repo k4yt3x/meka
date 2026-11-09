@@ -49,7 +49,7 @@ rank  module          holds
 17    checklist       the checklist: items, states, the open rule
 17    image           format detection and transcoding
 18    fs              private directories, atomic replace, file locks
-18    process         the one door for every process meka starts: behind meka for memory
+18    process         the one door for every process Meka starts: behind Meka for memory
 19    error           MekaError
 19    sync            locks that outlive a panic
 19    streams         raw stderr
@@ -102,7 +102,7 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    `TurnInput::from_parts` is the empty-prompt rule, raising
    `MekaError::EmptyPrompt` before admission.
 3. **The loop.** `Agent::run_turn` appends one user message of two blocks: a `TurnContext` block
-   holding everything meka injected (permission and environment context, world state, budget,
+   holding everything Meka injected (permission and environment context, world state, budget,
    background outcomes, the resume notice) and a `Text` block holding the words as typed. Providers
    render the first as text ahead of the second; exports, `GET /history`, replays and the title
    read the words. It then sends a `CompletionRequest` and dispatches every tool call the response
@@ -157,7 +157,7 @@ Non-secret settings live in `config.toml`. Secrets live in the store. Environmen
 operational only. The store is one SQLite file, `meka.db` under `MEKA_DATA_DIR`, opened by `Store`,
 and its shape is whatever the migration ledger says it is: a current store's `PRAGMA user_version`
 is the number of entries in the ledger, and `HEAD_SCHEMA_FINGERPRINT` in `store/migrations.rs` pins the
-columns of the tables in `HEAD_TABLES`. The count is the ledger's to state: `the_ledger_is_append_only` digests every entry, so read the ledger rather than this sentence for what the last ones do. The entries after `messages_are_indexed_by_kind` give sessions a title, a pin and a search index, fold every diacritic in the search indexes, and number turns. Before them, `sessions_have_an_inbox` adds the inbox table and `messages_are_indexed_by_kind` indexes a session's rows by kind so a resume finds its last `compact_boundary` row and the context block counts them without reading the whole log; before those, `names_follow_the_vocabulary` gives every table, column and index the name the vocabulary uses and drops the `provider_credentials` view and a column nothing read. That view existed for one replay: the frozen `sessions_name_their_provider` reads the name when no default profile resolves, so `classify_by_shape` classifies a store that lost its `user_version` and has no such view at the version this entry leaves it, past that step, rather than at the baseline. Before it, `sessions_record_their_context_tokens` adds the occupancy a resume checks its first turn against, `background_tasks_spell_canceled_with_one_l` rewrites a task status an earlier meka stored as `cancelled`, and `root_rows_take_the_default_level_once_the_config_reads` stamps `[permissions].default` on a root row that still records no level and refuses to migrate while `config.toml` cannot be read.
+columns of the tables in `HEAD_TABLES`. The count is the ledger's to state: `the_ledger_is_append_only` digests every entry, so read the ledger rather than this sentence for what the last ones do. The entries after `messages_are_indexed_by_kind` give sessions a title, a pin and a search index, fold every diacritic in the search indexes, and number turns. Before them, `sessions_have_an_inbox` adds the inbox table and `messages_are_indexed_by_kind` indexes a session's rows by kind so a resume finds its last `compact_boundary` row and the context block counts them without reading the whole log; before those, `names_follow_the_vocabulary` gives every table, column and index the name the vocabulary uses and drops the `provider_credentials` view and a column nothing read. That view existed for one replay: the frozen `sessions_name_their_provider` reads the name when no default profile resolves, so `classify_by_shape` classifies a store that lost its `user_version` and has no such view at the version this entry leaves it, past that step, rather than at the baseline. Before it, `sessions_record_their_context_tokens` adds the occupancy a resume checks its first turn against, `background_tasks_spell_canceled_with_one_l` rewrites a task status an earlier Meka stored as `cancelled`, and `root_rows_take_the_default_level_once_the_config_reads` stamps `[permissions].default` on a root row that still records no level and refuses to migrate while `config.toml` cannot be read.
 
 | Table | Owner | Columns and indexes |
 |-------|-------|---------------------|
@@ -225,7 +225,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | Forking | `Store::fork_session_locked` with `SourceLock::{Probe, Probed, HeldByCaller}` | `meka session fork` (`Probe`); screen `/fork` through `host::fork_and_lock` (`HeldByCaller`); ACP `session/fork`, which holds a resident source still under `HeldByCaller` (refusing it mid-turn) and `Probe`s a dormant one; HTTP `POST /fork`, which holds a resident source the same way and probes a dormant one first (`Store::probe_fork_source`, passed as `Probed`), so its `If-Match` and `turn_id` read the source the copy takes |
 | What an HTTP caller may do | `scope::Scoped<R>` as an extractor | every handler, by its signature |
 | Whether a path may be written | `workspace::WriteScope` | `file_write`, `file_edit`, `scratchpad_save_file`, `shell_execute`'s confinement |
-| Whether meka's own directories, or a process's own `/proc` entries, may be read, with the skills store as the readable part | `workspace::private_read_refusal` and `workspace::ReadFence` | `tools/util.rs` for the readers, `file_find`, `file_search` |
+| Whether Meka's own directories, or a process's own `/proc` entries, may be read, with the skills store as the readable part | `workspace::private_read_refusal` and `workspace::ReadFence` | `tools/util.rs` for the readers, `file_find`, `file_search` |
 | Whether a backend reads a profile or account key | `Backend::reads_profile_key` and `reads_account_key` (in `config.rs`) | `profile add`, `profile set`, `account add`, the load-time warning |
 | Which account a profile bills | `config::account_for` | config validation, the provider registry |
 | Whether an MCP server's config may be sent at all | `ServerEntry::refused`, a field set at construction | every connect door in `mcp/connector.rs`, `ServerEntry::reconnect` |
@@ -246,8 +246,8 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | How a notice serializes | `NoticeView` | SSE `notice`, the blocking response, the one-shot JSON report |
 | Whether an upstream's own words may reach a caller | `host::relay_provider_errors`, bounded by `error::bounded_upstream_body` | `ProblemDetail::for_error`'s `provider_response`, `acp_error_for`'s `data` |
 | How much of a reply is read | `error::MAX_REPLY_BYTES`, through `error::read_whole_reply` for a whole reply and `provider::sse::drive` for one streamed event; a redirect is refused ahead of either by `provider::succeeded`, since `provider::build_http_client` follows none | every provider reply, the token exchange included |
-| Whether a skill's name resolves outside meka's own store | `skills::refuse_foreign_write` / `refuse_foreign_delete`, both on `foreign_location` | `skill_write`, `skill_edit`, `skill_delete`, `meka skill add`/`remove`, `PUT`/`DELETE /v1/skills/{name}`; the `ForeignSkill` it hands back renders with the path for a local reader and without it on the wire |
-| Whether an older meka wrote the store | `store/migrations.rs` alone | nothing else may know |
+| Whether a skill's name resolves outside Meka's own store | `skills::refuse_foreign_write` / `refuse_foreign_delete`, both on `foreign_location` | `skill_write`, `skill_edit`, `skill_delete`, `meka skill add`/`remove`, `PUT`/`DELETE /v1/skills/{name}`; the `ForeignSkill` it hands back renders with the path for a local reader and without it on the wire |
+| Whether an older Meka wrote the store | `store/migrations.rs` alone | nothing else may know |
 
 ### One error, one mapping per host
 
@@ -260,14 +260,14 @@ maps the enum once, and no handler rewrites the sentence:
   (`session-not-found`); `TurnInFlight` and `SessionLocked` are 409 (`turn-in-flight`,
   `session-locked`); `EmptyPrompt`, `DisabledLevel`, `ProfileNotConfigured`, `Usage` and `Config`
   are all 422 under `invalid-body`, so a client tells them apart by `detail`; `RequestTooLarge` is
-  422 under its own `request-too-large`, because meka refused it and there is no provider response
+  422 under its own `request-too-large`, because Meka refused it and there is no provider response
   behind it. The `type` URIs live under `https://meka.bot/errors/`.
 - ACP: `acp_error_for` in `host/acp.rs`. Everything the caller can act on is `InvalidParams`
   (`-32602`) with the `Display` as `data`; everything else is `InternalError`.
 - Screen: an error item in the transcript, the `Display` text.
 - One-shot and CLI: the `Display` on stderr and exit code 1; 130 when the turn was interrupted.
 
-**Two classes never travel verbatim, on either wire.** `Installation` is meka's own sentence about
+**Two classes never travel verbatim, on either wire.** `Installation` is Meka's own sentence about
 the *operator's* setup -- a `[web]` client that will not build, a `base_url` shape a backend refuses
 -- so it names a path or an endpoint from `config.toml` that no caller can act on: HTTP answers a
 sanitized 500 and ACP an `InternalError` with the text in the log, while the screen and the CLI print
@@ -394,7 +394,7 @@ sub-agent rolls no activity into the card, both because `ToolContext::live_call_
 ## Building
 
 Two Cargo features shape a build. `serve`, on by default, is `meka serve`: the HTTP API and the
-dependencies only it needs, so `--no-default-features` builds a meka without one; `src/host/http.rs`
+dependencies only it needs, so `--no-default-features` builds a Meka without one; `src/host/http.rs`
 is behind `cfg(feature = "serve")`. `mock-provider` compiles in `provider/mock.rs`, the scripted
 provider the test suites drive every host with; debug builds carry it regardless, and CI enables it
 so a release-profile build is testable too. A shipped artifact is built without it. At run time,

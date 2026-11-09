@@ -51,13 +51,13 @@ pub(crate) enum CredentialWrite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum McpCredentialKind {
     /// A static token sent verbatim as `Authorization: Bearer <token>`. It *is* the credential:
-    /// nothing is exchanged for it and meka never rewrites it.
+    /// nothing is exchanged for it and Meka never rewrites it.
     Bearer,
     /// The client half of an OAuth client's identity, presented to an authorization server to
-    /// obtain an access token. Long-lived, and meka never rewrites it either.
+    /// obtain an access token. Long-lived, and Meka never rewrites it either.
     ClientSecret,
     /// An rmcp OAuth bundle, obtained by the authorization-code flow and refreshed in place by the
-    /// adapter. The only kind meka itself rewrites.
+    /// adapter. The only kind Meka itself rewrites.
     OAuth,
 }
 impl McpCredentialKind {
@@ -163,7 +163,7 @@ impl TokenStore {
     }
 
     /// Try to take the lock that serializes one account's credential rotation across processes.
-    /// `None` means another meka is already refreshing that account.
+    /// `None` means another Meka is already refreshing that account.
     ///
     /// Separate from the session locks beside it because the thing being protected is different: a
     /// session lock says who owns a conversation, this says who is allowed to spend a refresh
@@ -309,7 +309,7 @@ impl TokenStore {
     /// This is the door a *refresh* goes through, and the reason it is a compare-and-swap is that a
     /// refresh is not an assignment: it is a value computed from the old one, over a network round
     /// trip long enough for something else to have written. Two of those somethings are real. Two
-    /// meka processes refreshing at once both present the same refresh token, and against an issuer
+    /// Meka processes refreshing at once both present the same refresh token, and against an issuer
     /// with a reuse window *both* succeed, so a blind upsert leaves the database holding whichever
     /// finished last, which is the token the issuer has already superseded, and the next launch
     /// gets `invalid_grant` with nothing naming why. And a `meka account login` completing during
@@ -498,7 +498,7 @@ impl TokenStore {
     /// last read. Returns whether the write landed.
     ///
     /// The same compare-and-swap as [`Self::replace_account_credential`], for the same reason: two
-    /// meka processes refreshing one server's OAuth token both write, and a blind upsert leaves the
+    /// Meka processes refreshing one server's OAuth token both write, and a blind upsert leaves the
     /// database holding whichever finished last rather than the one the issuer considers current.
     /// It arbitrates less here because rmcp owns the refresh and hands this adapter only a
     /// `load`/`save` pair, so the losing process keeps using its own token for the rest of its run.
@@ -1336,7 +1336,7 @@ mod tests {
 
     /// A refresh may only replace the credential it was derived from.
     ///
-    /// Two meka processes refreshing at once both present the same refresh token, and against an
+    /// Two Meka processes refreshing at once both present the same refresh token, and against an
     /// issuer with a reuse window both succeed. A blind upsert leaves the database holding
     /// whichever refresh finished last, which is the token the issuer has already superseded, and
     /// the symptom arrives at the *next* launch as `invalid_grant` with nothing naming the cause.

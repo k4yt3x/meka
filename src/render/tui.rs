@@ -76,7 +76,7 @@ pub(crate) fn gray() -> Style {
 }
 
 /// The one accent on the screen: what inline code is drawn in, and the cursor of a picker. The
-/// terminal's own cyan, so it follows the theme the terminal has rather than one meka ships.
+/// terminal's own cyan, so it follows the theme the terminal has rather than one Meka ships.
 pub(crate) const ACCENT: Color = Color::Cyan;
 /// Full white, for what has to stand out of the gray blocks: the words of a prompt, the picked
 /// choice, the back-to-bottom pill. True color rather than the palette's white, because most
@@ -862,7 +862,7 @@ enum Breaks {
 
 /// A row of a listing wrapped to `width` as [`wrap_line`] wraps it, the rows after the first set
 /// in under the column the first break falls in, so a description wraps under its own column. A
-/// column starts after a gap of two spaces or more, the gap meka's listings put between columns
+/// column starts after a gap of two spaces or more, the gap Meka's listings put between columns
 /// ([`crate::text::format_columns_row`]); a row with no gap ahead of the break hangs at its own
 /// indentation, and one whose hang would leave fewer than [`MIN_NESTED_WIDTH`] columns hangs at its
 /// indentation, then not at all.
@@ -1698,7 +1698,7 @@ pub(crate) fn cut_line(line: Line<'static>, budget: usize) -> Line<'static> {
     Line::from(cut_spans(line.spans, budget))
 }
 
-/// A line meka says in its own voice as the screen draws it: without a closing period, which no
+/// A line Meka says in its own voice as the screen draws it: without a closing period, which no
 /// line on the screen ends in, so a sentence another surface shares reads here as the screen's own
 /// do. An ellipsis is not a period.
 pub(crate) fn without_closing_period(text: &str) -> &str {
@@ -1709,19 +1709,18 @@ pub(crate) fn without_closing_period(text: &str) -> &str {
     }
 }
 
-/// A line meka says in its own voice as the screen draws it: led by a capital and without a
+/// A line Meka says in its own voice as the screen draws it: led by a capital and without a
 /// closing period ([`without_closing_period`]), so a sentence another surface shares, an error's
 /// above all, whose words follow a prefix there, reads here as the screen's own do. A line that
 /// opens with a number, a mark or a name keeps it: a word of anything but lowercase letters, a
-/// tool's name among them, or meka's own, which is written lowercase.
+/// tool's name among them.
 pub(crate) fn screen_voice(text: &str) -> std::borrow::Cow<'_, str> {
     let text = without_closing_period(text);
     let first_word = text
         .split(|character: char| character.is_whitespace() || character == ':')
         .next()
         .unwrap_or_default();
-    if first_word.is_empty() || first_word == "meka" || !first_word.chars().all(char::is_lowercase)
-    {
+    if first_word.is_empty() || !first_word.chars().all(char::is_lowercase) {
         return text.into();
     }
     let mut characters = text.chars();

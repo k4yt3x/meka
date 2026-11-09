@@ -112,17 +112,17 @@ pub(crate) struct SkillsConfig {
     pub(crate) agent_managed: Option<bool>,
     /// Additional directories to scan for skills, **read-only**. Default empty.
     ///
-    /// meka writes only to its own `skills/` directory under the config dir; these roots are never
+    /// Meka writes only to its own `skills/` directory under the config dir; these roots are never
     /// created and never written to, so listing one that does not exist costs nothing and leaves
     /// no trace. That is what makes it safe to point at a shared location like `~/.agents/skills`,
-    /// which other Agent Skills clients populate: meka reads what is already there rather than
+    /// which other Agent Skills clients populate: Meka reads what is already there rather than
     /// putting anything in `$HOME` itself.
     ///
     /// Empty by default, and deliberately not defaulted to the cross-client convention: whether a
-    /// directory outside meka's own namespace should be read is the user's call, not meka's.
+    /// directory outside Meka's own namespace should be read is the user's call, not Meka's.
     ///
     /// A leading `~` is expanded (see [`expand_user_path`]). A relative path is resolved against
-    /// the process working directory, which is why nothing here is scanned implicitly: meka does
+    /// the process working directory, which is why nothing here is scanned implicitly: Meka does
     /// not auto-trust the cwd, so a project's skills are read only when a path names them.
     pub(crate) additional_directories: Option<Vec<String>>,
 }
@@ -327,7 +327,7 @@ impl MemoryConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PermissionsConfig {
-    /// Typed rather than read as strings, so a level meka does not have is refused where the file
+    /// Typed rather than read as strings, so a level Meka does not have is refused where the file
     /// is parsed, with its line, the way an unknown key is.
     pub(crate) default: Option<Permission>,
     pub(crate) enabled: Option<Vec<Permission>>,
@@ -351,7 +351,7 @@ pub(crate) struct PermissionsConfig {
 pub(crate) struct ToolsConfig {
     pub(crate) allowed_tools: Option<Vec<String>>,
     pub(crate) disabled_tools: Option<Vec<String>>,
-    /// Typed, like `[permissions]`, so a level meka does not have is refused where the file is
+    /// Typed, like `[permissions]`, so a level Meka does not have is refused where the file is
     /// parsed, with its line, rather than dropped with a warning.
     pub(crate) tool_permissions: Option<HashMap<String, Permission>>,
 }
@@ -970,7 +970,7 @@ impl WebClientConfig {
 }
 
 /// Default UA for the web tools when `[web].user_agent` is unset. Kept in sync with what real
-/// Chrome emits so anti-bot filters don't single out meka by default.
+/// Chrome emits so anti-bot filters don't single out Meka by default.
 pub(crate) const DEFAULT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 /// `[web].request_timeout` when unset.
 pub(crate) const DEFAULT_WEB_REQUEST_TIMEOUT: std::time::Duration =
@@ -1030,7 +1030,7 @@ pub(crate) struct ShellConfig {
 /// where the kernel allows: a pin for a host where the strongest boundary must be certain, which
 /// fails closed on a kernel that cannot supply the layer. Auto-resolution never picks it.
 /// `appcontainer` is the process security environment the OS enforces, `restricted-token` the
-/// token meka derives from its own; auto-resolution prefers the former where the API exists.
+/// token Meka derives from its own; auto-resolution prefers the former where the API exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum SandboxBackend {
@@ -1137,7 +1137,7 @@ impl From<SandboxBackend> for String {
 /// `[permissions].network` and `agent_spawn`'s `network` spell it: the host's network, other
 /// machines alone (`remote`), or none.
 ///
-/// meka itself holds every value for `web_fetch`, which runs in the meka process where no sandbox
+/// Meka itself holds every value for `web_fetch`, which runs in the Meka process where no sandbox
 /// reaches: withheld under `none`, and under `remote` refusing this machine's own addresses. A
 /// command holds what its backend can: `none` under Bubblewrap, Landlock and `sandbox-exec`, and a
 /// value a backend cannot hold as such runs as the next narrower one it can, which the startup
@@ -1243,7 +1243,7 @@ impl From<Network> for String {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionConfig {
     /// Delete sessions whose `updated_at` is older than this, at startup and hourly while a host
-    /// stays up. Unset means keep everything: conversation history is not reproducible, so meka
+    /// stays up. Unset means keep everything: conversation history is not reproducible, so Meka
     /// never discards it unasked. `"0s"` is refused at startup, since it would delete every
     /// session on each launch.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
@@ -1254,7 +1254,7 @@ pub(crate) struct SessionConfig {
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub(crate) turn_retention: Option<std::time::Duration>,
     pub(crate) auto_compact: Option<bool>,
-    /// The share of the context window meka lets the conversation fill on its own: `auto_compact`
+    /// The share of the context window Meka lets the conversation fill on its own: `auto_compact`
     /// fires past it, and a whole `scratchpad_read` is cut at it. Default
     /// [`DEFAULT_CONTEXT_CEILING_PERCENT`]; refused outside 1 through 100.
     pub(crate) context_ceiling_percent: Option<u64>,
@@ -1340,7 +1340,7 @@ impl Backend {
         }
     }
 
-    /// The top-level request fields meka writes on this backend, each with the setting that
+    /// The top-level request fields Meka writes on this backend, each with the setting that
     /// decides it where one does. A profile's `parameters` may name none of them, so every field
     /// has one owner. Every field the backend may write on any request whatever a profile's
     /// settings, so whether a parameter is allowed never turns on another key. Empty on the
@@ -1429,7 +1429,7 @@ impl Backend {
 
     /// The longest tool name this backend's wire accepts, in bytes, as the protocol's owner
     /// documents it: 128 on Anthropic's Messages API and OpenAI's Responses API, 64 on Chat
-    /// Completions. A longer name meka holds is cut to it on the way out; see
+    /// Completions. A longer name Meka holds is cut to it on the way out; see
     /// [`crate::provider::wire_names`]. The default of an account's `max_tool_name_bytes` on a
     /// backend whose endpoint the user names, and the cap itself on the two that have one.
     pub(crate) const fn max_tool_name_bytes(self) -> usize {
@@ -1805,7 +1805,7 @@ impl SessionResume {
 }
 
 /// Output format for a command's stdout: `meka account usage`, `whoami`, `stats`, and a
-/// `--oneshot` run. The one output-format vocabulary meka has; every command that offers a choice
+/// `--oneshot` run. The one output-format vocabulary Meka has; every command that offers a choice
 /// takes `--format`, and `cli` parses the flag into this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum OutputFormat {
@@ -1966,7 +1966,7 @@ pub(crate) struct ResolvedConfig {
     pub(crate) default_profile: Option<String>,
     /// The profile `default_profile` picks, ignoring `--profile`.
     ///
-    /// Only the migration ledger wants this. It stamps a profile onto sessions that predate meka
+    /// Only the migration ledger wants this. It stamps a profile onto sessions that predate Meka
     /// recording one, which is a guess it makes once and cannot revisit, so the answer must not
     /// depend on a flag the first invocation after an upgrade happened to carry: `meka --profile
     /// side -p "..."` would otherwise move a whole history onto `side` because of one run.
@@ -2095,7 +2095,7 @@ pub(crate) struct ResolvedConfig {
     /// Whether `skill_write`, `skill_edit` and `skill_delete` are additionally registered.
     /// Defaults to `false`; see [`SkillsConfig::agent_managed`].
     pub(crate) skills_agent_managed: bool,
-    /// Read-only skill roots scanned in addition to meka's own; see
+    /// Read-only skill roots scanned in addition to Meka's own; see
     /// [`SkillsConfig::additional_directories`]. Already tilde-expanded, and empty unless
     /// configured.
     ///
@@ -2133,7 +2133,7 @@ pub(crate) struct ResolvedConfig {
     /// at `meka serve` startup by [`crate::host::http::config::ResolvedServeConfig::resolve`], not
     /// here, so [`ResolvedConfig::resolve`] can stay infallible.
     pub(crate) serve: Option<ServeConfig>,
-    /// What this invocation asked for, as distinct from how meka is configured.
+    /// What this invocation asked for, as distinct from how Meka is configured.
     pub(crate) request: RunRequest,
     /// The scripted provider a test harness asked for with `MEKA_MOCK_PROVIDER=1`.
     #[cfg(any(debug_assertions, feature = "mock-provider"))]
@@ -2285,7 +2285,7 @@ pub(crate) fn substitute_env(input: &str) -> Result<(String, bool), String> {
 /// - A repeat of an earlier entry, which discovery would otherwise walk twice and then report every
 ///   skill in it as shadowed *by itself*, a warning naming one path twice, which an operator can
 ///   neither act on nor dismiss.
-/// - meka's own root, for the same reason. It is always scanned first; naming it again adds a
+/// - Meka's own root, for the same reason. It is always scanned first; naming it again adds a
 ///   second pass and the same self-shadowing report.
 ///
 /// Compared as written after expansion, not canonicalized: resolving symlinks would touch the
@@ -2307,7 +2307,7 @@ fn resolve_skills_additional_directories(raw: &[String], native: Option<&Path>) 
         };
         if Some(path.as_path()) == native {
             tracing::warn!(
-                "[skills] additional_directories entry '{entry}' is meka's own skills directory, \
+                "[skills] additional_directories entry '{entry}' is Meka's own skills directory, \
                  which is always scanned first; ignoring it"
             );
             continue;
@@ -2411,7 +2411,7 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
         .ok_or_else(|| std::io::Error::other("failed to determine the config directory"))?;
     // 0700 straight from `mkdir(2)`, as [`write_file_atomic`] does. A pre-existing directory is
     // left alone here and tightened by that function on the write this lock is being taken for,
-    // which is also the only place that knows whether a symlink took the write out of meka's tree.
+    // which is also the only place that knows whether a symlink took the write out of Meka's tree.
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -2640,7 +2640,7 @@ pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
 }
 
 /// Resolve the runtime permission level and the set of enabled levels from the layered config
-/// sources. CLI > env > config file > built-in defaults. A level meka does not have never reaches
+/// sources. CLI > env > config file > built-in defaults. A level Meka does not have never reaches
 /// here, because [`PermissionsConfig`] is typed and serde refuses it at parse; out-of-set overrides
 /// (e.g. `--permission unrestricted` when it is disabled) warn and clamp to the configured default
 /// rather than refusing to start, mirroring the `[tools.tool_permissions]` warn-and-skip pattern.
@@ -2798,7 +2798,7 @@ fn mock_provider_override() -> Option<MockProviderRequest> {
 }
 
 /// `MEKA_MCP_TOOL_TIMEOUT` as a duration, with the same tolerance as [`sandbox_backend_override`]:
-/// a value meka cannot use is warned about and ignored.
+/// a value Meka cannot use is warned about and ignored.
 fn mcp_tool_timeout_override() -> Option<std::time::Duration> {
     parse_mcp_tool_timeout(&std::env::var("MEKA_MCP_TOOL_TIMEOUT").ok()?)
 }
@@ -3222,7 +3222,7 @@ impl ResolvedConfig {
     /// Every directory skills are read from, in precedence order.
     ///
     /// A method rather than the four `skill_roots(&config.skills_additional_directories)` spellings
-    /// it replaces: the derivation is "meka's own first, then the configured extras", and a
+    /// it replaces: the derivation is "Meka's own first, then the configured extras", and a
     /// caller that assembled it itself was a caller that could get the order wrong.
     pub(crate) fn skill_roots(&self) -> Vec<PathBuf> {
         crate::paths::skill_roots(&self.skills_additional_directories)
@@ -3376,11 +3376,11 @@ impl ResolvedConfig {
                     .to_string(),
             ));
         }
-        // A lease has to outlast the work it covers, and the probe is the part meka can check. One
+        // A lease has to outlast the work it covers, and the probe is the part Meka can check. One
         // that expires while a host is still working lets a second host take the same occurrence,
         // which the session lock catches at the cost of a deferral and a re-run gate probe. Checked
         // against `gate_timeout` rather than against a fixed floor because that is the only bound
-        // on the work meka knows; the turn after it is unbounded, which is why the documentation
+        // on the work Meka knows; the turn after it is unbounded, which is why the documentation
         // asks for headroom on top rather than this settling the question.
         if self.schedule.claim_lease <= self.schedule.gate_timeout {
             return Err(crate::error::MekaError::Config(format!(
@@ -3476,7 +3476,7 @@ impl BuiltinToolFilter {
 /// Whether a Claude request asks for extended thinking, and which wire encoding it uses.
 ///
 /// One knob rather than two. Stated rather than inferred from the model name: `anthropic-messages`
-/// reaches any Anthropic-compatible endpoint, so meka cannot tell which encoding the far side
+/// reaches any Anthropic-compatible endpoint, so Meka cannot tell which encoding the far side
 /// implements. The profile states it, and is the user's to keep correct if they later change
 /// `model`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -3655,7 +3655,7 @@ pub(crate) enum ThinkingDisplay {
     /// redaction beta: Claude Code's own default since 2.1.263.
     Updates,
     /// `thinking.display = "summarized"` and no redaction beta: Claude Code's
-    /// `showThinkingSummaries` setting, and meka's default, because a summary says what the model
+    /// `showThinkingSummaries` setting, and Meka's default, because a summary says what the model
     /// is doing where a token count does not, at the same price.
     #[default]
     Summarized,
@@ -3812,7 +3812,7 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(expand_user_path(r"~\projects"), Some(home.join("projects")));
 
-        // Not a tilde-prefixed path: `~foo` is a user reference meka deliberately does not expand,
+        // Not a tilde-prefixed path: `~foo` is a user reference Meka deliberately does not expand,
         // and it must stay a literal rather than silently becoming `$HOME/foo`.
         assert_eq!(
             expand_user_path("~user/projects"),
@@ -3822,7 +3822,7 @@ mod tests {
 
     /// `additional_directories` resolution drops what discovery cannot use, and says so each time.
     ///
-    /// A repeat, or meka's own root listed again, makes discovery walk the directory twice and then
+    /// A repeat, or Meka's own root listed again, makes discovery walk the directory twice and then
     /// report every skill in it as shadowed *by itself*, a warning naming one path twice, which
     /// an operator can neither act on nor dismiss. The empty entry is the dangerous one: it would
     /// expand to `$HOME` and make the whole home directory a skills root.
@@ -4272,7 +4272,7 @@ model = "m"
     }
 
     /// `[mcp].default_permission`, a server's `permission` and its `tool_permissions` are refused
-    /// where the file is parsed, with the line, the way `[permissions]` is. Dropping a level meka
+    /// where the file is parsed, with the line, the way `[permissions]` is. Dropping a level Meka
     /// does not have with a warning, or failing the one server's connection later, tells the user
     /// nothing about where to look.
     #[test]
@@ -4287,7 +4287,7 @@ model = "m"
                 .to_string();
             assert!(
                 error.contains("write") && error.contains("unrestricted"),
-                "names the value and the levels meka has: {error}"
+                "names the value and the levels Meka has: {error}"
             );
         }
     }
@@ -4452,7 +4452,7 @@ thinking_display = "redacted"
     #[test]
     fn unknown_config_keys_are_rejected() {
         // `deny_unknown_fields`: an unrecognized key errors at load instead of silently doing
-        // nothing. An unknown key inside a provider profile (here `reasoning_effort`, which meka
+        // nothing. An unknown key inside a provider profile (here `reasoning_effort`, which Meka
         // does not accept because the provider owns that default).
         let stale_profile = r#"
 [accounts.work]
@@ -5614,7 +5614,7 @@ claim_lease = {lease}
         }
     }
 
-    /// A config that does not parse must stop meka, not be swapped for defaults: one mistyped key
+    /// A config that does not parse must stop Meka, not be swapped for defaults: one mistyped key
     /// would otherwise silently run the agent with no profiles, no MCP servers and default
     /// permissions, off one warn line among the rest of startup.
     #[test]
@@ -5758,7 +5758,7 @@ claim_lease = {lease}
     }
 
     /// Carrying the parse failure is only half of it: `validate` is what turns it into an exit.
-    /// Without this, deleting the `config_error` arm leaves the whole suite green while meka goes
+    /// Without this, deleting the `config_error` arm leaves the whole suite green while Meka goes
     /// back to silently running the agent on defaults.
     #[test]
     fn validate_rejects_an_unparseable_config() {
@@ -6118,7 +6118,7 @@ file_read = "unrestricted"
         assert!(config.tools.is_none());
     }
 
-    /// A level meka does not have is refused where the file is parsed, naming the value and the
+    /// A level Meka does not have is refused where the file is parsed, naming the value and the
     /// levels it has, rather than dropped with a warning that leaves the tool at its built-in
     /// level.
     #[test]
@@ -6669,7 +6669,7 @@ thinking = "budgeted"
     }
 
     /// Taking the lock must not add a file to the config directory. People keep that directory in a
-    /// dotfiles repository, and a lock file there is a working-tree change meka had no reason to
+    /// dotfiles repository, and a lock file there is a working-tree change Meka had no reason to
     /// make. Windows is excluded because it writes `.config.toml.lock` there by design; see
     /// [`open_config_lock_target`].
     #[cfg(unix)]
@@ -6751,7 +6751,7 @@ thinking = "budgeted"
         assert_eq!(enabled.iter().count(), 4);
     }
 
-    /// A level meka does not have is refused where the file is parsed, with its line, the way an
+    /// A level Meka does not have is refused where the file is parsed, with its line, the way an
     /// unknown key is: `ask` above all, which the migration script rewrites, rather than dropped
     /// with a warning and replaced by `read`.
     #[test]
@@ -6761,7 +6761,7 @@ thinking = "budgeted"
             .to_string();
         assert!(
             error.contains("ask") && error.contains("unrestricted"),
-            "names the value and the levels meka has: {error}"
+            "names the value and the levels Meka has: {error}"
         );
         let error = toml::from_str::<ConfigFile>("[permissions]\nenabled = [\"read\", \"lol\"]\n")
             .expect_err("lol is not a level")
@@ -6850,7 +6850,7 @@ thinking = "budgeted"
         assert_eq!(permission, Permission::Read);
     }
 
-    /// The env value has to be one meka still accepts, or this proves nothing: an unparseable
+    /// The env value has to be one Meka still accepts, or this proves nothing: an unparseable
     /// `MEKA_PERMISSION` is dropped before the precedence rule is ever consulted, so the CLI wins
     /// by default rather than by rule, and reversing the precedence leaves the test green.
     #[test]

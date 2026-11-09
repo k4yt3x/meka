@@ -213,7 +213,7 @@ fn is_private_destination(address: std::net::IpAddr) -> bool {
     }
 }
 
-/// Whether `web_fetch` is registered under `network`: the fetch runs in the meka process, where
+/// Whether `web_fetch` is registered under `network`: the fetch runs in the Meka process, where
 /// no sandbox reaches, so the one way to keep a session off the network is to give it no tool
 /// that is on it. One predicate for the registry and for `meka tool list`, which shows the tool
 /// as disabled rather than dropping its row.
@@ -921,7 +921,7 @@ mod tests {
         // verbatim, and `meka serve` would publish the operator's proxy URL in a 422.
         assert!(
             matches!(error, MekaError::Installation(_)),
-            "a client meka cannot build is the operator's to fix: {error:?}"
+            "a client Meka cannot build is the operator's to fix: {error:?}"
         );
     }
 

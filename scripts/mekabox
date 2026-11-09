@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 
-# Run meka in an archlinux:latest container with the host's meka binary
-# bind-mounted in. Requires meka installed and configured on the host.
+# Run Meka in an archlinux:latest container with the host's Meka binary
+# bind-mounted in. Requires Meka installed and configured on the host.
 
 set -euo pipefail
 
 for dir in "$HOME/.config/meka" "$HOME/.local/share/meka"; do
     if [[ ! -d "$dir" ]]; then
-        echo "$(basename "$0"): missing $dir; setup meka on the host first" >&2
+        echo "$(basename "$0"): missing $dir; set up Meka on the host first" >&2
         exit 1
     fi
 done
 
-# Resolve the host meka binary from PATH (cargo, distro package, etc.).
+# Resolve the host Meka binary from PATH (cargo, distro package, etc.).
 meka_bin="$(command -v meka || true)"
 if [[ -z "$meka_bin" || ! -x "$meka_bin" ]]; then
-    echo "$(basename "$0"): meka not found in PATH; install meka on the host first" >&2
+    echo "$(basename "$0"): meka not found in PATH; install Meka on the host first" >&2
     exit 1
 fi
 

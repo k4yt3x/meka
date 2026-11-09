@@ -157,7 +157,7 @@ fn render_message_full(message: &Message) -> String {
     for block in &message.content {
         match block {
             ContentBlock::Text { text } => segments.push(text.clone()),
-            // meka's own per-turn preamble, restated every turn; not part of the conversation.
+            // Meka's own per-turn preamble, restated every turn; not part of the conversation.
             ContentBlock::TurnContext { .. } => {}
             // What the model was sent back to work with, and what arrived for it, as it read them.
             ContentBlock::Nudge { text, .. }

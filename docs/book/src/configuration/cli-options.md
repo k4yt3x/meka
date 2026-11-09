@@ -189,7 +189,7 @@ See [Scheduling](../usage/scheduling.md) for details.
 
 ### `acp`
 
-Run meka as an [ACP](../usage/acp.md) agent over stdio. Takes no flags of its own; `-c`, `-r` and
+Run Meka as an [ACP](../usage/acp.md) agent over stdio. Takes no flags of its own; `-c`, `-r` and
 `--project` are refused, and `--profile` selects the profile a new session starts on.
 
 ```bash
@@ -198,7 +198,7 @@ meka acp
 
 ### `serve`
 
-Run meka as a long-lived [HTTP service](../usage/http-api.md). `--bind <ADDR>` overrides
+Run Meka as a long-lived [HTTP service](../usage/http-api.md). `--bind <ADDR>` overrides
 `[serve].bind`. Like `acp`, it refuses `-c`, `-r` and `--project`: the host creates a session per
 request.
 
@@ -219,7 +219,7 @@ meka --oneshot -p "list all files larger than 1MB"                  # first turn
 git diff | meka --oneshot -p -                                      # the prompt is the diff
 ```
 
-When omitted, meka opens the screen with no initial input. There is no bare positional prompt, so a mistyped subcommand is an error rather than a session opened with the typo as its first turn.
+When omitted, Meka opens the screen with no initial input. There is no bare positional prompt, so a mistyped subcommand is an error rather than a session opened with the typo as its first turn.
 
 ### `--skill <NAME>`
 
@@ -241,7 +241,7 @@ meka -c                        # pick up where you left off
 meka -c -p "and now add tests" # …with an opening prompt
 ```
 
-Starting fresh when there is no session yet is not an error; meka just begins a new one. With
+Starting fresh when there is no session yet is not an error; Meka just begins a new one. With
 `--project <name>`, the most recent session on that project, or a new one on it.
 
 ### `-r`, `--resume [SESSION]`
@@ -262,7 +262,7 @@ so `meka -r -p "fix it"` reads as a pick with an opening prompt. A scripted run 
 pick on, so `--oneshot -r` needs the session named. With `--project <name>`, a bare `-r` picks among
 that project's sessions, and `-r <id>` moves the named session onto the project.
 
-Errors if the session does not exist, the prefix matches multiple sessions (with the matching ids listed for disambiguation), or the session is locked by another meka instance.
+Errors if the session does not exist, the prefix matches multiple sessions (with the matching ids listed for disambiguation), or the session is locked by another Meka instance.
 
 `-c` and `-r` are mutually exclusive. Both work with `--oneshot`, which runs a single turn against the session and exits:
 
@@ -306,7 +306,7 @@ meka -r --project webdev          # the picker over webdev's sessions
 meka -r 550e --project webdev     # moves session 550e onto webdev
 ```
 
-Beside `-c` and a bare `-r`, the flag **filters** the session meka selects; beside `-r <SESSION>`
+Beside `-c` and a bare `-r`, the flag **filters** the session Meka selects; beside `-r <SESSION>`
 it **moves** the session you named, rewriting its row. A name no project has is refused before
 anything is touched. There is no value for "no project": a session with nothing named is
 on none, and `/project close` takes a session off one.
@@ -445,7 +445,7 @@ meka mcp get notion --format json | jq .url
 
 ### `--oneshot`
 
-Exit after the first turn finishes. Requires either `-p` or `--skill <NAME>`; without one of those, meka has nothing to do. Useful for scripts and CI invocations.
+Exit after the first turn finishes. Requires either `-p` or `--skill <NAME>`; without one of those, Meka has nothing to do. Useful for scripts and CI invocations.
 
 ```bash
 meka --oneshot -p "summarize the last commit"

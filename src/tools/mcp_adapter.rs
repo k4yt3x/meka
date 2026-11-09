@@ -47,7 +47,7 @@ impl Tool for McpToolAdapter {
         self.tool.permission
     }
 
-    /// An MCP call runs in the server's own process, which meka spawns but does not sandbox.
+    /// An MCP call runs in the server's own process, which Meka spawns but does not sandbox.
     fn runs_outside_confinement(&self) -> bool {
         true
     }
@@ -195,7 +195,7 @@ pub(crate) async fn tool_by_name(manager: &McpClientManager, name: &str) -> Opti
         .map(|tool| Arc::new(McpToolAdapter::new(tool)) as Arc<dyn Tool>)
 }
 
-/// Convert a server's `CallToolResult` into meka's [`ToolOutput`].
+/// Convert a server's `CallToolResult` into Meka's [`ToolOutput`].
 ///
 /// Split out of `execute` so it can be tested without a live server: everything above it in
 /// `execute` is transport and retry, and none of that bears on how a result is shaped.
@@ -233,7 +233,7 @@ fn tool_output_from_result(
     }
 }
 
-/// The arguments an MCP call actually carries: everything the model sent, minus meka's own.
+/// The arguments an MCP call actually carries: everything the model sent, minus Meka's own.
 ///
 /// `scratchpad` and `background` are accepted on every MCP tool and consumed by the agent loop, so
 /// a remote server never declared them, and a strict schema validator on the far side rejects a
@@ -297,7 +297,7 @@ mod tests {
     ///
     /// The fenced block is what the model reads and is presentational, so a scheduled job's gate
     /// predicate has to take the field: parsing the block back out would make a format string a
-    /// wire format between two parts of meka. Both halves are asserted so neither can quietly
+    /// wire format between two parts of Meka. Both halves are asserted so neither can quietly
     /// stop happening.
     #[test]
     fn structured_content_is_carried_as_data_and_still_rendered_for_the_model() {
@@ -342,7 +342,7 @@ mod tests {
         assert!(output.structured.is_none());
     }
 
-    /// A remote server sees the model's arguments and nothing of meka's.
+    /// A remote server sees the model's arguments and nothing of Meka's.
     ///
     /// `scratchpad` and `background` are accepted on every MCP tool and consumed here, so no server
     /// declares them and a server validating its schema strictly rejects the call over one. A
@@ -372,7 +372,7 @@ mod tests {
         );
         assert!(
             !arguments.contains_key("scratchpad"),
-            "`scratchpad` is still meka's here, and is still stripped"
+            "`scratchpad` is still Meka's here, and is still stripped"
         );
     }
 
@@ -385,7 +385,7 @@ mod tests {
                 "scratchpad": "results",
                 "background": true,
             }),
-            // A schema declaring neither name: the ordinary case, where both are meka's.
+            // A schema declaring neither name: the ordinary case, where both are Meka's.
             &serde_json::json!({"type": "object", "properties": {"query": {}, "limit": {}}}),
         )
         .expect("an object of arguments");

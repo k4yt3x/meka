@@ -5,7 +5,7 @@ use super::*;
 
 /// The arguments an approval prompt is shown, which is not quite the arguments the tool receives.
 ///
-/// `background` is meka's own parameter, spliced by the registry into the schema of every tool that
+/// `background` is Meka's own parameter, spliced by the registry into the schema of every tool that
 /// can run in the background and taken out again before dispatch so no tool sees a key it never
 /// advertised. It is also the argument that
 /// decides whether the call detaches and outlives the turn, so a prompt that showed everything
@@ -997,7 +997,7 @@ mod tests {
 
     /// The tool's output is marked as such and a word about the call is not: a result the tool
     /// returned, and a failure it reports when its failures are its output, as a command's exit
-    /// is; neither a failure from a tool whose failed result is a complaint nor meka's own
+    /// is; neither a failure from a tool whose failed result is a complaint nor Meka's own
     /// refusal. The `scratchpad` redirect takes the former and leaves the latter inline, so a
     /// caller that redirected a refused call still reads why.
     #[tokio::test]
@@ -1149,7 +1149,7 @@ mod tests {
         assert!(text.contains("panicked"), "{text}");
     }
 
-    /// A tool that runs outside any confinement meka can apply is refused at `workspace`, for
+    /// A tool that runs outside any confinement Meka can apply is refused at `workspace`, for
     /// every requirement above it, not only for `Unrestricted`.
     ///
     /// Deleting the gate fails open, because `resolve_tool_permission`'s fallback for an

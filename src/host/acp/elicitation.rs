@@ -232,12 +232,12 @@ mod tests {
             kind: ElicitationKind::Url {
                 url: "https://example.com/oauth".to_string(),
             },
-            message: "authorize meka".to_string(),
+            message: "authorize Meka".to_string(),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
             subagent_id: None,
         };
         let request = to_acp_request(&prompt, &session_id()).expect("url always converts");
-        assert_eq!(request.message, "authorize meka");
+        assert_eq!(request.message, "authorize Meka");
         match &request.mode {
             ElicitationMode::Url(url_mode) => {
                 assert_eq!(url_mode.url, "https://example.com/oauth");

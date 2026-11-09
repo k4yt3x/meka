@@ -1,6 +1,6 @@
 //! Image bytes: the `blobs` table, referenced from message rows by content hash.
 //!
-//! An image enters meka as bytes and leaves for a provider as bytes, but it rests here once: a
+//! An image enters Meka as bytes and leaves for a provider as bytes, but it rests here once: a
 //! message row holds a reference, and the same screenshot read twice costs one row. The store makes
 //! the exchange at its own two doors, so nothing above it handles the reference form except the
 //! readers that want it, the HTTP API's conversation reads and an export.

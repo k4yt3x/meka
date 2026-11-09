@@ -1,12 +1,12 @@
 # Environment variables
 
-The [config file](./config-file.md) is the recommended way to configure meka. Environment variables are useful for operational overrides; for example, in CI pipelines, containers, or to isolate a per-project config and data directory.
+The [config file](./config-file.md) is the recommended way to configure Meka. Environment variables are useful for operational overrides; for example, in CI pipelines, containers, or to isolate a per-project config and data directory.
 
 These operational variables override config file values but are overridden by CLI flags.
 
 > **Accounts and profiles are not configurable via the environment.** Profile selection comes from the [config file](./config-file.md) and `--profile`; the model and every other model-tied setting come from the selected profile, the endpoint from its account; secrets come from the store via [`meka account`](../usage/accounts-and-profiles.md#meka-account-cli). There are no account or profile env vars. This is deliberate: an ambient `OPENAI_API_KEY` or `MEKA_PROFILE` left in the environment must never silently rebind which account a named profile bills.
 
-## meka-specific variables
+## Meka-specific variables
 
 | Variable | Description | Example |
 |----------|-------------|---------|
@@ -21,7 +21,7 @@ These operational variables override config file values but are overridden by CL
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MEKA_MCP_TOOL_TIMEOUT` | Per-call timeout for MCP tools, as a duration string such as `10m` or `90s`. Applies to every remote tool invocation; on timeout meka cancels the request and returns an error to the model. A value that does not parse, or a zero, is warned about and ignored. | `10m` |
+| `MEKA_MCP_TOOL_TIMEOUT` | Per-call timeout for MCP tools, as a duration string such as `10m` or `90s`. Applies to every remote tool invocation; on timeout Meka cancels the request and returns an error to the model. A value that does not parse, or a zero, is warned about and ignored. | `10m` |
 
 How many servers connect at once at startup is a setting, not a variable: [`[mcp].stdio_concurrency` and `[mcp].http_concurrency`](./config-file.md#mcp-top-level-table).
 
@@ -33,7 +33,7 @@ How many servers connect at once at startup is a setting, not a variable: [`[mcp
 
 ## Logging
 
-meka uses the `tracing` framework. The log level can be controlled with:
+Meka uses the `tracing` framework. The log level can be controlled with:
 
 | Variable | Description | Example |
 |----------|-------------|---------|

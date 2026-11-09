@@ -1,8 +1,8 @@
 # Scheduling
 
-Scheduling lets the agent arrange its own future turns. Without it, meka only ever acts when
+Scheduling lets the agent arrange its own future turns. Without it, Meka only ever acts when
 something outside it asks: a human typing, an editor sending a prompt, a client calling the HTTP
-API. A scheduled job is the one trigger nothing else supplies, which is what makes meka usable as a
+API. A scheduled job is the one trigger nothing else supplies, which is what makes Meka usable as a
 daemon or a standing assistant rather than a tool you drive.
 
 The agent creates jobs itself through the `schedule_create` tool, so scheduling is usually a
@@ -10,7 +10,7 @@ conversation:
 
 > **You:** remind me in 20 minutes to check the deploy
 >
-> **meka:** Created job `7f3a1b2c` (once at 2026-08-11 15:22 +02:00). I'll remind you then.
+> **Meka:** Created job `7f3a1b2c` (once at 2026-08-11 15:22 +02:00). I'll remind you then.
 
 ## What a job is
 
@@ -37,7 +37,7 @@ that changes zone takes those jobs with it. The zone's own daylight-saving rules
 `0 9 * * *` in `America/New_York` fires at 09:00 there on both sides of a change. `timezone` beside
 `at` or `every` is refused, since neither reads one. Zone names come from the system's time-zone
 database, kept current by the operating system; Windows, which has none, uses a copy built into
-meka.
+Meka.
 
 A pattern that matches no calendar date (`0 0 30 2 *`) is refused when the job is created. One whose
 next occurrence is far off is not: `0 0 29 2 *` waits up to four years for the next February 29th and
@@ -177,7 +177,7 @@ a warning on every tick of the many gates for which a non-zero exit is the norma
 
 ## Where jobs run
 
-Jobs belong to the session that created them, and only fire while that session is live in some meka
+Jobs belong to the session that created them, and only fire while that session is live in some Meka
 process. That makes the two hosts behave differently, and the difference is worth knowing before you
 rely on one:
 
@@ -229,7 +229,7 @@ turn, and then advances the schedule (or retires a one-shot). Three consequences
   apart rather than a tick apart: three panics in half a minute would otherwise park a job whose
   only problem was a blip, and nothing retires a parked recurring job afterwards. The
   job is not deleted: it stays listed, cancelable, and marked as held with the reason, because a
-  prompt that crashes meka is something to look at rather than something to throw away. Recreate it,
+  prompt that crashes Meka is something to look at rather than something to throw away. Recreate it,
   or cancel it. A host that simply declines a job it cannot take (`meka serve` finding the session
   locked by a screen) does not count, since that says nothing about the job.
 
@@ -248,7 +248,7 @@ would mean running its probe on every tick.
 
 ### More than one host on the same store
 
-Several meka processes pointed at one data directory (two `meka serve` instances, or a daemon and
+Several Meka processes pointed at one data directory (two `meka serve` instances, or a daemon and
 a terminal) all poll the same table, so the same occurrence appears in several due lists at once.
 Each occurrence is nevertheless run once. A host takes it by leasing it in a single conditional
 write, recording itself and an expiry on a row that no other host currently holds, and the hosts
@@ -270,7 +270,7 @@ output, is not echoed, the way no tool's output is; the reply is what you read.
 ## Restarts and missed jobs
 
 Jobs live in the store, so restarting the process (or the `meka serve` systemd unit) does not
-lose them. What happens to jobs whose time passed while meka was down depends on the kind:
+lose them. What happens to jobs whose time passed while Meka was down depends on the kind:
 
 - **Recurring jobs fire once and resume.** A 30-second job that was down for six hours has 720
   missed occurrences; it produces exactly one turn, which is told how many it stands in for. It is
@@ -337,7 +337,7 @@ five-step chain in [Permission resolution](../configuration/config-file.md#permi
 server's `tool_permissions`, its `permission`, the tool's `readOnlyHint`, `[mcp] default_permission`,
 then `unrestricted`. Step four is worth knowing about here: one global line turns every unannotated
 tool on every server into a `read` probe a gate may call. And `readOnlyHint` is asserted by the
-server and not verified by meka, which is a weaker footing under a gate than under a call in
+server and not verified by Meka, which is a weaker footing under a gate than under a call in
 conversation, because nobody reads the result of a gate.
 
 That second level is the session's own, recorded on its row and kept current by whichever surface

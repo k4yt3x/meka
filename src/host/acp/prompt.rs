@@ -82,7 +82,7 @@ pub(super) fn embedded_resource_block(
     }
 }
 /// An ACP resource link as the block the turn's message carries: a `<resource_link>` tag
-/// carrying the link's name, URI and description, since meka does not fetch it.
+/// carrying the link's name, URI and description, since Meka does not fetch it.
 pub(super) fn resource_link_block(link: &ResourceLink) -> crate::conversation::ContentBlock {
     let mut tag = format!("<resource_link name=\"{}\" uri=\"{}\"", link.name, link.uri);
     push_mime_attr(&mut tag, &link.mime_type);
@@ -97,7 +97,7 @@ pub(super) fn resource_link_block(link: &ResourceLink) -> crate::conversation::C
         text: tag,
     }
 }
-/// Decode an ACP image content block into meka's internal [`crate::image::ImageSource`] via the
+/// Decode an ACP image content block into Meka's internal [`crate::image::ImageSource`] via the
 /// shared client-image pipeline, so ACP and the HTTP API enforce the same limits.
 ///
 /// Off the runtime, for the reason `file_read` and `web_fetch` document at their own call sites:
@@ -190,7 +190,7 @@ pub(super) async fn build_mcp_list_text(shared: &crate::host::SharedDeps) -> Str
                 // The name travels and the reason does not: a connector's reason has carried a
                 // spawn command line, which is for the terminal `meka acp` runs in.
                 crate::mcp::ServerState::Failed { .. } => {
-                    "failed; the reason is in the meka log".to_string()
+                    "failed; the reason is in the Meka log".to_string()
                 }
                 other => other.label().to_string(),
             },
@@ -411,11 +411,11 @@ pub(super) async fn run_prompt_turn(
                 text: text.text.clone(),
             }),
             // `ResourceLink` is part of the ACP baseline that every agent MUST support (alongside
-            // `Text`). meka doesn't fetch the resource server-side; the model sees the reference as
+            // `Text`). Meka doesn't fetch the resource server-side; the model sees the reference as
             // a structured tag so it can decide what to do with it.
             ContentBlock::ResourceLink(link) => parts.push(resource_link_block(link)),
             // `Resource` carries an @-mention's inlined contents (the `embedded_context`
-            // capability). meka surfaces it to the model as a `<resource>` tag rather than fetching
+            // capability). Meka surfaces it to the model as a `<resource>` tag rather than fetching
             // anything server-side, mirroring `ResourceLink`.
             ContentBlock::Resource(embedded) => parts.push(embedded_resource_block(embedded)),
             // Decoded here for its payload alone, through the shared image pipeline so the size
@@ -431,7 +431,7 @@ pub(super) async fn run_prompt_turn(
             },
             _ => {
                 return responder.respond_with_error(invalid_params_error(
-                    "meka acp accepts `text`, `resource_link`, `resource`, and (when the \
+                    "`meka acp` accepts `text`, `resource_link`, `resource`, and (when the \
                      profile has vision enabled) `image` content blocks in `prompt`; `audio` is \
                      not supported",
                 ));
@@ -701,7 +701,7 @@ pub(super) fn turn_usage(
     );
     usage.cached_read_tokens = Some(cache_read);
     usage.cached_write_tokens = Some(cache_write);
-    // `thought_tokens` is left at its `None` default: meka doesn't meter reasoning separately from
+    // `thought_tokens` is left at its `None` default: Meka doesn't meter reasoning separately from
     // output, and reporting a made-up split would be worse than reporting none.
     usage
 }

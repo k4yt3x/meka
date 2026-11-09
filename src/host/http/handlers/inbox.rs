@@ -40,7 +40,7 @@ pub(crate) struct InboxRequest {
     #[schema(value_type = String)]
     pub(crate) class: InboxClass,
     /// Who the message is from, as the header names them. Left out or blank, the header names
-    /// nobody: who sent a message is the client's to say, and meka does not guess it from the
+    /// nobody: who sent a message is the client's to say, and Meka does not guess it from the
     /// token.
     #[serde(default)]
     pub(crate) source: Option<String>,
@@ -64,7 +64,7 @@ pub(crate) struct InboxItemView {
     pub(crate) delivered_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) withdrawn_at: Option<String>,
-    /// When meka stops retrying it: its enqueue plus `[serve] inbox_retry_ceiling`.
+    /// When Meka stops retrying it: its enqueue plus `[serve] inbox_retry_ceiling`.
     pub(crate) retry_until: String,
     /// Why it was given up on, when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,7 +117,7 @@ pub(crate) struct InboxResponse {
     pub(crate) state: String,
     /// Whether the `Idempotency-Key` had been used before, so the item is the earlier one.
     pub(crate) replayed: bool,
-    /// When meka stops retrying it: its enqueue plus `[serve] inbox_retry_ceiling`.
+    /// When Meka stops retrying it: its enqueue plus `[serve] inbox_retry_ceiling`.
     pub(crate) retry_until: String,
     /// On a replayed item, as `GET /v1/sessions/{id}/inbox` shows them: when its next attempt
     /// may run and why the last one failed while it waits, or why it was given up on.

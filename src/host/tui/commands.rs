@@ -747,7 +747,7 @@ impl crate::oauth::LoginPrompt for ScreenLogin {
                             "callback_url": {
                                 "type": "string",
                                 "description": "paste the callback URL from the browser's \
-                                                address bar if the browser cannot reach meka, \
+                                                address bar if the browser cannot reach Meka, \
                                                 or leave empty to keep waiting"
                             }
                         }
@@ -1143,7 +1143,7 @@ fn parse_mcp_slash(rest: &str) -> SlashCommand {
     }
 }
 
-/// The line for a slash command meka does not know. It names the command and only the command:
+/// The line for a slash command Meka does not know. It names the command and only the command:
 /// `/frob a b` is refused as `/frob`, because the argument was never read.
 pub(crate) fn unknown_command_message(line: &str) -> String {
     let command = line.split(char::is_whitespace).next().unwrap_or(line);

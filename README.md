@@ -1,11 +1,11 @@
-# meka
+# Meka
 
 A general-purpose AI agent harness.
 
 > [!IMPORTANT]
-> meka is opinionated software and does not keep a stable interface. It favors the better design over compatibility, so anything may change between releases. Read the changelog before upgrading.
+> Meka is opinionated software and does not keep a stable interface. It favors the better design over compatibility, so anything may change between releases. Read the changelog before upgrading.
 
-![meka Screenshot](assets/screenshot.webp)
+![Meka Screenshot](assets/screenshot.webp)
 
 ## Features
 
@@ -32,13 +32,13 @@ The same agent core is available through several interfaces:
 
 - **CLI**: an interactive screen in the terminal, or one-shot commands for scripts.
 - **ACP**: runs inside editors like Zed via the [Agent Client Protocol](https://agentclientprotocol.com/).
-- **HTTP API**: use meka to power your own apps and bots.
+- **HTTP API**: use Meka to power your own apps and bots.
 - [**mekaweb**](https://github.com/k4yt3x/mekaweb), a web interface, hosted at [web.meka.bot](https://web.meka.bot).
 - [**mekabridge**](https://github.com/k4yt3x/mekabridge) connects the agent to messaging platforms such as Telegram.
 
 ## Installation
 
-meka runs on Linux, macOS, and Windows. Download a pre-built binary from [GitHub Releases](https://github.com/k4yt3x/meka/releases/latest), or install with Cargo:
+Meka runs on Linux, macOS, and Windows. Download a pre-built binary from [GitHub Releases](https://github.com/k4yt3x/meka/releases/latest), or install with Cargo:
 
 ```bash
 cargo install --locked --git https://github.com/k4yt3x/meka.git

@@ -130,7 +130,7 @@ pub(super) fn push_item(
         }
         // Mirrors `push_param`'s multi-line arm. Without it a bulleted string kept its newlines and
         // put every line after the first at column 0, which is both wrong to read and enough to
-        // forge a row of meka's own outside the block.
+        // forge a row of Meka's own outside the block.
         serde_json::Value::String(text) if is_multi_line(text) => {
             lines.push(format!("{indent}-"));
             push_value_body(lines, depth + 1, item, width);
@@ -166,7 +166,7 @@ pub(super) fn push_value_body(
     for line in text.lines() {
         // `str::lines` splits on `\n` and strips a trailing `\r`, but a lone `\r` mid-line survives
         // it; `sanitize_to_line` is what stops that returning the cursor over the indent. Flattened
-        // first, so wrapping only ever breaks text meka is choosing to spread over rows and a `\n`
+        // first, so wrapping only ever breaks text Meka is choosing to spread over rows and a `\n`
         // from the model never reaches the terminal.
         let flattened = sanitize_to_line(line, usize::MAX);
         for row in wrap_to_width(&flattened, budget, usize::MAX) {
@@ -185,7 +185,7 @@ pub(super) fn block_indent(depth: usize, width: usize) -> String {
     TOOL_PARAM_INDENT.repeat(depth.min(max_depth.max(1)))
 }
 
-/// Fit one of meka's own stand-in words into the budget it was given.
+/// Fit one of Meka's own stand-in words into the budget it was given.
 ///
 /// `(no printable text)` is nineteen columns, so emitting it whatever the budget overflows the line
 /// by the width of the word describing the value.
@@ -213,7 +213,7 @@ pub(super) fn scalar_text(value: &serde_json::Value, budget: usize) -> String {
             let line = elide_to_width(&sanitize_to_line(text, usize::MAX), budget)
                 .trim_end()
                 .to_string();
-            // A value made only of characters meka refuses to display (bidi controls, soft hyphens,
+            // A value made only of characters Meka refuses to display (bidi controls, soft hyphens,
             // zero-width joiners) is not empty and is not whitespace, and leaving it blank would
             // read as a rendering fault rather than as the deliberate omission it is.
             if line.is_empty() {

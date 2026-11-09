@@ -169,7 +169,7 @@ impl SandboxedChild {
 /// the token's integrity label so it cannot touch anything above Low; `WriteRestricted` leaves
 /// integrity alone and instead intersects every *write* access against a restricting-SID list,
 /// granting back exactly the workspace roots. Neither can express the other's boundary.
-/// `AppContainer` is the other backend: no token of meka's making, a policy the OS enforces.
+/// `AppContainer` is the other backend: no token of Meka's making, a policy the OS enforces.
 pub(crate) enum WindowsConfinement {
     /// Reads everywhere, writes nowhere outside the Low-integrity surface.
     LowIntegrity,
@@ -225,7 +225,7 @@ const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x0;
 /// (`S-1-4-x-y`), derived from the canonical root path.
 ///
 /// `S-1-4` is the point of the design. It is a SID space that corresponds to no real principal,
-/// so meka can mint one per workspace without creating an account and without any elevation.
+/// so Meka can mint one per workspace without creating an account and without any elevation.
 /// Its power is defined entirely by the ACEs that name it, which exist only on that workspace's
 /// own tree; the string itself is not a secret.
 ///
@@ -277,7 +277,7 @@ unsafe fn has_workspace_ace(acl: *const ACL, sid: *mut core::ffi::c_void) -> boo
         }
         // An ACE that does not carry both inherit flags covers the root only, so the tree below
         // it is unwritable and the grant has to be re-placed. Measured on a real ACL, the flags
-        // meka's own ACE comes back with are `0xb`: both inherit bits plus `INHERIT_ONLY_ACE`,
+        // Meka's own ACE comes back with are `0xb`: both inherit bits plus `INHERIT_ONLY_ACE`,
         // which `SetEntriesInAclW` adds because a mask holding generic bits means nothing when
         // applied to the object itself. So this tests for the two bits it needs rather than for
         // equality, which would never match.
@@ -306,16 +306,16 @@ unsafe fn has_workspace_ace(acl: *const ACL, sid: *mut core::ffi::c_void) -> boo
 /// Granting requires only that the caller *own* the directory, which supplies `WRITE_DAC`
 /// implicitly. No elevation, and no account creation.
 ///
-/// The ACE is real, standing state on the user's filesystem, visible to `icacls`. meka takes it
+/// The ACE is real, standing state on the user's filesystem, visible to `icacls`. Meka takes it
 /// back when the process exits; see [`WindowsGrants`] for what that does and does not cover.
-/// Whether `acl` already carries meka's inheritable write ACE for `sid`.
+/// Whether `acl` already carries Meka's inheritable write ACE for `sid`.
 ///
 /// Conservative in the safe direction: anything it cannot positively identify reads as absent,
 /// which re-places an ACE that was already correct. That costs time, never reach.
 ///
 /// Identifying by SID alone is sound here because `workspace_write_sid` mints an `S-1-4`
 /// identity that corresponds to no real principal and is derived from the root path, so nothing
-/// but meka ever names it in an ACE.
+/// but Meka ever names it in an ACE.
 unsafe fn set_workspace_ace(root: &std::path::Path, grant: bool) -> std::io::Result<()> {
     let sid_text: Vec<u16> = workspace_write_sid(root)
         .encode_utf16()
@@ -362,7 +362,7 @@ unsafe fn set_workspace_ace(root: &std::path::Path, grant: bool) -> std::io::Res
     // after it.
     //
     // This is a short-circuit, not a cache: it asks the filesystem, not a ledger. If another
-    // meka's `revoke_all` took the ACE off the root while this one was running, it reads as
+    // Meka's `revoke_all` took the ACE off the root while this one was running, it reads as
     // absent here and gets re-placed.
     //
     // What it does *not* preserve is repair below the root. Re-propagating on every command
@@ -426,7 +426,7 @@ unsafe fn set_workspace_ace(root: &std::path::Path, grant: bool) -> std::io::Res
 
 /// The workspace ACEs this process has placed, so they can be taken back.
 ///
-/// The grant is standing state on the user's own directories, and meka is the only thing that knows
+/// The grant is standing state on the user's own directories, and Meka is the only thing that knows
 /// it put it there. Revoking is what keeps `workspace` from leaving a permission trail behind on
 /// every folder the agent was ever run in. The cost is that the next run re-propagates the ACE,
 /// which is one pass over the tree.
@@ -487,7 +487,7 @@ impl WindowsGrants {
     ///
     /// A root whose revoke failed stays in the ledger, so a later attempt (or the next process
     /// running against the same root) still knows the ACE is out there. Clearing the whole set
-    /// unconditionally meant the one case worth remembering -- the ACE meka placed and could
+    /// unconditionally meant the one case worth remembering -- the ACE Meka placed and could
     /// not take back -- was the case it forgot.
     pub(crate) fn revoke_all(&self) {
         let mut granted = crate::sync::lock(&self.granted);
@@ -590,7 +590,7 @@ unsafe fn logon_session_sid(token: HANDLE) -> Option<Vec<u8>> {
 /// window makes the headless cases (ACP under an editor, `meka serve` as a service) behave like
 /// the terminal case.
 ///
-/// Runs at most once, and only when a restricted spawn is actually about to happen, so a meka
+/// Runs at most once, and only when a restricted spawn is actually about to happen, so a Meka
 /// that never reaches `workspace` never allocates anything.
 fn ensure_console() {
     // Not a `Once`: a failed allocation must be retried.
@@ -617,7 +617,7 @@ unsafe fn allocate_hidden_console() {
     //
     // Windows documents it as *initializing* the process's standard handles to the new
     // console's buffers. That is exactly wrong for the cases this function exists for: under
-    // ACP meka speaks JSON-RPC over stdin/stdout, and `meka serve` may be piped. Rebinding them
+    // ACP Meka speaks JSON-RPC over stdin/stdout, and `meka serve` may be piped. Rebinding them
     // mid-session on the first `workspace` shell command would break the transport silently,
     // with no error anywhere. Restoring unconditionally costs nothing when Windows leaves them
     // alone.
@@ -638,7 +638,7 @@ unsafe fn allocate_hidden_console() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(
             "failed to allocate a console ({error}); shell commands at `workspace` will fail to \
-             start. Running meka from a terminal avoids this"
+             start. Running Meka from a terminal avoids this"
         );
         return;
     }
@@ -701,7 +701,7 @@ pub(crate) fn spawn_sandboxed_command(
     // The session working directory, NUL-terminated for `lpCurrentDirectory`.
     //
     // Both `CreateProcess*` calls passed null here, which means "inherit the *process* cwd" --
-    // and meka deliberately never mutates that (`main.rs` says so outright), so the sandboxed
+    // and Meka deliberately never mutates that (`main.rs` says so outright), so the sandboxed
     // child ran somewhere else entirely from every other path. Under ACP or `meka serve` the
     // session cwd is client-supplied and the process cwd is wherever the editor or unit
     // started, so at `workspace` the ACE was granted on one directory and the command ran in
@@ -889,10 +889,10 @@ pub(crate) fn spawn_sandboxed_command(
     }
 }
 
-/// The primary token a confined child runs under: meka's own token duplicated and stripped of
+/// The primary token a confined child runs under: Meka's own token duplicated and stripped of
 /// every privilege, then dropped to Low integrity for the read-only child, or re-derived from
-/// meka's own as a `WRITE_RESTRICTED` token carrying one capability per workspace root for the
-/// writable one. Never meka's own token itself: the duplicate is what is confined.
+/// Meka's own as a `WRITE_RESTRICTED` token carrying one capability per workspace root for the
+/// writable one. Never Meka's own token itself: the duplicate is what is confined.
 ///
 /// The two shapes are different mechanisms rather than two settings of one, which is why the
 /// restricted token keeps its integrity label: dropping it to Low as well would confine the child
@@ -997,7 +997,7 @@ unsafe fn derive_confined_token(
         // to the logon SID and the capability, PowerShell dies before evaluating anything with
         // `Starting the CLR failed with HRESULT 80070005`, because the .NET runtime reaches
         // something on startup that only Everyone admits (measured on Windows 11 10.0.26200; a
-        // `cmd.exe` probe passes every case and says nothing about the process meka spawns). The
+        // `cmd.exe` probe passes every case and says nothing about the process Meka spawns). The
         // price is the one hole the docs name: a file carrying an explicit `Everyone: Write` ACE
         // stays writable from outside the workspace.
         let mut sid_texts: Vec<String> = vec!["S-1-1-0".to_string()];
@@ -1015,12 +1015,12 @@ unsafe fn derive_confined_token(
             });
         }
 
-        // Derived from meka's own token rather than from the privilege-stripped duplicate:
+        // Derived from Meka's own token rather than from the privilege-stripped duplicate:
         // `CreateProcessAsUserW` waives `SE_ASSIGNPRIMARYTOKEN` and `SE_INCREASE_QUOTA` only for a
         // token that is recognizably a restricted version of the caller's, and the duplicate is not
         // one. `DISABLE_MAX_PRIVILEGE` strips the privileges here instead, which restricting SIDs
         // do nothing about: they bound write access checks, and several privileges exist to bypass
-        // a DACL, `SeImpersonatePrivilege` under an elevated meka and `SeShutdownPrivilege` under
+        // a DACL, `SeImpersonatePrivilege` under an elevated Meka and `SeShutdownPrivilege` under
         // any.
         let mut restricted: HANDLE = ptr::null_mut();
         if CreateRestrictedToken(
@@ -1174,7 +1174,7 @@ unsafe fn create_process_confined(
             format!(
                 "{error}. `workspace` spawns through CreateProcessAsUserW, which needs \
                  SE_INCREASE_QUOTA_NAME; this account does not hold it. `unrestricted` \
-                 avoids that path, or run meka from an account that holds it."
+                 avoids that path, or run Meka from an account that holds it."
             ),
         ));
     }
@@ -1427,7 +1427,7 @@ impl Drop for LocalFreeGuard {
 mod tests {
     use super::*;
 
-    /// Read a directory's DACL and ask whether meka's write ACE is on it.
+    /// Read a directory's DACL and ask whether Meka's write ACE is on it.
     ///
     /// Test-only, because production only ever asks this from inside `set_workspace_ace`, which
     /// already holds the descriptor it read.
@@ -1473,13 +1473,13 @@ mod tests {
     /// Both failure directions are silent, which is why this is asserted rather than reasoned
     /// about. Always-false costs only time, so nothing would ever surface it: the measured
     /// 280ms-per-command would simply stay. Always-true is worse -- `ensure` would stop placing
-    /// the ACE at all and every `workspace` write would be denied on a tree meka believed it
+    /// the ACE at all and every `workspace` write would be denied on a tree Meka believed it
     /// had granted.
     ///
     /// The specific traps are the mask and the flags, and both were settled by dumping a real
     /// ACL rather than by reasoning: the mask comes back as the `GENERIC_WRITE | DELETE` that
     /// was written and is *not* mapped to `FILE_GENERIC_WRITE`, while the flags come back as
-    /// `0xb`, carrying an `INHERIT_ONLY_ACE` bit nothing in meka asked for. A check written
+    /// `0xb`, carrying an `INHERIT_ONLY_ACE` bit nothing in Meka asked for. A check written
     /// from the documentation alone would have tested for flag equality and never matched.
     #[test]
     fn the_workspace_ace_is_recognized_once_placed_and_not_before() {
@@ -1502,7 +1502,7 @@ mod tests {
         assert!(
             !carries_workspace_ace(root),
             "a revoked ACE must read as absent, or `ensure` would skip re-placing a grant that \
-             another meka took back"
+             another Meka took back"
         );
     }
 
@@ -1589,7 +1589,7 @@ mod tests {
 
     /// Allocating a console must not disturb stdin/stdout.
     ///
-    /// Under ACP meka speaks JSON-RPC over those handles, so a console allocation that
+    /// Under ACP Meka speaks JSON-RPC over those handles, so a console allocation that
     /// redirected them would break the session silently, with no error anywhere.
     ///
     /// **What this covers and what it cannot.** It calls `allocate_hidden_console` rather than
@@ -1598,7 +1598,7 @@ mod tests {
     /// Calling the inner function does run the snapshot-and-restore, but `AllocConsole` itself
     /// fails with `ERROR_ACCESS_DENIED` in a process that already has one, so the branch where the
     /// allocation *succeeds* and rebinds the handles is still not reachable from a test binary.
-    /// That branch is verified by running meka headless on Windows hardware, which is where the
+    /// That branch is verified by running Meka headless on Windows hardware, which is where the
     /// feasibility probe measured it in the first place.
     #[test]
     fn allocating_a_console_leaves_the_standard_handles_alone() {

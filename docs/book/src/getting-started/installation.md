@@ -1,6 +1,6 @@
 # Installation
 
-meka is written in Rust and builds as a single binary.
+Meka is written in Rust and builds as a single binary.
 
 ## Pre-built binaries
 
@@ -23,7 +23,7 @@ cp meka ~/.local/bin/
 ## `mekabox`
 
 [`scripts/mekabox`](https://github.com/k4yt3x/meka/blob/master/scripts/mekabox)
-runs the meka installed on the host inside a stock `archlinux:latest` container, with no image of
+runs the Meka installed on the host inside a stock `archlinux:latest` container, with no image of
 its own to build or pull: the binary is bind-mounted in, `~/.config/meka` read-only, and
 `~/.local/share/meka` writable, since that is where `meka.db` keeps every session and credential.
 The agent starts at `unrestricted` with instructions saying it may install whatever the task needs,
@@ -36,7 +36,7 @@ docker when both are present.
 
 ## Cargo install
 
-If you have [Rust](https://www.rust-lang.org/tools/install) installed, you can install meka directly from the Git repository:
+If you have [Rust](https://www.rust-lang.org/tools/install) installed, you can install Meka directly from the Git repository:
 
 ```bash
 cargo install --locked --git https://github.com/k4yt3x/meka.git

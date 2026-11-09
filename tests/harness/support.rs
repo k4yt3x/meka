@@ -32,7 +32,7 @@ pub(crate) fn meka() -> Command {
 /// (`dirs::config_dir()` and `dirs::data_dir()` ignore `XDG_*` on macOS and Windows, and
 /// `dirs::home_dir()` on Windows never reads the environment at all); `HOME` and the `XDG_*` pair
 /// are set as well so a code path that consults them on Linux lands inside the tempdir too, never
-/// in the developer's real profile. A test that needs a path outside meka's own directories names
+/// in the developer's real profile. A test that needs a path outside Meka's own directories names
 /// one under [`Self::root`] rather than relying on `HOME`.
 pub(crate) struct Install {
     temp: tempfile::TempDir,
@@ -64,8 +64,8 @@ impl Install {
         self.data_dir().join("meka.db")
     }
 
-    /// A project directory beside meka's own, for a session to work in. A path *under* the config
-    /// dir is inside meka's own directory, which the write fence refuses below `unrestricted`.
+    /// A project directory beside Meka's own, for a session to work in. A path *under* the config
+    /// dir is inside Meka's own directory, which the write fence refuses below `unrestricted`.
     pub(crate) fn work_dir(&self) -> PathBuf {
         self.temp.path().join("work")
     }

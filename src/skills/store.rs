@@ -1,5 +1,5 @@
 //! Writing skills to disk and removing them: the file layout, the template a new skill starts from,
-//! and the refusal to touch a skill meka did not put there.
+//! and the refusal to touch a skill Meka did not put there.
 //!
 //! Every refusal here names the skill and logs the path. These functions serve seven doors, and
 //! five of them answer someone who is not the operator: `PUT`/`DELETE /v1/skills/{name}` put the
@@ -17,8 +17,8 @@ use super::*;
 /// Refuse to create or overwrite `name` because it belongs to a read-only root, or `None`.
 ///
 /// `[skills] additional_directories` roots are scanned but never written to, and
-/// [`SkillCache::root`] only ever names meka's own, so a write to a name that already resolves
-/// elsewhere would not update that skill: it would put a second one in meka's store that shadows
+/// [`SkillCache::root`] only ever names Meka's own, so a write to a name that already resolves
+/// elsewhere would not update that skill: it would put a second one in Meka's store that shadows
 /// it.
 ///
 /// One function for all seven doors (`skill_write`, `skill_edit`, `meka skill add` and
@@ -73,7 +73,7 @@ impl std::fmt::Display for ForeignSkill {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "skill '{}' is in a `[skills] additional_directories` root, which meka does not write to; {}",
+            "skill '{}' is in a `[skills] additional_directories` root, which Meka does not write to; {}",
             self.name, self.remedy
         )
     }
@@ -92,9 +92,9 @@ impl ForeignSkill {
 /// callers and wrong for this store's; its own `warn!` is what keeps the path visible. One sentence
 /// for the two levels, because which link it was is a fact about the store rather than the skill.
 fn symlinked(name: &str) -> String {
-    format!("skill '{name}' is a symlink, which meka refuses to follow; remove the link")
+    format!("skill '{name}' is a symlink, which Meka refuses to follow; remove the link")
 }
-/// The directory `name` occupies when that directory is not meka's own to write to.
+/// The directory `name` occupies when that directory is not Meka's own to write to.
 pub(super) fn foreign_location(
     index: &SkillIndex,
     name: &str,
@@ -116,7 +116,7 @@ pub(super) fn foreign_location(
 /// `skill_read` nothing to return but the base-directory header.
 ///
 /// Rebuilds the file from the [`Skill`] the existing one parsed to, changing only what was asked
-/// for, so every frontmatter key survives a rewrite, including `metadata` entries meka has no
+/// for, so every frontmatter key survives a rewrite, including `metadata` entries Meka has no
 /// meaning for. `author` is only stamped on a skill that does not already claim one, since
 /// overwriting a human's attribution loses information nothing else records.
 pub(crate) fn write_skill(
@@ -148,7 +148,7 @@ pub(crate) fn write_skill(
     };
 
     // Start from what the file said and change only what was asked for. Rebuilding from a fixed
-    // list of fields loses every frontmatter key meka does not model.
+    // list of fields loses every frontmatter key Meka does not model.
     let mut merged = match &opened.existing {
         Some((_, existing)) => existing.clone(),
         None => Skill {
@@ -288,7 +288,7 @@ impl OpenedSkill {
                 );
                 return Err(format!(
                     "skill '{name}' exists but failed to read ({error}); refusing to overwrite \
-                     contents meka cannot see, so repair the file or remove the skill first"
+                     contents Meka cannot see, so repair the file or remove the skill first"
                 ));
             }
         };
@@ -312,7 +312,7 @@ impl OpenedSkill {
             None => None,
         };
         // Refused rather than worked around: the spec says `metadata` is a map, and a file where it
-        // is not leaves meka nowhere spec-legal to put `meka-priority` or `author`. Reading such a
+        // is not leaves Meka nowhere spec-legal to put `meka-priority` or `author`. Reading such a
         // skill still works; only rewriting it is refused.
         if let Some((_, existing)) = existing.as_ref()
             && existing
@@ -385,7 +385,7 @@ pub(crate) struct WrittenSkill {
 }
 /// What [`delete_skill`] removed: the directory, the skill file inside it, and that file's text as
 /// it was, which a frontend draws as the change. The text is `None` when the file could not be
-/// read, since a skill meka cannot read is still one it must be able to remove.
+/// read, since a skill Meka cannot read is still one it must be able to remove.
 #[derive(Debug, Clone)]
 pub(crate) struct DeletedSkill {
     pub(crate) dir: PathBuf,
@@ -440,7 +440,7 @@ pub(crate) fn delete_skill(root: &Path, name: &str) -> Result<DeletedSkill, Stri
 /// [`write_skill`] and [`render_template`] so the frontmatter key order has one owner.
 ///
 /// Takes the whole [`Skill`] rather than a field list, which is what lets a rewrite preserve keys
-/// meka does not model: [`Skill::metadata`] and [`Skill::extra`] are both emitted back out.
+/// Meka does not model: [`Skill::metadata`] and [`Skill::extra`] are both emitted back out.
 ///
 /// The frontmatter is built as a YAML mapping and handed to the serializer rather than written line
 /// by line: hand-rolled quoting gets a newline in a `license` or in a metadata key wrong, and each
@@ -487,7 +487,7 @@ pub(super) fn render_skill_file(skill: &Skill, body: &str) -> String {
     if !metadata.is_empty() {
         front.insert("metadata".into(), Value::Mapping(metadata));
     }
-    // Last, so a key the spec defines never sorts below one it does not, and so a file meka wrote
+    // Last, so a key the spec defines never sorts below one it does not, and so a file Meka wrote
     // reads top-down as the spec's own field order. Safe against clobbering the fields above:
     // `metadata` is a named field, so `flatten` cannot route one here.
     for (key, value) in &skill.extra {

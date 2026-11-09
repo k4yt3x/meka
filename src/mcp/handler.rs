@@ -3,7 +3,7 @@
 //! remote tool list into the `crate::tools` trait so the provider loop can call them like any other
 //! tool.
 //!
-//! meka does not implement the MCP sampling / roots / logging handlers: those features are
+//! Meka does not implement the MCP sampling / roots / logging handlers: those features are
 //! deprecated by SEP-2577 and slated for removal from the protocol, so the rmcp defaults apply
 //! (sampling → `method_not_found`, roots → empty, logging → ignored).
 
@@ -56,7 +56,7 @@ pub(super) const LEGACY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2
 /// How an HTTP connect opens: probe with `server/discover` and fall back to `initialize` on the
 /// same connection, the dual-era client the spec's compatibility matrix describes. A server of
 /// either era is served, and the version a connection speaks is the server's answer rather than
-/// meka's assumption. An HTTP server answers an unknown method one way or another, so the
+/// Meka's assumption. An HTTP server answers an unknown method one way or another, so the
 /// fallback can ride the probe's connection; a stdio server may not, see [`stdio_probe`].
 pub(super) fn http_lifecycle() -> ClientLifecycleMode {
     ClientLifecycleMode::Auto {
@@ -113,7 +113,7 @@ impl ClientHandler for MekaClientHandler {
         );
         rmcp::model::ClientConfig::new(
             capabilities,
-            Implementation::new("meka", env!("CARGO_PKG_VERSION")),
+            Implementation::new("meka", env!("CARGO_PKG_VERSION")).with_title("Meka"),
         )
         .with_protocol_version(LEGACY_PROTOCOL_VERSION)
     }
@@ -175,7 +175,7 @@ impl ClientHandler for MekaClientHandler {
 
     /// Notification that a server-side URL elicitation the user was sent to complete has finished.
     /// rmcp 3.1 has no typed hook for this, so it arrives as an unrecognized method: the wire
-    /// notification exists, but the SDK routes it nowhere specific. meka's
+    /// notification exists, but the SDK routes it nowhere specific. Meka's
     /// [`Self::create_elicitation`] already returned its response synchronously, so nothing needs
     /// to drive here; log it for observability.
     fn on_custom_notification(
@@ -322,7 +322,7 @@ pub(super) async fn elicit(
     // Bounded so an unanswered prompt cannot stall an MCP tool call forever, by the frontend's
     // own patience: a minute, or an approval's half hour where the host knows its client comes
     // back. An elicitation is an MCP *request*, so a `Decline` is how the server learns the user
-    // did not answer; `notifications/cancelled` is for requests meka started. The frontend is
+    // did not answer; `notifications/cancelled` is for requests Meka started. The frontend is
     // handed the same instant, so one that waits it out itself reports the expiry rather than a
     // cut.
     // Never past the call that asked: the call is cut at its own bound and the prompt canceled
@@ -363,7 +363,7 @@ pub(super) async fn elicit(
 
 /// Answer the input requests an `input_required` result carried, for the retry that follows.
 ///
-/// Only an elicitation can be answered, and only when the call has a frontend to put it to. meka
+/// Only an elicitation can be answered, and only when the call has a frontend to put it to. Meka
 /// declares no sampling or roots capability, and a server may not ask for what the client did not
 /// declare, so one that does has left the protocol and the call fails naming what it asked rather
 /// than retrying with a hole the server would ask to fill again.
@@ -455,7 +455,7 @@ impl<'a> Rounds<'a> {
     }
 
     /// Take in an `input_required` answer so the next [`Self::carry`] has what the retry needs.
-    /// An error when the server asked for what meka cannot give, sent an answer a retry could
+    /// An error when the server asked for what Meka cannot give, sent an answer a retry could
     /// carry nothing of, or has asked on every round the cap allows.
     pub(super) async fn absorb(
         &mut self,
@@ -732,7 +732,7 @@ impl McpTool {
     }
 }
 
-/// Map MCP `CallToolResult.content` items to meka's provider-layer `ToolResultContent` blocks. Text
+/// Map MCP `CallToolResult.content` items to Meka's provider-layer `ToolResultContent` blocks. Text
 /// stays text and images pass through as image blocks; audio, embedded resources and resource
 /// links collapse to text placeholders, because no provider accepts them as tool-result blocks.
 pub(crate) fn convert_tool_result_content(
@@ -809,7 +809,7 @@ pub(crate) fn convert_tool_result_content(
                         .iter()
                         .any(|allowed| allowed.eq_ignore_ascii_case(mime))
                 });
-                // Two ceilings, and both matter. `MAX_MCP_IMAGE_BYTES` is meka's own memory and
+                // Two ceilings, and both matter. `MAX_MCP_IMAGE_BYTES` is Meka's own memory and
                 // quota guard. The second is the providers' limit, which every other image
                 // producer gets for free by going through `prepare_image_payload`; this path
                 // builds its `ImageSource` directly, so without it an MCP image between the two
@@ -860,7 +860,7 @@ pub(crate) fn convert_tool_result_content(
                     text_buffer.push('\n');
                 }
                 text_buffer.push_str(&format!(
-                    "[audio content: {}, {} base64 bytes; meka does not yet pass audio to the provider]",
+                    "[audio content: {}, {} base64 bytes; Meka does not yet pass audio to the provider]",
                     audio.mime_type,
                     audio.data.len()
                 ));
@@ -1065,12 +1065,12 @@ mod tests {
         }
     }
 
-    /// Between meka's own memory guard and the ceiling providers accept lies a band where an MCP
+    /// Between Meka's own memory guard and the ceiling providers accept lies a band where an MCP
     /// image would be forwarded purely so the provider could answer 400.
     #[test]
     fn convert_tool_result_content_image_rejects_over_the_provider_ceiling() {
         use rmcp::model::ContentBlock;
-        // Comfortably over the provider ceiling, comfortably under meka's own cap.
+        // Comfortably over the provider ceiling, comfortably under Meka's own cap.
         let base64_len = crate::image::MAX_IMAGE_RAW_BYTES / 3 * 4 + 4096;
         assert!(base64_len < MAX_MCP_IMAGE_BYTES, "must sit between the two");
         let items = vec![ContentBlock::image("A".repeat(base64_len), "image/png")];
@@ -1109,7 +1109,7 @@ mod tests {
         ));
     }
 
-    /// The `initialize` request is meka's, not the SDK's: the version is pinned here rather than
+    /// The `initialize` request is Meka's, not the SDK's: the version is pinned here rather than
     /// floating with rmcp, the client is named, and elicitation is declared so a server may use it.
     #[test]
     fn the_client_introduces_itself_and_declares_elicitation() {
@@ -1118,6 +1118,7 @@ mod tests {
         let info = handler.get_info();
         assert_eq!(info.protocol_version, ProtocolVersion::V_2025_11_25);
         assert_eq!(info.client_info.name, "meka");
+        assert_eq!(info.client_info.title.as_deref(), Some("Meka"));
         assert_eq!(info.client_info.version, env!("CARGO_PKG_VERSION"));
         let elicitation = info
             .capabilities
@@ -1131,7 +1132,7 @@ mod tests {
     }
 
     /// A round carrying only state is retried with the state and nothing else; one asking for what
-    /// meka does not declare fails the call; an elicitation on a call with no frontend is
+    /// Meka does not declare fails the call; an elicitation on a call with no frontend is
     /// declined, not failed; and the cap counts requests sent.
     #[tokio::test]
     async fn rounds_carry_state_refuse_undeclared_asks_and_stop_at_the_cap() {

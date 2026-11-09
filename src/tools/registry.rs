@@ -1609,7 +1609,7 @@ impl ToolRegistry {
     /// `SilentFrontend` because nobody is watching a scheduled fire, and empty roots.
     ///
     /// Empty roots is not the same as nowhere: `WriteScope::confined_to` at `read` still admits the
-    /// job's own directory. A gate may only call a tool that resolves to `read`, and nothing meka
+    /// job's own directory. A gate may only call a tool that resolves to `read`, and nothing Meka
     /// ships writes at that level, but `tool_permissions` can lower one that does, and it then
     /// writes under the session's cwd, unattended, for as long as the job exists: the operator's
     /// own instruction, which is why this does not claim writes are impossible. `shell_execute`

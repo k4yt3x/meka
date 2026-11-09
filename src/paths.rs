@@ -1,4 +1,4 @@
-//! Where meka keeps things: the configuration and data directories, the file each holds, and the
+//! Where Meka keeps things: the configuration and data directories, the file each holds, and the
 //! `~` expansion every path setting goes through. A leaf, so any layer may ask without reaching
 //! into `config`.
 
@@ -29,7 +29,7 @@ pub(crate) fn expand_user_path(target: &str) -> Option<PathBuf> {
         Some(PathBuf::from(target))
     }
 }
-/// Returns the meka config directory (the directory that contains `config.toml` and `skills/`).
+/// Returns the Meka config directory (the directory that contains `config.toml` and `skills/`).
 /// Honors the `MEKA_CONFIG_DIR` env var, used by tests for per-run isolation and by power users
 /// who want a non-standard location, before falling back to the platform-native
 /// `dirs::config_dir().join("meka")`. The env-var route is the only reliable way to isolate state
@@ -108,14 +108,14 @@ pub(crate) fn config_file_path() -> Option<PathBuf> {
     meka_config_dir().map(|dir| dir.join("config.toml"))
 }
 
-/// The skills directory meka itself manages, under [`meka_config_dir`].
+/// The skills directory Meka itself manages, under [`meka_config_dir`].
 pub(crate) fn skills_dir() -> Option<PathBuf> {
     crate::paths::meka_config_dir().map(|dir| dir.join("skills"))
 }
-/// The roots to scan, in precedence order: meka's own first, then `additional_directories` as
+/// The roots to scan, in precedence order: Meka's own first, then `additional_directories` as
 /// given.
 ///
-/// meka's own root leads because it is the store the user curates *through meka*, and because it is
+/// Meka's own root leads because it is the store the user curates *through Meka*, and because it is
 /// the only one anything writes to; a skill there should not be shadowed by a copy another client
 /// installed.
 pub(crate) fn skill_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
