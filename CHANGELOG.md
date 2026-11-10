@@ -28,7 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replies go back to the provider with their reasoning and citations wherever the protocol allows.
 - Meka's notes to the model read `[Meka harness]`, and the screen leaves them out of tool output.
 - Meka is written with a capital wherever a person reads it; the command stays `meka`.
-- Session archives are `format_version` 25; older archives are brought forward on import.
+- Session archives are `format_version` 26; older archives are brought forward on import.
+- `claude-subscription` matches Claude Code 2.1.322, naming the tools a session has called.
+- A ChatGPT login redirects to `127.0.0.1` rather than `localhost`, as Codex 0.167 does.
+- `/resume` and `/fork` on the screen refuse while a sub-agent still runs.
+- A session whose usage row cannot be read is refused rather than resumed with fresh counters.
 - Session search no longer finds compaction summaries written before 0.13.
 - Upgrade `agent-client-protocol` to 5.1, `rmcp` to 3.9, `similar` to 3 and `toml` to 1.2.
 - An MCP server is told when Meka stops waiting on a read, a prompt, a list or a subscription.
@@ -55,6 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An ACP `initialize` asking for a newer protocol without `clientInfo` is answered with version 1.
 - A scheduled job in the hour before a daylight-saving jump no longer also runs right after it.
 - A schedule that names Sunday as `7` with `L` (`7L`, `7#L`) runs on the last Sunday; it never ran.
+- `/resume` on the screen no longer carries the last session's usage totals onto the new one.
+- ChatGPT usage stats read a profile whose daily buckets are `null`.
 
 ## [0.91.0] - 2026-11-08
 

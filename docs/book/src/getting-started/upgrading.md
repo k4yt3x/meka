@@ -21,9 +21,11 @@ written before has none, except a turn's last reply, which takes its turn's stop
 `max_tokens` or `refusal`, since 0.91 recorded `end_turn` for every other stop alike. A thinking
 block's text becomes the one part it was. The sentence Meka wrote into a reply that held
 nothing, such as "[The model returned an empty response.]", is taken out of the reply, which keeps
-the stop it named. 0.91 refuses a store 0.92 has opened; downgrading means restoring the backup the
-upgrade took. Session archives are `format_version` 25; a 0.91 archive (23) is brought forward on
-import, and 0.91 refuses a 25.
+the stop it named. Each session starts a list of the tools it has called, which the Claude
+subscription reports on every request; a session from before names what its conversation since its
+last compaction holds. 0.91 refuses a store 0.92 has opened; downgrading means restoring the backup
+the upgrade took. Session archives are `format_version` 26; a 0.91 archive (23) is brought forward
+on import, and 0.91 refuses a 26.
 
 **The HTTP API types what Meka wrote.** In the history and the context, a note Meka wrote in place
 of something it removed is a `harness_note` block, with `note`, the sentence, and `text` as the

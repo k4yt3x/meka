@@ -615,6 +615,13 @@ const MIGRATIONS: &[Migration] = &[
         name: "messages_keep_their_own_fields",
         step: Step::Rust(messages_keep_their_own_fields),
     },
+    // 0.92 keeps with a session's counters the tools it and its sub-agents have called, which the
+    // Claude subscription names on every request. A session written before has none the column
+    // knows of; the calls its conversation holds are recorded at its next turn.
+    Migration {
+        name: "sessions_record_the_tools_they_used",
+        step: Step::Rust(sessions_record_the_tools_they_used),
+    },
 ];
 
 /// See the ledger entry. Safe to replay: a `user` row and a thinking block's text exist only
@@ -868,6 +875,18 @@ fn record_reply_as_returned_0_91(
         }
     }
     changed
+}
+
+/// The column a session's tools are kept in. Safe to replay: the column is added once.
+fn sessions_record_the_tools_they_used(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "sessions", "tools_used")? {
+        transaction.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN tools_used TEXT NOT NULL DEFAULT '[]'",
+        )?;
+    }
+    Ok(())
 }
 
 /// The column a message's own fields are kept in. Safe to replay: the column is added once.
@@ -2356,7 +2375,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 9_358_111_554_427_328_396;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 9_037_510_241_726_614_513;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -4981,6 +5000,9 @@ const ARCHIVE_FORMAT_0_91: u64 = 23;
 /// The archive `format_version` 0.92's development builds wrote before replies were recorded as
 /// returned: no reply carries a record, and an empty one carries Meka's sentence in its place.
 const ARCHIVE_FORMAT_0_92_DEVELOPMENT: u64 = 24;
+/// The archive `format_version` 0.92's later development builds wrote, whose sessions' counters
+/// carry no tools the session called.
+const ARCHIVE_FORMAT_0_92_DEVELOPMENT_2: u64 = 25;
 
 /// How the text Meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -5568,7 +5590,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_88)
         | Some(ARCHIVE_FORMAT_0_90)
         | Some(ARCHIVE_FORMAT_0_91)
-        | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT) => {}
+        | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT)
+        | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT_2) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -5620,8 +5643,32 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     if from <= ARCHIVE_FORMAT_0_92_DEVELOPMENT {
         record_replies_in_archive_0_91(document);
     }
+    if from <= ARCHIVE_FORMAT_0_92_DEVELOPMENT_2 {
+        record_tools_used_in_archive_0_92(document);
+    }
     document["format_version"] = current.into();
     true
+}
+
+/// Each session's counters in an archive from before 0.92 name no tool it called, as a row the
+/// store held then does after its ledger step. A session that names some already keeps them.
+fn record_tools_used_in_archive_0_92(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(stats) = session
+            .get_mut("stats")
+            .and_then(|stats| stats.as_object_mut())
+        {
+            stats
+                .entry("tools_used")
+                .or_insert_with(|| serde_json::json!([]));
+        }
+    }
 }
 
 /// Each copy a compaction kept, in an archive from before 0.89, says where it was said: the turn
@@ -7092,6 +7139,10 @@ mod tests {
             ),
             ("replies_are_recorded_as_returned", 3089291456316266763_u64),
             ("messages_keep_their_own_fields", 11616838473919552756_u64),
+            (
+                "sessions_record_the_tools_they_used",
+                15382173615299672697_u64,
+            ),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or
         /// as a constant it reads, whatever its visibility, with its text: an item the digest
@@ -11890,9 +11941,10 @@ mod tests {
         let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
         let mut before = document.clone();
         before["format_version"] = current.into();
-        // An event copies none, which an archive before 0.87 does not say, and 0.92 records the
-        // thinking's text as the part it was.
+        // An event copies none, which an archive before 0.87 does not say, 0.92 records the
+        // thinking's text as the part it was, and the session names no tool it called.
         before["sessions"][0]["events"][0]["copy_of"] = serde_json::Value::Null;
+        before["sessions"][0]["stats"]["tools_used"] = serde_json::json!([]);
         before["sessions"][0]["events"][0]["event"]["Append"]["content"][0] = serde_json::json!(
             {"type": "thinking", "opaque": {"type": "signed", "signature": "MAC"},
              "parts": [{"kind": "reasoning", "text": "hmm"}]}
@@ -11970,12 +12022,14 @@ mod tests {
         let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
         let mut before = document.clone();
         before["format_version"] = current.into();
-        // With no opening message to read a level from, the turn takes its session's.
+        // With no opening message to read a level from, the turn takes its session's, and the
+        // session names no tool it called.
         before["sessions"][0]["turns"][0]["permission"] = "read".into();
+        before["sessions"][0]["stats"]["tools_used"] = serde_json::json!([]);
         assert!(bring_archive_forward(&mut document, current));
         assert_eq!(
             document, before,
-            "nothing to convert but the version stamp and the turn's level"
+            "nothing to convert but the version stamp, the turn's level and the tools"
         );
         let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
             .expect("a 0.77 archive reads");
@@ -12042,12 +12096,14 @@ mod tests {
         let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
         let mut before = document.clone();
         before["format_version"] = current.into();
-        // With no opening message to read a level from, the turn takes its session's.
+        // With no opening message to read a level from, the turn takes its session's, and the
+        // session names no tool it called.
         before["sessions"][0]["turns"][0]["permission"] = "read".into();
+        before["sessions"][0]["stats"]["tools_used"] = serde_json::json!([]);
         assert!(bring_archive_forward(&mut document, current));
         assert_eq!(
             document, before,
-            "nothing to convert but the version stamp and the turn's level"
+            "nothing to convert but the version stamp, the turn's level and the tools"
         );
         let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
             .expect("a format 13 archive reads");
@@ -12381,6 +12437,61 @@ mod tests {
         assert_eq!(level, "workspace");
     }
 
+    /// A session from before 0.92 names no tool it called, and a replay of the step finds the
+    /// column it added.
+    #[tokio::test]
+    async fn a_session_from_before_0_92_names_no_tool_it_called() {
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "sessions_record_the_tools_they_used");
+            plant_session(&connection, &session);
+        }
+
+        let store = crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+        let stats = store
+            .load_session_stats(session.parse().expect("a uuid"))
+            .await
+            .expect("load");
+        assert!(stats.tools_used.is_empty(), "{:?}", stats.tools_used);
+        drop(store);
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let transaction = connection.transaction().expect("transaction");
+        sessions_record_the_tools_they_used(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+    }
+
+    /// A format 25 archive's counters name no tool, so each session takes none, and one that
+    /// names some keeps them.
+    #[test]
+    fn a_format_25_archive_s_sessions_take_no_tools() {
+        let tools = serde_json::json!([{"name": "file_read", "mcp": false}]);
+        let mut archive = serde_json::json!({
+            "format_version": ARCHIVE_FORMAT_0_92_DEVELOPMENT_2,
+            "sessions": [
+                {"stats": {"turns": 1}, "events": []},
+                {"stats": {"turns": 1, "tools_used": tools.clone()}, "events": []},
+            ],
+        });
+        assert!(bring_archive_forward(
+            &mut archive,
+            ARCHIVE_FORMAT_0_92_DEVELOPMENT_2 + 1
+        ));
+        assert_eq!(
+            archive["sessions"][0]["stats"]["tools_used"],
+            serde_json::json!([])
+        );
+        assert_eq!(archive["sessions"][1]["stats"]["tools_used"], tools);
+    }
+
     /// A boundary from before 0.88 records the summary its message holds, up to the first section
     /// compaction writes after it; a message without the prefix records none, a boundary that
     /// records its summary keeps it, and a replay rewrites nothing. Through `Store::open` and
@@ -12711,8 +12822,10 @@ mod tests {
             }],
         });
         let mut before = document["sessions"].clone();
-        // An event copies none, which an archive before 0.87 does not say.
+        // An event copies none, which an archive before 0.87 does not say, and the session names
+        // no tool it called.
         before[0]["events"][0]["copy_of"] = serde_json::Value::Null;
+        before[0]["stats"]["tools_used"] = serde_json::json!([]);
         let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
         assert!(bring_archive_forward(&mut document, current));
         assert_eq!(document["sessions"], before, "nothing to convert");

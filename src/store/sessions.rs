@@ -2561,7 +2561,7 @@ impl Store {
                          input_tokens, output_tokens,
                          cache_creation_input_tokens, cache_read_input_tokens,
                          redactions, redacted_images, redacted_bytes,
-                         prompt_index, turn_index,
+                         prompt_index, turn_index, tools_used,
                          context_tokens, title, incomplete
                      )
                      SELECT ?1, ?2, ?2, parent_session_id, subagent_spec_json,
@@ -2572,7 +2572,7 @@ impl Store {
                             input_tokens, output_tokens,
                             cache_creation_input_tokens, cache_read_input_tokens,
                             redactions, redacted_images, redacted_bytes,
-                            prompt_index, turn_index,
+                            prompt_index, turn_index, tools_used,
                             context_tokens, title, 1
                      FROM sessions WHERE id = ?7",
                     rusqlite::params![
@@ -3111,6 +3111,7 @@ impl Store {
             title: Option<String>,
             pinned_at: Option<String>,
             stats: crate::stats::SessionStatsSnapshot,
+            tools_used: String,
             turns: Vec<super::export::ExportedTurn>,
             events: PreparedRows,
             scratchpad_entries: Vec<(String, String)>,
@@ -3151,6 +3152,11 @@ impl Store {
                     imported.copy_of,
                 ));
             }
+            let tools_used = serde_json::to_string(&record.stats.tools_used).map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to encode the tools a session used: {error}"
+                ))
+            })?;
             encoded.push(EncodedSession {
                 id: record.new_id.to_string(),
                 parent_id: record.new_parent_id.map(|id| id.to_string()),
@@ -3166,6 +3172,7 @@ impl Store {
                 title: record.title,
                 pinned_at: record.pinned_at,
                 stats: record.stats,
+                tools_used,
                 turns: record.turns,
                 events,
                 scratchpad_entries: record.scratchpad_entries,
@@ -3235,8 +3242,8 @@ impl Store {
                              turns, input_tokens, output_tokens,
                              cache_creation_input_tokens, cache_read_input_tokens,
                              redactions, redacted_images, redacted_bytes,
-                             title, pinned_at, prompt_index, turn_index, project, incomplete
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 1)",
+                             title, pinned_at, prompt_index, turn_index, project, tools_used, incomplete
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, 1)",
                         rusqlite::params![
                             session.id,
                             session.created_at,
@@ -3262,6 +3269,7 @@ impl Store {
                             session.stats.turn_position.map(|position| position.prompt_index as i64),
                             session.stats.turn_position.map(|position| position.turn_index as i64),
                             session.project,
+                            session.tools_used,
                         ],
                     )?;
                     for turn in &session.turns {
@@ -3631,6 +3639,11 @@ impl Store {
     ) -> Result<()> {
         // SQLite has no u64; counts never realistically exceed i64::MAX, so cast on the way in/out.
         let stats = stats.clone();
+        let tools_used = serde_json::to_string(&stats.tools_used).map_err(|error| {
+            MekaError::Database(format!(
+                "failed to encode the tools a session used: {error}"
+            ))
+        })?;
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
@@ -3644,7 +3657,8 @@ impl Store {
                          redacted_images = ?8,
                          redacted_bytes = ?9,
                          prompt_index = ?10,
-                         turn_index = ?11
+                         turn_index = ?11,
+                         tools_used = ?12
                      WHERE id = ?1",
                     rusqlite::params![
                         session_id.to_string(),
@@ -3662,6 +3676,7 @@ impl Store {
                         stats
                             .turn_position
                             .map(|position| position.turn_index as i64),
+                        tools_used,
                     ],
                 )?;
                 Ok(())
@@ -3682,7 +3697,7 @@ impl Store {
                     "SELECT turns, input_tokens, output_tokens,
                             cache_creation_input_tokens, cache_read_input_tokens,
                             redactions, redacted_images, redacted_bytes,
-                            prompt_index, turn_index
+                            prompt_index, turn_index, tools_used
                      FROM sessions WHERE id = ?1",
                     rusqlite::params![session_id.to_string()],
                     |row| {
@@ -3708,6 +3723,15 @@ impl Store {
                             redactions: row.get::<_, i64>(5)? as u64,
                             redacted_images: row.get::<_, i64>(6)? as u64,
                             redacted_bytes: row.get::<_, i64>(7)? as u64,
+                            tools_used: serde_json::from_str(&row.get::<_, String>(10)?).map_err(
+                                |error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        10,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                },
+                            )?,
                         })
                     },
                 );
@@ -5912,6 +5936,28 @@ mod tests {
         );
         let exported = super::export::ExportedTurn::from(record);
         assert_eq!(exported.cancel_reason.as_deref(), Some("abandoned"));
+    }
+
+    /// A fork holds the conversation that called the source's tools, so it names them too.
+    #[tokio::test]
+    async fn a_fork_names_the_tools_its_source_called() {
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let stats = crate::stats::SessionStatsSnapshot {
+            tools_used: vec![crate::stats::ToolUsed {
+                name: "mcp__kv__fetch".to_string(),
+                mcp: true,
+            }],
+            ..Default::default()
+        };
+        store.save_session_stats(id, &stats).await.expect("save");
+        let (forked, _lock) = store
+            .fork_session_locked(id, ForkOverrides::default(), SourceLock::Probe)
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        let copied = store.load_session_stats(forked.id).await.expect("load");
+        assert_eq!(copied.tools_used, stats.tools_used);
     }
 
     #[tokio::test]
@@ -8647,6 +8693,8 @@ mod tests {
             // Set by a fork, to unfinished while its rows are copied and whole after: never the
             // source's, which is whole when it is forked.
             "incomplete",
+            // Copied by a fork: the copy holds the conversation that called them.
+            "tools_used",
         ]);
     }
 
@@ -9501,7 +9549,18 @@ mod tests {
             redactions: 2,
             redacted_images: 3,
             redacted_bytes: 4096,
+            tools_used: vec![
+                crate::stats::ToolUsed {
+                    name: "file_read".to_string(),
+                    mcp: false,
+                },
+                crate::stats::ToolUsed {
+                    name: "mcp__kv__fetch".to_string(),
+                    mcp: true,
+                },
+            ],
         };
+        assert!(fresh.tools_used.is_empty(), "a fresh row names no tool");
         store
             .save_session_stats(session_id, &snapshot)
             .await
@@ -9519,6 +9578,7 @@ mod tests {
         assert_eq!(loaded.redactions, 2);
         assert_eq!(loaded.redacted_images, 3);
         assert_eq!(loaded.redacted_bytes, 4096);
+        assert_eq!(loaded.tools_used, snapshot.tools_used);
 
         // An unknown session id is not an error; it reads as all-zero.
         let unknown = store

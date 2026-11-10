@@ -28,7 +28,8 @@ const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessio
                       user:mcp_servers user:file_upload user:plugins";
 
 /// `chatgpt-subscription` OAuth flow constants. Mirror Codex's first-party CLI: the authorization
-/// server lives at `auth.openai.com`, the redirect listener binds on `localhost:1455`.
+/// server lives at `auth.openai.com`, and the redirect names the listener on `127.0.0.1:1455` by
+/// its address, as Codex 0.167 does.
 const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_REDIRECT_PORT: u16 = 1455;
@@ -859,7 +860,7 @@ impl BrowserLogin {
             CredentialKind::ChatGptLogin => {
                 let client_id = client_id.unwrap_or(DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID);
                 let token_url = oauth_token_url.unwrap_or(CODEX_TOKEN_URL);
-                let redirect_uri = format!("http://localhost:{CODEX_REDIRECT_PORT}/auth/callback");
+                let redirect_uri = format!("http://127.0.0.1:{CODEX_REDIRECT_PORT}/auth/callback");
                 let url =
                     build_codex_authorize_url(client_id, &code_challenge, &state, &redirect_uri)?;
                 (client_id, token_url, redirect_uri, url)

@@ -242,6 +242,9 @@ pub(crate) struct MockProvider {
     completion_turn_positions: Mutex<Vec<Option<crate::stats::TurnPosition>>>,
     /// How each `complete` call named its worker, in call order, for the same reason.
     completion_workers: Mutex<Vec<Option<crate::provider::WorkerIdentity>>>,
+    /// The tools each `complete` call said the session had called, in call order, for the same
+    /// reason.
+    completion_tools_used: Mutex<Vec<Vec<crate::stats::ToolUsed>>>,
     /// The tool names each `complete` call carried, in call order: whether a checkpoint's request
     /// carries the turn's catalog is visible nowhere else.
     completion_tools: Mutex<Vec<Vec<String>>>,
@@ -288,6 +291,10 @@ pub(crate) struct StreamRequest {
     /// The session the request named, for the same reason: a ChatGPT request sends it as its
     /// cache affinity, and a turn that reads it before the session exists sends none.
     pub(crate) session_id: Option<uuid::Uuid>,
+    /// The response before a compaction the request named, for the same reason.
+    pub(crate) response_before_compaction: Option<crate::provider::MainResponse>,
+    /// The tools the session had called when the request was built, for the same reason.
+    pub(crate) tools_used: Vec<crate::stats::ToolUsed>,
 }
 
 impl MockProvider {
@@ -331,6 +338,12 @@ impl MockProvider {
     #[cfg(test)]
     pub(crate) fn completion_workers(&self) -> Vec<Option<crate::provider::WorkerIdentity>> {
         crate::sync::lock(&self.completion_workers).clone()
+    }
+
+    /// The tools called behind each `complete` call so far, in order.
+    #[cfg(test)]
+    pub(crate) fn completion_tools_used(&self) -> Vec<Vec<crate::stats::ToolUsed>> {
+        crate::sync::lock(&self.completion_tools_used).clone()
     }
 
     /// A provider that replays `rounds`, one per call, and answers nothing once they are spent.
@@ -390,6 +403,7 @@ impl Provider for MockProvider {
         crate::sync::lock(&self.completion_turn_origins).push(attribution.turn_origin);
         crate::sync::lock(&self.completion_turn_positions).push(attribution.turn_position);
         crate::sync::lock(&self.completion_workers).push(attribution.worker.clone());
+        crate::sync::lock(&self.completion_tools_used).push(attribution.tools_used.clone());
 
         let events = {
             let mut rounds = crate::sync::lock(&self.rounds);
@@ -607,6 +621,8 @@ impl Provider for MockProvider {
             turn_origin: attribution.turn_origin,
             turn_position: attribution.turn_position,
             session_id: attribution.session_id,
+            response_before_compaction: attribution.response_before_compaction(),
+            tools_used: attribution.tools_used.clone(),
         });
 
         let events = {

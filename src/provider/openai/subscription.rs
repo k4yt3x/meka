@@ -654,8 +654,9 @@ struct CodexProfileStats {
     current_streak_days: Option<i64>,
     #[serde(default)]
     longest_streak_days: Option<i64>,
+    /// Optional and nullable in Codex's own type, so `null` reads as no buckets.
     #[serde(default)]
-    daily_usage_buckets: Vec<CodexDailyBucket>,
+    daily_usage_buckets: Option<Vec<CodexDailyBucket>>,
 }
 
 #[derive(Deserialize)]
@@ -677,6 +678,7 @@ impl CodexProfileResponse {
                 .map(|s| {
                     s.daily_usage_buckets
                         .into_iter()
+                        .flatten()
                         .map(|bucket| DailyUsage {
                             date: bucket.start_date,
                             tokens: bucket.tokens,
@@ -1286,6 +1288,17 @@ mod tests {
         assert_eq!(stats.daily.len(), 2);
         assert_eq!(stats.daily[1].date, "2026-07-01");
         assert_eq!(stats.daily[1].tokens, 12300);
+    }
+
+    /// Codex types the bucket list as nullable, so a profile stating `null` keeps its other stats.
+    #[test]
+    fn codex_profile_with_null_buckets_keeps_its_stats() {
+        let body = r#"{"stats": {"lifetime_tokens": 5, "daily_usage_buckets": null}}"#;
+        let stats = serde_json::from_str::<CodexProfileResponse>(body)
+            .unwrap()
+            .into_usage_stats();
+        assert_eq!(stats.lifetime_tokens, Some(5));
+        assert!(stats.daily.is_empty());
     }
 
     #[test]

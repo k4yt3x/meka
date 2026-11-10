@@ -304,6 +304,13 @@ impl Agent {
             input,
             unparsed,
         } = call;
+        // Ahead of every refusal, as Claude Code records a call once its tool is found, and ahead
+        // of the run, so a sub-agent the call spawns names it too. Not the checkpoint's own
+        // submission: that is the compaction handing back its summary, which Claude Code's
+        // compaction writes as text and never lists.
+        if !matches!(door, CallDoor::CheckpointSubmission) {
+            self.note_tool_called(name);
+        }
         // Read at the enforcement site, so a level cycled or a switch toggled during dispatch
         // means the next call rather than a snapshot captured earlier in the loop.
         let required = self

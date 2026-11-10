@@ -1225,6 +1225,7 @@ impl Agent {
             session_id: self.cells.session_id.get(),
             turn_origin: (!worker).then_some(origin),
             turn_position,
+            main_thread: self.main_thread(),
             ..Default::default()
         }
     }
@@ -1421,8 +1422,9 @@ impl Agent {
 
         // The cell is a copy of what the log records, and the log is the authority: a session
         // made resident, a rewind on another host, a follow-up on a worker all reach here with a
-        // log the cell has not read.
+        // log the cell has not read. The tools it called likewise.
         self.hydrate_checklist(messages).await;
+        self.note_tools_called(messages.as_slice());
         let result = self.run_rounds(messages, &mut run).await;
         self.settle_turn(messages, run, &opening, retention, &result)
             .await;
@@ -2358,6 +2360,7 @@ impl Agent {
         );
         let request_attribution = run.attribution.for_request(
             run.last_round_durations.clone(),
+            self.session_stats.tools_used(),
             self.take_context_compacted(),
         );
         // Streaming and blocking paths converge on a `Completion`. The blocking provider call
@@ -4288,6 +4291,182 @@ mod tests {
         assert_eq!(positions, vec![first, first]);
         let row = store.load_session_stats(session).await.expect("stats");
         assert_eq!(row.turn_position, first);
+    }
+
+    /// The session's tools as its next requests name them, with a registry that holds
+    /// `memory_read` and the agent its session's row.
+    async fn agent_with_a_tool(
+        rounds: Vec<Vec<MockEvent>>,
+    ) -> (Agent, Arc<MockProvider>, Store, uuid::Uuid) {
+        agent_with_a_tool_on(MockProvider::from_rounds(rounds)).await
+    }
+
+    /// [`agent_with_a_tool`] on `provider` as given, for one that refuses a name.
+    async fn agent_with_a_tool_on(
+        provider: MockProvider,
+    ) -> (Agent, Arc<MockProvider>, Store, uuid::Uuid) {
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(MemoryReadFixture))
+            .expect("register memory_read");
+        let provider = Arc::new(provider);
+        // The wire the registry asks whether a name is carried, as a session's own publishes it.
+        registry.publish_profile(&crate::provider::PublishedProfile::detached(
+            &crate::provider::ResolvedProfile {
+                provider: Arc::clone(&provider) as Arc<dyn Provider>,
+                profile: "test".to_string(),
+                context_window: 200_000,
+                vision: true,
+            },
+        ));
+        let (agent, store) =
+            agent_with_registry_for_test(Arc::clone(&provider) as Arc<dyn Provider>, registry)
+                .await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        (agent, provider, store, session_id)
+    }
+
+    fn call_round(name: &str) -> Vec<MockEvent> {
+        vec![
+            MockEvent::ToolUseStart {
+                id: format!("call-{name}"),
+                name: name.to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({"name": "notes"}),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+            },
+        ]
+    }
+
+    /// A call names its tool on the next request once the call reaches its tool, as Claude Code
+    /// records one, and the row keeps it once the turn closes; a name no tool answers to was never
+    /// called.
+    #[tokio::test]
+    async fn a_call_names_its_tool_once_it_reaches_it() {
+        let (agent, provider, store, session) = agent_with_a_tool(vec![
+            call_round("no_such_tool"),
+            call_round("memory_read"),
+            text_round("ok"),
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("read it".into(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        let read = crate::stats::ToolUsed {
+            name: "memory_read".to_string(),
+            mcp: false,
+        };
+        let named: Vec<_> = provider
+            .streams()
+            .iter()
+            .map(|request| request.tools_used.clone())
+            .collect();
+        assert_eq!(named, vec![Vec::new(), Vec::new(), vec![read.clone()]]);
+        let row = store.load_session_stats(session).await.expect("stats");
+        assert_eq!(row.tools_used, vec![read]);
+    }
+
+    /// A conversation read at a turn's start names the tools it holds calls to, as Claude Code
+    /// reads a resumed transcript, by the same rule: a call to a name no tool answers to is not
+    /// one.
+    #[tokio::test]
+    async fn a_conversation_read_at_a_turn_names_the_tools_it_called() {
+        let (agent, provider, _store, _session) = agent_with_a_tool(vec![text_round("ok")]).await;
+        let call = |id: &str, name: &str| {
+            [
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        input: serde_json::json!({}),
+                        unparsed: None,
+                        provider_fields: None,
+                    }],
+                    provider_fields: None,
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: id.to_string(),
+                        content: Vec::new(),
+                        is_error: false,
+                        display: None,
+                    }],
+                    provider_fields: None,
+                },
+            ]
+        };
+        let mut messages = Conversation::new();
+        for message in call("call-0", "no_such_tool")
+            .into_iter()
+            .chain(call("call-1", "memory_read"))
+        {
+            messages.append(message);
+        }
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("and now?".into(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        let named = provider.streams().pop().expect("a request").tools_used;
+        assert_eq!(named, vec![crate::stats::ToolUsed {
+            name: "memory_read".to_string(),
+            mcp: false,
+        }]);
+    }
+
+    /// A tool the serving wire does not carry is refused at dispatch before it is reached, so it is
+    /// not a call the session made, live or read back from the conversation.
+    #[tokio::test]
+    async fn a_tool_the_wire_does_not_carry_is_never_called() {
+        let (agent, provider, _store, _session) = agent_with_a_tool_on(
+            MockProvider::from_rounds(vec![call_round("memory_read"), text_round("ok")])
+                .refusing("memory_read"),
+        )
+        .await;
+        let mut messages = Conversation::new();
+        for _ in 0..2 {
+            agent
+                .run_turn(
+                    &mut messages,
+                    crate::agent::TurnInput::from_parts("read it".into(), Vec::new())
+                        .expect("a prompt"),
+                    crate::agent::TurnCancellation::new(),
+                )
+                .await
+                .expect("the turn runs");
+        }
+        assert!(
+            provider
+                .streams()
+                .iter()
+                .all(|request| request.tools_used.is_empty()),
+            "{:?}",
+            provider
+                .streams()
+                .iter()
+                .map(|request| request.tools_used.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The replies of a turn's rows, in order, with what was recorded about each.

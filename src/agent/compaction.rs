@@ -992,6 +992,10 @@ impl Agent {
         // is refused until the file is read again. Kept deliberately: whether the read survived
         // depends on where the kept tail was cut, and re-reading costs a call where trusting a
         // read that fell out of the window costs a blind edit.
+        //
+        // The reset forgets what an earlier compaction armed, which this one carries forward when
+        // no response has come since, so it is taken first.
+        let response_before_compaction = self.take_response_before_compaction();
         self.reset_conversation_markers(messages).await;
 
         // Publish only after persistence, so a failed compaction cannot suppress a later update
@@ -1031,6 +1035,7 @@ impl Agent {
         if self.role.is_root() {
             *crate::sync::lock(&self.context_compacted) = Some(compaction_kind);
         }
+        self.arm_response_before_compaction(response_before_compaction);
         // `diagnostics.previous_message_id` and `cc_prev_req` name the response the conversation
         // still ends on, which Claude Code reads off the last assistant message it sends. A
         // compaction that summarized that response leaves nothing to name, the `null` and the
@@ -1068,6 +1073,7 @@ impl Agent {
             previous_message: copy_of(&self.previous_message),
             session_id: self.cells.session_id.get(),
             compaction: Some(crate::provider::CompactionKind::from(request.trigger)),
+            tools_used: self.session_stats.tools_used(),
             ..Default::default()
         }
     }
@@ -1176,7 +1182,10 @@ impl Agent {
                             &active.definitions,
                         )
                         .declaring(&active.deferred_definitions)
-                        .attributed(attribution.clone()),
+                        .attributed(crate::provider::Attribution {
+                            tools_used: self.session_stats.tools_used(),
+                            ..attribution.clone()
+                        }),
                         Some(&rebuild),
                         &cancellation,
                         &cancellation,
@@ -1997,6 +2006,57 @@ mod tests {
             serde_json::json!({"name": "note"}),
             "Meka's own parameter is taken out at the checkpoint door too"
         );
+    }
+
+    /// A tool the checkpoint calls is the session's from the checkpoint's next round on, as a
+    /// turn's call is from its next request: each round names the tools as they stand.
+    #[tokio::test]
+    async fn a_checkpoint_round_names_the_tools_its_earlier_rounds_called() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "memory_write".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"name": "note"}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            replace_round("summary", None),
+        ]));
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(StubTool {
+                name: "memory_write".to_string(),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .expect("register stub");
+        let (agent, store) = agent_with_registry_and_checkpoint(provider.clone(), registry).await;
+        let mut messages = conversation();
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session"),
+        );
+        agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Manual),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("compaction");
+        let written = crate::stats::ToolUsed {
+            name: "memory_write".to_string(),
+            mcp: false,
+        };
+        assert_eq!(provider.completion_tools_used(), vec![Vec::new(), vec![
+            written
+        ]]);
     }
 
     /// A compaction records the rounds its checkpoint ran, without what a provider needs back to
@@ -3739,6 +3799,118 @@ mod tests {
             Some(crate::provider::CompactionKind::Auto)
         );
         assert_eq!(agent.take_context_compacted(), None);
+    }
+
+    /// A compaction arms the response the main thread last received for the main requests after
+    /// it, a second compaction before any response opens carries the same one, and the turn's
+    /// request after them names it, as Claude Code arms its own.
+    #[tokio::test]
+    async fn a_compaction_arms_the_response_before_it_for_the_main_requests_after() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            replace_round("first", None),
+            replace_round("second", None),
+            text_round("after"),
+        ]));
+        let (agent, store) = agent_with_checkpoint(provider.clone(), true).await;
+        let before = crate::provider::MainResponse {
+            message_id: Some("msg_01before".to_string()),
+            turn_position: Some(crate::stats::TurnPosition {
+                prompt_index: 2,
+                turn_index: 2,
+            }),
+        };
+        *crate::sync::lock(&agent.main_thread.last) = Some(before.clone());
+        let armed = || crate::sync::lock(&agent.main_thread.before_compaction).clone();
+        let mut messages = conversation();
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Manual),
+        )
+        .await;
+        assert_eq!(armed(), Some(before.clone()));
+        assert_eq!(*crate::sync::lock(&agent.main_thread.last), None, "taken");
+
+        for message in conversation().as_slice() {
+            messages.append(message.clone());
+        }
+        agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Manual),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a second compaction");
+        assert_eq!(
+            armed(),
+            Some(before.clone()),
+            "no response came between the two"
+        );
+
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("after".into(), Vec::new()).expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        let last = provider.streams().pop().expect("the turn's request");
+        assert_eq!(last.response_before_compaction, Some(before));
+    }
+
+    /// The checkpoint handing back its summary is the compaction's own output, not a tool the
+    /// session called, so the session's list does not gain `context_replace`.
+    #[tokio::test]
+    async fn a_checkpoint_s_submission_is_not_a_tool_the_session_called() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+            "summary", None,
+        )]));
+        let (agent, store) = agent_with_checkpoint(provider, true).await;
+        let mut messages = conversation();
+        let record = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactionTrigger::Manual),
+        )
+        .await;
+        assert!(!record.checkpoint.is_empty(), "the checkpoint ran");
+        assert!(
+            agent.session_stats_snapshot().tools_used.is_empty(),
+            "{:?}",
+            agent.session_stats_snapshot().tools_used
+        );
+    }
+
+    /// An agent moved to another session takes that session's counters and tools and forgets the
+    /// last one's previous request, message and main response, as a resume starts without them.
+    #[tokio::test]
+    async fn adopting_a_session_forgets_the_last_one_s_responses() {
+        let (agent, _store) = agent_for_test(Arc::new(MockProvider::from_rounds(vec![]))).await;
+        *crate::sync::lock(&agent.previous_message) = Some("msg_01last".to_string());
+        *crate::sync::lock(&agent.previous_request) = Some("req_011last".to_string());
+        *crate::sync::lock(&agent.main_thread.last) = Some(crate::provider::MainResponse {
+            message_id: Some("msg_01last".to_string()),
+            turn_position: None,
+        });
+        let tools = vec![crate::stats::ToolUsed {
+            name: "web_fetch".to_string(),
+            mcp: false,
+        }];
+        agent.adopt_session(&crate::stats::SessionStatsSnapshot {
+            turns: 4,
+            tools_used: tools.clone(),
+            ..Default::default()
+        });
+        assert_eq!(*crate::sync::lock(&agent.previous_message), None);
+        assert_eq!(*crate::sync::lock(&agent.previous_request), None);
+        assert_eq!(agent.take_response_before_compaction(), None);
+        let stats = agent.session_stats_snapshot();
+        assert_eq!(stats.turns, 4);
+        assert_eq!(stats.tools_used, tools);
     }
 
     /// The previous message and request ids name a response the request still carries.

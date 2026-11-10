@@ -135,6 +135,9 @@ pub(crate) struct Agent {
     /// it in the context-compacted headers, which is when Claude Code clears its own flag. Set by
     /// the root agent alone, since Claude Code stamps it on the main thread and nowhere else.
     context_compacted: std::sync::Mutex<Option<crate::provider::CompactionKind>>,
+    /// The main thread's last response and the one before its last compaction, which the root
+    /// agent's turns hand their requests and the Claude drivers record into as responses arrive.
+    main_thread: crate::provider::MainThreadResponses,
     /// Conversation length at the time of the most recent request the provider *accepted*, or
     /// [`LAST_ACCEPTED_UNKNOWN`] before the first one. Everything appended past it is what a
     /// `MekaError::InvalidRequest` is allowed to blame: the failing request differs from the last
@@ -263,6 +266,7 @@ impl Agent {
             previous_request: crate::provider::PreviousRequestSlot::default(),
             previous_message: crate::provider::PreviousMessageSlot::default(),
             context_compacted: std::sync::Mutex::new(None),
+            main_thread: crate::provider::MainThreadResponses::default(),
             last_accepted_len: std::sync::atomic::AtomicUsize::new(LAST_ACCEPTED_UNKNOWN),
             providers: Arc::clone(&materials.providers),
             profiles_tried: std::sync::Mutex::new(Vec::new()),
@@ -742,6 +746,8 @@ impl Agent {
             .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
         *self.last_rendered_world.write().await = None;
         *crate::sync::lock(&self.context_compacted) = None;
+        *crate::sync::lock(&self.main_thread.before_compaction) = None;
+        self.note_tools_called(messages);
         self.tool_registry.clear_read_tracker().await;
         crate::sync::lock(&self.schema_advisories_sent).clear();
         self.record_context_tokens(self.cells.estimate_context_tokens(messages))
@@ -774,10 +780,78 @@ impl Agent {
         }
     }
 
+    /// Serve another session from here on, one whose row holds `stats`: the counters and the
+    /// tools called become that session's, and the previous request, message and main response,
+    /// which were the last session's, go, as a resume starts without them.
+    pub(crate) fn adopt_session(&self, stats: &crate::stats::SessionStatsSnapshot) {
+        self.session_stats.adopt(stats);
+        *crate::sync::lock(&self.previous_request) = None;
+        *crate::sync::lock(&self.previous_message) = None;
+        *crate::sync::lock(&self.main_thread.last) = None;
+    }
+
     /// The compaction the next request is the first to follow, if any; see
     /// [`Self::context_compacted`].
     pub(super) fn take_context_compacted(&self) -> Option<crate::provider::CompactionKind> {
         crate::sync::lock(&self.context_compacted).take()
+    }
+
+    /// The main thread's records, for a turn's requests to carry; `None` on a worker, whose
+    /// responses are never the main thread's.
+    pub(super) fn main_thread(&self) -> Option<crate::provider::MainThreadResponses> {
+        self.role.is_root().then(|| self.main_thread.clone())
+    }
+
+    /// What a compaction about to rewrite the conversation arms: the response the main thread
+    /// received since the last one, else what the last one armed and no response has answered
+    /// yet. Taken, so a compaction straight after names the same response. `None` on a worker.
+    pub(super) fn take_response_before_compaction(&self) -> Option<crate::provider::MainResponse> {
+        if !self.role.is_root() {
+            return None;
+        }
+        crate::sync::lock(&self.main_thread.last)
+            .take()
+            .or_else(|| crate::sync::lock(&self.main_thread.before_compaction).take())
+    }
+
+    /// Arm what [`Self::take_response_before_compaction`] took, once the compaction is done.
+    pub(super) fn arm_response_before_compaction(
+        &self,
+        response: Option<crate::provider::MainResponse>,
+    ) {
+        *crate::sync::lock(&self.main_thread.before_compaction) = response;
+    }
+
+    /// Record the tool `name` among those the session called, when the call reaches a tool: one
+    /// the registry resolves and the serving wire carries, as Claude Code records a call once its
+    /// tool is found. A name no tool answers to was never called, whatever the model asked for,
+    /// and neither was one dispatch refuses as not carried. The one rule for both doors, a call
+    /// about to go through its admission and a conversation read back.
+    pub(super) fn note_tool_called(&self, name: &str) {
+        if self.tool_registry.get(name).is_none() || !self.tool_registry.is_carried(name) {
+            return;
+        }
+        self.session_stats
+            .record_tools_used([crate::stats::ToolUsed {
+                name: name.to_string(),
+                mcp: crate::tools::server_of_tool(name).is_some(),
+            }]);
+    }
+
+    /// Record the tools `messages` call among the session's, in order, by
+    /// [`Self::note_tool_called`]'s rule: a conversation as it is read, as Claude Code reads its
+    /// transcript on a resume, so a session whose calls were never saved names them still.
+    pub(super) fn note_tools_called<'a>(
+        &self,
+        messages: impl IntoIterator<Item = &'a crate::conversation::Message>,
+    ) {
+        for message in messages {
+            for block in &message.content {
+                if let crate::conversation::ContentBlock::ToolUse { name, .. } = block {
+                    self.note_tool_called(name);
+                }
+            }
+        }
     }
 
     /// The registry this agent dispatches through. Exposed so a host that attached it to the MCP

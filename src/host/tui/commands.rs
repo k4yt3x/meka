@@ -52,6 +52,22 @@ struct AttachContext<'a> {
     ui: &'a Ui,
 }
 
+/// Refuse moving the screen to another session, by `/resume` or `/fork`, while a sub-agent still
+/// runs: it shares the session's counters and its list of tools called, which the move hands to
+/// the other session in place, so it would go on writing into that one. The remedy is the screen's
+/// second Ctrl+C, which stops every background task of the process; `/task cancel --all` reaches
+/// only this session's, not one a sub-agent started.
+fn refuse_a_switch_while_subagents_run(shared: &crate::host::SharedDeps) -> anyhow::Result<()> {
+    let running = shared.running_subagents.running_ids().len();
+    if running > 0 {
+        anyhow::bail!(
+            "{running} sub-agent(s) still running; press Ctrl+C twice to stop them before \
+             switching sessions"
+        );
+    }
+    Ok(())
+}
+
 /// Make the session `value` names this run's, in place: what a resume at startup does, done
 /// between turns. Everything of the new session is taken and read before anything of the old one
 /// is let go, so a failure leaves the screen where it was, and the new lock drops with it.
@@ -73,10 +89,12 @@ async fn attach_session(value: &str, context: AttachContext<'_>) -> anyhow::Resu
         ui.reply("Already on this session");
         return Ok(());
     }
+    refuse_a_switch_while_subagents_run(shared)?;
     crate::host::refuse_a_spawned_session(store, Some(id)).await?;
     // Locked, then read, so the row this run moves to is the one it now owns.
     let (lock, recorded) = store.open_session_row(id).await?;
     let hydrated = crate::host::hydrate_conversation(store, id).await?;
+    let stats = store.load_session_stats(id).await?;
     let profile = crate::provider::profile_for_config(store, config, Some(id)).await?;
     let resolved = crate::host::resolve_profile_switch(shared, &profile).await?;
     // The row's project, refused by name when the store no longer has it, as the profile is.
@@ -95,6 +113,7 @@ async fn attach_session(value: &str, context: AttachContext<'_>) -> anyhow::Resu
     *session_id = Some(id);
     let cells = agent.cells();
     cells.session_id.set(id);
+    agent.adopt_session(&stats);
     agent.set_provider(resolved);
     agent.set_project(project);
     *crate::sync::write(current_profile) = profile;
@@ -272,6 +291,9 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             None => ui.reply("No active session to export"),
         },
         SlashCommand::Fork => match session_id {
+            Some(_) if let Err(error) = refuse_a_switch_while_subagents_run(shared) => {
+                ui.reply(error.to_string());
+            }
             Some(id) => match crate::host::fork_and_lock(store, id).await {
                 Ok(crate::host::ForkHandoff::Switched { id, lock }) => {
                     // Replacing the slot's contents drops the original guard only now that the new
@@ -1388,5 +1410,35 @@ mod tests {
             !attach.contains("hydrate_checklist("),
             "the reset reads the checklist itself: {attach}"
         );
+        // The counters and the tools called are the row's, read from it before anything moves,
+        // and never while a sub-agent sharing them still runs.
+        let at = |needle: &str| {
+            attach
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {attach}"))
+        };
+        assert!(
+            at("refuse_a_switch_while_subagents_run(") < at("open_session_row("),
+            "{attach}"
+        );
+        assert!(
+            at("load_session_stats(id)") < at("hold_session_lock("),
+            "{attach}"
+        );
+        assert!(at("hold_session_lock(") < at("adopt_session("), "{attach}");
+        // `/fork` moves the screen to the copy, handing it the same counters, so it refuses the
+        // same way.
+        let fork = include_str!("commands.rs")
+            .split("SlashCommand::Fork => match session_id {")
+            .nth(1)
+            .expect("the fork arm")
+            .split("None => ui.reply(\"No active session to fork\")")
+            .next()
+            .expect("the arm ends");
+        let guard = fork
+            .find("refuse_a_switch_while_subagents_run(")
+            .unwrap_or_else(|| panic!("the guard in {fork}"));
+        let forked = fork.find("fork_and_lock(").expect("the fork");
+        assert!(guard < forked, "{fork}");
     }
 }

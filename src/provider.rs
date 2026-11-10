@@ -192,6 +192,25 @@ pub(crate) type PreviousRequestSlot = Arc<std::sync::Mutex<Option<String>>>;
 /// for the request id: Claude Code names it as `diagnostics.previous_message_id`.
 pub(crate) type PreviousMessageSlot = Arc<std::sync::Mutex<Option<String>>>;
 
+/// A response the conversation's main thread received, as the requests after a compaction name
+/// the last one before it (`cc_prev_msg`, `cc_prev_prompt_index`, `cc_prev_turn_index`):
+/// the message id the response carried, and where the turn of the request it answered stood.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MainResponse {
+    pub(crate) message_id: Option<String>,
+    pub(crate) turn_position: Option<crate::stats::TurnPosition>,
+}
+
+/// The main thread's responses as Claude Code keeps them for that header: the last one received,
+/// and the one a compaction armed, kept until a response to a later request opens. Held by the
+/// root agent and carried by its turns' requests alone, so a compaction's or a sub-agent's
+/// response is never the main thread's.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MainThreadResponses {
+    pub(crate) last: Arc<std::sync::Mutex<Option<MainResponse>>>,
+    pub(crate) before_compaction: Arc<std::sync::Mutex<Option<MainResponse>>>,
+}
+
 /// Where the prompt a request answers came from, as `cc_turn_origin` names it. Claude Code
 /// stamps its own vocabulary on every user message and reports the one behind the request; a
 /// sub-agent inherits its spawner's, and a compaction reports none.
@@ -344,6 +363,13 @@ pub(crate) struct Attribution {
     /// Set on the first request of the conversation after a compaction: what set that compaction
     /// going, for the context-compacted headers.
     pub(crate) context_compacted: Option<CompactionKind>,
+    /// Set on a turn's requests on the main thread: where its responses are recorded as they
+    /// arrive, and where the response before the last compaction is read; see
+    /// [`Self::response_before_compaction`].
+    pub(crate) main_thread: Option<MainThreadResponses>,
+    /// The tools the session and its sub-agents have called, first call first, as they stood when
+    /// the request was built; empty on a request no conversation makes.
+    pub(crate) tools_used: Vec<crate::stats::ToolUsed>,
     /// The tool calls the previous round ran, in dispatch order, for
     /// `x-claude-code-prev-tool-durations`. Empty on a request that follows no tool round.
     pub(crate) previous_tool_durations: Vec<ToolDuration>,
@@ -366,17 +392,53 @@ impl Attribution {
         }
     }
 
-    /// This attribution for one request: carrying what the previous round ran and, on the first
-    /// request after a compaction, what set that compaction going.
+    /// This attribution for one request: carrying what the previous round ran, the tools called
+    /// so far and, on the first request after a compaction, what set that compaction going.
     pub(crate) fn for_request(
         &self,
         previous_tool_durations: Vec<ToolDuration>,
+        tools_used: Vec<crate::stats::ToolUsed>,
         context_compacted: Option<CompactionKind>,
     ) -> Self {
         Self {
             previous_tool_durations,
+            tools_used,
             context_compacted,
             ..self.clone()
+        }
+    }
+
+    /// The response the main thread received before its last compaction, while no response to a
+    /// request since has opened; `None` off the main thread. Read as each request is built, so a
+    /// retry after a response opened names it no longer, and one after a refusal before any did
+    /// still does, as Claude Code's do.
+    pub(crate) fn response_before_compaction(&self) -> Option<MainResponse> {
+        self.main_thread
+            .as_ref()
+            .and_then(|main_thread| crate::sync::lock(&main_thread.before_compaction).clone())
+    }
+
+    /// A response to this request arrived with a success status. On the main thread it is the last
+    /// response received, with no message id until its message opens: Claude Code records it once
+    /// such headers are in, whatever becomes of the stream.
+    pub(crate) fn note_response_arrived(&self) {
+        if let Some(main_thread) = &self.main_thread {
+            *crate::sync::lock(&main_thread.last) = Some(MainResponse {
+                message_id: None,
+                turn_position: self.turn_position,
+            });
+        }
+    }
+
+    /// The response's message opened as `message_id`. On the main thread the last response carries
+    /// it, and it answers what the last compaction armed.
+    pub(crate) fn note_message_opened(&self, message_id: &str) {
+        if let Some(main_thread) = &self.main_thread {
+            *crate::sync::lock(&main_thread.last) = Some(MainResponse {
+                message_id: Some(message_id.to_string()),
+                turn_position: self.turn_position,
+            });
+            *crate::sync::lock(&main_thread.before_compaction) = None;
         }
     }
 

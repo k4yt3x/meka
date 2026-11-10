@@ -121,10 +121,11 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// first-party feature an arbitrary endpoint may not implement.
 ///
 /// The `max_tokens` sent when the profile states no `max_output_tokens`: 128000 under adaptive
-/// thinking, which is what Claude Code 2.1.310 sends for Opus 5.5 (verified by wire capture), the
+/// thinking, which is what Claude Code 2.1.322 sends for Opus 5.5 (verified by wire capture), the
 /// model `profile add` suggests, and the most every model that takes adaptive thinking accepts;
 /// 32000 otherwise, raised to twice the budget under budgeted thinking when that is more. Claude
-/// Code reads the figure off a per-model catalog, which says 64000 for the rest of the line-up;
+/// Code reads the figure off a per-model catalog, which says the same for the rest of the 5.5
+/// line, Fable 5.2 and Mythos 5.2 and 64000 for the rest of the line-up;
 /// Meka carries one figure rather than that catalog, and the profile's `max_output_tokens` is
 /// where a user states another. The API requires the field, so omitting it is not a way to ask
 /// for a default.
@@ -216,7 +217,7 @@ pub(super) fn model_supports_temperature(model: &str) -> bool {
 
 /// Whether a Claude model accepts `output_config.effort`.
 ///
-/// A denylist mirroring Claude Code 2.1.310's own gate, which excludes the Claude 3.x line, Opus
+/// A denylist mirroring Claude Code 2.1.322's own gate, which excludes the Claude 3.x line, Opus
 /// 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5 and sends the field to everything else on the first-party
 /// endpoint. Same reasoning and same single caller as
 /// [`model_supports_mid_conversation_tool_changes`]: an unrecognized name here is one *newer* than
@@ -243,9 +244,10 @@ pub(super) fn model_supports_effort(model: &str) -> bool {
 /// The effort `claude-subscription` sends when the profile configures none.
 ///
 /// Claude Code reads a per-model `default_effort` out of a table bundled in its binary and clamps
-/// it to what that model accepts. `medium` is the 2.1.310 table's figure for Opus 5.5, the model
-/// `profile add` suggests; most other entries say `high`, Opus 4.5 through 4.7 say `xhigh`, and
-/// `high` is what Claude Code falls back to for a model the table does not list.
+/// it to what that model accepts. `medium` is the 2.1.322 table's figure for Opus 5.5, the model
+/// `profile add` suggests, and for the rest of the 5.5 line, Fable 5.2 and Mythos 5.2; Opus 4.7
+/// says `xhigh`, the other entries say `high`, and `high` is what Claude Code falls back to for a
+/// model the table gives none.
 ///
 /// One constant, and deliberately not a transcription of that table. A per-model figure would be a
 /// fact about someone else's data that goes stale on their release schedule with nothing in the
@@ -257,11 +259,12 @@ pub(super) const DEFAULT_EFFORT: &str = "medium";
 /// Whether a Claude model takes Claude Code's per-turn effort statements (the
 /// `per-turn-control-2026-07-01` beta).
 ///
-/// An **allowlist**, because that is the direction Claude Code 2.1.310's own gate points: it
+/// An **allowlist**, because that is the direction Claude Code 2.1.322's own gate points: it
 /// reads the `per_turn_effort` capability off the model catalog bundled in its binary, and a
 /// model the catalog does not list gets nothing. The catalog grants it to Opus 5.5, Sonnet 5.5,
-/// Haiku 5.5 and Fable 5.1 alone, so an unrecognized name, which in practice means one newer than
-/// this list, resolves to `false` and the beta is omitted, which every model tolerates.
+/// Haiku 5.5, Fable 5.1, Fable 5.2 and Mythos 5.2 alone, so an unrecognized name, which in
+/// practice means one newer than this list, resolves to `false` and the beta is omitted, which
+/// every model tolerates.
 pub(super) fn model_supports_per_turn_effort(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     let Some(version) = parse_model_version(&lower) else {
@@ -270,7 +273,9 @@ pub(super) fn model_supports_per_turn_effort(model: &str) -> bool {
     if lower.contains("opus") || lower.contains("sonnet") || lower.contains("haiku") {
         version == (5, 5)
     } else if lower.contains("fable") {
-        version == (5, 1)
+        matches!(version, (5, 1) | (5, 2))
+    } else if lower.contains("mythos") {
+        version == (5, 2)
     } else {
         false
     }
@@ -279,7 +284,7 @@ pub(super) fn model_supports_per_turn_effort(model: &str) -> bool {
 /// Whether a Claude model accepts tool changes mid-conversation (the
 /// `mid-conversation-tool-changes-2026-07-01` beta).
 ///
-/// A **denylist**, mirroring Claude Code 2.1.310's gate model for model: it reads the
+/// A **denylist**, mirroring Claude Code 2.1.322's gate model for model: it reads the
 /// `mid_conv_tool_change` capability off its bundled catalog, which withholds it from the Claude
 /// 3.x line, Opus 4.0 through 4.7, Sonnet 4.0 through 5.0 and Haiku 4.5, and sends the beta to a
 /// model the catalog does not list. An unrecognized name here is one *newer* than the list, which
@@ -832,13 +837,12 @@ pub(super) async fn stream<B: ClaudeBackend>(
     )
     .await?;
     backend.remember_request_id(&attribution, response.headers());
-    drive_claude_sse_stream(
-        response,
-        event_sender,
-        cancellation,
-        attribution.previous_message.clone(),
-    )
-    .await
+    // A refusal is no response of the conversation's: Claude Code holds a request id, and so
+    // records a response, only once the request is answered with a success.
+    if response.status().is_success() {
+        attribution.note_response_arrived();
+    }
+    drive_claude_sse_stream(response, event_sender, cancellation, Some(attribution)).await
 }
 
 /// Read a Claude SSE response to its end, forwarding each event on the channel.
@@ -846,10 +850,10 @@ pub(super) async fn drive_claude_sse_stream(
     response: reqwest::Response,
     event_sender: mpsc::Sender<StreamEvent>,
     cancellation: CancellationToken,
-    previous_message: Option<crate::provider::PreviousMessageSlot>,
+    attribution: Option<crate::provider::Attribution>,
 ) -> Result<()> {
     let mut protocol = ClaudeStream {
-        previous_message,
+        attribution,
         ..ClaudeStream::default()
     };
     let ended = crate::provider::sse::drive(
@@ -892,9 +896,10 @@ pub(super) async fn drive_claude_sse_stream(
 /// The Claude driver's state between frames.
 #[derive(Default)]
 struct ClaudeStream {
-    /// Where `message_start`'s id is recorded for the next request's
-    /// `diagnostics.previous_message_id`; `None` on a stream that is not a conversation turn.
-    previous_message: Option<crate::provider::PreviousMessageSlot>,
+    /// Who the request was for, whose slots `message_start`'s id is recorded in: the next
+    /// request's `diagnostics.previous_message_id`, and on the main thread its last response.
+    /// `None` on a stream read for no conversation.
+    attribution: Option<crate::provider::Attribution>,
     /// Whether the message reached its end rather than the byte stream simply stopping.
     saw_terminal_event: bool,
     /// The message as `message_start` stated it and each `message_delta` updated it, folded as
@@ -1404,13 +1409,16 @@ impl ClaudeStream {
                         return Ok(Step::ReceiverGone);
                     }
                 }
-                if let (Some(slot), Some(message_id)) = (
-                    &self.previous_message,
+                if let (Some(attribution), Some(message_id)) = (
+                    &self.attribution,
                     data.get("message")
                         .and_then(|message| message.get("id"))
                         .and_then(|id| id.as_str()),
                 ) {
-                    crate::provider::record_message_id(slot, message_id);
+                    if let Some(slot) = &attribution.previous_message {
+                        crate::provider::record_message_id(slot, message_id);
+                    }
+                    attribution.note_message_opened(message_id);
                 }
                 if let Some(model) = data
                     .get("message")
@@ -1667,7 +1675,10 @@ mod tests {
     async fn message_start_records_the_message_id_on_the_attribution() {
         let slot = crate::provider::PreviousMessageSlot::default();
         let mut protocol = super::ClaudeStream {
-            previous_message: Some(std::sync::Arc::clone(&slot)),
+            attribution: Some(crate::provider::Attribution {
+                previous_message: Some(std::sync::Arc::clone(&slot)),
+                ..Default::default()
+            }),
             ..super::ClaudeStream::default()
         };
         let (sender, _receiver) = tokio::sync::mpsc::channel(8);
@@ -1683,6 +1694,84 @@ mod tests {
         assert_eq!(
             crate::sync::lock(&slot).as_deref(),
             Some("msg_011Cepw4KgcVvSiBJbcdRbqv")
+        );
+    }
+
+    /// On the main thread, a response whose message opens is the last response, with the id and
+    /// the position of the same request, and answers what a compaction armed: even when the
+    /// stream then fails, as Claude Code forgets it once the message has started. Off the main
+    /// thread nothing is recorded.
+    #[tokio::test]
+    async fn an_opened_message_is_the_main_thread_s_last_response_and_answers_the_armed_one() {
+        let position = Some(crate::stats::TurnPosition {
+            prompt_index: 3,
+            turn_index: 4,
+        });
+        let armed = crate::provider::MainResponse {
+            message_id: Some("msg_01armed".to_string()),
+            turn_position: None,
+        };
+        let main_thread = crate::provider::MainThreadResponses::default();
+        *crate::sync::lock(&main_thread.before_compaction) = Some(armed.clone());
+        let attribution = crate::provider::Attribution {
+            main_thread: Some(main_thread.clone()),
+            turn_position: position,
+            ..Default::default()
+        };
+        attribution.note_response_arrived();
+        assert_eq!(
+            *crate::sync::lock(&main_thread.last),
+            Some(crate::provider::MainResponse {
+                message_id: None,
+                turn_position: position,
+            }),
+            "a response is the last once it arrives"
+        );
+        assert_eq!(
+            attribution.response_before_compaction(),
+            Some(armed.clone())
+        );
+
+        let response: reqwest::Response = http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01opened\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"
+                    .to_string(),
+            )
+            .expect("build response")
+            .into();
+        let (sender, _receiver) = mpsc::channel(64);
+        let outcome = drive_claude_sse_stream(
+            response,
+            sender,
+            CancellationToken::new(),
+            Some(attribution.clone()),
+        )
+        .await;
+        assert!(outcome.is_err(), "the stream ended before a stop reason");
+        assert_eq!(
+            *crate::sync::lock(&main_thread.last),
+            Some(crate::provider::MainResponse {
+                message_id: Some("msg_01opened".to_string()),
+                turn_position: position,
+            })
+        );
+        assert_eq!(attribution.response_before_compaction(), None);
+
+        let elsewhere = crate::provider::Attribution {
+            turn_position: position,
+            ..Default::default()
+        };
+        elsewhere.note_response_arrived();
+        elsewhere.note_message_opened("msg_01elsewhere");
+        assert_eq!(elsewhere.response_before_compaction(), None);
+        assert_eq!(
+            crate::sync::lock(&main_thread.last)
+                .as_ref()
+                .and_then(|response| response.message_id.as_deref()),
+            Some("msg_01opened"),
+            "a request off the main thread records nothing there"
         );
     }
 
@@ -2915,12 +3004,14 @@ mod tests {
     }
 
     #[test]
-    fn per_turn_effort_goes_to_the_four_models_the_catalog_grants_it() {
+    fn per_turn_effort_goes_to_the_six_models_the_catalog_grants_it() {
         for model in [
             "claude-opus-5-5",
             "claude-sonnet-5-5",
             "claude-haiku-5-5",
             "claude-fable-5-1",
+            "claude-fable-5-2",
+            "claude-mythos-5-2",
         ] {
             assert!(model_supports_per_turn_effort(model), "{model}");
         }

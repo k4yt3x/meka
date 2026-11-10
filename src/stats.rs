@@ -1,7 +1,8 @@
 //! Per-session counters surfaced by `/status`, recorded by the agent: tokens and turn count from
-//! the provider's usage, image redactions from the [`Redaction`] a Claude provider reports.
+//! the provider's usage, image redactions from the [`Redaction`] a Claude provider reports. Beside
+//! them, the tools the session has called, which the Claude subscription reports on every request.
 //!
-//! All fields are lock-free atomics so any task can update without contention; readers take a
+//! The counters are lock-free atomics so any task can update without contention; readers take a
 //! [`SessionStatsSnapshot`] for display.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -31,8 +32,16 @@ pub(crate) struct TurnPosition {
     pub(crate) turn_index: u64,
 }
 
-/// A session's lifetime counters, updated by the agent as turns complete, and the position of the
-/// turn it last opened.
+/// A tool the session called, as Claude Code's tools-used header names one: by the name the call
+/// gave, and whether an MCP server serves it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ToolUsed {
+    pub(crate) name: String,
+    pub(crate) mcp: bool,
+}
+
+/// A session's lifetime counters, updated by the agent as turns complete, the position of the
+/// turn it last opened, and the tools it has called.
 #[derive(Debug)]
 pub(crate) struct SessionStats {
     turns: AtomicU64,
@@ -49,6 +58,8 @@ pub(crate) struct SessionStats {
     redactions: AtomicU64,
     redacted_images: AtomicU64,
     redacted_bytes: AtomicU64,
+    /// Every tool the session and its sub-agents have called, each once, first call first.
+    tools_used: std::sync::Mutex<Vec<ToolUsed>>,
 }
 
 impl Default for SessionStats {
@@ -61,20 +72,45 @@ impl SessionStats {
     /// Rebuild the counters from a persisted snapshot, so a resumed session continues its lifetime
     /// totals instead of restarting at zero.
     pub(crate) fn from_snapshot(snapshot: &SessionStatsSnapshot) -> Self {
+        let stats = Self {
+            turns: AtomicU64::new(0),
+            numbered: AtomicBool::new(false),
+            prompt_index: AtomicU64::new(0),
+            turn_index: AtomicU64::new(0),
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
+            cache_creation_input_tokens: AtomicU64::new(0),
+            cache_read_input_tokens: AtomicU64::new(0),
+            redactions: AtomicU64::new(0),
+            redacted_images: AtomicU64::new(0),
+            redacted_bytes: AtomicU64::new(0),
+            tools_used: std::sync::Mutex::new(Vec::new()),
+        };
+        stats.adopt(snapshot);
+        stats
+    }
+
+    /// Take every counter, the position and the tools from `snapshot`, in place: the session
+    /// these stats are for is now the one `snapshot` was taken of. The one place a snapshot's
+    /// fields become the counters, so [`Self::from_snapshot`] cannot take one this misses.
+    pub(crate) fn adopt(&self, snapshot: &SessionStatsSnapshot) {
         let position = snapshot.turn_position.unwrap_or_default();
-        Self {
-            turns: AtomicU64::new(snapshot.turns),
-            numbered: AtomicBool::new(snapshot.turn_position.is_some()),
-            prompt_index: AtomicU64::new(position.prompt_index),
-            turn_index: AtomicU64::new(position.turn_index),
-            input_tokens: AtomicU64::new(snapshot.input_tokens),
-            output_tokens: AtomicU64::new(snapshot.output_tokens),
-            cache_creation_input_tokens: AtomicU64::new(snapshot.cache_creation_input_tokens),
-            cache_read_input_tokens: AtomicU64::new(snapshot.cache_read_input_tokens),
-            redactions: AtomicU64::new(snapshot.redactions),
-            redacted_images: AtomicU64::new(snapshot.redacted_images),
-            redacted_bytes: AtomicU64::new(snapshot.redacted_bytes),
-        }
+        self.turns.store(snapshot.turns, Relaxed);
+        self.numbered
+            .store(snapshot.turn_position.is_some(), Relaxed);
+        self.prompt_index.store(position.prompt_index, Relaxed);
+        self.turn_index.store(position.turn_index, Relaxed);
+        self.input_tokens.store(snapshot.input_tokens, Relaxed);
+        self.output_tokens.store(snapshot.output_tokens, Relaxed);
+        self.cache_creation_input_tokens
+            .store(snapshot.cache_creation_input_tokens, Relaxed);
+        self.cache_read_input_tokens
+            .store(snapshot.cache_read_input_tokens, Relaxed);
+        self.redactions.store(snapshot.redactions, Relaxed);
+        self.redacted_images
+            .store(snapshot.redacted_images, Relaxed);
+        self.redacted_bytes.store(snapshot.redacted_bytes, Relaxed);
+        *crate::sync::lock(&self.tools_used) = snapshot.tools_used.clone();
     }
 
     /// Stamp the turn about to open with its position and return it, or `None` for a session
@@ -128,6 +164,22 @@ impl SessionStats {
         self.redacted_bytes.fetch_add(redaction.bytes, Relaxed);
     }
 
+    /// Record the tools `called` names, in order, past those already recorded. A tool is
+    /// recorded once, where it was first called.
+    pub(crate) fn record_tools_used(&self, called: impl IntoIterator<Item = ToolUsed>) {
+        let mut used = crate::sync::lock(&self.tools_used);
+        for tool in called {
+            if !used.iter().any(|recorded| recorded.name == tool.name) {
+                used.push(tool);
+            }
+        }
+    }
+
+    /// Every tool recorded so far, first call first.
+    pub(crate) fn tools_used(&self) -> Vec<ToolUsed> {
+        crate::sync::lock(&self.tools_used).clone()
+    }
+
     /// The counters as plain numbers, for display and for the store.
     pub(crate) fn snapshot(&self) -> SessionStatsSnapshot {
         SessionStatsSnapshot {
@@ -143,6 +195,7 @@ impl SessionStats {
             redactions: self.redactions.load(Relaxed),
             redacted_images: self.redacted_images.load(Relaxed),
             redacted_bytes: self.redacted_bytes.load(Relaxed),
+            tools_used: self.tools_used(),
         }
     }
 }
@@ -160,6 +213,7 @@ pub(crate) struct SessionStatsSnapshot {
     pub(crate) redactions: u64,
     pub(crate) redacted_images: u64,
     pub(crate) redacted_bytes: u64,
+    pub(crate) tools_used: Vec<ToolUsed>,
 }
 
 /// A session that has done nothing yet: every counter zero, numbering from the first turn.
@@ -175,6 +229,7 @@ impl Default for SessionStatsSnapshot {
             redactions: 0,
             redacted_images: 0,
             redacted_bytes: 0,
+            tools_used: Vec::new(),
         }
     }
 }
@@ -379,6 +434,83 @@ mod tests {
         assert_eq!(stats.snapshot().turn_position, None);
     }
 
+    /// A tool is recorded once, where it was first called, whoever in the session called it.
+    #[test]
+    fn a_tool_is_recorded_once_where_it_was_first_called() {
+        let tool = |name: &str, mcp: bool| ToolUsed {
+            name: name.to_string(),
+            mcp,
+        };
+        let stats = SessionStats::default();
+        stats.record_tools_used([tool("agent_spawn", false), tool("file_read", false)]);
+        stats.record_tools_used([
+            tool("mcp__kv__fetch", true),
+            tool("agent_spawn", false),
+            tool("file_read", false),
+        ]);
+        assert_eq!(stats.tools_used(), vec![
+            tool("agent_spawn", false),
+            tool("file_read", false),
+            tool("mcp__kv__fetch", true),
+        ]);
+    }
+
+    /// Adopting another session's row replaces everything in place, the tools included, so an
+    /// agent that moves to another session neither keeps the last one's nor adds to them.
+    #[test]
+    fn adopting_a_row_replaces_every_field_in_place() {
+        let stats = SessionStats::default();
+        stats.stamp_turn(true);
+        stats.record_turn(&TokenUsage {
+            input_tokens: 7,
+            output_tokens: 7,
+            cache_creation_input_tokens: 7,
+            cache_read_input_tokens: 7,
+        });
+        stats.record_tools_used([ToolUsed {
+            name: "shell_run".to_string(),
+            mcp: false,
+        }]);
+        let other = SessionStatsSnapshot {
+            turns: 9,
+            turn_position: None,
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 4,
+            redactions: 5,
+            redacted_images: 6,
+            redacted_bytes: 7,
+            tools_used: vec![ToolUsed {
+                name: "web_fetch".to_string(),
+                mcp: false,
+            }],
+        };
+        stats.adopt(&other);
+        let adopted = stats.snapshot();
+        assert_eq!(adopted.turns, 9);
+        assert_eq!(adopted.turn_position, None);
+        assert_eq!(stats.stamp_turn(true), None, "the row numbers nothing");
+        assert_eq!(
+            (
+                adopted.input_tokens,
+                adopted.output_tokens,
+                adopted.cache_creation_input_tokens,
+                adopted.cache_read_input_tokens
+            ),
+            (1, 2, 3, 4)
+        );
+        assert_eq!(
+            (
+                adopted.redactions,
+                adopted.redacted_images,
+                adopted.redacted_bytes
+            ),
+            (5, 6, 7)
+        );
+        assert_eq!(adopted.tools_used, other.tools_used);
+    }
+
     #[test]
     fn from_snapshot_seeds_all_fields() {
         // Resume rebuilds the live counters from the persisted snapshot.
@@ -395,8 +527,13 @@ mod tests {
             redactions: 1,
             redacted_images: 2,
             redacted_bytes: 1024,
+            tools_used: vec![ToolUsed {
+                name: "file_read".to_string(),
+                mcp: false,
+            }],
         };
         let round = SessionStats::from_snapshot(&snapshot).snapshot();
+        assert_eq!(round.tools_used, snapshot.tools_used);
         assert_eq!(round.turns, 3);
         assert_eq!(round.turn_position, snapshot.turn_position);
         assert_eq!(round.input_tokens, 10);

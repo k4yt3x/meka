@@ -843,4 +843,91 @@ mod tests {
         assert_eq!(completion.usage.input_tokens, 7);
         assert_eq!(completion.usage.output_tokens, 1);
     }
+
+    /// Serve one answer with `status` and no frames, and stream a main-thread request at it.
+    async fn main_thread_after(status: &'static str) -> crate::provider::MainThreadResponses {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut chunk = [0u8; 65536];
+            if socket.read(&mut chunk).await.is_err() {
+                return;
+            }
+            let body = if status.starts_with("200") {
+                String::new()
+            } else {
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"too long"}}"#
+                    .to_string()
+            };
+            let content_type = if status.starts_with("200") {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.shutdown().await.is_err() {
+                tracing::debug!("mock endpoint failed to shut its socket down cleanly");
+            }
+        });
+
+        let provider = provider_with_base(
+            "claude-sonnet-4-20250514",
+            None,
+            Some(&format!("http://127.0.0.1:{port}")),
+        );
+        let main_thread = crate::provider::MainThreadResponses::default();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(64);
+        let outcome = provider
+            .stream(
+                CompletionRequest::new("", &[Message::user("hello")], &[]).attributed(
+                    crate::provider::Attribution {
+                        main_thread: Some(main_thread.clone()),
+                        turn_position: Some(crate::stats::TurnPosition {
+                            prompt_index: 1,
+                            turn_index: 2,
+                        }),
+                        ..Default::default()
+                    },
+                ),
+                sender,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(outcome.is_err(), "neither answer ends with a stop reason");
+        main_thread
+    }
+
+    /// On the main thread a response is the last one received once it is answered with a success,
+    /// with no message id while none opened, as Claude Code records it whatever becomes of the
+    /// stream; a refusal is not one, as Claude Code holds no request id for it.
+    #[tokio::test]
+    async fn a_successful_answer_is_the_main_thread_s_last_and_a_refusal_is_not() {
+        let answered = main_thread_after("200 OK").await;
+        assert_eq!(
+            *crate::sync::lock(&answered.last),
+            Some(crate::provider::MainResponse {
+                message_id: None,
+                turn_position: Some(crate::stats::TurnPosition {
+                    prompt_index: 1,
+                    turn_index: 2,
+                }),
+            })
+        );
+        let refused = main_thread_after("400 Bad Request").await;
+        assert_eq!(*crate::sync::lock(&refused.last), None);
+    }
 }

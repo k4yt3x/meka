@@ -192,9 +192,17 @@ impl ClaudeSubscriptionProvider {
         self.resolved_effort.is_some()
     }
 
-    /// Mirrors Claude Code 2.1.310's beta assembly for a first-party OAuth turn, validated against
-    /// live captures of its interactive CLI: Opus 5.5 and Opus 5 with tools, thinking on and
-    /// display updates, fifteen betas in this order on Opus 5.5.
+    /// Mirrors Claude Code 2.1.322's beta assembly for a first-party OAuth turn, validated against
+    /// captures of its interactive CLI on Opus 5.5 with tools and thinking on: fourteen betas in
+    /// this order on a turn, the same less one and plus one on a compaction, a worker's request
+    /// without the hour-long cache's.
+    ///
+    /// `tool-provenance-2026-10-26` goes on every request, whatever the model: Claude Code sends it
+    /// to the first-party endpoint alone, which is the only one this backend reaches. Its body half
+    /// (`ownership_metadata` on an MCP server it connects to on the user's behalf) never applies,
+    /// since every MCP server Meka knows is one the user configured.
+    /// `thinking-token-count-2026-05-13` follows it, since Claude Code appends that one after
+    /// assembling the rest of the model's list.
     ///
     /// `per-turn-control-2026-07-01` and `mid-conversation-tool-changes-2026-07-01` are gated on
     /// the model, each the way Claude Code's catalog gates it; see the two predicates.
@@ -239,7 +247,7 @@ impl ClaudeSubscriptionProvider {
         // A deferred declaration needs the beta as much as an active tool does; `has_tools` here
         // already covers both, as `authenticated_request` folds them before calling.
         let model = self.model.as_str();
-        let mut parts: Vec<&'static str> = Vec::with_capacity(17);
+        let mut parts: Vec<&'static str> = Vec::with_capacity(18);
 
         if !model_is_haiku(model) {
             parts.push("claude-code-20250219");
@@ -254,19 +262,22 @@ impl ClaudeSubscriptionProvider {
             if self.sends_redaction_beta(thinking_on) {
                 parts.push("redact-thinking-2026-02-12");
             }
-            parts.push("thinking-token-count-2026-05-13");
             parts.push("context-management-2025-06-27");
         }
 
         parts.push("prompt-caching-scope-2026-01-05");
 
         // No `mid-conversation-system-2026-04-07`: the feature is generally available, and Claude
-        // Code 2.1.310 refuses to send that header even when `ANTHROPIC_BETAS` names it.
+        // Code 2.1.322 refuses to send that header even when `ANTHROPIC_BETAS` names it.
         if model_supports_per_turn_effort(model) {
             parts.push("per-turn-control-2026-07-01");
         }
         if model_supports_mid_conversation_tool_changes(model) {
             parts.push("mid-conversation-tool-changes-2026-07-01");
+        }
+        parts.push("tool-provenance-2026-10-26");
+        if model_supports_modern_features(model) {
+            parts.push("thinking-token-count-2026-05-13");
         }
 
         if has_tools {
@@ -710,7 +721,7 @@ impl Provider for ClaudeSubscriptionProvider {
     /// `mcp__<server>__<tool>` names pass; so Meka's MCP meta-tools are never put on this wire.
     /// Established by replaying captured requests with the name as the one variable, 2026-10-16.
     fn refuses_tool_name(&self, name: &str) -> bool {
-        name.starts_with("mcp_") && !name.starts_with("mcp__")
+        endpoint_refuses_tool_name(name)
     }
 
     async fn complete(
@@ -861,6 +872,13 @@ impl OAuthUsageResponse {
 /// Claude Code stamps the id onto the assistant message as soon as the request resolves, error or
 /// not. A response with no `request-id` (a proxy that drops it) simply leaves the previous value in
 /// place, which is what Claude Code's "last assistant message that has one" does too.
+/// Whether this endpoint answers a request naming `name` as a tool with "You're out of extra
+/// usage": a name with the `mcp_` prefix that is not a server's `mcp__<server>__<tool>`. See
+/// [`ClaudeSubscriptionProvider::refuses_tool_name`].
+fn endpoint_refuses_tool_name(name: &str) -> bool {
+    name.starts_with("mcp_") && !name.starts_with("mcp__")
+}
+
 fn remember_request_id(
     attribution: &crate::provider::Attribution,
     headers: &reqwest::header::HeaderMap,
@@ -1768,9 +1786,9 @@ mod tests {
 
     #[test]
     fn betas_modern_thinking_model_full_set() {
-        // Tools + thinking + display updates. The live Claude Code 2.1.310 interactive CLI
-        // capture on Opus 5.5, taken with summaries on, is this list without the display beta,
-        // which the 2.1.301 capture with updates on showed in this position; both minus
+        // Tools + thinking + display updates. The Claude Code 2.1.322 interactive CLI capture on
+        // Opus 5.5, taken with summaries on, is this list without the display beta, which the
+        // 2.1.301 capture with updates on showed in this position; both minus
         // `context-1m-2025-08-07`, which this profile's window does not ask for. Display updates
         // replace the redaction beta on a turn with thinking on.
         let betas = provider_full(
@@ -1788,11 +1806,12 @@ mod tests {
                 "claude-code-20250219",
                 "oauth-2025-04-20",
                 "interleaved-thinking-2025-05-14",
-                "thinking-token-count-2026-05-13",
                 "context-management-2025-06-27",
                 "prompt-caching-scope-2026-01-05",
                 "per-turn-control-2026-07-01",
                 "mid-conversation-tool-changes-2026-07-01",
+                "tool-provenance-2026-10-26",
+                "thinking-token-count-2026-05-13",
                 "advanced-tool-use-2025-11-20",
                 "effort-2025-11-24",
                 "thinking-binding-controls-2026-08-01",
@@ -1800,7 +1819,7 @@ mod tests {
                 "extended-cache-ttl-2025-04-11",
                 "cache-diagnosis-2026-04-07",
             ],
-            "Claude Code 2.1.310 CLI beta set"
+            "Claude Code 2.1.322 CLI beta set"
         );
     }
 
@@ -2162,7 +2181,7 @@ mod tests {
 
     #[test]
     fn mid_conversation_tool_changes_follow_the_catalog_s_denylist() {
-        // The gate is a denylist over Claude Code 2.1.310's catalog: every entry with the
+        // The gate is a denylist over Claude Code 2.1.322's catalog: every entry with the
         // capability gets it, the named older ones and Sonnet 5 do not.
         for model in [
             "claude-opus-4-8",
@@ -2580,10 +2599,10 @@ mod tests {
         }
     }
 
-    /// Claude Code 2.1.310 with `showThinkingSummaries` on, captured on Opus 5.5: the same set
+    /// Claude Code 2.1.322 with `showThinkingSummaries` on, captured on Opus 5.5: the same set
     /// as the default display minus the display-updates beta, and `display: "summarized"`.
     #[test]
-    fn betas_under_summaries_match_the_2_1_301_capture() {
+    fn betas_under_summaries_match_the_2_1_322_capture() {
         let provider = provider_full(
             "claude-opus-5-5",
             true,
@@ -2595,11 +2614,12 @@ mod tests {
             "claude-code-20250219",
             "oauth-2025-04-20",
             "interleaved-thinking-2025-05-14",
-            "thinking-token-count-2026-05-13",
             "context-management-2025-06-27",
             "prompt-caching-scope-2026-01-05",
             "per-turn-control-2026-07-01",
             "mid-conversation-tool-changes-2026-07-01",
+            "tool-provenance-2026-10-26",
+            "thinking-token-count-2026-05-13",
             "advanced-tool-use-2025-11-20",
             "effort-2025-11-24",
             "thinking-binding-controls-2026-08-01",

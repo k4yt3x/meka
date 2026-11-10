@@ -21446,7 +21446,7 @@ fn a_codex_login_completes_from_the_loopback_listener_or_a_posted_callback() {
     assert_eq!(query_parameter(url, "client_id"), "cidcodex");
     assert_eq!(
         query_parameter(url, "redirect_uri"),
-        "http://localhost:1455/auth/callback"
+        "http://127.0.0.1:1455/auth/callback"
     );
     let state = query_parameter(url, "state");
     let login_id = started["login_id"].as_str().unwrap().to_string();
@@ -21482,7 +21482,7 @@ fn a_codex_login_completes_from_the_loopback_listener_or_a_posted_callback() {
     for expected in [
         "code=cbcode",
         "client_id=cidcodex",
-        "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback",
+        "redirect_uri=http%3A%2F%2F127%2E0%2E0%2E1%3A1455%2Fauth%2Fcallback",
     ] {
         assert!(exchange.contains(expected), "{expected} not in {exchange}");
     }

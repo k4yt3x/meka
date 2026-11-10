@@ -821,23 +821,21 @@ pub(crate) struct SessionSpec {
     /// so a value here is at most the row's own repeated.
     pub(crate) project: Option<String>,
 }
-/// A session's lifetime counters: the row's, when it has one, so a resumed session continues its
-/// `/status` totals wherever it is resumed; fresh otherwise, and fresh when the row cannot be read,
-/// which is logged rather than fatal because the counters inform nothing that decides.
+/// A session's lifetime counters, its turn position and the tools it called: the row's, when it
+/// has one, so a resumed session continues them wherever it is resumed; fresh for a session with
+/// no row yet. A row that cannot be read refuses the session, as the screen's `/resume` does:
+/// starting fresh would save the fresh counters over the row at the turn's end.
 pub(crate) async fn session_stats_for(
     store: &Store,
     session_id: Option<uuid::Uuid>,
-) -> Arc<crate::stats::SessionStats> {
+) -> crate::error::Result<Arc<crate::stats::SessionStats>> {
     let Some(id) = session_id else {
-        return Arc::new(crate::stats::SessionStats::default());
+        return Ok(Arc::new(crate::stats::SessionStats::default()));
     };
-    match store.load_session_stats(id).await {
-        Ok(snapshot) => Arc::new(crate::stats::SessionStats::from_snapshot(&snapshot)),
-        Err(error) => {
-            tracing::warn!("failed to load session stats, starting fresh: {error}");
-            Arc::new(crate::stats::SessionStats::default())
-        }
-    }
+    let snapshot = store.load_session_stats(id).await?;
+    Ok(Arc::new(crate::stats::SessionStats::from_snapshot(
+        &snapshot,
+    )))
 }
 /// Build one session's `Agent` from the already-prepared [`SharedDeps`]: the one door every host
 /// creates or reopens a session through. The registry it dispatches through and the cells it drives
@@ -904,7 +902,7 @@ pub(crate) async fn build_session_agent(
         Some(id) => cells.with_session(id),
         None => cells,
     };
-    let session_stats = session_stats_for(&shared.store, session_id).await;
+    let session_stats = session_stats_for(&shared.store, session_id).await?;
     assemble_agent(shared.materials(session_stats), cells, agent_options).await
 }
 /// This session's copy of the process-wide options: the standing text, with the files
@@ -1501,6 +1499,24 @@ impl SharedDeps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row whose counters cannot be read refuses the session rather than handing it fresh ones,
+    /// which the session's next turn would save over the row.
+    #[tokio::test]
+    async fn a_session_whose_counters_cannot_be_read_is_refused() {
+        let store = crate::store::Store::for_test().await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        assert!(session_stats_for(&store, Some(id)).await.is_ok());
+        store
+            .run_sql_for_test(&format!(
+                "UPDATE sessions SET tools_used = 'not json' WHERE id = '{id}'"
+            ))
+            .await;
+        assert!(session_stats_for(&store, Some(id)).await.is_err());
+    }
 
     /// Both arms, against real rows rather than a fabricated `parent_id`.
     ///

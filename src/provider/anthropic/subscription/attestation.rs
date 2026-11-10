@@ -21,7 +21,7 @@ use crate::{
 
 /// Claude Code version whose wire this module mirrors. A bump is verified against a capture of
 /// the real client first, because the server refuses a version too old for a new model.
-pub(super) const CC_VERSION: &str = "2.1.310";
+pub(super) const CC_VERSION: &str = "2.1.322";
 
 /// Fingerprint salt. `MHE` in the shipped 2.1.241 binary, present unchanged in 2.1.263.
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
@@ -84,10 +84,12 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
 /// real attestation by [`patch_request_body`] after serialization.
 ///
 /// The optional segments follow in the order Claude Code's builder emits them (2.1.241 through
-/// 2.1.310, verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`,
-/// `cc_prev_req`, `cc_prompt_id`, `cc_turn_origin`, and since 2.1.284 the pair `cc_prompt_index`
-/// and `cc_turn_index`, which go together or not at all. Meka never has a workload, so that one
-/// is always absent; the rest appear exactly when their source does.
+/// 2.1.322, verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`,
+/// `cc_prev_req`, `cc_prompt_id`, `cc_turn_origin`, since 2.1.284 the pair `cc_prompt_index`
+/// and `cc_turn_index`, which go together or not at all, and since 2.1.322 `cc_prev_msg` and the
+/// pair `cc_prev_prompt_index` and `cc_prev_turn_index`, which name the response before a
+/// compaction. Meka never has a workload, a gateway, a claude.ai project or a dispatch entrypoint,
+/// so those segments are always absent; the rest appear exactly when their source does.
 pub(super) fn generate_billing_header(
     messages: &[Message],
     attribution: &crate::provider::Attribution,
@@ -118,8 +120,25 @@ pub(super) fn generate_billing_header(
             )
         })
         .unwrap_or_default();
+    let before_compaction = attribution.response_before_compaction();
+    let message_before_compaction = before_compaction
+        .as_ref()
+        .and_then(|response| response.message_id.as_deref())
+        .filter(|id| is_billing_message_id(id))
+        .map(|id| format!(" cc_prev_msg={id};"))
+        .unwrap_or_default();
+    let position_before_compaction = before_compaction
+        .as_ref()
+        .and_then(|response| response.turn_position)
+        .map(|position| {
+            format!(
+                " cc_prev_prompt_index={}; cc_prev_turn_index={};",
+                position.prompt_index, position.turn_index
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}{}{}{}{}",
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}{}{}{}{}{}{}",
         CC_VERSION,
         compute_fingerprint_from_messages(messages),
         subagent,
@@ -127,7 +146,21 @@ pub(super) fn generate_billing_header(
         prompt,
         origin,
         position,
+        message_before_compaction,
+        position_before_compaction,
     )
+}
+
+/// Whether `id` is a message id `cc_prev_msg` carries: Claude Code's own pattern for the segment,
+/// `msg_` and up to 64 letters, digits and underscores, narrower than what Meka records.
+fn is_billing_message_id(id: &str) -> bool {
+    id.strip_prefix("msg_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 64
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
 }
 
 /// Claude Code caps `x-claude-code-prev-tool-durations` at this many calls and this many
@@ -168,6 +201,81 @@ fn percent_encode_tool_name(name: &str) -> String {
         }
     }
     encoded
+}
+
+/// Claude Code caps `x-claude-code-sandy-plover` at this many entries and this many bytes.
+const TOOLS_USED_MAX_ENTRIES: usize = 64;
+const TOOLS_USED_MAX_BYTES: usize = 7168;
+
+/// The name Claude Code records for a tool whose own name its pattern refuses, and the entry that
+/// leads the list when a cap cuts it.
+const UNREADABLE_TOOL_NAME: &str = "unreadable-tools-used-before-summary";
+
+/// `x-claude-code-sandy-plover`: the tools the session has called as Claude Code 2.1.322 lists
+/// them, a JSON array of `{"name":…}`, an MCP tool's with `"mcp":true`. Every name outside
+/// `^[A-Za-z0-9_.:-]{1,256}$` is listed as one entry of [`UNREADABLE_TOOL_NAME`]. When the whole
+/// list passes either cap, that name leads it, whether or not it is among them already, and as
+/// many entries as fit follow. Claude Code moves its own built-in tools' names to the end, which
+/// no name of Meka's is. A name the endpoint refuses as a tool is left out.
+fn render_tools_used(tools: &[crate::stats::ToolUsed]) -> String {
+    let mut entries: Vec<String> = Vec::with_capacity(tools.len());
+    let mut names: Vec<&str> = Vec::with_capacity(tools.len());
+    // A tool this endpoint refuses to see declared is not named here either, so a session that
+    // called one on another backend does not put it in front of this one.
+    for tool in tools
+        .iter()
+        .filter(|tool| !super::endpoint_refuses_tool_name(&tool.name))
+    {
+        let readable = is_readable_tool_name(&tool.name);
+        let name = if readable {
+            tool.name.as_str()
+        } else {
+            UNREADABLE_TOOL_NAME
+        };
+        if names.contains(&name) {
+            continue;
+        }
+        names.push(name);
+        entries.push(if readable && tool.mcp {
+            format!("{{\"name\":\"{name}\",\"mcp\":true}}")
+        } else {
+            format!("{{\"name\":\"{name}\"}}")
+        });
+    }
+    let fitting = entries_within_caps(&entries);
+    if fitting.len() == entries.len() {
+        return format!("[{}]", fitting.join(","));
+    }
+    let led: Vec<String> = std::iter::once(format!("{{\"name\":\"{UNREADABLE_TOOL_NAME}\"}}"))
+        .chain(entries)
+        .collect();
+    format!("[{}]", entries_within_caps(&led).join(","))
+}
+
+/// The leading entries that fit [`TOOLS_USED_MAX_ENTRIES`] and, with the brackets and commas,
+/// [`TOOLS_USED_MAX_BYTES`].
+fn entries_within_caps(entries: &[String]) -> Vec<&str> {
+    let mut fitting = Vec::new();
+    let mut bytes = 2;
+    for entry in entries {
+        if fitting.len() == TOOLS_USED_MAX_ENTRIES {
+            break;
+        }
+        let added = entry.len() + usize::from(!fitting.is_empty());
+        if bytes + added > TOOLS_USED_MAX_BYTES {
+            break;
+        }
+        fitting.push(entry.as_str());
+        bytes += added;
+    }
+    fitting
+}
+
+fn is_readable_tool_name(name: &str) -> bool {
+    (1..=256).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
 }
 
 // xxHash64 and the `cch` attestation token. The seed and the preimage filter below are the whole
@@ -495,7 +603,7 @@ fn claude_user_agent() -> String {
 /// verified against wire captures of real Claude Code traffic. The runtime reports as `node`
 /// (Bun's Node.js compat layer) with a fixed version string.
 const STAINLESS_RUNTIME: &str = "node";
-const STAINLESS_RUNTIME_VERSION: &str = "v26.3.0";
+const STAINLESS_RUNTIME_VERSION: &str = "v26.12.1";
 const STAINLESS_SDK_VERSION: &str = "0.128.0";
 
 /// Maps `std::env::consts::ARCH` to Node.js/Bun `process.arch` names.
@@ -524,7 +632,7 @@ fn stainless_os() -> &'static str {
 /// Applies all HTTP headers Claude Code sends, in the order it sends them.
 ///
 /// The order is not cosmetic: HTTP/2 preserves it, so it is as much a client signature as the
-/// values are. What the 2.1.241 through 2.1.310 wire captures show is the Stainless SDK's
+/// values are. What the 2.1.241 through 2.1.322 wire captures show is the Stainless SDK's
 /// `Headers` object serialized in a case-sensitive sort (uppercase before lowercase), then the
 /// transport's own `Connection` / `Host` / `Accept-Encoding` / `Content-Length` after it.
 /// `reqwest`'s `HeaderMap` iterates in insertion order, so inserting in that order reproduces it.
@@ -588,7 +696,7 @@ pub(super) fn apply_headers(
         .header("Accept-Encoding", "gzip, deflate, br, zstd")
 }
 
-/// The headers Claude Code 2.1.310 adds about the request itself, in the sorted position the
+/// The headers Claude Code 2.1.322 adds about the request itself, in the sorted position the
 /// captures show them: `x-cc-*` ahead of `x-claude-code-*`, each group alphabetical. Two facts
 /// go out twice because Claude Code keeps a first-party name and a gateway-hint name for each
 /// and sends both to Anthropic.
@@ -603,6 +711,9 @@ pub(super) fn apply_headers(
 /// Since 2.1.284 the prompt id goes out as a header as well as in the billing header, on every
 /// request that has one: a turn's, and a worker's, whose client is built with the prompt id it
 /// inherited; a compaction has none and sends none.
+///
+/// Since 2.1.322 every request names the tools its session has called; see
+/// [`render_tools_used`].
 fn apply_request_hints(
     mut request: reqwest::RequestBuilder,
     attribution: &crate::provider::Attribution,
@@ -641,7 +752,10 @@ fn apply_request_hints(
     if let Some(class) = attribution.request_class() {
         request = request.header("x-claude-code-request-class", class);
     }
-    request
+    request.header(
+        "x-claude-code-sandy-plover",
+        render_tools_used(&attribution.tools_used),
+    )
 }
 
 #[cfg(test)]
@@ -937,6 +1051,53 @@ mod tests {
         assert_ne!(h1, h_claude);
     }
 
+    /// The 2.1.322 capture's first request after `/compact`: the response before it follows the
+    /// turn's own position, and a message id outside Claude Code's pattern leaves its segment out
+    /// while the position still goes.
+    #[test]
+    fn the_billing_header_names_the_response_before_a_compaction_last() {
+        let prompt_id = Uuid::new_v4();
+        let attribution = |message_id: Option<&str>| {
+            let main_thread = crate::provider::MainThreadResponses::default();
+            *crate::sync::lock(&main_thread.before_compaction) =
+                message_id.map(|message_id| crate::provider::MainResponse {
+                    message_id: Some(message_id.to_string()),
+                    turn_position: Some(crate::stats::TurnPosition {
+                        prompt_index: 2,
+                        turn_index: 2,
+                    }),
+                });
+            crate::provider::Attribution {
+                prompt_id: Some(prompt_id),
+                turn_origin: Some(crate::provider::TurnOrigin::Human),
+                turn_position: Some(crate::stats::TurnPosition {
+                    prompt_index: 3,
+                    turn_index: 3,
+                }),
+                main_thread: Some(main_thread),
+                ..Default::default()
+            }
+        };
+        let header = generate_billing_header(
+            &[Message::user("hello")],
+            &attribution(Some("msg_01Fake003")),
+        );
+        let expected_tail = format!(
+            " cc_prompt_id={prompt_id}; cc_turn_origin=human; cc_prompt_index=3; cc_turn_index=3; \
+             cc_prev_msg=msg_01Fake003; cc_prev_prompt_index=2; cc_prev_turn_index=2;"
+        );
+        assert!(header.ends_with(&expected_tail), "{header}");
+        let header =
+            generate_billing_header(&[Message::user("hello")], &attribution(Some("msg_01-dash")));
+        assert!(!header.contains("cc_prev_msg"), "{header}");
+        assert!(
+            header.ends_with(" cc_prev_prompt_index=2; cc_prev_turn_index=2;"),
+            "{header}"
+        );
+        let header = generate_billing_header(&[Message::user("hello")], &attribution(None));
+        assert!(!header.contains("cc_prev_"), "{header}");
+    }
+
     #[test]
     fn the_billing_header_names_the_turn_origin_after_the_prompt_id() {
         let previous = crate::provider::PreviousRequestSlot::default();
@@ -1076,6 +1237,7 @@ mod tests {
             "x-claude-code-prev-tool-durations",
             "x-claude-code-prompt-id",
             "x-claude-code-request-class",
+            "x-claude-code-sandy-plover",
             "x-client-request-id",
         ]);
         let compaction = crate::provider::Attribution {
@@ -1088,6 +1250,7 @@ mod tests {
             "x-claude-code-agent-id",
             "x-claude-code-compaction",
             "x-claude-code-request-class",
+            "x-claude-code-sandy-plover",
             "x-client-request-id",
         ]);
         let worker = crate::provider::Attribution {
@@ -1101,6 +1264,7 @@ mod tests {
             "x-claude-code-agent-type",
             "x-claude-code-prompt-id",
             "x-claude-code-request-class",
+            "x-claude-code-sandy-plover",
             "x-client-request-id",
         ]);
         // A nested worker names its spawner between the compaction facts and the durations, where
@@ -1123,13 +1287,104 @@ mod tests {
             "x-claude-code-prev-tool-durations",
             "x-claude-code-prompt-id",
             "x-claude-code-request-class",
+            "x-claude-code-sandy-plover",
             "x-client-request-id",
         ]);
-        // A request that is none of those, the way a side query of no kind is, is unclassified.
+        // A request that is none of those, the way a side query of no kind is, is unclassified,
+        // and names the tools no conversation called.
         assert_eq!(
             names_after_x_app(crate::provider::Attribution::default()),
-            vec!["x-client-request-id"]
+            vec!["x-claude-code-sandy-plover", "x-client-request-id"]
         );
+    }
+
+    /// The 2.1.322 captures: nothing called is `[]`; a built-in and an MCP tool, first call first,
+    /// the MCP one marked.
+    #[test]
+    fn the_tools_used_header_lists_each_tool_as_the_captures_do() {
+        let tool = |name: &str, mcp: bool| crate::stats::ToolUsed {
+            name: name.to_string(),
+            mcp,
+        };
+        assert_eq!(render_tools_used(&[]), "[]");
+        assert_eq!(
+            render_tools_used(&[
+                tool("agent_spawn", false),
+                tool("mcp__kvhttp__kv_probe_fetch", true)
+            ]),
+            r#"[{"name":"agent_spawn"},{"name":"mcp__kvhttp__kv_probe_fetch","mcp":true}]"#
+        );
+    }
+
+    /// A name Claude Code's pattern refuses is listed as the unreadable name, once however many
+    /// there are, and never marked as an MCP tool's.
+    #[test]
+    fn an_unreadable_tool_name_is_listed_once_as_the_unreadable_name() {
+        let tool = |name: &str, mcp: bool| crate::stats::ToolUsed {
+            name: name.to_string(),
+            mcp,
+        };
+        assert_eq!(
+            render_tools_used(&[
+                tool("mcp__srv__ünïcode", true),
+                tool("file_read", false),
+                tool("has space", false),
+                tool(&"x".repeat(257), false),
+            ]),
+            r#"[{"name":"unreadable-tools-used-before-summary"},{"name":"file_read"}]"#
+        );
+    }
+
+    /// A tool this endpoint refuses to see declared, called on another backend before a profile
+    /// switch, is not named to it either.
+    #[test]
+    fn a_tool_the_endpoint_refuses_is_not_listed() {
+        let tool = |name: &str| crate::stats::ToolUsed {
+            name: name.to_string(),
+            mcp: false,
+        };
+        assert_eq!(
+            render_tools_used(&[tool("mcp_resource_read"), tool("file_read")]),
+            r#"[{"name":"file_read"}]"#
+        );
+    }
+
+    /// Past 64 entries, or past 7168 bytes, the list opens on the unreadable name and carries as
+    /// many of the rest as fit behind it.
+    #[test]
+    fn a_list_past_a_cap_opens_on_the_unreadable_name() {
+        let many: Vec<crate::stats::ToolUsed> = (0..65)
+            .map(|index| crate::stats::ToolUsed {
+                name: format!("tool_{index:02}"),
+                mcp: false,
+            })
+            .collect();
+        let rendered: Vec<serde_json::Value> =
+            serde_json::from_str(&render_tools_used(&many)).expect("json");
+        assert_eq!(rendered.len(), 64);
+        assert_eq!(rendered[0]["name"], UNREADABLE_TOOL_NAME);
+        assert_eq!(rendered[1]["name"], "tool_00");
+        assert_eq!(rendered[63]["name"], "tool_62");
+        assert_eq!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&render_tools_used(&many[..64]))
+                .expect("json")
+                .len(),
+            64,
+            "64 entries fit as they are"
+        );
+
+        let long: Vec<crate::stats::ToolUsed> = (0..40)
+            .map(|index| crate::stats::ToolUsed {
+                name: format!("{index:02}{}", "n".repeat(200)),
+                mcp: false,
+            })
+            .collect();
+        let rendered = render_tools_used(&long);
+        assert!(rendered.len() <= TOOLS_USED_MAX_BYTES, "{}", rendered.len());
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&rendered).expect("json");
+        assert_eq!(entries[0]["name"], UNREADABLE_TOOL_NAME);
+        assert_eq!(entries[1]["name"], long[0].name.as_str());
+        assert!(entries.len() < 41, "{}", entries.len());
     }
 
     #[test]

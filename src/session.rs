@@ -1111,6 +1111,10 @@ mod tests {
                 turn_index: 3,
             }),
             input_tokens: 1000,
+            tools_used: vec![crate::stats::ToolUsed {
+                name: "read".to_string(),
+                mcp: false,
+            }],
             ..Default::default()
         };
         manager
@@ -1287,6 +1291,7 @@ mod tests {
             .expect("load stats");
         assert_eq!(imported_stats.turns, 3);
         assert_eq!(imported_stats.input_tokens, 1000);
+        assert_eq!(imported_stats.tools_used, stats.tools_used);
         assert_eq!(
             imported_stats.turn_position,
             Some(crate::stats::TurnPosition {
