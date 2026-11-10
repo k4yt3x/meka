@@ -558,16 +558,18 @@ fn encode_tools(
     declared
 }
 
-/// Mutable state threaded through SSE event processing. Tracks the in-flight tool call's
-/// accumulated arguments so a parsed `ToolUseEnd` can be returned even if the server elides the
-/// final `arguments` field.
+/// What [`process_event`] carries between frames: the output items in progress, by the index the
+/// spec addresses each by, and what the response has said of itself.
 #[derive(Default)]
 pub(super) struct SseState {
-    active_tool_call: Option<ActiveToolCall>,
-    in_reasoning: bool,
-    /// The kind of the reasoning item's part in progress, so a delta of another kind opens a part
-    /// of its own.
-    reasoning_part: Option<crate::conversation::ReasoningKind>,
+    /// The output items open now, by `output_index`: every item and content event names its item
+    /// by it, and items may stream at once.
+    items: std::collections::BTreeMap<u64, OpenItem>,
+    /// The `output_index` of the item opened last, after which an event that names no item is
+    /// kept.
+    latest: u64,
+    /// The place the events returned so far are of; see [`StreamEvent::Place`].
+    place: u64,
     /// Whether this response emitted any `function_call` output item. The Responses API reports
     /// `status: "completed"` even for tool-call turns, so the stop reason has to be inferred from
     /// the presence of function calls rather than the status (mirrors the Chat Completions
@@ -606,7 +608,8 @@ fn response_fields(
 /// An output item's fields beyond `held`, the ones its blocks hold, with each list of parts under
 /// a key of `parts` kept as the parts' own remainders, in place: each part's fields beyond those
 /// listed beside the key. A part left with nothing is an empty object, so the places hold; a list
-/// whose parts all are is left out.
+/// whose parts all are is left out, since its blocks restate it. An empty list stays, since no
+/// block tells it from a list never stated, and so does a value under the key that is no list.
 fn item_fields(
     item: &serde_json::Value,
     held: &[&str],
@@ -615,10 +618,10 @@ fn item_fields(
     let item = item.as_object()?;
     let mut fields = crate::provider::fields_beyond(item, held).unwrap_or_default();
     for (key, part_held) in parts {
-        fields.remove(*key);
         let Some(list) = item.get(*key).and_then(serde_json::Value::as_array) else {
             continue;
         };
+        fields.remove(*key);
         let remainders: Vec<serde_json::Value> = list
             .iter()
             .map(|part| {
@@ -629,9 +632,10 @@ fn item_fields(
                 )
             })
             .collect();
-        if remainders
-            .iter()
-            .any(|part| part.as_object().is_some_and(|part| !part.is_empty()))
+        if remainders.is_empty()
+            || remainders
+                .iter()
+                .any(|part| part.as_object().is_some_and(|part| !part.is_empty()))
         {
             fields.insert((*key).to_string(), serde_json::Value::Array(remainders));
         }
@@ -639,11 +643,144 @@ fn item_fields(
     (!fields.is_empty()).then_some(fields)
 }
 
-struct ActiveToolCall {
-    /// The call's id and name as the item that opened it named them; `None` when it did not,
-    /// which leaves the call to the item that finishes it.
-    opened: Option<(String, String)>,
-    arguments_buffer: String,
+/// An output item between its `output_item.added` and its `output_item.done`.
+#[derive(Default)]
+struct OpenItem {
+    kind: ItemKind,
+    parts: Parts,
+    /// Events addressed to the item in a shape the spec does not allow (a part event naming no
+    /// part), kept whole after the item so it is not split.
+    unread: Vec<serde_json::Value>,
+}
+
+/// What an open item is, with what its end needs.
+#[derive(Default)]
+enum ItemKind {
+    /// A function call or the endpoint's search call: its id and name as the item that opened it
+    /// named them, `None` when it did not, which leaves the call to the item that finishes it, and
+    /// its arguments as they streamed.
+    Call {
+        opened: Option<(String, String)>,
+        arguments: String,
+    },
+    /// A reasoning item, and whether it streamed anything readable.
+    Reasoning { showed: bool },
+    /// A message, and whether it streamed any words.
+    Message { streamed: bool },
+    /// An item of a type Meka reads nothing from until it is done.
+    #[default]
+    Other,
+}
+
+/// A part of an item, by the index the spec numbers it with: a message's content and a reasoning
+/// item's raw text by `content_index`, a reasoning summary by `summary_index`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PartIndex {
+    Content(u64),
+    Summary(u64),
+}
+
+impl PartIndex {
+    /// Whether `self` and `other` are numbered by the same index.
+    fn same_kind(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Content(_), Self::Content(_)) | (Self::Summary(_), Self::Summary(_))
+        )
+    }
+}
+
+/// An item's parts in progress, handed over one part at a time and each kind in its indexes'
+/// order, as the reference client folds them by index: the words of a part go on the part in
+/// progress, so what a part streams while another part streams, or while a lower part of its kind
+/// is open, waits, and follows when that part ends.
+#[derive(Default)]
+struct Parts {
+    /// The parts begun and not ended.
+    open: std::collections::BTreeSet<PartIndex>,
+    /// The parts that have begun, so a reasoning part opens once.
+    begun: std::collections::BTreeSet<PartIndex>,
+    /// The parts that have ended, whose words are whole.
+    ended: std::collections::BTreeSet<PartIndex>,
+    /// The part streaming now: it has handed over events and not ended.
+    streaming: Option<PartIndex>,
+    /// What parts streamed while they waited.
+    waiting: std::collections::BTreeMap<PartIndex, Vec<StreamEvent>>,
+}
+
+impl Parts {
+    /// Whether `part` waits: another part is streaming, or a lower part of its kind is open.
+    fn held_back(&self, part: PartIndex) -> bool {
+        self.streaming.is_some_and(|streaming| streaming != part)
+            || self.open.range(..part).any(|lower| lower.same_kind(part))
+    }
+
+    /// `events` of `part`, which is open from its first: returned to go out now, or kept until
+    /// the lower parts of its kind end.
+    fn stream(&mut self, part: PartIndex, events: Vec<StreamEvent>) -> Vec<StreamEvent> {
+        self.open.insert(part);
+        if self.held_back(part) || self.waiting.contains_key(&part) {
+            self.waiting.entry(part).or_default().extend(events);
+            return Vec::new();
+        }
+        if !events.is_empty() {
+            self.streaming = Some(part);
+        }
+        events
+    }
+
+    /// End `part`, and return what waited on it, in order, as far as no open part holds it back.
+    fn end(&mut self, part: PartIndex) -> Vec<StreamEvent> {
+        self.open.remove(&part);
+        self.ended.insert(part);
+        if self.streaming == Some(part) {
+            self.streaming = None;
+        }
+        let mut released = Vec::new();
+        while let Some(next) = self
+            .waiting
+            .keys()
+            .copied()
+            .find(|waiting| !self.held_back(*waiting))
+        {
+            let events = self.waiting.remove(&next).unwrap_or_default();
+            // A part still open streams on from what it held, ahead of the rest.
+            if self.open.contains(&next) && !events.is_empty() {
+                self.streaming = Some(next);
+            }
+            released.extend(events);
+        }
+        released
+    }
+
+    /// Everything still waiting, in order, once the item ends.
+    fn finish(&mut self) -> Vec<StreamEvent> {
+        self.open.clear();
+        self.streaming = None;
+        std::mem::take(&mut self.waiting)
+            .into_values()
+            .flatten()
+            .collect()
+    }
+}
+
+/// The parts an item lists under `key`, as its done item states them.
+fn parts_of<'a>(
+    item: &'a serde_json::Value,
+    key: &str,
+) -> impl Iterator<Item = &'a serde_json::Value> {
+    item.get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+/// The words a part states under `key`, when it states any.
+fn text_of(part: &serde_json::Value, key: &str) -> Option<String> {
+    part.get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 /// The id and name a call item names, which the spec has the item that opens a call and the one
@@ -672,6 +809,406 @@ fn frame_name<'a>(data: &'a serde_json::Value, event_name: &'a str) -> &'a str {
     data.get("type")
         .and_then(|value| value.as_str())
         .unwrap_or(event_name)
+}
+
+impl SseState {
+    /// Add `events` of the item at `index` to `out`, saying first which item they are of when the
+    /// events before them were another's.
+    fn at(&mut self, index: u64, events: Vec<StreamEvent>, out: &mut Vec<StreamEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        if index != self.place {
+            out.push(StreamEvent::Place(index));
+            self.place = index;
+        }
+        out.extend(events);
+    }
+
+    /// Keep `frame`, an item event in a shape the spec does not allow, as it came: after the item
+    /// it names, or, naming none, inside the item opened last while it is open so the item is not
+    /// split, else after it.
+    fn keep_unread(
+        &mut self,
+        index: Option<u64>,
+        frame: &serde_json::Value,
+        out: &mut Vec<StreamEvent>,
+    ) {
+        let index = match index {
+            Some(index) => index,
+            None => match self.items.get_mut(&self.latest) {
+                Some(item) => {
+                    item.unread.push(frame.clone());
+                    return;
+                }
+                None => self.latest,
+            },
+        };
+        self.at(index, vec![StreamEvent::Unrecognized(frame.clone())], out);
+    }
+
+    /// Open the item `output_item.added` names. A repeated index closes the item open there
+    /// first, as one that never finished, so each keeps what it streamed.
+    fn open_item(&mut self, data: &serde_json::Value, out: &mut Vec<StreamEvent>) {
+        let index = data.get("output_index").and_then(serde_json::Value::as_u64);
+        // An `added` without its item says nothing, as the reference client reads it.
+        let Some(item) = data.get("item") else {
+            return;
+        };
+        let Some(index) = index else {
+            self.keep_unread(None, data, out);
+            return;
+        };
+        if let Some(earlier) = self.items.remove(&index) {
+            self.close_unfinished(index, earlier, out);
+        }
+        self.latest = index;
+        let kind = match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("function_call" | "tool_search_call") => {
+                let opened = call_identity(item);
+                if let Some((id, name)) = opened.clone() {
+                    self.emitted_tool_call = true;
+                    self.at(index, vec![StreamEvent::ToolUseStart { id, name }], out);
+                }
+                ItemKind::Call {
+                    opened,
+                    arguments: String::new(),
+                }
+            }
+            Some("reasoning") => ItemKind::Reasoning { showed: false },
+            Some("message") => ItemKind::Message { streamed: false },
+            _ => ItemKind::Other,
+        };
+        self.items.insert(index, OpenItem {
+            kind,
+            ..OpenItem::default()
+        });
+    }
+
+    /// Fold an event of an item in progress into it: a delta to the part its index names, a part
+    /// beginning or ending. One for an item that is not open is kept as it came; one of a kind its
+    /// item does not read is left to the item's done, as the reference client leaves it.
+    fn item_event(
+        &mut self,
+        event_name: &str,
+        data: &serde_json::Value,
+        out: &mut Vec<StreamEvent>,
+    ) {
+        let index = data.get("output_index").and_then(serde_json::Value::as_u64);
+        let Some(item) = index.and_then(|index| self.items.get_mut(&index)) else {
+            self.keep_unread(index, data, out);
+            return;
+        };
+        let index = index.unwrap_or_default();
+        let number = |key: &str| data.get(key).and_then(serde_json::Value::as_u64);
+        let delta = data
+            .get("delta")
+            .and_then(serde_json::Value::as_str)
+            .filter(|delta| !delta.is_empty());
+        let part = match event_name {
+            "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done" => {
+                number("summary_index").map(PartIndex::Summary)
+            }
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
+                None
+            }
+            _ => number("content_index").map(PartIndex::Content),
+        };
+        // A part's words are whole once it ends; more for it is a shape the spec does not allow.
+        if part.is_some_and(|part| item.parts.ended.contains(&part)) {
+            item.unread.push(data.clone());
+            return;
+        }
+        let events = match (&mut item.kind, event_name, part) {
+            (
+                ItemKind::Call { arguments, .. },
+                "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta",
+                _,
+            ) => {
+                let Some(delta) = delta else {
+                    return;
+                };
+                arguments.push_str(delta);
+                vec![StreamEvent::ToolArgumentsDelta(delta.to_string())]
+            }
+            // A part event naming no part has no place in its item.
+            (ItemKind::Message { .. } | ItemKind::Reasoning { .. }, _, None)
+                if !event_name.starts_with("response.function_call")
+                    && !event_name.starts_with("response.custom_tool_call") =>
+            {
+                item.unread.push(data.clone());
+                return;
+            }
+            (
+                ItemKind::Message { .. } | ItemKind::Reasoning { .. },
+                "response.content_part.done",
+                Some(part),
+            )
+            | (ItemKind::Reasoning { .. }, "response.reasoning_summary_part.done", Some(part)) => {
+                item.parts.end(part)
+            }
+            (
+                ItemKind::Message { .. } | ItemKind::Reasoning { .. },
+                "response.content_part.added",
+                Some(part),
+            ) => item.parts.stream(part, Vec::new()),
+            (ItemKind::Message { streamed }, "response.output_text.delta", Some(part)) => {
+                *streamed |= delta.is_some();
+                item.parts.stream(
+                    part,
+                    delta
+                        .map(|delta| StreamEvent::TextDelta(delta.to_string()))
+                        .into_iter()
+                        .collect(),
+                )
+            }
+            (ItemKind::Message { streamed }, "response.refusal.delta", Some(part)) => {
+                *streamed |= delta.is_some();
+                item.parts.stream(
+                    part,
+                    delta
+                        .map(|delta| StreamEvent::RefusalDelta(delta.to_string()))
+                        .into_iter()
+                        .collect(),
+                )
+            }
+            // Each reasoning part is recorded as the part it is: a summary part opens with its
+            // `added`, raw reasoning with its first words.
+            (
+                ItemKind::Reasoning { showed },
+                "response.reasoning_text.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.reasoning_summary_part.added",
+                Some(part),
+            ) => {
+                let kind = match part {
+                    PartIndex::Summary(_) => crate::conversation::ReasoningKind::Summary,
+                    PartIndex::Content(_) => crate::conversation::ReasoningKind::Reasoning,
+                };
+                let opens =
+                    event_name == "response.reasoning_summary_part.added" || delta.is_some();
+                let mut events = Vec::new();
+                if opens && item.parts.begun.insert(part) {
+                    events.push(StreamEvent::ThinkingPart(kind));
+                }
+                if let Some(delta) = delta {
+                    *showed = true;
+                    events.push(StreamEvent::ThinkingDelta(delta.to_string()));
+                }
+                item.parts.stream(part, events)
+            }
+            // What an item of a type Meka reads nothing from streams is restated whole by its
+            // done item, which is kept as it came.
+            (ItemKind::Other, ..) => return,
+            // An event of a kind its item does not have is a shape the spec does not allow.
+            _ => {
+                item.unread.push(data.clone());
+                return;
+            }
+        };
+        self.at(index, events, out);
+    }
+
+    /// Close the item `output_item.done` finishes, as its done item states it: what its parts still
+    /// held, then its block, then what it received unread. The done item alone makes an item too,
+    /// as the reference client takes it.
+    fn finish_item(&mut self, data: &serde_json::Value, out: &mut Vec<StreamEvent>) {
+        let Some(item) = data.get("item") else {
+            return;
+        };
+        let Some(index) = data.get("output_index").and_then(serde_json::Value::as_u64) else {
+            self.keep_unread(None, data, out);
+            return;
+        };
+        let mut open = self.items.remove(&index).unwrap_or_default();
+        let mut events = open.parts.finish();
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if item_type == "tool_search_call" || item_type == "function_call" {
+            let (opened, buffered) = match open.kind {
+                ItemKind::Call { opened, arguments } => (opened, Some(arguments)),
+                _ => (None, None),
+            };
+            // The call is the one the item that opened it named; one it did not name is named by
+            // the item that finishes it. A call neither names is in a shape the spec does not
+            // define, kept as it came and never run.
+            let Some((call_id, call_name)) = opened.clone().or_else(|| call_identity(item)) else {
+                events.push(StreamEvent::Unrecognized(item.clone()));
+                events.extend(open.unread.into_iter().map(StreamEvent::Unrecognized));
+                self.at(index, events, out);
+                return;
+            };
+            if opened.is_none() {
+                self.emitted_tool_call = true;
+                events.push(StreamEvent::ToolUseStart {
+                    id: call_id.clone(),
+                    name: call_name.clone(),
+                });
+            }
+            if item_type == "tool_search_call" {
+                // Arrives whole: the arguments are an object on the done item, with no deltas
+                // before it.
+                let arguments = match item.get("arguments") {
+                    Some(serde_json::Value::String(raw)) => raw.clone(),
+                    Some(value) if !value.is_null() => value.to_string(),
+                    _ => "{}".to_string(),
+                };
+                events.push(crate::provider::tool_use_event(
+                    call_id,
+                    SEARCH_TOOL_NAME.to_string(),
+                    &arguments,
+                    item.as_object().and_then(|item| {
+                        crate::provider::fields_beyond(item, &["type", "call_id", "arguments"])
+                    }),
+                ));
+            } else {
+                // The final `arguments` from the item wins over the accumulated buffer, since the
+                // server may normalize it; one that is not the string the spec defines refuses
+                // the call with what it was.
+                let arguments = match item.get("arguments") {
+                    Some(serde_json::Value::Null) | None => {
+                        crate::provider::finalize_tool_arguments(
+                            &call_name,
+                            &buffered.unwrap_or_default(),
+                        )
+                    }
+                    arguments => crate::provider::arguments_from_reply(&call_name, arguments),
+                };
+                events.push(crate::provider::call_event(
+                    call_id,
+                    call_name,
+                    arguments,
+                    item.as_object().and_then(|item| {
+                        crate::provider::fields_beyond(item, &[
+                            "type",
+                            "call_id",
+                            "name",
+                            "arguments",
+                        ])
+                    }),
+                ));
+            }
+        } else if item_type == "message" {
+            // An item that streamed no words states them whole, as the reference client takes it.
+            if !matches!(open.kind, ItemKind::Message { streamed: true }) {
+                events.extend(parts_of(item, "content").filter_map(|part| {
+                    match part.get("type").and_then(serde_json::Value::as_str) {
+                        Some("output_text") => text_of(part, "text").map(StreamEvent::TextDelta),
+                        Some("refusal") => text_of(part, "refusal").map(StreamEvent::RefusalDelta),
+                        _ => None,
+                    }
+                }));
+            }
+            // One part of the reply: its text closes as a block of its own, with what the item
+            // carries beside what its blocks hold, `phase` among it, and each content part's own
+            // fields, `annotations` among them.
+            events.push(StreamEvent::TextEnd {
+                provider_fields: item_fields(item, &["type", "role"], &[("content", &[
+                    "type", "text", "refusal",
+                ])]),
+            });
+        } else if item_type == "reasoning" {
+            // True when this item streamed anything readable, by either spelling: a requested
+            // summary, or the raw reasoning text a local server emits unprompted. An item that
+            // streamed none states it whole, as the reference client takes it.
+            let mut showed_its_reasoning =
+                matches!(open.kind, ItemKind::Reasoning { showed: true });
+            if !showed_its_reasoning {
+                for (key, kind) in [
+                    ("summary", crate::conversation::ReasoningKind::Summary),
+                    ("content", crate::conversation::ReasoningKind::Reasoning),
+                ] {
+                    for text in parts_of(item, key).filter_map(|part| text_of(part, "text")) {
+                        showed_its_reasoning = true;
+                        events.push(StreamEvent::ThinkingPart(kind));
+                        events.push(StreamEvent::ThinkingDelta(text));
+                    }
+                }
+            }
+            let encrypted_content = item
+                .get("encrypted_content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Deliberately not gated on that. `encrypted_content` is what the next request
+            // replays, and it arrives whether or not summaries were requested, so gating its
+            // capture on visible text would silently throw the reasoning chain away for exactly
+            // the configuration that asked for it. An item with neither is worth nothing to
+            // either the reader or the next turn, so it makes no block.
+            if showed_its_reasoning || encrypted_content.is_some() {
+                let id = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                // What the block does not hold: the id when nothing sealed it, and each summary
+                // and reasoning part's own fields.
+                let held: &[&str] = if encrypted_content.is_some() {
+                    &["type", "id", "encrypted_content"]
+                } else {
+                    &["type"]
+                };
+                let provider_fields = item_fields(item, held, &[
+                    ("summary", &["type", "text"]),
+                    ("content", &["type", "text"]),
+                ]);
+                events.push(StreamEvent::ThinkingComplete {
+                    opaque: encrypted_content.map(|encrypted_content| OpaqueReasoning::Sealed {
+                        encrypted_content,
+                        id,
+                        origin: self.origin.clone(),
+                    }),
+                    provider_fields,
+                });
+            } else {
+                // Nothing to read and nothing to carry: no block stands for it, so it is kept as
+                // it came.
+                events.push(StreamEvent::Unrecognized(item.clone()));
+            }
+        } else {
+            // An item of a type Meka reads nothing from, kept as it came.
+            events.push(StreamEvent::Unrecognized(item.clone()));
+        }
+        events.extend(open.unread.into_iter().map(StreamEvent::Unrecognized));
+        self.at(index, events, out);
+    }
+
+    /// Close `item`, open at `index`, as one that never finished, so what opens there next is
+    /// an item of its own: its text and reasoning as they stand, a call refused with the
+    /// arguments that had streamed.
+    fn close_unfinished(&mut self, index: u64, mut item: OpenItem, out: &mut Vec<StreamEvent>) {
+        let mut events = item.parts.finish();
+        match item.kind {
+            ItemKind::Call {
+                opened: Some((id, name)),
+                arguments,
+            } => events.push(StreamEvent::ToolCallRefused {
+                id,
+                name,
+                unparsed: crate::provider::unfinished_call(arguments),
+                provider_fields: None,
+            }),
+            ItemKind::Message { .. } => events.push(StreamEvent::TextEnd {
+                provider_fields: None,
+            }),
+            ItemKind::Reasoning { .. } => events.push(StreamEvent::ThinkingComplete {
+                opaque: None,
+                provider_fields: None,
+            }),
+            ItemKind::Call { opened: None, .. } | ItemKind::Other => {}
+        }
+        events.extend(item.unread.into_iter().map(StreamEvent::Unrecognized));
+        self.at(index, events, out);
+    }
+
+    /// Hand over what the items still open hold, in index order: the response ended, or the
+    /// stream broke off, before they were done.
+    fn release_open(&mut self, out: &mut Vec<StreamEvent>) {
+        for (index, mut item) in std::mem::take(&mut self.items) {
+            let mut events = item.parts.finish();
+            events.extend(item.unread.into_iter().map(StreamEvent::Unrecognized));
+            self.at(index, events, out);
+        }
+    }
 }
 
 /// Pure SSE-event handler. Inspects the named event and parsed JSON payload, updates `state`, and
@@ -704,213 +1241,22 @@ pub(super) fn process_event(
             }
         }
 
-        "response.output_text.delta" => {
-            if let Some(delta) = data.get("delta").and_then(|v| v.as_str())
-                && !delta.is_empty()
-            {
-                out.push(StreamEvent::TextDelta(delta.to_string()));
-            }
-        }
-
-        "response.refusal.delta" => {
-            if let Some(delta) = data.get("delta").and_then(|v| v.as_str())
-                && !delta.is_empty()
-            {
-                out.push(StreamEvent::RefusalDelta(delta.to_string()));
-            }
-        }
-
-        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-            if let Some(delta) = data.get("delta").and_then(|v| v.as_str())
-                && !delta.is_empty()
-            {
-                let kind = if event_name == "response.reasoning_text.delta" {
-                    crate::conversation::ReasoningKind::Reasoning
-                } else {
-                    crate::conversation::ReasoningKind::Summary
-                };
-                if state.reasoning_part != Some(kind) {
-                    state.reasoning_part = Some(kind);
-                    out.push(StreamEvent::ThinkingPart(kind));
-                }
-                state.in_reasoning = true;
-                out.push(StreamEvent::ThinkingDelta(delta.to_string()));
-            }
-        }
-
-        // A reasoning summary arrives as several parts, each its own section, and the deltas carry
-        // no separator of their own: each part is recorded as the part it is.
-        "response.reasoning_summary_part.added" => {
-            state.reasoning_part = Some(crate::conversation::ReasoningKind::Summary);
-            out.push(StreamEvent::ThinkingPart(
-                crate::conversation::ReasoningKind::Summary,
-            ));
-        }
-
-        "response.output_item.added" => {
-            let Some(item) = data.get("item") else {
-                return Ok(out);
-            };
-            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if item_type == "function_call" || item_type == "tool_search_call" {
-                let opened = call_identity(item);
-                if let Some((id, name)) = opened.clone() {
-                    state.emitted_tool_call = true;
-                    out.push(StreamEvent::ToolUseStart { id, name });
-                }
-                state.active_tool_call = Some(ActiveToolCall {
-                    opened,
-                    arguments_buffer: String::new(),
-                });
-            }
-        }
-
-        "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
-            if let Some(delta) = data.get("delta").and_then(|v| v.as_str())
-                && !delta.is_empty()
-                && let Some(tool) = state.active_tool_call.as_mut()
-            {
-                tool.arguments_buffer.push_str(delta);
-                out.push(StreamEvent::ToolArgumentsDelta(delta.to_string()));
-            }
-        }
-
-        "response.output_item.done" => {
-            let Some(item) = data.get("item") else {
-                return Ok(out);
-            };
-            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            // The call is the one the item that opened it named; one it did not name is named by
-            // the item that finishes it. A call neither names is in a shape the spec does not
-            // define, kept as it came and never run.
-            let call = if item_type == "tool_search_call" || item_type == "function_call" {
-                let buffered = state.active_tool_call.take();
-                let opened = buffered.as_ref().and_then(|tool| tool.opened.clone());
-                let Some((call_id, call_name)) = opened.clone().or_else(|| call_identity(item))
-                else {
-                    out.push(StreamEvent::Unrecognized(item.clone()));
-                    return Ok(out);
-                };
-                if opened.is_none() {
-                    state.emitted_tool_call = true;
-                    out.push(StreamEvent::ToolUseStart {
-                        id: call_id.clone(),
-                        name: call_name.clone(),
-                    });
-                }
-                Some((call_id, call_name, buffered))
-            } else {
-                None
-            };
-            if item_type == "tool_search_call"
-                && let Some((call_id, ..)) = call
-            {
-                // Arrives whole: the arguments are an object on the done item, with no deltas
-                // before it.
-                let arguments = match item.get("arguments") {
-                    Some(serde_json::Value::String(raw)) => raw.clone(),
-                    Some(value) if !value.is_null() => value.to_string(),
-                    _ => "{}".to_string(),
-                };
-                out.push(crate::provider::tool_use_event(
-                    call_id,
-                    SEARCH_TOOL_NAME.to_string(),
-                    &arguments,
-                    item.as_object().and_then(|item| {
-                        crate::provider::fields_beyond(item, &["type", "call_id", "arguments"])
-                    }),
-                ));
-            } else if let Some((call_id, call_name, buffered)) = call {
-                // The final `arguments` from the item wins over the accumulated buffer, since the
-                // server may normalize it; one that is not the string the spec defines refuses
-                // the call with what it was.
-                let arguments = match item.get("arguments") {
-                    Some(serde_json::Value::Null) | None => {
-                        crate::provider::finalize_tool_arguments(
-                            &call_name,
-                            &buffered
-                                .map(|tool| tool.arguments_buffer)
-                                .unwrap_or_default(),
-                        )
-                    }
-                    arguments => crate::provider::arguments_from_reply(&call_name, arguments),
-                };
-                out.push(crate::provider::call_event(
-                    call_id,
-                    call_name,
-                    arguments,
-                    item.as_object().and_then(|item| {
-                        crate::provider::fields_beyond(item, &[
-                            "type",
-                            "call_id",
-                            "name",
-                            "arguments",
-                        ])
-                    }),
-                ));
-            } else if item_type == "message" {
-                // One part of the reply: its text closes as a block of its own, with what the
-                // item carries beside what its blocks hold, `phase` among it, and each content
-                // part's own fields, `annotations` among them.
-                out.push(StreamEvent::TextEnd {
-                    provider_fields: item_fields(item, &["type", "role"], &[("content", &[
-                        "type", "text", "refusal",
-                    ])]),
-                });
-            } else if item_type == "reasoning" {
-                // True when this item streamed anything readable, by either spelling: a requested
-                // summary, or the raw reasoning text a local server emits unprompted.
-                let showed_its_reasoning = state.in_reasoning;
-                state.in_reasoning = false;
-                state.reasoning_part = None;
-                let encrypted_content = item
-                    .get("encrypted_content")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                // Deliberately not gated on that. `encrypted_content` is what the next request
-                // replays, and it arrives whether or not summaries were requested, so gating its
-                // capture on visible text would silently throw the reasoning chain away for
-                // exactly the configuration that asked for it. An item with neither is worth
-                // nothing to either the reader or the next turn, so it makes no block.
-                if showed_its_reasoning || encrypted_content.is_some() {
-                    let id = item
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    // What the block does not hold: the id when nothing sealed it, and each summary
-                    // and reasoning part's own fields.
-                    let held: &[&str] = if encrypted_content.is_some() {
-                        &["type", "id", "encrypted_content"]
-                    } else {
-                        &["type"]
-                    };
-                    let provider_fields = item_fields(item, held, &[
-                        ("summary", &["type", "text"]),
-                        ("content", &["type", "text"]),
-                    ]);
-                    out.push(StreamEvent::ThinkingComplete {
-                        opaque: encrypted_content.map(|encrypted_content| {
-                            OpaqueReasoning::Sealed {
-                                encrypted_content,
-                                id,
-                                origin: state.origin.clone(),
-                            }
-                        }),
-                        provider_fields,
-                    });
-                } else {
-                    // Nothing to read and nothing to carry: no block stands for it, so it is kept
-                    // as it came.
-                    out.push(StreamEvent::Unrecognized(item.clone()));
-                }
-            } else {
-                // An item of a type Meka reads nothing from, kept as it came.
-                out.push(StreamEvent::Unrecognized(item.clone()));
-            }
-        }
+        "response.output_item.added" => state.open_item(data, &mut out),
+        "response.output_item.done" => state.finish_item(data, &mut out),
+        "response.output_text.delta"
+        | "response.refusal.delta"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_summary_part.added"
+        | "response.reasoning_summary_part.done"
+        | "response.content_part.added"
+        | "response.content_part.done"
+        | "response.function_call_arguments.delta"
+        | "response.custom_tool_call_input.delta" => state.item_event(event_name, data, &mut out),
 
         "response.completed" => {
             state.finished = true;
+            state.release_open(&mut out);
             if let Some(response) = data.get("response") {
                 if let Some(usage) = response.get("usage") {
                     out.push(StreamEvent::Usage(usage_from(usage)));
@@ -974,6 +1320,7 @@ pub(super) fn process_event(
         // reason Meka has no class for each end the reply where it stopped, with what streamed.
         "response.incomplete" => {
             state.finished = true;
+            state.release_open(&mut out);
             let response = data.get("response").unwrap_or(&serde_json::Value::Null);
             if let Some(usage) = response.get("usage") {
                 out.push(StreamEvent::Usage(usage_from(usage)));
@@ -1227,27 +1574,39 @@ pub(super) async fn drive_responses_sse_stream(
             ..SseState::default()
         },
     };
-    match crate::provider::sse::drive(
+    let ended = match crate::provider::sse::drive(
         response,
         "Responses",
         &event_sender,
         &cancellation,
         &mut protocol,
     )
-    .await?
+    .await
     {
-        End::Finished | End::ReceiverGone => Ok(()),
+        Ok(End::Finished | End::ReceiverGone) => Ok(()),
         // The stream ended without `response.completed`, `response.failed` or
         // `response.incomplete`. Falling through here would commit a truncated turn as a complete
         // one: the agent would see whatever text had arrived, write it to the conversation, and
         // move on, with the retry path never consulted. A connection cut mid-response is exactly
         // what that path exists for.
-        End::Ended => Err(crate::provider::sse::stream_error(
+        Ok(End::Ended) => Err(crate::provider::sse::stream_error(
             &event_sender,
             "the Responses stream ended before a terminal response event".to_string(),
         )
         .await),
+        Err(error) => Err(error),
+    };
+    // What the items still open hold is handed over after the failure is said, so it goes to the
+    // attempt's partial reply and leaves the retry the failure allows.
+    let mut held = Vec::new();
+    protocol.state.release_open(&mut held);
+    for event in held {
+        if event_sender.send(event).await.is_err() {
+            tracing::trace!("stream event receiver dropped");
+            break;
+        }
     }
+    ended
 }
 
 /// The Responses driver's state between frames: [`process_event`]'s accumulator.
@@ -1721,20 +2080,458 @@ mod tests {
         );
 
         // And the name that comes out actually drives the decoder.
-        let (emitted, _) =
-            run_events(&[(frame_name(&bare, ""), serde_json::json!({"delta": "hi"}))]);
+        let (emitted, _) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0, "item": {"type": "message"}}),
+            ),
+            (
+                frame_name(&bare, ""),
+                serde_json::json!({"output_index": 0, "content_index": 0, "delta": "hi"}),
+            ),
+        ]);
         assert!(
             matches!(emitted.as_slice(), [StreamEvent::TextDelta(text)] if text == "hi"),
             "{emitted:?}"
         );
     }
 
+    /// The message `events` fold to, as the turn folds them.
+    fn folded(events: Vec<StreamEvent>) -> Message {
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        for event in events {
+            accumulator.push(event);
+        }
+        accumulator.finish().message
+    }
+
+    /// Items that stream at once fold by their `output_index`, as the reference client folds
+    /// them: each call keeps its own id, name and arguments, and the reply lays them out in index
+    /// order.
+    #[test]
+    fn calls_that_stream_at_once_fold_by_their_output_index() {
+        let call = |index: u64, id: &str, name: &str| {
+            serde_json::json!({"output_index": index,
+                "item": {"type": "function_call", "call_id": id, "name": name}})
+        };
+        let arguments =
+            |index: u64, delta: &str| serde_json::json!({"output_index": index, "delta": delta});
+        let (events, outcome) = run_events(&[
+            ("response.output_item.added", call(0, "c0", "file_read")),
+            ("response.output_item.added", call(1, "c1", "shell_execute")),
+            (
+                "response.function_call_arguments.delta",
+                arguments(1, "{\"command\":"),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                arguments(0, "{\"path\":"),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                arguments(1, "\"ls\"}"),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                arguments(0, "\"a\"}"),
+            ),
+            ("response.output_item.done", call(1, "c1", "shell_execute")),
+            ("response.output_item.done", call(0, "c0", "file_read")),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let message = folded(events);
+        let calls: Vec<(&str, &str, &serde_json::Value)> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some((id.as_str(), name.as_str(), input)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, [
+            ("c0", "file_read", &serde_json::json!({"path": "a"})),
+            ("c1", "shell_execute", &serde_json::json!({"command": "ls"})),
+        ]);
+    }
+
+    /// A reasoning item and a message that stream at once each keep their own words, and the
+    /// reply lays them out in index order.
+    #[test]
+    fn reasoning_and_a_message_that_stream_at_once_keep_their_own_words() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1"}}),
+            ),
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 1, "item": {"type": "message"}}),
+            ),
+            (
+                "response.reasoning_summary_part.added",
+                serde_json::json!({"output_index": 0, "summary_index": 0}),
+            ),
+            (
+                "response.output_text.delta",
+                serde_json::json!({"output_index": 1, "content_index": 0, "delta": "The "}),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({"output_index": 0, "summary_index": 0, "delta": "Plan "}),
+            ),
+            (
+                "response.output_text.delta",
+                serde_json::json!({"output_index": 1, "content_index": 0, "delta": "answer."}),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({"output_index": 0, "summary_index": 0, "delta": "first."}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 1, "item": {"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The answer."}]}}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "Plan first."}]}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let message = folded(events);
+        let [
+            ContentBlock::Thinking { parts, .. },
+            ContentBlock::Text { text, .. },
+        ] = message.content.as_slice()
+        else {
+            panic!("{:?}", message.content);
+        };
+        assert_eq!(crate::conversation::reasoning_text(parts), "Plan first.");
+        assert_eq!(text, "The answer.");
+    }
+
+    /// An item's parts fold in their index order, as the reference client addresses them: a
+    /// message's later part that streams while an earlier one is open follows it, and so does a
+    /// reasoning summary's.
+    #[test]
+    fn an_item_s_parts_fold_in_their_index_order() {
+        let text = |part: u64, delta: &str| serde_json::json!({"output_index": 0, "content_index": part, "delta": delta});
+        let content = |part: u64| serde_json::json!({"output_index": 0, "content_index": part});
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0, "item": {"type": "message"}}),
+            ),
+            ("response.content_part.added", content(0)),
+            ("response.content_part.added", content(1)),
+            ("response.output_text.delta", text(1, "world")),
+            ("response.output_text.delta", text(0, "Hello ")),
+            ("response.content_part.done", content(0)),
+            ("response.content_part.done", content(1)),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 0, "item": {"type": "message", "role": "assistant"}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, ["Hello ", "world"]);
+
+        let summary = |part: u64| serde_json::json!({"output_index": 0, "summary_index": part});
+        let words = |part: u64, delta: &str| serde_json::json!({"output_index": 0, "summary_index": part, "delta": delta});
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1"}}),
+            ),
+            ("response.reasoning_summary_part.added", summary(0)),
+            ("response.reasoning_summary_part.added", summary(1)),
+            ("response.reasoning_summary_text.delta", words(1, "Second")),
+            ("response.reasoning_summary_text.delta", words(0, "First")),
+            ("response.reasoning_summary_part.done", summary(0)),
+            ("response.reasoning_summary_part.done", summary(1)),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1",
+                    "encrypted_content": "E"}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let message = folded(events);
+        let [ContentBlock::Thinking { parts, .. }] = message.content.as_slice() else {
+            panic!("{:?}", message.content);
+        };
+        let parts: Vec<&str> = parts.iter().map(|part| part.text.as_str()).collect();
+        assert_eq!(parts, ["First", "Second"]);
+    }
+
+    /// A reasoning item's summary and raw reasoning that stream at once each keep their own
+    /// words: one part streams at a time, and the other follows when it ends.
+    #[test]
+    fn a_summary_and_raw_reasoning_that_stream_at_once_keep_their_own_words() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1"}}),
+            ),
+            (
+                "response.reasoning_summary_part.added",
+                serde_json::json!({"output_index": 0, "summary_index": 0}),
+            ),
+            (
+                "response.reasoning_text.delta",
+                serde_json::json!({"output_index": 0, "content_index": 0, "delta": "raw"}),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({"output_index": 0, "summary_index": 0, "delta": "summary"}),
+            ),
+            (
+                "response.reasoning_summary_part.done",
+                serde_json::json!({"output_index": 0, "summary_index": 0}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1",
+                    "encrypted_content": "E"}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let message = folded(events);
+        let [ContentBlock::Thinking { parts, .. }] = message.content.as_slice() else {
+            panic!("{:?}", message.content);
+        };
+        let parts: Vec<(crate::conversation::ReasoningKind, &str)> = parts
+            .iter()
+            .map(|part| (part.kind, part.text.as_str()))
+            .collect();
+        assert_eq!(parts, [
+            (crate::conversation::ReasoningKind::Summary, "summary"),
+            (crate::conversation::ReasoningKind::Reasoning, "raw"),
+        ]);
+    }
+
+    /// An event of a kind its item does not have, or one for a part already whole, is a shape
+    /// the spec does not allow: kept as it came after the item, never read into it.
+    #[test]
+    fn an_event_its_item_or_part_does_not_take_is_kept_as_it_came() {
+        let misplaced =
+            serde_json::json!({"output_index": 0, "content_index": 0, "delta": "thought"});
+        let late = serde_json::json!({"output_index": 0, "content_index": 0, "delta": " late"});
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0, "item": {"type": "message"}}),
+            ),
+            ("response.reasoning_text.delta", misplaced.clone()),
+            (
+                "response.output_text.delta",
+                serde_json::json!({"output_index": 0, "content_index": 0, "delta": "words"}),
+            ),
+            (
+                "response.content_part.done",
+                serde_json::json!({"output_index": 0, "content_index": 0}),
+            ),
+            ("response.output_text.delta", late.clone()),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 0, "item": {"type": "message", "role": "assistant"}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let message = folded(events);
+        assert!(
+            matches!(message.content.as_slice(), [
+                ContentBlock::Text { text, .. },
+                ContentBlock::Unrecognized { parts },
+            ] if text == "words" && *parts == [misplaced.clone(), late.clone()]),
+            "{:?}",
+            message.content
+        );
+    }
+
+    /// An item that streams none of its words states them whole in its done item, which the
+    /// reply takes as the reference client takes it: a message's text and refusal, and a
+    /// reasoning item's summary.
+    #[test]
+    fn an_item_that_arrives_whole_in_its_done_keeps_its_words() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "Plan."}]}}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 1, "item": {"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Whole."}]}}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 2, "item": {"type": "message", "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": "Not that."}]}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let message = folded(events);
+        let [
+            ContentBlock::Thinking { parts, .. },
+            ContentBlock::Text { text, .. },
+            ContentBlock::Refusal { text: refusal, .. },
+        ] = message.content.as_slice()
+        else {
+            panic!("{:?}", message.content);
+        };
+        assert_eq!(crate::conversation::reasoning_text(parts), "Plan.");
+        assert_eq!(text, "Whole.");
+        assert_eq!(refusal, "Not that.");
+    }
+
+    /// An event for an item that was never opened, or one naming no item, is a shape the spec
+    /// does not allow: kept as it came, never read as the reply's words.
+    #[test]
+    fn an_event_for_no_open_item_is_kept_as_it_came() {
+        let stray = serde_json::json!({"output_index": 3, "content_index": 0, "delta": "stray"});
+        let unnamed = serde_json::json!({"content_index": 0, "delta": "unnamed"});
+        let (events, outcome) = run_events(&[
+            ("response.output_text.delta", stray.clone()),
+            ("response.output_text.delta", unnamed.clone()),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let message = folded(events);
+        let mut kept = Vec::new();
+        for block in &message.content {
+            match block {
+                ContentBlock::Unrecognized { parts } => kept.extend(parts.iter()),
+                other => panic!("only what was kept: {other:?}"),
+            }
+        }
+        assert_eq!(kept, [&unnamed, &stray]);
+    }
+
+    /// A second item opened at an index already open closes the first as one that never finished,
+    /// so each keeps what it streamed: a call refused with the arguments it had, then the item that
+    /// replaced it.
+    #[test]
+    fn a_repeated_output_index_closes_the_item_open_there() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0,
+                    "item": {"type": "function_call", "call_id": "c0", "name": "file_read"}}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                serde_json::json!({"output_index": 0, "delta": "{\"pa"}),
+            ),
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0, "item": {"type": "message"}}),
+            ),
+            (
+                "response.output_text.delta",
+                serde_json::json!({"output_index": 0, "content_index": 0, "delta": "words"}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 0, "item": {"type": "message", "role": "assistant"}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let message = folded(events);
+        assert!(
+            matches!(message.content.as_slice(), [
+                ContentBlock::ToolUse { id, unparsed: Some(unparsed), .. },
+                ContentBlock::Text { text, .. },
+            ] if id == "c0" && unparsed.text.as_deref() == Some("{\"pa") && text == "words"),
+            "{:?}",
+            message.content
+        );
+    }
+
+    /// What an item holds when the stream breaks off, a part that waited on an earlier one among
+    /// it, is handed over after the failure is said, so it reaches the attempt's partial reply
+    /// and leaves the retry the failure allows.
+    #[tokio::test]
+    async fn what_an_open_item_holds_is_handed_over_after_a_cut() {
+        let (events, outcome) = decode_sse(concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\
+             \"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\
+             \"content_index\":0}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\
+             \"content_index\":1,\"delta\":\"later\"}\n\n",
+        ))
+        .await;
+        assert!(outcome.is_err(), "a stream that ends early fails");
+        let order: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Error(_) => Some("error".to_string()),
+                StreamEvent::TextDelta(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["error", "later"]);
+    }
+
     #[test]
     fn process_event_text_delta() {
         let mut state = SseState::default();
+        process_event(
+            "response.output_item.added",
+            &serde_json::json!({"output_index": 0, "item": {"type": "message"}}),
+            &mut state,
+        )
+        .expect("ok");
         let events = process_event(
             "response.output_text.delta",
-            &serde_json::json!({"delta": "hello"}),
+            &serde_json::json!({"output_index": 0, "content_index": 0, "delta": "hello"}),
             &mut state,
         )
         .expect("ok");
@@ -1745,9 +2542,15 @@ mod tests {
     #[test]
     fn process_event_text_delta_empty_emits_nothing() {
         let mut state = SseState::default();
+        process_event(
+            "response.output_item.added",
+            &serde_json::json!({"output_index": 0, "item": {"type": "message"}}),
+            &mut state,
+        )
+        .expect("ok");
         let events = process_event(
             "response.output_text.delta",
-            &serde_json::json!({"delta": ""}),
+            &serde_json::json!({"output_index": 0, "content_index": 0, "delta": ""}),
             &mut state,
         )
         .expect("ok");
@@ -1757,9 +2560,16 @@ mod tests {
     #[test]
     fn process_event_reasoning_delta_emits_thinking() {
         let mut state = SseState::default();
+        let added = process_event(
+            "response.output_item.added",
+            &serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1"}}),
+            &mut state,
+        )
+        .expect("ok");
+        assert!(added.is_empty(), "{added:?}");
         let events = process_event(
             "response.reasoning_text.delta",
-            &serde_json::json!({"delta": "hmm"}),
+            &serde_json::json!({"output_index": 0, "content_index": 0, "delta": "hmm"}),
             &mut state,
         )
         .expect("ok");
@@ -1773,7 +2583,13 @@ mod tests {
             ),
             "{events:?}"
         );
-        assert!(state.in_reasoning);
+        assert!(matches!(
+            state.items.get(&0),
+            Some(OpenItem {
+                kind: ItemKind::Reasoning { showed: true },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1782,6 +2598,7 @@ mod tests {
             (
                 "response.output_item.added",
                 serde_json::json!({
+                    "output_index": 0,
                     "item": {
                         "type": "function_call",
                         "call_id": "c1",
@@ -1791,15 +2608,16 @@ mod tests {
             ),
             (
                 "response.function_call_arguments.delta",
-                serde_json::json!({"delta": "{\"path\":"}),
+                serde_json::json!({"output_index": 0, "delta": "{\"path\":"}),
             ),
             (
                 "response.function_call_arguments.delta",
-                serde_json::json!({"delta": "\"/tmp/x\"}"}),
+                serde_json::json!({"output_index": 0, "delta": "\"/tmp/x\"}"}),
             ),
             (
                 "response.output_item.done",
                 serde_json::json!({
+                    "output_index": 0,
                     "item": {
                         "type": "function_call",
                         "call_id": "c1",
@@ -1967,8 +2785,12 @@ mod tests {
     #[tokio::test]
     async fn a_stream_of_bare_data_frames_decodes_end_to_end() {
         let (events, outcome) = decode_sse(concat!(
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"PO\"}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"NG\"}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\
+             \"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\
+             \"content_index\":0,\"delta\":\"PO\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\
+             \"content_index\":0,\"delta\":\"NG\"}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\
              \"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
         ))
@@ -2037,16 +2859,18 @@ mod tests {
             (
                 "response.output_item.added",
                 serde_json::json!({
+                    "output_index": 0,
                     "item": {"type": "function_call", "call_id": "c1", "name": "file_write"}
                 }),
             ),
             (
                 "response.function_call_arguments.delta",
-                serde_json::json!({"delta": "{\"path\": "}),
+                serde_json::json!({"output_index": 0, "delta": "{\"path\": "}),
             ),
             (
                 "response.output_item.done",
                 serde_json::json!({
+                    "output_index": 0,
                     "item": {
                         "type": "function_call",
                         "call_id": "c1",
@@ -2104,12 +2928,14 @@ mod tests {
             (
                 "response.output_item.added",
                 serde_json::json!({
+                    "output_index": 0,
                     "item": {"type": "function_call", "call_id": "c1", "name": "x"}
                 }),
             ),
             (
                 "response.output_item.done",
                 serde_json::json!({
+                    "output_index": 0,
                     "item": {
                         "type": "function_call",
                         "call_id": "c1",
@@ -2422,13 +3248,15 @@ mod tests {
 
     #[test]
     fn process_event_reasoning_done_emits_thinking_complete_with_signature() {
-        let mut state = SseState {
-            in_reasoning: true,
-            ..SseState::default()
-        };
+        let mut state = SseState::default();
+        state.items.insert(0, OpenItem {
+            kind: ItemKind::Reasoning { showed: true },
+            ..OpenItem::default()
+        });
         let events = process_event(
             "response.output_item.done",
             &serde_json::json!({
+                "output_index": 0,
                 "item": {
                     "type": "reasoning",
                     "id": "rs_123",
@@ -2455,7 +3283,48 @@ mod tests {
             }
             other => panic!("expected ThinkingComplete, got {other:?}"),
         }
-        assert!(!state.in_reasoning);
+        assert!(state.items.is_empty());
+    }
+
+    /// A list of parts an item states empty, or a value it states where a list of parts goes,
+    /// is the item's own and kept as stated, since no block tells it from one never stated.
+    #[test]
+    fn an_item_s_empty_or_unlisted_parts_are_kept_as_stated() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1",
+                    "summary": [], "content": [], "encrypted_content": "E"}}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"output_index": 1, "item": {"type": "message", "role": "assistant",
+                    "content": null}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let message = folded(events);
+        let [
+            ContentBlock::Thinking {
+                provider_fields: Some(reasoning),
+                ..
+            },
+            ContentBlock::Text {
+                provider_fields: Some(answer),
+                ..
+            },
+        ] = message.content.as_slice()
+        else {
+            panic!("{:?}", message.content);
+        };
+        assert_eq!(reasoning["summary"], serde_json::json!([]));
+        assert_eq!(reasoning["content"], serde_json::json!([]));
+        assert_eq!(answer["content"], serde_json::Value::Null);
+        assert!(answer.contains_key("content"), "{answer:?}");
     }
 
     /// The defect this whole path had: `encrypted_content` arrives whether or not a summary was
@@ -2467,6 +3336,7 @@ mod tests {
         let events = process_event(
             "response.output_item.done",
             &serde_json::json!({
+                "output_index": 0,
                 "item": {
                     "type": "reasoning",
                     "id": "rs_silent",
@@ -2499,7 +3369,7 @@ mod tests {
         let item = serde_json::json!({ "type": "reasoning", "id": "rs_1", "summary": [] });
         let events = process_event(
             "response.output_item.done",
-            &serde_json::json!({ "item": item }),
+            &serde_json::json!({ "output_index": 0, "item": item }),
             &mut state,
         )
         .expect("ok");
@@ -2516,30 +3386,42 @@ mod tests {
     fn message_items_stay_apart_with_their_phase_and_a_refusal_is_its_own() {
         let (events, outcome) = run_events(&[
             (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0, "item": {"type": "message"}}),
+            ),
+            (
                 "response.output_text.delta",
-                serde_json::json!({"delta": "Looking."}),
+                serde_json::json!({"output_index": 0, "content_index": 0, "delta": "Looking."}),
             ),
             (
                 "response.output_item.done",
-                serde_json::json!({"item": {
+                serde_json::json!({"output_index": 0, "item": {
                     "type": "message", "role": "assistant", "phase": "commentary",
                     "content": [{"type": "output_text", "text": "Looking."}],
                 }}),
             ),
             (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 1, "item": {"type": "message"}}),
+            ),
+            (
                 "response.output_text.delta",
-                serde_json::json!({"delta": "Done."}),
+                serde_json::json!({"output_index": 1, "content_index": 0, "delta": "Done."}),
             ),
             (
                 "response.output_item.done",
-                serde_json::json!({"item": {
+                serde_json::json!({"output_index": 1, "item": {
                     "type": "message", "role": "assistant", "phase": "final_answer",
                     "content": [{"type": "output_text", "text": "Done."}],
                 }}),
             ),
             (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 2, "item": {"type": "message"}}),
+            ),
+            (
                 "response.refusal.delta",
-                serde_json::json!({"delta": "Not that part."}),
+                serde_json::json!({"output_index": 2, "content_index": 0, "delta": "Not that part."}),
             ),
             (
                 "response.completed",
@@ -2601,22 +3483,34 @@ mod tests {
         let mut events = Vec::new();
         for (name, data) in [
             (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1"}}),
+            ),
+            (
+                "response.reasoning_summary_part.added",
+                serde_json::json!({"output_index": 0, "summary_index": 0}),
+            ),
+            (
                 "response.reasoning_summary_text.delta",
-                serde_json::json!({"delta": "Plan"}),
+                serde_json::json!({"output_index": 0, "summary_index": 0, "delta": "Plan"}),
             ),
             (
                 "response.output_item.done",
-                serde_json::json!({"item": {"type": "reasoning", "id": "rs_1", "status": "completed",
+                serde_json::json!({"output_index": 0, "item": {"type": "reasoning", "id": "rs_1", "status": "completed",
                     "summary": [{"type": "summary_text", "text": "Plan"}],
                     "encrypted_content": "E"}}),
             ),
             (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 1, "item": {"type": "message", "id": "msg_1"}}),
+            ),
+            (
                 "response.output_text.delta",
-                serde_json::json!({"delta": "Done."}),
+                serde_json::json!({"output_index": 1, "content_index": 0, "delta": "Done."}),
             ),
             (
                 "response.output_item.done",
-                serde_json::json!({"item": {"type": "message", "id": "msg_1", "role": "assistant",
+                serde_json::json!({"output_index": 1, "item": {"type": "message", "id": "msg_1", "role": "assistant",
                     "status": "completed", "content": [{"type": "output_text", "text": "Done.",
                     "annotations": [{"type": "url_citation", "url": "u"}]}]}}),
             ),
@@ -2834,11 +3728,15 @@ mod tests {
         let (events, outcome) = run_events(&[
             (
                 "response.output_item.done",
-                serde_json::json!({"item": {"type": "web_search_call", "id": "ws_1"}}),
+                serde_json::json!({"output_index": 0, "item": {"type": "web_search_call", "id": "ws_1"}}),
+            ),
+            (
+                "response.output_item.added",
+                serde_json::json!({"output_index": 1, "item": {"type": "message"}}),
             ),
             (
                 "response.output_text.delta",
-                serde_json::json!({"delta": "Found it."}),
+                serde_json::json!({"output_index": 1, "content_index": 0, "delta": "Found it."}),
             ),
             (
                 "response.completed",
@@ -2870,28 +3768,40 @@ mod tests {
     fn reasoning_parts_are_kept_as_returned_and_go_back_as_returned() {
         let (events, outcome) = run_events(&[
             (
-                "response.reasoning_summary_part.added",
-                serde_json::json!({ "summary_index": 0 }),
-            ),
-            (
-                "response.reasoning_summary_text.delta",
-                serde_json::json!({ "delta": "**First**\nthinking" }),
+                "response.output_item.added",
+                serde_json::json!({ "output_index": 0, "item": {"type": "reasoning", "id": "rs_1"} }),
             ),
             (
                 "response.reasoning_summary_part.added",
-                serde_json::json!({ "summary_index": 1 }),
+                serde_json::json!({ "output_index": 0, "summary_index": 0 }),
             ),
             (
                 "response.reasoning_summary_text.delta",
-                serde_json::json!({ "delta": "**Second**" }),
+                serde_json::json!({ "output_index": 0, "summary_index": 0, "delta": "**First**\nthinking" }),
+            ),
+            (
+                "response.reasoning_summary_part.done",
+                serde_json::json!({ "output_index": 0, "summary_index": 0 }),
+            ),
+            (
+                "response.reasoning_summary_part.added",
+                serde_json::json!({ "output_index": 0, "summary_index": 1 }),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({ "output_index": 0, "summary_index": 1, "delta": "**Second**" }),
+            ),
+            (
+                "response.reasoning_summary_part.done",
+                serde_json::json!({ "output_index": 0, "summary_index": 1 }),
             ),
             (
                 "response.reasoning_text.delta",
-                serde_json::json!({ "delta": "raw" }),
+                serde_json::json!({ "output_index": 0, "content_index": 0, "delta": "raw" }),
             ),
             (
                 "response.output_item.done",
-                serde_json::json!({ "item": {
+                serde_json::json!({ "output_index": 0, "item": {
                     "type": "reasoning",
                     "id": "rs_1",
                     "encrypted_content": "SEALED",
@@ -3261,11 +4171,11 @@ mod tests {
         let (events, outcome) = run_events(&[
             (
                 "response.output_item.added",
-                serde_json::json!({"item": {"type": "tool_search_call", "call_id": "call_1", "execution": "client", "arguments": {}, "status": "in_progress"}}),
+                serde_json::json!({"output_index": 0, "item": {"type": "tool_search_call", "call_id": "call_1", "execution": "client", "arguments": {}, "status": "in_progress"}}),
             ),
             (
                 "response.output_item.done",
-                serde_json::json!({"item": {"type": "tool_search_call", "call_id": "call_1", "execution": "client", "arguments": {"names": ["mcp__kv__probe"]}, "status": "completed"}}),
+                serde_json::json!({"output_index": 0, "item": {"type": "tool_search_call", "call_id": "call_1", "execution": "client", "arguments": {"names": ["mcp__kv__probe"]}, "status": "completed"}}),
             ),
             (
                 "response.completed",
@@ -3512,13 +4422,27 @@ mod tests {
     #[tokio::test]
     async fn reasoning_survives_the_wire_and_goes_straight_back_out() {
         let (events, outcome) = decode_sse(concat!(
-            "data: {\"type\":\"response.reasoning_summary_part.added\",\"summary_index\":0}\n\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Plan**\"}\n\n",
-            "data: {\"type\":\"response.reasoning_summary_part.added\",\"summary_index\":1}\n\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Act**\"}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\
-             \"id\":\"rs_live\",\"summary\":[],\"encrypted_content\":\"OPAQUE\"}}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"here you go\"}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\
+             \"item\":{\"type\":\"reasoning\",\"id\":\"rs_live\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"output_index\":0,\
+             \"summary_index\":0}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\
+             \"summary_index\":0,\"delta\":\"**Plan**\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\",\"output_index\":0,\
+             \"summary_index\":0}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"output_index\":0,\
+             \"summary_index\":1}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\
+             \"summary_index\":1,\"delta\":\"**Act**\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\",\"output_index\":0,\
+             \"summary_index\":1}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\
+             \"item\":{\"type\":\"reasoning\",\"id\":\"rs_live\",\"summary\":[],\
+             \"encrypted_content\":\"OPAQUE\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\
+             \"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\
+             \"content_index\":0,\"delta\":\"here you go\"}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\
              \"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
         ))

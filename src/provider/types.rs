@@ -288,9 +288,9 @@ impl ToolDefinition {
 #[derive(Debug, Clone)]
 pub(crate) enum StreamEvent {
     /// The part events that follow are of the part at this place in the reply, until the next
-    /// `Place`: a Claude block's `index`, which numbers blocks a stream may open before an earlier
-    /// one stops. A stream that sends none has every part at place 0. Parts are laid out by
-    /// place, and parts at one place in the order they arrive.
+    /// `Place`: a Claude block's `index` or a Responses item's `output_index`, which number parts a
+    /// stream may open before an earlier one ends. A stream that sends none has every part at
+    /// place 0. Parts are laid out by place, and parts at one place in the order they arrive.
     Place(u64),
     TextDelta(String),
     /// The end of one part of the reply's text as the provider returned it (a Claude text block, a

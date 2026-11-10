@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refusals, content filters and context-window cuts are reported as such, not as errors or answers.
 - Fields a provider returns, such as `reasoning_details` and citations, are kept, streamed or not.
 - A Claude reply whose blocks overlap on OpenRouter's stream keeps and shows every block, in order.
+- A Responses reply whose items stream at once keeps each item whole and in its numbered place.
+- A Responses message or reasoning item that arrives whole, unstreamed, keeps its words.
 - A malformed stream frame fails the attempt rather than leaving a hole in the reply.
 - The screen says when a round of tool calls stopped at the output limit.
 - A turn kept through a compaction shows what was said, not the context's rewrite of it.
