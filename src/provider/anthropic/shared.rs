@@ -881,17 +881,12 @@ pub(super) async fn drive_claude_sse_stream(
         .await),
         Err(error) => Err(error),
     };
-    // What the stream held, a block it left open and the blocks held behind one, is handed over
-    // after the failure is said, so it goes to the attempt's partial reply and leaves the retry
-    // the failure allows.
-    match (ended, protocol.release_held(&event_sender).await) {
-        (Ok(()), Ok(_)) => Ok(()),
-        (Err(error), Ok(_)) | (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(held)) => {
-            tracing::debug!("failed to fold a held block after the stream failed: {held}");
-            Err(error)
-        }
+    // A block the stream left open is handed over after the failure is said, so it goes to the
+    // attempt's partial reply and leaves the retry the failure allows.
+    if !protocol.close_open(&event_sender).await {
+        tracing::trace!("stream event receiver dropped");
     }
+    ended
 }
 
 /// The Claude driver's state between frames.
@@ -900,53 +895,93 @@ struct ClaudeStream {
     /// Where `message_start`'s id is recorded for the next request's
     /// `diagnostics.previous_message_id`; `None` on a stream that is not a conversation turn.
     previous_message: Option<crate::provider::PreviousMessageSlot>,
-    current_tool_input: String,
-    /// The `input` the call's block opened with when it held anything, which stands as its
-    /// arguments when no `input_json_delta` follows, as the reference client keeps it.
-    current_tool_start_input: Option<serde_json::Value>,
-    in_tool_use: bool,
-    /// Retained past `ToolUseStart` so a call whose arguments never parse can be *rejected* by id
-    /// rather than silently run with `{}`.
-    current_tool_id: String,
-    current_tool_name: String,
-    /// Every field the call's block carried beyond its type, id, name and input.
-    current_tool_fields: Option<crate::conversation::ProviderFields>,
-    /// The fields of the text block in progress beyond its type and text, `Some` while one is
-    /// open, so its end closes it as one part with them.
-    current_text_fields: Option<Option<crate::conversation::ProviderFields>>,
     /// Whether the message reached its end rather than the byte stream simply stopping.
     saw_terminal_event: bool,
-    in_thinking: bool,
-    current_thinking_signature: Option<String>,
-    /// The fields of the thinking or redacted block in progress beyond those its block holds.
-    current_thinking_fields: Option<crate::conversation::ProviderFields>,
-    /// A block of a type Meka has no block for, `Some` while one is open: the events that start
-    /// it and carry its deltas, whole, as they came, each naming the block by its `index`.
-    unread_block: Option<Vec<serde_json::Value>>,
-    /// The events that arrived inside the open block and that the reference client does not fold
-    /// (a delta or an event of a type it does not know), kept whole after the block so the block
-    /// is not split.
-    unread: Vec<serde_json::Value>,
     /// The message as `message_start` stated it and each `message_delta` updated it, folded as
     /// the reference client folds them, without its content.
     response: serde_json::Map<String, serde_json::Value>,
-    /// The `index` of the block whose frames fold now.
-    next_block: u64,
-    /// The frames of blocks after [`Self::next_block`], by index, each with its name, as they
-    /// came: a block's index is its place in the message's content, so one that opens while an
-    /// earlier one is open waits for every block before it to close.
-    held: std::collections::BTreeMap<u64, Vec<(String, serde_json::Value)>>,
+    /// The blocks open now, by `index`: a block's index is its place in the message's content,
+    /// and a stream may open one before an earlier one stops.
+    open: std::collections::BTreeMap<u64, OpenBlock>,
+    /// The `index` of the block opened last, after which a frame that names no block is kept.
+    latest: u64,
+    /// The place the events sent so far are of; see [`StreamEvent::Place`].
+    place: u64,
+}
+
+/// A content block between its start and its stop.
+struct OpenBlock {
+    kind: BlockKind,
+    /// What arrived inside the block that the reference client does not fold (a delta of a type
+    /// the block does not read, or an event of a type it does not know), kept whole after the
+    /// block so the block is not split.
+    unread: Vec<serde_json::Value>,
+}
+
+/// What an open block is, with what its stop needs.
+enum BlockKind {
+    /// A block of a type Meka has no block for, or one without what the spec requires of its
+    /// type: the frames that start it and carry its deltas, whole, as they came, each naming the
+    /// block by its `index`.
+    Unread(Vec<serde_json::Value>),
+    /// A text block, with its fields beyond its type and text.
+    Text(Option<crate::conversation::ProviderFields>),
+    Thinking {
+        signature: Option<String>,
+        /// The block's fields beyond its type, thinking and signature.
+        fields: Option<crate::conversation::ProviderFields>,
+    },
+    /// A `redacted_thinking` block, with the opaque `data` its start carried whole and its fields
+    /// beyond its type and data.
+    Redacted {
+        data: String,
+        fields: Option<crate::conversation::ProviderFields>,
+    },
+    Call {
+        id: String,
+        name: String,
+        /// The arguments as they streamed.
+        arguments: String,
+        /// The `input` the block opened with when it held anything, which stands as its arguments
+        /// when no `input_json_delta` follows, as the reference client keeps it.
+        opened_with: Option<serde_json::Value>,
+        /// The block's fields beyond its type, id, name and input.
+        fields: Option<crate::conversation::ProviderFields>,
+    },
+}
+
+#[async_trait::async_trait]
+impl crate::provider::sse::Protocol for ClaudeStream {
+    async fn frame(
+        &mut self,
+        event: eventsource_stream::Event,
+        event_sender: &mpsc::Sender<StreamEvent>,
+    ) -> Result<Step> {
+        let data = crate::provider::sse::frame_json("Claude", &event.data)?;
+        let name = claude_frame_name(&data, &event.event).to_string();
+        if !name.starts_with("content_block_") {
+            return self.message_frame(&name, data, event_sender).await;
+        }
+        // Every block event names its block's `index`; one that does not is a shape the protocol
+        // does not define, kept as it came.
+        let delivered = match data.get("index").and_then(serde_json::Value::as_u64) {
+            Some(index) => match name.as_str() {
+                "content_block_start" => self.start(index, data, event_sender).await,
+                "content_block_delta" => self.delta(index, data, event_sender).await,
+                "content_block_stop" => self.close(index, true, event_sender).await,
+                _ => self.keep_unread(data, event_sender).await,
+            },
+            None => self.keep_unread(data, event_sender).await,
+        };
+        Ok(if delivered {
+            Step::Continue
+        } else {
+            Step::ReceiverGone
+        })
+    }
 }
 
 impl ClaudeStream {
-    /// Whether a content block is open.
-    fn in_block(&self) -> bool {
-        self.current_text_fields.is_some()
-            || self.in_thinking
-            || self.in_tool_use
-            || self.unread_block.is_some()
-    }
-
     /// The message's fields nothing else holds: all but its role, content, model and how it
     /// stopped, which the reply and its record hold. The raw `usage` stays.
     fn response_fields(&self) -> Option<crate::conversation::ProviderFields> {
@@ -971,428 +1006,326 @@ impl ClaudeStream {
         }
     }
 
-    /// Close the block the stream left open as one that never finished: an unread block's frames
-    /// as they came, a text part with its fields, its reasoning unsigned, since a signature that
-    /// arrived before the block ended may not cover all of it, and a call refused with the
-    /// arguments that had streamed. What arrived unread inside it follows. Whether the receiver
-    /// is still there.
-    async fn close_unfinished(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> bool {
-        let events = if let Some(unread_block) = self.unread_block.take() {
-            unread_block
-                .into_iter()
-                .map(StreamEvent::Unrecognized)
-                .collect()
-        } else if let Some(provider_fields) = self.current_text_fields.take() {
-            vec![StreamEvent::TextEnd { provider_fields }]
-        } else if self.in_thinking {
-            self.in_thinking = false;
-            self.current_thinking_signature = None;
-            vec![StreamEvent::ThinkingComplete {
-                opaque: None,
-                provider_fields: self.current_thinking_fields.take(),
-            }]
-        } else if self.in_tool_use {
-            self.in_tool_use = false;
-            let arguments = match self.current_tool_start_input.take() {
-                Some(input) if self.current_tool_input.is_empty() => input.to_string(),
-                _ => std::mem::take(&mut self.current_tool_input),
-            };
-            vec![StreamEvent::ToolCallRefused {
-                id: self.current_tool_id.clone(),
-                name: self.current_tool_name.clone(),
-                unparsed: crate::provider::unfinished_call(arguments),
-                provider_fields: self.current_tool_fields.take(),
-            }]
-        } else {
-            Vec::new()
-        };
-        for event in events {
-            if event_sender.send(event).await.is_err() {
+    /// Send `event` of the block at `index`, saying first which block it is of when the event sent
+    /// before it was another's. Whether the receiver is still there.
+    async fn send(
+        &mut self,
+        index: u64,
+        event: StreamEvent,
+        event_sender: &mpsc::Sender<StreamEvent>,
+    ) -> bool {
+        if index != self.place {
+            if event_sender.send(StreamEvent::Place(index)).await.is_err() {
                 return false;
             }
+            self.place = index;
         }
-        self.release_unread(event_sender).await
+        event_sender.send(event).await.is_ok()
     }
 
-    /// Hand over what arrived unread inside the block that just closed, after it.
-    async fn release_unread(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> bool {
-        for part in std::mem::take(&mut self.unread) {
-            if event_sender
-                .send(StreamEvent::Unrecognized(part))
-                .await
-                .is_err()
-            {
+    /// Keep `frame`, which names no open block, as it came: inside the block opened last while
+    /// that block is open, so the block is not split, else after it.
+    async fn keep_unread(
+        &mut self,
+        frame: serde_json::Value,
+        event_sender: &mpsc::Sender<StreamEvent>,
+    ) -> bool {
+        match self.open.get_mut(&self.latest) {
+            Some(block) => {
+                block.unread.push(frame);
+                true
+            }
+            None => {
+                self.send(self.latest, StreamEvent::Unrecognized(frame), event_sender)
+                    .await
+            }
+        }
+    }
+
+    /// Open the block `frame` starts at `index`, handing over what its start already carries. A
+    /// start at an index already open closes the block there first, as one that never finished.
+    async fn start(
+        &mut self,
+        index: u64,
+        frame: serde_json::Value,
+        event_sender: &mpsc::Sender<StreamEvent>,
+    ) -> bool {
+        if self.open.contains_key(&index) && !self.close(index, false, event_sender).await {
+            return false;
+        }
+        self.latest = index;
+        let content_block = frame
+            .get("content_block")
+            .and_then(serde_json::Value::as_object);
+        let block_type = content_block
+            .and_then(|block| block.get("type"))
+            .and_then(serde_json::Value::as_str);
+        let field = |name: &str| {
+            content_block
+                .and_then(|block| block.get(name))
+                .and_then(serde_json::Value::as_str)
+        };
+        // What a text or reasoning block opens with is its first, as the reference client folds
+        // it.
+        let opening = |name: &str| {
+            field(name)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        let fields_beyond = |read: &[&str]| {
+            content_block.and_then(|block| crate::provider::fields_beyond(block, read))
+        };
+        let mut events = Vec::new();
+        let kind = match (block_type, field("data"), field("id").zip(field("name"))) {
+            (Some("text"), ..) => {
+                events.extend(opening("text").map(StreamEvent::TextDelta));
+                BlockKind::Text(fields_beyond(&["type", "text"]))
+            }
+            (Some("thinking"), ..) => {
+                // Announce the block itself, before any estimate: this is the earliest point the
+                // pause becomes explainable, and on a redacted block it is otherwise the only thing
+                // that happens for seconds at a time.
+                events.push(StreamEvent::ThinkingProgress {
+                    estimated_tokens: None,
+                });
+                events.extend(opening("thinking").map(StreamEvent::ThinkingDelta));
+                // Both schemas make `signature` required on a thinking block sent back, and
+                // require it verbatim, but it does not always arrive as a `signature_delta`.
+                // Anthropic opens the block with an empty one and fills it by delta; OpenRouter
+                // sends no delta at all for a non-Anthropic model, leaving that empty string as the
+                // value. Losing it there costs every later request in the session, rejected for the
+                // missing field.
+                BlockKind::Thinking {
+                    signature: field("signature").map(str::to_string),
+                    fields: fields_beyond(&["type", "thinking", "signature"]),
+                }
+            }
+            // The opaque `data` arrives whole in the start event and is handed over when the block
+            // stops, after the progress the server streams inside it; the block is announced as a
+            // thinking block is.
+            (Some("redacted_thinking"), Some(data), _) => {
+                events.push(StreamEvent::ThinkingProgress {
+                    estimated_tokens: None,
+                });
+                BlockKind::Redacted {
+                    data: data.to_string(),
+                    fields: fields_beyond(&["type", "data"]),
+                }
+            }
+            (Some("tool_use"), _, Some((id, name))) => {
+                let (id, name) = (id.to_string(), name.to_string());
+                events.push(StreamEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+                BlockKind::Call {
+                    id,
+                    name,
+                    arguments: String::new(),
+                    opened_with: content_block
+                        .and_then(|block| block.get("input"))
+                        .filter(|input| {
+                            !input.is_null()
+                                && input.as_object().is_none_or(|input| !input.is_empty())
+                        })
+                        .cloned(),
+                    fields: fields_beyond(&["type", "id", "name", "input"]),
+                }
+            }
+            // A block of a type Meka has no block for, or without what the spec requires of its
+            // type (a call without its id and name, redacted reasoning without its data), kept
+            // whole with its deltas and never run.
+            _ => BlockKind::Unread(vec![frame.clone()]),
+        };
+        self.open.insert(index, OpenBlock {
+            kind,
+            unread: Vec::new(),
+        });
+        for event in events {
+            if !self.send(index, event, event_sender).await {
                 return false;
             }
         }
         true
     }
-}
 
-#[async_trait::async_trait]
-impl crate::provider::sse::Protocol for ClaudeStream {
-    async fn frame(
+    /// Fold a delta into the block at `index` as the reference client folds it. A delta of a type
+    /// its block does not read is kept unread after the block, and one for a block that is not
+    /// open is kept where it names.
+    async fn delta(
         &mut self,
-        event: eventsource_stream::Event,
+        index: u64,
+        frame: serde_json::Value,
         event_sender: &mpsc::Sender<StreamEvent>,
-    ) -> Result<Step> {
-        let data = crate::provider::sse::frame_json("Claude", &event.data)?;
-        let name = claude_frame_name(&data, &event.event).to_string();
-        if name.starts_with("content_block_") {
-            let index = data.get("index").and_then(serde_json::Value::as_u64);
-            if let Some(index) = index
-                && index > self.next_block
-            {
-                self.held.entry(index).or_default().push((name, data));
-                return Ok(Step::Continue);
+    ) -> bool {
+        let Some(block) = self.open.get_mut(&index) else {
+            return self
+                .send(index, StreamEvent::Unrecognized(frame), event_sender)
+                .await;
+        };
+        let delta = frame.get("delta");
+        let field = |name: &str| {
+            delta
+                .and_then(|delta| delta.get(name))
+                .and_then(serde_json::Value::as_str)
+        };
+        // `estimated_tokens` is the server's running count of thinking spent so far (the
+        // `thinking-token-count` beta). The final delta of a block carries `null`; skipping it
+        // leaves the last real figure on screen rather than blanking the display just before the
+        // block ends.
+        let progress = delta
+            .and_then(|delta| delta.get("estimated_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|estimated| StreamEvent::ThinkingProgress {
+                estimated_tokens: Some(estimated),
+            });
+        let thinking = field("thinking").filter(|thinking| !thinking.is_empty());
+        let mut events = Vec::new();
+        match (&mut block.kind, field("type").unwrap_or("")) {
+            (BlockKind::Unread(frames), _) => frames.push(frame.clone()),
+            (BlockKind::Thinking { .. }, "thinking_delta") => {
+                events.extend(progress);
+                events.extend(
+                    thinking.map(|thinking| StreamEvent::ThinkingDelta(thinking.to_string())),
+                );
             }
-            let closes =
-                name == "content_block_stop" && index.is_none_or(|index| index == self.next_block);
-            let step = self.fold(&name, data, event_sender).await?;
-            if !closes || !matches!(step, Step::Continue) {
-                return Ok(step);
+            // Under the `redact-thinking` beta the server streams the withheld block's progress as
+            // `thinking_delta` estimates with no words, which the reference client folds into
+            // nothing; words there have no block to go on and are kept unread.
+            (BlockKind::Redacted { .. }, "thinking_delta") if thinking.is_none() => {
+                events.extend(progress);
             }
-            return self.fold_next_blocks(event_sender).await;
-        }
-        // The message's end follows every block it holds.
-        if name == "message_delta" {
-            let step = self.release_held(event_sender).await?;
-            if !matches!(step, Step::Continue) {
-                return Ok(step);
-            }
-        }
-        self.fold(&name, data, event_sender).await
-    }
-}
-
-impl ClaudeStream {
-    /// Fold the blocks held for the ones after the block that just closed, in order, as far as
-    /// the frames that arrived reach.
-    async fn fold_next_blocks(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> Result<Step> {
-        loop {
-            self.next_block += 1;
-            let Some(frames) = self.held.remove(&self.next_block) else {
-                return Ok(Step::Continue);
-            };
-            let mut closed = false;
-            for (name, data) in frames {
-                closed |= name == "content_block_stop";
-                let step = self.fold(&name, data, event_sender).await?;
-                if !matches!(step, Step::Continue) {
-                    return Ok(step);
+            // The delta states the signature whole, and replaces what the start held, as the
+            // reference client folds it.
+            (BlockKind::Thinking { signature, .. }, "signature_delta") => {
+                if let Some(stated) = field("signature") {
+                    *signature = Some(stated.to_string());
                 }
             }
-            if !closed {
-                return Ok(Step::Continue);
-            }
-        }
-    }
-
-    /// Close the block left open and fold every block still held, in index order: the message is
-    /// over, or the stream broke off and what arrived of it is the reply so far.
-    async fn release_held(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> Result<Step> {
-        // A block that never closed closes first, as one that never finished: what it holds that
-        // only this fold has (an unread block's frames, a text part's citations) reaches the
-        // reply, and what was held behind it follows in its place.
-        if self.in_block() && !self.close_unfinished(event_sender).await {
-            return Ok(Step::ReceiverGone);
-        }
-        while let Some((index, frames)) = self.held.pop_first() {
-            self.next_block = index;
-            for (name, data) in frames {
-                let step = self.fold(&name, data, event_sender).await?;
-                if !matches!(step, Step::Continue) {
-                    return Ok(step);
+            (BlockKind::Text(_), "text_delta") => {
+                if let Some(text) = field("text").filter(|text| !text.is_empty()) {
+                    events.push(StreamEvent::TextDelta(text.to_string()));
                 }
             }
+            // A citation goes on its text block's `citations`, as the reference client folds it.
+            (BlockKind::Text(fields), "citations_delta") => {
+                if let Some(citation) = delta.and_then(|delta| delta.get("citation")) {
+                    let citations = fields
+                        .get_or_insert_with(Default::default)
+                        .entry("citations".to_string())
+                        .or_insert(serde_json::Value::Null);
+                    match citations.as_array_mut() {
+                        Some(citations) => citations.push(citation.clone()),
+                        None => *citations = serde_json::json!([citation]),
+                    }
+                }
+            }
+            (BlockKind::Call { arguments, .. }, "input_json_delta") => {
+                if let Some(partial_json) = field("partial_json") {
+                    arguments.push_str(partial_json);
+                    events.push(StreamEvent::ToolArgumentsDelta(partial_json.to_string()));
+                }
+            }
+            _ => block.unread.push(frame.clone()),
         }
-        Ok(Step::Continue)
+        for event in events {
+            if !self.send(index, event, event_sender).await {
+                return false;
+            }
+        }
+        true
     }
 
-    /// Fold one frame into the reply, its blocks arriving one after another.
-    async fn fold(
+    /// Close the block at `index` and hand it over, then what arrived unread inside it. A block
+    /// that `finished` is handed over as it stopped; one the message or the stream ended inside
+    /// as one that never finished: its reasoning unsigned, since a signature that arrived before
+    /// the block ended may not cover all of it, and a call refused with the arguments that had
+    /// streamed. A stop for a block that is not open closes nothing. Whether the receiver is
+    /// still there.
+    async fn close(
+        &mut self,
+        index: u64,
+        finished: bool,
+        event_sender: &mpsc::Sender<StreamEvent>,
+    ) -> bool {
+        let Some(block) = self.open.remove(&index) else {
+            return true;
+        };
+        let events = match block.kind {
+            BlockKind::Unread(frames) => {
+                frames.into_iter().map(StreamEvent::Unrecognized).collect()
+            }
+            BlockKind::Text(provider_fields) => vec![StreamEvent::TextEnd { provider_fields }],
+            BlockKind::Thinking { signature, fields } => vec![StreamEvent::ThinkingComplete {
+                opaque: signature
+                    .filter(|_| finished)
+                    .map(|signature| OpaqueReasoning::Signed { signature }),
+                provider_fields: fields,
+            }],
+            BlockKind::Redacted { data, fields } => vec![StreamEvent::RedactedThinking {
+                data,
+                provider_fields: fields,
+            }],
+            BlockKind::Call {
+                id,
+                name,
+                arguments,
+                opened_with,
+                fields,
+            } => {
+                let arguments = match opened_with {
+                    Some(input) if arguments.is_empty() => input.to_string(),
+                    _ => arguments,
+                };
+                // An empty body is a legitimate zero-argument call and becomes `{}`; arguments that
+                // arrived but do not parse are refused rather than replaced.
+                vec![if finished {
+                    crate::provider::tool_use_event(id, name, &arguments, fields)
+                } else {
+                    StreamEvent::ToolCallRefused {
+                        id,
+                        name,
+                        unparsed: crate::provider::unfinished_call(arguments),
+                        provider_fields: fields,
+                    }
+                }]
+            }
+        };
+        let unread = block.unread.into_iter().map(StreamEvent::Unrecognized);
+        for event in events.into_iter().chain(unread) {
+            if !self.send(index, event, event_sender).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Close every block still open as one that never finished, in index order: the message is
+    /// over, or the stream broke off and what arrived of it is the reply so far. Whether the
+    /// receiver is still there.
+    async fn close_open(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> bool {
+        let indices: Vec<u64> = self.open.keys().copied().collect();
+        for index in indices {
+            if !self.close(index, false, event_sender).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Fold a frame of the message's own, outside its blocks.
+    async fn message_frame(
         &mut self,
         name: &str,
         data: serde_json::Value,
         event_sender: &mpsc::Sender<StreamEvent>,
     ) -> Result<Step> {
         match name {
-            "content_block_start" => {
-                let Some(content_block) = data.get("content_block") else {
-                    return Ok(Step::Continue);
-                };
-                let block_type = content_block
-                    .get("type")
-                    .and_then(|block_type| block_type.as_str())
-                    .unwrap_or("");
-
-                if block_type == "text" {
-                    self.current_text_fields = Some(content_block.as_object().and_then(|block| {
-                        crate::provider::fields_beyond(block, &["type", "text"])
-                    }));
-                    // Text the block opens with is its first, as the reference client folds it.
-                    if let Some(text) = content_block
-                        .get("text")
-                        .and_then(|text| text.as_str())
-                        .filter(|text| !text.is_empty())
-                        && event_sender
-                            .send(StreamEvent::TextDelta(text.to_string()))
-                            .await
-                            .is_err()
-                    {
-                        return Ok(Step::ReceiverGone);
-                    }
-                } else if block_type == "thinking" {
-                    self.in_thinking = true;
-                    self.current_thinking_fields = content_block.as_object().and_then(|block| {
-                        crate::provider::fields_beyond(block, &["type", "thinking", "signature"])
-                    });
-                    // Both schemas make `signature` required on a thinking block
-                    // sent back, and require it verbatim, but it does not always
-                    // arrive as a `signature_delta`. Anthropic opens the block with
-                    // an empty one and fills it by delta; OpenRouter sends no delta
-                    // at all for a non-Anthropic model, leaving that empty string
-                    // as the value. Losing it there costs every later request in
-                    // the session, rejected for the missing field.
-                    //
-                    // Assigned rather than merged, so a block that opens without
-                    // the field cannot inherit the signature of an earlier one.
-                    self.current_thinking_signature = content_block
-                        .get("signature")
-                        .and_then(|signature| signature.as_str())
-                        .map(str::to_string);
-                    // Announce the block itself, before any estimate: this is the
-                    // earliest point the pause becomes explainable, and on a
-                    // redacted block it is otherwise the only thing that happens
-                    // for seconds at a time.
-                    if event_sender
-                        .send(StreamEvent::ThinkingProgress {
-                            estimated_tokens: None,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return Ok(Step::ReceiverGone);
-                    }
-                    // Reasoning the block opens with is its first, as the reference client folds
-                    // it.
-                    if let Some(thinking) = content_block
-                        .get("thinking")
-                        .and_then(|thinking| thinking.as_str())
-                        .filter(|thinking| !thinking.is_empty())
-                        && event_sender
-                            .send(StreamEvent::ThinkingDelta(thinking.to_string()))
-                            .await
-                            .is_err()
-                    {
-                        return Ok(Step::ReceiverGone);
-                    }
-                } else if block_type == "redacted_thinking" {
-                    // The opaque `data` arrives whole in the start event; forward
-                    // it so the agent can replay it verbatim on later turns.
-                    if let Some(data) = content_block.get("data").and_then(|d| d.as_str())
-                        && event_sender
-                            .send(StreamEvent::RedactedThinking {
-                                data: data.to_string(),
-                                provider_fields: content_block.as_object().and_then(|block| {
-                                    crate::provider::fields_beyond(block, &["type", "data"])
-                                }),
-                            })
-                            .await
-                            .is_err()
-                    {
-                        return Ok(Step::ReceiverGone);
-                    }
-                } else if block_type == "tool_use"
-                    && let (Some(id), Some(name)) = (
-                        content_block.get("id").and_then(|id| id.as_str()),
-                        content_block.get("name").and_then(|name| name.as_str()),
-                    )
-                {
-                    let (id, name) = (id.to_string(), name.to_string());
-
-                    self.current_tool_input.clear();
-                    self.current_tool_start_input = content_block
-                        .get("input")
-                        .filter(|input| {
-                            !input.is_null()
-                                && input.as_object().is_none_or(|input| !input.is_empty())
-                        })
-                        .cloned();
-                    self.in_tool_use = true;
-                    self.current_tool_id = id.clone();
-                    self.current_tool_name = name.clone();
-                    self.current_tool_fields = content_block.as_object().and_then(|block| {
-                        crate::provider::fields_beyond(block, &["type", "id", "name", "input"])
-                    });
-                    if event_sender
-                        .send(StreamEvent::ToolUseStart { id, name })
-                        .await
-                        .is_err()
-                    {
-                        return Ok(Step::ReceiverGone);
-                    }
-                } else {
-                    // A block of a type Meka has no block for, or a call without the id and name
-                    // the spec requires, kept whole with its deltas and never run.
-                    self.unread_block = Some(vec![data.clone()]);
-                }
-            }
-            "content_block_delta" => {
-                let Some(delta) = data.get("delta") else {
-                    return Ok(Step::Continue);
-                };
-                if let Some(unread_block) = self.unread_block.as_mut() {
-                    unread_block.push(data.clone());
-                    return Ok(Step::Continue);
-                }
-                let delta_type = delta
-                    .get("type")
-                    .and_then(|delta_type| delta_type.as_str())
-                    .unwrap_or("");
-
-                match delta_type {
-                    "thinking_delta" => {
-                        // `estimated_tokens` is the server's running count of
-                        // thinking spent so far (the `thinking-token-count` beta).
-                        // It is the only progress signal on a redacted block,
-                        // where `thinking` is `""` on every delta. The final delta
-                        // of a block carries `null`; skipping it leaves the last
-                        // real figure on screen rather than blanking the display
-                        // just before the block ends.
-                        if let Some(estimated) =
-                            delta.get("estimated_tokens").and_then(|t| t.as_u64())
-                            && event_sender
-                                .send(StreamEvent::ThinkingProgress {
-                                    estimated_tokens: Some(estimated),
-                                })
-                                .await
-                                .is_err()
-                        {
-                            return Ok(Step::ReceiverGone);
-                        }
-                        if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str())
-                            && !thinking.is_empty()
-                            && event_sender
-                                .send(StreamEvent::ThinkingDelta(thinking.to_string()))
-                                .await
-                                .is_err()
-                        {
-                            return Ok(Step::ReceiverGone);
-                        }
-                    }
-                    "text_delta" => {
-                        if let Some(text) = delta.get("text").and_then(|text| text.as_str())
-                            && !text.is_empty()
-                            && event_sender
-                                .send(StreamEvent::TextDelta(text.to_string()))
-                                .await
-                                .is_err()
-                        {
-                            return Ok(Step::ReceiverGone);
-                        }
-                    }
-                    // The delta states the signature whole, and replaces what the start held, as
-                    // the reference client folds it.
-                    "signature_delta" => {
-                        if let Some(signature) = delta.get("signature").and_then(|s| s.as_str()) {
-                            self.current_thinking_signature = Some(signature.to_string());
-                        }
-                    }
-                    "input_json_delta" => {
-                        if let Some(partial_json) = delta
-                            .get("partial_json")
-                            .and_then(|partial_json| partial_json.as_str())
-                        {
-                            self.current_tool_input.push_str(partial_json);
-                            if event_sender
-                                .send(StreamEvent::ToolArgumentsDelta(partial_json.to_string()))
-                                .await
-                                .is_err()
-                            {
-                                return Ok(Step::ReceiverGone);
-                            }
-                        }
-                    }
-                    // A citation goes on its text block's `citations`, as the reference client
-                    // folds it.
-                    "citations_delta" if self.current_text_fields.is_some() => {
-                        if let Some(citation) = delta.get("citation")
-                            && let Some(fields) = self.current_text_fields.as_mut()
-                        {
-                            let fields = fields.get_or_insert_with(Default::default);
-                            let citations = fields
-                                .entry("citations".to_string())
-                                .or_insert(serde_json::Value::Null);
-                            match citations.as_array_mut() {
-                                Some(citations) => citations.push(citation.clone()),
-                                None => *citations = serde_json::json!([citation]),
-                            }
-                        }
-                    }
-                    _ => self.unread.push(data.clone()),
-                }
-            }
-            "content_block_stop" => {
-                if let Some(mut unread_block) = self.unread_block.take() {
-                    for part in unread_block.drain(..) {
-                        if event_sender
-                            .send(StreamEvent::Unrecognized(part))
-                            .await
-                            .is_err()
-                        {
-                            return Ok(Step::ReceiverGone);
-                        }
-                    }
-                } else if let Some(provider_fields) = self.current_text_fields.take() {
-                    if event_sender
-                        .send(StreamEvent::TextEnd { provider_fields })
-                        .await
-                        .is_err()
-                    {
-                        return Ok(Step::ReceiverGone);
-                    }
-                } else if self.in_thinking {
-                    self.in_thinking = false;
-                    let signature = self.current_thinking_signature.take();
-                    if event_sender
-                        .send(StreamEvent::ThinkingComplete {
-                            opaque: signature
-                                .map(|signature| OpaqueReasoning::Signed { signature }),
-                            provider_fields: self.current_thinking_fields.take(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return Ok(Step::ReceiverGone);
-                    }
-                } else if self.in_tool_use {
-                    // An empty accumulator is a legitimate zero-argument call and
-                    // becomes `{}`. Arguments that arrived but do not parse are a
-                    // different thing entirely, and are rejected rather than
-                    // replaced.
-                    let opened_with = self.current_tool_start_input.take();
-                    let raw = match opened_with {
-                        Some(input) if self.current_tool_input.is_empty() => input.to_string(),
-                        _ => std::mem::take(&mut self.current_tool_input),
-                    };
-                    let event = crate::provider::tool_use_event(
-                        self.current_tool_id.clone(),
-                        self.current_tool_name.clone(),
-                        &raw,
-                        self.current_tool_fields.take(),
-                    );
-                    if event_sender.send(event).await.is_err() {
-                        return Ok(Step::ReceiverGone);
-                    }
-                    self.current_tool_input.clear();
-                    self.in_tool_use = false;
-                }
-                if !self.release_unread(event_sender).await {
+            "message_delta" => {
+                // The message's end follows every block it holds: one still open never finished.
+                if !self.close_open(event_sender).await {
                     return Ok(Step::ReceiverGone);
                 }
-            }
-            "message_delta" => {
                 // Folded into the message as the reference client folds it: the delta's fields and
                 // the event's own set the message's, and each usage field stated overwrites, since
                 // the counts are running totals. The reference sets only the fields it types; the
@@ -1527,13 +1460,7 @@ impl ClaudeStream {
             // An event of a type Meka does not read, kept whole where it came, or after the block
             // it came inside.
             _ => {
-                if self.in_block() {
-                    self.unread.push(data);
-                } else if event_sender
-                    .send(StreamEvent::Unrecognized(data))
-                    .await
-                    .is_err()
-                {
+                if !self.keep_unread(data, event_sender).await {
                     return Ok(Step::ReceiverGone);
                 }
             }
@@ -1789,7 +1716,9 @@ mod tests {
     #[tokio::test]
     async fn a_stream_without_event_lines_is_read_by_its_data_types() {
         let (events, outcome) = decode_sse(concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         ))
@@ -3048,10 +2977,10 @@ mod tests {
     }
 
     /// Every field a Claude reply returns has a home: a citation folds onto its text block as the
-    /// reference client folds it, a block and a delta Meka has no block for are kept whole after
-    /// the block they came in without splitting its text, and the message's own fields, folded
-    /// with its `message_delta`, are the record's, with the raw usage and without what the reply
-    /// holds.
+    /// reference client folds it, a delta Meka has no block for is kept whole after the block it
+    /// came in without splitting its text, a block Meka has no block for is kept whole in its
+    /// place, and the message's own fields, folded with its `message_delta`, are the record's,
+    /// with the raw usage and without what the reply holds.
     #[tokio::test]
     async fn every_field_a_claude_reply_returns_has_a_home() {
         let frames = [
@@ -3106,7 +3035,8 @@ mod tests {
                 text,
                 provider_fields: Some(text_fields),
             },
-            ContentBlock::Unrecognized { parts },
+            ContentBlock::Unrecognized { parts: delta },
+            ContentBlock::Unrecognized { parts: block },
         ] = completion.message.content.as_slice()
         else {
             panic!("{:?}", completion.message.content);
@@ -3117,13 +3047,16 @@ mod tests {
             serde_json::json!([{"cited_text": "a"}])
         );
         assert_eq!(
-            parts[0],
-            serde_json::json!({"type": "content_block_delta", "index": 0,
-                "delta": {"type": "future_delta", "x": 1}}),
+            delta.as_slice(),
+            [
+                serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "future_delta", "x": 1}})
+            ],
             "kept as the event it came in, so it names its block"
         );
-        assert_eq!(parts[1]["content_block"]["type"], "server_tool_use");
-        assert_eq!(parts[2]["delta"]["type"], "input_json_delta");
+        assert_eq!(block.len(), 2, "{block:?}");
+        assert_eq!(block[0]["content_block"]["type"], "server_tool_use");
+        assert_eq!(block[1]["delta"]["type"], "input_json_delta");
         let record = completion
             .response_fields
             .expect("the message's own fields");
@@ -3139,8 +3072,8 @@ mod tests {
         }
     }
 
-    /// The completion `frames` fold to, each sent as the SSE event its `type` names.
-    async fn claude_completion(frames: &[serde_json::Value]) -> crate::provider::Completion {
+    /// The events `frames` stream as, each sent as the SSE event its `type` names.
+    async fn claude_events(frames: &[serde_json::Value]) -> Vec<StreamEvent> {
         let mut protocol = super::ClaudeStream::default();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
         for frame in frames {
@@ -3155,8 +3088,17 @@ mod tests {
                 .expect("frame");
         }
         drop(sender);
-        let mut accumulator = crate::provider::MessageAccumulator::new();
+        let mut events = Vec::new();
         while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    /// The completion `frames` fold to.
+    async fn claude_completion(frames: &[serde_json::Value]) -> crate::provider::Completion {
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        for event in claude_events(frames).await {
             accumulator.push(event);
         }
         accumulator.finish()
@@ -3164,7 +3106,8 @@ mod tests {
 
     /// A block's `index` is its place in the message, so blocks that overlap on the wire (as
     /// OpenRouter streams them) fold in index order, each whole: a text block that holds only its
-    /// citations keeps them, and a block that opens inside another follows it.
+    /// citations keeps them, and a block that opens inside another follows it. Each is handed
+    /// over as it arrives, the answer before the block open around it closes.
     #[tokio::test]
     async fn blocks_fold_in_index_order_when_they_overlap() {
         let start = serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
@@ -3173,7 +3116,7 @@ mod tests {
         let end = serde_json::json!({"type": "message_delta",
             "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 9}});
         let citation = serde_json::json!({"type": "web_search_result_location", "url": "u"});
-        let completion = claude_completion(&[
+        let around = [
             start.clone(),
             serde_json::json!({"type": "content_block_start", "index": 0,
                 "content_block": {"type": "text", "text": "", "citations": []}}),
@@ -3193,8 +3136,24 @@ mod tests {
             serde_json::json!({"type": "content_block_stop", "index": 2}),
             serde_json::json!({"type": "content_block_stop", "index": 0}),
             end.clone(),
-        ])
-        .await;
+        ];
+        let events = claude_events(&around).await;
+        let position = |wanted: fn(&StreamEvent) -> bool| {
+            events
+                .iter()
+                .position(wanted)
+                .unwrap_or_else(|| panic!("{events:?}"))
+        };
+        let answered = position(
+            |event| matches!(event, StreamEvent::TextDelta(text) if text == "The answer."),
+        );
+        let cited = position(|event| {
+            matches!(event, StreamEvent::TextEnd {
+                provider_fields: Some(_)
+            })
+        });
+        assert!(answered < cited, "{events:?}");
+        let completion = claude_completion(&around).await;
         let [
             ContentBlock::Text {
                 text: cited,
@@ -3248,6 +3207,63 @@ mod tests {
         assert_eq!(kinds, ["thinking", "redacted_thinking", "text"]);
     }
 
+    /// Under the `redact-thinking` beta a withheld block streams its progress as `thinking_delta`
+    /// estimates with no words: each is shown as progress while the block runs, the block is
+    /// handed over when it stops, ahead of the next, and the record holds the block alone.
+    #[tokio::test]
+    async fn a_redacted_block_shows_its_progress_and_ends_when_it_stops() {
+        let progress = |estimated: u64| {
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "", "estimated_tokens": estimated}})
+        };
+        let frames = [
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+                "type": "message", "role": "assistant", "model": "m", "content": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "redacted_thinking", "data": "SEALED"}}),
+            progress(3),
+            progress(9),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "answer"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({"type": "message_delta",
+                "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 9}}),
+        ];
+        let events = claude_events(&frames).await;
+        let order: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingProgress { estimated_tokens } => Some(format!(
+                    "progress {}",
+                    estimated_tokens.map_or("-".to_string(), |estimated| estimated.to_string())
+                )),
+                StreamEvent::RedactedThinking { data, .. } => Some(format!("redacted {data}")),
+                StreamEvent::TextDelta(text) => Some(format!("text {text}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, [
+            "progress -",
+            "progress 3",
+            "progress 9",
+            "redacted SEALED",
+            "text answer"
+        ]);
+        let completion = claude_completion(&frames).await;
+        assert!(
+            matches!(completion.message.content.as_slice(), [
+                ContentBlock::RedactedThinking { data, .. },
+                ContentBlock::Text { text, .. },
+            ] if data == "SEALED" && text == "answer"),
+            "{:?}",
+            completion.message.content
+        );
+    }
+
     /// A block whose opening event already carries content keeps it, as the reference client
     /// does: text and reasoning start with what the start held, and a call that streams no
     /// argument deltas runs with the input its start carried.
@@ -3294,19 +3310,19 @@ mod tests {
         assert!(unparsed.is_none());
     }
 
-    /// A block that never closed before the message ended closes ahead of the blocks held behind
-    /// it, so each keeps its own place and words, and its reasoning goes unsigned, since a
-    /// signature that arrived before the block ended may not cover all of it.
+    /// A block that never closed before the message ended is handed over as one that never
+    /// finished, its reasoning unsigned, since a signature that arrived before the block ended may
+    /// not cover all of it, and the blocks after it keep their own places and words.
     #[tokio::test]
-    async fn a_block_left_open_closes_before_the_ones_held_behind_it() {
+    async fn a_block_left_open_is_unfinished_and_the_ones_after_it_keep_their_places() {
         let start = serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
             "type": "message", "role": "assistant", "model": "m", "content": [],
             "usage": {"input_tokens": 1, "output_tokens": 1}}});
-        let held_text = [
+        let later_text = [
             serde_json::json!({"type": "content_block_start", "index": 1,
                 "content_block": {"type": "text", "text": ""}}),
             serde_json::json!({"type": "content_block_delta", "index": 1,
-                "delta": {"type": "text_delta", "text": "held"}}),
+                "delta": {"type": "text_delta", "text": "later"}}),
             serde_json::json!({"type": "content_block_stop", "index": 1}),
         ];
         let end = serde_json::json!({"type": "message_delta",
@@ -3318,7 +3334,7 @@ mod tests {
             serde_json::json!({"type": "content_block_delta", "index": 0,
                 "delta": {"type": "text_delta", "text": "open"}}),
         ];
-        frames.extend(held_text.clone());
+        frames.extend(later_text.clone());
         frames.push(end.clone());
         let completion = claude_completion(&frames).await;
         let texts: Vec<_> = completion
@@ -3330,7 +3346,7 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        assert_eq!(texts, ["open", "held"]);
+        assert_eq!(texts, ["open", "later"]);
 
         let mut frames = vec![
             start,
@@ -3341,7 +3357,7 @@ mod tests {
             serde_json::json!({"type": "content_block_delta", "index": 0,
                 "delta": {"type": "signature_delta", "signature": "S"}}),
         ];
-        frames.extend(held_text);
+        frames.extend(later_text);
         frames.push(end);
         let completion = claude_completion(&frames).await;
         let [
@@ -3353,7 +3369,7 @@ mod tests {
         };
         assert_eq!(crate::conversation::reasoning_text(parts), "partial");
         assert_eq!(opaque, &None);
-        assert_eq!(text, "held");
+        assert_eq!(text, "later");
     }
 
     /// A stream that ends inside a block says it failed before it hands the block over, so a retry
@@ -3417,8 +3433,8 @@ mod tests {
         assert_eq!(kinds(&events), ["error", "unsigned"], "{events:?}");
     }
 
-    /// A stream that breaks off inside a block of a type Meka reads nothing from, with nothing held
-    /// behind it, still keeps the block as it came; and a call without the id or name the spec
+    /// A stream that breaks off inside a block of a type Meka reads nothing from still keeps the
+    /// block as it came; and a call without the id or name the spec
     /// requires is kept the same way and never run, rather than failing the reply.
     #[tokio::test]
     async fn a_block_kept_as_it_came_survives_a_cut_and_an_unnamed_call_is_one() {
@@ -3444,7 +3460,7 @@ mod tests {
                 .await
                 .expect("frame");
         }
-        protocol.release_held(&sender).await.expect("released");
+        assert!(protocol.close_open(&sender).await, "released");
         drop(sender);
         let mut accumulator = crate::provider::MessageAccumulator::new();
         while let Some(event) = receiver.recv().await {

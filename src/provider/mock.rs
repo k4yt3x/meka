@@ -71,12 +71,22 @@ pub(crate) enum MockEvent {
         #[serde(default)]
         opaque: Option<crate::conversation::OpaqueReasoning>,
     },
+    /// A `redacted_thinking` block, whole, as a Claude stream opens one.
+    RedactedThinking {
+        data: String,
+    },
     ToolUseStart {
         id: String,
         name: String,
     },
+    /// The end of the call the last `ToolUseStart` at this place began.
     ToolUseEnd {
         input: serde_json::Value,
+    },
+    /// The events that follow are of the part at `place`, as a Claude stream's `index` places a
+    /// block that opens before an earlier one stops.
+    Place {
+        place: u64,
     },
     MessageEnd {
         stop_reason: MockStopReason,
@@ -154,8 +164,7 @@ pub(crate) enum MockEvent {
     },
     /// [`Self::FailStream`] from a driver that held part of the reply when its stream broke: the
     /// failure is said, then `held` is handed over, as a driver delivers what it assembled (the
-    /// calls a Chat Completions stream builds to its end, a block a Claude stream left open and
-    /// those held behind it).
+    /// calls a Chat Completions stream builds to its end, the blocks a Claude stream left open).
     FailStreamHolding {
         message: String,
         held: Vec<MockEvent>,
@@ -504,6 +513,20 @@ impl Provider for MockProvider {
                         content.push(block);
                     }
                 }
+                MockEvent::RedactedThinking { data } => {
+                    if !text.is_empty() {
+                        content.push(ContentBlock::Text {
+                            text: std::mem::take(&mut text),
+                            provider_fields: None,
+                        });
+                    }
+                    content.push(ContentBlock::RedactedThinking {
+                        data,
+                        provider_fields: None,
+                    });
+                }
+                // The whole-reply path lays parts out in the order the script gives them.
+                MockEvent::Place { .. } => {}
                 MockEvent::ToolUseStart { id, name } => {
                     // Flush first, so text that preceded this call stays ahead of it and text
                     // between two calls stays between them. Accumulating everything and appending
@@ -590,6 +613,7 @@ impl Provider for MockProvider {
             let mut rounds = crate::sync::lock(&self.rounds);
             rounds.pop_front().unwrap_or_default()
         };
+        let mut script = ScriptedStream::default();
         for event in events {
             // A stop that has already landed is answered the way `sse::drive` answers one, as the
             // interrupt it is: `Ok(())` with nothing streamed reads to the agent as a reply the
@@ -620,7 +644,10 @@ impl Provider for MockProvider {
                 }
                 MockEvent::FailStreamHolding { message, held } => {
                     send_stream_error(&event_sender, &message).await;
-                    for event in held.into_iter().filter_map(stream_event_of) {
+                    for event in held
+                        .into_iter()
+                        .filter_map(|event| script.stream_event_of(event))
+                    {
                         if event_sender.send(event).await.is_err() {
                             break;
                         }
@@ -709,7 +736,7 @@ impl Provider for MockProvider {
                     continue;
                 }
                 event => {
-                    let Some(stream_event) = stream_event_of(event) else {
+                    let Some(stream_event) = script.stream_event_of(event) else {
                         continue;
                     };
                     if event_sender.send(stream_event).await.is_err() {
@@ -723,53 +750,80 @@ impl Provider for MockProvider {
     }
 }
 
-/// The event a scripted step streams as, or `None` for a step that only steers the script (a
-/// sleep, a hold, a failure), which the stream loop acts on itself.
-fn stream_event_of(event: MockEvent) -> Option<StreamEvent> {
-    Some(match event {
-        MockEvent::Notice { message } => {
-            StreamEvent::Notice(crate::frontend::Notice::info(message))
-        }
-        MockEvent::Redaction {
-            images,
-            bytes,
-            positions,
-        } => StreamEvent::Notice(redaction_notice(images, bytes, positions)),
-        MockEvent::Text { text } => StreamEvent::TextDelta(text),
-        MockEvent::Refusal { text } => StreamEvent::RefusalDelta(text),
-        MockEvent::Unrecognized { value } => StreamEvent::Unrecognized(value),
-        MockEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
-        MockEvent::ThinkingProgress { estimated_tokens } => {
-            StreamEvent::ThinkingProgress { estimated_tokens }
-        }
-        MockEvent::ThinkingComplete { opaque } => StreamEvent::ThinkingComplete {
-            opaque,
-            provider_fields: None,
-        },
-        MockEvent::ToolUseStart { id, name } => StreamEvent::ToolUseStart { id, name },
-        MockEvent::ToolUseEnd { input } => StreamEvent::ToolUseEnd {
-            input,
-            provider_fields: None,
-        },
-        MockEvent::MessageEnd { stop_reason } => StreamEvent::MessageEnd {
-            stop: crate::provider::Stop::of(stop_reason.into()),
-        },
-        MockEvent::Usage { input_tokens } => StreamEvent::Usage(TokenUsage {
-            input_tokens,
-            ..TokenUsage::default()
-        }),
-        MockEvent::Sleep { .. }
-        | MockEvent::Stall { .. }
-        | MockEvent::Hold { .. }
-        | MockEvent::Fail { .. }
-        | MockEvent::ExpectSystemPrompt { .. }
-        | MockEvent::FailStream { .. }
-        | MockEvent::FailStreamHolding { .. }
-        | MockEvent::FailRetryable { .. }
-        | MockEvent::FailExhausted { .. }
-        | MockEvent::FailInvalidRequest { .. }
-        | MockEvent::FailContextOverflow { .. } => return None,
-    })
+/// What a scripted stream has said so far that a later step depends on.
+#[derive(Default)]
+struct ScriptedStream {
+    /// The place the steps arriving now are of; see [`MockEvent::Place`].
+    place: u64,
+    /// The id and name of the call in progress at each place, which its end repeats.
+    calls: std::collections::HashMap<u64, (String, String)>,
+}
+
+impl ScriptedStream {
+    /// The event a scripted step streams as, or `None` for a step that only steers the script (a
+    /// sleep, a hold, a failure), which the stream loop acts on itself.
+    fn stream_event_of(&mut self, event: MockEvent) -> Option<StreamEvent> {
+        Some(match event {
+            MockEvent::Notice { message } => {
+                StreamEvent::Notice(crate::frontend::Notice::info(message))
+            }
+            MockEvent::Redaction {
+                images,
+                bytes,
+                positions,
+            } => StreamEvent::Notice(redaction_notice(images, bytes, positions)),
+            MockEvent::Text { text } => StreamEvent::TextDelta(text),
+            MockEvent::Refusal { text } => StreamEvent::RefusalDelta(text),
+            MockEvent::Unrecognized { value } => StreamEvent::Unrecognized(value),
+            MockEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
+            MockEvent::ThinkingProgress { estimated_tokens } => {
+                StreamEvent::ThinkingProgress { estimated_tokens }
+            }
+            MockEvent::ThinkingComplete { opaque } => StreamEvent::ThinkingComplete {
+                opaque,
+                provider_fields: None,
+            },
+            MockEvent::RedactedThinking { data } => StreamEvent::RedactedThinking {
+                data,
+                provider_fields: None,
+            },
+            MockEvent::ToolUseStart { id, name } => {
+                self.calls.insert(self.place, (id.clone(), name.clone()));
+                StreamEvent::ToolUseStart { id, name }
+            }
+            MockEvent::ToolUseEnd { input } => {
+                let (id, name) = self.calls.remove(&self.place).unwrap_or_default();
+                StreamEvent::ToolUseEnd {
+                    id,
+                    name,
+                    input,
+                    provider_fields: None,
+                }
+            }
+            MockEvent::Place { place } => {
+                self.place = place;
+                StreamEvent::Place(place)
+            }
+            MockEvent::MessageEnd { stop_reason } => StreamEvent::MessageEnd {
+                stop: crate::provider::Stop::of(stop_reason.into()),
+            },
+            MockEvent::Usage { input_tokens } => StreamEvent::Usage(TokenUsage {
+                input_tokens,
+                ..TokenUsage::default()
+            }),
+            MockEvent::Sleep { .. }
+            | MockEvent::Stall { .. }
+            | MockEvent::Hold { .. }
+            | MockEvent::Fail { .. }
+            | MockEvent::ExpectSystemPrompt { .. }
+            | MockEvent::FailStream { .. }
+            | MockEvent::FailStreamHolding { .. }
+            | MockEvent::FailRetryable { .. }
+            | MockEvent::FailExhausted { .. }
+            | MockEvent::FailInvalidRequest { .. }
+            | MockEvent::FailContextOverflow { .. } => return None,
+        })
+    }
 }
 
 /// The JSON-encoded script at `path`, which `MEKA_MOCK_PROVIDER_SCRIPT` named.

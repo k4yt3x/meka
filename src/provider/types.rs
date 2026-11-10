@@ -287,6 +287,11 @@ impl ToolDefinition {
 }
 #[derive(Debug, Clone)]
 pub(crate) enum StreamEvent {
+    /// The part events that follow are of the part at this place in the reply, until the next
+    /// `Place`: a Claude block's `index`, which numbers blocks a stream may open before an earlier
+    /// one stops. A stream that sends none has every part at place 0. Parts are laid out by
+    /// place, and parts at one place in the order they arrive.
+    Place(u64),
     TextDelta(String),
     /// The end of one part of the reply's text as the provider returned it (a Claude text block, a
     /// Responses message item), with every field the provider put on it beyond its text. The text
@@ -324,8 +329,8 @@ pub(crate) enum StreamEvent {
         /// The part's fields nothing else holds.
         provider_fields: Option<crate::conversation::ProviderFields>,
     },
-    /// A complete `redacted_thinking` block (the `redact-thinking` beta). `data` is opaque and
-    /// arrives whole in the `content_block_start` event, so there is no delta/complete pair.
+    /// A complete `redacted_thinking` block (the `redact-thinking` beta), when it ends: `data` is
+    /// opaque and arrives whole when the block opens, and what streams inside it is progress.
     RedactedThinking {
         data: String,
         /// The part's fields nothing else holds.
@@ -337,7 +342,10 @@ pub(crate) enum StreamEvent {
     },
     /// A piece of the arguments of the call in progress, as it streamed.
     ToolArgumentsDelta(String),
+    /// The end of the call in progress, with the arguments it ran on.
     ToolUseEnd {
+        id: String,
+        name: String,
         input: serde_json::Value,
         /// Every field the provider put on the call beyond its id, name and arguments.
         provider_fields: Option<crate::conversation::ProviderFields>,

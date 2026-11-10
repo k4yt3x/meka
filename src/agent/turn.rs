@@ -3339,10 +3339,13 @@ impl Agent {
         // request is even sent, so any other event is proof the request was judged.
         let mut response_started = false;
         // Whether the driver has said its stream failed. What it hands over after that is what it
-        // held when the stream broke (the calls a Chat Completions stream assembles to its end, a
-        // block a Claude stream left open and those held behind it): kept with the attempt's
-        // partial reply and never shown, so it leaves a retry as possible as the failure found it.
+        // held when the stream broke (the calls a Chat Completions stream assembles to its end, the
+        // blocks a Claude stream left open): kept with the attempt's partial reply and never shown,
+        // so it leaves a retry as possible as the failure found it.
         let mut failed = false;
+
+        // The order the reply's parts reach the surfaces, one part at a time.
+        let mut order = DrawOrder::default();
 
         while let Some(event) = event_receiver.recv().await {
             if failed {
@@ -3352,22 +3355,11 @@ impl Agent {
             if !matches!(event, StreamEvent::Notice(_)) {
                 response_started = true;
             }
-            // What the user sees is decided here, event by event; what the conversation keeps is
-            // the accumulator's one answer, shared with every other reader of a stream.
-            match &event {
+            // What the user sees is decided here, event by event, while the accumulator holds the
+            // part as it stood when the event arrived; what the conversation keeps is the
+            // accumulator's one answer, shared with every other reader of a stream.
+            let (drawn, closes) = match &event {
                 StreamEvent::ThinkingDelta(text) => {
-                    // Marked like `StreamEvent::TextDelta` marks its first chunk, and for the same
-                    // reason: this is model output a consumer now holds, and a retry would send it
-                    // again. Not the `Notice` exemption, since a notice is Meka's own advisory,
-                    // queued before the request is even sent.
-                    //
-                    // Asked of the frontend rather than assumed, because reasoning is the *first*
-                    // thing a turn produces: marking every turn that reasoned would refuse the
-                    // retry for almost any mid-turn failure, which is exactly when an overloaded
-                    // provider needs one. A frontend that discards these loses nothing to a retry.
-                    if self.cells.frontend.retains_reasoning() {
-                        progress.content_started = true;
-                    }
                     // Each part is recorded as its own; a reader sees them a blank line apart, as
                     // the block reads whole.
                     let text = if accumulator.opens_a_later_part() {
@@ -3375,23 +3367,14 @@ impl Agent {
                     } else {
                         text.clone()
                     };
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::ThinkingDelta(text))
-                        .await;
+                    (Some(FrontendEvent::ThinkingDelta(text)), false)
                 }
-                StreamEvent::ThinkingPart(_) => {}
-                StreamEvent::ThinkingProgress { estimated_tokens } => {
-                    // Deliberately does not set `content_started`: this is a transient indicator
-                    // the frontend erases, not output the turn produced. Counting it would make an
-                    // interrupted think look like a partial answer.
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::ThinkingProgress {
-                            estimated_tokens: *estimated_tokens,
-                        })
-                        .await;
-                }
+                StreamEvent::ThinkingProgress { estimated_tokens } => (
+                    Some(FrontendEvent::ThinkingProgress {
+                        estimated_tokens: *estimated_tokens,
+                    }),
+                    false,
+                ),
                 StreamEvent::ThinkingComplete { .. } => {
                     let content = accumulator.pending_thinking();
                     // Whether there is anything to *show*, which is the question
@@ -3402,97 +3385,72 @@ impl Agent {
                     // question can only be asked once the block is whole, which is here. Whether
                     // the block is *kept* is the accumulator's answer, and asks the raw text: what
                     // the provider will accept back is not a question about what is worth showing.
-                    let showable = !content.trim().is_empty();
-                    if showable {
-                        progress.content_started = true;
-                        self.cells
-                            .frontend
-                            .emit(FrontendEvent::ThinkingBlock {
-                                content: content.to_string(),
-                            })
-                            .await;
+                    //
+                    // Nothing to render still ends the block, so a frontend showing a live
+                    // indicator can close it here instead of holding the line open for an event
+                    // that may never come.
+                    let drawn = if content.trim().is_empty() {
+                        FrontendEvent::ThinkingEnded
                     } else {
-                        // Nothing to render, but the block is over: say so, so a frontend showing a
-                        // live indicator can close it here instead of holding the line open for an
-                        // event that may never come.
-                        self.cells.frontend.emit(FrontendEvent::ThinkingEnded).await;
-                    }
+                        FrontendEvent::ThinkingBlock { content }
+                    };
+                    (Some(drawn), true)
                 }
                 StreamEvent::RedactedThinking { .. } => {
-                    progress.content_started = true;
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::RedactedThinking)
-                        .await;
+                    (Some(FrontendEvent::RedactedThinking), true)
                 }
                 // A refusal's words are the model's, shown as it streams them.
                 StreamEvent::TextDelta(text) | StreamEvent::RefusalDelta(text) => {
-                    progress.content_started = true;
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::AssistantTextDelta(text.clone()))
-                        .await;
+                    (Some(FrontendEvent::AssistantTextDelta(text.clone())), false)
                 }
-                // The end of a part changes nothing on screen, and what Meka reads nothing from is
-                // kept, not shown: neither is output a retry would show twice.
-                StreamEvent::TextEnd { .. } | StreamEvent::Unrecognized(_) => {}
-                StreamEvent::ToolUseStart { id, name } => {
-                    // Deliberately does not set `content_started`, for the same reason
-                    // `ThinkingProgress` doesn't: a call whose arguments never finish produced no
-                    // output, and the flag is what decides whether a mid-stream failure is still
-                    // safe to retry.
-                    progress.announced.push((id.clone(), false));
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::ToolCallComposing {
-                            id: id.clone(),
-                            name: name.clone(),
-                        })
-                        .await;
-                }
-                StreamEvent::ToolUseEnd { input, .. } => {
-                    progress.content_started = true;
-                    let (id, name) = accumulator.pending_tool();
-                    progress.started(id);
-                    let display_summary = crate::tools::resolve_primary_param(name, input);
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::ToolCallStarted {
-                            id: id.to_string(),
-                            name: name.to_string(),
-                            input: input.clone(),
-                            display_summary,
-                            unparsed: None,
-                        })
-                        .await;
-                }
+                // The end of a part changes nothing on screen.
+                StreamEvent::TextEnd { .. } => (None, true),
+                StreamEvent::ToolUseStart { id, name } => (
+                    Some(FrontendEvent::ToolCallComposing {
+                        id: id.clone(),
+                        name: name.clone(),
+                    }),
+                    false,
+                ),
+                StreamEvent::ToolUseEnd {
+                    id, name, input, ..
+                } => (
+                    Some(FrontendEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        display_summary: crate::tools::resolve_primary_param(name, input),
+                        unparsed: None,
+                    }),
+                    true,
+                ),
+                // A malformed call arrived. The accumulator keeps a `ToolUse` block with `{}` for
+                // its arguments and what the model sent beside it, so the assistant message stays
+                // valid for the round trip and dispatch refuses the call rather than run it on
+                // arguments the model did not give. Shown the same way.
                 StreamEvent::ToolCallRefused {
                     id, name, unparsed, ..
-                } => {
-                    // A malformed call arrived. The accumulator keeps a `ToolUse` block with `{}`
-                    // for its arguments and what the model sent beside it, so the assistant
-                    // message stays valid for the round trip and dispatch refuses the call rather
-                    // than run it on arguments the model did not give. Shown the same way.
-                    progress.content_started = true;
-                    progress.started(id);
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::ToolCallStarted {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: serde_json::json!({}),
-                            display_summary: None,
-                            unparsed: Some(unparsed.clone()),
-                        })
-                        .await;
-                }
-                // A call's arguments are drawn whole, when the call starts.
-                StreamEvent::ToolArgumentsDelta(_)
+                } => (
+                    Some(FrontendEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: serde_json::json!({}),
+                        display_summary: None,
+                        unparsed: Some(unparsed.clone()),
+                    }),
+                    true,
+                ),
+                // What Meka reads nothing from is kept, not shown, and a call's arguments are drawn
+                // whole, when the call starts.
+                StreamEvent::Place(_)
+                | StreamEvent::ThinkingPart(_)
+                | StreamEvent::Unrecognized(_)
+                | StreamEvent::ToolArgumentsDelta(_)
                 | StreamEvent::MessageEnd { .. }
                 | StreamEvent::Model(_)
                 | StreamEvent::MessageFields(_)
                 | StreamEvent::ResponseFields(_)
-                | StreamEvent::Usage(_) => {}
+                | StreamEvent::Usage(_) => (None, false),
                 StreamEvent::Notice(notice) => {
                     // Provider advisories (image redaction) are emitted inline so the user sees
                     // them in order with the assistant text that follows.
@@ -3503,6 +3461,7 @@ impl Agent {
                     // even sent, so marking it would disable retry for the whole turn from the
                     // first event onward; `forward_notice` drops the advisory a retry repeats.
                     self.forward_notice(notice.clone()).await;
+                    (None, false)
                 }
                 StreamEvent::Error(error) => {
                     // No return: every producer of this event sends it ahead of its own typed
@@ -3521,9 +3480,20 @@ impl Agent {
                     self.cells.frontend.emit(FrontendEvent::ThinkingEnded).await;
                     tracing::debug!("stream error: {error}");
                     failed = true;
+                    (None, false)
                 }
+            };
+            for drawn in order.arrive(accumulator.place(), drawn, closes) {
+                self.draw(drawn, progress).await;
             }
             accumulator.push(event);
+        }
+        // What waited for a part that never closed is drawn once the reply has ended; what waited
+        // when the stream failed is held with the attempt's partial reply and never shown.
+        if !failed {
+            for drawn in order.finish() {
+                self.draw(drawn, progress).await;
+            }
         }
 
         match stream_handle.await {
@@ -3552,6 +3522,101 @@ impl Agent {
 
         // Its notices were forwarded as they arrived.
         Ok(accumulator.finish())
+    }
+}
+
+impl Agent {
+    /// Draw `event` of the reply on every surface, and note what drawing it means for a retry
+    /// and for the calls the stream announced.
+    async fn draw(&self, event: FrontendEvent, progress: &mut StreamProgress) {
+        match &event {
+            // Marked like a text delta marks the answer, and for the same reason: this is model
+            // output a consumer now holds, and a retry would send it again. Asked of the frontend
+            // rather than assumed, because reasoning is the *first* thing a turn produces: marking
+            // every turn that reasoned would refuse the retry for almost any mid-turn failure,
+            // which is exactly when an overloaded provider needs one. A frontend that discards
+            // these loses nothing to a retry.
+            FrontendEvent::ThinkingDelta(_) => {
+                if self.cells.frontend.retains_reasoning() {
+                    progress.content_started = true;
+                }
+            }
+            FrontendEvent::ThinkingBlock { .. }
+            | FrontendEvent::RedactedThinking
+            | FrontendEvent::AssistantTextDelta(_) => progress.content_started = true,
+            // Deliberately does not set `content_started`, for the same reason a thinking
+            // indicator doesn't: a call whose arguments never finish produced no output, and the
+            // flag is what decides whether a mid-stream failure is still safe to retry.
+            FrontendEvent::ToolCallComposing { id, .. } => {
+                progress.announced.push((id.clone(), false));
+            }
+            FrontendEvent::ToolCallStarted { id, .. } => {
+                progress.content_started = true;
+                progress.started(id);
+            }
+            // A thinking indicator is transient, erased by the frontend, not output the turn
+            // produced: counting it would make an interrupted think look like a partial answer.
+            _ => {}
+        }
+        self.cells.frontend.emit(event).await;
+    }
+}
+
+/// The order a reply's parts reach the surfaces: each as it arrives, one part at a time.
+///
+/// Every surface draws one stream of words, one thought or one call at a time (the screen's live
+/// row, an editor's chunks, the feed's deltas), and a stream may open a part before an earlier
+/// one stops (OpenRouter overlaps Claude's blocks). A part that has drawn holds the surfaces until
+/// it closes; what other parts draw meanwhile waits, and follows in their places' order.
+#[derive(Default)]
+struct DrawOrder {
+    /// The place of the part on the surfaces now: it has drawn and not closed.
+    drawing: Option<u64>,
+    /// What other parts drew while one held the surfaces, by place, and whether each has closed.
+    waiting: std::collections::BTreeMap<u64, (Vec<FrontendEvent>, bool)>,
+}
+
+impl DrawOrder {
+    /// What to draw now that the part at `place` arrived with `drawn`, closing it when `closes`.
+    fn arrive(
+        &mut self,
+        place: u64,
+        drawn: Option<FrontendEvent>,
+        closes: bool,
+    ) -> Vec<FrontendEvent> {
+        if self.drawing.is_some_and(|holder| holder != place) {
+            if drawn.is_some() || closes {
+                let (events, closed) = self.waiting.entry(place).or_default();
+                events.extend(drawn);
+                *closed |= closes;
+            }
+            return Vec::new();
+        }
+        let mut now = Vec::new();
+        if let Some(event) = drawn {
+            now.push(event);
+            self.drawing = Some(place);
+        }
+        if closes && self.drawing == Some(place) {
+            self.drawing = None;
+            while let Some((place, (events, closed))) = self.waiting.pop_first() {
+                let drew = !events.is_empty();
+                now.extend(events);
+                if drew && !closed {
+                    self.drawing = Some(place);
+                    break;
+                }
+            }
+        }
+        now
+    }
+
+    /// Everything still waiting, in place order, once the reply has ended.
+    fn finish(self) -> Vec<FrontendEvent> {
+        self.waiting
+            .into_values()
+            .flat_map(|(events, _)| events)
+            .collect()
     }
 }
 
@@ -4474,6 +4539,171 @@ mod tests {
                 .iter()
                 .any(|message| message.text_content().contains("answered on the retry"))
         );
+    }
+
+    /// Words of parts open at once are drawn one part at a time: a part that has drawn holds the
+    /// surfaces until it closes, a part that has drawn nothing holds nothing, and what waited
+    /// follows in place order up to the next part still open; what waits on a part that never
+    /// closes is drawn when the reply ends.
+    #[test]
+    fn parts_that_overlap_are_drawn_one_at_a_time_in_place_order() {
+        let text = |words: &str| Some(FrontendEvent::AssistantTextDelta(words.to_string()));
+        let words = |events: Vec<FrontendEvent>| -> Vec<String> {
+            events
+                .into_iter()
+                .map(|event| match event {
+                    FrontendEvent::AssistantTextDelta(words) => words,
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        let mut order = DrawOrder::default();
+        assert!(order.arrive(0, None, false).is_empty());
+        assert_eq!(words(order.arrive(2, text("two "), false)), ["two "]);
+        assert!(order.arrive(1, text("one "), false).is_empty());
+        assert!(order.arrive(0, text("zero "), false).is_empty());
+        assert!(order.arrive(1, None, true).is_empty());
+        assert_eq!(words(order.arrive(2, text("more"), false)), ["more"]);
+        assert_eq!(words(order.arrive(2, None, true)), ["zero "]);
+        assert_eq!(words(order.arrive(0, None, true)), ["one "]);
+        assert_eq!(words(order.arrive(3, text("three"), false)), ["three"]);
+        assert!(order.finish().is_empty());
+
+        let mut order = DrawOrder::default();
+        assert_eq!(words(order.arrive(0, text("open"), false)), ["open"]);
+        assert!(order.arrive(1, text("after"), false).is_empty());
+        assert_eq!(words(order.finish()), ["after"]);
+    }
+
+    /// A part that opens inside another on the stream (OpenRouter's `redacted_thinking` inside the
+    /// thinking it follows) is drawn once the other closes, rather than over its live row, and the
+    /// record keeps each part in its place.
+    #[tokio::test]
+    async fn a_part_that_opens_inside_another_is_drawn_once_the_other_closes() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, _provider, _store, _session_id, frontend) = agent_with_session(vec![vec![
+            MockEvent::ThinkingProgress {
+                estimated_tokens: None,
+            },
+            MockEvent::ThinkingDelta {
+                text: "summary".to_string(),
+            },
+            MockEvent::Place { place: 1 },
+            MockEvent::RedactedThinking {
+                data: "SEALED".to_string(),
+            },
+            MockEvent::Place { place: 0 },
+            MockEvent::ThinkingDelta {
+                text: " more".to_string(),
+            },
+            MockEvent::ThinkingComplete {
+                opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                    signature: "S".to_string(),
+                }),
+            },
+            MockEvent::Place { place: 2 },
+            MockEvent::Text {
+                text: "899".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]])
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn");
+        let drawn: Vec<String> = frontend
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                FrontendEvent::ThinkingProgress { .. } => Some("progress".to_string()),
+                FrontendEvent::ThinkingDelta(text) => Some(format!("thinking:{text}")),
+                FrontendEvent::ThinkingBlock { .. } => Some("thought".to_string()),
+                FrontendEvent::RedactedThinking => Some("redacted".to_string()),
+                FrontendEvent::AssistantTextDelta(text) => Some(format!("text:{text}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drawn, [
+            "progress",
+            "thinking:summary",
+            "thinking: more",
+            "thought",
+            "redacted",
+            "text:899"
+        ]);
+        let reply = messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("the reply");
+        assert!(
+            matches!(reply.content.as_slice(), [
+                ContentBlock::Thinking { .. },
+                ContentBlock::RedactedThinking { .. },
+                ContentBlock::Text { .. },
+            ]),
+            "{:?}",
+            reply.content
+        );
+    }
+
+    /// What a part drew while another held the surfaces was never shown, so a stream that fails
+    /// before the other closes leaves the retry the failure allows, and the retry's answer is the
+    /// one drawn.
+    #[tokio::test]
+    async fn a_part_that_waited_for_another_does_not_refuse_the_retry() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, _provider, _store, _session_id, frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-open".to_string(),
+                    name: "file_read".to_string(),
+                },
+                MockEvent::Place { place: 1 },
+                MockEvent::Text {
+                    text: "waited".to_string(),
+                },
+                MockEvent::FailStream {
+                    message: "connection reset".to_string(),
+                },
+            ],
+            vec![
+                MockEvent::Text {
+                    text: "answered on the retry".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the retry carries the turn");
+        let words: Vec<String> = frontend
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                FrontendEvent::AssistantTextDelta(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(words, ["answered on the retry"]);
     }
 
     /// A reply stopped mid-stream is recorded whole, its reasoning and the call it made included,

@@ -712,6 +712,8 @@ pub(crate) fn call_event(
 ) -> StreamEvent {
     match arguments {
         Ok(input) => StreamEvent::ToolUseEnd {
+            id,
+            name,
             input,
             provider_fields,
         },
@@ -888,6 +890,22 @@ pub(crate) struct PartialReply {
 /// turn.
 #[derive(Default)]
 pub(crate) struct MessageAccumulator {
+    /// What arrived at each place, laid out by place; see [`StreamEvent::Place`].
+    places: std::collections::BTreeMap<u64, PartsAt>,
+    /// The place the part events arriving now are of.
+    place: u64,
+    stop: Option<Stop>,
+    model: Option<String>,
+    message_fields: Option<crate::conversation::ProviderFields>,
+    response_fields: Option<crate::conversation::ProviderFields>,
+    usage: TokenUsage,
+    notices: Vec<Notice>,
+}
+
+/// The parts at one place of a reply, folded in the order they arrive: the blocks they closed, and
+/// the text, refusal, reasoning and call in progress.
+#[derive(Default)]
+struct PartsAt {
     content: Vec<ContentBlock>,
     text: String,
     refusal: String,
@@ -895,15 +913,9 @@ pub(crate) struct MessageAccumulator {
     thinking: Vec<crate::conversation::ReasoningPart>,
     tool_id: String,
     tool_name: String,
-    stop: Option<Stop>,
-    model: Option<String>,
-    message_fields: Option<crate::conversation::ProviderFields>,
-    response_fields: Option<crate::conversation::ProviderFields>,
     /// The arguments of the call in progress as they streamed, kept for a reply that ends before
     /// the call does.
     tool_arguments: String,
-    usage: TokenUsage,
-    notices: Vec<Notice>,
 }
 
 impl MessageAccumulator {
@@ -911,16 +923,27 @@ impl MessageAccumulator {
         Self::default()
     }
 
-    /// The thinking of the block in progress as a reader sees it, whole once `ThinkingComplete`
-    /// arrives.
-    pub(crate) fn pending_thinking(&self) -> String {
-        crate::conversation::reasoning_text(&self.thinking)
+    /// The place the part events arriving now are of.
+    pub(crate) fn place(&self) -> u64 {
+        self.place
     }
 
-    /// Whether the next reasoning delta is the first text of a part that follows one with text,
-    /// which a reader sees after a blank line.
+    /// The thinking of the block in progress at the current place as a reader sees it, whole once
+    /// `ThinkingComplete` arrives.
+    pub(crate) fn pending_thinking(&self) -> String {
+        self.places
+            .get(&self.place)
+            .map(|parts| crate::conversation::reasoning_text(&parts.thinking))
+            .unwrap_or_default()
+    }
+
+    /// Whether the next reasoning delta at the current place is the first text of a part that
+    /// follows one with text, which a reader sees after a blank line.
     pub(crate) fn opens_a_later_part(&self) -> bool {
-        match self.thinking.split_last() {
+        let Some(parts) = self.places.get(&self.place) else {
+            return false;
+        };
+        match parts.thinking.split_last() {
             Some((last, earlier)) => {
                 last.text.is_empty() && earlier.iter().any(|part| !part.text.is_empty())
             }
@@ -928,11 +951,80 @@ impl MessageAccumulator {
         }
     }
 
-    /// The `(id, name)` of the tool call whose arguments are in progress.
-    pub(crate) fn pending_tool(&self) -> (&str, &str) {
-        (&self.tool_id, &self.tool_name)
+    /// Fold one event. The display-only events (`ThinkingProgress`, `Error`) change nothing here; a
+    /// `Notice` is kept for [`Self::finish`].
+    pub(crate) fn push(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::Place(place) => self.place = place,
+            StreamEvent::MessageEnd { stop } => self.stop = Some(stop),
+            // The first name stands: a wire that names the model on every chunk names one.
+            StreamEvent::Model(model) => {
+                self.model.get_or_insert(model);
+            }
+            StreamEvent::MessageFields(fields) => self.message_fields = Some(fields),
+            StreamEvent::ResponseFields(fields) => self.response_fields = Some(fields),
+            // Merged rather than overwritten: Anthropic streams the input and cache tiers on
+            // `message_start` and the output on `message_delta`, so last-event-wins would drop the
+            // input count.
+            StreamEvent::Usage(usage) => self.usage.merge_stream(&usage),
+            StreamEvent::Notice(notice) => self.notices.push(notice),
+            StreamEvent::Error(_) => {}
+            part => self.places.entry(self.place).or_default().push(part),
+        }
     }
 
+    /// Every place's blocks in place order, with what is still open closed as the reply returned
+    /// it.
+    fn content(&mut self) -> Vec<ContentBlock> {
+        std::mem::take(&mut self.places)
+            .into_values()
+            .flat_map(|mut parts| {
+                parts.close_open_blocks();
+                parts.content
+            })
+            .collect()
+    }
+
+    /// What arrived before a stream failed, as it arrived, for a caller that keeps a partial
+    /// reply: `None` when nothing did.
+    pub(crate) fn partial(mut self) -> Option<PartialReply> {
+        let content = self.content();
+        (!content.is_empty()).then(|| PartialReply {
+            message: Message {
+                role: Role::Assistant,
+                content,
+                provider_fields: self.message_fields,
+            },
+            model: self.model,
+            usage: self.usage,
+            response_fields: self.response_fields,
+        })
+    }
+
+    /// The message and how it ended. A stream that never stated its stop ends the turn, with no
+    /// word of the provider's recorded for it.
+    pub(crate) fn finish(mut self) -> Completion {
+        let content = self.content();
+        let stop = self
+            .stop
+            .unwrap_or(Stop::of(StopReason::EndTurn))
+            .with_refusal_of(&content);
+        Completion {
+            message: Message {
+                role: Role::Assistant,
+                content,
+                provider_fields: self.message_fields,
+            },
+            stop,
+            model: self.model,
+            usage: self.usage,
+            response_fields: self.response_fields,
+            notices: self.notices,
+        }
+    }
+}
+
+impl PartsAt {
     /// Close the text in progress as a block, ahead of whatever block comes next, so the message
     /// holds its blocks in the order the wire sent them and a replay reads as the live turn did.
     /// A refusal in progress closes the same way.
@@ -971,9 +1063,8 @@ impl MessageAccumulator {
         }
     }
 
-    /// Fold one event. The display-only events (`ThinkingProgress`, `Error`) change nothing here; a
-    /// `Notice` is kept for [`Self::finish`].
-    pub(crate) fn push(&mut self, event: StreamEvent) {
+    /// Fold one part event.
+    fn push(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::TextDelta(text) => {
                 if !self.refusal.is_empty() {
@@ -1033,7 +1124,6 @@ impl MessageAccumulator {
                     provider_fields,
                 });
             }
-            StreamEvent::ThinkingProgress { .. } | StreamEvent::Error(_) => {}
             StreamEvent::ToolUseStart { id, name } => {
                 // Text that preceded the call stays ahead of it, and text between two calls stays
                 // between them.
@@ -1044,15 +1134,21 @@ impl MessageAccumulator {
             }
             StreamEvent::ToolArgumentsDelta(fragment) => self.tool_arguments.push_str(&fragment),
             StreamEvent::ToolUseEnd {
+                id,
+                name,
                 input,
                 provider_fields,
-            } => self.content.push(ContentBlock::ToolUse {
-                id: std::mem::take(&mut self.tool_id),
-                name: std::mem::take(&mut self.tool_name),
-                input,
-                unparsed: None,
-                provider_fields,
-            }),
+            } => {
+                self.content.push(ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    unparsed: None,
+                    provider_fields,
+                });
+                self.tool_id.clear();
+                self.tool_name.clear();
+            }
             StreamEvent::ToolCallRefused {
                 id,
                 name,
@@ -1067,18 +1163,15 @@ impl MessageAccumulator {
                 self.tool_id.clear();
                 self.tool_name.clear();
             }
-            StreamEvent::MessageEnd { stop } => self.stop = Some(stop),
-            // The first name stands: a wire that names the model on every chunk names one.
-            StreamEvent::Model(model) => {
-                self.model.get_or_insert(model);
-            }
-            StreamEvent::MessageFields(fields) => self.message_fields = Some(fields),
-            StreamEvent::ResponseFields(fields) => self.response_fields = Some(fields),
-            // Merged rather than overwritten: Anthropic streams the input and cache tiers on
-            // `message_start` and the output on `message_delta`, so last-event-wins would drop the
-            // input count.
-            StreamEvent::Usage(usage) => self.usage.merge_stream(&usage),
-            StreamEvent::Notice(notice) => self.notices.push(notice),
+            StreamEvent::ThinkingProgress { .. }
+            | StreamEvent::Place(_)
+            | StreamEvent::MessageEnd { .. }
+            | StreamEvent::Model(_)
+            | StreamEvent::MessageFields(_)
+            | StreamEvent::ResponseFields(_)
+            | StreamEvent::Usage(_)
+            | StreamEvent::Notice(_)
+            | StreamEvent::Error(_) => {}
         }
     }
 
@@ -1098,44 +1191,6 @@ impl MessageAccumulator {
                 unfinished_call(std::mem::take(&mut self.tool_arguments)),
                 None,
             ));
-        }
-    }
-
-    /// What arrived before a stream failed, as it arrived, for a caller that keeps a partial
-    /// reply: `None` when nothing did.
-    pub(crate) fn partial(mut self) -> Option<PartialReply> {
-        self.close_open_blocks();
-        (!self.content.is_empty()).then(|| PartialReply {
-            message: Message {
-                role: Role::Assistant,
-                content: self.content,
-                provider_fields: self.message_fields,
-            },
-            model: self.model,
-            usage: self.usage,
-            response_fields: self.response_fields,
-        })
-    }
-
-    /// The message and how it ended. A stream that never stated its stop ends the turn, with no
-    /// word of the provider's recorded for it.
-    pub(crate) fn finish(mut self) -> Completion {
-        self.close_open_blocks();
-        let stop = self
-            .stop
-            .unwrap_or(Stop::of(StopReason::EndTurn))
-            .with_refusal_of(&self.content);
-        Completion {
-            message: Message {
-                role: Role::Assistant,
-                content: self.content,
-                provider_fields: self.message_fields,
-            },
-            stop,
-            model: self.model,
-            usage: self.usage,
-            response_fields: self.response_fields,
-            notices: self.notices,
         }
     }
 }

@@ -189,23 +189,26 @@ impl CutRequest {
         }
     }
 
-    /// `event` with every name restored. `pending` is the name of the call whose arguments are
-    /// streaming, which a call's end does not repeat.
-    fn restore_event(&self, event: StreamEvent, pending: &mut Option<String>) -> StreamEvent {
+    /// `event` with every name restored.
+    fn restore_event(&self, event: StreamEvent) -> StreamEvent {
         match event {
-            StreamEvent::ToolUseStart { id, name } => {
-                let name = self.restore(name);
-                *pending = Some(name.clone());
-                StreamEvent::ToolUseStart { id, name }
-            }
+            StreamEvent::ToolUseStart { id, name } => StreamEvent::ToolUseStart {
+                id,
+                name: self.restore(name),
+            },
             StreamEvent::ToolUseEnd {
+                id,
+                name,
                 mut input,
                 provider_fields,
             } => {
-                if pending.take().as_deref() == Some(SEARCH_TOOL_NAME) {
+                let name = self.restore(name);
+                if name == SEARCH_TOOL_NAME {
                     self.restore_searched(&mut input);
                 }
                 StreamEvent::ToolUseEnd {
+                    id,
+                    name,
                     input,
                     provider_fields,
                 }
@@ -215,15 +218,12 @@ impl CutRequest {
                 name,
                 unparsed,
                 provider_fields,
-            } => {
-                pending.take();
-                StreamEvent::ToolCallRefused {
-                    id,
-                    name: self.restore(name),
-                    unparsed,
-                    provider_fields,
-                }
-            }
+            } => StreamEvent::ToolCallRefused {
+                id,
+                name: self.restore(name),
+                unparsed,
+                provider_fields,
+            },
             other => other,
         }
     }
@@ -272,10 +272,9 @@ impl Provider for ToolNameCap {
         // would have closed the driver's own, rather than leaving the driver blocked on a full one.
         let restore = &cut;
         let forward = async move {
-            let mut pending = None;
             while let Some(event) = receiver.recv().await {
                 if event_sender
-                    .send(restore.restore_event(event, &mut pending))
+                    .send(restore.restore_event(event))
                     .await
                     .is_err()
                 {
