@@ -956,7 +956,13 @@ mod tests {
             .import_sessions(records, blobs)
             .await
             .expect("import");
-        let mut imported = target.load_history(root_new_id).await.expect("history");
+        let mut imported: Vec<Event> = target
+            .load_history(root_new_id)
+            .await
+            .expect("history")
+            .into_iter()
+            .map(|recorded| recorded.event)
+            .collect();
         assert_eq!(imported.len(), 4_101);
         target.inline_blobs(&mut imported).await.expect("inline");
         let Some(Event::Append(last)) = imported.last() else {
@@ -1011,19 +1017,25 @@ mod tests {
                 // imported session unable to replay its own reasoning, silently.
                 content: vec![
                     ContentBlock::Thinking {
-                        thinking: "weighing it up".to_string(),
+                        parts: vec![crate::conversation::ReasoningPart::reasoning(
+                            "weighing it up",
+                        )],
                         opaque: Some(crate::conversation::OpaqueReasoning::Sealed {
                             encrypted_content: "OPAQUE".to_string(),
                             id: Some("rs_1".to_string()),
                             origin: Some("https://chatgpt.com".to_string()),
                         }),
+                        provider_fields: None,
                     },
                     ContentBlock::ToolUse {
                         id: "u1".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "/x"}),
+                        unparsed: None,
+                        provider_fields: None,
                     },
                 ],
+                provider_fields: None,
             }),
             Event::Append(Message {
                 role: Role::User,
@@ -1035,6 +1047,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             }),
             Event::CompactBoundary {
                 summary: Message::user("[summary]"),
@@ -1654,14 +1667,14 @@ mod tests {
         log.replace_for_compaction(
             user_msg("[Conversation summary from session compaction]\n\nYou discussed things."),
             vec![assistant_text("kept tail answer")],
-            std::collections::HashSet::new(),
+            Default::default(),
             Default::default(),
             crate::conversation::CompactionRecord::for_test(),
         );
 
         let markdown = format_session_as_markdown(
             uuid::Uuid::nil(),
-            log.events(),
+            log.events().iter().map(|event| (event, None)),
             &std::collections::HashMap::new(),
         );
 

@@ -145,6 +145,8 @@ pub(crate) struct AcpFrontend {
     /// token of its own, and a frontend holding a stale clone would race against a token nobody
     /// signals.
     pub(super) cancel: crate::host::CancelCell,
+    /// Whether the last update sent was a thought, which the next thought starts apart from.
+    pub(super) after_thought: std::sync::atomic::AtomicBool,
 }
 /// `clientCapabilities._meta` key a client sets to say it renders agent-owned terminals from the
 /// `_meta` frames below. Distinct from the typed `terminal` capability, which means "I implement
@@ -390,6 +392,7 @@ impl AcpFrontend {
             prompted: std::sync::Mutex::new(std::collections::HashSet::new()),
             call_ids: std::sync::Mutex::new(CallIds::new(thread)),
             cancel,
+            after_thought: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -530,6 +533,10 @@ impl AcpFrontend {
     /// `send_notification` is synchronous, which is what lets the live-output path hold its buffer
     /// lock across a send to keep chunks ordered.
     pub(super) fn send_update(&self, update: SessionUpdate) {
+        self.after_thought.store(
+            matches!(update, SessionUpdate::AgentThoughtChunk(_)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Err(error) = self
             .connection
             .send_notification(SessionNotification::new(self.session_id.clone(), update))
@@ -587,14 +594,25 @@ impl Frontend for AcpFrontend {
             // screen signage an editor has its own UI for -- these two are the opposite case,
             // signals this frontend structurally cannot represent.
             FrontendEvent::ThinkingProgress { .. } | FrontendEvent::ThinkingEnded => return,
+            // The editor relays the conversation, and an empty reply holds nothing to relay; the
+            // turn's stop says how it ended. A round's stop has no place in the protocol; the
+            // calls it made are told as they run.
+            FrontendEvent::NoAnswer | FrontendEvent::ReplyStopped { .. } => return,
             // ACP takes reasoning whole, from `ThinkingBlock` below. The deltas carry the same text
             // and forwarding both would double every thought chunk in the thread.
             FrontendEvent::ThinkingDelta(_) => return,
-            FrontendEvent::ThinkingBlock { content, .. } => {
-                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                    agent_client_protocol::schema::v1::TextContent::new(content),
-                )))
-            }
+            FrontendEvent::ThinkingBlock { content, .. } => thought_chunk(
+                &content,
+                self.after_thought
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            // ACP has no typed slot for a withheld block, so it is said as a thought, in the words
+            // a replay of the log says it in.
+            FrontendEvent::RedactedThinking => thought_chunk(
+                crate::conversation::REDACTED_THINKING,
+                self.after_thought
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
             // ACP has a `pending` status this could drive, but a call is announced to the client
             // exactly once, and that announcement carries the title, locations and arguments an
             // editor renders -- none of which exist yet here. Sending a name-only call first would
@@ -605,6 +623,7 @@ impl Frontend for AcpFrontend {
                 name,
                 input,
                 display_summary,
+                ..
             } => {
                 // No separate `pending` state in the agent loop, so the in-progress emit is the
                 // first one the client sees. The title carries the resolved primary argument (the
@@ -890,6 +909,10 @@ impl Frontend for AcpFrontend {
                         | crate::conversation::ContentBlock::Resource { .. }
                         | crate::conversation::ContentBlock::TurnContext { .. }
                         | crate::conversation::ContentBlock::Nudge { .. }
+                        | crate::conversation::ContentBlock::HarnessNote { .. }
+                        | crate::conversation::ContentBlock::Summary { .. }
+                        | crate::conversation::ContentBlock::Refusal { .. }
+                        | crate::conversation::ContentBlock::Unrecognized { .. }
                         | crate::conversation::ContentBlock::Image { .. }
                         | crate::conversation::ContentBlock::Thinking { .. }
                         | crate::conversation::ContentBlock::RedactedThinking { .. }
@@ -1223,15 +1246,14 @@ impl Frontend for AcpFrontend {
     }
 }
 /// The update that says a notice: a `notice` for an advisory when the client renders one, else an
-/// assistant-message chunk. The chunk's `[meka]` prefix (`[meka warn]` for a
-/// [`crate::frontend::NoticeLevel::Warn`]) is what lets an editor's transcript record the
-/// side-effect and a client filter or style by it. A stage direction is a chunk whatever the
-/// client renders: it annotates a place in the reply, and a notice has no place.
+/// assistant-message chunk. The chunk's `[Meka]` prefix (`[Meka warn]` for a
+/// [`crate::frontend::NoticeLevel::Warn`]) tells a person reading the transcript the line is
+/// Meka's; a client that wants the severity advertises `session.notices` and reads it typed. A
+/// stage direction is a chunk whatever the client renders: it annotates a place in the reply, and
+/// a notice has no place.
 ///
-/// Deliberately not [`crate::conversation::HARNESS_NOTE`], despite the resemblance. That marker is
-/// longer because a *model* has to read it and should not have to recall what Meka is; this one is
-/// read by a person looking at their own editor, where the product name needs no gloss, and by
-/// clients matching on the prefix, which a rename would break.
+/// Shorter than the label a model reads ahead of Meka's notes, since a person looking at their own
+/// editor needs no gloss on the product's name.
 pub(super) fn notice_update(
     notice: &crate::frontend::Notice,
     client_renders_notices: bool,
@@ -1253,8 +1275,8 @@ pub(super) fn notice_update(
         }
         crate::frontend::NoticeKind::Advisory => {
             let prefix = match notice.level {
-                crate::frontend::NoticeLevel::Info => "[meka]",
-                crate::frontend::NoticeLevel::Warn => "[meka warn]",
+                crate::frontend::NoticeLevel::Info => "[Meka]",
+                crate::frontend::NoticeLevel::Warn => "[Meka warn]",
             };
             format!("{prefix} {}", notice.text)
         }
@@ -1665,9 +1687,20 @@ pub(super) fn build_completion_content(
     }
 
     if tool_name == "shell_execute" {
-        // Reuse the canonical text-flattening; `shell_execute` output is text-only, so the
-        // `[Image]` marker `tool_result_text_content` would emit for images never appears here.
-        let combined = MekaContentBlock::tool_result_text_content(content);
+        // The command's output as the console shows it: its text, a large output's opening as
+        // the screen shows it, and no note Meka wrote to the model.
+        let combined: String = content
+            .iter()
+            .filter_map(|block| match block {
+                ToolResultContent::Text { text } => Some(text.as_str()),
+                ToolResultContent::LargeOutput { preview, .. } => Some(preview.as_str()),
+                ToolResultContent::Image { .. }
+                | ToolResultContent::ToolReference { .. }
+                | ToolResultContent::ImageCaption { .. }
+                | ToolResultContent::HarnessNote { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         if combined.trim_end().is_empty() {
             return Vec::new();
         }
@@ -1676,30 +1709,54 @@ pub(super) fn build_completion_content(
 
     content
         .iter()
-        .map(|block| match block {
-            ToolResultContent::Text { text } => text_content_block(text.clone()),
+        .filter_map(|block| match block {
+            ToolResultContent::Text { text } => Some(text_content_block(text.clone())),
             // The payload is already provider-normalized (size-capped, converted to a native
             // format) by the time it reaches here, so it can go out as-is. A reference has no
             // payload to show and is named instead.
-            ToolResultContent::Image { source } => match source.base64_data() {
+            ToolResultContent::Image { source } => Some(match source.base64_data() {
                 Some(data) => ToolCallContent::from(ContentBlock::Image(ImageContent::new(
                     data.to_string(),
                     source.media_type().to_string(),
                 ))),
                 None => text_content_block(crate::image::UNRESOLVED_IMAGE_PLACEHOLDER.to_string()),
+            }),
+            ToolResultContent::ToolReference { tool_name } => {
+                Some(text_content_block(tool_name.clone()))
+            }
+            // The caption names the file in the transcript, as the model reads it; a large
+            // output shows its opening, as the screen does.
+            ToolResultContent::ImageCaption { .. } => match block.wire_part() {
+                crate::conversation::ResultPart::Text(caption) => {
+                    Some(text_content_block(caption.into_owned()))
+                }
+                _ => None,
             },
-            ToolResultContent::ToolReference { tool_name } => text_content_block(tool_name.clone()),
+            ToolResultContent::LargeOutput { preview, .. } => {
+                Some(text_content_block(preview.clone()))
+            }
+            // Meka's note to the model is the model's, not the tool's output.
+            ToolResultContent::HarnessNote { .. } => None,
         })
         .collect()
 }
 /// One entry of a session's log as a replay says it: a message, or a compaction where the log has
 /// a boundary.
 pub(super) enum Replayed<'a> {
-    Message(&'a crate::conversation::Message),
+    /// A message, and whether it is a reply its record says was cut before it ended.
+    Message {
+        message: &'a crate::conversation::Message,
+        cut: bool,
+    },
     Compaction {
         id: String,
         record: &'a crate::conversation::CompactionRecord,
         generation: u64,
+    },
+    /// A compaction that ended without replacing the window, where the log records it.
+    CompactionFailed {
+        id: String,
+        failure: &'a crate::conversation::FailedCompaction,
     },
 }
 
@@ -1717,8 +1774,16 @@ pub(super) fn replay_entries<'a>(
     let mut generation = first_generation;
     for row in rows {
         let said = row.said(rewound);
-        if let Said::Message(message) = said {
-            entries.push(Replayed::Message(message));
+        match said {
+            Said::Message(message) => entries.push(Replayed::Message {
+                message,
+                cut: row.reply.as_ref().is_some_and(|reply| reply.cut.is_some()),
+            }),
+            Said::CompactionFailed { failure } => entries.push(Replayed::CompactionFailed {
+                id: format!("replayed-failed-{}", row.id),
+                failure,
+            }),
+            _ => {}
         }
         // Every boundary counts, one a rewind took included, as the history numbers them.
         if matches!(
@@ -1864,16 +1929,20 @@ pub(super) fn compacted_update(
 /// provider may give one id to every call.
 pub(super) fn checkpoint_calls(
     compaction_id: &str,
-    rounds: &[crate::conversation::Message],
+    rounds: &[crate::conversation::RecordedMessage],
     cwd: &SharedCwd,
 ) -> Vec<ToolCall> {
     let mut calls = Vec::new();
     for (index, round) in rounds.iter().enumerate() {
+        let round = &round.message;
         if round.role != Role::Assistant {
             continue;
         }
+        // Paired by place, as the round sent them, so calls a provider numbered alike keep their
+        // own results.
         let mut results = rounds
             .get(index + 1)
+            .map(|next| &next.message)
             .filter(|next| next.role == Role::User)
             .into_iter()
             .flat_map(|next| &next.content)
@@ -1890,11 +1959,16 @@ pub(super) fn checkpoint_calls(
             let MekaContentBlock::ToolUse { name, input, .. } = block else {
                 continue;
             };
+            let result = results.next();
+            // The call that handed the summary in is the compaction's own, as the live run said.
+            if name == "context_replace" {
+                continue;
+            }
             calls.push(checkpoint_call(
                 crate::frontend::checkpoint_call_id(compaction_id, calls.len() + 1),
                 name,
                 input,
-                results.next(),
+                result,
                 cwd,
             ));
         }
@@ -1962,8 +2036,8 @@ pub(super) fn replay_session_updates(
     let mut open_tools: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for entry in entries {
-        let message = match entry {
-            Replayed::Message(message) => *message,
+        let (message, cut) = match entry {
+            Replayed::Message { message, cut } => (*message, *cut),
             // Said as the live run said it, never as the summary's words in a user turn: the
             // summary is the model's, and the turns before it are replayed above it.
             Replayed::Compaction {
@@ -1979,6 +2053,30 @@ pub(super) fn replay_session_updates(
                 for call in checkpoint_calls(id, &record.checkpoint, cwd) {
                     send_session_update(connection, session_id, SessionUpdate::ToolCall(call));
                 }
+                continue;
+            }
+            // Opened and closed as the live run opened and closed it, with the calls its
+            // checkpoint made on the way, which the live run told as each finished.
+            Replayed::CompactionFailed { id, failure } => {
+                send_session_update(
+                    connection,
+                    session_id,
+                    compaction_started_update(client_state, id.clone(), failure.trigger),
+                );
+                for call in checkpoint_calls(id, &failure.checkpoint, cwd) {
+                    send_session_update(connection, session_id, SessionUpdate::ToolCall(call));
+                }
+                send_session_update(
+                    connection,
+                    session_id,
+                    compaction_failed_update(
+                        client_state,
+                        id.clone(),
+                        failure.trigger,
+                        failure.error.clone().unwrap_or_default(),
+                        failure.error.is_none(),
+                    ),
+                );
                 continue;
             }
         };
@@ -2003,7 +2101,7 @@ pub(super) fn replay_session_updates(
             Role::User => {
                 for block in &message.content {
                     match block {
-                        MekaContentBlock::Text { text } => {
+                        MekaContentBlock::Text { text, .. } => {
                             if !text.is_empty() {
                                 send_session_update(
                                     connection,
@@ -2164,67 +2262,43 @@ pub(super) fn replay_session_updates(
                 // a call its round left unrun is dropped before the next round: closed now, so a
                 // later result under its id is not taken for it.
                 close_orphans(connection, session_id, call_ids, &mut open_tools);
+                let mut after_thought = false;
                 for block in &message.content {
-                    match block {
-                        MekaContentBlock::Text { text } => {
-                            send_session_update(
-                                connection,
-                                session_id,
-                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                    ContentBlock::Text(
-                                        agent_client_protocol::schema::v1::TextContent::new(
-                                            text.clone(),
-                                        ),
-                                    ),
-                                )),
-                            );
-                        }
-                        MekaContentBlock::Thinking { thinking, .. } => {
-                            send_session_update(
-                                connection,
-                                session_id,
-                                SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                                    ContentBlock::Text(
-                                        agent_client_protocol::schema::v1::TextContent::new(
-                                            thinking.clone(),
-                                        ),
-                                    ),
-                                )),
-                            );
-                        }
-                        MekaContentBlock::RedactedThinking { .. } => {
-                            send_session_update(
-                                connection,
-                                session_id,
-                                SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                                    ContentBlock::Text(
-                                        agent_client_protocol::schema::v1::TextContent::new(
-                                            "[redacted thinking]".to_string(),
-                                        ),
-                                    ),
-                                )),
-                            );
-                        }
-                        MekaContentBlock::ToolUse { id, name, input } => {
-                            let locations = tool_locations(name, input, cwd);
-                            // Match the live path's rich title, which is read off the call alone.
-                            let display_summary = crate::tools::resolve_primary_param(name, input);
-                            let title = tool_call_title(name, display_summary.as_deref());
-                            let id = crate::sync::lock(call_ids).open(id);
-                            let call = ToolCall::new(id.clone(), title)
-                                .kind(tool_kind_for(name))
-                                .status(ToolCallStatus::InProgress)
-                                .locations(locations)
-                                .raw_input(input.clone());
-                            send_session_update(
-                                connection,
-                                session_id,
-                                SessionUpdate::ToolCall(call),
-                            );
-                            open_tools.insert(id, name.clone());
-                        }
-                        _ => {}
+                    // Of a reply cut before it ended, its words alone, which the live run sent as
+                    // they came: its reasoning may not have reached an editor, or not whole, and
+                    // its calls never ran, so the record holds what the live run may never have
+                    // sent, and a replay says less rather than more.
+                    if cut
+                        && !matches!(
+                            block,
+                            MekaContentBlock::Text { .. } | MekaContentBlock::Refusal { .. }
+                        )
+                    {
+                        continue;
                     }
+                    if let Some(update) = reply_update(block, &mut after_thought) {
+                        send_session_update(connection, session_id, update);
+                        continue;
+                    }
+                    let MekaContentBlock::ToolUse {
+                        id, name, input, ..
+                    } = block
+                    else {
+                        continue;
+                    };
+                    after_thought = false;
+                    let locations = tool_locations(name, input, cwd);
+                    // Match the live path's rich title, which is read off the call alone.
+                    let display_summary = crate::tools::resolve_primary_param(name, input);
+                    let title = tool_call_title(name, display_summary.as_deref());
+                    let id = crate::sync::lock(call_ids).open(id);
+                    let call = ToolCall::new(id.clone(), title)
+                        .kind(tool_kind_for(name))
+                        .status(ToolCallStatus::InProgress)
+                        .locations(locations)
+                        .raw_input(input.clone());
+                    send_session_update(connection, session_id, SessionUpdate::ToolCall(call));
+                    open_tools.insert(id, name.clone());
                 }
             }
         }
@@ -2234,6 +2308,53 @@ pub(super) fn replay_session_updates(
     // indicator doesn't get stuck, and so a live call after the load is not reported as one of
     // them.
     close_orphans(connection, session_id, call_ids, &mut open_tools);
+}
+
+/// What a replay sends for a reply's `block` when it holds words or reasoning, as the live turn
+/// sent it: a refusal's words as the model's, nothing for a part with nothing to read.
+/// `after_thought` says whether the last update was a thought, and is kept up to date.
+pub(super) fn reply_update(
+    block: &MekaContentBlock,
+    after_thought: &mut bool,
+) -> Option<SessionUpdate> {
+    let (update, thought) = match block {
+        MekaContentBlock::Text { text, .. } | MekaContentBlock::Refusal { text, .. } => {
+            if crate::text::is_blank(text) {
+                return None;
+            }
+            let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new(text.clone()),
+            )));
+            (update, false)
+        }
+        MekaContentBlock::Thinking { parts, .. } => {
+            let reasoning = crate::conversation::reasoning_text(parts);
+            if crate::text::is_blank(&reasoning) {
+                return None;
+            }
+            (thought_chunk(&reasoning, *after_thought), true)
+        }
+        MekaContentBlock::RedactedThinking { .. } => (
+            thought_chunk(crate::conversation::REDACTED_THINKING, *after_thought),
+            true,
+        ),
+        _ => return None,
+    };
+    *after_thought = thought;
+    Some(update)
+}
+
+/// A thought as the chunk that carries it. The protocol marks no boundary between chunks, so one
+/// that follows another thought starts a paragraph of its own.
+fn thought_chunk(text: &str, after_thought: bool) -> SessionUpdate {
+    let text = if after_thought {
+        format!("\n\n{text}")
+    } else {
+        text.to_string()
+    };
+    SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+        agent_client_protocol::schema::v1::TextContent::new(text),
+    )))
 }
 
 /// Close every call a replay has open as failed, and forget them as running.

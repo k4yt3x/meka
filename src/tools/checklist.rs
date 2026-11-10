@@ -420,12 +420,16 @@ pub(crate) fn replay_checklist_over(
     for message in messages {
         for block in &message.content {
             match block {
-                ContentBlock::ToolUse { id, name, input } if name == ADD_TOOL_NAME => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } if name == ADD_TOOL_NAME => {
                     if let Ok(items) = parse_add(&crate::tools::without_background_flag(input)) {
                         pending.insert(id, Pending::Add(items));
                     }
                 }
-                ContentBlock::ToolUse { id, name, input } if name == EDIT_TOOL_NAME => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } if name == EDIT_TOOL_NAME => {
                     if let Ok(edit) = parse_edit(&crate::tools::without_background_flag(input)) {
                         pending.insert(id, Pending::Edit(edit));
                     }
@@ -799,6 +803,8 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             input,
+            unparsed: None,
+            provider_fields: None,
         }
     }
 
@@ -818,10 +824,12 @@ mod tests {
             Event::Append(Message {
                 role: Role::Assistant,
                 content: calls,
+                provider_fields: None,
             }),
             Event::Append(Message {
                 role: Role::User,
                 content: results,
+                provider_fields: None,
             }),
         ]
     }

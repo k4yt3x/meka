@@ -28,6 +28,11 @@ use crate::{
 pub(crate) struct MessageBody {
     pub(crate) role: String,
     pub(crate) content: Vec<ContentBlockView>,
+    /// The fields a provider put on the message itself that nothing else holds, as it returned
+    /// them (a Chat Completions message's `reasoning_details`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub(crate) provider_fields: Option<crate::conversation::ProviderFields>,
 }
 
 /// `message` as the API types it.
@@ -35,6 +40,102 @@ pub(crate) fn message_body(message: &Message) -> MessageBody {
     MessageBody {
         role: message.role.name().to_string(),
         content: message.content.iter().map(view_for_block).collect(),
+        provider_fields: message.provider_fields.clone(),
+    }
+}
+
+/// A message on the history, and for a reply what its provider said about it.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct MessageItem {
+    #[serde(flatten)]
+    pub(crate) message: MessageBody,
+    /// On a reply, what its provider said about it beside its content; absent on any other
+    /// message and on a reply written before Meka recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reply: Option<Box<ReplyView>>,
+}
+
+/// One part of a thinking block.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ReasoningPartView {
+    /// `reasoning`, the reasoning itself, or `summary`, a summary the provider wrote of reasoning
+    /// it keeps.
+    pub(crate) kind: String,
+    pub(crate) text: String,
+}
+
+/// What a provider said about a reply beside its content.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ReplyView {
+    /// How the reply ended, as its provider said; absent on one cut before it said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stop: Option<StopView>,
+    /// What cut the reply short: `stopped`, `interrupted` or `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cut: Option<String>,
+    /// The model the response names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    /// The profile that sent the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
+    /// What the response reported spending, as Meka counts it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) usage: Option<crate::host::http::handlers::turn::UsageView>,
+    /// The response's fields nothing else holds, as its provider returned them: its id, the raw
+    /// `usage` the counts are read from, and whatever else it said about the completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub(crate) provider_fields: Option<crate::conversation::ProviderFields>,
+}
+
+/// How a reply ended.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StopView {
+    /// Meka's class of the stop: `end_turn`, `tool_use`, `max_tokens`, `context_window`,
+    /// `refusal`, `content_filter` or `unknown`.
+    pub(crate) reason: String,
+    /// The provider's own word for it, as sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) word: Option<String>,
+    /// What the provider said about the stop beside its word, under its own names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub(crate) details: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl From<&crate::conversation::ReplyRecord> for ReplyView {
+    fn from(record: &crate::conversation::ReplyRecord) -> Self {
+        Self {
+            stop: record.stop.as_ref().map(|stop| StopView {
+                reason: stop.reason.name().to_string(),
+                word: stop.word.clone(),
+                details: stop.details.clone(),
+            }),
+            cut: record.cut.map(|cut| cut.name().to_string()),
+            model: record.model.clone(),
+            profile: record.profile.clone(),
+            usage: record.usage.as_ref().map(|usage| {
+                crate::host::http::handlers::turn::UsageView {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                }
+            }),
+            provider_fields: record.provider_fields.clone(),
+        }
+    }
+}
+
+/// `recorded` as the API types it.
+fn message_item(recorded: &crate::conversation::RecordedMessage) -> MessageItem {
+    MessageItem {
+        message: message_body(&recorded.message),
+        reply: recorded
+            .reply
+            .as_ref()
+            .map(|record| Box::new(ReplyView::from(record))),
     }
 }
 
@@ -60,9 +161,11 @@ pub(crate) struct HistoryItem {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum HistoryItemKind {
     /// A message, where it was said.
-    Message(MessageBody),
+    Message(MessageItem),
     /// A compaction, where it happened.
     Compaction(CompactionItem),
+    /// A compaction that failed or was stopped, where it ended, with what it did on the way.
+    CompactionFailed(CompactionFailedItem),
     /// A rewind, and the positions it took out of the history.
     Rewind(RewindItem),
     /// A prompt a turn took back to join a message to it; the message it joined follows.
@@ -75,11 +178,33 @@ pub(crate) struct CompactionItem {
     /// The summary as the agent or the summarizer wrote it. The message the model reads in its
     /// place is on `GET /v1/sessions/{id}/context/messages`.
     pub(crate) summary: String,
-    /// The rounds the checkpoint turn ran on the way: what the agent thought and called while it
-    /// saved what must last, with the results. Empty when no checkpoint round ran.
-    pub(crate) checkpoint: Vec<MessageBody>,
+    /// The rounds the checkpoint turn ran on the way, as they happened: each reply as returned
+    /// with its record, and the results sent back. Empty when no checkpoint round ran.
+    pub(crate) checkpoint: Vec<MessageItem>,
+    /// The summarizer's replies, as returned with their records, when the summarizer wrote the
+    /// summary.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) summarizer: Vec<MessageItem>,
     #[serde(flatten)]
     pub(crate) compaction: crate::view::CompactionView,
+}
+
+/// A compaction that failed or was stopped, as the history says it.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CompactionFailedItem {
+    /// What set it going: `reactive`, `proactive`, `manual`, `requested`, `emergency` or
+    /// `retention`.
+    pub(crate) trigger: String,
+    /// The memories its checkpoint wrote, which stay written.
+    pub(crate) memories_written: Vec<String>,
+    /// See [`CompactionItem::checkpoint`].
+    pub(crate) checkpoint: Vec<MessageItem>,
+    /// See [`CompactionItem::summarizer`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) summarizer: Vec<MessageItem>,
+    /// What it failed on; absent when it was stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
 }
 
 /// A rewind as the history says it.
@@ -122,12 +247,25 @@ fn position_ranges(rows: &[std::ops::RangeInclusive<i64>]) -> Vec<PositionRange>
 pub(crate) fn history_item(entry: crate::store::HistoryEntry) -> HistoryItem {
     use crate::store::HistoryKind;
     let kind = match entry.kind {
-        HistoryKind::Message(message) => HistoryItemKind::Message(message_body(&message)),
+        HistoryKind::Message { message, reply } => HistoryItemKind::Message(MessageItem {
+            message: message_body(&message),
+            reply: reply.map(|record| Box::new(ReplyView::from(&*record))),
+        }),
         HistoryKind::Compaction { record, generation } => {
             HistoryItemKind::Compaction(CompactionItem {
                 summary: record.written_summary.clone(),
-                checkpoint: record.checkpoint.iter().map(message_body).collect(),
+                checkpoint: record.checkpoint.iter().map(message_item).collect(),
+                summarizer: record.summarizer.iter().map(message_item).collect(),
                 compaction: crate::view::CompactionView::new(&record, generation),
+            })
+        }
+        HistoryKind::CompactionFailed { failure } => {
+            HistoryItemKind::CompactionFailed(CompactionFailedItem {
+                trigger: failure.trigger.name().to_string(),
+                memories_written: failure.memories_written.clone(),
+                checkpoint: failure.checkpoint.iter().map(message_item).collect(),
+                summarizer: failure.summarizer.iter().map(message_item).collect(),
+                error: failure.error.clone(),
             })
         }
         HistoryKind::Rewind { rows, turns } => HistoryItemKind::Rewind(RewindItem {
@@ -469,20 +607,41 @@ fn blob_hash(source: &crate::image::ImageSource) -> Option<String> {
 pub(crate) enum ContentBlockView {
     Text {
         text: String,
+        /// The part's fields nothing else holds, as its provider returned them (a Responses
+        /// message's `phase`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(value_type = Option<Object>)]
+        provider_fields: Option<crate::conversation::ProviderFields>,
+    },
+    /// Words a model returned in the field its provider keeps for declining (OpenAI's `refusal`).
+    Refusal {
+        text: String,
+        /// The part's fields nothing else holds, as its provider returned them.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(value_type = Option<Object>)]
+        provider_fields: Option<crate::conversation::ProviderFields>,
+    },
+    /// What a provider returned that Meka reads no block from, verbatim and in the order it
+    /// arrived; never sent back to a model.
+    Unrecognized {
+        #[schema(value_type = Vec<Object>)]
+        parts: Vec<serde_json::Value>,
     },
     /// What Meka injected ahead of the user's words for that turn (permission and environment
     /// context, catalog changes, background outcomes, the resume notice), which the model
     /// saw as text ahead of them. Typed so a client can show or hide it; `text` alone is the words.
-    TurnContext {
-        text: String,
-    },
+    TurnContext { text: String },
     /// Words Meka wrote into the model's own turn in the user's role, to send it back to work:
     /// `kind` is `visible_reply` after a reply with no visible text, `checklist` after one that
     /// left checklist items open. Typed so a client can show it as Meka's rather than the person's.
-    Nudge {
-        kind: String,
-        text: String,
-    },
+    Nudge { kind: String, text: String },
+    /// Words Meka wrote into a user message in place of what it removed (an image the provider
+    /// rejected or the request budget could not carry): `note` the sentence, `text` as the model
+    /// read it, behind Meka's label. Typed so a client shows it as Meka's rather than the person's.
+    HarnessNote { note: String, text: String },
+    /// The message a compaction put in place of the turns it summarized, as the model reads it.
+    /// The message's `compaction` says what the compaction was, its summary as written included.
+    Summary { text: String },
     /// An inbox item the model read: `text` as it read it, header included, `body` the person's
     /// words, with the item's id, its class (`steer`, `followup`, `interrupt`) and its source
     /// where they were recorded. Typed so a client shows the words as the person's and labels
@@ -506,10 +665,7 @@ pub(crate) enum ContentBlockView {
     },
     /// Finished background work the model read, the tasks `task_ids` name: the `text` a
     /// `task.reported` feed event carried, or a turn of its own delivered.
-    BackgroundReport {
-        task_ids: Vec<String>,
-        text: String,
-    },
+    BackgroundReport { task_ids: Vec<String>, text: String },
     /// A skill or an MCP prompt somebody invoked by name: `kind` is `skill` or `mcp_prompt`,
     /// `name` what was invoked (an MCP prompt as `server:prompt`), `directive` the words typed
     /// with it, a file an editor attached among them named by its mention (`@name`), blank when
@@ -536,17 +692,36 @@ pub(crate) enum ContentBlockView {
         #[serde(skip_serializing_if = "Option::is_none")]
         hash: Option<String>,
     },
+    /// Reasoning the model showed, in the parts its provider returned it in.
     Thinking {
-        thinking: String,
+        parts: Vec<ReasoningPartView>,
+        /// The part's fields nothing else holds, as its provider returned them.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(value_type = Option<Object>)]
+        provider_fields: Option<crate::conversation::ProviderFields>,
     },
     /// Encrypted reasoning whose contents the API withholds; surfaced as a presence marker so
     /// history responses note it occurred without exposing the opaque payload.
-    RedactedThinking {},
+    RedactedThinking {
+        /// The part's fields nothing else holds, as its provider returned them.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(value_type = Option<Object>)]
+        provider_fields: Option<crate::conversation::ProviderFields>,
+    },
     ToolUse {
         id: String,
         name: String,
+        /// The arguments; `{}` when `unparsed` is present.
         #[schema(value_type = Object)]
         input: serde_json::Value,
+        /// What the model sent as the arguments when it was not a JSON object, and why the call
+        /// was refused.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unparsed: Option<UnparsedArgumentsView>,
+        /// Every field the provider put on the call beyond its id, name and arguments, as it came.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(value_type = Option<Object>)]
+        provider_fields: Option<crate::conversation::ProviderFields>,
     },
     ToolResult {
         tool_use_id: String,
@@ -573,16 +748,65 @@ pub(crate) enum ToolResultContentView {
     ToolReference {
         tool_name: String,
     },
+    /// Words Meka wrote into the result for the model: `note` the sentence, `text` as the model
+    /// read it, behind Meka's label.
+    HarnessNote {
+        note: String,
+        text: String,
+    },
+    /// The line naming where the image after it came from (a file read, a page fetched).
+    ImageCaption {
+        caption: String,
+    },
+    /// An output too large to keep inline, saved whole to the scratchpad entry it names, with its
+    /// size and its opening.
+    LargeOutput {
+        scratchpad_entry: String,
+        size_bytes: usize,
+        preview: String,
+    },
+}
+
+/// What a model sent as a call's arguments when it was not a JSON object.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct UnparsedArgumentsView {
+    /// The text as the model sent it; absent on a call recorded before the text was kept, or
+    /// that carried no arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    /// Why the text is not arguments, in the words the call was refused with.
+    error: String,
 }
 
 fn view_for_block(block: &ContentBlock) -> ContentBlockView {
     match block {
-        ContentBlock::Text { text } => ContentBlockView::Text { text: text.clone() },
+        ContentBlock::Text {
+            text,
+            provider_fields,
+        } => ContentBlockView::Text {
+            text: text.clone(),
+            provider_fields: provider_fields.clone(),
+        },
+        ContentBlock::Refusal {
+            text,
+            provider_fields,
+        } => ContentBlockView::Refusal {
+            text: text.clone(),
+            provider_fields: provider_fields.clone(),
+        },
+        ContentBlock::Unrecognized { parts } => ContentBlockView::Unrecognized {
+            parts: parts.clone(),
+        },
         ContentBlock::TurnContext { text } => ContentBlockView::TurnContext { text: text.clone() },
         ContentBlock::Nudge { kind, text } => ContentBlockView::Nudge {
             kind: kind.name().to_string(),
             text: text.clone(),
         },
+        ContentBlock::HarnessNote { note } => ContentBlockView::HarnessNote {
+            note: note.clone(),
+            text: crate::conversation::harness_note_text(note),
+        },
+        ContentBlock::Summary { text } => ContentBlockView::Summary { text: text.clone() },
         ContentBlock::Inbox {
             item_id,
             class,
@@ -629,14 +853,40 @@ fn view_for_block(block: &ContentBlock) -> ContentBlockView {
             media_type: source.media_type().to_string(),
             hash: blob_hash(source),
         },
-        ContentBlock::Thinking { thinking, .. } => ContentBlockView::Thinking {
-            thinking: thinking.clone(),
+        ContentBlock::Thinking {
+            parts,
+            provider_fields,
+            ..
+        } => ContentBlockView::Thinking {
+            parts: parts
+                .iter()
+                .map(|part| ReasoningPartView {
+                    kind: part.kind.name().to_string(),
+                    text: part.text.clone(),
+                })
+                .collect(),
+            provider_fields: provider_fields.clone(),
         },
-        ContentBlock::RedactedThinking { .. } => ContentBlockView::RedactedThinking {},
-        ContentBlock::ToolUse { id, name, input } => ContentBlockView::ToolUse {
+        ContentBlock::RedactedThinking {
+            provider_fields, ..
+        } => ContentBlockView::RedactedThinking {
+            provider_fields: provider_fields.clone(),
+        },
+        ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            unparsed,
+            provider_fields,
+        } => ContentBlockView::ToolUse {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
+            unparsed: unparsed.as_ref().map(|unparsed| UnparsedArgumentsView {
+                text: unparsed.text.clone(),
+                error: unparsed.error.clone(),
+            }),
+            provider_fields: provider_fields.clone(),
         },
         ContentBlock::ToolResult {
             tool_use_id,
@@ -666,6 +916,22 @@ pub(crate) fn tool_result_views(content: &[ToolResultContent]) -> Vec<ToolResult
                     tool_name: tool_name.clone(),
                 }
             }
+            ToolResultContent::HarnessNote { note } => ToolResultContentView::HarnessNote {
+                note: note.clone(),
+                text: crate::conversation::harness_note_text(note),
+            },
+            ToolResultContent::ImageCaption { caption } => ToolResultContentView::ImageCaption {
+                caption: caption.clone(),
+            },
+            ToolResultContent::LargeOutput {
+                scratchpad_entry,
+                size_bytes,
+                preview,
+            } => ToolResultContentView::LargeOutput {
+                scratchpad_entry: scratchpad_entry.clone(),
+                size_bytes: *size_bytes,
+                preview: preview.clone(),
+            },
         })
         .collect()
 }

@@ -185,16 +185,17 @@ impl HttpHooks {
     /// response would get, under the same relay switch, so the two never disagree about what the
     /// upstream's text may travel in. The webhook's keeps the type, title, status and detail and
     /// never `provider_response`: a webhook payload carries no content, for the reason
-    /// `notify_turn_end` gives. Built once, so the upstream's text is logged once.
+    /// `notify_turn_end` gives. The failure is the scheduler's to log, and the turn's terminal's.
     fn event_errors(
         &self,
         error: &crate::error::MekaError,
     ) -> (serde_json::Value, serde_json::Value) {
-        let full = serde_json::to_value(crate::host::http::errors::ProblemDetail::for_error(
-            error,
-            self.state.config.relay_provider_errors,
-        ))
-        .unwrap_or(serde_json::Value::Null);
+        let full =
+            serde_json::to_value(crate::host::http::errors::ProblemDetail::for_logged_error(
+                error,
+                self.state.config.relay_provider_errors,
+            ))
+            .unwrap_or(serde_json::Value::Null);
         let slim = serde_json::json!({
             "type": full.get("type"),
             "title": full.get("title"),

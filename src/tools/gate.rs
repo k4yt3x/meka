@@ -170,7 +170,7 @@ impl crate::schedule::GateTools for GateToolset {
         .ok_or_else(|| format!("gate tool '{name}' is not available"))?;
         let definition = tool.definition();
         let (arguments, _detach) =
-            match crate::tools::admit_arguments(&*tool, &definition, arguments) {
+            match crate::tools::admit_arguments(&*tool, &definition, arguments, None) {
                 Ok(admitted) => admitted,
                 Err(refusal) => {
                     return Err(format!(

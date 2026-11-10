@@ -9,12 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- The ACP and MCP handshakes carry Meka as the `title` beside the identifier `meka`.
+- Each reply is stored as returned, with how it stopped, the model, the profile and the usage.
+- History, `conversation_read` and Markdown exports say when a reply stopped short or was cut.
+- A compaction that fails stays in the history with what it did; editors and exports show it.
+- The ACP and MCP handshakes carry `Meka` as the `title`.
 
 ### Changed
 
-- Meka is written with a capital wherever a person reads it; the command and its paths stay `meka`.
-- `meka --version` prints `Meka <version>`.
+- **Breaking:** HTTP history and the feed type Meka's notes, summaries, captions and large outputs.
+- **Breaking:** History replies carry `reply`; `thinking` holds `parts`; there are new block kinds.
+- **Breaking:** `stop_reason` gains `tool_use`, `context_window`, `content_filter` and `unknown`.
+- **Breaking:** An unparsable call's `input` is `{}`, with what the model sent under `unparsed`.
+- **Breaking:** A tool call in a shape its protocol does not define is kept and not run.
+- **Breaking:** An empty reply streams nothing to ACP or the feed.
+- **Breaking:** `refusal_text` holds only the model's own words.
+- **Breaking:** ACP's fallback prefix is `[Meka]` or `[Meka warn]`; read severity from a `notice`.
+- Replies go back to the provider with their reasoning and citations wherever the protocol allows.
+- Meka's notes to the model read `[Meka harness]`, and the screen leaves them out of tool output.
+- Meka is written with a capital wherever a person reads it; the command stays `meka`.
+- Session archives are `format_version` 25; older archives are brought forward on import.
+- Session search no longer finds compaction summaries written before 0.13.
+
+### Fixed
+
+- A reply with nothing in it is no longer stored as a sentence Meka wrote.
+- A stopped, interrupted or failed reply keeps its reasoning and tool calls on record.
+- A tool call whose arguments are not a JSON object is refused rather than run without them.
+- Refusals, content filters and context-window cuts are reported as such, not as errors or answers.
+- Fields a provider returns, such as `reasoning_details` and citations, are kept, streamed or not.
+- A Claude reply whose blocks overlap on OpenRouter's stream keeps every block, in order.
+- A malformed stream frame fails the attempt rather than leaving a hole in the reply.
+- The screen says when a round of tool calls stopped at the output limit.
+- A turn kept through a compaction shows what was said, not the context's rewrite of it.
+- A prompt that opens like one of Meka's notes titles its session.
+- `tool_search` finds a tool whose name is longer than 128 bytes.
+- `meka serve` logs each provider failure once.
 
 ## [0.91.0] - 2026-11-08
 

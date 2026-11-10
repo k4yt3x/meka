@@ -481,8 +481,9 @@ impl Tool for ContextReplaceTool {
                 true,
             ));
         }
+        // As the model submitted it: `optional_str` reads a blank one as not given.
         let summary = match optional_str(&input, "summary", "context_replace") {
-            Ok(Some(summary)) => summary.trim(),
+            Ok(Some(summary)) => summary,
             // Not given, or not a string: a tool error rather than a hard failure either way, so
             // the loop gets another iteration to try again; if it never does, the fallback ladder
             // catches it.

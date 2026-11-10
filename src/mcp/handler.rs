@@ -536,7 +536,7 @@ impl McpTool {
         peer: Peer<RoleClient>,
         mut params: CallToolRequestParams,
         context: &CallContext,
-    ) -> std::result::Result<rmcp::model::CallToolResult, ServiceError> {
+    ) -> std::result::Result<Attempt<rmcp::model::CallToolResult>, ServiceError> {
         let mut meta = RequestMetaObject::new();
         if let Some(id) = &context.tool_call_id {
             meta.0
@@ -560,25 +560,22 @@ impl McpTool {
         loop {
             (params.input_responses, params.request_state) = rounds.carry();
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(params.clone()));
-            match self.send_bounded(&peer, request, context, deadline).await? {
-                ServerResult::CallToolResult(result) => return Ok(result),
+            let answer = match self.send_bounded(&peer, request, context, deadline).await? {
+                Attempt::Answered(answer) => answer,
+                Attempt::Stopped(stopped) => return Ok(Attempt::Stopped(stopped)),
+            };
+            match answer {
+                ServerResult::CallToolResult(result) => return Ok(Attempt::Answered(result)),
                 // The wait for the user's answer is the call's too: an interrupt or the deadline
                 // ends it, and the asker's end dropping is what withdraws the question from the
                 // screen.
                 ServerResult::InputRequiredResult(result) => tokio::select! {
                     biased;
                     _ = context.cancellation.cancelled() => {
-                        return Err(ServiceError::Cancelled {
-                            reason: Some("user interrupt".to_string()),
-                        });
+                        return Ok(Attempt::Stopped(Stopped::Interrupted));
                     }
                     _ = tokio::time::sleep_until(deadline) => {
-                        return Err(ServiceError::Cancelled {
-                            reason: Some(format!(
-                                "timed out after {}s",
-                                self.entry.tool_call_timeout.as_secs()
-                            )),
-                        });
+                        return Ok(Attempt::Stopped(Stopped::TimedOut));
                     }
                     absorbed = rounds.absorb(result) => absorbed?,
                 },
@@ -595,7 +592,7 @@ impl McpTool {
         request: ClientRequest,
         context: &CallContext,
         deadline: tokio::time::Instant,
-    ) -> std::result::Result<ServerResult, ServiceError> {
+    ) -> std::result::Result<Attempt<ServerResult>, ServiceError> {
         let handle = peer
             .send_cancellable_request(request, PeerRequestOptions::no_options())
             .await?;
@@ -645,21 +642,14 @@ impl McpTool {
         };
 
         tokio::select! {
-            response = handle.await_response() => response,
+            response = handle.await_response() => response.map(Attempt::Answered),
             _ = context.cancellation.cancelled() => {
                 notify_cancel("user interrupt").await;
-                Err(ServiceError::Cancelled {
-                    reason: Some("user interrupt".to_string()),
-                })
+                Ok(Attempt::Stopped(Stopped::Interrupted))
             }
             _ = tokio::time::sleep_until(deadline) => {
                 notify_cancel("timeout").await;
-                Err(ServiceError::Cancelled {
-                    reason: Some(format!(
-                        "timed out after {}s",
-                        self.entry.tool_call_timeout.as_secs()
-                    )),
-                })
+                Ok(Attempt::Stopped(Stopped::TimedOut))
             }
         }
     }
@@ -682,18 +672,16 @@ impl McpTool {
             p
         };
 
-        let is_timeout = |error: &ServiceError| matches!(error, ServiceError::Cancelled { reason: Some(reason) } if reason.starts_with("timed out"));
-
         // Refused in the state's own words when the server is not connected: a server still
         // connecting, disabled or refused is not a closed transport, and the reconnect the retry
         // below makes for one is a no-op for these that would then report "transport closed" for
         // a server somebody shut down.
         self.entry.require_connected().await?;
 
-        let failed = |error: ServiceError| MekaError::McpToolExecution {
+        let failed = |message: String| MekaError::McpToolExecution {
             server_name: self.entry.server_name().to_string(),
             tool_name: self.remote_tool_name.clone(),
-            message: crate::text::redact_urls(&error.to_string()),
+            message,
         };
         let result = match self
             .entry
@@ -702,13 +690,14 @@ impl McpTool {
             })
             .await?
         {
-            Ok(result) => result,
-            Err(ServiceError::Cancelled { reason })
-                if reason.as_deref() == Some("user interrupt") =>
-            {
-                return Err(MekaError::Interrupted);
+            Ok(Attempt::Answered(result)) => result,
+            Ok(Attempt::Stopped(Stopped::Interrupted)) => return Err(MekaError::Interrupted),
+            Ok(Attempt::Stopped(Stopped::TimedOut)) => {
+                return Err(failed(format!(
+                    "timed out after {}s",
+                    self.entry.tool_call_timeout.as_secs()
+                )));
             }
-            Err(error) if is_timeout(&error) => return Err(failed(error)),
             Err(error) => {
                 if crate::mcp::rejected_as_unauthorized(&error) {
                     let server_name = self.entry.server_name();
@@ -724,12 +713,26 @@ impl McpTool {
                         );
                     }
                 }
-                return Err(failed(error));
+                return Err(failed(crate::text::redact_urls(&error.to_string())));
             }
         };
 
         Ok(result)
     }
+}
+
+/// How a call's wait on its server ended short of an answer: Meka's own stop, the user's
+/// interrupt or the call's deadline, rather than anything the server or the transport said.
+enum Stopped {
+    Interrupted,
+    TimedOut,
+}
+
+/// What one attempt at a request came to: the server's answer, or Meka's own stop. A failure the
+/// server or the transport reported is the attempt's error, which a reconnect may answer.
+enum Attempt<T> {
+    Answered(T),
+    Stopped(Stopped),
 }
 
 /// Map MCP `CallToolResult.content` items to Meka's provider-layer `ToolResultContent` blocks. Text

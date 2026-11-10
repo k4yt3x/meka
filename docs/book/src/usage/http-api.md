@@ -220,7 +220,9 @@ is when; `permission` is the level it ran under,
 the one its opening told the model, and for a turn still opening, such as the record a detached
 request's `202` carries, the session's level, which it opens under unless the level moves first.
 Once the turn has ended, `ended_at` says
-when and `status` how: `succeeded`, with its `stop_reason` (`end_turn`, `max_tokens` or `refusal`),
+when and `status` how: `succeeded`, with its `stop_reason`, the class of the stop its last reply
+ended on (`end_turn`, `tool_use`, `max_tokens`, `context_window`, `refusal`, `content_filter` or
+`unknown`, a stop the provider named that Meka has no class for),
 `failed`, with an `error` carrying the same `type` and `detail` a Problem Detail would (never the
 provider's own text), or `canceled`; `profile` names the fallback that served the turn when the
 session's own profile could not ([Fallback profiles](sessions.md#fallback-profiles)), and is absent
@@ -261,9 +263,9 @@ the memories the session now sees. Like `profile`, it is a `409` when a turn is 
 
 To move a live session onto another profile, `PATCH /v1/sessions/{id}` with `{"profile": "other"}`.
 That rewrites the session's row, so it holds for a resume from any surface rather than for this
-request. Switching mid-conversation is allowed and is your call: a thinking block is tagged with the
-backend that produced it and is not replayed to a different one, so from the next turn the model no
-longer sees the reasoning recorded under the old profile. Like `working_directory`, it is a `409` when a turn is
+request. Switching mid-conversation is allowed and is your call: from the next turn each request
+carries what the conversation holds that its protocol has a place for
+([what a switch carries](sessions.md#what-a-profile-switch-carries)). Like `working_directory`, it is a `409` when a turn is
 already in flight; cancel first. A `PATCH` naming any of `working_directory`, `profile` and
 `project` holds the session while it writes, the way compact does, so a turn arriving meanwhile
 answers `409` rather than starting under it, and so does a second such `PATCH`. `permission` and `approvals` are the two fields that apply during
@@ -305,7 +307,7 @@ Sessions persist server-side until explicitly deleted or evicted by the idle tim
 
 | Capability | Default | Meaning |
 |------------|---------|---------|
-| `supports_reasoning_stream` | `false` | Include `thinking.delta` events in the SSE stream |
+| `supports_reasoning_stream` | `false` | Include `thinking.delta` and `thinking.redacted` events in the SSE stream |
 | `supports_permission_prompts` | `true` | The client can answer a mid-turn `approval.requested` event |
 | `answers_prompts_on_return` | `false` | A prompt in a turn no request holds waits for this session's client to come back and answer it; an elicitation waits an approval's thirty minutes there, or as long as the call that asked, if that is sooner |
 | `supports_elicitation` | `false` | An MCP server's elicitation parks as an `elicitation.requested` event for the client to answer; see [Elicitations](#elicitations) |
@@ -596,8 +598,9 @@ said), and a `type`:
 
 | `type` | Fields | What it is |
 |--------|--------|------------|
-| `message` | `role`, `content` | A message, where it was said |
-| `compaction` | `summary`, `checkpoint`, `trigger`, `source`, `memories_written`, `kept_recent`, `generation` | A compaction, where it happened. `summary` is the summary as written, a string; `checkpoint` is the rounds its checkpoint turn ran, as messages with `role` and `content`, empty when none ran; the rest are as [`context.compacted`](#event-types) carries them |
+| `message` | `role`, `content`, `reply` on a reply, `provider_fields` when the provider put any on the message | A message, where it was said |
+| `compaction` | `summary`, `checkpoint`, `summarizer`, `trigger`, `source`, `memories_written`, `kept_recent`, `generation` | A compaction, where it happened. `summary` is the summary as written, a string; `checkpoint` is the rounds its checkpoint turn ran as they happened, as messages with `role`, `content` and, on a reply, `reply`, the call that handed the summary in included, empty when none ran; `summarizer` is the summarizer's replies, present when it wrote the summary; the rest are as [`context.compacted`](#event-types) carries them |
+| `compaction_failed` | `trigger`, `memories_written`, `checkpoint`, `summarizer`, `error` | A compaction that ended without replacing the window, where it ended: what it did on the way, the memories its checkpoint wrote staying written, and `error`, absent when it was stopped |
 | `rewind` | `ranges`, `turns` | A rewind: the positions it took out of the history, as `ranges` of `{"from", "through"}`, and how many turns they held |
 | `join` | `ranges` | A prompt a turn took back to join a message to it, at the positions its `ranges` hold; the message it joined follows |
 
@@ -617,8 +620,12 @@ else Meka writes into a user message keeps its own kind, so a client can show it
 and never has to parse a header: a `nudge` (Meka's "keep going", with its `kind`); an `inbox`
 block for a message that reached the model through the inbox, with `body`, the person's words,
 and the `item_id`, `class` and `source` where they were recorded; a `scheduled` block for a
-job's fire, with `job_id` and `prompt`, the job's words; and a `background_report` for finished
-background work, with `task_ids`. What a person sent where Meka expanded part of it keeps its
+job's fire, with `job_id` and `prompt`, the job's words; a `background_report` for finished
+background work, with `task_ids`; a `harness_note` for what Meka wrote in place of something it
+removed, an image the provider rejected or the request budget could not carry, with `note`, the
+sentence, and `text` as the model read it behind Meka's label; and a `summary` for the message a
+compaction put in place of the turns it summarized, whose `compaction` says what the compaction
+was. What a person sent where Meka expanded part of it keeps its
 kind too: an `invocation` for a skill or an MCP prompt invoked by name, with its `kind` (`skill`
 or `mcp_prompt`), the `name` invoked (an MCP prompt as `server:prompt`) and the `directive`
 typed with it, blank when none was; and a `resource` for a file an editor attached, with its `uri`
@@ -627,16 +634,38 @@ prompt that invokes a skill is part of the invocation instead: its `directive` n
 its mention (`@name`) where it was attached, its `text` holds the contents, and the message has no
 `resource` block for it. On each of these `text` is what the model read, header, expanded body or
 file contents included, as the `nudge` and `turn_context` blocks hold theirs. An assistant message
-carries `text`, `thinking`, `redacted_thinking` (a marker, without the encrypted payload) and
-`tool_use` blocks, and the user message after it the `tool_result` blocks that answered the calls.
+carries what the model returned, part for part: `text`, `thinking` (its `parts`, each a `kind`,
+`reasoning` or `summary`, and the `text`, as the provider returned them), `redacted_thinking` (a
+marker, without the encrypted payload), `refusal` (the words an OpenAI model refused in),
+`unrecognized` (`parts` Meka reads nothing from, as the provider sent them) and `tool_use` blocks,
+and the user message after it the `tool_result` blocks that answered the calls. Each block that
+stands for a provider's part carries `provider_fields` when the provider put fields on the part
+beside those Meka reads, such as a Responses message's `phase` or a Claude text block's
+`citations`, and a message carries its own when its provider put fields on the message itself,
+such as OpenRouter's `reasoning_details` on Chat Completions; a streamed reply's are folded as the
+provider's own client folds them, so it reads as the same reply sent whole. A reply also carries
+`reply`, what its provider said about it: `stop` (`reason`, the class `stop_reason` names, `word`,
+the provider's own stop value, and `details`, what it said beside the word), `cut` for a reply
+stopped, interrupted or failed before it ended, `model`, `profile`, `usage` as Meka counts it, and
+`provider_fields`, the rest of the response as returned: its id, the raw usage, and whatever else it
+said about the completion, without what restates the request. A reply with nothing in it is recorded
+as the provider returned it, and a client says so as it chooses; a reply written before 0.92 has a
+`reply` only where the upgrade recovered its stop: from the sentence Meka wrote in place of a reply
+of no words, or, on a turn's last reply, from the turn's `max_tokens` or `refusal`. A `tool_use`
+whose arguments the model sent as something other than a JSON object has `input` `{}` and an
+`unparsed` object beside it: `text`, what the model sent, absent when it sent nothing or the call
+was recorded before 0.92, and `error`, why the call was refused. Meka's own items in a result keep
+their kind too: a `harness_note` (`note` and `text`, as on a user message), an `image_caption`
+naming where the image after it came from, and a `large_output` for an output saved to the
+scratchpad, with its `scratchpad_entry`, `size_bytes` and `preview`, its opening.
 
 An image block, whether an attachment on a user message or a tool result, carries its `media_type`
 and the `hash` of its bytes rather than the bytes. `GET /v1/sessions/{id}/blobs/{hash}` returns them
 under that media type, and only for a session whose messages reference the hash, and a later turn
 names the image again by that hash; see [Image attachments](#image-attachments). An image the
-request budget redacted to fit the profile's `max_request_bytes` reads in the context as a `text`
-block saying so, since that is what the model was last sent; the history shows the image as it was
-sent. A tool result may also carry a `tool_reference` item, `{"type": "tool_reference",
+request budget redacted to fit the profile's `max_request_bytes` reads in the context as a
+`harness_note` saying so, since that is what the model was last sent; the history shows the image
+as it was sent. A tool result may also carry a `tool_reference` item, `{"type": "tool_reference",
 "tool_name": "..."}`: a deferred tool that `tool_load` or `tool_search` made callable on a profile
 whose [`deferred_tools`](../configuration/config-file.md#deferred_tools) is `native`, which the
 provider expanded into the tool's schema where the item sits.
@@ -818,9 +847,11 @@ Key fields:
   assistant's messages with their text, their thinking whenever it was recorded, and their tool
   calls, the tool-result messages that answered those calls, and a compaction that ran mid-turn as
   its `compaction` item. The reply a bot shows is the text blocks of the assistant messages,
-  joined. `supports_reasoning_stream` governs only the `thinking.delta` events.
+  joined. `supports_reasoning_stream` governs only the `thinking.delta` and `thinking.redacted`
+  events.
 - **`notices`**: provider advisories and warnings about approvals refused without asking.
-- **`refusal_text`**: present only when `stop_reason` is `"refusal"`.
+- **`refusal_text`**: present only when `stop_reason` is `"refusal"` and the model wrote words: its
+  refusal, else the text it wrote before the stop.
 
 ## Streaming response
 
@@ -861,16 +892,17 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 |-------|---------|------|
 | `assistant_text.delta` | `text` | Each chunk of assistant text |
 | `thinking.delta` | `text` | A chunk of extended thinking content (only when `supports_reasoning_stream: true`) |
+| `thinking.redacted` | | A thinking block whose text the provider withheld (only when `supports_reasoning_stream: true`) |
 
-Reasoning streams in chunks, one event per chunk, the way `assistant_text.delta` does; concatenate them to reassemble the block. A turn the provider answered without streaming sends the block as a single delta, so a client never has to tell the two apart. The blocking response (`stream: false`) reports each block whole, as a `thinking` content block in `messages`, whenever the turn recorded one; `supports_reasoning_stream` governs only these deltas.
+Reasoning streams in chunks, one event per chunk, the way `assistant_text.delta` does; concatenate them to reassemble the block, whose parts arrive a blank line apart. A turn the provider answered without streaming sends the block as a single delta, so a client never has to tell the two apart. The blocking response (`stream: false`) reports each block whole, as a `thinking` content block in `messages`, whenever the turn recorded one; `supports_reasoning_stream` governs only these events.
 
 #### Tool execution
 
 | Event | Payload | When |
 |-------|---------|------|
 | `tool_call.composing` | `id`, `name` | The model started writing the call's arguments |
-| `tool_call.executing` | `id`, `name`, `input`, `display_summary` | Tool call starts |
-| `tool_call.completed` | `id`, `is_error`, `content`, `change` | Tool call finishes |
+| `tool_call.executing` | `id`, `name`, `input`, `display_summary`, `unparsed` | Tool call starts |
+| `tool_call.completed` | `id`, `is_error`, `content` (the history's result items), `change` | Tool call finishes |
 | `tool_call.progress` | `id`, `progress`, `total`, `message` | An MCP tool reported progress while running |
 | `tool_call.output_delta` | `id`, `chunk` | A running `shell_execute` produced output; append `chunk` to what you show for the call |
 
@@ -1348,13 +1380,14 @@ never touches a background outcome that was riding on the message, whose row is 
 
 The response says which happened. A turn that failed or was canceled after it began carries
 `message_withdrawn`, in the Problem Detail body of a blocking turn and on the `turn.failed` and
-`turn.canceled` events of a streaming one. Branch on it rather than on what you saw arrive: thinking
-and a half-composed tool call both look like output on the stream, and neither reaches the
-conversation, while a completed reply of nothing but thinking does and is invisible to a blocking
-client. `true` means the conversation no longer holds the message and your resend will be the only
-copy. `false` means it does, and a resend appends a second one after whatever the turn produced. A
-turn refused before it began, such as the `503` for a required MCP server or any `4xx`, never added
-the message and carries no `message_withdrawn`; a resend is the first copy.
+`turn.canceled` events of a streaming one. Branch on it rather than on what you saw arrive: a reply
+a failure or a stop cut short is recorded whole, thinking and a half-composed call included, but
+keeps the message only when it streamed words; one of nothing but thinking or a call, like a request
+that failed before anything arrived, does not, and is invisible to a blocking client. `true` means
+the conversation no longer holds the message and your resend will be the only copy. `false` means it
+does, and a resend appends a second one after whatever the turn produced. A turn refused before it
+began, such as the `503` for a required MCP server or any `4xx`, never added the message and carries
+no `message_withdrawn`; a resend is the first copy.
 
 ## Discovery endpoints
 

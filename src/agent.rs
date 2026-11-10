@@ -9,14 +9,14 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    conversation::{ContentBlock, Conversation, HARNESS_NOTE, Message, Role, ToolResultContent},
+    conversation::{
+        ContentBlock, Conversation, Message, Role, Stop, StopReason, ToolResultContent,
+    },
     error::{MekaError, Result},
     frontend::{FrontendEvent, PermissionOutcome, PermissionRequest, PromptedCall},
     image::ImageSource,
     prompt,
-    provider::{
-        CompletionRequest, Provider, ResolvedProfile, StopReason, StreamEvent, ToolDefinition,
-    },
+    provider::{CompletionRequest, Provider, ResolvedProfile, StreamEvent, ToolDefinition},
     skills::SkillCache,
     store::{Store, memory::MemoryStore},
     tools::ToolRegistry,
@@ -1252,7 +1252,9 @@ mod tests {
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
+                provider_fields: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -1263,7 +1265,10 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "file_read".to_string(),
                 input: serde_json::json!({"path": "/tmp/test"}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -1278,6 +1283,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         }
     }
 }

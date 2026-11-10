@@ -54,7 +54,7 @@ pub(crate) struct SessionMatch {
 /// again. `the_definition_number_moves_with_the_words` pins the pair of this number and a digest
 /// of what a fixture of rows yields, so a change to the words without a bump, or a bump without a
 /// change, fails.
-const INDEXED_WORDS_DEFINITION: u32 = 5;
+const INDEXED_WORDS_DEFINITION: u32 = 7;
 
 /// The triggers the index needs, and the single place their text lives, so [`reconcile_index`]
 /// compares against exactly what it will write. A delete reaches the index through the first,
@@ -113,16 +113,16 @@ fn spoken_words_of_row(kind: &str, content: &str) -> String {
         copy_of: None,
         said_turn_id: None,
         said_at: None,
+        reply: None,
+        provider_fields: None,
     };
     match decode_event_from_row(&row) {
         Ok(Some(Event::Append(message))) => spoken_words(&message),
-        // Minus the messages the summary quotes as they were written: those are rows this index
-        // already holds, and a second copy would rank the summary above the message itself. No
-        // bump of `INDEXED_WORDS_DEFINITION` came with this: no row written before the markers
-        // existed carries them, so every index already built equals a rebuild of it.
-        Ok(Some(Event::CompactBoundary { summary, .. })) => {
-            crate::conversation::without_retained_messages(&spoken_words(&summary)).into_owned()
-        }
+        // The summary as it was written, without what compaction wrote around it in the message
+        // the model reads: the messages it quotes are rows this index already holds, and a second
+        // copy would rank the summary above the message itself; the checklist, the context and
+        // the direction to carry on are Meka's.
+        Ok(Some(Event::CompactBoundary { record, .. })) => record.written_summary,
         _ => String::new(),
     }
 }
@@ -193,11 +193,15 @@ fn tiered_expressions(words: &[String]) -> Vec<String> {
 /// reads through, so what the index finds the tool can find.
 fn spoken_words(message: &Message) -> String {
     message
-        .content
+        .shown_content()
         .iter()
         .filter_map(|block| match (&message.role, block) {
             (Role::User, block) => block.spoken_words().map(str::to_string),
-            (Role::Assistant, ContentBlock::Text { .. }) => block.search_text(),
+            // The model's words, in its answer or in the field its provider keeps for declining.
+            (
+                Role::Assistant,
+                ContentBlock::Text { text, .. } | ContentBlock::Refusal { text, .. },
+            ) => Some(text.clone()),
             (Role::Assistant, _) => None,
         })
         .collect::<Vec<_>>()
@@ -216,8 +220,9 @@ pub(super) fn insert_message(
     // left to guess from the table.
     connection.execute(
         "INSERT INTO messages
-             (session_id, kind, content, created_at, turn_id, copy_of, said_turn_id, said_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (session_id, kind, content, created_at, turn_id, copy_of, said_turn_id, said_at, reply,
+              provider_fields)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             session_id,
             row.kind,
@@ -226,7 +231,9 @@ pub(super) fn insert_message(
             row.turn_id,
             row.copy_of,
             row.said_turn_id,
-            row.said_at
+            row.said_at,
+            row.reply,
+            row.provider_fields
         ],
     )?;
     let message_id = connection.last_insert_rowid();
@@ -306,6 +313,10 @@ pub(super) struct NewMessage<'a> {
     pub(super) said_turn_id: Option<&'a str>,
     /// For a copy a compaction kept, when it was said.
     pub(super) said_at: Option<&'a str>,
+    /// For a reply, its [`crate::conversation::ReplyRecord`] as JSON.
+    pub(super) reply: Option<&'a str>,
+    /// For an appended message, its own fields as JSON.
+    pub(super) provider_fields: Option<&'a str>,
 }
 
 /// Bring the index into line with the `messages` table and with this build's definition of the
@@ -932,11 +943,24 @@ mod tests {
     #[tokio::test]
     async fn what_meka_wrote_beside_the_users_words_is_not_indexed() {
         let store = Store::for_test().await;
-        let noted = session_saying(&store, &[&format!(
-            "{} the model produced no visible output",
-            crate::conversation::HARNESS_NOTE
-        )])
-        .await;
+        let noted = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        store
+            .save_event(
+                noted,
+                &Event::Append(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::HarnessNote {
+                        note: "the model produced no visible output".to_string(),
+                    }],
+                    provider_fields: None,
+                }),
+                None,
+            )
+            .await
+            .expect("save");
         let headed = store
             .create_session(None, "test-profile".to_string())
             .await
@@ -955,6 +979,7 @@ mod tests {
                                words about egrets"
                             .to_string(),
                     }],
+                    provider_fields: None,
                 }),
                 None,
             )
@@ -993,6 +1018,7 @@ mod tests {
                         is_error: false,
                         display: None,
                     }],
+                    provider_fields: None,
                 }),
                 None,
             )
@@ -1219,7 +1245,9 @@ mod tests {
         let store = Store::for_test().await;
         let session = session_saying(&store, &["the old words about cranes"]).await;
         store
-            .run_sql_for_test("UPDATE messages SET content = 'brand new words about herons'")
+            .run_sql_for_test(
+                "UPDATE messages SET content = '[{\"type\":\"text\",\"text\":\"brand new words about herons\"}]'",
+            )
             .await;
         assert!(ids_found(&store, "cranes").await.is_empty());
         assert!(ids_found(&store, "herons").await.is_empty());
@@ -1239,7 +1267,9 @@ mod tests {
             .run_sql_for_test(&format!(
                 "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {})
                  INSERT INTO messages (session_id, kind, content, created_at)
-                 SELECT '{session}', 'user', 'a pelican numbered ' || i, 'now' FROM n",
+                 SELECT '{session}', 'user_blocks', \
+                        json_array(json_object('type', 'text', 'text', 'a pelican numbered ' || i)), \
+                        'now' FROM n",
                 FILL_BATCH_ROWS + 50
             ))
             .await;
@@ -1250,13 +1280,21 @@ mod tests {
         assert_eq!(ids_found(&store, "pelican").await, vec![session]);
     }
 
+    /// A reply with nothing in it, or with reasoning alone, says no words, so the index holds an
+    /// empty document for it.
+    #[test]
+    fn an_empty_reply_indexes_nothing() {
+        assert_eq!(indexed_words("assistant", "[]", None), "");
+        let thinking = serde_json::json!([{"type": "thinking",
+            "parts": [{"kind": "reasoning", "text": "private"}]}]);
+        assert_eq!(indexed_words("assistant", &thinking.to_string(), None), "");
+    }
+
     /// The definition number and the words a fixture of rows yields are pinned as a pair: a
     /// change to what a row contributes without a bump, or a bump without a change, fails here
     /// and names what to do.
     #[test]
     fn the_definition_number_moves_with_the_words() {
-        use std::collections::HashSet;
-
         use crate::conversation::{ContentBlock, Message};
 
         fn digest(input: &str) -> u64 {
@@ -1270,15 +1308,15 @@ mod tests {
         let blocks = |blocks: Vec<ContentBlock>| serde_json::to_string(&blocks).expect("json");
         let text = |text: &str| ContentBlock::Text {
             text: text.to_string(),
+            provider_fields: None,
         };
         let fixture: Vec<(&str, String)> = vec![
-            ("user", "plain words here".to_string()),
+            ("user_blocks", blocks(vec![text("plain words here")])),
             (
-                "user",
-                format!(
-                    "{} a stand-in Meka wrote",
-                    crate::conversation::HARNESS_NOTE
-                ),
+                "user_blocks",
+                blocks(vec![ContentBlock::HarnessNote {
+                    note: "a note Meka wrote".to_string(),
+                }]),
             ),
             (
                 "user_blocks",
@@ -1300,14 +1338,18 @@ mod tests {
                 "assistant",
                 blocks(vec![
                     ContentBlock::Thinking {
-                        thinking: "private".to_string(),
-                        opaque: None,
+                        parts: vec![crate::conversation::ReasoningPart::reasoning("private")],
+                        opaque: None, provider_fields: None,
                     },
                     text("办公室在深圳 iphone手机, a reply"),
+                    ContentBlock::Refusal {
+                        text: "not that part".to_string(),
+                        provider_fields: None,
+                    },
                     ContentBlock::ToolUse {
                         id: "t1".to_string(),
                         name: "shell_execute".to_string(),
-                        input: serde_json::json!({"command": "ls"}),
+                        input: serde_json::json!({"command": "ls"}), unparsed: None, provider_fields: None,
                     },
                 ]),
             ),
@@ -1365,20 +1407,25 @@ mod tests {
             ),
             (
                 COMPACT_BOUNDARY_KIND,
-                // Shaped the way compaction writes one: a user message opening on the prefix,
-                // with a retained section between the markers, so the digest covers what a
-                // boundary row leaves out as well as what it contributes.
+                // Shaped the way compaction writes one: the message the model reads, quotes and
+                // sections included, beside the summary as it was written, so the digest covers
+                // what a boundary row leaves out as well as what it contributes.
                 serde_json::to_string(&Event::CompactBoundary {
-                    summary: Message::user(format!(
-                        "{}\n\nthe summary\n\n{}\n> the quoted words\n{}\n\n[Post-compaction \
-                         context]\n\nlevel read",
-                        crate::conversation::COMPACTION_SUMMARY_PREFIX,
-                        crate::conversation::RETAINED_MESSAGES_HEADER,
-                        crate::conversation::RETAINED_MESSAGES_END
-                    )),
+                    summary: Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Summary {
+                            text: "[Conversation summary from session compaction]\n\nthe \
+                                   summary\n\n> the quoted words\n\n[Post-compaction \
+                                   context]\n\nlevel read"
+                                .to_string(),
+                        }], provider_fields: None,
+                    },
                     replaced_count: 2,
-                    record: crate::conversation::CompactionRecord::for_test(),
-                    loaded_tools_snapshot: HashSet::new(),
+                    record: crate::conversation::CompactionRecord {
+                        written_summary: "the summary".to_string(),
+                        ..crate::conversation::CompactionRecord::for_test()
+                    },
+                    loaded_tools_snapshot: Default::default(),
                     checklist_snapshot: Default::default(),
                 })
                 .expect("json"),
@@ -1391,7 +1438,7 @@ mod tests {
             .join("\u{1e}");
         assert_eq!(
             (INDEXED_WORDS_DEFINITION, digest(&words)),
-            (5, 7_730_688_909_017_102_265_u64),
+            (7, 7_437_640_812_775_458_469_u64),
             "the words a row contributes changed, or the definition number moved without them: \
              bump INDEXED_WORDS_DEFINITION and pin the new pair here (the words were: {words:?})"
         );
@@ -1401,8 +1448,6 @@ mod tests {
     /// person said and was not.
     #[tokio::test]
     async fn an_excerpt_from_a_summary_says_so() {
-        use std::collections::HashSet;
-
         let store = Store::for_test().await;
         let session = store
             .create_session(None, "test-profile".to_string())
@@ -1412,10 +1457,21 @@ mod tests {
             .save_event(
                 session,
                 &Event::CompactBoundary {
-                    summary: Message::assistant_text("the summary mentions pelicans"),
+                    summary: Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Summary {
+                            text: "[Conversation summary from session compaction]\n\nthe \
+                                   summary mentions pelicans"
+                                .to_string(),
+                        }],
+                        provider_fields: None,
+                    },
                     replaced_count: 0,
-                    record: crate::conversation::CompactionRecord::for_test(),
-                    loaded_tools_snapshot: HashSet::new(),
+                    record: crate::conversation::CompactionRecord {
+                        written_summary: "the summary mentions pelicans".to_string(),
+                        ..crate::conversation::CompactionRecord::for_test()
+                    },
+                    loaded_tools_snapshot: Default::default(),
                     checklist_snapshot: Default::default(),
                 },
                 None,
@@ -1440,36 +1496,36 @@ mod tests {
         );
     }
 
-    /// The messages a summary quotes as they were written are rows this index already holds, so
-    /// a summary contributes its own words and not the quotes: otherwise a search for a phrase
-    /// someone wrote would rank the summary beside, or above, the message itself.
+    /// A summary contributes the words it was written with, and not what compaction wrote
+    /// around them: the messages it quotes are rows this index already holds, so a search for a
+    /// phrase someone wrote would rank the summary beside, or above, the message itself, and the
+    /// context after the compaction is Meka's.
     #[test]
-    fn a_summary_contributes_its_words_and_not_the_messages_it_quotes() {
-        use std::collections::HashSet;
-
-        use crate::conversation::{
-            COMPACTION_SUMMARY_PREFIX, RETAINED_MESSAGES_END, RETAINED_MESSAGES_HEADER,
-        };
-
-        // A quoted message that itself pastes the closing marker must not end the cut early: the
-        // marker counts only at the start of a line, and every quoted line begins with `> `.
-        let summary = format!(
-            "{COMPACTION_SUMMARY_PREFIX}\n\nbirds were discussed\n\n{RETAINED_MESSAGES_HEADER}\n\
-             > {RETAINED_MESSAGES_END} pasted by someone\n> the pelicans nest here\n\
-             {RETAINED_MESSAGES_END}\n\n[Post-compaction context]\n\nlevel read"
-        );
+    fn a_summary_contributes_the_words_it_was_written_with() {
         let content = serde_json::to_string(&Event::CompactBoundary {
-            summary: Message::user(summary),
+            summary: Message {
+                role: Role::User,
+                content: vec![ContentBlock::Summary {
+                    text: "[Conversation summary from session compaction]\n\nbirds were \
+                           discussed\n\n> the pelicans nest here\n\n[Post-compaction \
+                           context]\n\nlevel read"
+                        .to_string(),
+                }],
+                provider_fields: None,
+            },
             replaced_count: 2,
-            record: crate::conversation::CompactionRecord::for_test(),
-            loaded_tools_snapshot: HashSet::new(),
+            record: crate::conversation::CompactionRecord {
+                written_summary: "birds were discussed".to_string(),
+                ..crate::conversation::CompactionRecord::for_test()
+            },
+            loaded_tools_snapshot: Default::default(),
             checklist_snapshot: Default::default(),
         })
         .expect("json");
         let words = indexed_words(COMPACT_BOUNDARY_KIND, &content, None);
         assert!(words.contains("birds were discussed"), "{words}");
-        assert!(words.contains("level read"), "{words}");
         assert!(!words.contains("pelicans"), "{words}");
+        assert!(!words.contains("level read"), "{words}");
     }
 
     /// Every diacritic is folded, so a word typed without them finds the word with them.

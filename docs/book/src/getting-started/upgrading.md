@@ -10,6 +10,85 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 Meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.91 to 0.92
+
+Nothing in `config.toml` is renamed. The store moves forward on its first open, behind the
+automatic backup: what Meka wrote into a conversation as text becomes content of its own type, a
+note in place of something it removed, a compaction's summary, the caption ahead of an image, an
+output saved to the scratchpad and a call whose arguments did not parse, and the session search
+index is built again. Each reply gains a record of what its provider said about it; a reply
+written before has none, except a turn's last reply, which takes its turn's stop when that was
+`max_tokens` or `refusal`, since 0.91 recorded `end_turn` for every other stop alike. A thinking
+block's text becomes the one part it was. The sentence Meka wrote into a reply that held
+nothing, such as "[The model returned an empty response.]", is taken out of the reply, which keeps
+the stop it named. 0.91 refuses a store 0.92 has opened; downgrading means restoring the backup the
+upgrade took. Session archives are `format_version` 25; a 0.91 archive (23) is brought forward on
+import, and 0.91 refuses a 25.
+
+**The HTTP API types what Meka wrote.** In the history and the context, a note Meka wrote in place
+of something it removed is a `harness_note` block, with `note`, the sentence, and `text` as the
+model read it, and a compaction's message is a `summary` block; in a tool result a note is a
+`harness_note` item, the caption ahead of an image an `image_caption` and an output saved to the
+scratchpad a `large_output`, with `scratchpad_entry`, `size_bytes` and `preview`. Each was a `text`
+block or item. `tool_call.completed` on the feed carries a result's items in the history's shapes,
+an image with its `hash`. A client that draws only `text` shows the person's words and the tool's
+output as before, but for an output saved to the scratchpad, whose opening is now the
+`large_output`'s `preview`; it needs these kinds to show what Meka wrote.
+
+**A call whose arguments did not parse.** Its `input` is `{}`, and `unparsed` beside it holds what
+the model sent, `text`, and why the call was refused, `error`, on the history's `tool_use` block,
+`tool_call.executing` and the one-shot JSON's `tool_calls[]`. It was an object holding the reason
+under `_meka_invalid_arguments`, which an upgraded store keeps as `error` with no `text`.
+
+**Each reply's record.** A `message` item of `GET /v1/sessions/{id}/history` that is a reply carries
+`reply`: `stop` with `reason`, Meka's class, `word`, the provider's own stop value, and `details`,
+what the provider said beside it; `cut` for one that was stopped, interrupted or failed before it
+ended; `model`, `profile` and `usage`. A compaction's `checkpoint` rounds carry it too, and the
+summarizer's replies are its `summarizer`.
+
+**New stop classes.** `stop_reason` on a turn, `turn.finished` and the one-shot JSON report can
+also be `tool_use` (a reply that stopped for calls and made none), `context_window`,
+`content_filter` or `unknown`; ACP answers them `end_turn`, `max_tokens`, `refusal` and `end_turn`,
+its closed set. A client that switches on `stop_reason` handles the four or treats an unknown value
+as finished.
+
+**Reasoning parts and new block kinds.** The history's `thinking` block holds `parts`, each with a
+`kind`, `reasoning` or `summary`, and its `text`, in place of one `thinking` string; a client joins
+them as it likes. A `refusal` block holds the words an OpenAI model refused in, and an
+`unrecognized` block holds `parts` Meka reads nothing from, as the provider sent them. `text` and
+`tool_use` blocks carry `provider_fields`, what the provider put on the part beside what Meka reads.
+The feed sends `thinking.redacted` for reasoning the provider withheld, where it sent
+`[redacted thinking]` as a `thinking.delta`.
+
+**Everything else a provider returns.** Every block that stands for a provider's part (`text`,
+`thinking`, `redacted_thinking`, `refusal`, `tool_use`), a message (on Chat Completions, whose
+messages carry fields of their own) and a reply's `reply` carry `provider_fields`: what the provider
+returned there beyond what Meka reads, verbatim, a streamed reply folded as the provider's own
+client folds one. A Claude block or event of a type Meka does not read is an `unrecognized`
+block.
+
+**A reply with no words and no call.** Meka no longer writes a sentence into it. ACP and the
+feed relay only what it held, and the turn's stop says how it ended; the screen says the model
+returned no answer, and a one-shot warns on stderr. `refusal_text` is absent unless the model
+wrote words; Claude's explanation of a refusal is in the reply's `stop.details`.
+
+**A compaction that fails** is in the history as a `compaction_failed` item, with the rounds its
+checkpoint completed, the memories they wrote and the error.
+
+**A tool call outside its protocol.** A call in a shape the protocol does not define is recorded as
+an `unrecognized` block and not run: on Chat Completions a streamed fragment without its `index`, a
+call with `name` and `arguments` beside `function` rather than in it, and one that never names its
+`id` or `function.name`; on Claude's protocol a `tool_use` block without its `id` or `name`, which
+failed the reply before; on Responses a call item that names neither in the item opening it nor in
+the one finishing it. A Chat Completions call none of whose fragments carries `arguments` is refused,
+as a whole reply's is. Meka read some of these shapes before. An endpoint that sends them deviates
+from the protocol: use one that follows it.
+
+**ACP's fallback prefix.** A client that does not advertise `session.notices` gets an advisory as an
+agent-message chunk prefixed `[Meka]`, or `[Meka warn]` for a warning, where it was `[meka]` and
+`[meka warn]`. The prefix is for the person reading the transcript; a client that wants the
+severity advertises `session.notices` and reads it from the `notice`.
+
 ## 0.90 to 0.91
 
 Nothing in `config.toml` is renamed. The store moves forward on its first open: the result of

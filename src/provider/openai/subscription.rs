@@ -1633,7 +1633,7 @@ mod tests {
             .unwrap();
         sender
             .send(StreamEvent::MessageEnd {
-                stop_reason: StopReason::EndTurn,
+                stop: crate::provider::Stop::of(StopReason::EndTurn),
             })
             .await
             .unwrap();
@@ -1641,12 +1641,12 @@ mod tests {
 
         let crate::provider::Completion {
             message,
-            stop_reason,
+            stop,
             notices,
             ..
         } = aggregate_stream(receiver).await;
         assert_eq!(message.text_content(), "Summary: all done.");
-        assert!(matches!(stop_reason, StopReason::EndTurn));
+        assert_eq!(stop.reason, StopReason::EndTurn);
         assert!(notices.is_empty());
     }
 

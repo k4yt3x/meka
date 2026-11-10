@@ -546,9 +546,10 @@ pub(super) fn redirects_to_scratchpad(input: &serde_json::Value) -> bool {
     )
 }
 
-/// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw image bytes plus a
-/// pre-computed classification. Wraps `prepare_image_payload` so error paths become a text
-/// `ToolOutput` with `is_error: true`. Shared by `web_fetch`, `file_read`, and `image_render`.
+/// Build a two-item `ToolOutput` (the caption `marker` names the image by, then the image) from
+/// raw image bytes plus a pre-computed classification. Wraps `prepare_image_payload` so error paths
+/// become a text `ToolOutput` with `is_error: true`. Shared by `web_fetch`, `file_read`, and
+/// `image_render`.
 pub(crate) fn build_image_tool_output(
     marker: &str,
     handling: ImageHandling,
@@ -563,8 +564,8 @@ pub(crate) fn build_image_tool_output(
 
     ToolOutput {
         content: vec![
-            ToolResultContent::Text {
-                text: format!("[{marker}]"),
+            ToolResultContent::ImageCaption {
+                caption: marker.to_string(),
             },
             ToolResultContent::Image { source },
         ],

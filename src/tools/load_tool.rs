@@ -619,9 +619,9 @@ pub(crate) fn extract_loaded_tool_names_from_events(
                   loaded: &mut Vec<String>| {
         for block in &message.content {
             match block {
-                ContentBlock::ToolUse { id, name, input }
-                    if name == crate::tools::LOAD_TOOL_NAME =>
-                {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } if name == crate::tools::LOAD_TOOL_NAME => {
                     let names = crate::tools::load_tool_names(input);
                     if !names.is_empty() {
                         pending.insert(id.clone(), names);
@@ -669,7 +669,7 @@ pub(crate) fn extract_loaded_tool_names_from_events(
                 }
             }
             // Touches images only; no tool call is added or removed by it.
-            Event::Redact { .. } | Event::Unsign => {}
+            Event::Redact { .. } | Event::Unsign | Event::CompactionFailed(_) => {}
             Event::CompactBoundary {
                 loaded_tools_snapshot,
                 ..
@@ -684,13 +684,11 @@ pub(crate) fn extract_loaded_tool_names_from_events(
                     seen.clear();
                     continue;
                 }
-                // The snapshot is an unordered set, so sort it for a deterministic tail. Continuity
-                // with the pre-boundary order isn't needed: compaction rewrites the head of the
-                // conversation and re-caches everything anyway. What matters is that every turn
-                // *after* the boundary agrees on the order.
-                let mut absorbed: Vec<&String> = loaded_tools_snapshot.iter().collect();
-                absorbed.sort();
-                for name in absorbed {
+                // In the snapshot's own order, by name. Continuity with the pre-boundary order
+                // isn't needed: compaction rewrites the head of the conversation and re-caches
+                // everything anyway. What matters is that every turn *after* the boundary agrees
+                // on the order.
+                for name in loaded_tools_snapshot {
                     if seen.insert(name.clone()) {
                         loaded.push(name.clone());
                     }

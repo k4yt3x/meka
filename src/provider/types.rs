@@ -288,7 +288,23 @@ impl ToolDefinition {
 #[derive(Debug, Clone)]
 pub(crate) enum StreamEvent {
     TextDelta(String),
+    /// The end of one part of the reply's text as the provider returned it (a Claude text block, a
+    /// Responses message item), with every field the provider put on it beyond its text. The text
+    /// since the last part is one block, so two parts never merge.
+    TextEnd {
+        provider_fields: Option<crate::conversation::ProviderFields>,
+    },
+    /// Words the model returned in the field its provider keeps for declining (OpenAI's
+    /// `refusal`), streamed like text.
+    RefusalDelta(String),
+    /// Something the provider returned that Meka reads no block from, verbatim: an output item of
+    /// a type Meka does not know, or a reply in a shape its protocol does not define.
+    Unrecognized(serde_json::Value),
+    /// Reasoning text, which goes on the part in progress, opening one of reasoning when none is.
     ThinkingDelta(String),
+    /// A new part of the thinking block in progress begins, of `kind`: a Responses item's next
+    /// summary part, or its reasoning after its summary.
+    ThinkingPart(crate::conversation::ReasoningKind),
     /// The model has entered a thinking block, carrying the server's running estimate of the
     /// thinking tokens spent so far when it offers one (`None` at the start of the block, before
     /// any estimate has arrived).
@@ -305,30 +321,47 @@ pub(crate) enum StreamEvent {
         /// Whatever the provider gave to carry this reasoning forward, in its own shape. Passed
         /// through to [`ContentBlock::Thinking`] untouched.
         opaque: Option<OpaqueReasoning>,
+        /// The part's fields nothing else holds.
+        provider_fields: Option<crate::conversation::ProviderFields>,
     },
     /// A complete `redacted_thinking` block (the `redact-thinking` beta). `data` is opaque and
     /// arrives whole in the `content_block_start` event, so there is no delta/complete pair.
     RedactedThinking {
         data: String,
+        /// The part's fields nothing else holds.
+        provider_fields: Option<crate::conversation::ProviderFields>,
     },
     ToolUseStart {
         id: String,
         name: String,
     },
+    /// A piece of the arguments of the call in progress, as it streamed.
+    ToolArgumentsDelta(String),
     ToolUseEnd {
         input: serde_json::Value,
+        /// Every field the provider put on the call beyond its id, name and arguments.
+        provider_fields: Option<crate::conversation::ProviderFields>,
     },
-    /// Emitted in lieu of `ToolUseEnd` when the accumulated tool-call arguments fail to parse as
-    /// JSON. The agent layer must not execute the tool; it should surface the parse error back to
-    /// the model as a `ToolResult { is_error: true }` instead.
+    /// Emitted in lieu of `ToolUseEnd` when the accumulated tool-call arguments are not a JSON
+    /// object. The agent layer must not execute the tool; it surfaces the error back to the model
+    /// as a `ToolResult { is_error: true }` instead.
     ToolCallRefused {
         id: String,
         name: String,
-        reason: String,
+        unparsed: crate::conversation::UnparsedArguments,
+        provider_fields: Option<crate::conversation::ProviderFields>,
     },
     MessageEnd {
-        stop_reason: StopReason,
+        stop: Stop,
     },
+    /// The model the response names, as it names it.
+    Model(String),
+    /// The message's own fields nothing else holds, as its protocol folds them; the latest
+    /// statement stands.
+    MessageFields(crate::conversation::ProviderFields),
+    /// The response's own fields nothing else holds, as its protocol folds them; the latest
+    /// statement stands, so a reply cut short keeps what was known when it was cut.
+    ResponseFields(crate::conversation::ProviderFields),
     Usage(TokenUsage),
     /// User-visible advisory from the provider layer (e.g. "redacted N old images to fit the
     /// 32 MiB request limit"). The agent translates this into
@@ -338,22 +371,6 @@ pub(crate) enum StreamEvent {
     Notice(Notice),
     Error(String),
 }
-/// Sentinel key inserted into `ToolUse::input` when the upstream tool-call arguments failed to
-/// parse. `resolve_and_execute_tool` checks for this and short-circuits to an error result instead
-/// of invoking the tool with a potentially surprising default-filled object.
-pub(crate) const INVALID_TOOL_ARGS_MARKER: &str = "_meka_invalid_arguments";
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StopReason {
-    EndTurn,
-    ToolUse,
-    MaxTokens,
-    /// The model declined to comply with the request. Claude's API surfaces this as `stop_reason:
-    /// "refusal"`; OpenAI's responses API has the equivalent. The string carries the model's
-    /// refusal text when the provider includes one, empty otherwise.
-    Refusal(String),
-    Unknown(String),
-}
-
 /// One completion, as every backend receives it: the prompt, the conversation and the tools on
 /// offer, under the profile's thinking setting, which no request overrides. Borrowed, because the
 /// redact-and-retry loop re-invokes a body builder over a substituted message slice and nothing

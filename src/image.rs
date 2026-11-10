@@ -1257,10 +1257,10 @@ mod tests {
         assert!(!output.is_error);
         assert_eq!(output.content.len(), 2);
         match &output.content[0] {
-            ToolResultContent::Text { text } => {
-                assert!(text.contains("https://example.com/a.png"));
+            ToolResultContent::ImageCaption { caption } => {
+                assert!(caption.contains("https://example.com/a.png"));
             }
-            _ => panic!("first block should be Text"),
+            _ => panic!("first block should be the caption"),
         }
         match &output.content[1] {
             ToolResultContent::Image { source } => {

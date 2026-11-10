@@ -631,7 +631,10 @@ mod tests {
             .turn_store()
             .close_turn(
                 turn,
-                &TurnEnding::succeeded("end_turn", TurnUsage::default()),
+                &TurnEnding::succeeded(
+                    crate::conversation::StopReason::EndTurn,
+                    TurnUsage::default(),
+                ),
             )
             .await
             .expect("close");

@@ -3814,52 +3814,61 @@ mod tests {
         let record = CompactionRecord {
             trigger: CompactionTrigger::Requested,
             kept_recent: false,
-            checkpoint: vec![
+            checkpoint: [
                 Message {
                     role: Role::Assistant,
                     content: vec![
                         ContentBlock::Thinking {
-                            thinking: "Hmm.".into(),
+                            parts: vec![crate::conversation::ReasoningPart::reasoning("Hmm.")],
                             opaque: None,
+                            provider_fields: None,
                         },
                         ContentBlock::ToolUse {
                             id: "call-0".into(),
                             name: "memory_search".into(),
                             input: serde_json::json!({"queries": ["release"]}),
+                            unparsed: None,
+                            provider_fields: None,
                         },
                         ContentBlock::ToolUse {
                             id: "call-1".into(),
                             name: "memory_write".into(),
                             input: serde_json::json!({"name": "notes", "content": memory}),
+                            unparsed: None,
+                            provider_fields: None,
                         },
                     ],
+                    provider_fields: None,
                 },
                 Message {
                     role: Role::User,
-                    content: vec![ContentBlock::ToolResult {
-                        tool_use_id: "call-0".into(),
-                        content: vec![ToolResultContent::Text {
-                            text: "No memories.".into(),
-                        }],
-                        is_error: false,
-                        display: None,
-                    }],
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call-0".into(),
+                            content: vec![ToolResultContent::Text {
+                                text: "No memories.".into(),
+                            }],
+                            is_error: false,
+                            display: None,
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call-1".into(),
+                            content: vec![ToolResultContent::Text {
+                                text: "Saved memory 'notes'.".into(),
+                            }],
+                            is_error: false,
+                            display: Some(ResultDisplay {
+                                change: Some(Change::between(None, Some(&memory))),
+                                ..ResultDisplay::default()
+                            }),
+                        },
+                    ],
+                    provider_fields: None,
                 },
-                Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::ToolResult {
-                        tool_use_id: "call-1".into(),
-                        content: vec![ToolResultContent::Text {
-                            text: "Saved memory 'notes'.".into(),
-                        }],
-                        is_error: false,
-                        display: Some(ResultDisplay {
-                            change: Some(Change::between(None, Some(&memory))),
-                            ..ResultDisplay::default()
-                        }),
-                    }],
-                },
-            ],
+            ]
+            .into_iter()
+            .map(crate::conversation::RecordedMessage::unrecorded)
+            .collect(),
             written_summary: "**Done:** the release.".into(),
             ..CompactionRecord::for_test()
         };
@@ -4595,6 +4604,7 @@ mod tests {
             name: "file_read".into(),
             input: serde_json::json!({}),
             display_summary: None,
+            unparsed: None,
         });
         assert_eq!(activity, Activity::UsingTool);
         activity.note(&FrontendEvent::ChecklistUpdated { items: Vec::new() });
@@ -5001,8 +5011,11 @@ mod tests {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {
                             text: (*text).to_string(),
+                            provider_fields: None,
                         }],
+                        provider_fields: None,
                     }),
+                    reply: None,
                 })
                 .collect(),
             more,

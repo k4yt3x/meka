@@ -8,7 +8,7 @@ pub(super) fn sent_text(parts: &[crate::conversation::ContentBlock]) -> String {
     parts
         .iter()
         .filter_map(|part| match part {
-            crate::conversation::ContentBlock::Text { text }
+            crate::conversation::ContentBlock::Text { text, .. }
             | crate::conversation::ContentBlock::Resource { text, .. } => Some(text.as_str()),
             _ => None,
         })
@@ -307,7 +307,7 @@ pub(super) async fn slash_to_invocation(
     parts: &[crate::conversation::ContentBlock],
     skills: &Arc<SkillCache>,
 ) -> Result<Option<crate::conversation::ContentBlock>, SlashInvocationError> {
-    let Some((crate::conversation::ContentBlock::Text { text: opening }, rest)) =
+    let Some((crate::conversation::ContentBlock::Text { text: opening, .. }, rest)) =
         parts.split_first()
     else {
         return Ok(None);
@@ -356,7 +356,7 @@ pub(super) async fn slash_to_invocation(
     let mut after_text = true;
     for part in rest {
         match part {
-            crate::conversation::ContentBlock::Text { text } => {
+            crate::conversation::ContentBlock::Text { text, .. } => {
                 if after_text {
                     directive.push('\n');
                     words.push('\n');
@@ -409,6 +409,7 @@ pub(super) async fn run_prompt_turn(
         match block {
             ContentBlock::Text(text) => parts.push(crate::conversation::ContentBlock::Text {
                 text: text.text.clone(),
+                provider_fields: None,
             }),
             // `ResourceLink` is part of the ACP baseline that every agent MUST support (alongside
             // `Text`). Meka doesn't fetch the resource server-side; the model sees the reference as
@@ -444,7 +445,7 @@ pub(super) async fn run_prompt_turn(
     let typed_from = parts
         .iter()
         .position(|part| {
-            !matches!(part, crate::conversation::ContentBlock::Text { text } if crate::text::is_blank(text))
+            !matches!(part, crate::conversation::ContentBlock::Text { text, .. } if crate::text::is_blank(text))
         })
         .unwrap_or(parts.len());
     parts.drain(..typed_from);
@@ -640,9 +641,7 @@ pub(super) async fn run_prompt_turn(
     entry.touch();
 
     let stop_reason = match result {
-        Ok(crate::agent::TurnOutcome::EndTurn) => StopReason::EndTurn,
-        Ok(crate::agent::TurnOutcome::MaxTokens) => StopReason::MaxTokens,
-        Ok(crate::agent::TurnOutcome::Refusal(_)) => StopReason::Refusal,
+        Ok(outcome) => acp_stop_reason(outcome.stop_reason),
         Err(MekaError::Interrupted) => StopReason::Cancelled,
         Err(error) => {
             if cancel_probe.is_canceled() {
@@ -671,6 +670,18 @@ pub(super) async fn run_prompt_turn(
 
     let after = agent.session_stats_snapshot();
     responder.respond(PromptResponse::new(stop_reason).usage(turn_usage(&before, &after)))
+}
+
+/// ACP's word for a turn that ended on a reply of class `stop_reason`. The protocol's set is
+/// closed, so a cut is `max_tokens` whatever cut it, a content filter is a refusal, and a stop
+/// Meka has no class for, or a `tool_use` with no call, ends the turn as an answer does.
+fn acp_stop_reason(stop_reason: crate::conversation::StopReason) -> StopReason {
+    use crate::conversation::StopReason as Class;
+    match stop_reason {
+        Class::EndTurn | Class::ToolUse | Class::Unknown => StopReason::EndTurn,
+        Class::MaxTokens | Class::ContextWindow => StopReason::MaxTokens,
+        Class::Refusal | Class::ContentFilter => StopReason::Refusal,
+    }
 }
 /// What one turn spent, for `session/prompt`'s response, which the protocol defines as the turn's
 /// usage: the session's counters after it less before, so a sub-agent's spend and a compaction's

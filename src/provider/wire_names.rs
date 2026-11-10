@@ -19,7 +19,7 @@ use crate::{
     error::Result,
     provider::{
         AccountIdentity, AccountUsage, Completion, CompletionRequest, DeferredToolDelivery,
-        Provider, StreamEvent, ToolDefinition, UsageStats,
+        Provider, SEARCH_TOOL_NAME, StreamEvent, ToolDefinition, UsageStats,
     },
 };
 
@@ -70,9 +70,24 @@ impl CutRequest {
     /// request but one naming a tool past the cap.
     fn of(request: &CompletionRequest<'_>, max_bytes: usize) -> Option<Self> {
         let over = |name: &str| name.len() > max_bytes;
+        // The names a search call asked for, which go out cut as the model sent them.
+        let searched = |name: &str, input: &serde_json::Value| -> Vec<String> {
+            if name != SEARCH_TOOL_NAME {
+                return Vec::new();
+            }
+            input
+                .get("names")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|name| name.as_str().map(str::to_string))
+                .collect()
+        };
         let named_over = |block: &ContentBlock| {
             match block {
-            ContentBlock::ToolUse { name, .. } => over(name),
+            ContentBlock::ToolUse { name, input, .. } => {
+                over(name) || searched(name, input).iter().any(|name| over(name))
+            }
             ContentBlock::ToolResult { content, .. } => content.iter().any(|item| {
                 matches!(item, ToolResultContent::ToolReference { tool_name } if over(tool_name))
             }),
@@ -108,7 +123,22 @@ impl CutRequest {
             .flat_map(|message| message.content.iter_mut())
         {
             match block {
-                ContentBlock::ToolUse { name, .. } => cut(name),
+                ContentBlock::ToolUse { name, input, .. } => {
+                    if name == SEARCH_TOOL_NAME
+                        && let Some(names) = input
+                            .get_mut("names")
+                            .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for searched in names {
+                            if let Some(whole) = searched.as_str() {
+                                let mut cut_name = whole.to_string();
+                                cut(&mut cut_name);
+                                *searched = serde_json::Value::String(cut_name);
+                            }
+                        }
+                    }
+                    cut(name);
+                }
                 ContentBlock::ToolResult { content, .. } => {
                     for item in content.iter_mut() {
                         if let ToolResultContent::ToolReference { tool_name } = item {
@@ -144,25 +174,67 @@ impl CutRequest {
         self.whole.get(&name).cloned().unwrap_or(name)
     }
 
-    fn restore_event(&self, event: StreamEvent) -> StreamEvent {
+    /// `names` in a `tool_search` call's arguments, which name tools the way the request did,
+    /// restored to the whole names the registry knows.
+    fn restore_searched(&self, input: &mut serde_json::Value) {
+        if let Some(names) = input
+            .get_mut("names")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for name in names {
+                if let Some(cut) = name.as_str() {
+                    *name = serde_json::Value::String(self.restore(cut.to_string()));
+                }
+            }
+        }
+    }
+
+    /// `event` with every name restored. `pending` is the name of the call whose arguments are
+    /// streaming, which a call's end does not repeat.
+    fn restore_event(&self, event: StreamEvent, pending: &mut Option<String>) -> StreamEvent {
         match event {
-            StreamEvent::ToolUseStart { id, name } => StreamEvent::ToolUseStart {
+            StreamEvent::ToolUseStart { id, name } => {
+                let name = self.restore(name);
+                *pending = Some(name.clone());
+                StreamEvent::ToolUseStart { id, name }
+            }
+            StreamEvent::ToolUseEnd {
+                mut input,
+                provider_fields,
+            } => {
+                if pending.take().as_deref() == Some(SEARCH_TOOL_NAME) {
+                    self.restore_searched(&mut input);
+                }
+                StreamEvent::ToolUseEnd {
+                    input,
+                    provider_fields,
+                }
+            }
+            StreamEvent::ToolCallRefused {
                 id,
-                name: self.restore(name),
-            },
-            StreamEvent::ToolCallRefused { id, name, reason } => StreamEvent::ToolCallRefused {
-                id,
-                name: self.restore(name),
-                reason,
-            },
+                name,
+                unparsed,
+                provider_fields,
+            } => {
+                pending.take();
+                StreamEvent::ToolCallRefused {
+                    id,
+                    name: self.restore(name),
+                    unparsed,
+                    provider_fields,
+                }
+            }
             other => other,
         }
     }
 
     fn restore_completion(&self, mut completion: Completion) -> Completion {
         for block in &mut completion.message.content {
-            if let ContentBlock::ToolUse { name, .. } = block {
+            if let ContentBlock::ToolUse { name, input, .. } = block {
                 *name = self.restore(std::mem::take(name));
+                if name == SEARCH_TOOL_NAME {
+                    self.restore_searched(input);
+                }
             }
         }
         completion
@@ -200,9 +272,10 @@ impl Provider for ToolNameCap {
         // would have closed the driver's own, rather than leaving the driver blocked on a full one.
         let restore = &cut;
         let forward = async move {
+            let mut pending = None;
             while let Some(event) = receiver.recv().await {
                 if event_sender
-                    .send(restore.restore_event(event))
+                    .send(restore.restore_event(event, &mut pending))
                     .await
                     .is_err()
                 {
@@ -301,6 +374,86 @@ mod tests {
         assert!(streamed.is_ok(), "the driver returned");
     }
 
+    /// A search that names a tool by its cut name, the name the model was shown, finds the tool by
+    /// its whole name.
+    #[tokio::test]
+    async fn a_search_names_a_cut_tool_by_its_whole_name() {
+        let long = format!("mcp__server__{}", "x".repeat(140));
+        let short = wire_name(&long, 128).into_owned();
+        let mock = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: SEARCH_TOOL_NAME.to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({"names": [short]}),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::ToolUse,
+            },
+        ]]));
+        let provider = cap_tool_names(mock, 128);
+        let tools = [tool(&long)];
+        let history = [Message::user("go")];
+        let (sender, mut receiver) = mpsc::channel(16);
+        provider
+            .stream(
+                CompletionRequest::new("", &history, &tools),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("streams");
+        let mut searched = None;
+        while let Some(event) = receiver.recv().await {
+            if let StreamEvent::ToolUseEnd { input, .. } = event {
+                searched = Some(input);
+            }
+        }
+        assert_eq!(searched, Some(serde_json::json!({"names": [long]})));
+    }
+
+    /// A search the history holds goes out naming the tools as the model was shown them, cut,
+    /// as the call it restores on the way in was sent, whether or not the catalog still holds
+    /// the tool.
+    #[tokio::test]
+    async fn a_search_in_the_history_goes_out_under_the_cut_names() {
+        let long = format!("mcp__server__{}", "x".repeat(80));
+        let short = wire_name(&long, 64).into_owned();
+        let mock = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]]));
+        let provider = cap_tool_names(mock.clone(), 64);
+        let history = [Message::user("go"), Message {
+            role: crate::conversation::Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: SEARCH_TOOL_NAME.to_string(),
+                input: serde_json::json!({"names": [long, "short_one"]}),
+                unparsed: None,
+                provider_fields: None,
+            }],
+            provider_fields: None,
+        }];
+        let (sender, mut receiver) = mpsc::channel(16);
+        provider
+            .stream(
+                CompletionRequest::new("", &history, &[]),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("streams");
+        while receiver.recv().await.is_some() {}
+        let sent = mock.streams();
+        let ContentBlock::ToolUse { input, .. } = &sent[0].messages[1].content[0] else {
+            panic!("{:?}", sent[0].messages[1]);
+        };
+        assert_eq!(input, &serde_json::json!({"names": [short, "short_one"]}));
+    }
+
     /// The wire sees only cut names, in the catalog and in the history, and the call the model
     /// makes under one comes back under the whole name the rest of Meka knows.
     #[tokio::test]
@@ -327,7 +480,10 @@ mod tests {
                 id: "call-1".to_string(),
                 name: long.clone(),
                 input: serde_json::json!({}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         }];
         let (sender, mut receiver) = mpsc::channel(16);
         provider

@@ -582,7 +582,311 @@ const MIGRATIONS: &[Migration] = &[
         name: "background_starts_record_their_task",
         step: Step::Rust(background_starts_record_their_task),
     },
+    // 0.92 types what Meka wrote into a conversation as text: the notes it put in place of what
+    // it removed, a compaction's summary, a call whose arguments did not parse, the caption ahead
+    // of an image and a large output's reference. A row written before carries each as text,
+    // read once here by the exact words each release wrote; a `user` row that held a note or a
+    // summary becomes `user_blocks`.
+    Migration {
+        name: "meka_s_own_content_is_typed",
+        step: Step::Rust(meka_s_own_content_is_typed),
+    },
+    // 0.92 records with each reply what its provider said about it beside its content: how it
+    // stopped, the model, the profile and the usage. A reply written before has no record, which
+    // is what the column holds for it.
+    Migration {
+        name: "messages_record_what_a_reply_returned",
+        step: Step::Rust(messages_record_what_a_reply_returned),
+    },
+    // 0.92 records what a model returned as it returned it. A thinking block's text becomes the
+    // one part it was: a summary under reasoning an endpoint sealed, reasoning otherwise. The
+    // sentence Meka wrote into a reply that held nothing is taken out of the reply, which keeps
+    // the stop it named in its record, as a turn's last reply keeps the stop its turn row
+    // records. A `user` row becomes the `user_blocks` row of one text block every person's
+    // message is now written as.
+    Migration {
+        name: "replies_are_recorded_as_returned",
+        step: Step::Rust(replies_are_recorded_as_returned),
+    },
+    // 0.92 keeps the fields a provider puts on a message itself, beside its blocks: a Chat
+    // Completions message's `reasoning_details`, `annotations` or `audio`. A message written
+    // before has none, which the column holds for it.
+    Migration {
+        name: "messages_keep_their_own_fields",
+        step: Step::Rust(messages_keep_their_own_fields),
+    },
 ];
+
+/// See the ledger entry. Safe to replay: a `user` row and a thinking block's text exist only
+/// before their conversion, a reply's sentence is taken out of a reply of no other words, and a
+/// record is written only where there is none. A turn row's `end_turn` is not copied: 0.91 wrote
+/// it for an answer and for every stop it had no class for alike, so it says nothing of the reply.
+fn replies_are_recorded_as_returned(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let encode = |value: &serde_json::Value| {
+        serde_json::to_string(value)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    };
+    let users: Vec<(i64, String)> = transaction
+        .prepare("SELECT id, content FROM messages WHERE kind = 'user'")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, content) in users {
+        let blocks = serde_json::json!([{"type": "text", "text": content}]);
+        transaction.execute(
+            "UPDATE messages SET kind = 'user_blocks', content = ?1 WHERE id = ?2",
+            rusqlite::params![encode(&blocks)?, id],
+        )?;
+    }
+    // Only the rows holding what the step converts: a thinking block, or a sentence of Meka's.
+    let rows: Vec<(i64, String, String, Option<String>)> = transaction
+        .prepare(
+            "SELECT id, kind, content, reply FROM messages \
+             WHERE kind IN ('assistant', 'repair', 'compact_boundary') \
+             AND (content LIKE '%\"thinking\"%' OR content LIKE '%[The model %')",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, kind, content, reply) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let mut stops = Vec::new();
+        let changed = if kind == "assistant" {
+            match value.as_array_mut() {
+                Some(blocks) => record_reply_as_returned_0_91(blocks, &mut stops),
+                None => false,
+            }
+        } else {
+            record_replies_as_returned_0_91(&mut value, &mut stops)
+        };
+        if changed {
+            transaction.execute(
+                "UPDATE messages SET content = ?1 WHERE id = ?2",
+                rusqlite::params![encode(&value)?, id],
+            )?;
+        }
+        if kind == "assistant"
+            && reply.is_none()
+            && let Some(Some(stop)) = stops.first()
+        {
+            let record = serde_json::json!({ "stop": stop });
+            transaction.execute(
+                "UPDATE messages SET reply = ?1 WHERE id = ?2",
+                rusqlite::params![encode(&record)?, id],
+            )?;
+        }
+    }
+    // A turn's last reply ended the turn, so it stopped as the turn's row records. A copy a
+    // compaction kept is not where the reply was said. One ordered pass finds each turn's last
+    // reply, since nothing indexes a row's turn.
+    let endings: std::collections::HashMap<String, String> = transaction
+        .prepare(
+            "SELECT id, stop_reason FROM turns WHERE status = 'succeeded' \
+             AND stop_reason IN ('max_tokens', 'refusal')",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut last_replies: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    if !endings.is_empty() {
+        let mut statement = transaction.prepare(
+            "SELECT id, turn_id FROM messages WHERE kind = 'assistant' AND turn_id IS NOT NULL \
+             AND copy_of IS NULL AND said_at IS NULL ORDER BY id",
+        )?;
+        let replies = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for reply in replies {
+            let (id, turn_id) = reply?;
+            if endings.contains_key(&turn_id) {
+                last_replies.insert(turn_id, id);
+            }
+        }
+    }
+    for (turn_id, id) in last_replies {
+        let Some(stop_reason) = endings.get(&turn_id) else {
+            continue;
+        };
+        let record = serde_json::json!({"stop": {"reason": stop_reason}});
+        transaction.execute(
+            "UPDATE messages SET reply = ?1 WHERE id = ?2 AND reply IS NULL",
+            rusqlite::params![encode(&record)?, id],
+        )?;
+    }
+    // A copy a compaction kept stands for its row, and is the record once the row is swept.
+    transaction.execute_batch(
+        "UPDATE messages SET reply = \
+         (SELECT original.reply FROM messages AS original WHERE original.id = messages.copy_of) \
+         WHERE copy_of IS NOT NULL AND reply IS NULL",
+    )?;
+    Ok(())
+}
+
+/// The class this release gives a stop word 0.91 had none for, which 0.91 named in the sentence it
+/// wrote in place of the reply: the words each wire's driver classes, frozen here.
+fn stop_class_0_91(word: &str) -> &'static str {
+    match word {
+        "end_turn" | "stop" | "stop_sequence" | "completed" => "end_turn",
+        "tool_use" | "tool_calls" => "tool_use",
+        "max_tokens" | "length" | "max_output_tokens" => "max_tokens",
+        "model_context_window_exceeded" => "context_window",
+        "refusal" => "refusal",
+        "content_filter" => "content_filter",
+        _ => "unknown",
+    }
+}
+
+/// The sentences 0.91 and every release before it wrote into a reply that held no words and no
+/// call, in place of the reply, each with the class of the stop it named: a refusal, a cut at the
+/// output limit, and any other stop, which it did not name.
+const EMPTY_REPLY_SENTENCES_0_91: [(&str, Option<&str>); 3] = [
+    (
+        "[The model declined to respond to this request.]",
+        Some("refusal"),
+    ),
+    (
+        "[The model reached its output limit before producing a response.]",
+        Some("max_tokens"),
+    ),
+    ("[The model returned an empty response.]", None),
+];
+
+/// How the sentence for a stop Meka had no class for opened and closed around the provider's word.
+const UNNAMED_STOP_SENTENCE_0_91: (&str, &str) = (
+    "[The model returned an empty response (stop reason: ",
+    ").]",
+);
+
+/// Record every message `value` holds as it was returned, wherever it sits: a repair's messages,
+/// a boundary's summary and the checkpoint rounds its record keeps, an archive's events; see
+/// [`record_reply_as_returned_0_91`]. `stops` gains each reply's sentence's stop, in order.
+/// Reports whether anything changed.
+fn record_replies_as_returned_0_91(
+    value: &mut serde_json::Value,
+    stops: &mut Vec<Option<serde_json::Value>>,
+) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let role = object
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if let Some(role) = role
+                && let Some(blocks) = object
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_array_mut)
+            {
+                return role == "assistant" && record_reply_as_returned_0_91(blocks, stops);
+            }
+            let mut changed = false;
+            for child in object.values_mut() {
+                changed |= record_replies_as_returned_0_91(child, stops);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= record_replies_as_returned_0_91(item, stops);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// A reply's blocks as returned: each thinking block's text the one part it was, and the sentence
+/// Meka wrote in place of a reply of no words and no call taken out. Pushes onto `stops` the stop
+/// the sentence named, as a record states it: its class, and the provider's word for a stop Meka
+/// had no class for; `None` for the sentence that named none. Reports whether anything changed.
+fn record_reply_as_returned_0_91(
+    blocks: &mut Vec<serde_json::Value>,
+    stops: &mut Vec<Option<serde_json::Value>>,
+) -> bool {
+    let mut changed = false;
+    for block in blocks.iter_mut() {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("thinking") {
+            continue;
+        }
+        let Some(object) = block.as_object_mut() else {
+            continue;
+        };
+        let Some(thinking) = object.remove("thinking") else {
+            continue;
+        };
+        let text = thinking.as_str().unwrap_or_default().to_string();
+        let sealed = object
+            .get("opaque")
+            .and_then(|opaque| opaque.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("sealed");
+        let kind = if sealed { "summary" } else { "reasoning" };
+        let parts = if text.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{"kind": kind, "text": text}])
+        };
+        object.insert("parts".to_string(), parts);
+        changed = true;
+    }
+    let calls = blocks
+        .iter()
+        .any(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"));
+    let worded: Vec<usize> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| {
+            text_of_0_91(block).is_some_and(|text| !text.trim().is_empty())
+                || block.get("type").and_then(serde_json::Value::as_str) == Some("refusal")
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if !calls
+        && let [index] = worded.as_slice()
+        && let Some(text) = blocks.get(*index).and_then(text_of_0_91)
+    {
+        let (opening, closing) = UNNAMED_STOP_SENTENCE_0_91;
+        let stop = match EMPTY_REPLY_SENTENCES_0_91
+            .iter()
+            .find(|(sentence, _)| *sentence == text.as_str())
+        {
+            Some((_, class)) => Some(class.map(|class| serde_json::json!({"reason": class}))),
+            None => text
+                .strip_prefix(opening)
+                .and_then(|rest| rest.strip_suffix(closing))
+                .map(|word| {
+                    Some(serde_json::json!({"reason": stop_class_0_91(word), "word": word}))
+                }),
+        };
+        if let Some(stop) = stop {
+            blocks.remove(*index);
+            stops.push(stop);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The column a message's own fields are kept in. Safe to replay: the column is added once.
+fn messages_keep_their_own_fields(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "messages", "provider_fields")? {
+        transaction.execute_batch("ALTER TABLE messages ADD COLUMN provider_fields TEXT")?;
+    }
+    Ok(())
+}
+
+/// The column a reply's record is kept in. Safe to replay: the column is added once.
+fn messages_record_what_a_reply_returned(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "messages", "reply")? {
+        transaction.execute_batch("ALTER TABLE messages ADD COLUMN reply TEXT")?;
+    }
+    Ok(())
+}
 
 /// The column that marks a session whose copy is unfinished. Safe to replay: the column is added
 /// once.
@@ -1212,6 +1516,536 @@ fn record_background_starts_in_archive_0_90(document: &mut serde_json::Value) {
     }
 }
 
+/// What Meka wrote into a conversation as text before 0.92 typed it, read here once by the exact
+/// words each release wrote: the notes it put in place of what it removed, the summary a
+/// compaction writes, a call whose arguments did not parse, the caption ahead of an image and the
+/// reference a large output was saved behind. A person's words that happen to look alike are left
+/// as they are by every rule here: a note needs one of the labels and one of the openings below, a
+/// caption needs the image it names after it, a summary needs the heading opening a message's
+/// first block, and a glued note a message of one text block, which only a row from before every
+/// turn carried its context block is.
+fn meka_s_own_content_is_typed(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    const KINDS: &str = "kind IN ('user', 'user_blocks', 'tool_results', 'assistant', 'repair', 'compact_boundary')";
+    let sessions: Vec<String> = transaction
+        .prepare(&format!(
+            "SELECT DISTINCT session_id FROM messages WHERE {KINDS}"
+        ))?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for session_id in sessions {
+        let rows: Vec<(i64, String, String)> = transaction
+            .prepare(&format!(
+                "SELECT id, kind, content FROM messages WHERE session_id = ?1 AND {KINDS} ORDER BY id"
+            ))?
+            .query_map([&session_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, kind, content) in rows {
+            let Some((kind, content)) = type_row_content_0_91(&kind, &content)? else {
+                continue;
+            };
+            transaction.execute(
+                "UPDATE messages SET kind = ?1, content = ?2 WHERE id = ?3",
+                rusqlite::params![kind, content, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The labels Meka put ahead of its notes before 0.92 typed them: `[meka harness] ` from 0.44,
+/// `[meka] ` before.
+const NOTE_LABELS_0_91: [&str; 2] = ["[meka harness] ", "[meka] "];
+
+/// How every note Meka wrote opens, in every wording a release wrote: from 0.46 a provider
+/// "rejected", before it "refused".
+const NOTE_OPENINGS_0_91: [&str; 9] = [
+    "An image attached to this message was removed because the provider rejected it: ",
+    "An image attached to this message was removed because the provider refused it: ",
+    "An image here was removed: it is declared ",
+    "The provider rejected this tool result, so its non-text content was removed",
+    "The provider refused this tool result, so its non-text content was removed",
+    "The provider rejected the request carrying this call, so its arguments and result were \
+     removed",
+    "The provider refused the request carrying this call, so its arguments and result were removed",
+    "Sent but not declared in this tool's schema",
+    "Called without loading its schema",
+];
+
+/// How the note on a call made without its tool's schema opens, the one note Meka appended to a
+/// tool's own output rather than writing as an item of its own.
+const SCHEMA_NOTE_OPENINGS_0_91: [&str; 2] = [
+    "Sent but not declared in this tool's schema",
+    "Called without loading its schema",
+];
+
+/// The text that stood where the request budget took an image out before 0.92.
+const IMAGE_PLACEHOLDER_0_91: &str = "[image redacted to fit request size budget]";
+
+/// The note that stands there from 0.92: what the replay computes for the same image, so a copy a
+/// compaction kept of a redacted view still equals the view an archive's import recomputes.
+const BUDGET_NOTE_0_92: &str = "An image here was removed to fit the request size budget.";
+
+/// How the message a compaction writes opens, the heading and the blank line under it.
+const SUMMARY_OPENING_0_91: &str = "[Conversation summary from session compaction]\n\n";
+
+/// The keys a call whose arguments did not parse held its reason under: `_agsh_invalid_arguments`
+/// before the project took Meka's name, `_meka_invalid_arguments` after.
+const UNPARSED_ARGUMENT_KEYS_0_91: [&str; 2] =
+    ["_meka_invalid_arguments", "_agsh_invalid_arguments"];
+
+/// The keys a call a refused request emptied held its breadcrumb under, one per label.
+const EMPTIED_ARGUMENT_KEYS_0_91: [&str; 2] = ["[meka harness]", "[meka]"];
+
+/// How the caption a tool wrote ahead of an image opens: `file_read`'s, `web_fetch`'s and
+/// `image_render`'s.
+const CAPTION_OPENINGS_0_91: [&str; 3] =
+    ["[Image: ", "[Image fetched from ", "[Image rendered from "];
+
+/// A row's kind and content with what Meka wrote as text typed, or `None` when there was nothing to
+/// type. A `user` row held a message of text alone, flattened; one a note or a summary is found in
+/// becomes `user_blocks`, the kind a message of other blocks is stored under.
+fn type_row_content_0_91(kind: &str, content: &str) -> rusqlite::Result<Option<(String, String)>> {
+    let encode = |value: &serde_json::Value| {
+        serde_json::to_string(value)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    };
+    if kind == "user" {
+        let mut blocks = vec![serde_json::json!({"type": "text", "text": content})];
+        if !type_user_blocks_0_91(&mut blocks) {
+            return Ok(None);
+        }
+        return Ok(Some((
+            "user_blocks".to_string(),
+            encode(&serde_json::Value::Array(blocks))?,
+        )));
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Ok(None);
+    };
+    let changed = match (kind, value.as_array_mut()) {
+        ("user_blocks" | "tool_results", Some(blocks)) => type_user_blocks_0_91(blocks),
+        ("assistant", Some(blocks)) => type_assistant_blocks_0_91(blocks),
+        _ => type_content_0_91(&mut value),
+    };
+    Ok(if changed {
+        Some((kind.to_string(), encode(&value)?))
+    } else {
+        None
+    })
+}
+
+/// Type every message `value` holds, wherever it sits: a repair's messages, a boundary's summary
+/// and the checkpoint rounds its record keeps, an archive's events. A message's blocks are not
+/// descended into, since a call's arguments are the model's data. Reports whether anything
+/// changed.
+fn type_content_0_91(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut changed = false;
+            // A boundary: its summary is a message of one text block under the heading.
+            if object.contains_key("replaced_count")
+                && let Some(summary) = object
+                    .get_mut("summary")
+                    .and_then(|summary| summary.get_mut("content"))
+                    .and_then(serde_json::Value::as_array_mut)
+                && let [block] = summary.as_mut_slice()
+                && let Some(text) = text_of_0_91(block)
+                && text.starts_with(SUMMARY_OPENING_0_91)
+            {
+                *block = serde_json::json!({"type": "summary", "text": text});
+                changed = true;
+            }
+            let role = object
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if let Some(role) = role
+                && let Some(blocks) = object
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_array_mut)
+            {
+                return changed
+                    | match role.as_str() {
+                        "user" => type_user_blocks_0_91(blocks),
+                        "assistant" => type_assistant_blocks_0_91(blocks),
+                        _ => false,
+                    };
+            }
+            for child in object.values_mut() {
+                changed |= type_content_0_91(child);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= type_content_0_91(item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// The text of a `text` block or item, or `None` for any other.
+fn text_of_0_91(block: &serde_json::Value) -> Option<String> {
+    (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .then(|| block.get("text").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_string)
+}
+
+/// The note `text` is, as the sentence alone, when it is one of Meka's: a label and an opening,
+/// or the redaction placeholder, which becomes today's note.
+fn note_of_0_91(text: &str) -> Option<String> {
+    if text == IMAGE_PLACEHOLDER_0_91 {
+        return Some(BUDGET_NOTE_0_92.to_string());
+    }
+    NOTE_LABELS_0_91.iter().find_map(|label| {
+        text.strip_prefix(label)
+            .filter(|rest| {
+                NOTE_OPENINGS_0_91
+                    .iter()
+                    .any(|opening| rest.starts_with(opening))
+            })
+            .map(str::to_string)
+    })
+}
+
+/// A user message's blocks with its notes and its tool results' items typed. A message of one
+/// text block is a row flattened before every turn carried its context block: a summary when it
+/// opens under the heading, else the person's words with any note glued on after them. A first
+/// block under the heading among others is a summary an interrupt joined its arrivals onto.
+fn type_user_blocks_0_91(blocks: &mut Vec<serde_json::Value>) -> bool {
+    if let [block] = blocks.as_mut_slice()
+        && let Some(text) = text_of_0_91(block)
+    {
+        if text.starts_with(SUMMARY_OPENING_0_91) {
+            *block = serde_json::json!({"type": "summary", "text": text});
+            return true;
+        }
+        if let Some(split) = split_glued_notes_0_91(&text) {
+            *blocks = split;
+            return true;
+        }
+        return false;
+    }
+    let mut changed = false;
+    if let Some(first) = blocks.first_mut()
+        && let Some(text) = text_of_0_91(first)
+        && text.starts_with(SUMMARY_OPENING_0_91)
+    {
+        *first = serde_json::json!({"type": "summary", "text": text});
+        changed = true;
+    }
+    for block in blocks.iter_mut() {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                if let Some(note) = text_of_0_91(block).and_then(|text| note_of_0_91(&text)) {
+                    *block = serde_json::json!({"type": "harness_note", "note": note});
+                    changed = true;
+                }
+            }
+            Some("tool_result") => {
+                if let Some(items) = block
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    changed |= type_result_items_0_91(items);
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
+/// `text` as the blocks it was flattened from, when a note is glued into it: the words ahead, then
+/// each note. `None` when it holds none.
+fn split_glued_notes_0_91(text: &str) -> Option<Vec<serde_json::Value>> {
+    let note_at = |from: usize| {
+        (from..text.len())
+            .filter(|at| text.is_char_boundary(*at))
+            .find(|at| note_of_0_91(&text[*at..]).is_some())
+    };
+    let first = note_at(0)?;
+    let mut blocks = Vec::new();
+    if !text[..first].trim().is_empty() {
+        blocks.push(serde_json::json!({"type": "text", "text": &text[..first]}));
+    }
+    let mut start = first;
+    loop {
+        let next = note_at(start + 1);
+        let end = next.unwrap_or(text.len());
+        if let Some(note) = note_of_0_91(&text[start..end]) {
+            blocks.push(serde_json::json!({"type": "harness_note", "note": note}));
+        }
+        match next {
+            Some(next) => start = next,
+            None => break,
+        }
+    }
+    Some(blocks)
+}
+
+/// A tool result's items with Meka's typed: a note, a caption ahead of the image it names, a large
+/// output's reference, and the schema note appended to a tool's own text. A result that holds a
+/// typed note was typed already, and the tool's text left in it may quote a note of its own.
+fn type_result_items_0_91(items: &mut Vec<serde_json::Value>) -> bool {
+    if items
+        .iter()
+        .any(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("harness_note"))
+    {
+        return false;
+    }
+    let mut changed = false;
+    let mut typed = Vec::with_capacity(items.len() + 1);
+    for (index, item) in items.iter().enumerate() {
+        let Some(text) = text_of_0_91(item) else {
+            typed.push(item.clone());
+            continue;
+        };
+        if let Some(note) = note_of_0_91(&text) {
+            typed.push(serde_json::json!({"type": "harness_note", "note": note}));
+        } else if let Some(large_output) = large_output_of_0_91(&text) {
+            typed.push(large_output);
+        } else if let Some(caption) = caption_of_0_91(&text)
+            && items.get(index + 1).is_some_and(stands_for_an_image_0_91)
+        {
+            typed.push(serde_json::json!({"type": "image_caption", "caption": caption}));
+        } else if let Some((output, note)) = split_schema_note_0_91(&text) {
+            typed.push(serde_json::json!({"type": "text", "text": output}));
+            typed.push(serde_json::json!({"type": "harness_note", "note": note}));
+        } else {
+            typed.push(item.clone());
+            continue;
+        }
+        changed = true;
+    }
+    if changed {
+        *items = typed;
+    }
+    changed
+}
+
+/// Whether `item` is an image, or what stood where one was: the redaction placeholder, or the note
+/// on an image whose bytes disagreed with their type.
+fn stands_for_an_image_0_91(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(serde_json::Value::as_str) == Some("image")
+        || text_of_0_91(item).is_some_and(|text| {
+            text == IMAGE_PLACEHOLDER_0_91
+                || note_of_0_91(&text).is_some_and(|note| {
+                    note.starts_with("An image here was removed: it is declared ")
+                })
+        })
+}
+
+/// The caption `text` is, without its brackets, when it is one a tool wrote ahead of an image.
+fn caption_of_0_91(text: &str) -> Option<String> {
+    (CAPTION_OPENINGS_0_91
+        .iter()
+        .any(|opening| text.starts_with(opening))
+        && text.ends_with(']')
+        && !text.contains('\n'))
+    .then(|| text[1..text.len() - 1].to_string())
+}
+
+/// `text` split where the schema note was appended to it, the tool's own text and the note's
+/// sentence, when one was: the last blank line followed by a label and the note's opening.
+fn split_schema_note_0_91(text: &str) -> Option<(String, String)> {
+    NOTE_LABELS_0_91.iter().find_map(|label| {
+        let at = text.rfind(&format!("\n\n{label}"))?;
+        let note = &text[at + 2 + label.len()..];
+        SCHEMA_NOTE_OPENINGS_0_91
+            .iter()
+            .any(|opening| note.starts_with(opening))
+            .then(|| (text[..at].to_string(), note.to_string()))
+    })
+}
+
+/// The large output `text` refers to, as the item that types it, when it is the reference a spill
+/// left: the entry, the size, and the opening it quotes, read by the count its header states. The
+/// header said characters before 0.30, and the writer counted bytes all along.
+fn large_output_of_0_91(text: &str) -> Option<serde_json::Value> {
+    let rest = text.strip_prefix("<large-output name=\"")?;
+    let (entry, rest) = rest.split_once("\" size=\"")?;
+    let (size, rest) = rest.split_once("\">\n")?;
+    let size: usize = size.parse().ok()?;
+    let (_, rest) = rest.split_once("\n\nPreview (first ")?;
+    let (count, rest) = rest.split_once(' ')?;
+    let count: usize = count.parse().ok()?;
+    let rest = rest
+        .strip_prefix("bytes):\n")
+        .or_else(|| rest.strip_prefix("characters):\n"))?;
+    let (preview, rest) = (rest.get(..count)?, rest.get(count..)?);
+    if rest != "\n</large-output>" && rest != "\n...\n</large-output>" {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": "large_output",
+        "scratchpad_entry": entry,
+        "size_bytes": size,
+        "preview": preview,
+    }))
+}
+
+/// An assistant message's calls with their arguments typed: the reason a call that did not parse
+/// held under a key becomes its `unparsed` error, the text it was sent with never kept; a call a
+/// refused request emptied goes back to `{}`.
+fn type_assistant_blocks_0_91(blocks: &mut [serde_json::Value]) -> bool {
+    let mut changed = false;
+    for block in blocks.iter_mut() {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let Some((key, value)) = block
+            .get("input")
+            .and_then(serde_json::Value::as_object)
+            .filter(|input| input.len() == 1)
+            .and_then(|input| input.iter().next())
+            .map(|(key, value)| (key.clone(), value.clone()))
+        else {
+            continue;
+        };
+        if UNPARSED_ARGUMENT_KEYS_0_91.contains(&key.as_str())
+            && let Some(reason) = value.as_str()
+        {
+            block["input"] = serde_json::json!({});
+            block["unparsed"] = serde_json::json!({"error": reason});
+            changed = true;
+        } else if EMPTIED_ARGUMENT_KEYS_0_91.contains(&key.as_str())
+            && value
+                .as_str()
+                .is_some_and(|breadcrumb| breadcrumb.starts_with("arguments removed"))
+        {
+            block["input"] = serde_json::json!({});
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// What [`meka_s_own_content_is_typed`] types, in every session of an archive from before 0.92.
+fn type_content_in_archive_0_91(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(events) = session.get_mut("events") {
+            type_content_0_91(events);
+        }
+    }
+}
+
+/// What [`replies_are_recorded_as_returned`] records, in every session of an archive from before
+/// 0.92 recorded replies as returned: each reply's blocks, the stop its sentence named, a turn's
+/// last reply's stop from the turn's own record where that says something, and a kept copy's
+/// record from the row it copies.
+fn record_replies_in_archive_0_91(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        let endings: Vec<(String, String)> = session
+            .get("turns")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|turn| {
+                turn.get("status").and_then(serde_json::Value::as_str) == Some("succeeded")
+                    && matches!(
+                        turn.get("stop_reason").and_then(serde_json::Value::as_str),
+                        Some("max_tokens" | "refusal")
+                    )
+            })
+            .filter_map(|turn| {
+                Some((
+                    turn.get("id")?.as_str()?.to_string(),
+                    turn.get("stop_reason")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let Some(events) = session
+            .get_mut("events")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for event in events.iter_mut() {
+            let mut stops = Vec::new();
+            let is_reply = event
+                .get("event")
+                .and_then(|inner| inner.get("Append"))
+                .and_then(|message| message.get("role"))
+                .and_then(serde_json::Value::as_str)
+                == Some("assistant");
+            if let Some(inner) = event.get_mut("event") {
+                record_replies_as_returned_0_91(inner, &mut stops);
+            }
+            if is_reply
+                && event.get("reply").is_none_or(serde_json::Value::is_null)
+                && let Some(Some(stop)) = stops.first()
+                && let Some(object) = event.as_object_mut()
+            {
+                object.insert("reply".to_string(), serde_json::json!({ "stop": stop }));
+            }
+        }
+        for (turn_id, stop_reason) in endings {
+            let last = events.iter_mut().rev().find(|event| {
+                event.get("turn_id").and_then(serde_json::Value::as_str) == Some(turn_id.as_str())
+                    && event.get("copy_of").is_none_or(serde_json::Value::is_null)
+                    && event.get("said_at").is_none_or(serde_json::Value::is_null)
+                    && event
+                        .get("event")
+                        .and_then(|inner| inner.get("Append"))
+                        .and_then(|message| message.get("role"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("assistant")
+            });
+            if let Some(event) = last
+                && event.get("reply").is_none_or(serde_json::Value::is_null)
+                && let Some(object) = event.as_object_mut()
+            {
+                object.insert(
+                    "reply".to_string(),
+                    serde_json::json!({"stop": {"reason": stop_reason}}),
+                );
+            }
+        }
+        // A copy a compaction kept stands for its row, and is the record once the row is swept.
+        for index in 0..events.len() {
+            let unrecorded = events
+                .get(index)
+                .is_some_and(|event| event.get("reply").is_none_or(serde_json::Value::is_null));
+            let Some(record) = events
+                .get(index)
+                .and_then(|event| event.get("copy_of"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|original| usize::try_from(original).ok())
+                .filter(|_| unrecorded)
+                .and_then(|original| events.get(original))
+                .and_then(|original| original.get("reply"))
+                .filter(|record| !record.is_null())
+                .cloned()
+            else {
+                continue;
+            };
+            if let Some(object) = events
+                .get_mut(index)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                object.insert("reply".to_string(), record);
+            }
+        }
+    }
+}
+
 fn recall_entries_take_their_name(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     let tables: Vec<String> = transaction
         .prepare(
@@ -1522,7 +2356,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 9_688_403_848_242_860_359;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 9_358_111_554_427_328_396;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -4141,6 +4975,12 @@ const ARCHIVE_FORMAT_0_88: u64 = 21;
 /// The archive `format_version` 0.89 and 0.90 wrote, whose background calls record their task
 /// only in the words they were answered with.
 const ARCHIVE_FORMAT_0_90: u64 = 22;
+/// The archive `format_version` 0.91 wrote, which carries what Meka wrote into a conversation as
+/// text: notes, a compaction's summary, unparsed arguments, captions, large outputs' references.
+const ARCHIVE_FORMAT_0_91: u64 = 23;
+/// The archive `format_version` 0.92's development builds wrote before replies were recorded as
+/// returned: no reply carries a record, and an empty one carries Meka's sentence in its place.
+const ARCHIVE_FORMAT_0_92_DEVELOPMENT: u64 = 24;
 
 /// How the text Meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -4726,7 +5566,9 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_88_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_88_DEVELOPMENT_2)
         | Some(ARCHIVE_FORMAT_0_88)
-        | Some(ARCHIVE_FORMAT_0_90) => {}
+        | Some(ARCHIVE_FORMAT_0_90)
+        | Some(ARCHIVE_FORMAT_0_91)
+        | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -4771,6 +5613,12 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     record_turn_levels_0_88(document);
     if from <= ARCHIVE_FORMAT_0_90 {
         record_background_starts_in_archive_0_90(document);
+    }
+    if from <= ARCHIVE_FORMAT_0_91 {
+        type_content_in_archive_0_91(document);
+    }
+    if from <= ARCHIVE_FORMAT_0_92_DEVELOPMENT {
+        record_replies_in_archive_0_91(document);
     }
     document["format_version"] = current.into();
     true
@@ -6237,6 +7085,13 @@ mod tests {
                 "background_starts_record_their_task",
                 1392066146600183403_u64,
             ),
+            ("meka_s_own_content_is_typed", 17452181306727884340_u64),
+            (
+                "messages_record_what_a_reply_returned",
+                9925406482029992082_u64,
+            ),
+            ("replies_are_recorded_as_returned", 3089291456316266763_u64),
+            ("messages_keep_their_own_fields", 11616838473919552756_u64),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or
         /// as a constant it reads, whatever its visibility, with its text: an item the digest
@@ -6722,10 +7577,11 @@ mod tests {
         let mut connection = rusqlite::Connection::open(&path).expect("reopen");
         let after = stored_messages(&connection);
         // Untouched by the retag; the 0.87 step names the endpoint its sealed block came from,
-        // none here, as it does for every sealed block written before it.
+        // none here, as it does for every sealed block written before it, and 0.92 records its
+        // text as the summary part it was.
         assert_eq!(
             after[1].1,
-            r#"{"Repair":{"replaced_count":1,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E","origin":null}}]}]}}"#,
+            r#"{"Repair":{"replaced_count":1,"messages":[{"role":"assistant","content":[{"type":"thinking","opaque":{"type":"sealed","encrypted_content":"E","origin":null},"parts":[{"kind":"summary","text":"s"}]}]}]}}"#,
             "a row in the new shape is untouched"
         );
         assert_eq!(
@@ -7282,7 +8138,10 @@ mod tests {
         let after = stored_messages(&connection);
         assert_eq!(
             after[0],
-            ("user".to_string(), "a person's words".to_string())
+            (
+                "user_blocks".to_string(),
+                r#"[{"type":"text","text":"a person's words"}]"#.to_string()
+            )
         );
         assert_eq!(after[1].0, "user_blocks");
         assert_eq!(
@@ -7658,7 +8517,10 @@ mod tests {
                  \"media_type\":\"image/png\",\"size\":3}}]"
                     .to_string(),
             ),
-            ("user".to_string(), "plain words".to_string()),
+            (
+                "user_blocks".to_string(),
+                r#"[{"type":"text","text":"plain words"}]"#.to_string(),
+            ),
             (
                 "user_blocks".to_string(),
                 "[{\"type\":\"turn_context\",\"text\":\"<context>\\nonly context\\n</context>\"}]"
@@ -7738,7 +8600,13 @@ mod tests {
             }),
             "both rows reference the blob and neither carries the bytes: {after:?}"
         );
-        assert_eq!(after[2], ("user".to_string(), "no image here".to_string()));
+        assert_eq!(
+            after[2],
+            (
+                "user_blocks".to_string(),
+                r#"[{"type":"text","text":"no image here"}]"#.to_string()
+            )
+        );
         assert_eq!(
             after[3],
             ("assistant".to_string(), arguments),
@@ -7851,15 +8719,18 @@ mod tests {
             vec![
                 (
                     "assistant".to_string(),
-                    r#"[{"type":"thinking","thinking":"hmm","opaque":{"type":"signed","signature":"SIG"}},{"type":"text","text":"hi"}]"#.to_string()
+                    r#"[{"type":"thinking","opaque":{"type":"signed","signature":"SIG"},"parts":[{"kind":"reasoning","text":"hmm"}]},{"type":"text","text":"hi"}]"#.to_string()
                 ),
                 // Respelled; the 0.87 step names no endpoint on a sealed block from before it.
                 (
                     "assistant".to_string(),
-                    r#"[{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E","id":"rs_1","origin":null}}]"#.to_string()
+                    r#"[{"type":"thinking","opaque":{"type":"sealed","encrypted_content":"E","id":"rs_1","origin":null},"parts":[{"kind":"summary","text":"s"}]}]"#.to_string()
                 ),
                 ("assistant".to_string(), arguments.to_string()),
-                ("user".to_string(), "a plain row that says opaque".to_string()),
+                (
+                    "user_blocks".to_string(),
+                    r#"[{"type":"text","text":"a plain row that says opaque"}]"#.to_string()
+                ),
             ]
         );
         let names = indexes(&connection);
@@ -9318,7 +10189,10 @@ mod tests {
                 Ok((row.get(0)?, row.get(1)?))
             })
             .expect("the message row");
-        assert_eq!((kind.as_str(), content.as_str()), ("user", "hello"));
+        assert_eq!(
+            (kind.as_str(), content.as_str()),
+            ("user_blocks", r#"[{"type":"text","text":"hello"}]"#)
+        );
         let (tool, entry): (String, String) = connection
             .query_row(
                 "SELECT tool, scratchpad_entry FROM background_tasks",
@@ -9581,6 +10455,559 @@ mod tests {
             "an archive carries no task rows, so no sub-agent"
         );
         assert!(events[3]["event"]["Append"]["content"][0]["display"].is_null());
+    }
+
+    /// 0.92 records replies as returned: a person's `user` row becomes one text block, a thinking
+    /// block's text the one part it was, and the sentence Meka wrote in place of a reply of no
+    /// words goes, the stop it named kept in the reply's record, as a turn's last reply keeps its
+    /// turn's class. A sentence beside other words or a call is not one Meka wrote alone, and
+    /// stays. A replay finds nothing left to do.
+    #[test]
+    fn replies_are_recorded_as_returned_in_every_place_and_a_look_alike_stays() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        let text = |text: &str| serde_json::json!({"type": "text", "text": text});
+        let sealed = serde_json::json!({"type": "thinking", "thinking": "s",
+            "opaque": {"type": "sealed", "encrypted_content": "E", "origin": null}});
+        let plain = serde_json::json!({"type": "thinking", "thinking": "r"});
+        let call =
+            serde_json::json!({"type": "tool_use", "id": "c1", "name": "file_read", "input": {}});
+        let rows: Vec<(&str, String, Option<&str>)> = vec![
+            ("user", "hello".to_string(), None),
+            (
+                "assistant",
+                serde_json::json!([
+                    sealed,
+                    text("[The model returned an empty response (stop reason: pause_turn).]"),
+                ])
+                .to_string(),
+                None,
+            ),
+            (
+                "assistant",
+                serde_json::json!([text("[The model declined to respond to this request.]")])
+                    .to_string(),
+                None,
+            ),
+            (
+                "assistant",
+                serde_json::json!([
+                    text("[The model returned an empty response.]"),
+                    text("more")
+                ])
+                .to_string(),
+                None,
+            ),
+            (
+                "assistant",
+                serde_json::json!([text("[The model returned an empty response.]"), call])
+                    .to_string(),
+                None,
+            ),
+            (
+                "repair",
+                serde_json::json!({"Repair": {"replaced_count": 1, "messages": [
+                    {"role": "assistant", "content": [plain, text("kept")]},
+                ]}})
+                .to_string(),
+                None,
+            ),
+            (
+                "assistant",
+                serde_json::json!([text("the end")]).to_string(),
+                Some("t1"),
+            ),
+            (
+                "assistant",
+                serde_json::json!([text(
+                    "[The model returned an empty response (stop reason: \
+                     model_context_window_exceeded).]"
+                )])
+                .to_string(),
+                None,
+            ),
+            (
+                "assistant",
+                serde_json::json!([text("an answer")]).to_string(),
+                Some("t2"),
+            ),
+            (
+                "assistant",
+                serde_json::json!([text("the end")]).to_string(),
+                None,
+            ),
+        ];
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'then', 'then');
+                 INSERT INTO turns (id, session_id, source, started_at, status, stop_reason)
+                 VALUES ('t1', 's', 'client', 'then', 'succeeded', 'max_tokens'),
+                        ('t2', 's', 'client', 'then', 'succeeded', 'end_turn');",
+            )
+            .expect("a session and its turns");
+        for (id, (kind, content, turn)) in (1_i64..).zip(&rows) {
+            connection
+                .execute(
+                    "INSERT INTO messages (id, session_id, kind, content, created_at, turn_id) \
+                     VALUES (?1, 's', ?2, ?3, 'then', ?4)",
+                    rusqlite::params![id, kind, content, turn],
+                )
+                .expect("a row");
+        }
+        connection
+            .execute("UPDATE messages SET copy_of = 7 WHERE id = 10", [])
+            .expect("a kept copy of the turn's last reply");
+        let read = |connection: &rusqlite::Connection| -> Vec<(String, serde_json::Value, Option<String>)> {
+            connection
+                .prepare("SELECT kind, content, reply FROM messages ORDER BY id")
+                .expect("prepare")
+                .query_map([], |row| {
+                    let content: String = row.get(1)?;
+                    Ok((
+                        row.get(0)?,
+                        serde_json::from_str(&content).unwrap_or(serde_json::Value::String(content)),
+                        row.get(2)?,
+                    ))
+                })
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let transaction = connection.transaction().expect("transaction");
+        replies_are_recorded_as_returned(&transaction).expect("the step");
+        let recorded = read(&transaction);
+        assert_eq!(
+            (recorded[0].0.as_str(), &recorded[0].1),
+            ("user_blocks", &serde_json::json!([text("hello")]))
+        );
+        assert_eq!(
+            recorded[1].1,
+            serde_json::json!([{"type": "thinking",
+                "opaque": {"type": "sealed", "encrypted_content": "E", "origin": null},
+                "parts": [{"kind": "summary", "text": "s"}]}])
+        );
+        assert_eq!(
+            recorded[1]
+                .2
+                .as_deref()
+                .map(|reply| serde_json::from_str::<serde_json::Value>(reply).expect("json")),
+            Some(serde_json::json!({"stop": {"reason": "unknown", "word": "pause_turn"}}))
+        );
+        assert_eq!(recorded[2].1, serde_json::json!([]));
+        assert_eq!(
+            recorded[2]
+                .2
+                .as_deref()
+                .map(|reply| serde_json::from_str::<serde_json::Value>(reply).expect("json")),
+            Some(serde_json::json!({"stop": {"reason": "refusal"}})),
+            "a sentence that named a stop's class keeps it"
+        );
+        assert_eq!(
+            recorded[3].1,
+            serde_json::from_str::<serde_json::Value>(&rows[3].1).expect("json")
+        );
+        assert_eq!(
+            recorded[4].1,
+            serde_json::from_str::<serde_json::Value>(&rows[4].1).expect("json")
+        );
+        assert_eq!(
+            recorded[5].1["Repair"]["messages"][0]["content"][0],
+            serde_json::json!({"type": "thinking", "parts": [{"kind": "reasoning", "text": "r"}]})
+        );
+        assert_eq!(
+            recorded[6]
+                .2
+                .as_deref()
+                .map(|reply| serde_json::from_str::<serde_json::Value>(reply).expect("json")),
+            Some(serde_json::json!({"stop": {"reason": "max_tokens"}})),
+            "a turn's last reply stopped as its turn did"
+        );
+        let record_of = |index: usize| {
+            recorded[index]
+                .2
+                .as_deref()
+                .map(|reply| serde_json::from_str::<serde_json::Value>(reply).expect("json"))
+        };
+        assert_eq!(
+            record_of(7),
+            Some(serde_json::json!({"stop": {"reason": "context_window",
+                "word": "model_context_window_exceeded"}})),
+            "a word this release classes is recorded under its class"
+        );
+        assert_eq!(
+            record_of(8),
+            None,
+            "an `end_turn` turn row says nothing of how its reply stopped"
+        );
+        assert_eq!(record_of(9), record_of(6), "a kept copy stands for its row");
+        replies_are_recorded_as_returned(&transaction).expect("a replay");
+        assert_eq!(
+            read(&transaction),
+            recorded,
+            "a replay finds nothing left to do"
+        );
+
+        let mut archive = serde_json::json!({
+            "format_version": ARCHIVE_FORMAT_0_92_DEVELOPMENT,
+            "sessions": [{
+                "turns": [{"id": "t1", "status": "succeeded", "stop_reason": "refusal"},
+                    {"id": "t2", "status": "succeeded", "stop_reason": "end_turn"}],
+                "events": [
+                    {"at": "then", "turn_id": "t1", "event": {"Append": {"role": "assistant",
+                        "content": [plain_for_archive(), text("[The model returned an empty response (stop reason: odd).]")]}}},
+                    {"at": "then", "turn_id": "t1", "event": {"Append": {"role": "assistant",
+                        "content": [text("the answer")]}}},
+                    {"at": "then", "turn_id": "t2", "event": {"Append": {"role": "assistant",
+                        "content": [text("another")]}}},
+                    {"at": "then", "copy_of": 1, "event": {"Append": {"role": "assistant",
+                        "content": [text("the answer")]}}},
+                    {"at": "then", "event": {"Append": {"role": "assistant", "content": [
+                        text("[The model reached its output limit before producing a response.]")]}}},
+                    {"at": "then", "event": {"Append": {"role": "assistant", "content": [
+                        text("[The model returned an empty response.]")]}}},
+                ],
+            }],
+        });
+        assert!(bring_archive_forward(
+            &mut archive,
+            ARCHIVE_FORMAT_0_92_DEVELOPMENT + 1
+        ));
+        let events = &archive["sessions"][0]["events"];
+        assert_eq!(
+            events[0]["event"]["Append"]["content"],
+            serde_json::json!([{"type": "thinking", "parts": [{"kind": "reasoning", "text": "r"}]}])
+        );
+        assert_eq!(
+            events[0]["reply"],
+            serde_json::json!({"stop": {"reason": "unknown", "word": "odd"}})
+        );
+        assert_eq!(
+            events[1]["reply"],
+            serde_json::json!({"stop": {"reason": "refusal"}})
+        );
+        assert_eq!(events[2].get("reply"), None, "an `end_turn` says nothing");
+        assert_eq!(
+            events[3]["reply"], events[1]["reply"],
+            "a kept copy stands for its row"
+        );
+        assert_eq!(
+            (
+                &events[4]["event"]["Append"]["content"],
+                &events[4]["reply"]
+            ),
+            (
+                &serde_json::json!([]),
+                &serde_json::json!({"stop": {"reason": "max_tokens"}})
+            )
+        );
+        assert_eq!(
+            (
+                &events[5]["event"]["Append"]["content"],
+                events[5].get("reply")
+            ),
+            (&serde_json::json!([]), None),
+            "a sentence that named no stop leaves no record"
+        );
+    }
+
+    fn plain_for_archive() -> serde_json::Value {
+        serde_json::json!({"type": "thinking", "thinking": "r"})
+    }
+
+    /// The step types what Meka wrote as text, in every wording a release wrote it and wherever
+    /// it sits: a note in a user message, glued onto a flattened row's words or its own block; a
+    /// note, a caption ahead of its image, a large output's reference and an appended schema note
+    /// in a result; a call that did not parse or that a refused request emptied; a summary in a
+    /// boundary or a pre-boundary row. A person's look-alike, a caption with no image after it and
+    /// the model's own words are left; a replay changes nothing; an archive at 0.91's format comes
+    /// forward the same way.
+    #[test]
+    fn meka_s_own_content_is_typed_in_every_wording_and_place() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        let note = |text: &str| serde_json::json!({"type": "text", "text": text});
+        let result = |items: serde_json::Value| {
+            serde_json::json!([{
+                "type": "tool_result", "tool_use_id": "c1", "content": items, "is_error": false,
+            }])
+            .to_string()
+        };
+        let call = |input: serde_json::Value| serde_json::json!({"type": "tool_use", "id": "c1", "name": "file_read", "input": input});
+        let image = serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}});
+        let rows: Vec<(&str, String)> = vec![
+            (
+                "user",
+                "look at this[meka] An image attached to this message was removed because the \
+                 provider refused it: too big."
+                    .to_string(),
+            ),
+            (
+                "user",
+                "[Conversation summary from session compaction]\n\nwhat came before".to_string(),
+            ),
+            (
+                "user",
+                "[meka harness] what does this label mean?".to_string(),
+            ),
+            (
+                "user_blocks",
+                serde_json::json!([
+                    {"type": "turn_context", "text": "<context/>"},
+                    note("words"),
+                    note(
+                        "[meka harness] An image attached to this message was removed because \
+                         the provider rejected it: too big."
+                    ),
+                ])
+                .to_string(),
+            ),
+            (
+                "tool_results",
+                result(serde_json::json!([
+                    note(
+                        "output\n\n[meka harness] Called without loading its schema. These \
+                         documented parameters were omitted:\n  limit"
+                    ),
+                    note("[Image: a.png]"),
+                    image.clone(),
+                    note("[Image: b.png]"),
+                    note(
+                        "[meka] The provider refused this tool result, so its non-text content \
+                         was removed to keep the conversation usable: r. Do not repeat this call \
+                         unchanged."
+                    ),
+                    note(
+                        "<large-output name=\"shell_execute_a_1\" size=\"40000\">\nOutput too \
+                         large (39.1 KiB). Read it with `scratchpad_read`.\n\nPreview (first 5 \
+                         bytes):\nhello\n...\n</large-output>"
+                    ),
+                    note(
+                        "<large-output name=\"old\" size=\"9\">\nOutput too large.\n\nPreview \
+                         (first 4 characters):\nhéy\n...\n</large-output>"
+                    ),
+                    note("[image redacted to fit request size budget]"),
+                ])),
+            ),
+            (
+                "assistant",
+                serde_json::json!([
+                    note("[meka harness] Called without loading its schema, I think"),
+                    call(
+                        serde_json::json!({"_meka_invalid_arguments": "invalid JSON arguments: x"})
+                    ),
+                    call(
+                        serde_json::json!({"_agsh_invalid_arguments": "invalid JSON arguments: y"})
+                    ),
+                    call(serde_json::json!({
+                        "[meka harness]": "arguments removed; they are quoted in this call's result"
+                    })),
+                    call(serde_json::json!({"path": "notes.md"})),
+                ])
+                .to_string(),
+            ),
+            (
+                "repair",
+                serde_json::json!({"Repair": {"replaced_count": 1, "messages": [{
+                    "role": "user",
+                    "content": [note(
+                        "[meka harness] An image here was removed: it is declared image/png but \
+                         the bytes are something else, which the provider refuses."
+                    )],
+                }]}})
+                .to_string(),
+            ),
+            (
+                "compact_boundary",
+                serde_json::json!({"CompactBoundary": {
+                    "summary": {"role": "user", "content": [note(
+                        "[Conversation summary from session compaction]\n\nthe summary"
+                    )]},
+                    "replaced_count": 2,
+                    "loaded_tools_snapshot": [],
+                    "checklist_snapshot": {"items": []},
+                    "trigger": "manual",
+                    "source": "summarizer",
+                    "memories_written": [],
+                    "kept_recent": true,
+                    "checkpoint": [],
+                    "written_summary": "the summary",
+                }})
+                .to_string(),
+            ),
+            (
+                "user_blocks",
+                serde_json::json!([
+                    note("[Conversation summary from session compaction]\n\nthe summary"),
+                    {"type": "inbox", "text": "[Message from bot]\nhi", "body": "hi"},
+                ])
+                .to_string(),
+            ),
+            (
+                "tool_results",
+                result(serde_json::json!([note(
+                    "it said:\n\n[meka harness] Called without loading its schema. quoted\n\n\
+                     [meka harness] Called without loading its schema. These documented \
+                     parameters were omitted:\n  limit"
+                )])),
+            ),
+        ];
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'then', 'then');",
+            )
+            .expect("a session");
+        for (id, (kind, content)) in (1_i64..).zip(&rows) {
+            connection
+                .execute(
+                    "INSERT INTO messages (id, session_id, kind, content, created_at) \
+                     VALUES (?1, 's', ?2, ?3, 'then')",
+                    rusqlite::params![id, kind, content],
+                )
+                .expect("a row");
+        }
+        let read = |connection: &rusqlite::Connection| -> Vec<(String, String)> {
+            connection
+                .prepare("SELECT kind, content FROM messages ORDER BY id")
+                .expect("prepare")
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let json =
+            |content: &str| -> serde_json::Value { serde_json::from_str(content).expect("json") };
+        let harness_note = |text: &str| serde_json::json!({"type": "harness_note", "note": text});
+        let transaction = connection.transaction().expect("transaction");
+        meka_s_own_content_is_typed(&transaction).expect("the step");
+        let typed = read(&transaction);
+
+        assert_eq!(typed[0].0, "user_blocks", "a glued note makes blocks");
+        assert_eq!(
+            json(&typed[0].1),
+            serde_json::json!([
+                note("look at this"),
+                harness_note(
+                    "An image attached to this message was removed because the provider refused \
+                     it: too big."
+                ),
+            ])
+        );
+        assert_eq!(
+            json(&typed[1].1),
+            serde_json::json!([{
+                "type": "summary",
+                "text": "[Conversation summary from session compaction]\n\nwhat came before",
+            }])
+        );
+        assert_eq!(
+            typed[2],
+            (rows[2].0.to_string(), rows[2].1.clone()),
+            "a person's look-alike is theirs"
+        );
+        assert_eq!(
+            json(&typed[3].1)[2],
+            harness_note(
+                "An image attached to this message was removed because the provider rejected \
+                 it: too big."
+            )
+        );
+        assert_eq!(
+            json(&typed[4].1)[0]["content"],
+            serde_json::json!([
+                note("output"),
+                harness_note(
+                    "Called without loading its schema. These documented parameters were \
+                     omitted:\n  limit"
+                ),
+                {"type": "image_caption", "caption": "Image: a.png"},
+                image,
+                note("[Image: b.png]"),
+                harness_note(
+                    "The provider refused this tool result, so its non-text content was removed \
+                     to keep the conversation usable: r. Do not repeat this call unchanged."
+                ),
+                {
+                    "type": "large_output",
+                    "scratchpad_entry": "shell_execute_a_1",
+                    "size_bytes": 40000,
+                    "preview": "hello",
+                },
+                {"type": "large_output", "scratchpad_entry": "old", "size_bytes": 9, "preview": "héy"},
+                harness_note(BUDGET_NOTE_0_92),
+            ])
+        );
+        let calls = json(&typed[5].1);
+        assert_eq!(
+            calls[0],
+            note("[meka harness] Called without loading its schema, I think"),
+            "the model's words are its own"
+        );
+        assert_eq!(calls[1]["input"], serde_json::json!({}));
+        assert_eq!(
+            calls[1]["unparsed"],
+            serde_json::json!({"error": "invalid JSON arguments: x"})
+        );
+        assert_eq!(
+            calls[2]["unparsed"],
+            serde_json::json!({"error": "invalid JSON arguments: y"})
+        );
+        assert_eq!(calls[3]["input"], serde_json::json!({}));
+        assert!(calls[3].get("unparsed").is_none());
+        assert_eq!(calls[4]["input"], serde_json::json!({"path": "notes.md"}));
+        assert_eq!(
+            json(&typed[6].1)["Repair"]["messages"][0]["content"],
+            serde_json::json!([harness_note(
+                "An image here was removed: it is declared image/png but the bytes are something \
+                 else, which the provider refuses."
+            )])
+        );
+        assert_eq!(
+            json(&typed[7].1)["CompactBoundary"]["summary"]["content"],
+            serde_json::json!([{
+                "type": "summary",
+                "text": "[Conversation summary from session compaction]\n\nthe summary",
+            }])
+        );
+        assert_eq!(
+            json(&typed[8].1)[0]["type"],
+            "summary",
+            "a summary an interrupt joined its arrivals onto"
+        );
+        assert_eq!(
+            json(&typed[9].1)[0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "it said:\n\n[meka harness] Called without loading its \
+                    schema. quoted"},
+                {"type": "harness_note", "note": "Called without loading its schema. These \
+                    documented parameters were omitted:\n  limit"},
+            ]),
+            "the last note splits off, the quoted one stays the tool's"
+        );
+        meka_s_own_content_is_typed(&transaction).expect("a replay");
+        assert_eq!(read(&transaction), typed, "a replay changes nothing");
+
+        let mut archive = serde_json::json!({
+            "format_version": ARCHIVE_FORMAT_0_91,
+            "sessions": [{"events": [
+                {"event": {"Append": {"role": "user", "content": [note(&rows[0].1)]}}},
+                {"event": {"Append": {"role": "assistant", "content": json(&rows[5].1)}}},
+            ]}],
+        });
+        assert!(bring_archive_forward(
+            &mut archive,
+            u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION)
+        ));
+        let events = &archive["sessions"][0]["events"];
+        assert_eq!(events[0]["event"]["Append"]["content"], json(&typed[0].1));
+        assert_eq!(events[1]["event"]["Append"]["content"], calls);
+    }
+
+    /// The note the step writes where the budget took an image out is the one the replay computes
+    /// today, so a kept copy equals the view an archive's import recomputes. A change to the note
+    /// is a change to stored data, and wants a step of its own.
+    #[test]
+    fn the_budget_note_a_step_writes_is_the_one_the_replay_computes() {
+        assert_eq!(BUDGET_NOTE_0_92, crate::conversation::BUDGET_REDACTION_NOTE);
     }
 
     /// The step gives every copy a compaction kept, a copy of a copy included, the turn and the
@@ -10112,10 +11539,10 @@ mod tests {
         assert_eq!(
             converted[4],
             (
-                "user".to_string(),
-                serde_json::Value::String("plain words".to_string())
+                "user_blocks".to_string(),
+                serde_json::json!([{"type": "text", "text": "plain words"}])
             ),
-            "a person's words are left alone"
+            "a person's words are left alone, as the one text block every one is written as"
         );
 
         let transaction = connection.transaction().expect("transaction");
@@ -10463,10 +11890,18 @@ mod tests {
         let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
         let mut before = document.clone();
         before["format_version"] = current.into();
-        // An event copies none, which an archive before 0.87 does not say.
+        // An event copies none, which an archive before 0.87 does not say, and 0.92 records the
+        // thinking's text as the part it was.
         before["sessions"][0]["events"][0]["copy_of"] = serde_json::Value::Null;
+        before["sessions"][0]["events"][0]["event"]["Append"]["content"][0] = serde_json::json!(
+            {"type": "thinking", "opaque": {"type": "signed", "signature": "MAC"},
+             "parts": [{"kind": "reasoning", "text": "hmm"}]}
+        );
         assert!(bring_archive_forward(&mut document, current));
-        assert_eq!(document, before, "nothing to convert but the version stamp");
+        assert_eq!(
+            document, before,
+            "nothing else to convert but the version stamp"
+        );
         let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
             .expect("a 0.76 archive reads");
         assert!(matches!(

@@ -12,8 +12,6 @@
 //! `store::sessions`'s `encode_event_for_db` / `decode_event_from_row` helpers, behind the
 //! [`crate::store::Store::save_event`] / [`crate::store::Store::load_events`] API.
 
-use std::collections::HashSet;
-
 use serde::{Deserialize, Serialize};
 
 use crate::image::ImageSource;
@@ -208,12 +206,17 @@ pub(crate) struct CompactionRecord {
     /// lands below the minimum worth summarizing, which is routine in a session whose user turns
     /// are separated by long tool runs.
     pub(crate) kept_recent: bool,
-    /// The checkpoint turn's rounds as a screen shows them under the compaction's row: what the
-    /// agent thought and called while it saved what must last, with the results. Display only,
-    /// never sent to a provider; empty when no checkpoint round ran, or none is recorded. A
-    /// checkpoint that failed keeps the rounds it ran, beside the summary the summarizer then
-    /// wrote.
-    pub(crate) checkpoint: Vec<Message>,
+    /// The checkpoint turn's rounds as they happened: each reply as its provider returned it, with
+    /// what the provider said about it, and the results Meka sent back, the call that handed the
+    /// summary in included. Never sent to a provider; empty when no checkpoint round ran, or none
+    /// is recorded. A checkpoint that failed keeps the rounds it completed, beside the summary the
+    /// summarizer then wrote; a round cut short is not among them, since no call in it ran and
+    /// nobody saw it. What of them a surface shows is the surface's to decide.
+    pub(crate) checkpoint: Vec<RecordedMessage>,
+    /// The summarizer's replies as their provider returned them, when the summarizer wrote the
+    /// summary: one, or two when the first held no words and it was asked again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) summarizer: Vec<RecordedMessage>,
     /// The summary as the agent or the summarizer wrote it, without the sections compaction
     /// writes around it in the message the boundary puts in place of what it replaced: what the
     /// screen and an editor show of the summary, live and on a replay. Never sent to a provider;
@@ -221,7 +224,63 @@ pub(crate) struct CompactionRecord {
     pub(crate) written_summary: String,
 }
 
+/// A message as it happened, outside the conversation: a round of a compaction's checkpoint or a
+/// summarizer's reply, and for a reply what its provider said about it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RecordedMessage {
+    #[serde(flatten)]
+    pub(crate) message: Message,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reply: Option<ReplyRecord>,
+}
+
+impl RecordedMessage {
+    /// `message`, which no provider returned, or whose record was not kept.
+    pub(crate) fn unrecorded(message: Message) -> Self {
+        Self {
+            message,
+            reply: None,
+        }
+    }
+}
+
+/// A compaction that ended without replacing the window: what it did on the way, which stays done
+/// (the memories its checkpoint wrote), and what ended it. Changes nothing the model sees.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FailedCompaction {
+    pub(crate) trigger: CompactionTrigger,
+    pub(crate) memories_written: Vec<String>,
+    /// See [`CompactionRecord::checkpoint`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) checkpoint: Vec<RecordedMessage>,
+    /// See [`CompactionRecord::summarizer`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) summarizer: Vec<RecordedMessage>,
+    /// What it failed on, in the words the live failure said; absent when it was stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+}
+
 impl CompactionRecord {
+    /// The class of the stop its last reply ended on, the summarizer's or else the checkpoint's:
+    /// how a turn that ran the compaction alone ended. A reply that recorded none ended as an
+    /// answer, and so did one that stopped for its calls, since the compaction ran them and the
+    /// turn ended on nothing left to run.
+    pub(crate) fn last_stop(&self) -> StopReason {
+        match self
+            .summarizer
+            .iter()
+            .rev()
+            .chain(self.checkpoint.iter().rev())
+            .find_map(|round| round.reply.as_ref())
+            .and_then(|reply| reply.stop.as_ref())
+            .map(|stop| stop.reason)
+        {
+            None | Some(StopReason::ToolUse) => StopReason::EndTurn,
+            Some(reason) => reason,
+        }
+    }
+
     /// What the compaction was, in one line: the sentence for what set it going, then what differs
     /// from the ordinary case. Said where a compaction is one line nobody can open: on the export's
     /// marker and as the one-shot's note. The screen and an editor's card say the
@@ -307,6 +366,7 @@ impl CompactionRecord {
             kept_recent: true,
             written_summary: String::new(),
             checkpoint: Vec::new(),
+            summarizer: Vec::new(),
         }
     }
 }
@@ -327,7 +387,7 @@ pub(crate) enum Event {
     CompactBoundary {
         summary: Message,
         replaced_count: usize,
-        loaded_tools_snapshot: HashSet<String>,
+        loaded_tools_snapshot: std::collections::BTreeSet<String>,
         checklist_snapshot: crate::checklist::ChecklistState,
         #[serde(flatten)]
         record: CompactionRecord,
@@ -343,7 +403,7 @@ pub(crate) enum Event {
         replaced_count: usize,
         messages: Vec<Message>,
     },
-    /// Replaces the images at `images` with [`IMAGE_REDACTION_PLACEHOLDER`], once, so the body
+    /// Replaces the images at `images` with a note ([`BUDGET_REDACTION_NOTE`]), once, so the body
     /// that fit the request budget is the body every later request sends and the cache prefix
     /// ahead of the newest turn stops moving. Redacting per request instead would move it on every
     /// send, since each request re-derives the set from scratch.
@@ -352,6 +412,9 @@ pub(crate) enum Event {
     /// `Agent::run_turn`, records it before appending the round's own messages, so the view it
     /// addresses is the view the request was built from.
     Redact { images: Vec<RedactedImage> },
+    /// A compaction that ended without replacing the window; see [`FailedCompaction`]. The view
+    /// is as it was.
+    CompactionFailed(FailedCompaction),
     /// Takes the thinking Claude checks out of every message the view holds at this point (see
     /// [`Message::without_claude_thinking`]), after Claude rejected a thinking block's signature:
     /// a rejected block fails every later request that carries it, wherever it sits. Recorded by
@@ -364,9 +427,236 @@ pub(crate) enum Event {
 
 pub(crate) use crate::image::RedactedImage;
 
-/// Placeholder text that replaces an image payload when the request body would otherwise exceed
-/// the ceiling.
-pub(crate) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit request size budget]";
+/// Meka's class of how a reply ended, the one the loop and every surface read: the provider's own
+/// word for it is [`Stop::word`], recorded beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum StopReason {
+    /// The model finished its reply.
+    EndTurn,
+    /// The model asked for tools.
+    ToolUse,
+    /// The reply reached the output limit and was cut there.
+    MaxTokens,
+    /// The reply reached the context window and was cut there.
+    ContextWindow,
+    /// The model, or its provider's classifier, declined the request.
+    Refusal,
+    /// The provider's content filter withheld the rest of the reply.
+    ContentFilter,
+    /// A stop the provider named that Meka has no class for; the loop treats it as an end.
+    Unknown,
+}
+
+impl StopReason {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [StopReason; 7] = [
+        Self::EndTurn,
+        Self::ToolUse,
+        Self::MaxTokens,
+        Self::ContextWindow,
+        Self::Refusal,
+        Self::ContentFilter,
+        Self::Unknown,
+    ];
+
+    /// The class's one spelling: the turn row, the stored reply record and every surface.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::ToolUse => "tool_use",
+            Self::MaxTokens => "max_tokens",
+            Self::ContextWindow => "context_window",
+            Self::Refusal => "refusal",
+            Self::ContentFilter => "content_filter",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for StopReason {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|reason| reason.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a stop reason. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for StopReason {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<StopReason> for String {
+    fn from(reason: StopReason) -> Self {
+        reason.name().to_string()
+    }
+}
+
+/// How a reply ended, as recorded: Meka's class of it, the word the provider said it with, and
+/// what the provider said about it beside the word, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Stop {
+    pub(crate) reason: StopReason,
+    /// The provider's own stop value as it sent it (Claude's `stop_reason`, Chat Completions'
+    /// `finish_reason`, the Responses `status`); absent when the reply stated none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) word: Option<String>,
+    /// What the provider said about the stop beside its word, under its own names: Claude's
+    /// `stop_details` and `stop_sequence`, the Responses `incomplete_details`, OpenRouter's
+    /// `native_finish_reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) details: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl Stop {
+    /// A stop of class `reason` with no word of the provider's beside it: one Meka decides, or a
+    /// test's.
+    pub(crate) fn of(reason: StopReason) -> Self {
+        Self {
+            reason,
+            word: None,
+            details: None,
+        }
+    }
+
+    /// `self`, classed a refusal when the reply carries the words the model declined in and
+    /// otherwise ended as an answer: OpenAI says so in a field of the reply, not in its stop.
+    pub(crate) fn with_refusal_of(mut self, content: &[ContentBlock]) -> Self {
+        let refused = content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Refusal { .. }));
+        if refused && self.reason == StopReason::EndTurn {
+            self.reason = StopReason::Refusal;
+        }
+        self
+    }
+}
+
+/// What a provider said about a reply beside its content, recorded with the reply's row: how it
+/// stopped or was cut, the model the response names, the profile that sent the request, and what
+/// the response reported spending. A fact about the row, as when it was said is, so a message stays
+/// what a wire maps from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReplyRecord {
+    /// How the reply ended, as the provider said; absent on one cut before it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stop: Option<Stop>,
+    /// What cut the reply short, on one that did not run to its stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cut: Option<ReplyCut>,
+    /// The model the response names; absent when it names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    /// The profile that sent the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
+    /// What the response reported spending, as Meka counts it; absent when it reported nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) usage: Option<crate::stats::TokenUsage>,
+    /// The response's fields nothing else holds, verbatim and in place: its id, the raw `usage`
+    /// Meka's counts are read from, a choice's `logprobs`, and whatever else the provider said
+    /// about the completion. Never what restates the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_fields: Option<ProviderFields>,
+}
+
+impl ReplyRecord {
+    /// How the reply ended when it did not end as an answer or a round of calls, as a reader of
+    /// the conversation labels it: `[cut: <cut>]` for one cut short, `[stop: <class>]` for another
+    /// stop.
+    pub(crate) fn unfinished_label(&self) -> Option<String> {
+        if let Some(cut) = self.cut {
+            return Some(format!("[cut: {cut}]"));
+        }
+        let reason = self.stop.as_ref()?.reason;
+        (!matches!(reason, StopReason::EndTurn | StopReason::ToolUse))
+            .then(|| format!("[stop: {reason}]"))
+    }
+}
+
+/// What cut a reply short before its provider said how it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum ReplyCut {
+    /// The turn was stopped.
+    Stopped,
+    /// An inbox interrupt cut the reply, and the turn went on.
+    Interrupted,
+    /// The stream failed.
+    Failed,
+}
+
+impl ReplyCut {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [ReplyCut; 3] = [Self::Stopped, Self::Interrupted, Self::Failed];
+
+    /// The value's one spelling.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for ReplyCut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ReplyCut {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|cut| cut.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a reply cut. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for ReplyCut {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ReplyCut> for String {
+    fn from(cut: ReplyCut) -> Self {
+        cut.name().to_string()
+    }
+}
 
 /// Characters a session title keeps on every wire before it is cut, and the most a user may set,
 /// so a surface that fits one fits the other; the screen's session picker, which lays the title
@@ -437,12 +727,11 @@ impl Conversation {
     /// Read from the log rather than the view, because a compaction replaces the view's first user
     /// message with its summary and a label that changed when the session was reopened would name
     /// nothing. The words are the first block of a user `Append` that carries a person's words by
-    /// [`ContentBlock::spoken_words`]: typed text that is not a stand-in Meka wrote
-    /// ([`is_harness_stand_in`]), an inbox item's body, a fire's prompt, an invocation's words or
-    /// name; a turn's context block carries none. The store's `title_of_first_user_row` selects the
-    /// same row in SQL. A log pruned by [`Self::prune_compacted_events`] starts at its last
-    /// boundary and no longer holds the first turn; every surface that labels a stored session
-    /// reads the store's rows, which do.
+    /// [`ContentBlock::spoken_words`]: typed text, an inbox item's body, a fire's prompt, an
+    /// invocation's words or name; a turn's context block and a note Meka wrote carry none. The
+    /// store's `title_of_first_user_row` selects the same row in SQL. A log pruned by
+    /// [`Self::prune_compacted_events`] starts at its last boundary and no longer holds the first
+    /// turn; every surface that labels a stored session reads the store's rows, which do.
     pub(crate) fn title(&self) -> String {
         self.title_within(TITLE_CHARS)
     }
@@ -563,8 +852,26 @@ impl Conversation {
     /// [`Event::Append`] says "the message on the end is one somebody appended", which a summary
     /// carried by a `CompactBoundary` is not. [`Self::pop_unsaved`] guards its own removal the same
     /// way and for the same reason.
+    ///
+    /// A reply cut short that the context keeps none of is recorded and taken back at once, an
+    /// `Append` of the model's and a repair of it to nothing, which leaves the opening standing as
+    /// it stood: such pairs at the end are looked past.
     pub(crate) fn ends_on_a_turn_opening(&self) -> bool {
-        matches!(self.events.last(), Some(Event::Append(_)))
+        let mut events = self.events.as_slice();
+        while let [
+            earlier @ ..,
+            Event::Append(reply),
+            Event::Repair {
+                replaced_count: 1,
+                messages,
+            },
+        ] = events
+            && reply.role == Role::Assistant
+            && messages.is_empty()
+        {
+            events = earlier;
+        }
+        matches!(events.last(), Some(Event::Append(_)))
             && self.materialized.last().is_some_and(opens_turn)
     }
 
@@ -573,16 +880,30 @@ impl Conversation {
         self.materialized.iter()
     }
 
-    /// Text content of the most recent `Role::Assistant` message, or `None` when no assistant
-    /// message exists. Walks backward, which is necessary because a turn that ended via tool-use
-    /// leaves a `Role::User` tool-result trailer in the conversation, hiding the assistant's
-    /// final text from a look at the last message alone.
+    /// The words of the most recent `Role::Assistant` message, its text and refusal blocks a blank
+    /// line apart, or `None` when there is no assistant message or it holds no words. Walks
+    /// backward, which is necessary because a turn that ended via tool-use leaves a `Role::User`
+    /// tool-result trailer in the conversation, hiding the assistant's final text from a look at
+    /// the last message alone.
     pub(crate) fn last_assistant_text(&self) -> Option<String> {
-        self.materialized
+        let reply = self
+            .materialized
             .iter()
             .rev()
-            .find(|message| matches!(message.role, crate::conversation::Role::Assistant))
-            .map(|message| message.text_content())
+            .find(|message| matches!(message.role, crate::conversation::Role::Assistant))?;
+        let words = reply
+            .shown_content()
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } | ContentBlock::Refusal { text, .. } => {
+                    Some(text.trim())
+                }
+                _ => None,
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!words.is_empty()).then_some(words)
     }
 
     /// Roll back an [`Conversation::append`] that did not reach the persistence layer. Used by
@@ -624,7 +945,7 @@ impl Conversation {
         &mut self,
         summary: Message,
         tail: Vec<Message>,
-        loaded_tools_snapshot: HashSet<String>,
+        loaded_tools_snapshot: std::collections::BTreeSet<String>,
         checklist_snapshot: crate::checklist::ChecklistState,
         record: CompactionRecord,
     ) {
@@ -684,7 +1005,7 @@ impl Conversation {
         event
     }
 
-    /// Record that a request budget redacted `images`, replacing each with the placeholder in the
+    /// Record that a request budget redacted `images`, replacing each with Meka's note in the
     /// view. Returns the event so the caller can persist it; see [`Event::Redact`] for why it is
     /// recorded rather than redone per request.
     pub(crate) fn redact_images(&mut self, images: Vec<RedactedImage>) -> Event {
@@ -1124,6 +1445,8 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
                     }
                 }
             }
+            // Changes nothing in the view, and stands between nothing a repair could rejoin.
+            Event::CompactionFailed(_) => taken = taken_back,
         }
     }
     Replayed {
@@ -1133,22 +1456,18 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> Replayed {
     }
 }
 
-/// Replace the image `image` names in `message` with the placeholder. A position that names
-/// something else is left alone: the event was recorded against a view this one may not be, and
-/// removing text on a stale address would be worse than keeping an image.
+/// Replace the image `image` names in `message` with [`BUDGET_REDACTION_NOTE`]. A position that
+/// names something else is left alone: the event was recorded against a view this one may not
+/// be, and removing text on a stale address would be worse than keeping an image.
 fn redact_image(message: &mut Message, image: &RedactedImage) {
-    let placeholder = || IMAGE_REDACTION_PLACEHOLDER.to_string();
+    let note = || BUDGET_REDACTION_NOTE.to_string();
     match (message.content.get_mut(image.block), image.item) {
         (Some(block @ ContentBlock::Image { .. }), None) => {
-            *block = ContentBlock::Text {
-                text: placeholder(),
-            };
+            *block = ContentBlock::HarnessNote { note: note() };
         }
         (Some(ContentBlock::ToolResult { content, .. }), Some(item)) => {
             if let Some(entry @ ToolResultContent::Image { .. }) = content.get_mut(item) {
-                *entry = ToolResultContent::Text {
-                    text: placeholder(),
-                };
+                *entry = ToolResultContent::HarnessNote { note: note() };
             }
         }
         _ => {}
@@ -1233,78 +1552,6 @@ pub(crate) fn rewinds<Stamp: Clone>(events: &[(Stamp, Event)]) -> Vec<Rewind<Sta
         .collect()
 }
 
-/// Prefix on every note Meka writes *into the conversation itself*, as opposed to onto the screen.
-///
-/// It answers one question the surrounding blocks cannot: who wrote this. A note replacing a tool
-/// result sits where the tool's own output would be, and one replacing an attachment sits in the
-/// user's message, so without a marker the model has to guess whether the tool said it, the user
-/// said it, or something between them did.
-///
-/// Names the harness in words rather than only by product, because a bare `[meka]` is legible only
-/// to a model that recalls what Meka is from the system prompt and infers the rest. `[system]`
-/// would read better still and is the wrong choice: nothing strips markers out of a tool result, so
-/// a fetched page or an MCP server's output can contain any string this does, and a marker models
-/// already obey on sight is the worst one to make load-bearing.
-pub(crate) const HARNESS_NOTE: &str = "[meka harness]";
-
-/// Whether `text` is something Meka put into a user message in place of the user's own content:
-/// the placeholder a redaction leaves or a harness note. Both are `Text` blocks, because that is
-/// the one shape every provider renders, so a reader after what the user typed has to ask.
-pub(crate) fn is_harness_stand_in(text: &str) -> bool {
-    text == IMAGE_REDACTION_PLACEHOLDER || text.starts_with(HARNESS_NOTE)
-}
-
-/// How the header Meka writes above an inbox item's body begins when the client named the sender:
-/// `[Message from <source>, arrived <time>]`, then a newline, then the body verbatim. Rendered by
-/// `prompt::render_inbox_item`; read back only by the migration that types an item recorded
-/// before [`ContentBlock::Inbox`] existed.
-pub(crate) const INBOX_HEADER_PREFIX: &str = "[Message from ";
-
-/// How the header begins when the client named nobody: `[Message arrived <time>]`. The name is
-/// left out rather than guessed, so the model is never told a sender nobody chose.
-pub(crate) const UNNAMED_INBOX_HEADER_PREFIX: &str = "[Message arrived ";
-
-/// How the message a compaction writes in place of the summarized turns begins. Read back by the
-/// next compaction, so a summary's own quotes are never quoted a second time.
-pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "[Conversation summary from session compaction]";
-/// The lines that open and close the section of a summary message where compaction copies the
-/// messages received as they were written. Markers rather than a shape to parse: what lies between
-/// them is a copy of rows the search index already holds, and indexing the copy would rank the
-/// summary above the message it quotes.
-pub(crate) const RETAINED_MESSAGES_HEADER: &str = "[Messages received, as written, oldest first]";
-/// The line that closes the section [`RETAINED_MESSAGES_HEADER`] opens.
-pub(crate) const RETAINED_MESSAGES_END: &str = "[End of messages received]";
-/// `text` with every retained-messages section cut out, markers included; `text` itself when it
-/// has none. A marker counts only at the start of a line: the section quotes every line of what it
-/// carries with `> `, so a marker inside a quoted message never sits there, and a summary that
-/// mentions one mid-sentence is left alone.
-pub(crate) fn without_retained_messages(text: &str) -> std::borrow::Cow<'_, str> {
-    let header = format!("\n{RETAINED_MESSAGES_HEADER}");
-    let end_marker = format!("\n{RETAINED_MESSAGES_END}");
-    let Some(first) = text.find(&header) else {
-        return std::borrow::Cow::Borrowed(text);
-    };
-    let mut stripped = String::with_capacity(text.len());
-    let mut rest = text;
-    let mut start = first;
-    loop {
-        let Some(end) = rest[start..].find(&end_marker) else {
-            stripped.push_str(rest);
-            break;
-        };
-        stripped.push_str(&rest[..start]);
-        rest = &rest[start + end + end_marker.len()..];
-        match rest.find(&header) {
-            Some(next) => start = next,
-            None => {
-                stripped.push_str(rest);
-                break;
-            }
-        }
-    }
-    std::borrow::Cow::Owned(stripped)
-}
-
 /// Replace every image whose bytes disagree with its declared `media_type` with a text note,
 /// returning how many were replaced.
 ///
@@ -1335,8 +1582,8 @@ fn repair_invalid_images(messages: &mut [Message]) -> usize {
     };
     let note = |source: &crate::image::ImageSource| {
         format!(
-            "{HARNESS_NOTE} An image here was removed: it is declared {} but the bytes are \
-             something else, which the provider refuses.",
+            "An image here was removed: it is declared {} but the bytes are something else, \
+             which the provider refuses.",
             source.media_type()
         )
     };
@@ -1347,7 +1594,7 @@ fn repair_invalid_images(messages: &mut [Message]) -> usize {
             match block {
                 ContentBlock::Image { source } if mismatched(source) => {
                     replaced += 1;
-                    *block = ContentBlock::Text { text: note(source) };
+                    *block = ContentBlock::HarnessNote { note: note(source) };
                 }
                 ContentBlock::ToolResult {
                     content, is_error, ..
@@ -1359,8 +1606,7 @@ fn repair_invalid_images(messages: &mut [Message]) -> usize {
                         {
                             replaced += 1;
                             touched = true;
-                            *item =
-                                crate::conversation::ToolResultContent::Text { text: note(source) };
+                            *item = ToolResultContent::HarnessNote { note: note(source) };
                         }
                     }
                     if touched {
@@ -1502,6 +1748,27 @@ pub(crate) enum ToolResultContent {
     /// appends never records one. Everywhere a reader wants text, it reads as the name.
     ToolReference {
         tool_name: String,
+    },
+    /// Words Meka wrote into a result for the model: a call made without loading its tool's
+    /// schema, or what a refused request took out of the result. `note` is the sentence alone;
+    /// each wire renders it behind Meka's label, so a reader tells Meka's words from the tool's by
+    /// the item rather than by the label.
+    HarnessNote {
+        note: String,
+    },
+    /// The line a tool writes ahead of an image it returns, naming where the image came from (a
+    /// file read, a page fetched, a render). Its own item rather than a field of the image, so it
+    /// stands wherever the image is redacted, repaired or stripped, and a surface that counts the
+    /// images leaves it out by its type.
+    ImageCaption {
+        caption: String,
+    },
+    /// A result too large to keep inline, saved whole to the scratchpad entry it names: the model
+    /// reads where the output went, how large it is and its opening; a surface shows the opening.
+    LargeOutput {
+        scratchpad_entry: String,
+        size_bytes: usize,
+        preview: String,
     },
 }
 /// The most text a tool result keeps inline: a text block larger than this is persisted to the
@@ -1754,11 +2021,11 @@ impl Change {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum OpaqueReasoning {
-    /// Anthropic. The reasoning is in the block's `thinking` text; this authenticates it, and the
-    /// API wants both back together.
+    /// Anthropic. The reasoning is in the block's parts; this authenticates it, and the API wants
+    /// both back together.
     Signed { signature: String },
-    /// The Responses API. This *is* the reasoning, sealed, and the block's `thinking` holds only
-    /// the summary the server chose to show. Replayed under `id` when the server issued one.
+    /// The Responses API. This *is* the reasoning, sealed, and the block's parts hold only the
+    /// summary the server chose to show. Replayed under `id` when the server issued one.
     Sealed {
         encrypted_content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1770,9 +2037,7 @@ pub(crate) enum OpaqueReasoning {
         #[serde(deserialize_with = "Option::deserialize")]
         origin: Option<String>,
     },
-    /// Chat Completions. The reasoning is the block's `thinking` text, and that text is what goes
-    /// back, as the `reasoning_content` of its assistant message: DeepSeek's thinking mode
-    /// rejects a request with tools that omits it, and the other endpoints accept or ignore it.
+    /// Chat Completions. The reasoning is the block's parts, and nothing else goes back with it.
     Verbatim,
 }
 /// Why the loop wrote a nudge: the reply it answers had no visible text, or left checklist items
@@ -1970,13 +2235,13 @@ impl InvocationKind {
 
 /// A user message's words with each resource an editor attached among them shown as its mention,
 /// `@name`, in the words' block: an editor sends the words around a mention as blocks of their
-/// own, and drawn apart they would read as separate prompts. A stand-in Meka wrote stays a block
-/// of its own, as it is drawn without resources.
+/// own, and drawn apart they would read as separate prompts. A note Meka wrote stays a block of its
+/// own, as it is drawn without resources.
 pub(crate) fn mentions_inline(content: &[ContentBlock]) -> Vec<ContentBlock> {
     let mut joined: Vec<ContentBlock> = Vec::new();
     for block in content {
         let piece = match block {
-            ContentBlock::Text { text } if !is_harness_stand_in(text) => text.clone(),
+            ContentBlock::Text { text, .. } => text.clone(),
             ContentBlock::Resource { name, .. } => format!("@{name}"),
             other => {
                 joined.push(other.clone());
@@ -1984,10 +2249,13 @@ pub(crate) fn mentions_inline(content: &[ContentBlock]) -> Vec<ContentBlock> {
             }
         };
         match joined.last_mut() {
-            Some(ContentBlock::Text { text }) if !is_harness_stand_in(text) => {
+            Some(ContentBlock::Text { text, .. }) => {
                 text.push_str(&piece);
             }
-            _ => joined.push(ContentBlock::Text { text: piece }),
+            _ => joined.push(ContentBlock::Text {
+                text: piece,
+                provider_fields: None,
+            }),
         }
     }
     joined
@@ -2007,29 +2275,80 @@ impl From<InvocationKind> for String {
     }
 }
 
+/// The fields a provider put on a part of a reply beyond those Meka reads, verbatim.
+pub(crate) type ProviderFields = serde_json::Map<String, serde_json::Value>;
+
+/// What a model sent as a call's arguments when Meka could not read it as a JSON object.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct UnparsedArguments {
+    /// The argument text exactly as the model sent it. Absent on a call recorded before the text
+    /// was kept, which recorded the error alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) text: Option<String>,
+    /// Why the text is not arguments, in the words the call was refused with.
+    pub(crate) error: String,
+}
+
+/// A call's arguments as the text the OpenAI wires send, whose spec defines them as the string the
+/// model generated: what the model sent when Meka could not read it, else the arguments
+/// serialized.
+pub(crate) fn call_arguments_text(
+    input: &serde_json::Value,
+    unparsed: Option<&UnparsedArguments>,
+) -> String {
+    match unparsed.and_then(|unparsed| unparsed.text.as_deref()) {
+        Some(text) => text.to_string(),
+        None => input.to_string(),
+    }
+}
+
 /// One block of a message, in the shape the session store persists and every provider maps from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ContentBlock {
     Text {
         text: String,
+        /// The part's fields nothing else holds, verbatim: what Meka records of a reply as it
+        /// came, and sends back where the wire's spec defines a field (a Responses message's
+        /// `phase`). Every block that stands for a provider's part carries the same.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_fields: Option<ProviderFields>,
     },
+    /// Words a model returned in the field its provider keeps for declining (OpenAI's `refusal`),
+    /// rather than as its answer. Its own block because the provider typed it: the OpenAI wires
+    /// send it back in that field, the others as text.
+    Refusal {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_fields: Option<ProviderFields>,
+    },
+    /// What a provider returned that Meka reads no block from, verbatim and in the order it
+    /// arrived: an output item of a type Meka does not know, or a reply in a shape its protocol
+    /// does not define. Recorded so nothing a model returned is lost; never sent back.
+    Unrecognized { parts: Vec<serde_json::Value> },
     /// Words Meka wrote into the model's own turn in the user's role: the nudge after a reply
     /// that stopped too soon. Its own block, so a nudge is known by its shape rather than its
     /// words, every provider renders it as text, every reader that shows what a person said can
     /// skip it, and an inbox item that arrives while the nudged round runs can ride behind it as a
     /// `Text` block and still be the person's. A user message carries zero or one of these, first.
-    Nudge {
-        kind: NudgeKind,
-        text: String,
-    },
+    Nudge { kind: NudgeKind, text: String },
+    /// Words Meka wrote into a user message in place of what it removed: an image the provider
+    /// rejected, an image whose bytes disagree with their declared type, an image the request
+    /// budget could not carry. `note` is the sentence alone; every wire renders it behind Meka's
+    /// label, so a reader tells it from the person's words by the block, and a stand-in the replay
+    /// recomputes equals the copy a log holds.
+    HarnessNote { note: String },
+    /// The message a compaction puts in place of the turns it summarized, as the model reads it:
+    /// the summary under its heading, the messages it quotes, the request in progress, the
+    /// checklist, the context after the compaction and the direction to carry on. Its own block,
+    /// so the next compaction and every reader of a person's words pass it over by its type; the
+    /// summary as it was written is the boundary's record, which search reads.
+    Summary { text: String },
     /// What Meka injected ahead of the user's words for this turn: the permission and environment
     /// context, world state, budget, background outcomes and the resume notice. Its own
     /// block, so every reader that shows what the user typed can skip it, and every provider
     /// renders it as text ahead of the words. A user message carries zero or one of these, first.
-    TurnContext {
-        text: String,
-    },
+    TurnContext { text: String },
     /// An inbox item as the model read it: `text` is the header Meka wrote with the person's
     /// words under it, `body` the words alone. Its own block, so every reader shows the words as
     /// the person's, labeled by `class` and `source` rather than read back from the header, and a
@@ -2057,10 +2376,7 @@ pub(crate) enum ContentBlock {
     /// Finished background work as the model read it, the tasks `task_ids` name. Its own block, so
     /// a reader tells it from the person's words and a replay says which tasks reported, as the
     /// live screen did.
-    BackgroundReport {
-        task_ids: Vec<String>,
-        text: String,
-    },
+    BackgroundReport { task_ids: Vec<String>, text: String },
     /// A skill or an MCP prompt somebody invoked by name, as the model read it: `text` is what the
     /// invocation expanded to, behind the words typed with it for a skill (an MCP prompt renders
     /// its arguments itself), and `directive` those words alone, a file an editor attached among
@@ -2085,19 +2401,19 @@ pub(crate) enum ContentBlock {
     /// Image supplied as *input* (e.g. an ACP client's @-mention or pasted screenshot). Distinct
     /// from a tool result's image, which travels inside [`ContentBlock::ToolResult`] as a
     /// [`ToolResultContent::Image`].
-    Image {
-        source: ImageSource,
-    },
+    Image { source: ImageSource },
     Thinking {
-        /// The readable half, and only the readable half. How much of the reasoning it is depends
-        /// on `opaque`: under [`OpaqueReasoning::Signed`] and [`OpaqueReasoning::Verbatim`] this
-        /// is the reasoning, under [`OpaqueReasoning::Sealed`] it is a summary of reasoning kept
-        /// elsewhere.
-        thinking: String,
+        /// The readable half, and only the readable half, in the parts the provider returned it
+        /// in: one part of reasoning on Claude's wire and DeepSeek's, the summary and reasoning
+        /// parts of a Responses item as the item held them. Read as one text through
+        /// [`reasoning_text`].
+        parts: Vec<ReasoningPart>,
         /// What the provider wants handed back to carry this reasoning into the next request.
         /// `None` when it gave nothing to carry, which makes the block display-only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         opaque: Option<OpaqueReasoning>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_fields: Option<ProviderFields>,
     },
     /// Encrypted reasoning the API declines to return in the clear (the `redact-thinking` beta).
     /// `data` is opaque: it cannot be read, only replayed verbatim on later turns so the model can
@@ -2105,11 +2421,23 @@ pub(crate) enum ContentBlock {
     /// text, which carries a `signature` instead of `data`.
     RedactedThinking {
         data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_fields: Option<ProviderFields>,
     },
     ToolUse {
         id: String,
         name: String,
+        /// The arguments, an object; `{}` when `unparsed` holds what the model sent instead.
         input: serde_json::Value,
+        /// What the model sent as the arguments when it was not a JSON object, and why it could
+        /// not be read. The call is refused, so it never runs on arguments it did not give.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unparsed: Option<UnparsedArguments>,
+        /// Every field the provider put on the call beyond its id, name and arguments, verbatim
+        /// (Gemini's `extra_content` on Chat Completions): recorded as the call came, sent back
+        /// where an extension Meka supports defines it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_fields: Option<ProviderFields>,
     },
     ToolResult {
         tool_use_id: String,
@@ -2126,10 +2454,27 @@ impl ContentBlock {
     /// to replay. One rule for the streamed fold and the whole-reply parser, so a resumed
     /// transcript never differs from the live turn by a block one of them kept.
     pub(crate) fn replayable_thinking(
-        thinking: String,
+        parts: Vec<ReasoningPart>,
         opaque: Option<OpaqueReasoning>,
+        provider_fields: Option<ProviderFields>,
     ) -> Option<Self> {
-        (!thinking.is_empty() || opaque.is_some()).then_some(Self::Thinking { thinking, opaque })
+        // Every part as returned, an empty one included; a block of empty parts and nothing to
+        // carry back holds nothing.
+        let worded = parts.iter().any(|part| !part.text.is_empty());
+        (worded || opaque.is_some()).then_some(Self::Thinking {
+            parts,
+            opaque,
+            provider_fields,
+        })
+    }
+
+    /// A thinking block of one part of reasoning, `text`.
+    pub(crate) fn reasoning(text: impl Into<String>, opaque: Option<OpaqueReasoning>) -> Self {
+        Self::Thinking {
+            parts: vec![ReasoningPart::reasoning(text)],
+            opaque,
+            provider_fields: None,
+        }
     }
 
     /// The block as one searchable string, labeled by what it is where it is not plain text, or
@@ -2139,19 +2484,25 @@ impl ContentBlock {
     /// words alone, by [`Self::spoken_words`].
     pub(crate) fn search_text(&self) -> Option<String> {
         match self {
-            ContentBlock::Text { text }
+            ContentBlock::Text { text, .. }
             | ContentBlock::Inbox { text, .. }
             | ContentBlock::Scheduled { text, .. }
             | ContentBlock::BackgroundReport { text, .. }
+            | ContentBlock::Summary { text }
             | ContentBlock::Resource { text, .. } => Some(text.clone()),
             ContentBlock::Invocation {
                 kind, name, text, ..
             } => Some(format!("[{kind}: {name}] {text}")),
             ContentBlock::TurnContext { .. }
             | ContentBlock::Nudge { .. }
+            | ContentBlock::HarnessNote { .. }
             | ContentBlock::Image { .. } => None,
-            ContentBlock::Thinking { thinking, .. } => Some(format!("[thinking] {thinking}")),
+            ContentBlock::Refusal { text, .. } => Some(format!("[refusal] {text}")),
+            ContentBlock::Thinking { parts, .. } => {
+                Some(format!("[thinking] {}", reasoning_text(parts)))
+            }
             ContentBlock::RedactedThinking { .. } => Some("[redacted thinking]".to_string()),
+            ContentBlock::Unrecognized { .. } => None,
             ContentBlock::ToolUse { name, input, .. } => {
                 Some(format!("[tool call: {name}] {input}"))
             }
@@ -2179,7 +2530,7 @@ impl ContentBlock {
     /// that holds no words.
     pub(crate) fn spoken_words(&self) -> Option<&str> {
         match self {
-            ContentBlock::Text { text } if !is_harness_stand_in(text) => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
             ContentBlock::Inbox { body, .. } => Some(body.as_str()),
             ContentBlock::Scheduled { prompt, .. } => Some(prompt.as_str()),
             ContentBlock::Invocation {
@@ -2193,24 +2544,249 @@ impl ContentBlock {
         }
     }
 
-    /// Extract the text content of a ToolResult (for display/logging).
-    pub(crate) fn tool_result_text_content(content: &[ToolResultContent]) -> String {
-        content
-            .iter()
-            .map(|block| match block {
-                ToolResultContent::Text { text } => text.as_str(),
-                ToolResultContent::Image { .. } => "[Image]",
-                ToolResultContent::ToolReference { tool_name } => tool_name.as_str(),
-            })
-            .collect::<Vec<_>>()
-            .join("")
+    /// The block as the text a wire sends for it, for every block a wire sends as text: the words,
+    /// what Meka wrote beside them (a note behind its label), and what arrived for the model.
+    /// `None` for a block that is not text on the wire: an image, reasoning, a call or a result.
+    /// The one definition every encoder renders a user message's text from, so a new kind of block
+    /// cannot reach one wire and miss another.
+    pub(crate) fn model_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        match self {
+            ContentBlock::Text { text, .. }
+            | ContentBlock::TurnContext { text }
+            | ContentBlock::Nudge { text, .. }
+            | ContentBlock::Summary { text }
+            | ContentBlock::Inbox { text, .. }
+            | ContentBlock::Scheduled { text, .. }
+            | ContentBlock::BackgroundReport { text, .. }
+            | ContentBlock::Invocation { text, .. }
+            | ContentBlock::Resource { text, .. }
+            | ContentBlock::Refusal { text, .. } => Some(Cow::Borrowed(text)),
+            ContentBlock::HarnessNote { note } => Some(Cow::Owned(harness_note_text(note))),
+            ContentBlock::Image { .. }
+            | ContentBlock::Unrecognized { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. } => None,
+        }
     }
+
+    /// A tool result as one string, for a wire that takes a result as text and for a reader that
+    /// wants its words: each item as [`ToolResultContent::wire_part`] renders it, an image as
+    /// `[Image]`, a note set apart from what comes before it by a blank line.
+    pub(crate) fn tool_result_text_content(content: &[ToolResultContent]) -> String {
+        let mut joined = String::new();
+        for item in content {
+            if matches!(item, ToolResultContent::HarnessNote { .. }) && !joined.is_empty() {
+                joined.push_str("\n\n");
+            }
+            match item.wire_part() {
+                ResultPart::Text(text) => joined.push_str(&text),
+                ResultPart::Image(_) => joined.push_str("[Image]"),
+                ResultPart::ToolReference(tool_name) => joined.push_str(tool_name),
+            }
+        }
+        joined
+    }
+}
+
+/// One part of a thinking block, as its provider returned it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReasoningPart {
+    pub(crate) kind: ReasoningKind,
+    pub(crate) text: String,
+}
+
+impl ReasoningPart {
+    /// A part of reasoning itself.
+    pub(crate) fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            kind: ReasoningKind::Reasoning,
+            text: text.into(),
+        }
+    }
+
+    /// A part of a summary the provider wrote of reasoning it keeps.
+    #[cfg(test)]
+    pub(crate) fn summary(text: impl Into<String>) -> Self {
+        Self {
+            kind: ReasoningKind::Summary,
+            text: text.into(),
+        }
+    }
+}
+
+/// What a part of a thinking block is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum ReasoningKind {
+    /// The reasoning itself.
+    Reasoning,
+    /// A summary the provider wrote of reasoning it keeps.
+    Summary,
+}
+
+impl ReasoningKind {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [ReasoningKind; 2] = [Self::Reasoning, Self::Summary];
+
+    /// The value's one spelling.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Reasoning => "reasoning",
+            Self::Summary => "summary",
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ReasoningKind {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a reasoning part. Supported: {}",
+                    Self::ALL.map(Self::name).join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for ReasoningKind {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ReasoningKind> for String {
+    fn from(kind: ReasoningKind) -> Self {
+        kind.name().to_string()
+    }
+}
+
+/// A thinking block's parts as one text for a reader, a blank line between parts: the one join
+/// every surface that shows or searches reasoning reads it through. Nothing sends it.
+pub(crate) fn reasoning_text(parts: &[ReasoningPart]) -> String {
+    parts
+        .iter()
+        .map(|part| part.text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The parts' text with nothing between them, as a wire that streamed them into one field sent
+/// them: what goes back in that field.
+pub(crate) fn reasoning_as_streamed(parts: &[ReasoningPart]) -> String {
+    parts.iter().map(|part| part.text.as_str()).collect()
+}
+
+/// How Meka marks its own words to the model wherever they sit beside someone else's: in a user
+/// message, where the model would otherwise take them for the person's, and in a tool result,
+/// where it would take them for the tool's. Rendered ahead of a [`ContentBlock::HarnessNote`] or
+/// a [`ToolResultContent::HarnessNote`] at every wire, and read back nowhere.
+///
+/// Names the harness in words rather than only by product, because a bare `[Meka]` is legible
+/// only to a model that recalls what Meka is from the system prompt. `[system]` would read better
+/// still and is the wrong choice: nothing strips markers out of a tool result, so a fetched page
+/// or an MCP server's output can contain any string this does, and a marker models already obey
+/// on sight is the worst one to make load-bearing.
+const HARNESS_LABEL: &str = "[Meka harness]";
+
+/// A harness note as the model reads it: the sentence behind Meka's label.
+pub(crate) fn harness_note_text(note: &str) -> String {
+    format!("{HARNESS_LABEL} {note}")
+}
+
+/// `text` made safe to put inside a harness note: a provider's rejection quoted in one may not
+/// forge the label, since the label is what tells the model the sentence around it is Meka's.
+///
+/// Two steps, because neither is enough alone: [`crate::text::sanitize_text`] strips control
+/// characters and bidi overrides but keeps `\n`, so a body with a newline and then the label passes
+/// through it intact. This needs no hostile gateway: a provider echoing the request body back
+/// reproduces every note the conversation carries.
+pub(crate) fn scrub_for_harness_note(text: &str) -> String {
+    crate::text::sanitize_text(text).replace(HARNESS_LABEL, "[removed]")
+}
+
+/// The note that stands where the request budget took an image out, so the body that fit is the
+/// body every later request sends.
+pub(crate) const BUDGET_REDACTION_NOTE: &str =
+    "An image here was removed to fit the request size budget.";
+
+/// One item of a tool result as a wire sends it. Meka's own items (a note, a caption, a large
+/// output) are text here, each rendered by the one function that owns its shape.
+pub(crate) enum ResultPart<'a> {
+    Text(std::borrow::Cow<'a, str>),
+    Image(&'a ImageSource),
+    ToolReference(&'a str),
+}
+
+impl ToolResultContent {
+    /// The item as a wire sends it.
+    pub(crate) fn wire_part(&self) -> ResultPart<'_> {
+        use std::borrow::Cow;
+        match self {
+            Self::Text { text } => ResultPart::Text(Cow::Borrowed(text)),
+            Self::Image { source } => ResultPart::Image(source),
+            Self::ToolReference { tool_name } => ResultPart::ToolReference(tool_name),
+            Self::HarnessNote { note } => ResultPart::Text(Cow::Owned(harness_note_text(note))),
+            Self::ImageCaption { caption } => ResultPart::Text(Cow::Owned(format!("[{caption}]"))),
+            Self::LargeOutput {
+                scratchpad_entry,
+                size_bytes,
+                preview,
+            } => ResultPart::Text(Cow::Owned(large_output_text(
+                scratchpad_entry,
+                *size_bytes,
+                preview,
+            ))),
+        }
+    }
+}
+
+/// A [`ToolResultContent::LargeOutput`] as the model reads it: where the output went, its size,
+/// how to read it, and its opening, with `...` when the opening stops short of the whole.
+fn large_output_text(scratchpad_entry: &str, size_bytes: usize, preview: &str) -> String {
+    let mut text = format!(
+        "<large-output name=\"{scratchpad_entry}\" size=\"{size_bytes}\">\n\
+         Output too large ({}). Read it with `scratchpad_read`: a read returns as much as fits in \
+         the context window and says where to continue; `start` and `end` name a line range.\n\n\
+         Preview (first {} bytes):\n\
+         {preview}",
+        crate::text::format_size(size_bytes),
+        preview.len(),
+    );
+    if preview.len() < size_bytes {
+        text.push_str("\n...");
+    }
+    text.push_str("\n</large-output>");
+    text
 }
 /// One message of the conversation: who sent it and what it carries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Message {
     pub(crate) role: Role,
     pub(crate) content: Vec<ContentBlock>,
+    /// The fields a provider put on the message itself that nothing else holds, verbatim: a Chat
+    /// Completions message's `reasoning_details`, `annotations` or `audio`. A wire whose message
+    /// is its response, or whose parts are its output, has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_fields: Option<ProviderFields>,
 }
 impl Message {
     /// Whether this message is the envelope of a tool round's results, the user-role message that
@@ -2249,6 +2825,7 @@ impl Message {
                 kind,
                 text: text.into(),
             }],
+            provider_fields: None,
         }
     }
 
@@ -2271,7 +2848,11 @@ impl Message {
     pub(crate) fn user(text: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                provider_fields: None,
+            }],
+            provider_fields: None,
         }
     }
 
@@ -2284,7 +2865,10 @@ impl Message {
         images: Vec<ImageSource>,
     ) -> Self {
         let words = words.into();
-        let spoken = (!words.is_empty()).then_some(ContentBlock::Text { text: words });
+        let spoken = (!words.is_empty()).then_some(ContentBlock::Text {
+            text: words,
+            provider_fields: None,
+        });
         Self::turn_opening(context, spoken.into_iter().collect(), images)
     }
 
@@ -2309,7 +2893,82 @@ impl Message {
         Self {
             role: Role::User,
             content,
+            provider_fields: None,
         }
+    }
+
+    /// A conversation holding every kind of content Meka writes into one, for a wire's tests: a
+    /// compaction's summary, a note beside a person's words, a call whose arguments were not an
+    /// object, and a result carrying the tool's text, an appended note, a caption and a large
+    /// output's reference.
+    #[cfg(test)]
+    pub(crate) fn typed_content_for_test() -> Vec<Self> {
+        vec![
+            Self {
+                role: Role::User,
+                content: vec![ContentBlock::Summary {
+                    text: "[Conversation summary from session compaction]\n\nthe summary"
+                        .to_string(),
+                }],
+                provider_fields: None,
+            },
+            Self {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::TurnContext {
+                        text: "<context/>".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "the words".to_string(),
+                        provider_fields: None,
+                    },
+                    ContentBlock::HarnessNote {
+                        note: "the note".to_string(),
+                    },
+                ],
+                provider_fields: None,
+            },
+            Self {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "file_read".to_string(),
+                    input: serde_json::json!({}),
+                    unparsed: Some(UnparsedArguments {
+                        text: Some("{\"path\": ".to_string()),
+                        error: "invalid JSON arguments: EOF while parsing".to_string(),
+                    }),
+                    provider_fields: None,
+                }],
+                provider_fields: None,
+            },
+            Self {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![
+                        ToolResultContent::Text {
+                            text: "the output".to_string(),
+                        },
+                        ToolResultContent::HarnessNote {
+                            note: "the schema note".to_string(),
+                        },
+                        ToolResultContent::ImageCaption {
+                            caption: "Image: a.png".to_string(),
+                        },
+                        ToolResultContent::LargeOutput {
+                            scratchpad_entry: "the_entry".to_string(),
+                            size_bytes: 40_000,
+                            preview: "the opening".to_string(),
+                        },
+                    ],
+                    is_error: true,
+                    display: None,
+                }],
+                provider_fields: None,
+            },
+            Self::assistant_text("the answer"),
+        ]
     }
 
     /// An opening as an editor's `/review the parser` with a file attached among words sends it:
@@ -2330,6 +2989,7 @@ impl Message {
                 },
                 ContentBlock::Text {
                     text: "compare ".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::Resource {
                     uri: "file:///a.rs".to_string(),
@@ -2338,8 +2998,10 @@ impl Message {
                 },
                 ContentBlock::Text {
                     text: " with the old one".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         }
     }
 
@@ -2347,7 +3009,10 @@ impl Message {
     /// yields the same shape as [`Message::user`].
     #[cfg(test)]
     pub(crate) fn user_with_images(text: impl Into<String>, images: Vec<ImageSource>) -> Self {
-        let mut content = vec![ContentBlock::Text { text: text.into() }];
+        let mut content = vec![ContentBlock::Text {
+            text: text.into(),
+            provider_fields: None,
+        }];
         content.extend(
             images
                 .into_iter()
@@ -2356,6 +3021,7 @@ impl Message {
         Self {
             role: Role::User,
             content,
+            provider_fields: None,
         }
     }
 
@@ -2363,7 +3029,11 @@ impl Message {
     pub(crate) fn assistant_text(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                provider_fields: None,
+            }],
+            provider_fields: None,
         }
     }
 
@@ -2373,23 +3043,91 @@ impl Message {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("")
     }
 
-    /// The `Text` blocks as paragraphs, a blank line between them. A user message's second `Text`
-    /// block is a stand-in Meka put where an attachment was, and glued to the words it would read
-    /// as part of them. For the wires that take a user message as one string and for the Markdown
-    /// export; assistant text keeps [`Self::text_content`]'s join, since its blocks are one answer
-    /// split around tool calls.
+    /// The message's blocks as a reader shows them: in a reply, adjacent `Text` blocks are one run
+    /// of words joined with nothing, as they streamed, because a wire splits one answer into blocks
+    /// for reasons of its own (a citation, an output item) and the split is no paragraph. Every
+    /// other block, and every block of a message that is not a reply, is as recorded.
+    pub(crate) fn shown_content(&self) -> std::borrow::Cow<'_, [ContentBlock]> {
+        let is_text = |block: &ContentBlock| matches!(block, ContentBlock::Text { .. });
+        if self.role != Role::Assistant
+            || !self.content.windows(2).any(|pair| pair.iter().all(is_text))
+        {
+            return std::borrow::Cow::Borrowed(&self.content);
+        }
+        let mut shown: Vec<ContentBlock> = Vec::with_capacity(self.content.len());
+        for block in &self.content {
+            match (shown.last_mut(), block) {
+                (Some(ContentBlock::Text { text: run, .. }), ContentBlock::Text { text, .. }) => {
+                    run.push_str(text)
+                }
+                (_, ContentBlock::Text { text, .. }) => shown.push(ContentBlock::Text {
+                    text: text.clone(),
+                    provider_fields: None,
+                }),
+                (_, block) => shown.push(block.clone()),
+            }
+        }
+        std::borrow::Cow::Owned(shown)
+    }
+
+    /// Whether the message holds words for a reader: text or a refusal that is not blank.
+    pub(crate) fn has_visible_text(&self) -> bool {
+        self.content.iter().any(|block| match block {
+            ContentBlock::Text { text, .. } | ContentBlock::Refusal { text, .. } => {
+                !crate::text::is_blank(text)
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether this is a reply that answers nothing: no words to read and no call. Its reasoning,
+    /// when it has any, is not an answer.
+    pub(crate) fn holds_no_answer(&self) -> bool {
+        self.role == Role::Assistant
+            && !self.has_visible_text()
+            && !self
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+    }
+
+    /// The words a reply that ended as a refusal declined in: the refusal it returned, else the
+    /// text it wrote before the stop, the blocks a blank line apart. `None` when it wrote nothing.
+    pub(crate) fn refusal_words(&self) -> Option<String> {
+        let content = self.shown_content();
+        let words = |refusal: bool| {
+            content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Refusal { text, .. } if refusal => Some(text.trim()),
+                    ContentBlock::Text { text, .. } if !refusal => Some(text.trim()),
+                    _ => None,
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        [words(true), words(false)]
+            .into_iter()
+            .find(|words| !words.is_empty())
+    }
+
+    /// The words a user message sent as the model read them, a blank line between blocks: typed
+    /// text, inbox items, fires, invocations and resources, without the context block, a nudge,
+    /// a report or a note Meka wrote beside them. Assistant text keeps [`Self::text_content`]'s
+    /// join, since its blocks are one answer split around tool calls.
     pub(crate) fn text_paragraphs(&self) -> String {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text }
+                ContentBlock::Text { text, .. }
                 | ContentBlock::Inbox { text, .. }
                 | ContentBlock::Scheduled { text, .. }
                 | ContentBlock::Invocation { text, .. }
@@ -2408,7 +3146,7 @@ impl Message {
         mentions_inline(&self.content)
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text }
+                ContentBlock::Text { text, .. }
                 | ContentBlock::Inbox { text, .. }
                 | ContentBlock::Scheduled { text, .. } => Some(text.clone()),
                 ContentBlock::Invocation {
@@ -2433,17 +3171,7 @@ impl Message {
     pub(crate) fn wire_text(&self) -> String {
         self.content
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text }
-                | ContentBlock::TurnContext { text }
-                | ContentBlock::Nudge { text, .. }
-                | ContentBlock::Inbox { text, .. }
-                | ContentBlock::Scheduled { text, .. }
-                | ContentBlock::BackgroundReport { text, .. }
-                | ContentBlock::Invocation { text, .. }
-                | ContentBlock::Resource { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
+            .filter_map(ContentBlock::model_text)
             .collect::<Vec<_>>()
             .join("\n\n")
     }
@@ -2460,6 +3188,7 @@ impl Message {
                 .filter(|block| !matches!(block, ContentBlock::ToolUse { .. }))
                 .cloned()
                 .collect(),
+            provider_fields: self.provider_fields.clone(),
         }
     }
 
@@ -2490,9 +3219,12 @@ impl Message {
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Thinking {
-                    thinking,
+                    parts,
                     opaque: Some(OpaqueReasoning::Signed { .. }),
-                } => ContentBlock::replayable_thinking(thinking.clone(), None),
+                    provider_fields,
+                } => {
+                    ContentBlock::replayable_thinking(parts.clone(), None, provider_fields.clone())
+                }
                 ContentBlock::RedactedThinking { .. } => None,
                 other => Some(other.clone()),
             })
@@ -2500,6 +3232,7 @@ impl Message {
         Some(Message {
             role: self.role,
             content,
+            provider_fields: self.provider_fields.clone(),
         })
     }
 
@@ -2597,10 +3330,10 @@ impl From<PromptRetention> for String {
     }
 }
 /// The whole event log as the Markdown `meka session export` writes, compactions and repairs
-/// marked in place.
-pub(crate) fn format_session_as_markdown(
+/// marked in place, each event with what its provider said about the reply it appends.
+pub(crate) fn format_session_as_markdown<'a>(
     session_id: uuid::Uuid,
-    events: &[Event],
+    events: impl IntoIterator<Item = (&'a Event, Option<&'a ReplyRecord>)>,
     scratchpad_entries: &std::collections::HashMap<String, String>,
 ) -> String {
     use std::fmt::Write;
@@ -2611,10 +3344,13 @@ pub(crate) fn format_session_as_markdown(
     // Walk the log as history so the full conversation is exported, including turns a compaction
     // later hid from the model. Each `CompactBoundary` becomes a marker; the turns it summarized
     // stay above it, and the turns it kept are said once, above it, where they were first said.
-    for event in events {
+    for (event, reply) in events {
         match event {
             Event::Append(message) => {
                 write_message_markdown(&mut output, message, scratchpad_entries);
+                if let Some(label) = reply.and_then(ReplyRecord::unfinished_label) {
+                    writeln!(output, "*{label}*\n").ok();
+                }
             }
             Event::CompactBoundary {
                 summary, record, ..
@@ -2628,7 +3364,7 @@ pub(crate) fn format_session_as_markdown(
                     record.note()
                 )
                 .ok();
-                writeln!(output, "{}\n", summary.text_content()).ok();
+                writeln!(output, "{}\n", summary.wire_text()).ok();
                 writeln!(output, "</details>\n").ok();
             }
             Event::Redact { images } => {
@@ -2675,6 +3411,20 @@ pub(crate) fn format_session_as_markdown(
                 )
                 .ok();
             }
+            Event::CompactionFailed(failure) => {
+                match &failure.error {
+                    Some(error) => writeln!(output, "*Compaction failed: {error}*\n").ok(),
+                    None => writeln!(output, "*Compaction stopped.*\n").ok(),
+                };
+                if !failure.memories_written.is_empty() {
+                    writeln!(
+                        output,
+                        "*Its checkpoint saved: {}.*\n",
+                        failure.memories_written.join(", ")
+                    )
+                    .ok();
+                }
+            }
         }
     }
 
@@ -2695,7 +3445,10 @@ pub(crate) fn write_message_markdown(
             // person's, under its own heading after what it rode; a background report is Meka's,
             // under Meka's heading wherever it sits.
             let mut reports = message.content.iter().filter_map(|block| match block {
-                crate::conversation::ContentBlock::BackgroundReport { text, .. } => Some(text),
+                crate::conversation::ContentBlock::BackgroundReport { text, .. } => {
+                    Some(text.as_str())
+                }
+                crate::conversation::ContentBlock::HarnessNote { note } => Some(note.as_str()),
                 _ => None,
             });
             let opens_a_turn = message.opens_turn();
@@ -2715,9 +3468,22 @@ pub(crate) fn write_message_markdown(
                         };
                         writeln!(output, "<details>").ok();
                         writeln!(output, "<summary>{label}</summary>\n").ok();
-                        let text =
-                            crate::conversation::ContentBlock::tool_result_text_content(content);
-                        let text = resolve_large_output_tags(&text, scratchpad_entries);
+                        // A large output reads as the entry it went to, where the export has it.
+                        let resolved: Vec<ToolResultContent> = content
+                            .iter()
+                            .map(|item| match item {
+                                ToolResultContent::LargeOutput {
+                                    scratchpad_entry, ..
+                                } => scratchpad_entries.get(scratchpad_entry).map_or_else(
+                                    || item.clone(),
+                                    |whole| ToolResultContent::Text {
+                                        text: whole.clone(),
+                                    },
+                                ),
+                                other => other.clone(),
+                            })
+                            .collect();
+                        let text = ContentBlock::tool_result_text_content(&resolved);
                         writeln!(output, "```\n{text}\n```\n").ok();
                         writeln!(output, "</details>\n").ok();
                     }
@@ -2746,10 +3512,24 @@ pub(crate) fn write_message_markdown(
         }
         crate::conversation::Role::Assistant => {
             writeln!(output, "## Assistant\n").ok();
-            for block in &message.content {
+            for block in message.shown_content().iter() {
                 match block {
-                    crate::conversation::ContentBlock::Text { text } => {
+                    crate::conversation::ContentBlock::Text { text, .. }
+                    | crate::conversation::ContentBlock::Refusal { text, .. } => {
                         writeln!(output, "{text}\n").ok();
+                    }
+                    crate::conversation::ContentBlock::ToolUse {
+                        name,
+                        unparsed: Some(unparsed),
+                        ..
+                    } => {
+                        writeln!(output, "<details>").ok();
+                        writeln!(output, "<summary>Tool call: {name}</summary>\n").ok();
+                        // The arguments as sent; the call's result says why they were refused.
+                        if let Some(text) = &unparsed.text {
+                            writeln!(output, "```\n{text}\n```\n").ok();
+                        }
+                        writeln!(output, "</details>\n").ok();
                     }
                     crate::conversation::ContentBlock::ToolUse { name, input, .. } => {
                         let input_pretty = serde_json::to_string_pretty(input)
@@ -2762,6 +3542,8 @@ pub(crate) fn write_message_markdown(
                     crate::conversation::ContentBlock::ToolResult { .. }
                     | crate::conversation::ContentBlock::TurnContext { .. }
                     | crate::conversation::ContentBlock::Nudge { .. }
+                    | crate::conversation::ContentBlock::HarnessNote { .. }
+                    | crate::conversation::ContentBlock::Summary { .. }
                     | crate::conversation::ContentBlock::Inbox { .. }
                     | crate::conversation::ContentBlock::Scheduled { .. }
                     | crate::conversation::ContentBlock::BackgroundReport { .. }
@@ -2769,31 +3551,12 @@ pub(crate) fn write_message_markdown(
                     | crate::conversation::ContentBlock::Resource { .. }
                     | crate::conversation::ContentBlock::Thinking { .. }
                     | crate::conversation::ContentBlock::RedactedThinking { .. }
+                    | crate::conversation::ContentBlock::Unrecognized { .. }
                     | crate::conversation::ContentBlock::Image { .. } => {}
                 }
             }
         }
     }
-}
-/// Replace each `<large-output>` tag with the scratchpad entry it names, where one exists.
-pub(crate) fn resolve_large_output_tags(
-    text: &str,
-    scratchpad_entries: &std::collections::HashMap<String, String>,
-) -> String {
-    let re = match regex::Regex::new(r#"<large-output name="([^"]+)"[^>]*>[\s\S]*?</large-output>"#)
-    {
-        Ok(re) => re,
-        Err(_) => return text.to_string(),
-    };
-
-    re.replace_all(text, |caps: &regex::Captures| {
-        let name = &caps[1];
-        match scratchpad_entries.get(name) {
-            Some(content) => content.clone(),
-            None => caps[0].to_string(),
-        }
-    })
-    .into_owned()
 }
 /// Stands in for a block whose text the server withheld, under Claude's `redact-thinking` beta or
 /// display updates.
@@ -2953,8 +3716,8 @@ mod tests {
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: vec![
-                        ToolResultContent::Text {
-                            text: "[Image: a.png]".to_string(),
+                        ToolResultContent::ImageCaption {
+                            caption: "Image: a.png".to_string(),
                         },
                         ToolResultContent::Image { source: image() },
                         ToolResultContent::ToolReference {
@@ -2964,6 +3727,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
             Message::user("plain"),
         ];
@@ -3001,6 +3765,7 @@ mod tests {
             content: vec![ContentBlock::TurnContext {
                 text: "<context/>".to_string(),
             }],
+            provider_fields: None,
         }]);
         assert_eq!(conversation.title(), "");
         conversation.append(Message::user("   "));
@@ -3025,7 +3790,7 @@ mod tests {
                 summary: Message::user("[Conversation summary from session compaction] found them"),
                 replaced_count: 2,
                 record: crate::conversation::CompactionRecord::for_test(),
-                loaded_tools_snapshot: HashSet::new(),
+                loaded_tools_snapshot: Default::default(),
                 checklist_snapshot: Default::default(),
             },
             Event::Append(Message::user_turn(
@@ -3058,6 +3823,7 @@ mod tests {
                         ),
                     },
                 ],
+                provider_fields: None,
             }])
         };
         assert_eq!(invoked("the parser").title(), "the parser");
@@ -3072,10 +3838,84 @@ mod tests {
                 },
                 ContentBlock::Text {
                     text: "explain it".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         }]);
         assert_eq!(attached.title(), "explain it");
+    }
+
+    /// A boundary writes the tools loaded at it in one order, by name, however they were
+    /// gathered, so the same compaction is the same row and an archive of it the same bytes.
+    #[test]
+    fn a_boundary_lists_its_loaded_tools_by_name() {
+        let names = [
+            "web_fetch",
+            "mcp__exa__search",
+            "scratchpad_read",
+            "agent_spawn",
+            "mcp__notion__fetch",
+            "file_find",
+            "skill_read",
+            "memory_search",
+        ];
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("summary"),
+            replaced_count: 1,
+            loaded_tools_snapshot: names.iter().map(|name| name.to_string()).collect(),
+            checklist_snapshot: Default::default(),
+            record: CompactionRecord::for_test(),
+        };
+        let written = serde_json::to_value(&boundary).expect("serializes");
+        let mut sorted = names.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            written["CompactBoundary"]["loaded_tools_snapshot"],
+            serde_json::json!(sorted)
+        );
+    }
+
+    /// A reply that did not end as an answer or a round of calls is exported with how it stopped,
+    /// and one cut short with what cut it, as `conversation_read` reads them.
+    #[test]
+    fn the_export_says_how_a_reply_stopped_when_it_did_not_end_as_an_answer() {
+        let record = |stop: Option<StopReason>, cut: Option<ReplyCut>| ReplyRecord {
+            stop: stop.map(Stop::of),
+            cut,
+            model: None,
+            profile: None,
+            usage: None,
+            provider_fields: None,
+        };
+        let events = [
+            (
+                Event::Append(Message::assistant_text("half")),
+                record(Some(StopReason::MaxTokens), None),
+            ),
+            (
+                Event::Append(Message::assistant_text("so far")),
+                record(None, Some(ReplyCut::Interrupted)),
+            ),
+            (
+                Event::Append(Message::assistant_text("done")),
+                record(Some(StopReason::EndTurn), None),
+            ),
+        ];
+        let markdown = format_session_as_markdown(
+            uuid::Uuid::nil(),
+            events.iter().map(|(event, record)| (event, Some(record))),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            markdown.contains("half\n\n*[stop: max_tokens]*"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("so far\n\n*[cut: interrupted]*"),
+            "{markdown}"
+        );
+        assert!(markdown.trim_end().ends_with("done"), "{markdown}");
     }
 
     /// The Markdown export says what was done, as every history does: an invocation as what was
@@ -3083,9 +3923,10 @@ mod tests {
     /// or the file's contents.
     #[test]
     fn the_export_shows_an_invocation_and_a_file_as_what_was_done() {
+        let event = Event::Append(Message::invoked_with_a_resource_for_test());
         let markdown = format_session_as_markdown(
             uuid::Uuid::nil(),
-            &[Event::Append(Message::invoked_with_a_resource_for_test())],
+            [(&event, None)],
             &std::collections::HashMap::new(),
         );
         assert!(markdown.contains("*Running skill 'review'.*"), "{markdown}");
@@ -3110,14 +3951,15 @@ mod tests {
                 source: source.map(str::to_string),
                 body: body.to_string(),
                 text: match source {
-                    Some(source) => format!(
-                        "{INBOX_HEADER_PREFIX}{source}, arrived 2026-09-16 05:41 +00:00]\n{body}"
-                    ),
+                    Some(source) => {
+                        format!("[Message from {source}, arrived 2026-09-16 05:41 +00:00]\n{body}")
+                    }
                     None => {
-                        format!("{UNNAMED_INBOX_HEADER_PREFIX}2026-09-16 05:41 +00:00]\n{body}")
+                        format!("[Message arrived 2026-09-16 05:41 +00:00]\n{body}")
                     }
                 },
             }],
+            provider_fields: None,
         };
         let mut log = Conversation::new();
         log.append(item(Some("telegram"), "What is 5+5?"));
@@ -3127,9 +3969,9 @@ mod tests {
         assert_eq!(unnamed.title(), "What is 6+6?");
     }
 
-    /// What Meka put in place of an attachment is a `Text` block like the words, and is not a
-    /// title: a first turn that carried only an image has none, whether the image was redacted by
-    /// the budget or replaced by a harness note, until a user says something.
+    /// What Meka put in place of an attachment is a note, not words, and is not a title: a first
+    /// turn that carried only an image has none, whether the image was redacted by the budget or
+    /// replaced by another note, until a user says something.
     #[test]
     fn a_title_skips_what_meka_put_in_place_of_an_attachment() {
         let image = ImageSource::Base64 {
@@ -3154,27 +3996,45 @@ mod tests {
                 ContentBlock::TurnContext {
                     text: "<context/>".to_string(),
                 },
-                ContentBlock::Text {
-                    text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                ContentBlock::HarnessNote {
+                    note: BUDGET_REDACTION_NOTE.to_string(),
                 },
             ],
+            provider_fields: None,
         });
-        conversation.append(Message::user(format!(
-            "{HARNESS_NOTE} An image here was removed."
-        )));
-        assert_eq!(
-            conversation.title(),
-            "",
-            "nor is a placeholder or a harness note"
-        );
+        conversation.append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::HarnessNote {
+                note: "An image here was removed.".to_string(),
+            }],
+            provider_fields: None,
+        });
+        assert_eq!(conversation.title(), "", "nor is a note");
         conversation.append(Message::user("what is in the picture?"));
         assert_eq!(conversation.title(), "what is in the picture?");
     }
 
-    /// A placeholder recorded beside the user's words is its own paragraph on a single-string wire
-    /// and in the export, not a suffix of what they typed.
+    /// Words a person typed are words, whatever they look like: a prompt that opens with Meka's
+    /// label, or spells a note's sentence, titles its session like any other.
     #[test]
-    fn a_users_words_and_a_placeholder_are_separate_paragraphs() {
+    fn a_prompt_that_looks_like_a_note_is_a_title() {
+        let mut conversation = Conversation::new();
+        conversation.append(Message::user(harness_note_text(
+            "what does this label mean?",
+        )));
+        assert_eq!(
+            conversation.title(),
+            "[Meka harness] what does this label mean?"
+        );
+        let mut placeholder = Conversation::new();
+        placeholder.append(Message::user(BUDGET_REDACTION_NOTE));
+        assert_eq!(placeholder.title(), BUDGET_REDACTION_NOTE);
+    }
+
+    /// A note recorded beside the user's words is its own paragraph on a single-string wire, behind
+    /// Meka's label, and Meka's in the export, not a suffix of what they typed.
+    #[test]
+    fn a_users_words_and_a_note_are_separate_paragraphs() {
         let message = Message {
             role: Role::User,
             content: vec![
@@ -3183,20 +4043,23 @@ mod tests {
                 },
                 ContentBlock::Text {
                     text: "look at this".to_string(),
+                    provider_fields: None,
                 },
-                ContentBlock::Text {
-                    text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                ContentBlock::HarnessNote {
+                    note: BUDGET_REDACTION_NOTE.to_string(),
                 },
             ],
+            provider_fields: None,
         };
         assert_eq!(
             message.wire_text(),
-            format!("<context/>\n\nlook at this\n\n{IMAGE_REDACTION_PLACEHOLDER}")
+            format!("<context/>\n\nlook at this\n\n[Meka harness] {BUDGET_REDACTION_NOTE}")
         );
         let mut output = String::new();
         write_message_markdown(&mut output, &message, &std::collections::HashMap::new());
         assert!(
-            output.contains(&format!("look at this\n\n{IMAGE_REDACTION_PLACEHOLDER}\n")),
+            output.contains(&format!("## Meka\n\n{BUDGET_REDACTION_NOTE}\n"))
+                && output.contains("## User\n\nlook at this\n"),
             "{output}"
         );
         assert_eq!(
@@ -3214,6 +4077,7 @@ mod tests {
         let mut envelope = user_with_tool_result("call_1");
         envelope.content.push(ContentBlock::Text {
             text: "[Message from a client, arrived now]\nand name the file".to_string(),
+            provider_fields: None,
         });
         let mut output = String::new();
         write_message_markdown(&mut output, &envelope, &std::collections::HashMap::new());
@@ -3228,6 +4092,7 @@ mod tests {
         let mut nudge = Message::nudge_message(NudgeKind::Checklist, "[Checklist: open]");
         nudge.content.push(ContentBlock::Text {
             text: "[Message from a client, arrived now]\nstop".to_string(),
+            provider_fields: None,
         });
         let mut output = String::new();
         write_message_markdown(&mut output, &nudge, &std::collections::HashMap::new());
@@ -3262,7 +4127,10 @@ mod tests {
                 id: use_id.to_string(),
                 name: "file_read".to_string(),
                 input: serde_json::json!({"path": "/tmp/x"}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -3277,6 +4145,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -3287,7 +4156,10 @@ mod tests {
                 id: id.to_string(),
                 name: crate::tools::LOAD_TOOL_NAME.to_string(),
                 input: serde_json::json!({"name": target}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -3302,6 +4174,7 @@ mod tests {
                 is_error,
                 display: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -3340,7 +4213,7 @@ mod tests {
         conversation.replace_for_compaction(
             Message::user("[summary of everything above]"),
             Vec::new(),
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -3377,7 +4250,7 @@ mod tests {
         conversation.replace_for_compaction(
             Message::user("[summary of everything above]"),
             vec![Message::user("kept"), Message::assistant_text("kept reply")],
-            HashSet::new(),
+            Default::default(),
             snapshot.clone(),
             CompactionRecord::for_test(),
         );
@@ -3419,7 +4292,7 @@ mod tests {
         conversation.replace_for_compaction(
             Message::user("[summary of everything above]"),
             vec![prompt],
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -3474,6 +4347,79 @@ mod tests {
         assert_eq!(collected.len(), 3);
     }
 
+    /// A reply a wire split into text blocks reads as one run of words wherever it is shown, as it
+    /// streamed, while words on either side of another block stay apart and a person's blocks are
+    /// left as they are.
+    #[test]
+    fn a_reply_s_adjacent_text_blocks_read_as_one_run() {
+        let text = |words: &str| ContentBlock::Text {
+            text: words.to_string(),
+            provider_fields: None,
+        };
+        let reply = Message {
+            role: Role::Assistant,
+            content: vec![
+                text("The answer is "),
+                text("42"),
+                text(", as cited."),
+                ContentBlock::reasoning("then", None),
+                text("After."),
+            ],
+            provider_fields: None,
+        };
+        assert_eq!(reply.shown_content().into_owned(), vec![
+            text("The answer is 42, as cited."),
+            ContentBlock::reasoning("then", None),
+            text("After."),
+        ]);
+        let mut log = Conversation::new();
+        log.append(Message::user("q"));
+        log.append(reply.clone());
+        assert_eq!(
+            log.last_assistant_text().as_deref(),
+            Some("The answer is 42, as cited.\n\nAfter.")
+        );
+        let mut markdown = String::new();
+        write_message_markdown(&mut markdown, &reply, &std::collections::HashMap::new());
+        assert!(
+            markdown.contains("The answer is 42, as cited.\n"),
+            "{markdown}"
+        );
+        let asked = Message {
+            role: Role::User,
+            content: vec![text("one"), text("two")],
+            provider_fields: None,
+        };
+        assert!(matches!(
+            asked.shown_content(),
+            std::borrow::Cow::Borrowed(blocks) if blocks == asked.content.as_slice()
+        ));
+    }
+
+    /// A call whose arguments Meka could not read is exported as the model sent them, not as the
+    /// empty arguments it was refused with; its result says why.
+    #[test]
+    fn an_unread_call_is_exported_as_the_model_sent_it() {
+        let reply = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: "file_read".to_string(),
+                input: serde_json::json!({}),
+                unparsed: Some(UnparsedArguments {
+                    text: Some("{\"path\": ".to_string()),
+                    error: "EOF while parsing".to_string(),
+                }),
+                provider_fields: None,
+            }],
+            provider_fields: None,
+        };
+        let mut markdown = String::new();
+        write_message_markdown(&mut markdown, &reply, &std::collections::HashMap::new());
+        assert!(markdown.contains("```\n{\"path\": \n```"), "{markdown}");
+        assert!(!markdown.contains("```json"), "{markdown}");
+    }
+
     #[test]
     fn last_assistant_text_walks_past_tool_results() {
         // Sub-agent turn shape after a tool-use round: assistant emits a tool_use, then the loop
@@ -3488,6 +4434,48 @@ mod tests {
             log.last_assistant_text().as_deref(),
             Some("final assistant answer")
         );
+    }
+
+    /// A reply's parts are joined when its words are read, a blank line apart, so text the provider
+    /// returned in two parts is not glued into one sentence; a reply with no words reads as none.
+    #[test]
+    fn the_last_reply_reads_its_parts_apart_and_a_blank_one_as_none() {
+        let mut log = Conversation::new();
+        log.append(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "First part.".to_string(),
+                    provider_fields: None,
+                },
+                ContentBlock::Thinking {
+                    parts: vec![crate::conversation::ReasoningPart::reasoning("late")],
+                    opaque: None,
+                    provider_fields: None,
+                },
+                ContentBlock::Text {
+                    text: "Second part.".to_string(),
+                    provider_fields: None,
+                },
+            ],
+            provider_fields: None,
+        });
+        assert_eq!(
+            log.last_assistant_text().as_deref(),
+            Some("First part.\n\nSecond part.")
+        );
+        log.append(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                parts: vec![crate::conversation::ReasoningPart::reasoning(
+                    "nothing to say",
+                )],
+                opaque: None,
+                provider_fields: None,
+            }],
+            provider_fields: None,
+        });
+        assert_eq!(log.last_assistant_text(), None);
     }
 
     #[test]
@@ -3515,7 +4503,7 @@ mod tests {
         log.replace_for_compaction(
             summary,
             tail,
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -3534,7 +4522,7 @@ mod tests {
         log.replace_for_compaction(
             Message::user("[summary]"),
             Vec::new(),
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -3567,18 +4555,22 @@ mod tests {
     #[test]
     fn a_message_without_claude_thinking_keeps_the_readable_reasoning() {
         let signed = |thinking: &str| ContentBlock::Thinking {
-            thinking: thinking.to_string(),
+            parts: vec![crate::conversation::ReasoningPart::reasoning(
+                thinking.to_string(),
+            )],
             opaque: Some(OpaqueReasoning::Signed {
                 signature: "sig".to_string(),
             }),
+            provider_fields: None,
         };
         let sealed = ContentBlock::Thinking {
-            thinking: "summary".to_string(),
+            parts: vec![crate::conversation::ReasoningPart::reasoning("summary")],
             opaque: Some(OpaqueReasoning::Sealed {
                 encrypted_content: "sealed".to_string(),
                 id: None,
                 origin: Some("https://chatgpt.com".to_string()),
             }),
+            provider_fields: None,
         };
         let message = Message {
             role: Role::Assistant,
@@ -3587,24 +4579,31 @@ mod tests {
                 signed(""),
                 ContentBlock::RedactedThinking {
                     data: "redacted".to_string(),
+                    provider_fields: None,
                 },
                 sealed.clone(),
                 ContentBlock::Text {
                     text: "the answer".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let without = message.without_claude_thinking().expect("it carried some");
         assert_eq!(
             serde_json::to_value(&without.content).expect("serializes"),
             serde_json::to_value(vec![
                 ContentBlock::Thinking {
-                    thinking: "the reasoning".to_string(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning(
+                        "the reasoning"
+                    )],
                     opaque: None,
+                    provider_fields: None,
                 },
                 sealed.clone(),
                 ContentBlock::Text {
                     text: "the answer".to_string(),
+                    provider_fields: None,
                 },
             ])
             .expect("serializes")
@@ -3619,6 +4618,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![sealed],
+                provider_fields: None,
             }
             .without_claude_thinking()
             .is_none(),
@@ -3635,15 +4635,20 @@ mod tests {
             role: Role::Assistant,
             content: vec![
                 ContentBlock::Thinking {
-                    thinking: thinking.to_string(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning(
+                        thinking.to_string(),
+                    )],
                     opaque: Some(OpaqueReasoning::Signed {
                         signature: "sig".to_string(),
                     }),
+                    provider_fields: None,
                 },
                 ContentBlock::Text {
                     text: "an answer".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let mut log = Conversation::new();
         log.append(Message::user("first question"));
@@ -3662,14 +4667,14 @@ mod tests {
             assert!(!view[1].carries_claude_thinking());
             assert!(matches!(
                 &view[1].content[0],
-                ContentBlock::Thinking { thinking, opaque: None } if thinking == "first reasoning"
+                ContentBlock::Thinking { parts, opaque: None, .. } if reasoning_text(parts) == "first reasoning"
             ));
             assert!(view[3].carries_claude_thinking(), "appended after it");
         }
 
         let markdown = format_session_as_markdown(
             uuid::Uuid::nil(),
-            log.events(),
+            log.events().iter().map(|event| (event, None)),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -3743,7 +4748,7 @@ mod tests {
         log.replace_for_compaction(
             Message::user("summary"),
             vec![Message::user("three")],
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -3772,7 +4777,7 @@ mod tests {
         log.replace_for_compaction(
             Message::user("summary one"),
             Vec::new(),
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -3782,7 +4787,7 @@ mod tests {
         log.replace_for_compaction(
             Message::user("summary two"),
             vec![Message::user("kept")],
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -3862,9 +4867,11 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "look".to_string(),
+                    provider_fields: None,
                 },
                 image_block(base64_of(image::ImageFormat::Jpeg), "image/png"),
             ],
+            provider_fields: None,
         });
 
         assert_eq!(log.invalid_images_replaced(), 1);
@@ -3874,8 +4881,8 @@ mod tests {
             "text is kept"
         );
         match &content[1] {
-            ContentBlock::Text { text } => assert!(text.contains("image/png"), "{text}"),
-            other => panic!("expected the image to become text, got {other:?}"),
+            ContentBlock::HarnessNote { note } => assert!(note.contains("image/png"), "{note}"),
+            other => panic!("expected the image to become a note, got {other:?}"),
         }
     }
 
@@ -3895,6 +4902,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
 
         assert_eq!(log.invalid_images_replaced(), 1);
@@ -3909,7 +4917,7 @@ mod tests {
                 assert!(is_error);
                 assert!(matches!(
                     content[0],
-                    crate::conversation::ToolResultContent::Text { .. }
+                    crate::conversation::ToolResultContent::HarnessNote { .. }
                 ));
             }
             other => panic!("expected ToolResult, got {other:?}"),
@@ -3927,6 +4935,7 @@ mod tests {
                 image_block(base64_of(image::ImageFormat::Png), "image/png"),
                 image_block("BASE64DATA".to_string(), "image/png"),
             ],
+            provider_fields: None,
         });
 
         assert_eq!(log.invalid_images_replaced(), 0);
@@ -3951,6 +4960,7 @@ mod tests {
                 base64_of(image::ImageFormat::Jpeg),
                 "image/png",
             )],
+            provider_fields: None,
         });
         log.append(Message::assistant_text("answer two"));
 
@@ -4017,6 +5027,7 @@ mod tests {
         let mut ridden = checklist_nudge.clone();
         ridden.content.push(ContentBlock::Text {
             text: "[Message from a client, arrived now]\nstop".to_string(),
+            provider_fields: None,
         });
         assert!(
             ridden.is_nudge(),
@@ -4149,6 +5160,7 @@ mod tests {
         let mut both = Message::user("turn two");
         both.content.push(ContentBlock::Text {
             text: "and this".to_string(),
+            provider_fields: None,
         });
         joined.append(both);
         joined.append(Message::assistant_text("answer two"));
@@ -4161,6 +5173,7 @@ mod tests {
         let mut steered = Message::user("summary");
         steered.content.push(ContentBlock::Text {
             text: "and this".to_string(),
+            provider_fields: None,
         });
         let summary_joined = Conversation::from_events(vec![
             Event::Append(Message::user("old turn")),
@@ -4195,6 +5208,7 @@ mod tests {
         let mut steered = Message::user("summary");
         steered.content.push(ContentBlock::Text {
             text: "and this".to_string(),
+            provider_fields: None,
         });
         let events = vec![
             Event::Append(Message::user("old turn")),
@@ -4244,8 +5258,8 @@ mod tests {
         assert!(log.is_empty());
     }
 
-    /// A redaction names one image, tail-relative, and the replay puts the placeholder exactly
-    /// there: an input image by block, a tool result's image by item, and nothing else.
+    /// A redaction names one image, tail-relative, and the replay puts Meka's note exactly there:
+    /// an input image by block, a tool result's image by item, and nothing else.
     #[test]
     fn a_redaction_replaces_the_image_it_names_and_nothing_else() {
         let image = crate::image::ImageSource::Base64 {
@@ -4259,8 +5273,8 @@ mod tests {
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "u1".to_string(),
                 content: vec![
-                    ToolResultContent::Text {
-                        text: "[Image: x.png]".to_string(),
+                    ToolResultContent::ImageCaption {
+                        caption: "Image: x.png".to_string(),
                     },
                     ToolResultContent::Image {
                         source: image.clone(),
@@ -4269,6 +5283,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
         log.append(Message::assistant_text("seen"));
 
@@ -4293,19 +5308,21 @@ mod tests {
         assert!(matches!(event, Event::Redact { .. }));
 
         let check = |view: &[Message]| {
-            assert!(matches!(&view[0].content[0], ContentBlock::Text { text } if text == "look"));
             assert!(
-                matches!(&view[0].content[1], ContentBlock::Text { text } if text == IMAGE_REDACTION_PLACEHOLDER),
+                matches!(&view[0].content[0], ContentBlock::Text { text, .. } if text == "look")
+            );
+            assert!(
+                matches!(&view[0].content[1], ContentBlock::HarnessNote { note } if note == BUDGET_REDACTION_NOTE),
                 "{:?}",
                 view[0].content
             );
             match &view[1].content[0] {
                 ContentBlock::ToolResult { content, .. } => {
                     assert!(
-                        matches!(&content[0], ToolResultContent::Text { text } if text == "[Image: x.png]")
+                        matches!(&content[0], ToolResultContent::ImageCaption { caption } if caption == "Image: x.png")
                     );
                     assert!(
-                        matches!(&content[1], ToolResultContent::Text { text } if text == IMAGE_REDACTION_PLACEHOLDER)
+                        matches!(&content[1], ToolResultContent::HarnessNote { note } if note == BUDGET_REDACTION_NOTE)
                     );
                 }
                 other => panic!("expected the tool result, got {other:?}"),
@@ -4338,7 +5355,7 @@ mod tests {
         resumed.replace_for_compaction(
             Message::assistant_text("summary"),
             Vec::new(),
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -4388,18 +5405,24 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "I'll check the uncommitted changes.".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "u1".to_string(),
                     name: "shell_execute".to_string(),
                     input: serde_json::json!({"command": "git diff"}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "u2".to_string(),
                     name: "scratchpad_read".to_string(),
                     input: serde_json::json!({"name": "tool_1_output"}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         });
 
         let dropped = log.sanitize_orphans();
@@ -4459,7 +5482,7 @@ mod tests {
         log.replace_for_compaction(
             Message::user("[summary]"),
             vec![Message::user("tail")],
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -4485,7 +5508,7 @@ mod tests {
         log.replace_for_compaction(
             Message::user("[summary]"),
             vec![Message::assistant_text("kept-1"), Message::user("kept-2")],
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -4541,7 +5564,8 @@ mod tests {
         log.append(load_tool_use("u1", "scratchpad_read"));
         log.append(load_tool_result("u1", false));
 
-        let snapshot: HashSet<String> = ["scratchpad_read".to_string()].into_iter().collect();
+        let snapshot: std::collections::BTreeSet<String> =
+            ["scratchpad_read".to_string()].into_iter().collect();
         log.replace_for_compaction(
             Message::user("[summary]"),
             Vec::new(),
@@ -4564,7 +5588,8 @@ mod tests {
         log.append(load_tool_result("u1", false));
         log.append(Message::user("m1"));
 
-        let snapshot: HashSet<String> = ["scratchpad_read".to_string()].into_iter().collect();
+        let snapshot: std::collections::BTreeSet<String> =
+            ["scratchpad_read".to_string()].into_iter().collect();
         log.replace_for_compaction(
             Message::user("[summary-1]"),
             vec![Message::user("tail-1")],
@@ -4637,7 +5662,10 @@ mod tests {
                 id: "s1".to_string(),
                 name: "tool_search".to_string(),
                 input: serde_json::json!({"names": ["mcp__kv__alpha"]}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         });
         log.append(Message {
             role: Role::User,
@@ -4649,6 +5677,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
         let before = extract(&log, DeferredToolDelivery::Appended);
         assert_eq!(before, vec!["mcp__kv__alpha"]);
@@ -4670,7 +5699,10 @@ mod tests {
                 id: "l1".to_string(),
                 name: "tool_load".to_string(),
                 input: serde_json::json!({"name": "mcp__kv__gamma"}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         });
         log.append(Message {
             role: Role::User,
@@ -4682,6 +5714,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
         assert_eq!(extract(&log, DeferredToolDelivery::Appended), vec![
             "mcp__kv__alpha",
@@ -4711,7 +5744,7 @@ mod tests {
         log.replace_for_compaction(
             Message::user("[summary]"),
             vec![load_tool_result("u1", false)],
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -4732,7 +5765,7 @@ mod tests {
         log.replace_for_compaction(
             Message::user("[summary]"),
             Vec::new(),
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -4771,7 +5804,42 @@ mod tests {
             kept_recent,
             written_summary: String::new(),
             checkpoint: Vec::new(),
+            summarizer: Vec::new(),
         }
+    }
+
+    /// A turn that ran a compaction alone ends as its last reply stopped, the summarizer's ahead of
+    /// the checkpoint's, except that a round that stopped for its calls ended on nothing left to
+    /// run, since the compaction ran them; a reply that recorded no stop ended as an answer.
+    #[test]
+    fn a_compaction_turn_ends_as_its_last_reply_stopped() {
+        let replied = |reason: Option<StopReason>| RecordedMessage {
+            message: Message::assistant_text("words"),
+            reply: Some(ReplyRecord {
+                stop: reason.map(Stop::of),
+                cut: None,
+                model: None,
+                profile: None,
+                usage: None,
+                provider_fields: None,
+            }),
+        };
+        let mut compaction = record(
+            CompactionTrigger::Manual,
+            CompactionSource::Checkpoint,
+            &[],
+            true,
+        );
+        assert_eq!(compaction.last_stop(), StopReason::EndTurn);
+        compaction.checkpoint = vec![
+            replied(Some(StopReason::MaxTokens)),
+            replied(Some(StopReason::ToolUse)),
+        ];
+        assert_eq!(compaction.last_stop(), StopReason::EndTurn);
+        compaction.summarizer = vec![replied(Some(StopReason::Refusal))];
+        assert_eq!(compaction.last_stop(), StopReason::Refusal);
+        compaction.summarizer = vec![replied(None)];
+        assert_eq!(compaction.last_stop(), StopReason::EndTurn);
     }
 
     /// The note names what the checkpoint wrote, because a memory is durable and instance-scoped:
@@ -4844,7 +5912,7 @@ mod tests {
         let event = Event::CompactBoundary {
             summary: Message::user("summary"),
             replaced_count: 2,
-            loaded_tools_snapshot: HashSet::new(),
+            loaded_tools_snapshot: Default::default(),
             checklist_snapshot: Default::default(),
             record: CompactionRecord {
                 trigger: CompactionTrigger::Requested,
@@ -4853,6 +5921,7 @@ mod tests {
                 kept_recent: false,
                 written_summary: "what was done".to_string(),
                 checkpoint: Vec::new(),
+                summarizer: Vec::new(),
             },
         };
         let encoded = serde_json::to_value(&event).expect("encodes");
@@ -4892,7 +5961,8 @@ mod tests {
             _ => panic!("wrong variant"),
         }
 
-        let snapshot: HashSet<String> = ["mcp__notion__fetch".to_string()].into_iter().collect();
+        let snapshot: std::collections::BTreeSet<String> =
+            ["mcp__notion__fetch".to_string()].into_iter().collect();
         let boundary = Event::CompactBoundary {
             summary: Message::user("[summary]"),
             replaced_count: 5,
@@ -4923,7 +5993,7 @@ mod tests {
         log.replace_for_compaction(
             Message::user("[summary]"),
             Vec::new(),
-            HashSet::new(),
+            Default::default(),
             Default::default(),
             CompactionRecord::for_test(),
         );
@@ -5004,7 +6074,10 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
                 input: serde_json::json!({}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -5019,6 +6092,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -5113,7 +6187,7 @@ mod tests {
         log.append(assistant_text("hi there"));
         let markdown = crate::conversation::format_session_as_markdown(
             uuid::Uuid::nil(),
-            log.events(),
+            log.events().iter().map(|event| (event, None)),
             &std::collections::HashMap::new(),
         );
         assert!(markdown.contains("## User") && markdown.contains("hello"));

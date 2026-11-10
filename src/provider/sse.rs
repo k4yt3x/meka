@@ -65,15 +65,12 @@ pub(crate) async fn stream_error(
     MekaError::StreamError(message)
 }
 
-/// A frame's `data` as JSON, or `None` with a warning for one that is not, which a protocol skips.
-pub(crate) fn frame_json(what: &str, data: &str) -> Option<serde_json::Value> {
-    match serde_json::from_str(data) {
-        Ok(data) => Some(data),
-        Err(error) => {
-            tracing::warn!("failed to parse {what} SSE data: {error}");
-            None
-        }
-    }
+/// A frame's `data` as JSON. A frame that is not is part of a reply Meka could not read, so the
+/// attempt fails as any broken stream does rather than committing a reply with a hole in it.
+pub(crate) fn frame_json(what: &str, data: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(data).map_err(|error| {
+        MekaError::StreamError(format!("failed to parse a {what} SSE frame: {error}"))
+    })
 }
 
 /// Read `response` as SSE to its end, handing each frame to `protocol`. `what` names the protocol

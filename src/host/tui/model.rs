@@ -161,6 +161,9 @@ pub(crate) enum Item {
     },
 }
 
+/// What the screen says of a reply that held nothing to read and no call, live and on a replay.
+const NO_ANSWER: &str = "The model returned no answer";
+
 impl Item {
     /// Whether the banner stays with this item beside it: a line said beside the conversation
     /// does not start one, where a prompt, an answer, a call or the session's own rows do.
@@ -255,6 +258,9 @@ struct Page {
     /// owes when the turn changes there.
     first_turn: Option<Uuid>,
     last_turn: Option<Uuid>,
+    /// Where among the page's entries its last turn begins, for the calls of that turn a later
+    /// page shows ending to take out.
+    last_turn_start: usize,
     /// Whether the page's entries open with the row closing the turn above it, or end with the
     /// row closing its own last turn: the join between two pages owes one such row, and whichever
     /// page loads second draws it unless the first already has.
@@ -672,7 +678,7 @@ impl Transcript {
         let text = crate::render::turn_end_summary(
             &self.settings.turn_end_summary,
             status,
-            record.stop_reason.as_deref(),
+            record.stop_reason,
             ended_at,
             elapsed,
             &record.usage,
@@ -812,10 +818,19 @@ impl Transcript {
         let page = self.without_rewound(page);
         // The first page after a reset is the newest, so its last turn ends with the log.
         let closes_log = self.pages.is_empty() && self.window.is_empty();
-        let (mut entries, mut ends_with_turn_end) =
+        let (mut entries, mut ends_with_turn_end, last_turn_start) =
             self.build_entries(&page.rows, false, closes_log);
         self.attach_orphans(&mut entries);
         let (first_turn, last_turn) = edge_turns(&page);
+        // The page's last turn ended in the window below when another turn's rows, or the log's
+        // end, are there: each of its calls here that nothing there answered never ran, as
+        // `build_entries` takes out of a turn that ends inside the page.
+        if let Some(turn) = last_turn
+            && !self.pages.is_empty()
+            && (self.attached || self.pages.iter().any(|page| page.last_turn != Some(turn)))
+        {
+            self.take_out_unrun_calls(&mut entries, last_turn_start, turn);
+        }
         // The join with the page below: a turn that ends where the next page begins closes here,
         // unless that page already opens with the row.
         if let Some(below) = self.pages.front()
@@ -833,6 +848,7 @@ impl Transcript {
             entries: entries.len(),
             first_turn,
             last_turn,
+            last_turn_start,
             starts_with_turn_end: false,
             ends_with_turn_end,
         });
@@ -873,8 +889,26 @@ impl Transcript {
             return;
         };
         let page = self.without_rewound(page);
-        let (mut entries, ends_with_turn_end) = self.build_entries(&page.rows, true, !page.more);
+        let (mut entries, ends_with_turn_end, last_turn_start) =
+            self.build_entries(&page.rows, true, !page.more);
         let (first_turn, last_turn) = edge_turns(&page);
+        // The window's last turn ends in this page when another turn's rows, or the log's end,
+        // are here: each of its calls above that nothing answered never ran, as `build_entries`
+        // takes out of a turn that ends inside the page.
+        if let Some(above) = self.pages.back()
+            && let Some(turn) = above.last_turn
+            && (first_turn != Some(turn) || last_turn != Some(turn) || !page.more)
+        {
+            let from = self.window.len().saturating_sub(above.entries) + above.last_turn_start;
+            let mut window = std::mem::take(&mut self.window);
+            let held = window.len();
+            self.take_out_unrun_calls(&mut window, from, turn);
+            let removed = held.saturating_sub(window.len());
+            self.window = window;
+            if let Some(above) = self.pages.back_mut() {
+                above.entries = above.entries.saturating_sub(removed);
+            }
+        }
         // The join with the page above: the turn its last row belongs to ends here when this
         // page opens another, unless that page already closes it.
         let mut starts_with_turn_end = false;
@@ -893,6 +927,7 @@ impl Transcript {
             entries: entries.len(),
             first_turn,
             last_turn,
+            last_turn_start: last_turn_start + usize::from(starts_with_turn_end),
             starts_with_turn_end,
             ends_with_turn_end,
         });
@@ -1340,10 +1375,10 @@ impl Transcript {
                 self.turn_level = None;
                 self.nudged = false;
                 self.opening_at = None;
-                // A call with no result when the turn ended never ran, and the log holds none of
-                // it: one still being written, or written whole and cut before it was run, an
-                // attempt that failed and was tried again or one the stop cut. What ran was
-                // answered, if only to say the stop interrupted it.
+                // A call with no result when the turn ended never ran: one still being written, or
+                // written whole and cut before it was run, an attempt that failed and was tried
+                // again or one the stop cut. What ran was answered, if only to say the stop
+                // interrupted it. A replay takes the same calls out where their turn ends.
                 while let Some(index) = self.tail.iter().rposition(|entry| {
                     matches!(entry.item, Item::ToolCall {
                         state: ToolState::Composing | ToolState::Running,
@@ -1360,7 +1395,7 @@ impl Transcript {
                 if let Some(text) = crate::render::turn_end_summary(
                     &self.settings.turn_end_summary,
                     ending.status,
-                    ending.stop_reason.as_deref(),
+                    ending.stop_reason,
                     ended_at,
                     elapsed,
                     &ending.usage,
@@ -1388,6 +1423,19 @@ impl Transcript {
                 }
             }
             FrontendEvent::InboxDelivered { item_ids } => self.mark_delivered(&item_ids),
+            // The reply is recorded as it came, with no words to draw, so the screen says what
+            // happened in its own words, as the replay of the log says it.
+            FrontendEvent::NoAnswer => {
+                self.close_streams();
+                self.push_left_to_replay(Item::note(NO_ANSWER));
+            }
+            // Said as the replay of the log says it, from the reply's record.
+            FrontendEvent::ReplyStopped { stop_reason } => {
+                if let Some(direction) = crate::render::reply_stop_direction(stop_reason) {
+                    self.close_streams();
+                    self.push_left_to_replay(Item::note(direction));
+                }
+            }
             // The words are the model's to read; the stage direction that follows a checklist
             // nudge is what the person sees of it, counted live, where a replay of the log says it
             // in the words the log can carry.
@@ -1476,6 +1524,10 @@ impl Transcript {
                         | ContentBlock::Resource { .. }
                         | ContentBlock::TurnContext { .. }
                         | ContentBlock::Nudge { .. }
+                        | ContentBlock::HarnessNote { .. }
+                        | ContentBlock::Summary { .. }
+                        | ContentBlock::Refusal { .. }
+                        | ContentBlock::Unrecognized { .. }
                         | ContentBlock::Image { .. }
                         | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
@@ -1510,6 +1562,27 @@ impl Transcript {
                     self.end_thinking(index);
                 }
             }
+            // Drawn as a replay of the log draws the block.
+            FrontendEvent::RedactedThinking => match self.open_thinking.take() {
+                Some(index) => {
+                    if let Some(Entry {
+                        item: Item::Thinking { text, .. },
+                        ..
+                    }) = self.tail.get_mut(index)
+                    {
+                        *text = crate::conversation::REDACTED_THINKING.to_string();
+                    }
+                    self.end_thinking(index);
+                }
+                None => {
+                    self.close_streams();
+                    self.push(Item::Thinking {
+                        text: crate::conversation::REDACTED_THINKING.to_string(),
+                        estimate: None,
+                        ended: true,
+                    });
+                }
+            },
             FrontendEvent::ThinkingBlock { content } => {
                 match self.open_thinking.take() {
                     // The text is already here; this is only the end of the block.
@@ -1558,6 +1631,7 @@ impl Transcript {
                 name,
                 input,
                 display_summary,
+                ..
             } => {
                 self.close_streams();
                 // The call being written under this id, never an earlier round's call that a
@@ -1785,12 +1859,13 @@ impl Transcript {
     /// call in the window when `window_holds_older` (a page read below it), and otherwise kept
     /// for the older page the call is on: a call precedes its result, so a page read above the
     /// window cannot owe one to it, and a repeated call id must not take a newer call's result.
+    /// Besides the items, whether they end on a turn's closing row and where the last turn's begin.
     fn build_entries(
         &mut self,
         rows: &[LogRow],
         window_holds_older: bool,
         closes_log: bool,
-    ) -> (Vec<Entry>, bool) {
+    ) -> (Vec<Entry>, bool, usize) {
         use crate::store::Said;
         let mut out: Vec<Entry> = Vec::new();
         let mut shown_checklist: Option<Vec<ChecklistItem>> = None;
@@ -1805,12 +1880,20 @@ impl Transcript {
                 |entry| matches!(&entry.item, Item::ToolCall { id: call, .. } if call == id),
             )
         };
+        // Where the turn being drawn begins in `out`.
+        let mut turn_start = 0;
+        // What stopped a reply that made calls, said once the results that answered them are.
+        let mut stop_direction: Option<String> = None;
         for row in rows {
-            if let Some(ended) = turn
-                && row.turn_id != Some(ended)
-                && let Some(entry) = self.turn_end_entry(ended)
-            {
-                out.push(entry);
+            if row.turn_id != turn {
+                if let Some(ended) = turn {
+                    self.take_out_unrun_calls(&mut out, turn_start, ended);
+                    if let Some(entry) = self.turn_end_entry(ended) {
+                        out.push(entry);
+                    }
+                }
+                stop_direction = None;
+                turn_start = out.len();
             }
             // A row naming no turn was written between turns, as a rewind is, so the turn before it
             // has ended; in a log written before turns were recorded, no row names one.
@@ -1825,6 +1908,9 @@ impl Transcript {
                     out.extend(entries);
                     continue;
                 }
+                // The live screen drew nothing for a compaction that failed; the turn's end says
+                // how the turn went.
+                Said::CompactionFailed { .. } => continue,
                 Said::Rewind { turns, .. } => {
                     let entry = self.entry(Item::note(rewound_note(turns)));
                     out.push(entry);
@@ -1838,8 +1924,13 @@ impl Transcript {
                 let entry = self.entry(Item::note(note));
                 out.push(entry);
             }
+            // Said of a reply that ended answering nothing, as the live screen says it; one cut
+            // short did not end, and its turn's row says what cut it.
+            let cut = row.reply.as_ref().is_some_and(|reply| reply.cut.is_some());
+            let no_answer = message.holds_no_answer() && !cut;
             let mut checklist = None;
             let with_mentions;
+            let shown;
             let content = if message.role == Role::User
                 && message
                     .content
@@ -1849,14 +1940,15 @@ impl Transcript {
                 with_mentions = crate::conversation::mentions_inline(&message.content);
                 with_mentions.as_slice()
             } else {
-                message.content.as_slice()
+                shown = message.shown_content();
+                &shown
             };
             for block in content {
                 if !matches!(block, ContentBlock::ToolResult { .. }) {
                     self.draw_batch_checklist(&mut out, &mut checklist, &mut shown_checklist);
                 }
                 match block {
-                    ContentBlock::Text { text } => {
+                    ContentBlock::Text { text, .. } => {
                         if text.trim().is_empty() {
                             continue;
                         }
@@ -1876,6 +1968,17 @@ impl Transcript {
                         let entry = self.entry(item);
                         out.push(entry);
                     }
+                    // The model's words in the field its provider keeps for declining, drawn as
+                    // its words.
+                    ContentBlock::Refusal { text, .. } => {
+                        let entry = self.entry(Item::Text {
+                            text: sanitize_stream_text(text),
+                            streaming: false,
+                        });
+                        out.push(entry);
+                    }
+                    // Nothing a reader can draw: kept for the record.
+                    ContentBlock::Unrecognized { .. } => {}
                     // The person's words, labeled as the live screen labeled them.
                     ContentBlock::Inbox {
                         item_id,
@@ -1927,17 +2030,21 @@ impl Transcript {
                             self.entry(Item::note(self.replayed_report_direction(task_ids)));
                         out.push(entry);
                     }
-                    // Meka's own words for the turn; a replay shows what was typed.
-                    ContentBlock::TurnContext { .. } | ContentBlock::Nudge { .. } => {}
+                    // Meka's own words for the turn or the model; a replay shows what was typed.
+                    ContentBlock::TurnContext { .. }
+                    | ContentBlock::Nudge { .. }
+                    | ContentBlock::HarnessNote { .. }
+                    | ContentBlock::Summary { .. } => {}
                     ContentBlock::Image { source } => {
                         let entry = self.entry(Item::Image(self.picture_of(source)));
                         out.push(entry);
                     }
                     // A block with no words is none: the live run let its counter go as it ended.
-                    ContentBlock::Thinking { thinking, .. } => {
+                    ContentBlock::Thinking { parts, .. } => {
+                        let thinking = crate::conversation::reasoning_text(parts);
                         if !thinking.trim().is_empty() {
                             let entry = self.entry(Item::Thinking {
-                                text: sanitize_stream_text(thinking),
+                                text: sanitize_stream_text(&thinking),
                                 estimate: None,
                                 ended: true,
                             });
@@ -1952,14 +2059,19 @@ impl Transcript {
                         });
                         out.push(entry);
                     }
-                    ContentBlock::ToolUse { id, name, input } => {
+                    // A call of a reply cut before it ended never ran, and the live screen took it
+                    // out when its turn ended.
+                    ContentBlock::ToolUse { .. } if cut => {}
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         let entry = self.entry(Item::ToolCall {
                             id: id.clone(),
                             name: name.clone(),
                             input: Some(input.clone()),
                             summary: None,
                             // Replayed as done without an error until its result says otherwise;
-                            // a call whose result the log never recorded is one the turn lost.
+                            // one no result answers when its turn ends never ran, and goes then.
                             state: ToolState::Done { is_error: false },
                             output: String::new(),
                             result: None,
@@ -2034,16 +2146,57 @@ impl Transcript {
                 }
             }
             self.draw_batch_checklist(&mut out, &mut checklist, &mut shown_checklist);
+            if no_answer {
+                let entry = self.entry(Item::note(NO_ANSWER));
+                out.push(entry);
+            }
+            // A reply that made calls and stopped for a reason that is not a round's is said after
+            // the round's results, as the live screen said it, and not at all when no round ran.
+            if message.carries_tool_results() {
+                if let Some(direction) = stop_direction.take() {
+                    let entry = self.entry(Item::note(direction));
+                    out.push(entry);
+                }
+            } else {
+                stop_direction = row
+                    .reply
+                    .as_ref()
+                    .filter(|_| {
+                        message
+                            .content
+                            .iter()
+                            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+                    })
+                    .and_then(|reply| reply.stop.as_ref())
+                    .and_then(|stop| crate::render::reply_stop_direction(stop.reason));
+            }
         }
         let mut ends_with_turn_end = false;
-        if closes_log
-            && let Some(ended) = turn
-            && let Some(entry) = self.turn_end_entry(ended)
-        {
-            out.push(entry);
-            ends_with_turn_end = true;
+        if closes_log && let Some(ended) = turn {
+            self.take_out_unrun_calls(&mut out, turn_start, ended);
+            if let Some(entry) = self.turn_end_entry(ended) {
+                out.push(entry);
+                ends_with_turn_end = true;
+            }
         }
-        (out, ends_with_turn_end)
+        (out, ends_with_turn_end, turn_start)
+    }
+
+    /// Take out of `out`, from `from` on, the calls of `turn` that no result answered, once the
+    /// turn has ended: they never ran, and the live screen took them out when the turn ended. A
+    /// compaction's steps carry their own results.
+    fn take_out_unrun_calls(&self, out: &mut Vec<Entry>, from: usize, turn: Uuid) {
+        if !self
+            .turn_records
+            .get(&turn)
+            .is_some_and(|record| record.status.is_some())
+        {
+            return;
+        }
+        let drawn = out.split_off(from.min(out.len()));
+        out.extend(drawn.into_iter().filter(|entry| {
+            entry.compaction.is_some() || !matches!(entry.item, Item::ToolCall { result: None, .. })
+        }));
     }
 
     /// Draw the list a batch of checklist calls left, `checklist`, where the live screen drew it:
@@ -2091,10 +2244,11 @@ fn edge_turns(page: &crate::store::LogPage) -> (Option<Uuid>, Option<Uuid>) {
 }
 
 /// The readable part of a tool result, tail-capped, and how many images it carried. What Meka
-/// wrote into a result for the model alone is left out or said for a reader: the line naming a
-/// file read as an image, which the count says; the tools a load made callable, which its row
-/// names; the directions around a large output kept in the scratchpad. The notice of a call sent
-/// to the background is the call's to say; see [`settle_call`].
+/// wrote into a result for the model alone is left out or said for a reader: a note; the caption
+/// naming where an image came from, which the count says while the image is there; the tools a
+/// load made callable, which its row names; the directions around a large output kept in the
+/// scratchpad. The notice of a call sent to the background is the call's to say; see
+/// [`settle_call`].
 fn result_text(content: &[ToolResultContent]) -> (String, usize) {
     let images = content
         .iter()
@@ -2102,22 +2256,27 @@ fn result_text(content: &[ToolResultContent]) -> (String, usize) {
         .count();
     let mut text = String::new();
     for part in content {
-        let ToolResultContent::Text { text: part } = part else {
-            continue;
+        let shown = match part {
+            ToolResultContent::Text { text } => std::borrow::Cow::Borrowed(text.as_str()),
+            // A large output is spilled to the scratchpad after the live screen has drawn it
+            // whole, so the opening the log keeps of it is what a replay can show of the same
+            // output.
+            ToolResultContent::LargeOutput { preview, .. } => {
+                std::borrow::Cow::Borrowed(preview.as_str())
+            }
+            ToolResultContent::ImageCaption { .. } if images == 0 => match part.wire_part() {
+                crate::conversation::ResultPart::Text(caption) => caption,
+                _ => continue,
+            },
+            ToolResultContent::ImageCaption { .. }
+            | ToolResultContent::HarnessNote { .. }
+            | ToolResultContent::Image { .. }
+            | ToolResultContent::ToolReference { .. } => continue,
         };
-        if images > 0 && crate::tools::file::is_image_marker(part.trim()) {
-            continue;
-        }
         if !text.is_empty() {
             text.push('\n');
         }
-        // A large output is spilled to the scratchpad after the live screen has drawn it whole,
-        // so the opening the log keeps of it is what a replay can show of the same output.
-        if let Some(preview) = crate::tools::scratchpad::large_output_preview(part) {
-            text.push_str(preview);
-        } else {
-            text.push_str(part);
-        }
+        text.push_str(&shown);
     }
     keep_tail(&mut text, TOOL_TEXT_KEEP_BYTES);
     (text, images)
@@ -2214,19 +2373,30 @@ fn compaction_steps(record: &crate::conversation::CompactionRecord) -> Vec<Item>
 /// The items a compaction's checkpoint rounds show, as a replay shows a turn's: its reasoning, its
 /// words, and its calls with their results. The `context_replace` that handed in the summary is
 /// left out, since the summary is shown under them whole.
-fn checkpoint_items(rounds: &[crate::conversation::Message]) -> Vec<Item> {
+fn checkpoint_items(rounds: &[crate::conversation::RecordedMessage]) -> Vec<Item> {
     let mut items: Vec<Item> = Vec::new();
-    for message in rounds {
+    // The items of the last round's calls, by place, `None` for the call that handed the summary
+    // in: a round's results answer its calls in the order they were made, whatever ids a
+    // provider gave them.
+    let mut calls: Vec<Option<usize>> = Vec::new();
+    for message in rounds.iter().map(|round| &round.message) {
+        if message.role == Role::Assistant {
+            calls.clear();
+        }
+        let mut answered = 0;
         for block in &message.content {
             match block {
-                ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
-                    items.push(Item::Thinking {
-                        text: sanitize_stream_text(thinking),
-                        estimate: None,
-                        ended: true,
-                    });
+                ContentBlock::Thinking { parts, .. } => {
+                    let thinking = crate::conversation::reasoning_text(parts);
+                    if !thinking.trim().is_empty() {
+                        items.push(Item::Thinking {
+                            text: sanitize_stream_text(&thinking),
+                            estimate: None,
+                            ended: true,
+                        });
+                    }
                 }
-                ContentBlock::Text { text } if message.role == Role::Assistant => {
+                ContentBlock::Text { text, .. } if message.role == Role::Assistant => {
                     if !text.trim().is_empty() {
                         items.push(Item::Text {
                             text: sanitize_stream_text(text),
@@ -2234,7 +2404,14 @@ fn checkpoint_items(rounds: &[crate::conversation::Message]) -> Vec<Item> {
                         });
                     }
                 }
-                ContentBlock::ToolUse { id, name, input } if name != "context_replace" => {
+                // The compaction's own call, which the live run did not draw.
+                ContentBlock::ToolUse { name, .. } if name == "context_replace" => {
+                    calls.push(None);
+                }
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    calls.push(Some(items.len()));
                     items.push(Item::ToolCall {
                         id: id.clone(),
                         name: name.clone(),
@@ -2251,17 +2428,17 @@ fn checkpoint_items(rounds: &[crate::conversation::Message]) -> Vec<Item> {
                     });
                 }
                 ContentBlock::ToolResult {
-                    tool_use_id,
                     content,
                     is_error,
                     display,
+                    ..
                 } => {
-                    let (text, images) = result_text(content);
-                    if let Some(item) = items
-                        .iter_mut()
-                        .rev()
-                        .find(|item| matches!(item, Item::ToolCall { id, .. } if id == tool_use_id))
+                    let call = calls.get(answered).copied().flatten();
+                    answered += 1;
+                    if let Some(index) = call
+                        && let Some(item) = items.get_mut(index)
                     {
+                        let (text, images) = result_text(content);
                         settle_call(item, text, images, *is_error, display.as_ref());
                     }
                 }
@@ -2331,6 +2508,7 @@ mod tests {
                     size: 10,
                 },
             }],
+            provider_fields: None,
         };
         let mut read = transcript();
         read.set_pictures(std::collections::HashMap::from([(
@@ -2373,6 +2551,7 @@ mod tests {
                     created_at: String::new(),
                     said: None,
                     event: Event::Append(Message::user("in a recorded turn")),
+                    reply: None,
                 },
                 LogRow {
                     id: 2,
@@ -2380,6 +2559,7 @@ mod tests {
                     created_at: String::new(),
                     said: None,
                     event: Event::Append(Message::user("before turns were recorded")),
+                    reply: None,
                 },
             ],
             more: false,
@@ -2426,6 +2606,7 @@ mod tests {
                     body: "from another client".to_string(),
                     text: "from another client".to_string(),
                 }],
+                provider_fields: None,
             },
             outcomes: Vec::new(),
             late: None,
@@ -2438,7 +2619,7 @@ mod tests {
         live.apply(FrontendEvent::TurnEnded {
             turn_id: Uuid::new_v4(),
             ending: crate::store::turns::TurnEnding::succeeded(
-                "end_turn",
+                crate::conversation::StopReason::EndTurn,
                 crate::store::turns::TurnUsage::default(),
             ),
         });
@@ -2475,6 +2656,7 @@ mod tests {
                     created_at: String::new(),
                     said: None,
                     event,
+                    reply: None,
                 })
                 .collect(),
             more,
@@ -2486,7 +2668,9 @@ mod tests {
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
                 text: words.to_string(),
+                provider_fields: None,
             }],
+            provider_fields: None,
         })
     }
 
@@ -2527,6 +2711,7 @@ mod tests {
             name: "shell_execute".into(),
             input: serde_json::json!({"command": "ls"}),
             display_summary: Some("ls".into()),
+            unparsed: None,
         });
         transcript.apply(FrontendEvent::ToolCallOutputDelta {
             id: "call-1".into(),
@@ -2561,6 +2746,7 @@ mod tests {
             name: "agent_spawn".into(),
             input: serde_json::json!({"prompt": "count the files", "background": true}),
             display_summary: None,
+            unparsed: None,
         });
         transcript.apply(FrontendEvent::ToolCallCompleted {
             id: "call-1".into(),
@@ -2597,6 +2783,7 @@ mod tests {
             name: name.into(),
             input: serde_json::json!({"path": "/tmp/hello.py"}),
             display_summary: None,
+            unparsed: None,
         };
         let completed = |name: &str, new_text: Option<&str>| FrontendEvent::ToolCallCompleted {
             id: "call-1".into(),
@@ -2695,15 +2882,21 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::Thinking {
-                        thinking: "saving the notes first".into(),
+                        parts: vec![crate::conversation::ReasoningPart::reasoning(
+                            "saving the notes first",
+                        )],
                         opaque: None,
+                        provider_fields: None,
                     },
                     ContentBlock::ToolUse {
                         id: "call-1".into(),
                         name: "memory_write".into(),
                         input: serde_json::json!({"name": "notes"}),
+                        unparsed: None,
+                        provider_fields: None,
                     },
                 ],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -2715,6 +2908,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::Assistant,
@@ -2722,7 +2916,10 @@ mod tests {
                     id: "call-2".into(),
                     name: "context_replace".into(),
                     input: serde_json::json!({"summary": "a summary"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
         ];
         let record = crate::conversation::CompactionRecord {
@@ -2733,7 +2930,11 @@ mod tests {
             // A summary that carries an earlier summary's section heading over, as a second
             // compaction's often does: the record holds it as written.
             written_summary: "a summary\n\n[Checklist]\n\n1. carried over\n".to_string(),
-            checkpoint: rounds,
+            checkpoint: rounds
+                .into_iter()
+                .map(crate::conversation::RecordedMessage::unrecorded)
+                .collect(),
+            summarizer: Vec::new(),
         };
         let mut live = transcript();
         live.apply(FrontendEvent::CompactionStarted {
@@ -2759,11 +2960,16 @@ mod tests {
         let mut resumed = transcript();
         resumed.load_page_above(page(
             vec![Event::CompactBoundary {
-                summary: Message::user(format!(
-                    "{}\n\na summary\n\n[Checklist]\n\n1. carried over\n\n[Checklist]\n\n\
-                     [Continue the work.]",
-                    crate::conversation::COMPACTION_SUMMARY_PREFIX,
-                )),
+                summary: Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Summary {
+                        text: "[Conversation summary from session compaction]\n\na summary\n\n\
+                               [Checklist]\n\n1. carried over\n\n[Checklist]\n\n[Continue the \
+                               work.]"
+                            .to_string(),
+                    }],
+                    provider_fields: None,
+                },
                 replaced_count: 3,
                 record: record.clone(),
                 loaded_tools_snapshot: Default::default(),
@@ -2883,7 +3089,10 @@ mod tests {
                             id: "call-1".into(),
                             name: name.into(),
                             input,
+                            unparsed: None,
+                            provider_fields: None,
                         }],
+                        provider_fields: None,
                     }),
                     Event::Append(Message {
                         role: Role::User,
@@ -2895,6 +3104,7 @@ mod tests {
                             is_error,
                             display: None,
                         }],
+                        provider_fields: None,
                     }),
                 ],
                 1,
@@ -3019,6 +3229,7 @@ mod tests {
                 name: (*name).into(),
                 input: input.clone(),
                 display_summary: crate::tools::resolve_primary_param(name, input),
+                unparsed: None,
             });
             live.apply(FrontendEvent::ToolCallOutputDelta {
                 id: id.clone(),
@@ -3044,6 +3255,8 @@ mod tests {
                 id: format!("call-{index}"),
                 name: (*name).into(),
                 input: input.clone(),
+                unparsed: None,
+                provider_fields: None,
             })
             .collect();
         let results = calls
@@ -3064,10 +3277,12 @@ mod tests {
                 Event::Append(Message {
                     role: Role::Assistant,
                     content: uses,
+                    provider_fields: None,
                 }),
                 Event::Append(Message {
                     role: Role::User,
                     content: results,
+                    provider_fields: None,
                 }),
             ],
             1,
@@ -3133,7 +3348,10 @@ mod tests {
                         id: id.into(),
                         name: "checklist_edit".into(),
                         input: serde_json::json!({"id": 1}),
+                        unparsed: None,
+                        provider_fields: None,
                     }],
+                    provider_fields: None,
                 }),
                 Event::Append(Message {
                     role: Role::User,
@@ -3146,6 +3364,7 @@ mod tests {
                             ..Default::default()
                         }),
                     }],
+                    provider_fields: None,
                 }),
             ]
         };
@@ -3172,8 +3391,8 @@ mod tests {
     }
 
     /// What Meka wrote into a result for the model alone is left out of the screen or said for
-    /// a reader: the line naming an image, the tools a load made callable, the directions around
-    /// a large output and around a call sent to the background.
+    /// a reader: a note, the caption naming an image, the tools a load made callable, the
+    /// directions around a large output and around a call sent to the background.
     #[test]
     fn a_result_is_shown_without_the_directions_written_for_the_model() {
         let image = ToolResultContent::Image {
@@ -3183,14 +3402,24 @@ mod tests {
             },
         };
         let text = |text: &str| ToolResultContent::Text { text: text.into() };
+        let caption = ToolResultContent::ImageCaption {
+            caption: "Image: logo.png".into(),
+        };
         assert_eq!(
-            result_text(&[text("[Image: logo.png]"), image.clone()]),
+            result_text(&[caption.clone(), image.clone()]),
             (String::new(), 1)
         );
         assert_eq!(
-            result_text(&[text("[Image: logo.png]")]),
+            result_text(&[caption]),
             ("[Image: logo.png]".to_string(), 0),
-            "without an image, the line is what the tool said"
+            "without the image, the caption is what is left of it"
+        );
+        assert_eq!(
+            result_text(&[text("done"), ToolResultContent::HarnessNote {
+                note: "Called without loading its schema.".into(),
+            },]),
+            ("done".to_string(), 0),
+            "a note is the model's"
         );
         assert_eq!(
             result_text(&[ToolResultContent::ToolReference {
@@ -3217,10 +3446,12 @@ mod tests {
             "Background task 7f3a1c22",
             "a task named by its prefix alone"
         );
-        let spilled = "<large-output name=\"shell_execute_x_1\" size=\"47000\">\nOutput too \
-                       large (45.9 KiB). Read it with `scratchpad_read`.\n\nPreview (first 5 \
-                       bytes):\nhello\n...\n</large-output>";
-        assert_eq!(result_text(&[text(spilled)]).0, "hello");
+        let spilled = ToolResultContent::LargeOutput {
+            scratchpad_entry: "shell_execute_x_1".into(),
+            size_bytes: 47_000,
+            preview: "hello".into(),
+        };
+        assert_eq!(result_text(&[spilled]).0, "hello");
     }
 
     /// A stored conversation replays as the items the live run would have shown, with each call's
@@ -3237,22 +3468,28 @@ mod tests {
                     },
                     ContentBlock::Text {
                         text: "list the files".into(),
+                        provider_fields: None,
                     },
                 ],
+                provider_fields: None,
             },
             Message {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::Thinking {
-                        thinking: "ls will do".into(),
+                        parts: vec![crate::conversation::ReasoningPart::reasoning("ls will do")],
                         opaque: None,
+                        provider_fields: None,
                     },
                     ContentBlock::ToolUse {
                         id: "call-1".into(),
                         name: "shell_execute".into(),
                         input: serde_json::json!({"command": "ls"}),
+                        unparsed: None,
+                        provider_fields: None,
                     },
                 ],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -3262,12 +3499,15 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text {
                     text: "Two files.".into(),
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
         ];
         transcript.load_page_above(page(
@@ -3310,6 +3550,7 @@ mod tests {
                     },
                 },
             ],
+            provider_fields: None,
         };
         let mut live = transcript();
         live.apply(FrontendEvent::MessageAppended {
@@ -3337,6 +3578,7 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "compare ".into(),
+                    provider_fields: None,
                 },
                 ContentBlock::Resource {
                     uri: "file:///src/a.rs".into(),
@@ -3345,8 +3587,10 @@ mod tests {
                 },
                 ContentBlock::Text {
                     text: " with the old one".into(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let mut replayed = transcript();
         replayed.load_page_above(page(vec![Event::Append(mentioned)], 1, false));
@@ -3395,6 +3639,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
         transcript.load_page_above(page(vec![result, said("Two files.")], 5, true));
         let before: Vec<u64> = transcript.drawn().map(|entry| entry.id).collect();
@@ -3407,7 +3652,10 @@ mod tests {
                 id: "call-1".into(),
                 name: "shell_execute".into(),
                 input: serde_json::json!({"command": "ls"}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         });
         transcript.load_page_above(page(vec![said("Earlier."), call], 3, false));
         let shown = items(&transcript);
@@ -3626,7 +3874,9 @@ mod tests {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: words.to_string(),
+                provider_fields: None,
             }],
+            provider_fields: None,
         })
     }
 
@@ -3642,6 +3892,7 @@ mod tests {
                     created_at: String::new(),
                     said: None,
                     event,
+                    reply: None,
                 })
                 .collect(),
             more,
@@ -3698,7 +3949,7 @@ mod tests {
         transcript.apply(FrontendEvent::TurnEnded {
             turn_id: turn,
             ending: crate::store::turns::TurnEnding::succeeded(
-                "end_turn",
+                crate::conversation::StopReason::EndTurn,
                 crate::store::turns::TurnUsage {
                     input_tokens: 1000,
                     output_tokens: 200,
@@ -3767,7 +4018,7 @@ mod tests {
         transcript.apply(FrontendEvent::TurnEnded {
             turn_id: turn,
             ending: crate::store::turns::TurnEnding::succeeded(
-                "end_turn",
+                crate::conversation::StopReason::EndTurn,
                 crate::store::turns::TurnUsage::default(),
             ),
         });
@@ -3805,6 +4056,7 @@ mod tests {
             Event::Append(Message {
                 role: Role::User,
                 content,
+                provider_fields: None,
             })
         };
         let context = || ContentBlock::TurnContext {
@@ -3944,6 +4196,7 @@ mod tests {
                     created_at: String::new(),
                     said: None,
                     event,
+                    reply: None,
                 })
                 .collect(),
             more,
@@ -4034,6 +4287,7 @@ mod tests {
                 created_at: String::new(),
                 said: Some(said),
                 event: asked("kept?"),
+                reply: None,
             }],
             more: false,
         });
@@ -4045,6 +4299,187 @@ mod tests {
             "{:?}",
             items(&transcript)
         );
+    }
+
+    /// A call no result answered by the time its turn ended never ran: the live screen takes it
+    /// out as the turn ends, and a replay of the log, whose record keeps the reply that made it,
+    /// draws it nowhere. A call that was answered stays on both.
+    #[test]
+    fn a_call_that_never_ran_is_gone_live_and_on_a_replay() {
+        let calls = |transcript: &Transcript| -> Vec<String> {
+            items(transcript)
+                .into_iter()
+                .filter_map(|item| match item {
+                    Item::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let call = |id: &str| ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "file_read".to_string(),
+            input: serde_json::json!({}),
+            unparsed: None,
+            provider_fields: None,
+        };
+        let turn = Uuid::new_v4();
+        let mut live = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        live.apply(FrontendEvent::TurnStarted { turn_id: turn });
+        live.apply(FrontendEvent::ToolCallStarted {
+            id: "never".to_string(),
+            name: "file_read".to_string(),
+            input: serde_json::json!({}),
+            display_summary: None,
+            unparsed: None,
+        });
+        live.apply(FrontendEvent::TurnEnded {
+            turn_id: turn,
+            ending: crate::store::turns::TurnEnding::canceled(
+                crate::store::turns::TurnUsage::default(),
+                crate::store::turns::CancelReason::Client,
+            ),
+        });
+        assert!(calls(&live).is_empty(), "{:?}", calls(&live));
+
+        let (answered, stopped) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut replayed = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        replayed.set_turn_records(vec![
+            closed_turn(answered, TurnStatus::Succeeded),
+            closed_turn(stopped, TurnStatus::Canceled),
+        ]);
+        let reply = |id: &str| {
+            Event::Append(Message {
+                role: Role::Assistant,
+                content: vec![call(id)],
+                provider_fields: None,
+            })
+        };
+        replayed.load_page_above(in_turns(
+            vec![
+                (answered, asked("one?")),
+                (answered, reply("ran")),
+                (
+                    answered,
+                    Event::Append(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::ToolResult {
+                            tool_use_id: "ran".into(),
+                            content: vec![ToolResultContent::Text { text: "ok".into() }],
+                            is_error: false,
+                            display: None,
+                        }],
+                        provider_fields: None,
+                    }),
+                ),
+                (answered, said("One.")),
+                (stopped, asked("two?")),
+                (stopped, reply("never")),
+            ],
+            &[1, 2, 3, 4, 5, 6],
+            false,
+        ));
+        assert_eq!(calls(&replayed), ["ran"]);
+    }
+
+    /// A call that never ran is drawn nowhere on a replay whichever page holds it: a cut reply's
+    /// by its record, wherever its turn ends, and one whose turn ends on another page, whether
+    /// that page was drawn first and the call's read above it, or the call's was drawn first and
+    /// the other read below it on the way back down.
+    #[test]
+    fn a_call_that_never_ran_is_gone_across_pages_and_when_cut() {
+        use crate::conversation::{ReplyCut, ReplyRecord};
+        let calls = |transcript: &Transcript| -> Vec<String> {
+            items(transcript)
+                .into_iter()
+                .filter_map(|item| match item {
+                    Item::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let reply = |id: &str| {
+            Event::Append(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: id.to_string(),
+                    name: "file_read".to_string(),
+                    input: serde_json::json!({}),
+                    unparsed: None,
+                    provider_fields: None,
+                }],
+                provider_fields: None,
+            })
+        };
+        let mut cut = transcript();
+        let mut page = page(vec![asked("one?"), reply("cut")], 1, false);
+        page.rows[1].reply = Some(ReplyRecord {
+            stop: None,
+            cut: Some(ReplyCut::Stopped),
+            model: None,
+            profile: None,
+            usage: None,
+            provider_fields: None,
+        });
+        cut.load_page_above(page);
+        assert!(calls(&cut).is_empty(), "{:?}", calls(&cut));
+
+        let (stopped, after) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut paged = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        paged.set_turn_records(vec![
+            closed_turn(stopped, TurnStatus::Canceled),
+            closed_turn(after, TurnStatus::Succeeded),
+        ]);
+        paged.load_page_above(in_turns(
+            vec![
+                (stopped, said("Partial.")),
+                (after, asked("two?")),
+                (after, said("Two.")),
+            ],
+            &[3, 4, 5],
+            true,
+        ));
+        paged.load_page_above(in_turns(
+            vec![(stopped, asked("one?")), (stopped, reply("never"))],
+            &[1, 2],
+            false,
+        ));
+        assert!(calls(&paged).is_empty(), "{:?}", calls(&paged));
+
+        let older = Uuid::new_v4();
+        let mut scrolled = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        scrolled.set_turn_records(vec![
+            closed_turn(older, TurnStatus::Succeeded),
+            closed_turn(stopped, TurnStatus::Canceled),
+            closed_turn(after, TurnStatus::Succeeded),
+        ]);
+        let newest = || {
+            in_turns(
+                vec![(after, asked("two?")), (after, said("Two."))],
+                &[1500, 1501],
+                true,
+            )
+        };
+        let middle = || {
+            in_turns(
+                vec![(stopped, asked("one?")), (stopped, reply("never"))],
+                &[1000, 1001],
+                true,
+            )
+        };
+        scrolled.load_page_above(newest());
+        scrolled.load_page_above(middle());
+        // A page this long leaves the window room for itself alone, which drops both newer ones.
+        scrolled.load_page_above(in_turns(
+            vec![(older, asked("zero?")), (older, said("Zero."))],
+            &[1, 1999],
+            false,
+        ));
+        scrolled.load_page_below(middle());
+        scrolled.load_page_below(LogPage {
+            more: false,
+            ..newest()
+        });
+        assert!(calls(&scrolled).is_empty(), "{:?}", calls(&scrolled));
     }
 
     /// On a replay each recorded turn closes where its rows end: inside a page where the next
@@ -4233,8 +4668,10 @@ mod tests {
                     },
                     ContentBlock::Text {
                         text: "typed".to_string(),
+                        provider_fields: None,
                     },
                 ],
+                provider_fields: None,
             },
             outcomes: vec![task],
             late: Some(crate::frontend::FireLateness {
@@ -4294,6 +4731,7 @@ mod tests {
                     inbox(own, "mine"),
                     inbox(foreign, "from afar"),
                 ],
+                provider_fields: None,
             },
             outcomes: Vec::new(),
             late: None,
@@ -4352,7 +4790,10 @@ mod tests {
                         id: "c1".into(),
                         name: "checklist_add".into(),
                         input: serde_json::json!({"items": ["first thing"]}),
+                        unparsed: None,
+                        provider_fields: None,
                     }],
+                    provider_fields: None,
                 }),
                 Event::Append(Message {
                     role: Role::User,
@@ -4365,6 +4806,7 @@ mod tests {
                             ..ResultDisplay::default()
                         }),
                     }],
+                    provider_fields: None,
                 }),
             ],
             1,
@@ -4426,9 +4868,145 @@ mod tests {
         ]);
     }
 
+    /// A reply that made calls and stopped at the output limit is said in one row, live and on a
+    /// replay of the log, where its record says how it stopped: after the round's results and the
+    /// list they left. A round that stopped to have its calls run says nothing, and nor does a
+    /// reply whose calls never ran.
+    #[test]
+    fn a_round_cut_short_is_said_live_and_on_a_replay() {
+        use crate::conversation::{ReplyRecord, Stop, StopReason};
+        let listed = vec![ChecklistItem {
+            id: 1,
+            text: "first thing".into(),
+            status: crate::checklist::ChecklistStatus::Pending,
+            reason: None,
+            task: None,
+        }];
+        let row = |id: i64, event: Event, reply: Option<ReplyRecord>| LogRow {
+            id,
+            turn_id: None,
+            created_at: String::new(),
+            said: None,
+            event,
+            reply,
+        };
+        let page = |stop_reason, answered: bool| {
+            let mut rows = vec![row(
+                1,
+                Event::Append(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-1".to_string(),
+                        name: "checklist_add".to_string(),
+                        input: serde_json::json!({}),
+                        unparsed: None,
+                        provider_fields: None,
+                    }],
+                    provider_fields: None,
+                }),
+                Some(ReplyRecord {
+                    stop: Some(Stop::of(stop_reason)),
+                    cut: None,
+                    model: None,
+                    profile: None,
+                    usage: None,
+                    provider_fields: None,
+                }),
+            )];
+            if answered {
+                rows.push(row(
+                    2,
+                    Event::Append(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::ToolResult {
+                            tool_use_id: "call-1".into(),
+                            content: vec![ToolResultContent::Text { text: "ok".into() }],
+                            is_error: false,
+                            display: Some(ResultDisplay {
+                                checklist: Some(listed.clone()),
+                                ..ResultDisplay::default()
+                            }),
+                        }],
+                        provider_fields: None,
+                    }),
+                    None,
+                ));
+            }
+            LogPage { rows, more: false }
+        };
+        let notes = |transcript: &Transcript| -> Vec<String> {
+            items(transcript)
+                .into_iter()
+                .filter_map(|item| match item {
+                    Item::Notice { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut live = transcript();
+        live.apply(FrontendEvent::ReplyStopped {
+            stop_reason: StopReason::MaxTokens,
+        });
+        let mut replayed = transcript();
+        replayed.load_page_above(page(StopReason::MaxTokens, true));
+        assert_eq!(notes(&live), ["Reply hit the output limit"]);
+        assert_eq!(notes(&replayed), notes(&live));
+        assert!(
+            matches!(items(&replayed)[..], [
+                Item::ToolCall { .. },
+                Item::Checklist { .. },
+                Item::Notice { .. }
+            ]),
+            "{:?}",
+            items(&replayed)
+        );
+        let mut round = transcript();
+        round.load_page_above(page(StopReason::ToolUse, true));
+        assert!(notes(&round).is_empty(), "{:?}", notes(&round));
+        let mut never_ran = transcript();
+        never_ran.load_page_above(page(StopReason::MaxTokens, false));
+        assert!(notes(&never_ran).is_empty(), "{:?}", notes(&never_ran));
+    }
+
+    /// A reply a wire split into text blocks is drawn as one text, on a replay as live, where its
+    /// words streamed into one.
+    #[test]
+    fn a_reply_split_into_text_blocks_is_one_text_on_a_replay() {
+        let text = |words: &str| ContentBlock::Text {
+            text: words.to_string(),
+            provider_fields: None,
+        };
+        let mut live = transcript();
+        live.apply(FrontendEvent::AssistantTextDelta("The answer is ".into()));
+        live.apply(FrontendEvent::AssistantTextDelta("42.".into()));
+        live.apply(FrontendEvent::TurnFinished);
+        let mut replayed = transcript();
+        replayed.load_page_above(page(
+            vec![Event::Append(Message {
+                role: Role::Assistant,
+                content: vec![text("The answer is "), text("42.")],
+                provider_fields: None,
+            })],
+            1,
+            false,
+        ));
+        let texts = |transcript: &Transcript| -> Vec<String> {
+            items(transcript)
+                .into_iter()
+                .filter_map(|item| match item {
+                    Item::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(texts(&replayed), ["The answer is 42."]);
+        assert_eq!(texts(&replayed), texts(&live));
+    }
+
     /// A thinking block with no words is no step, live or on a replay of the log: the live run
     /// lets its counter go as it ends, a whole block that comes with no words is not drawn, and
-    /// a replay draws none, so the folds count alike.
+    /// a replay draws none, so the folds count alike. A reply that held nothing else is said to be
+    /// empty, in one wording on both.
     #[test]
     fn a_thinking_block_with_no_words_is_no_step() {
         let mut live = transcript();
@@ -4439,20 +5017,62 @@ mod tests {
         live.apply(FrontendEvent::ThinkingBlock {
             content: String::new(),
         });
-        assert!(items(&live).is_empty(), "{:?}", items(&live));
+        live.apply(FrontendEvent::NoAnswer);
+        assert_eq!(items(&live), vec![&Item::note(NO_ANSWER)]);
         let mut replayed = transcript();
         replayed.load_page_above(page(
             vec![Event::Append(Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Thinking {
-                    thinking: String::new(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning("")],
                     opaque: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             })],
             1,
             false,
         ));
-        assert!(items(&replayed).is_empty(), "{:?}", items(&replayed));
+        assert_eq!(items(&replayed), vec![&Item::note(NO_ANSWER)]);
+    }
+
+    /// A reply cut short before it answered did not end, so a replay says nothing of an answer for
+    /// it, as the live screen said nothing: its turn's row says what cut it.
+    #[test]
+    fn a_reply_cut_before_it_answered_is_not_said_to_have_answered_nothing() {
+        use crate::conversation::{ReplyCut, ReplyRecord};
+        let mut replayed = transcript();
+        replayed.load_page_above(LogPage {
+            rows: vec![LogRow {
+                id: 1,
+                turn_id: None,
+                created_at: String::new(),
+                said: None,
+                event: Event::Append(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Thinking {
+                        parts: vec![crate::conversation::ReasoningPart::reasoning("Working")],
+                        opaque: None,
+                        provider_fields: None,
+                    }],
+                    provider_fields: None,
+                }),
+                reply: Some(ReplyRecord {
+                    stop: None,
+                    cut: Some(ReplyCut::Failed),
+                    model: None,
+                    profile: None,
+                    usage: None,
+                    provider_fields: None,
+                }),
+            }],
+            more: false,
+        });
+        assert!(
+            !items(&replayed).contains(&&Item::note(NO_ANSWER)),
+            "{:?}",
+            items(&replayed)
+        );
     }
 
     /// What the log never holds is not left drawn live: answer text of spaces alone once its
@@ -4473,7 +5093,7 @@ mod tests {
         transcript.apply(FrontendEvent::TurnEnded {
             turn_id: Uuid::new_v4(),
             ending: crate::store::turns::TurnEnding::succeeded(
-                "end_turn",
+                crate::conversation::StopReason::EndTurn,
                 crate::store::turns::TurnUsage::default(),
             ),
         });
@@ -4497,7 +5117,10 @@ mod tests {
                     id: "call_0".into(),
                     name: "shell_execute".into(),
                     input: serde_json::json!({"command": "ls"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             })
         };
         let result = |text: &str| {
@@ -4509,6 +5132,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             })
         };
         let results = |above: Vec<Event>| {
@@ -4593,8 +5217,10 @@ mod tests {
                     },
                     ContentBlock::Text {
                         text: "typed".into(),
+                        provider_fields: None,
                     },
                 ],
+                provider_fields: None,
             },
             outcomes: Vec::new(),
             late: None,
@@ -4745,7 +5371,7 @@ mod tests {
         FrontendEvent::TurnEnded {
             turn_id: Uuid::new_v4(),
             ending: crate::store::turns::TurnEnding::succeeded(
-                "end_turn",
+                crate::conversation::StopReason::EndTurn,
                 crate::store::turns::TurnUsage::default(),
             ),
         }
@@ -4771,7 +5397,10 @@ mod tests {
                     id: "a".into(),
                     name: "checklist_add".into(),
                     input: serde_json::json!({"items": ["first thing"]}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             }),
             Event::Append(Message {
                 role: Role::User,
@@ -4797,6 +5426,7 @@ mod tests {
                         text: "look here".into(),
                     },
                 ],
+                provider_fields: None,
             }),
         ];
         let mut transcript = transcript();
@@ -4824,6 +5454,7 @@ mod tests {
             name: "file_read".into(),
             input: serde_json::json!({"path": "a.txt"}),
             display_summary: Some("a.txt".into()),
+            unparsed: None,
         });
         transcript.apply(FrontendEvent::ToolCallCompleted {
             id: "ran".into(),
@@ -4838,6 +5469,7 @@ mod tests {
             name: "file_read".into(),
             input: serde_json::json!({"path": "b.txt"}),
             display_summary: Some("b.txt".into()),
+            unparsed: None,
         });
         transcript.apply(succeeded());
         let calls: Vec<&str> = items(&transcript)
@@ -4860,6 +5492,7 @@ mod tests {
             name: "file_read".into(),
             input: serde_json::json!({ "path": path }),
             display_summary: Some(path.to_string()),
+            unparsed: None,
         };
         transcript.apply(started("a.txt"));
         transcript.apply(FrontendEvent::ToolCallDropped {
@@ -4896,6 +5529,7 @@ mod tests {
             name: "file_read".into(),
             input: serde_json::json!({"path": "b.txt"}),
             display_summary: Some("b.txt".into()),
+            unparsed: None,
         });
         transcript.apply(FrontendEvent::ToolCallDropped {
             id: "b".into(),
@@ -5117,6 +5751,7 @@ mod tests {
                         },
                     },
                 ],
+                provider_fields: None,
             },
             outcomes: Vec::new(),
             late: None,
@@ -5168,6 +5803,7 @@ mod tests {
                 name: "shell_execute".into(),
                 input: serde_json::json!({"command": command}),
                 display_summary: Some(command.into()),
+                unparsed: None,
             });
             transcript.apply(FrontendEvent::ToolCallCompleted {
                 id: "call_0".into(),

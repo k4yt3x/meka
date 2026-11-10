@@ -60,10 +60,10 @@ pub(crate) use self::{
     scratchpad::{RenameOutcome, ScratchpadEntry},
     search::SessionMatch,
     sessions::{
-        ForkOverrides, HistoryEdge, HistoryEntry, HistoryKind, ImportSessionRecord, ImportedEvent,
-        LogPage, LogRow, Rewound, Said, SaidStamp, SessionFilter, SessionMetaRow, SessionPatch,
-        SessionReach, SessionSummary, SessionSweep, SourceLock, SpawnTerms, is_rewound,
-        normalize_title,
+        ForkOverrides, HistoryEdge, HistoryEntry, HistoryKind, HistoryReply, ImportSessionRecord,
+        ImportedEvent, LogPage, LogRow, RecordedEvent, Rewound, Said, SaidStamp, SessionFilter,
+        SessionMetaRow, SessionPatch, SessionReach, SessionSummary, SessionSweep, SourceLock,
+        SpawnTerms, is_rewound, normalize_title,
     },
 };
 use crate::error::{MekaError, Result};

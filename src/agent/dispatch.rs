@@ -24,6 +24,8 @@ pub(super) struct ResolvedCall<'a> {
     pub(super) tool_call_id: &'a str,
     pub(super) name: &'a str,
     pub(super) input: &'a serde_json::Value,
+    /// What the model sent when it was not arguments, which refuses the call.
+    pub(super) unparsed: Option<&'a crate::conversation::UnparsedArguments>,
 }
 
 /// Which door a resolved call comes through; see [`Agent::run_admitted_call`].
@@ -89,11 +91,21 @@ impl Agent {
         // Emit tool-call indicators in source order. The streaming path already emitted these as
         // `ToolUseEnd` events; this loop only fires for the blocking provider path. Serial so
         // concurrent execution below can't interleave indicators.
-        let mut planned: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut planned: Vec<(&str, &str, &serde_json::Value, Option<&_>)> = Vec::new();
         for block in &assistant_message.content {
-            if let ContentBlock::ToolUse { id, name, input } = block {
+            if let ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                unparsed,
+                ..
+            } = block
+            {
                 if !self.options.streaming {
-                    let display_summary = crate::tools::resolve_primary_param(name, input);
+                    let display_summary = unparsed
+                        .is_none()
+                        .then(|| crate::tools::resolve_primary_param(name, input))
+                        .flatten();
                     self.cells
                         .frontend
                         .emit(FrontendEvent::ToolCallStarted {
@@ -101,16 +113,17 @@ impl Agent {
                             name: name.clone(),
                             input: input.clone(),
                             display_summary,
+                            unparsed: unparsed.clone(),
                         })
                         .await;
                 }
-                planned.push((id.clone(), name.clone(), input.clone()));
+                planned.push((id, name, input, unparsed.as_ref()));
             }
         }
 
         // Dispatch concurrently. `join_all` preserves input ordering so the i-th output corresponds
         // to the i-th planned call.
-        let futures = planned.iter().map(|(id, name, input)| {
+        let futures = planned.iter().map(|&(id, name, input, unparsed)| {
             let cancellation = cancellation.clone();
             async move {
                 use futures::FutureExt;
@@ -120,9 +133,12 @@ impl Agent {
                 // conversation ending on a call with no result, and every later request is
                 // rejected until the session is evicted.
                 let run = self.resolve_and_execute_tool(
-                    id.as_str(),
-                    name.as_str(),
-                    input,
+                    ResolvedCall {
+                        tool_call_id: id,
+                        name,
+                        input,
+                        unparsed,
+                    },
                     loaded,
                     attribution,
                     cancellation,
@@ -149,7 +165,8 @@ impl Agent {
         let mut durations = Vec::with_capacity(planned.len());
         let mut inline_results = Vec::new();
         let mut checklist_fired = false;
-        for ((id, name, _), (output, elapsed)) in planned.into_iter().zip(outputs) {
+        for ((id, name, ..), (output, elapsed)) in planned.into_iter().zip(outputs) {
+            let (id, name) = (id.to_string(), name.to_string());
             if !output.is_output {
                 inline_results.push(id.clone());
             }
@@ -215,13 +232,12 @@ impl Agent {
 
     pub(super) async fn resolve_and_execute_tool(
         &self,
-        tool_call_id: &str,
-        name: &str,
-        input: &serde_json::Value,
+        call: ResolvedCall<'_>,
         loaded: &[String],
         attribution: &crate::provider::Attribution,
         cancellation: CancellationToken,
     ) -> crate::tools::ToolOutput {
+        let name = call.name;
         let Some(tool) = self.tool_registry.get(name) else {
             // A tool from a server that never connected was never registered, so it lands here.
             // Saying "unknown" would be false (it exists and is unreachable) and would teach the
@@ -254,11 +270,7 @@ impl Agent {
 
         self.run_admitted_call(
             &tool,
-            ResolvedCall {
-                tool_call_id,
-                name,
-                input,
-            },
+            call,
             loaded,
             attribution,
             cancellation,
@@ -290,6 +302,7 @@ impl Agent {
             tool_call_id,
             name,
             input,
+            unparsed,
         } = call;
         // Read at the enforcement site, so a level cycled or a switch toggled during dispatch
         // means the next call rather than a snapshot captured earlier in the loop.
@@ -323,10 +336,11 @@ impl Agent {
         let definition = tool.definition();
         let schema = &definition.parameters;
 
-        let (input, detach) = match crate::tools::admit_arguments(&**tool, &definition, input) {
-            Ok(admitted) => admitted,
-            Err(refusal) => return refusal,
-        };
+        let (input, detach) =
+            match crate::tools::admit_arguments(&**tool, &definition, input, unparsed) {
+                Ok(admitted) => admitted,
+                Err(refusal) => return refusal,
+            };
         let input = &input;
         // A checkpoint tool runs inline whatever the model asked: the flag is stripped like
         // everywhere else and not honored, since a task outliving the checkpoint would report
@@ -397,7 +411,7 @@ impl Agent {
         };
         if let Some(advisory) = self.schema_advisory(name, input, schema, loaded, !output.is_error)
         {
-            output.append_notice(&advisory);
+            output.push_note(advisory);
         }
         output
     }
@@ -831,7 +845,7 @@ async fn background_outcome(
     Option<String>,
     Option<crate::store::background::SavedOutput>,
 ) {
-    use crate::tools::scratchpad::{Redirect, redirect, save_images, spill};
+    use crate::tools::scratchpad::{Redirect, notes_of, redirect, save_images, spill};
     let wanted = output
         .spill_hint
         .name
@@ -855,7 +869,15 @@ async fn background_outcome(
                     name,
                     content: text,
                 };
-                return (reference, None, Some(entry));
+                let notes = crate::conversation::ContentBlock::tool_result_text_content(&notes_of(
+                    &output.content,
+                ));
+                let report = if notes.is_empty() {
+                    reference
+                } else {
+                    format!("{reference}\n\n{notes}")
+                };
+                return (report, None, Some(entry));
             }
             Some(Redirect::Refused(refusal)) => note = refusal,
             None => {}
@@ -1062,8 +1084,11 @@ mod tests {
                     id: format!("call-{}", index + 1),
                     name: name.to_string(),
                     input: serde_json::json!({ "scratchpad": "probe" }),
+                    unparsed: None,
+                    provider_fields: None,
                 })
                 .collect(),
+            provider_fields: None,
         };
         let (results, _, inline_results) = agent
             .execute_tool_calls(
@@ -1128,7 +1153,10 @@ mod tests {
                 id: "call-1".to_string(),
                 name: "panicking".to_string(),
                 input: serde_json::json!({}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         };
         let (results, _durations, _) = agent
             .execute_tool_calls(
@@ -1242,9 +1270,12 @@ mod tests {
         ] {
             let output = agent
                 .resolve_and_execute_tool(
-                    "call-1",
-                    name,
-                    &serde_json::json!({}),
+                    ResolvedCall {
+                        tool_call_id: "call-1",
+                        name,
+                        input: &serde_json::json!({}),
+                        unparsed: None,
+                    },
                     &[],
                     &crate::provider::Attribution::default(),
                     CancellationToken::new(),
@@ -1267,6 +1298,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A call whose arguments were not an object is refused with the reason, at the one door every
+    /// call passes, and the tool never runs on arguments the model did not give.
+    #[tokio::test]
+    async fn a_call_whose_arguments_were_not_an_object_is_refused_before_the_tool_runs() {
+        use crate::provider::mock::MockProvider;
+
+        struct Fixture(Arc<std::sync::atomic::AtomicBool>);
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Fixture {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "read_thing".to_string(),
+                    description: "fixture".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    ..Default::default()
+                }
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: crate::tools::ToolContext,
+            ) -> crate::error::Result<crate::tools::ToolOutput> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::tools::ToolOutput::text("ran".to_string(), false))
+            }
+        }
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(Fixture(Arc::clone(&ran))))
+            .expect("registration");
+        let (agent, _store) =
+            agent_with_registry_for_test(Arc::new(MockProvider::from_rounds(vec![])), registry)
+                .await;
+        let unparsed = crate::conversation::UnparsedArguments {
+            text: Some("{\"path\": ".to_string()),
+            error: "invalid JSON arguments: EOF while parsing".to_string(),
+        };
+        let output = agent
+            .resolve_and_execute_tool(
+                ResolvedCall {
+                    tool_call_id: "call-1",
+                    name: "read_thing",
+                    input: &serde_json::json!({}),
+                    unparsed: Some(&unparsed),
+                },
+                &[],
+                &crate::provider::Attribution::default(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert_eq!(
+            output.text_content(),
+            "Tool call refused: invalid JSON arguments: EOF while parsing"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the tool never ran"
+        );
     }
 
     /// A detached call the background machinery would refuse is refused before anyone is asked
@@ -1318,9 +1418,12 @@ mod tests {
 
         let output = agent
             .resolve_and_execute_tool(
-                "call-1",
-                "write_thing",
-                &serde_json::json!({"background": true}),
+                ResolvedCall {
+                    tool_call_id: "call-1",
+                    name: "write_thing",
+                    input: &serde_json::json!({"background": true}),
+                    unparsed: None,
+                },
                 &[],
                 &crate::provider::Attribution::default(),
                 CancellationToken::new(),
@@ -1477,9 +1580,12 @@ mod tests {
 
         let output = agent
             .resolve_and_execute_tool(
-                "call-1",
-                "shell_execute",
-                &serde_json::json!({"command": "true"}),
+                ResolvedCall {
+                    tool_call_id: "call-1",
+                    name: "shell_execute",
+                    input: &serde_json::json!({"command": "true"}),
+                    unparsed: None,
+                },
                 &[],
                 &crate::provider::Attribution::default(),
                 CancellationToken::new(),
@@ -1531,9 +1637,12 @@ mod tests {
         async fn send(agent: &Agent, path: &str) -> crate::tools::ToolOutput {
             agent
                 .resolve_and_execute_tool(
-                    "call-1",
-                    "mcp__bridge__send_file",
-                    &serde_json::json!({"path": path}),
+                    ResolvedCall {
+                        tool_call_id: "call-1",
+                        name: "mcp__bridge__send_file",
+                        input: &serde_json::json!({"path": path}),
+                        unparsed: None,
+                    },
                     &[],
                     &crate::provider::Attribution::default(),
                     CancellationToken::new(),
@@ -1603,13 +1712,18 @@ mod tests {
                     id: "call-1".to_string(),
                     name: "checklist_add".to_string(),
                     input: serde_json::json!({"items": ["first"]}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "call-2".to_string(),
                     name: "no_such_tool".to_string(),
                     input: serde_json::json!({}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let (results, durations, _) = agent
             .execute_tool_calls(
@@ -1694,13 +1808,18 @@ mod tests {
                     input: serde_json::json!({
                         "id": 1, "status": "deferred", "reason": "building", "task": "1a2b3c4d"
                     }),
+                    unparsed: None,
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "edit-2".to_string(),
                     name: "checklist_edit".to_string(),
                     input: serde_json::json!({"id": 1, "status": "in_progress"}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let (results, ..) = agent
             .execute_tool_calls(
@@ -1811,18 +1930,25 @@ mod tests {
                     id: "exits-1".to_string(),
                     name: "exits".to_string(),
                     input: serde_json::json!({}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "changes-1".to_string(),
                     name: "changes".to_string(),
                     input: serde_json::json!({}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "add-1".to_string(),
                     name: "checklist_add".to_string(),
                     input: serde_json::json!({"items": ["first"]}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let (results, ..) = agent
             .execute_tool_calls(
@@ -1912,7 +2038,10 @@ mod tests {
                 id: "checklist-1".to_string(),
                 name: name.to_string(),
                 input,
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         };
         let rendered = || {
             frontend
@@ -2072,9 +2201,12 @@ mod tests {
 
         let output = agent
             .resolve_and_execute_tool(
-                "call-1",
-                "start_fixture",
-                &serde_json::json!({"background": true}),
+                ResolvedCall {
+                    tool_call_id: "call-1",
+                    name: "start_fixture",
+                    input: &serde_json::json!({"background": true}),
+                    unparsed: None,
+                },
                 &[],
                 &crate::provider::Attribution::default(),
                 CancellationToken::new(),
@@ -2124,9 +2256,12 @@ mod tests {
             for attempt in 0..2 {
                 let output = agent
                     .resolve_and_execute_tool(
-                        "call-1",
-                        "start_fixture",
-                        &input,
+                        ResolvedCall {
+                            tool_call_id: "call-1",
+                            name: "start_fixture",
+                            input: &input,
+                            unparsed: None,
+                        },
                         &[],
                         &attribution,
                         CancellationToken::new(),
@@ -2164,9 +2299,12 @@ mod tests {
         let input = serde_json::json!({"background": true});
         let attribution = crate::provider::Attribution::default();
         let call = agent.resolve_and_execute_tool(
-            "call-1",
-            "start_fixture",
-            &input,
+            ResolvedCall {
+                tool_call_id: "call-1",
+                name: "start_fixture",
+                input: &input,
+                unparsed: None,
+            },
             &[],
             &attribution,
             CancellationToken::new(),
@@ -2201,9 +2339,12 @@ mod tests {
         stop.cancel();
         let output = agent
             .resolve_and_execute_tool(
-                "call-1",
-                "start_fixture",
-                &serde_json::json!({"background": true}),
+                ResolvedCall {
+                    tool_call_id: "call-1",
+                    name: "start_fixture",
+                    input: &serde_json::json!({"background": true}),
+                    unparsed: None,
+                },
                 &[],
                 &crate::provider::Attribution::default(),
                 stop,
@@ -2235,9 +2376,12 @@ mod tests {
         let input = serde_json::json!({"background": true});
         let attribution = crate::provider::Attribution::default();
         let call = agent.resolve_and_execute_tool(
-            "call-1",
-            "start_fixture",
-            &input,
+            ResolvedCall {
+                tool_call_id: "call-1",
+                name: "start_fixture",
+                input: &input,
+                unparsed: None,
+            },
             &[],
             &attribution,
             stop.clone(),

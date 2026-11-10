@@ -4,31 +4,34 @@
 use super::*;
 use crate::{conversation::PromptRetention, session::CompactRequest, store::turns::CancelReason};
 
-/// Why an [`Agent::run_turn`] invocation finished cleanly. Callers that drive a user-facing
-/// protocol (e.g. the ACP `session/prompt` response) use this to map to a protocol-level stop
-/// reason; screen and one-shot callers discard it. `Interrupted` is not represented here. It
-/// surfaces as `Err(MekaError::Interrupted)` so the success-path return type stays straightforward.
+/// How an [`Agent::run_turn`] invocation finished cleanly: the class of its last reply's stop, and
+/// on a refusal the model's own words. A stop is `Err(MekaError::Interrupted)` instead, so the
+/// success path holds only turns that ran to an answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TurnOutcome {
-    /// The model returned a natural end-of-turn (or an unrecognized stop reason, treated as
-    /// end-of-turn since we have nothing better to surface).
-    EndTurn,
-    /// The provider stopped because the model hit its maximum output tokens. The assistant message
-    /// may be truncated; clients can reflect this in their UI.
-    MaxTokens,
-    /// The model refused to comply with the request (Claude `stop_reason: "refusal"`, OpenAI
-    /// equivalent). The string carries the model's refusal text when available so clients can
-    /// render it instead of a generic "request failed."
-    Refusal(String),
+pub(crate) struct TurnOutcome {
+    pub(crate) stop_reason: StopReason,
+    /// On a refusal, the words the model refused in: the refusal it returned, else the text it
+    /// wrote before the stop. `None` when it wrote nothing.
+    pub(crate) refusal_text: Option<String>,
 }
 
 impl TurnOutcome {
-    /// The stop reason's wire word, the one every surface reports it by.
-    pub(crate) const fn stop_reason(&self) -> &'static str {
-        match self {
-            Self::EndTurn => "end_turn",
-            Self::MaxTokens => "max_tokens",
-            Self::Refusal(_) => "refusal",
+    /// A turn whose last reply stopped as `stop_reason` and carried no refusal.
+    pub(crate) const fn of(stop_reason: StopReason) -> Self {
+        Self {
+            stop_reason,
+            refusal_text: None,
+        }
+    }
+
+    /// A turn that ended on `reply`, which stopped as `stop_reason`.
+    pub(crate) fn of_reply(stop_reason: StopReason, reply: &Message) -> Self {
+        let refusal_text = (stop_reason == StopReason::Refusal)
+            .then(|| reply.refusal_words())
+            .flatten();
+        Self {
+            stop_reason,
+            refusal_text,
         }
     }
 }
@@ -85,7 +88,10 @@ impl TurnInput {
         let words = if prompt.is_empty() {
             Vec::new()
         } else {
-            vec![ContentBlock::Text { text: prompt }]
+            vec![ContentBlock::Text {
+                text: prompt,
+                provider_fields: None,
+            }]
         };
         Ok(Self {
             prompt: Prompt::Sent(words),
@@ -107,7 +113,7 @@ impl TurnInput {
         images: Vec<ImageSource>,
     ) -> crate::error::Result<Self> {
         let says_something = parts.iter().any(|part| match part {
-            ContentBlock::Text { text } => !crate::text::is_blank(text),
+            ContentBlock::Text { text, .. } => !crate::text::is_blank(text),
             _ => true,
         });
         if !says_something && images.is_empty() {
@@ -232,6 +238,7 @@ impl TurnInput {
             Prompt::Sent(parts) => Message {
                 role: crate::conversation::Role::User,
                 content: parts.clone(),
+                provider_fields: None,
             }
             .text_paragraphs(),
             Prompt::Scheduled { prompt, .. } => prompt.clone(),
@@ -416,32 +423,6 @@ pub(super) fn gate_on_required_servers(not_ready: Vec<crate::mcp::NotConnected>)
             .collect(),
     })
 }
-/// Whether an assistant turn produced any user-visible text: a `Text` block with non-whitespace
-/// content. `Thinking`, `ToolUse`, `ToolResult`, and `Image` blocks are not user-visible prose, so
-/// a thinking-only turn returns `false` here.
-pub(super) fn has_visible_text(content: &[ContentBlock]) -> bool {
-    content
-        .iter()
-        .any(|block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()))
-}
-/// Human-readable stand-in for a terminal turn that produced no content (e.g. a hard refusal, or an
-/// empty `max_tokens` / `end_turn`). Used both as the persisted assistant text (so the message
-/// isn't empty) and as the line surfaced to the user.
-pub(super) fn empty_turn_notice(stop_reason: &StopReason) -> String {
-    match stop_reason {
-        StopReason::Refusal(text) if !text.is_empty() => text.clone(),
-        StopReason::Refusal(_) => "[The model declined to respond to this request.]".to_string(),
-        StopReason::MaxTokens => {
-            "[The model reached its output limit before producing a response.]".to_string()
-        }
-        // Surface the raw reason so an unrecognized stop reason is visible instead of being
-        // swallowed as a blank turn.
-        StopReason::Unknown(reason) => {
-            format!("[The model returned an empty response (stop reason: {reason}).]")
-        }
-        _ => "[The model returned an empty response.]".to_string(),
-    }
-}
 /// How many times in a row a turn is sent back to its open checklist items with no tool round in
 /// between before it is allowed to end with them open. Three tells stuck from slow: a model that
 /// answers the nudge three times without touching a tool is not going to touch one on the fourth.
@@ -471,13 +452,12 @@ pub(super) fn should_nudge_checklist(
         && open_items > 0
         && consecutive_nudges < CHECKLIST_NUDGE_LIMIT
         && nudges_this_turn < CHECKLIST_NUDGES_PER_TURN
-        && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_))
+        && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown)
 }
 
 /// Whether to nudge the model for a user-visible response after a turn that made no tool call and
-/// produced no visible text (a thinking-only turn): at most once per turn, and only for a terminal
-/// stop reason without its own handling, since `MaxTokens` and `Refusal` carry their own outcomes
-/// and a no-text turn under those reasons falls through to [`empty_turn_notice`].
+/// produced no visible text (a thinking-only turn): at most once per turn, and only for a stop that
+/// means done, since every other class is its own outcome and the turn ends on it as returned.
 pub(super) fn should_nudge_thinking_only(
     has_tool_calls: bool,
     has_visible_text: bool,
@@ -487,8 +467,52 @@ pub(super) fn should_nudge_thinking_only(
     !has_tool_calls
         && !has_visible_text
         && !already_nudged
-        && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_))
+        && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown)
 }
+/// The rows that record `reply`, a reply cut before it ended or stopped before its round ran, as
+/// it was returned, under `record`, and what the context keeps of it: with `kept`, the reply
+/// without the calls it made, which never ran and so have no result to answer them, as long as it
+/// holds words; otherwise nothing, since reasoning cut short carries nothing a provider takes back.
+/// `None` when a cut came before anything arrived; a reply that ended is recorded even when it
+/// holds nothing, as every reply that ends is. The second half is the messages a repair puts in its
+/// place, `None` when the context keeps it whole.
+fn cut_reply_rows(
+    reply: &Message,
+    record: crate::conversation::ReplyRecord,
+    kept: bool,
+) -> Option<(Vec<crate::store::RecordedEvent>, Option<Vec<Message>>)> {
+    if reply.content.is_empty() && record.cut.is_some() {
+        return None;
+    }
+    let without_calls = reply.without_tool_use();
+    let view = if !kept || !without_calls.has_visible_text() {
+        Some(Vec::new())
+    } else if without_calls.content.len() == reply.content.len() {
+        None
+    } else {
+        Some(vec![without_calls])
+    };
+    let mut rows = vec![crate::store::RecordedEvent::reply(reply.clone(), record)];
+    if let Some(messages) = &view {
+        rows.push(
+            crate::conversation::Event::Repair {
+                replaced_count: 1,
+                messages: messages.clone(),
+            }
+            .into(),
+        );
+    }
+    Some((rows, view))
+}
+
+/// Mirror in memory what [`cut_reply_rows`] wrote: the reply, then the repair over it.
+fn apply_cut_reply(messages: &mut Conversation, reply: Message, view: Option<Vec<Message>>) {
+    messages.append(reply);
+    if let Some(view) = view {
+        messages.replace_tail(1, view);
+    }
+}
+
 /// Say that a compaction the turn ran on its own failed; a stop is the user's, said where the
 /// turn ends, and not a failure of the compaction's.
 fn warn_unless_interrupted(what: &str, error: &MekaError) {
@@ -518,24 +542,45 @@ pub(super) fn strip_images_and_truncate(content: &mut [ContentBlock]) {
                                 text: "[image]".to_string(),
                             };
                         }
-                        // A name, already as short as it gets.
-                        ToolResultContent::ToolReference { .. } => {}
+                        // A name, already as short as it gets, and a caption or a large output's
+                        // reference, each a line or a bounded preview.
+                        ToolResultContent::ToolReference { .. }
+                        | ToolResultContent::ImageCaption { .. }
+                        | ToolResultContent::LargeOutput { .. } => {}
                         ToolResultContent::Text { text } => truncate_for_compaction(text),
+                        ToolResultContent::HarnessNote { note } => truncate_for_compaction(note),
                     }
                 }
             }
             // The context block too: it is the larger of the two on most turns, and the summarizer
             // needs no more of it than it needs of a long prompt; what arrived for the model, a
             // relayed message or a report, the same.
-            ContentBlock::Text { text }
+            ContentBlock::Text { text, .. }
             | ContentBlock::TurnContext { text }
+            | ContentBlock::Summary { text }
             | ContentBlock::Inbox { text, .. }
             | ContentBlock::Scheduled { text, .. }
             | ContentBlock::BackgroundReport { text, .. }
             | ContentBlock::Invocation { text, .. }
             | ContentBlock::Resource { text, .. } => truncate_for_compaction(text),
-            ContentBlock::ToolUse { input, .. } => truncate_strings_for_compaction(input),
-            _ => {}
+            ContentBlock::HarnessNote { note } => truncate_for_compaction(note),
+            ContentBlock::Refusal { text, .. } => truncate_for_compaction(text),
+            ContentBlock::ToolUse {
+                input, unparsed, ..
+            } => {
+                truncate_strings_for_compaction(input);
+                if let Some(text) = unparsed
+                    .as_mut()
+                    .and_then(|unparsed| unparsed.text.as_mut())
+                {
+                    truncate_for_compaction(text);
+                }
+            }
+            ContentBlock::Nudge { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Unrecognized { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. } => {}
         }
     }
 }
@@ -683,11 +728,32 @@ impl Agent {
         )
     }
 
+    /// What the provider said about a reply that ended on `stop`, or was cut by `cut` before it
+    /// said, for the reply's row: the model the response named, the profile that sent the request,
+    /// what the response reported spending, and the rest of the response, `provider_fields`.
+    pub(super) fn reply_record(
+        &self,
+        stop: Option<Stop>,
+        cut: Option<crate::conversation::ReplyCut>,
+        model: Option<String>,
+        usage: &crate::stats::TokenUsage,
+        provider_fields: Option<crate::conversation::ProviderFields>,
+    ) -> crate::conversation::ReplyRecord {
+        crate::conversation::ReplyRecord {
+            stop,
+            cut,
+            model,
+            profile: Some(self.cells.profile.current().profile),
+            usage: (!usage.is_empty()).then(|| usage.clone()),
+            provider_fields,
+        }
+    }
+
     /// [`Store::save_events_atomic`] naming the turn this agent is running.
     pub(super) async fn save_events_atomic(
         &self,
         session_id: Uuid,
-        events: Vec<crate::conversation::Event>,
+        events: Vec<impl Into<crate::store::RecordedEvent>>,
     ) -> Result<()> {
         self.note_save(
             self.store
@@ -705,7 +771,7 @@ impl Agent {
     pub(super) async fn save_carrying(
         &self,
         session_id: Uuid,
-        events: Vec<crate::conversation::Event>,
+        events: Vec<impl Into<crate::store::RecordedEvent>>,
         arrivals: &Arrivals,
     ) -> Result<()> {
         let saved = self.note_save(
@@ -920,9 +986,9 @@ pub(super) struct StreamProgress {
     /// Set the instant anything user-visible is forwarded to the frontend, so a failure after it
     /// is never retried: the user has seen output the retry would re-send.
     pub(crate) content_started: bool,
-    /// What had streamed when the attempt failed, if any of it was text. The user watched it
-    /// arrive, so it is theirs to keep whatever the stream did afterwards.
-    pub(crate) partial: Option<Message>,
+    /// What had streamed when the attempt failed, if anything had: what the provider returned,
+    /// which the record keeps whatever the stream did afterwards.
+    pub(crate) partial: Option<crate::provider::PartialReply>,
     /// The stream was stopped after the provider had answered, so the message returned is what
     /// had arrived by then and not the whole reply. Which token stopped it is the caller's to ask.
     pub(crate) cut: bool,
@@ -1783,7 +1849,14 @@ impl Agent {
                 .await;
             unrun = std::mem::take(&mut progress.announced);
 
-            let (mut assistant_message, stop_reason, usage) = match call_result {
+            let crate::provider::Completion {
+                message: assistant_message,
+                stop,
+                model,
+                usage,
+                response_fields,
+                ..
+            } = match call_result {
                 Ok(value) => value,
                 Err(MekaError::ContextOverflow(message))
                     if self.auto_compact_ceiling().is_some()
@@ -1826,8 +1899,9 @@ impl Agent {
                     // store agreeing.
                     run.recovery.undo_rejected_repair(messages);
                     if !refusal_may_blame_content(&error, progress.content_started) {
-                        // The same treatment an interrupt gives a half-streamed answer: the text
-                        // the user watched arrive is kept, without the tool calls that never ran.
+                        // The same treatment an interrupt gives a half-streamed answer: what
+                        // arrived is recorded, and the context keeps it without the calls that
+                        // never ran.
                         //
                         // The prompt goes first, as it does on the interrupt arm below: this is
                         // the one exit ahead of the 2xx that persists a row, so a partial written
@@ -1835,20 +1909,23 @@ impl Agent {
                         // ahead of its question. A prompt the store still cannot take gets no row
                         // for its answer either.
                         if let Some(partial) = progress.partial.take() {
-                            match run
-                                .recovery
-                                .ensure_prompt_saved(self, session_id, &run.user_message)
-                                .await
-                            {
-                                Ok(()) => {
-                                    self.keep_partial_answer(session_id, messages, partial)
-                                        .await
-                                }
-                                Err(save_error) => tracing::warn!(
-                                    "dropping the partial answer: failed to persist its prompt: \
-                                     {save_error}"
-                                ),
-                            }
+                            let record = self.reply_record(
+                                None,
+                                Some(crate::conversation::ReplyCut::Failed),
+                                partial.model,
+                                &partial.usage,
+                                partial.response_fields,
+                            );
+                            self.record_cut_reply(
+                                session_id,
+                                messages,
+                                &mut run.recovery,
+                                &run.user_message,
+                                partial.message,
+                                record,
+                                true,
+                            )
+                            .await;
                         }
                         return Err(error);
                     }
@@ -1866,6 +1943,8 @@ impl Agent {
                 }
             };
 
+            let stop_reason = stop.reason;
+            let record = self.reply_record(Some(stop), None, model, &usage, response_fields);
             self.accept_round(run, sent_len, &usage, progress.cut).await;
 
             if let Err(error) = run
@@ -1924,42 +2003,53 @@ impl Agent {
             }
 
             if run.cancellation.is_canceled() {
-                // Interrupted mid-stream. Persist the partial assistant text so it survives resume
-                // instead of being discarded, but drop any `tool_use` blocks first: no tools run
-                // on an interrupt, so a persisted `tool_use` would be orphaned (no matching
-                // `tool_result`) and the provider would reject the next request. Only persist
-                // when text actually streamed; a partial with no text (interrupted before any
-                // output, or mid-thinking) has nothing worth restoring.
-                let partial = assistant_message.without_tool_use();
-                if partial
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Text { .. }))
-                {
-                    messages.append(partial.clone());
-                    if let Err(error) = self
-                        .save_events_atomic(session_id, vec![crate::conversation::Event::Append(
-                            partial,
-                        )])
-                        .await
-                    {
-                        tracing::warn!(
-                            "failed to persist interrupted partial assistant message: {error}"
-                        );
+                // Stopped: what arrived is recorded as it arrived, cut only when the stop cut the
+                // stream, and the context keeps it without the calls that never ran, which no
+                // result would answer.
+                let record = if progress.cut {
+                    crate::conversation::ReplyRecord {
+                        stop: None,
+                        cut: Some(crate::conversation::ReplyCut::Stopped),
+                        ..record
                     }
-                }
+                } else {
+                    // The reply ended before the stop, so it is said as every reply that ends
+                    // is, the way a replay of the log says it.
+                    if !self.options.streaming {
+                        self.show_whole_reply(&assistant_message).await;
+                    }
+                    if assistant_message.holds_no_answer() {
+                        self.cells.frontend.emit(FrontendEvent::NoAnswer).await;
+                    }
+                    record
+                };
+                self.record_cut_reply(
+                    session_id,
+                    messages,
+                    &mut run.recovery,
+                    &run.user_message,
+                    assistant_message,
+                    record,
+                    true,
+                )
+                .await;
                 return Err(MekaError::Interrupted);
             }
             if progress.cut {
                 // An inbox interrupt cut the stream after the provider had answered. What arrived
                 // is kept as the answer so far, the message follows it, and the turn goes on:
                 // same turn, no terminal, the way a person is cut off and told the next thing.
+                let record = crate::conversation::ReplyRecord {
+                    stop: None,
+                    cut: Some(crate::conversation::ReplyCut::Interrupted),
+                    ..record
+                };
                 self.absorb_interrupt(
                     session_id,
                     messages,
                     &mut run.recovery,
                     &run.user_message,
-                    Some(assistant_message),
+                    Some((assistant_message, record)),
                 )
                 .await?;
                 continue;
@@ -1968,16 +2058,19 @@ impl Agent {
             // Run tools based on the *presence* of tool-call blocks, not the reported stop reason:
             // stop reasons are advisory and providers sometimes mislabel a tool turn as a plain
             // end, but any tool call the model made must be answered with a result or the next
-            // request is invalid. Only complete tool calls reach the content blocks, so executing
-            // whatever is present is safe.
+            // request is invalid. A call whose arguments never finished is among them, refused for
+            // what it sent, so executing whatever is present is safe.
             let has_tool_calls = assistant_message
                 .content
                 .iter()
                 .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
-            let has_visible_text = has_visible_text(&assistant_message.content);
+            let has_visible_text = assistant_message.has_visible_text();
 
             if !self.options.streaming {
                 self.show_whole_reply(&assistant_message).await;
+            }
+            if assistant_message.holds_no_answer() {
+                self.cells.frontend.emit(FrontendEvent::NoAnswer).await;
             }
 
             if should_nudge_thinking_only(
@@ -1986,14 +2079,12 @@ impl Agent {
                 &stop_reason,
                 run.recovery.thinking_only_nudged,
             ) {
+                let reply = crate::conversation::RecordedMessage {
+                    message: assistant_message,
+                    reply: Some(record),
+                };
                 run.recovery
-                    .nudge_thinking_only(
-                        self,
-                        session_id,
-                        messages,
-                        &assistant_message,
-                        &stop_reason,
-                    )
+                    .nudge_thinking_only(self, session_id, messages, &reply)
                     .await?;
                 continue;
             }
@@ -2015,19 +2106,16 @@ impl Agent {
                     run.recovery.checklist_nudges_this_turn,
                 ) {
                     let nudge = prompt::render_checklist_nudge(&state, &reported);
+                    let reply = crate::conversation::RecordedMessage {
+                        message: assistant_message,
+                        reply: Some(record),
+                    };
                     run.recovery
-                        .nudge_checklist(
-                            self,
-                            session_id,
-                            messages,
-                            &assistant_message,
-                            nudge,
-                            open,
-                        )
+                        .nudge_checklist(self, session_id, messages, &reply, nudge, open)
                         .await?;
                     continue;
                 }
-                if open > 0 && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_)) {
+                if open > 0 && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown) {
                     // Whichever bound ended it; the turn's own is the last word when both did.
                     let notice =
                         if run.recovery.checklist_nudges_this_turn >= CHECKLIST_NUDGES_PER_TURN {
@@ -2050,27 +2138,12 @@ impl Agent {
                 }
             }
 
-            // No tool call and no visible text, and the nudge above didn't fire (already used this
-            // turn, or a stop reason with its own handling such as refusal / max tokens). Surface
-            // a stand-in in the assistant's place and persist it so the message is non-empty: an
-            // empty content array is invalid on the next request and breaks resume, and a silent
-            // turn leaves the user with nothing.
-            if !has_tool_calls && !has_visible_text {
-                let notice = empty_turn_notice(&stop_reason);
-                self.cells
-                    .frontend
-                    .emit(FrontendEvent::AssistantTextDelta(notice.clone()))
-                    .await;
-                assistant_message
-                    .content
-                    .push(ContentBlock::Text { text: notice });
-            }
-
             // Append in memory now so the next iteration sees the full state; defer the DB save
             // to the branches below (atomic with results on the tool path, standalone otherwise).
             messages.append(assistant_message.clone());
-            let round_events = vec![crate::conversation::Event::Append(
+            let round_events = vec![crate::store::RecordedEvent::reply(
                 assistant_message.clone(),
+                record.clone(),
             )];
 
             if !has_tool_calls {
@@ -2078,7 +2151,7 @@ impl Agent {
                 // interrupt or a finished task that arrived while the model wrote it is answered
                 // in this turn rather than left for whichever turn opens next. Only a reply that
                 // ended normally; a cut or a refusal ends the turn with what it is.
-                if matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_)) {
+                if matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown) {
                     let arrivals = self
                         .take_arrivals(session_id, &run.recovery.inbox_ids)
                         .await;
@@ -2091,24 +2164,15 @@ impl Agent {
                 // No tool calls: the assistant message stands alone and ends the turn. Save it
                 // before returning so the persistent log includes it.
                 self.save_events_atomic(session_id, round_events).await?;
-                return Ok(match stop_reason {
-                    StopReason::MaxTokens => TurnOutcome::MaxTokens,
-                    StopReason::Refusal(text) if !text.is_empty() => TurnOutcome::Refusal(text),
-                    // An empty refusal body carries no text, so fall back to the assistant
-                    // message's text (the model's own refusal, or the stand-in above).
-                    StopReason::Refusal(_) => {
-                        TurnOutcome::Refusal(assistant_message.text_content())
-                    }
-                    _ => TurnOutcome::EndTurn,
-                });
+                return Ok(TurnOutcome::of_reply(stop_reason, &assistant_message));
             }
 
-            // Surface a provider that mislabeled the stop reason, the bug this presence check
-            // guards against.
-            if !matches!(stop_reason, StopReason::ToolUse) {
+            // One that says it simply ended is a provider mislabeling a round, the bug this
+            // presence check guards against.
+            if stop_reason == StopReason::EndTurn {
                 tracing::warn!(
-                    "assistant message carries tool calls but stop_reason is {stop_reason:?}; \
-                     executing them anyway"
+                    "assistant message carries tool calls but stop_reason is end_turn; executing \
+                     them anyway"
                 );
             }
             // What the round runs is what its message holds; a call the stream announced on an
@@ -2121,18 +2185,59 @@ impl Agent {
                     _ => None,
                 })
                 .collect();
+            let mut unstarted = Vec::new();
             unrun.retain(
                 |(id, started)| match running.iter().position(|running| running == id) {
-                    Some(place) if *started => {
+                    Some(place) => {
+                        if !*started {
+                            unstarted.push(id.clone());
+                        }
                         running.remove(place);
                         false
                     }
-                    _ => true,
+                    None => true,
                 },
             );
             self.drop_unrun(std::mem::take(&mut unrun)).await;
-            self.run_tool_round(messages, run, &assistant_message, &loaded, round_events)
-                .await?;
+            // A call the stream opened and the reply closed without its end, refused for the
+            // arguments that never finished, is shown as it runs.
+            if self.options.streaming {
+                for block in &assistant_message.content {
+                    if let ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        unparsed,
+                        ..
+                    } = block
+                        && unstarted.contains(id)
+                    {
+                        self.cells
+                            .frontend
+                            .emit(FrontendEvent::ToolCallStarted {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                                display_summary: None,
+                                unparsed: unparsed.clone(),
+                            })
+                            .await;
+                    }
+                }
+            }
+            let ran = self
+                .run_tool_round(messages, run, &assistant_message, &loaded, round_events)
+                .await;
+            // A reply that made calls and stopped for a reason that is not a round's is said once
+            // its round has run, however it ended, where a replay of the log says it after the
+            // round's results.
+            if !matches!(stop_reason, StopReason::ToolUse | StopReason::EndTurn) {
+                self.cells
+                    .frontend
+                    .emit(FrontendEvent::ReplyStopped { stop_reason })
+                    .await;
+            }
+            ran?;
             // A tool round is not the stall the cap counts, whatever it did.
             run.recovery.checklist_nudges = 0;
 
@@ -2211,10 +2316,7 @@ impl Agent {
         run: &mut TurnRun,
         round: &CancellationToken,
         progress: &mut StreamProgress,
-    ) -> (
-        Result<(Message, StopReason, crate::stats::TokenUsage)>,
-        Vec<String>,
-    ) {
+    ) -> (Result<crate::provider::Completion>, Vec<String>) {
         // Whatever a request that never reached this point reported is not about the view this
         // request is built from.
         crate::sync::lock(&self.pending_redactions).clear();
@@ -2258,10 +2360,9 @@ impl Agent {
             run.last_round_durations.clone(),
             self.take_context_compacted(),
         );
-        // Streaming and blocking paths converge on `(Message, StopReason, TokenUsage)`. The
-        // blocking provider call surfaces notices in its return tuple (no event channel); they
-        // are forwarded to the frontend here so the user sees the same advisories the streaming
-        // path emits inline via `StreamEvent::Notice`.
+        // Streaming and blocking paths converge on a `Completion`. The blocking provider call
+        // surfaces notices in it (no event channel); they are forwarded to the frontend here so the
+        // user sees the same advisories the streaming path emits inline via `StreamEvent::Notice`.
         let call_result = if self.options.streaming {
             self.run_streaming(
                 Arc::clone(&run.system_prompt),
@@ -2289,16 +2390,11 @@ impl Agent {
                 )
                 .await
             {
-                Ok(crate::provider::Completion {
-                    message,
-                    stop_reason,
-                    usage,
-                    notices,
-                }) => {
-                    for notice in notices {
+                Ok(mut completion) => {
+                    for notice in std::mem::take(&mut completion.notices) {
                         self.forward_notice(notice).await;
                     }
-                    Ok((message, stop_reason, usage))
+                    Ok(completion)
                 }
                 Err(error) => Err(error),
             }
@@ -2374,7 +2470,8 @@ impl Agent {
     async fn show_whole_reply(&self, assistant_message: &Message) {
         for block in &assistant_message.content {
             match block {
-                ContentBlock::Text { text } => {
+                // A refusal's words are the model's, shown as a streamed one's are.
+                ContentBlock::Text { text, .. } | ContentBlock::Refusal { text, .. } => {
                     self.cells
                         .frontend
                         .emit(FrontendEvent::AssistantTextDelta(text.clone()))
@@ -2384,30 +2481,23 @@ impl Agent {
                 // block in `render::render_message_history`: a block of whitespace has nothing to
                 // show, and the two must not disagree about that or a resumed transcript gains a
                 // block the live turn skipped.
-                ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
+                ContentBlock::Thinking { parts, .. }
+                    if !crate::conversation::reasoning_text(parts).trim().is_empty() =>
+                {
+                    let thinking = crate::conversation::reasoning_text(parts);
                     self.cells
                         .frontend
                         .emit(FrontendEvent::ThinkingDelta(thinking.clone()))
                         .await;
                     self.cells
                         .frontend
-                        .emit(FrontendEvent::ThinkingBlock {
-                            content: thinking.clone(),
-                        })
+                        .emit(FrontendEvent::ThinkingBlock { content: thinking })
                         .await;
                 }
                 ContentBlock::RedactedThinking { .. } => {
                     self.cells
                         .frontend
-                        .emit(FrontendEvent::ThinkingDelta(
-                            crate::conversation::REDACTED_THINKING.to_string(),
-                        ))
-                        .await;
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::ThinkingBlock {
-                            content: crate::conversation::REDACTED_THINKING.to_string(),
-                        })
+                        .emit(FrontendEvent::RedactedThinking)
                         .await;
                 }
                 _ => {}
@@ -2433,7 +2523,7 @@ impl Agent {
         run: &mut TurnRun,
         assistant_message: &Message,
         loaded: &[String],
-        mut round_events: Vec<crate::conversation::Event>,
+        mut round_events: Vec<crate::store::RecordedEvent>,
     ) -> Result<()> {
         let session_id = run.session_id;
         let (mut tool_results, tool_durations, inline_results) = self
@@ -2486,6 +2576,7 @@ impl Agent {
         let result_message = Message {
             role: Role::User,
             content: tool_results,
+            provider_fields: None,
         };
 
         // Save assistant + tool-results together in one transaction. Both rows commit or neither
@@ -2499,7 +2590,7 @@ impl Agent {
         // the round leaves disk one round behind memory until the next turn, which starts from what
         // the store holds, as a resume does: a prompt with no reply, never a half round, since the
         // pair is written as one unit or not at all.
-        round_events.push(crate::conversation::Event::Append(result_message.clone()));
+        round_events.push(crate::conversation::Event::Append(result_message.clone()).into());
         let tool_calls = result_message.content.len();
         messages.append(result_message);
         self.save_carrying(session_id, round_events, &arrivals)
@@ -2725,7 +2816,7 @@ impl Agent {
         // own.
         let usage = crate::store::turns::TurnUsage::from(&spent);
         let ending = match result {
-            Ok(outcome) => crate::store::turns::TurnEnding::succeeded(outcome.stop_reason(), usage),
+            Ok(outcome) => crate::store::turns::TurnEnding::succeeded(outcome.stop_reason, usage),
             // Every stop goes through the signal and names itself; a bare one, which nothing
             // fires, reads as asked for.
             Err(MekaError::Interrupted) => crate::store::turns::TurnEnding::canceled(
@@ -2872,29 +2963,45 @@ impl Agent {
             .await;
     }
 
-    /// Keep the text of an answer the stream did not finish, in memory and in the store.
-    async fn keep_partial_answer(
+    /// Record `reply`, a reply the turn did not run on to its calls, as it arrived under `record`,
+    /// in the store and in memory, with the context keeping what [`cut_reply_rows`] says of it
+    /// (`kept` as there). The prompt is saved first, so a reply never replays ahead of its
+    /// question; a store that takes neither leaves the turn as it was, which a warning says. A
+    /// reply the context keeps none of leaves a prompt that stood alone standing so, for the
+    /// withdrawal a failed turn makes.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the turn's state, the prompt it answers and the reply with its record"
+    )]
+    async fn record_cut_reply(
         &self,
         session_id: uuid::Uuid,
         messages: &mut Conversation,
-        partial: Message,
+        recovery: &mut TurnRecovery,
+        prompt: &Message,
+        reply: Message,
+        record: crate::conversation::ReplyRecord,
+        kept: bool,
     ) {
-        let partial = partial.without_tool_use();
-        if !partial
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::Text { .. }))
-        {
+        let Some((rows, view)) = cut_reply_rows(&reply, record, kept) else {
+            return;
+        };
+        let stood_alone = messages.events_len() == recovery.prompt_only_events;
+        if let Err(error) = recovery.ensure_prompt_saved(self, session_id, prompt).await {
+            tracing::warn!(
+                "failed to persist the cut reply: failed to persist its prompt: {error}"
+            );
             return;
         }
-        messages.append(partial.clone());
-        if let Err(error) = self
-            .save_events_atomic(session_id, vec![crate::conversation::Event::Append(
-                partial,
-            )])
-            .await
-        {
-            tracing::warn!("failed to persist the partial assistant message: {error}");
+        let leaves_the_view = view.as_ref().is_some_and(Vec::is_empty);
+        match self.save_events_atomic(session_id, rows).await {
+            Ok(()) => {
+                apply_cut_reply(messages, reply, view);
+                if stood_alone && leaves_the_view {
+                    recovery.prompt_only_events = messages.events_len();
+                }
+            }
+            Err(error) => tracing::warn!("failed to persist the cut reply: {error}"),
         }
     }
 
@@ -2905,14 +3012,15 @@ impl Agent {
         &self,
         session_id: Uuid,
         messages: &mut Conversation,
-        mut round_events: Vec<crate::conversation::Event>,
+        mut round_events: Vec<crate::store::RecordedEvent>,
         arrivals: Arrivals,
     ) -> Result<()> {
         let arrived = Message {
             role: Role::User,
             content: arrivals.blocks(),
+            provider_fields: None,
         };
-        round_events.push(crate::conversation::Event::Append(arrived.clone()));
+        round_events.push(crate::conversation::Event::Append(arrived.clone()).into());
         self.save_carrying(session_id, round_events, &arrivals)
             .await?;
         messages.append(arrived.clone());
@@ -2944,11 +3052,13 @@ impl Agent {
     /// Read again rather than trusting the watcher: what it saw may have been withdrawn since, and
     /// a steer or a background outcome that arrived in the meantime belongs here as much as at a
     /// tool round's boundary.
-    /// With nothing to put in, the partial is dropped and the request is repeated as it stood.
+    /// With nothing to put in, what streamed is recorded and left out of the context, and the
+    /// request is repeated as it stood.
     ///
-    /// The shape depends on what streamed. Text that did is kept as the assistant's message,
-    /// without the tool calls that never ran, and the items follow it as the next user message.
-    /// Nothing kept means the items join the user message that was cut, since Meka never sends
+    /// The shape depends on what streamed, which is recorded whole either way. Words that did are
+    /// kept in the context as the assistant's message, without the tool calls that never ran, and
+    /// the items follow it as the next user message. A reply with no words is recorded and left
+    /// out, and the items join the user message that was cut, since Meka never sends
     /// two user turns in a row: it is withdrawn and appended again with them in one write. That
     /// leaves the log ending on an appended turn opening, so a turn cut before the provider
     /// accepted anything still withdraws its prompt if it then fails, and the items with it.
@@ -2958,13 +3068,18 @@ impl Agent {
         messages: &mut Conversation,
         recovery: &mut TurnRecovery,
         prompt: &Message,
-        partial: Option<Message>,
+        partial: Option<(Message, crate::conversation::ReplyRecord)>,
     ) -> Result<()> {
         use crate::conversation::Event;
 
-        // The cut is spent either way: with nothing to carry, the request is repeated as it stood.
+        // The cut is spent either way: with nothing to carry, the request is repeated as it stood,
+        // and what arrived of the reply is recorded and left out of the context.
         let arrivals = self.take_arrivals(session_id, &recovery.inbox_ids).await;
         if arrivals.is_empty() {
+            if let Some((reply, record)) = partial {
+                self.record_cut_reply(session_id, messages, recovery, prompt, reply, record, false)
+                    .await;
+            }
             return Ok(());
         }
         if let Err(error) = recovery.ensure_prompt_saved(self, session_id, prompt).await {
@@ -2973,14 +3088,25 @@ impl Agent {
         }
         let ids = arrivals.item_ids();
         let blocks = arrivals.blocks();
-        let partial = partial
-            .map(|partial| partial.without_tool_use())
-            .filter(|partial| {
-                partial
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Text { .. }))
-            });
+        let partial = partial.and_then(|(reply, record)| {
+            cut_reply_rows(&reply, record, true).map(|(rows, view)| (reply, rows, view))
+        });
+        // A reply the context keeps none of is recorded ahead of the items, which then go where
+        // they would with no reply before them.
+        let (leading, partial) = match partial {
+            Some((reply, rows, Some(view))) if view.is_empty() => (Some((reply, rows)), None),
+            other => (None, other),
+        };
+        let prompt_stood_alone = messages.events_len() == recovery.prompt_only_events;
+        let (leading_rows, leading_reply) = match leading {
+            Some((reply, rows)) => (rows, Some(reply)),
+            None => (Vec::new(), None),
+        };
+        let apply_leading = |messages: &mut Conversation| {
+            if let Some(reply) = leading_reply {
+                apply_cut_reply(messages, reply, Some(Vec::new()));
+            }
+        };
         // A trailing user message is the prompt the cut landed on, or a nudge whose round it cut;
         // the items join either, as text blocks behind what was there, so a nudge stays one by
         // its block and the person's words stay the person's as blocks of their own.
@@ -2993,21 +3119,15 @@ impl Agent {
         // by the events that name blocks added to a message, below.
         let mut appended_whole: Option<Message> = None;
         match (partial, tail_is_user) {
-            (Some(partial), _) => {
+            (Some((reply, mut rows, view)), _) => {
                 let arrived = Message {
                     role: Role::User,
                     content: blocks,
+                    provider_fields: None,
                 };
-                self.save_carrying(
-                    session_id,
-                    vec![
-                        Event::Append(partial.clone()),
-                        Event::Append(arrived.clone()),
-                    ],
-                    &arrivals,
-                )
-                .await?;
-                messages.append(partial);
+                rows.push(Event::Append(arrived.clone()).into());
+                self.save_carrying(session_id, rows, &arrivals).await?;
+                apply_cut_reply(messages, reply, view);
                 messages.append(arrived.clone());
                 appended_whole = Some(arrived);
             }
@@ -3019,21 +3139,20 @@ impl Agent {
                     .unwrap_or_else(|| Message {
                         role: Role::User,
                         content: Vec::new(),
+                        provider_fields: None,
                     });
                 joined.content.extend(blocks);
-                let prompt_stood_alone = messages.events_len() == recovery.prompt_only_events;
-                self.save_carrying(
-                    session_id,
-                    vec![
-                        Event::Repair {
-                            replaced_count: 1,
-                            messages: Vec::new(),
-                        },
-                        Event::Append(joined.clone()),
-                    ],
-                    &arrivals,
-                )
-                .await?;
+                let mut rows = leading_rows;
+                rows.push(
+                    Event::Repair {
+                        replaced_count: 1,
+                        messages: Vec::new(),
+                    }
+                    .into(),
+                );
+                rows.push(Event::Append(joined.clone()).into());
+                self.save_carrying(session_id, rows, &arrivals).await?;
+                apply_leading(messages);
                 messages.replace_tail(1, Vec::new());
                 messages.append(joined);
                 // The prompt moved and the items are part of it now, so a withdrawal takes both
@@ -3052,9 +3171,12 @@ impl Agent {
                 let arrived = Message {
                     role: Role::User,
                     content: blocks,
+                    provider_fields: None,
                 };
-                self.save_carrying(session_id, vec![Event::Append(arrived.clone())], &arrivals)
-                    .await?;
+                let mut rows = leading_rows;
+                rows.push(Event::Append(arrived.clone()).into());
+                self.save_carrying(session_id, rows, &arrivals).await?;
+                apply_leading(messages);
                 messages.append(arrived.clone());
                 appended_whole = Some(arrived);
             }
@@ -3108,7 +3230,7 @@ impl Agent {
         attribution: crate::provider::Attribution,
         cancellation: CancellationToken,
         progress: &mut StreamProgress,
-    ) -> Result<(Message, StopReason, crate::stats::TokenUsage)> {
+    ) -> Result<crate::provider::Completion> {
         let mut retries = 0u32;
         let mut started = std::time::Instant::now();
         loop {
@@ -3189,7 +3311,7 @@ impl Agent {
         attribution: crate::provider::Attribution,
         cancellation: CancellationToken,
         progress: &mut StreamProgress,
-    ) -> Result<(Message, StopReason, crate::stats::TokenUsage)> {
+    ) -> Result<crate::provider::Completion> {
         // Bounded so a provider streaming faster than the renderer consumes can't grow memory
         // without limit. 1024 is far above any realistic in-flight backlog, so backpressure
         // effectively never engages.
@@ -3216,8 +3338,17 @@ impl Agent {
         // seen a 2xx, except the redaction notice, which the Claude drivers queue before the
         // request is even sent, so any other event is proof the request was judged.
         let mut response_started = false;
+        // Whether the driver has said its stream failed. What it hands over after that is what it
+        // held when the stream broke (the calls a Chat Completions stream assembles to its end, a
+        // block a Claude stream left open and those held behind it): kept with the attempt's
+        // partial reply and never shown, so it leaves a retry as possible as the failure found it.
+        let mut failed = false;
 
         while let Some(event) = event_receiver.recv().await {
+            if failed {
+                accumulator.push(event);
+                continue;
+            }
             if !matches!(event, StreamEvent::Notice(_)) {
                 response_started = true;
             }
@@ -3237,11 +3368,19 @@ impl Agent {
                     if self.cells.frontend.retains_reasoning() {
                         progress.content_started = true;
                     }
+                    // Each part is recorded as its own; a reader sees them a blank line apart, as
+                    // the block reads whole.
+                    let text = if accumulator.opens_a_later_part() {
+                        format!("\n\n{text}")
+                    } else {
+                        text.clone()
+                    };
                     self.cells
                         .frontend
-                        .emit(FrontendEvent::ThinkingDelta(text.clone()))
+                        .emit(FrontendEvent::ThinkingDelta(text))
                         .await;
                 }
+                StreamEvent::ThinkingPart(_) => {}
                 StreamEvent::ThinkingProgress { estimated_tokens } => {
                     // Deliberately does not set `content_started`: this is a transient indicator
                     // the frontend erases, not output the turn produced. Counting it would make an
@@ -3259,8 +3398,7 @@ impl Agent {
                     // `render::render_message_history` asks of the same block on replay, so a
                     // resumed transcript cannot gain or lose a block against the live turn.
                     //
-                    // The deltas above are not held to it: whitespace is content mid-block (the
-                    // Responses API separates two summary parts with a bare `\n\n` delta), so the
+                    // The deltas above are not held to it: whitespace is content mid-block, so the
                     // question can only be asked once the block is whole, which is here. Whether
                     // the block is *kept* is the accumulator's answer, and asks the raw text: what
                     // the provider will accept back is not a question about what is worth showing.
@@ -3282,30 +3420,22 @@ impl Agent {
                 }
                 StreamEvent::RedactedThinking { .. } => {
                     progress.content_started = true;
-                    // Delta then block, like every other block carrying visible text. The marker is
-                    // Meka's own words rather than the model's, but a frontend that reads the
-                    // deltas would otherwise be the only one that never hears about a redacted
-                    // block at all.
                     self.cells
                         .frontend
-                        .emit(FrontendEvent::ThinkingDelta(
-                            crate::conversation::REDACTED_THINKING.to_string(),
-                        ))
-                        .await;
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::ThinkingBlock {
-                            content: crate::conversation::REDACTED_THINKING.to_string(),
-                        })
+                        .emit(FrontendEvent::RedactedThinking)
                         .await;
                 }
-                StreamEvent::TextDelta(text) => {
+                // A refusal's words are the model's, shown as it streams them.
+                StreamEvent::TextDelta(text) | StreamEvent::RefusalDelta(text) => {
                     progress.content_started = true;
                     self.cells
                         .frontend
                         .emit(FrontendEvent::AssistantTextDelta(text.clone()))
                         .await;
                 }
+                // The end of a part changes nothing on screen, and what Meka reads nothing from is
+                // kept, not shown: neither is output a retry would show twice.
+                StreamEvent::TextEnd { .. } | StreamEvent::Unrecognized(_) => {}
                 StreamEvent::ToolUseStart { id, name } => {
                     // Deliberately does not set `content_started`, for the same reason
                     // `ThinkingProgress` doesn't: a call whose arguments never finish produced no
@@ -3320,7 +3450,7 @@ impl Agent {
                         })
                         .await;
                 }
-                StreamEvent::ToolUseEnd { input } => {
+                StreamEvent::ToolUseEnd { input, .. } => {
                     progress.content_started = true;
                     let (id, name) = accumulator.pending_tool();
                     progress.started(id);
@@ -3332,32 +3462,37 @@ impl Agent {
                             name: name.to_string(),
                             input: input.clone(),
                             display_summary,
+                            unparsed: None,
                         })
                         .await;
                 }
-                StreamEvent::ToolCallRefused { id, name, reason } => {
-                    // A malformed tool-call arrived (bad JSON). The accumulator keeps a `ToolUse`
-                    // block with a sentinel marker so the shape of the assistant message stays
-                    // valid for the API round-trip, and `resolve_and_execute_tool` sees the marker
-                    // and surfaces an error back to the model rather than running the tool on a
-                    // silently-empty argument object. Shown the same way.
+                StreamEvent::ToolCallRefused {
+                    id, name, unparsed, ..
+                } => {
+                    // A malformed call arrived. The accumulator keeps a `ToolUse` block with `{}`
+                    // for its arguments and what the model sent beside it, so the assistant
+                    // message stays valid for the round trip and dispatch refuses the call rather
+                    // than run it on arguments the model did not give. Shown the same way.
                     progress.content_started = true;
                     progress.started(id);
-                    let marker_input = serde_json::json!({
-                        crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
-                    });
-                    let display_summary = crate::tools::resolve_primary_param(name, &marker_input);
                     self.cells
                         .frontend
                         .emit(FrontendEvent::ToolCallStarted {
                             id: id.clone(),
                             name: name.clone(),
-                            input: marker_input,
-                            display_summary,
+                            input: serde_json::json!({}),
+                            display_summary: None,
+                            unparsed: Some(unparsed.clone()),
                         })
                         .await;
                 }
-                StreamEvent::MessageEnd { .. } | StreamEvent::Usage(_) => {}
+                // A call's arguments are drawn whole, when the call starts.
+                StreamEvent::ToolArgumentsDelta(_)
+                | StreamEvent::MessageEnd { .. }
+                | StreamEvent::Model(_)
+                | StreamEvent::MessageFields(_)
+                | StreamEvent::ResponseFields(_)
+                | StreamEvent::Usage(_) => {}
                 StreamEvent::Notice(notice) => {
                     // Provider advisories (image redaction) are emitted inline so the user sees
                     // them in order with the assistant text that follows.
@@ -3370,8 +3505,9 @@ impl Agent {
                     self.forward_notice(notice.clone()).await;
                 }
                 StreamEvent::Error(error) => {
-                    // No return: every producer of this event sends it immediately before its
-                    // own typed `Err` return (see `provider::sse`), so the channel closes and the
+                    // No return: every producer of this event sends it ahead of its own typed
+                    // `Err` return (see `provider::sse`), handing over only what it held in
+                    // between, so the channel closes and the
                     // `stream_handle.await` below surfaces the original typed error, which
                     // `run_streaming`'s retry logic needs to see. Logged at debug only, because
                     // that typed error is said once already: as a warning by the retry when it
@@ -3384,6 +3520,7 @@ impl Agent {
                     // because every frontend ignores it when nothing is drawn.
                     self.cells.frontend.emit(FrontendEvent::ThinkingEnded).await;
                     tracing::debug!("stream error: {error}");
+                    failed = true;
                 }
             }
             accumulator.push(event);
@@ -3413,13 +3550,8 @@ impl Agent {
             }
         }
 
-        let crate::provider::Completion {
-            message,
-            stop_reason,
-            usage,
-            ..
-        } = accumulator.finish();
-        Ok((message, stop_reason, usage))
+        // Its notices were forwarded as they arrived.
+        Ok(accumulator.finish())
     }
 }
 
@@ -3523,7 +3655,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text }
+                ContentBlock::Text { text, .. }
                 | ContentBlock::Inbox { text, .. }
                 | ContentBlock::Scheduled { text, .. }
                 | ContentBlock::BackgroundReport { text, .. } => Some(text.as_str()),
@@ -4093,6 +4225,579 @@ mod tests {
         assert_eq!(row.turn_position, first);
     }
 
+    /// The replies of a turn's rows, in order, with what was recorded about each.
+    async fn recorded_replies(
+        store: &Store,
+        session_id: uuid::Uuid,
+    ) -> Vec<(Message, Option<crate::conversation::ReplyRecord>)> {
+        store
+            .load_events_with_timestamps(session_id)
+            .await
+            .expect("load")
+            .into_iter()
+            .filter_map(|(stamp, event)| match event {
+                crate::conversation::Event::Append(message) if message.role == Role::Assistant => {
+                    Some((message, stamp.reply))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each reply is recorded with how it stopped and the profile that sent it, a round that
+    /// called a tool as much as the one that ended the turn, and the turn ends on the last.
+    #[tokio::test]
+    async fn every_reply_records_how_it_stopped() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, _provider, store, session_id, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "no_such_tool".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![
+                MockEvent::Text {
+                    text: "half an answer".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::MaxTokens,
+                },
+            ],
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
+        let replies = recorded_replies(&store, session_id).await;
+        let stops: Vec<Option<StopReason>> = replies
+            .iter()
+            .map(|(_, reply)| {
+                reply
+                    .as_ref()
+                    .and_then(|reply| reply.stop.as_ref())
+                    .map(|stop| stop.reason)
+            })
+            .collect();
+        assert_eq!(stops, [
+            Some(StopReason::ToolUse),
+            Some(StopReason::MaxTokens)
+        ]);
+        assert!(
+            replies
+                .iter()
+                .all(|(_, reply)| reply.as_ref().is_some_and(|reply| reply.profile.is_some())),
+            "{replies:?}"
+        );
+    }
+
+    /// A reply with nothing in it is recorded as it came, with nothing of Meka's in it, and a
+    /// surface is told by an event of its own; a refusal with no words ends the turn as a refusal
+    /// with none, and one with words carries them.
+    #[tokio::test]
+    async fn an_empty_reply_is_recorded_as_it_came_and_a_refusal_carries_only_the_models_words() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, _provider, store, session_id, frontend) = agent_with_session(vec![
+            vec![MockEvent::MessageEnd {
+                stop_reason: MockStopReason::Refusal,
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "I won't do that.".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::Refusal,
+                },
+            ],
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(outcome, TurnOutcome {
+            stop_reason: StopReason::Refusal,
+            refusal_text: None,
+        });
+        let replies = recorded_replies(&store, session_id).await;
+        assert!(replies[0].0.content.is_empty(), "{replies:?}");
+        let events = frontend.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::NoAnswer))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::AssistantTextDelta(_))),
+            "{events:?}"
+        );
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("again".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(outcome.refusal_text.as_deref(), Some("I won't do that."));
+    }
+
+    /// A reply that ended, with a stop landing before the turn read its end, is recorded as it
+    /// came, as every reply that ends is, even when it holds nothing, and said as one that ended
+    /// with nothing, as a replay of the log says it; the stop, the model and the spend are its
+    /// record's.
+    #[tokio::test]
+    async fn an_empty_reply_a_stop_lands_behind_is_recorded() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, _provider, store, session_id, frontend) = agent_with_session(vec![vec![
+            MockEvent::Usage { input_tokens: 7 },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+            MockEvent::Stall { ms: 400 },
+        ]])
+        .await;
+        let cancellation = crate::agent::TurnCancellation::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                cancellation.cancel(CancelReason::Client);
+            }
+        });
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                cancellation,
+            )
+            .await;
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "{outcome:?}"
+        );
+        let replies = recorded_replies(&store, session_id).await;
+        let (reply, record) = replies.last().expect("the reply is recorded");
+        assert!(reply.content.is_empty(), "{reply:?}");
+        let record = record.as_ref().expect("a record");
+        assert_eq!(record.cut, None);
+        assert_eq!(
+            record.stop.as_ref().map(|stop| stop.reason),
+            Some(StopReason::EndTurn)
+        );
+        assert!(
+            frontend
+                .events()
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::NoAnswer)),
+            "{:?}",
+            frontend.events()
+        );
+    }
+
+    /// What a driver hands over after it said its stream failed, the calls a Chat Completions
+    /// stream assembles to its end among it, goes to the attempt's partial reply and is never
+    /// shown, so the retry the failure allows still runs.
+    #[tokio::test]
+    async fn what_a_failed_stream_held_is_never_shown_and_leaves_the_retry() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, _provider, _store, _session_id, frontend) = agent_with_session(vec![
+            vec![MockEvent::FailStreamHolding {
+                message: "connection reset".to_string(),
+                held: vec![
+                    MockEvent::ToolUseStart {
+                        id: "call-held".to_string(),
+                        name: "file_read".to_string(),
+                    },
+                    MockEvent::ToolUseEnd {
+                        input: serde_json::json!({"path": "notes.txt"}),
+                    },
+                ],
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "answered on the retry".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the retry carries the turn");
+        assert!(
+            !frontend.events().iter().any(|event| matches!(
+                event,
+                FrontendEvent::ToolCallComposing { id, .. }
+                    | FrontendEvent::ToolCallStarted { id, .. } if id == "call-held"
+            )),
+            "{:?}",
+            frontend.events()
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.text_content().contains("answered on the retry"))
+        );
+    }
+
+    /// A reply stopped mid-stream is recorded whole, its reasoning and the call it made included,
+    /// as cut by the stop; the context the next request sends keeps none of it, since the call
+    /// never ran and reasoning cut short carries nothing a provider takes back.
+    #[tokio::test]
+    async fn a_stopped_reply_is_recorded_whole_and_its_context_holds_no_unrun_call() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, _provider, store, session_id, _frontend) = agent_with_session(vec![vec![
+            MockEvent::ThinkingDelta {
+                text: "pondering".to_string(),
+            },
+            MockEvent::ThinkingComplete { opaque: None },
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: "file_read".to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({"path": "notes.txt"}),
+            },
+            MockEvent::Sleep { ms: 5000 },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::ToolUse,
+            },
+        ]])
+        .await;
+        let cancellation = crate::agent::TurnCancellation::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                cancellation.cancel(CancelReason::Client);
+            }
+        });
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                cancellation,
+            )
+            .await;
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "{outcome:?}"
+        );
+        let replies = recorded_replies(&store, session_id).await;
+        let (reply, record) = replies.last().expect("the reply is recorded");
+        assert!(
+            matches!(reply.content.as_slice(), [
+                ContentBlock::Thinking { .. },
+                ContentBlock::ToolUse { .. }
+            ]),
+            "{reply:?}"
+        );
+        let record = record.as_ref().expect("a record");
+        assert_eq!(record.cut, Some(crate::conversation::ReplyCut::Stopped));
+        assert_eq!(record.stop, None);
+        // Reasoning cut short carries nothing a provider takes back, so the context keeps none of
+        // a reply that held no words.
+        let view =
+            Conversation::from_events(store.load_view_events(session_id).await.expect("view"));
+        let last = view.last().expect("the prompt stands in the context");
+        assert_eq!(last.role, crate::conversation::Role::User, "{last:?}");
+        assert_eq!(
+            messages.as_slice().last(),
+            Some(last),
+            "memory holds what the store holds"
+        );
+    }
+
+    /// The first round of a reply that thought, made a call and then waited, for a test to cut.
+    fn a_reply_with_a_call_then(last: MockEvent) -> Vec<MockEvent> {
+        vec![
+            MockEvent::ThinkingDelta {
+                text: "pondering".to_string(),
+            },
+            MockEvent::ThinkingComplete { opaque: None },
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: "file_read".to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({"path": "notes.txt"}),
+            },
+            last,
+        ]
+    }
+
+    /// A round of calls that stopped at the output limit is said once the round has run, after
+    /// its call, where a replay of the log says it; a round that asked for its calls is not said.
+    #[tokio::test]
+    async fn a_round_cut_at_the_limit_is_said_after_its_calls() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, _provider, _store, _session_id, frontend) = agent_with_session(vec![
+            a_reply_with_a_call_then(MockEvent::MessageEnd {
+                stop_reason: MockStopReason::MaxTokens,
+            }),
+            a_reply_with_a_call_then(MockEvent::MessageEnd {
+                stop_reason: MockStopReason::ToolUse,
+            }),
+            vec![
+                MockEvent::Text {
+                    text: "done".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        let events = frontend.events();
+        let stopped: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, FrontendEvent::ReplyStopped { .. }))
+            .map(|(place, _)| place)
+            .collect();
+        let completed: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, FrontendEvent::ToolCallCompleted { .. }))
+            .map(|(place, _)| place)
+            .collect();
+        assert_eq!(stopped.len(), 1, "{events:?}");
+        assert!(
+            completed.len() == 2 && completed[0] < stopped[0] && stopped[0] < completed[1],
+            "{events:?}"
+        );
+    }
+
+    /// A refusal a provider returned whole, with nothing streamed, reaches a surface as its words,
+    /// as a streamed refusal's do.
+    #[tokio::test]
+    async fn a_whole_reply_s_refusal_is_shown() {
+        use crate::provider::mock::MockStopReason;
+        let (mut agent, _provider, _store, _session_id, frontend) = agent_with_session(vec![vec![
+            MockEvent::Refusal {
+                text: "I can't help with that.".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]])
+        .await;
+        agent.options.streaming = false;
+        let outcome = agent
+            .run_turn(
+                &mut Conversation::new(),
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(outcome.stop_reason, StopReason::Refusal);
+        assert!(
+            frontend.events().iter().any(|event| matches!(
+                event,
+                FrontendEvent::AssistantTextDelta(text) if text == "I can't help with that."
+            )),
+            "{:?}",
+            frontend.events()
+        );
+    }
+
+    /// A prompt that goes when its turn produced nothing still goes when the turn was stopped while
+    /// the model thought: the reply is recorded and the context keeps none of it, so nothing the
+    /// prompt drew stands.
+    #[tokio::test]
+    async fn a_prompt_withdrawn_on_a_stop_goes_though_a_reply_was_recorded() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, _provider, store, session_id, _frontend) = agent_with_session(vec![vec![
+            MockEvent::ThinkingDelta {
+                text: "pondering".to_string(),
+            },
+            MockEvent::ThinkingComplete { opaque: None },
+            MockEvent::Sleep { ms: 5000 },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]])
+        .await;
+        let cancellation = crate::agent::TurnCancellation::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                cancellation.cancel(CancelReason::Client);
+            }
+        });
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt")
+                    .retaining(PromptRetention::Withdraw),
+                cancellation,
+            )
+            .await;
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "{outcome:?}"
+        );
+        assert!(
+            !recorded_replies(&store, session_id).await.is_empty(),
+            "the reply is on record"
+        );
+        let view =
+            Conversation::from_events(store.load_view_events(session_id).await.expect("view"));
+        assert!(view.is_empty(), "the prompt is withdrawn: {view:?}");
+        assert!(messages.is_empty(), "{messages:?}");
+    }
+
+    /// A reply whose stream fails after it began is recorded whole as failed, its reasoning and
+    /// call included, and the context the next request sends holds none of it, since it held no
+    /// words.
+    #[tokio::test]
+    async fn a_failed_reply_is_recorded_whole_and_its_context_holds_no_unrun_call() {
+        let (agent, _provider, store, session_id, _frontend) =
+            agent_with_session(vec![a_reply_with_a_call_then(MockEvent::Fail {
+                message: "the stream broke".to_string(),
+            })])
+            .await;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        assert!(outcome.is_err(), "{outcome:?}");
+        let replies = recorded_replies(&store, session_id).await;
+        let (reply, record) = replies.last().expect("the reply is recorded");
+        assert!(
+            matches!(reply.content.as_slice(), [
+                ContentBlock::Thinking { .. },
+                ContentBlock::ToolUse { .. }
+            ]),
+            "{reply:?}"
+        );
+        assert_eq!(
+            record.as_ref().and_then(|record| record.cut),
+            Some(crate::conversation::ReplyCut::Failed)
+        );
+        let view =
+            Conversation::from_events(store.load_view_events(session_id).await.expect("view"));
+        assert_eq!(
+            view.last().map(|last| last.role),
+            Some(crate::conversation::Role::User),
+            "the context keeps none of a reply that held no words: {:?}",
+            view.last()
+        );
+    }
+
+    /// A reply an inbox interrupt cuts is recorded whole as interrupted, its call included, and
+    /// the request that carries the message holds the reasoning without the call.
+    #[tokio::test]
+    async fn an_interrupted_reply_is_recorded_whole_and_the_next_request_holds_no_unrun_call() {
+        let (agent, provider, store, session_id, _frontend) = agent_with_session(vec![
+            a_reply_with_a_call_then(MockEvent::Sleep { ms: 5000 }),
+            text_round("carrying on with your message"),
+        ])
+        .await;
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "stop, do this instead",
+            std::time::Duration::from_millis(300),
+        );
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn runs on");
+        enqueued.await.expect("enqueued");
+        let replies = recorded_replies(&store, session_id).await;
+        let (reply, record) = replies.first().expect("the cut reply is recorded");
+        assert!(
+            matches!(reply.content.as_slice(), [
+                ContentBlock::Thinking { .. },
+                ContentBlock::ToolUse { .. }
+            ]),
+            "{reply:?}"
+        );
+        assert_eq!(
+            record.as_ref().and_then(|record| record.cut),
+            Some(crate::conversation::ReplyCut::Interrupted)
+        );
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 2, "the cut request and the one after it");
+        assert!(
+            !requests[1]
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. })),
+            "{:?}",
+            requests[1].messages
+        );
+    }
+
     fn a_stalled_answer(first: &str, rest: &str) -> Vec<MockEvent> {
         vec![
             MockEvent::Text {
@@ -4442,7 +5147,13 @@ mod tests {
             .expect("the turn runs on");
         let item_id = enqueued.await.expect("enqueued");
 
-        assert!(matches!(outcome, TurnOutcome::EndTurn), "{outcome:?}");
+        assert!(
+            matches!(outcome, TurnOutcome {
+                stop_reason: StopReason::EndTurn,
+                ..
+            }),
+            "{outcome:?}"
+        );
         let requests = provider.streams();
         assert_eq!(
             requests.len(),
@@ -5324,7 +6035,13 @@ mod tests {
             .await;
         enqueued.await.expect("enqueued");
         assert!(
-            matches!(outcome, Ok(TurnOutcome::EndTurn)),
+            matches!(
+                outcome,
+                Ok(TurnOutcome {
+                    stop_reason: StopReason::EndTurn,
+                    ..
+                })
+            ),
             "the tier the cut put back is spent on the next refusal, and the turn gets through: \
              {outcome:?}"
         );
@@ -5693,7 +6410,9 @@ mod tests {
             role: Role::Assistant,
             content: vec![crate::conversation::ContentBlock::Text {
                 text: format!("earlier answer {body}"),
+                provider_fields: None,
             }],
+            provider_fields: None,
         });
 
         hide_messages_table(&path, true);
@@ -6067,7 +6786,7 @@ mod tests {
             .await
             .expect("the turn runs");
         assert_eq!(provider.completions().len(), 1, "the summarizer ran once");
-        let summary = messages.as_slice()[0].text_content();
+        let summary = messages.as_slice()[0].wire_text();
         assert!(
             summary.contains("[The request this turn is answering, as the user wrote it]")
                 && summary.contains("finish the report in exactly two lines"),
@@ -6125,7 +6844,7 @@ mod tests {
             1,
             "the emergency summarizer ran once"
         );
-        let summary = messages.as_slice()[0].text_content();
+        let summary = messages.as_slice()[0].wire_text();
         assert!(
             summary.contains("[The request this turn is answering, as the user wrote it]")
                 && summary.contains("finish the report in exactly two lines"),
@@ -6180,7 +6899,7 @@ mod tests {
             .await
             .expect("the turn runs");
         assert_eq!(provider.completions().len(), 1, "the round compacted");
-        let summary = messages.as_slice()[0].text_content();
+        let summary = messages.as_slice()[0].wire_text();
         assert!(
             !summary.contains("[The request this turn is answering"),
             "{summary}"
@@ -6909,7 +7628,7 @@ mod tests {
         assert!(
             matches!(
                 &sent[1][0].content[1],
-                ContentBlock::Text { text } if text == crate::conversation::IMAGE_REDACTION_PLACEHOLDER
+                ContentBlock::HarnessNote { note } if note == crate::conversation::BUDGET_REDACTION_NOTE
             ),
             "the next request carries the placeholder, not the image: {:?}",
             sent[1][0].content
@@ -7604,7 +8323,10 @@ mod tests {
             .turn_store()
             .close_turn(
                 old,
-                &TurnEnding::succeeded("end_turn", TurnUsage::default()),
+                &TurnEnding::succeeded(
+                    crate::conversation::StopReason::EndTurn,
+                    TurnUsage::default(),
+                ),
             )
             .await
             .expect("close");
@@ -7984,7 +8706,10 @@ mod tests {
             .expect("the turn must retry past a notice-then-drop, not fail");
 
         assert!(
-            matches!(outcome, TurnOutcome::EndTurn),
+            matches!(outcome, TurnOutcome {
+                stop_reason: StopReason::EndTurn,
+                ..
+            }),
             "the retry must carry the turn to a normal end: {outcome:?}",
         );
         assert!(
@@ -7992,6 +8717,106 @@ mod tests {
                 .iter()
                 .any(|message| message.text_content().contains("answered on the retry")),
             "and the retry's answer is what lands in the conversation",
+        );
+    }
+
+    /// A call the stream opened and the reply ended without finishing is refused for the
+    /// arguments that never came and runs as the reply's other calls do: it is shown starting and
+    /// answered, never dropped as a call nothing will run.
+    #[tokio::test]
+    async fn a_call_left_open_at_a_clean_end_is_shown_and_answered_not_dropped() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call_open".to_string(),
+                    name: "checklist_read".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![
+                MockEvent::Text {
+                    text: "done".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, frontend) =
+            agent_recording_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn ends");
+        let about_the_call: Vec<&str> = frontend
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                FrontendEvent::ToolCallDropped { id, .. } if id == "call_open" => Some("dropped"),
+                FrontendEvent::ToolCallStarted { id, unparsed, .. } if id == "call_open" => {
+                    assert!(unparsed.is_some(), "refused for its arguments");
+                    Some("started")
+                }
+                FrontendEvent::ToolCallCompleted { id, .. } if id == "call_open" => {
+                    Some("completed")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(about_the_call, ["started", "completed"]);
+    }
+
+    /// A part Meka reads nothing from is kept, not shown, so it leaves the turn's retry in place:
+    /// a stream that fails after one has put nothing on screen a retry would show twice.
+    #[tokio::test]
+    async fn an_unread_part_before_a_dropped_stream_does_not_disable_the_retry() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Unrecognized {
+                    value: serde_json::json!({"type": "server_tool_use"}),
+                },
+                MockEvent::FailStream {
+                    message: "connection reset".to_string(),
+                },
+            ],
+            vec![
+                MockEvent::Text {
+                    text: "answered on the retry".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let provider_handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (agent, _store) = agent_for_test(provider_handle).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the turn retries past an unread part, not fail");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.text_content().contains("answered on the retry")),
+            "the retry's answer lands in the conversation"
         );
     }
 
@@ -8256,7 +9081,8 @@ mod tests {
             "{stored:?}"
         );
         assert_eq!(stored.content[1], ContentBlock::Text {
-            text: "hello there".to_string()
+            text: "hello there".to_string(),
+            provider_fields: None,
         });
         assert_eq!(stored.text_content(), "hello there");
     }
@@ -8271,6 +9097,7 @@ mod tests {
             },
             ContentBlock::Text {
                 text: "short".to_string(),
+                provider_fields: None,
             },
         ];
         super::turn::strip_images_and_truncate(&mut content);
@@ -8280,7 +9107,8 @@ mod tests {
         assert!(text.len() < 2_000, "{}", text.len());
         assert!(text.contains("truncated for compaction"));
         assert_eq!(content[1], ContentBlock::Text {
-            text: "short".to_string()
+            text: "short".to_string(),
+            provider_fields: None,
         });
     }
 
@@ -8293,6 +9121,8 @@ mod tests {
             id: "call".to_string(),
             name: "file_write".to_string(),
             input: serde_json::json!({"path": "a.txt", "content": "x".repeat(50_000)}),
+            unparsed: None,
+            provider_fields: None,
         }];
         super::turn::strip_images_and_truncate(&mut content);
         let ContentBlock::ToolUse { input, .. } = &content[0] else {
@@ -8377,7 +9207,7 @@ mod tests {
         let placeholder = |message: &Message| {
             matches!(
                 &message.content[1],
-                ContentBlock::Text { text } if text == crate::conversation::IMAGE_REDACTION_PLACEHOLDER
+                ContentBlock::HarnessNote { note } if note == crate::conversation::BUDGET_REDACTION_NOTE
             )
         };
         assert!(
@@ -8516,7 +9346,10 @@ mod tests {
             .await
             .expect("the compacted retry must succeed");
         assert!(
-            matches!(outcome, TurnOutcome::EndTurn),
+            matches!(outcome, TurnOutcome {
+                stop_reason: StopReason::EndTurn,
+                ..
+            }),
             "the retry must end the turn cleanly: {outcome:?}",
         );
 
@@ -8577,7 +9410,7 @@ mod tests {
             )
             .await
             .expect("the turn survives a first attempt that got no response");
-        assert_eq!(outcome, TurnOutcome::EndTurn);
+        assert_eq!(outcome, TurnOutcome::of(StopReason::EndTurn));
         assert_eq!(
             provider.streams().len(),
             2,
@@ -8588,7 +9421,7 @@ mod tests {
                 .iter()
                 .flat_map(|message| message.content.iter())
                 .any(
-                    |block| matches!(block, ContentBlock::Text { text } if text.contains("chart"))
+                    |block| matches!(block, ContentBlock::Text { text, .. } if text.contains("chart"))
                 ),
             "the answer from the surviving attempt is what lands in the conversation"
         );
@@ -8633,7 +9466,7 @@ mod tests {
             )
             .await
             .expect("the turn recovers instead of dying");
-        assert_eq!(outcome, TurnOutcome::EndTurn);
+        assert_eq!(outcome, TurnOutcome::of(StopReason::EndTurn));
 
         // The image is gone from the live conversation, replaced by an explanation.
         let user = &messages.as_slice()[0];
@@ -8644,7 +9477,7 @@ mod tests {
             "the refused image must not survive in the conversation"
         );
         assert!(
-            user.text_content().contains("image/jpeg"),
+            user.wire_text().contains("image/jpeg"),
             "carries the reason"
         );
 
@@ -8697,7 +9530,7 @@ mod tests {
                 )
                 .await
                 .expect("the turn recovers instead of dying");
-            assert_eq!(outcome, TurnOutcome::EndTurn);
+            assert_eq!(outcome, TurnOutcome::of(StopReason::EndTurn));
         }
 
         let streams = provider.streams();
@@ -8734,10 +9567,14 @@ mod tests {
         );
         assert!(!carries_claude_thinking(reloaded.as_slice()), "persisted");
         assert!(
-            reloaded.iter().flat_map(|message| &message.content).any(|block| matches!(
-                block,
-                ContentBlock::Thinking { thinking, opaque: None } if thinking == "the first reasoning"
-            )),
+            reloaded
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(
+                    block,
+                    ContentBlock::Thinking { parts, opaque: None, .. }
+                        if crate::conversation::reasoning_text(parts) == "the first reasoning"
+                )),
             "the reasoning stays readable"
         );
         assert!(
@@ -8967,7 +9804,7 @@ mod tests {
             )
             .await
             .expect("a spent retry budget degrades rather than ending the turn");
-        assert_eq!(outcome, TurnOutcome::EndTurn);
+        assert_eq!(outcome, TurnOutcome::of(StopReason::EndTurn));
 
         let user = &messages.as_slice()[0];
         assert!(
@@ -8977,9 +9814,9 @@ mod tests {
             "the content the provider kept refusing must not survive the turn"
         );
         assert!(
-            user.text_content().contains("500"),
+            user.wire_text().contains("500"),
             "the model is told what the provider said: {}",
-            user.text_content()
+            user.wire_text()
         );
 
         let session_id = agent.session_id().expect("session created");
@@ -9318,13 +10155,12 @@ mod tests {
             "the call stays a call, so nothing can be orphaned: {:?}",
             messages.as_slice()
         );
-        let results: Vec<&str> = blocks
+        let results: Vec<String> = blocks
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::ToolResult { content, .. } => match content.first() {
-                    Some(ToolResultContent::Text { text }) => Some(text.as_str()),
-                    _ => None,
-                },
+                ContentBlock::ToolResult { content, .. } => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
                 _ => None,
             })
             .collect();
@@ -9877,8 +10713,8 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .find_map(|block| match block {
-                ContentBlock::Thinking { thinking, opaque } => {
-                    Some((thinking.clone(), opaque.clone()))
+                ContentBlock::Thinking { parts, opaque, .. } => {
+                    Some((crate::conversation::reasoning_text(parts), opaque.clone()))
                 }
                 _ => None,
             })
@@ -11220,20 +12056,26 @@ mod tests {
             .await
             .expect("turn succeeds");
 
-        let results: String = messages
+        use crate::conversation::ToolResultContent;
+        let items: Vec<&ToolResultContent> = messages
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|block| match block {
-                ContentBlock::ToolResult { content, .. } => {
-                    Some(ContentBlock::tool_result_text_content(content))
-                }
+                ContentBlock::ToolResult { content, .. } => Some(content),
                 _ => None,
             })
+            .flatten()
             .collect();
+        let results = items
+            .iter()
+            .map(|item| ContentBlock::tool_result_text_content(std::slice::from_ref(*item)))
+            .collect::<String>();
 
         assert!(results.contains("Sent (message id 1)"), "{results}");
         assert!(
-            !results.contains(crate::conversation::HARNESS_NOTE),
+            !items
+                .iter()
+                .any(|item| matches!(item, ToolResultContent::HarnessNote { .. })),
             "the schema was loaded; nothing to advise: {results}"
         );
     }
@@ -11326,50 +12168,61 @@ mod tests {
     }
 
     #[test]
-    fn empty_turn_notice_includes_unknown_stop_reason() {
-        assert_eq!(
-            empty_turn_notice(&StopReason::Refusal("custom refusal".to_string())),
-            "custom refusal"
+    fn only_non_blank_text_counts_as_visible() {
+        let reply = |content: Vec<ContentBlock>| Message {
+            role: Role::Assistant,
+            content,
+            provider_fields: None,
+        };
+        assert!(!reply(vec![]).has_visible_text());
+        assert!(
+            !reply(vec![ContentBlock::Thinking {
+                parts: vec![crate::conversation::ReasoningPart::reasoning("pondering")],
+                opaque: None,
+                provider_fields: None,
+            }])
+            .has_visible_text()
+        );
+        // Whitespace-only text is not visible output.
+        assert!(
+            !reply(vec![ContentBlock::Text {
+                text: "   \n".to_string(),
+                provider_fields: None,
+            }])
+            .has_visible_text()
         );
         assert!(
-            empty_turn_notice(&StopReason::Refusal(String::new())).contains("declined to respond")
+            !reply(vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "file_read".to_string(),
+                input: serde_json::json!({}),
+                unparsed: None,
+                provider_fields: None,
+            }])
+            .has_visible_text()
         );
-        assert!(empty_turn_notice(&StopReason::MaxTokens).contains("output limit"));
-        // The raw reason of an unrecognized stop reason must be surfaced, not swallowed.
-        let notice = empty_turn_notice(&StopReason::Unknown("pause_turn".to_string()));
-        assert!(notice.contains("pause_turn"), "got: {notice}");
-        assert!(empty_turn_notice(&StopReason::EndTurn).contains("empty response"));
-    }
-
-    #[test]
-    fn only_non_blank_text_counts_as_visible() {
-        assert!(!has_visible_text(&[]));
-        assert!(!has_visible_text(&[ContentBlock::Thinking {
-            thinking: "pondering".to_string(),
-            opaque: None,
-        }]));
-        // Whitespace-only text is not visible output.
-        assert!(!has_visible_text(&[ContentBlock::Text {
-            text: "   \n".to_string(),
-        }]));
-        assert!(!has_visible_text(&[ContentBlock::ToolUse {
-            id: "call_1".to_string(),
-            name: "file_read".to_string(),
-            input: serde_json::json!({}),
-        }]));
-        assert!(has_visible_text(&[ContentBlock::Text {
-            text: "hello".to_string(),
-        }]));
+        assert!(
+            reply(vec![ContentBlock::Text {
+                text: "hello".to_string(),
+                provider_fields: None,
+            }])
+            .has_visible_text()
+        );
         // A thinking block followed by real text still counts as visible.
-        assert!(has_visible_text(&[
-            ContentBlock::Thinking {
-                thinking: "pondering".to_string(),
-                opaque: None,
-            },
-            ContentBlock::Text {
-                text: "answer".to_string(),
-            },
-        ]));
+        assert!(
+            reply(vec![
+                ContentBlock::Thinking {
+                    parts: vec![crate::conversation::ReasoningPart::reasoning("pondering")],
+                    opaque: None,
+                    provider_fields: None,
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                    provider_fields: None,
+                },
+            ])
+            .has_visible_text()
+        );
     }
 
     fn not_connected(name: &str, required: bool) -> crate::mcp::NotConnected {
@@ -11458,7 +12311,7 @@ mod tests {
         assert!(should_nudge_thinking_only(
             false,
             false,
-            &StopReason::Unknown("pause_turn".to_string()),
+            &StopReason::Unknown,
             false,
         ));
         // Already nudged this turn: no second nudge (prevents loops).
@@ -11492,7 +12345,7 @@ mod tests {
         assert!(!should_nudge_thinking_only(
             false,
             false,
-            &StopReason::Refusal(String::new()),
+            &StopReason::Refusal,
             false,
         ));
     }
@@ -11692,7 +12545,7 @@ mod tests {
         assert!(should_nudge_checklist(false, &StopReason::EndTurn, 1, 0, 0));
         assert!(should_nudge_checklist(
             false,
-            &StopReason::Unknown("odd".to_string()),
+            &StopReason::Unknown,
             1,
             CHECKLIST_NUDGE_LIMIT - 1,
             CHECKLIST_NUDGES_PER_TURN - 1
@@ -11722,7 +12575,7 @@ mod tests {
         ));
         assert!(!should_nudge_checklist(
             false,
-            &StopReason::Refusal(String::new()),
+            &StopReason::Refusal,
             1,
             0,
             0
@@ -11773,7 +12626,10 @@ mod tests {
             .await
             .expect("the turn ends");
 
-        assert!(matches!(outcome, TurnOutcome::EndTurn));
+        assert!(matches!(outcome, TurnOutcome {
+            stop_reason: StopReason::EndTurn,
+            ..
+        }));
         assert_eq!(nudges_in(&messages), 1, "{:?}", messages.as_slice());
         let last = messages.as_slice().last().expect("a reply");
         assert_eq!(
@@ -11823,7 +12679,10 @@ mod tests {
             .await
             .expect("the turn ends");
 
-        assert!(matches!(outcome, TurnOutcome::EndTurn));
+        assert!(matches!(outcome, TurnOutcome {
+            stop_reason: StopReason::EndTurn,
+            ..
+        }));
         // Two nudges, a read that resets the count, three more, then the cap lets "six" stand.
         assert_eq!(nudges_in(&messages), 5, "{:?}", messages.as_slice());
         assert_eq!(
@@ -12844,7 +13703,10 @@ mod tests {
                 id: "add-1".to_string(),
                 name: "checklist_add".to_string(),
                 input: serde_json::json!({"items": ["a"]}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         });
         emptied.append(Message {
             role: Role::User,
@@ -12856,6 +13718,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
         emptied.append(Message {
             role: Role::Assistant,
@@ -12863,7 +13726,10 @@ mod tests {
                 id: "edit-1".to_string(),
                 name: "checklist_edit".to_string(),
                 input: serde_json::json!({"id": 1, "status": "completed"}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         });
         emptied.append(Message {
             role: Role::User,
@@ -12875,6 +13741,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
         agent.hydrate_checklist(&emptied).await;
         let announced = || {
@@ -12925,7 +13792,10 @@ mod tests {
             .await
             .expect("the turn ends");
 
-        assert!(matches!(outcome, TurnOutcome::MaxTokens));
+        assert!(matches!(outcome, TurnOutcome {
+            stop_reason: StopReason::MaxTokens,
+            ..
+        }));
         assert_eq!(nudges_in(&messages), 0);
         assert!(checklist_notices(&frontend).is_empty());
     }
@@ -12962,7 +13832,10 @@ mod tests {
                     id: "add-0".to_string(),
                     name: "checklist_add".to_string(),
                     input: serde_json::json!({"items": ["finish the report"]}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             }),
             Event::Append(Message {
                 role: Role::User,
@@ -12974,6 +13847,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             }),
             Event::Append(Message::assistant_text("Planned.")),
         ]);

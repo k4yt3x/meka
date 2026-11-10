@@ -11,10 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::ThinkingMode,
-    conversation::{ContentBlock, Message, OpaqueReasoning, Role, ToolResultContent},
+    conversation::{ContentBlock, Message, OpaqueReasoning, ResultPart, Role, ToolResultContent},
     error::{MekaError, Result},
     provider::{
-        CompletionRequest, StopReason, StreamEvent, ToolDefinition,
+        CompletionRequest, Stop, StopReason, StreamEvent, ToolDefinition,
         sse::{End, Step},
     },
     stats::TokenUsage,
@@ -55,9 +55,9 @@ pub(crate) fn normalize_claude_base_url(url: &str) -> String {
 // The redaction itself, its stopping point and the refusal live in `crate::provider::budget`, since
 // every backend applies them; the constant above is the Anthropic default ceiling they run against.
 // The redaction tests live beside the downscale tests, hence the test-only import.
-pub(super) use crate::provider::budget::serialize_body;
 #[cfg(test)]
-pub(super) use crate::provider::budget::{IMAGE_REDACTION_PLACEHOLDER, redact_oldest_images};
+pub(super) use crate::provider::budget::redact_oldest_images;
+pub(super) use crate::provider::budget::serialize_body;
 
 /// Anthropic accepts up to 8000 px per axis on a *single*-image request, but rejects anything over
 /// 2000 px on either axis once the request contains more than one image. Every image is downscaled
@@ -393,29 +393,51 @@ pub(super) fn convert_messages_to_claude_content(
                 .iter()
                 .filter_map(|block| {
                     Some(match block {
-                        // The turn's context block, a nudge and what arrived for the model are
-                        // text on this wire, in the order the message holds them.
+                        // The turn's context block, a nudge, a note and what arrived for the model
+                        // are text on this wire, in the order the message holds them.
                         // A blank one is left out: the API refuses a text block with no
                         // non-whitespace text in it, and a reply that streamed a newline before
                         // it was cut is saved as one.
-                        ContentBlock::Text { text }
-                        | ContentBlock::TurnContext { text }
-                        | ContentBlock::Nudge { text, .. }
-                        | ContentBlock::Inbox { text, .. }
-                        | ContentBlock::Scheduled { text, .. }
-                        | ContentBlock::BackgroundReport { text, .. }
-                        | ContentBlock::Invocation { text, .. }
-                        | ContentBlock::Resource { text, .. } => {
-                            if crate::text::is_blank(text) {
+                        ContentBlock::Text { .. }
+                        | ContentBlock::TurnContext { .. }
+                        | ContentBlock::Nudge { .. }
+                        | ContentBlock::HarnessNote { .. }
+                        | ContentBlock::Summary { .. }
+                        | ContentBlock::Inbox { .. }
+                        | ContentBlock::Scheduled { .. }
+                        | ContentBlock::BackgroundReport { .. }
+                        | ContentBlock::Invocation { .. }
+                        | ContentBlock::Resource { .. }
+                        | ContentBlock::Refusal { .. } => {
+                            let text = block.model_text()?;
+                            if crate::text::is_blank(&text) {
                                 return None;
                             }
-                            serde_json::json!({
+                            let mut text_block = serde_json::json!({
                                 "type": "text",
                                 "text": text,
-                            })
+                            });
+                            // The citations a text block came with go back on it, where the
+                            // spec defines them.
+                            if let ContentBlock::Text {
+                                provider_fields: Some(fields),
+                                ..
+                            } = block
+                                && let Some(citations) = fields
+                                    .get("citations")
+                                    .filter(|citations| {
+                                        citations.as_array().is_some_and(|list| !list.is_empty())
+                                    })
+                                && let Some(object) = text_block.as_object_mut()
+                            {
+                                object.insert("citations".to_string(), citations.clone());
+                            }
+                            text_block
                         }
                         ContentBlock::Image { source } => claude_image_block(source),
-                        ContentBlock::ToolUse { id, name, input } => {
+                        // Kept for the record; nothing on this wire carries it.
+                        ContentBlock::Unrecognized { .. } => return None,
+                        ContentBlock::ToolUse { id, name, input, .. } => {
                             serde_json::json!({
                                 "type": "tool_use",
                                 "id": id,
@@ -434,17 +456,15 @@ pub(super) fn convert_messages_to_claude_content(
                                 .filter(|item| {
                                     !matches!(item, ToolResultContent::Text { text } if crate::text::is_blank(text))
                                 })
-                                .map(|item| match item {
-                                    ToolResultContent::Text { text } => {
+                                .map(|item| match item.wire_part() {
+                                    ResultPart::Text(text) => {
                                         serde_json::json!({"type": "text", "text": text})
                                     }
-                                    ToolResultContent::Image { source } => {
-                                        claude_image_block(source)
-                                    }
+                                    ResultPart::Image(source) => claude_image_block(source),
                                     // The API expands the reference into the tool's definition
                                     // where it sits, under the deferred-tools beta the declaring
                                     // backends send.
-                                    ToolResultContent::ToolReference { tool_name } => {
+                                    ResultPart::ToolReference(tool_name) => {
                                         serde_json::json!({
                                             "type": "tool_reference",
                                             "tool_name": tool_name,
@@ -464,29 +484,24 @@ pub(super) fn convert_messages_to_claude_content(
                             }
                             serde_json::Value::Object(block)
                         }
-                        // Only a block Claude signed goes back to Claude: the API makes
-                        // `signature` required and rejects the whole request without one. A block
-                        // with none, sealed by the Responses API or returned unsigned by an
-                        // Anthropic-compatible endpoint that does not sign (an empty string, on
-                        // OpenRouter), is left out rather than sent in a shape Claude rejects.
-                        ContentBlock::Thinking { thinking, opaque } => {
-                            let signature = match opaque {
-                                Some(OpaqueReasoning::Signed { signature })
-                                    if !signature.is_empty() =>
-                                {
-                                    signature
-                                }
-                                _ => return None,
+                        // A thinking block goes back with the signature it came with, the empty
+                        // string OpenRouter gives a model that does not sign included. One with no
+                        // signature at all, sealed by the Responses API or reasoning a Chat
+                        // Completions endpoint returned in the clear, has no place here: the
+                        // protocol makes `signature` required.
+                        ContentBlock::Thinking { parts, opaque, .. } => {
+                            let Some(OpaqueReasoning::Signed { signature }) = opaque else {
+                                return None;
                             };
                             serde_json::json!({
                                 "type": "thinking",
-                                "thinking": thinking,
+                                "thinking": crate::conversation::reasoning_as_streamed(parts),
                                 "signature": signature,
                             })
                         }
                         // Replayed verbatim: the API needs the opaque `data` unchanged to continue
                         // the redacted reasoning chain.
-                        ContentBlock::RedactedThinking { data } => {
+                        ContentBlock::RedactedThinking { data, .. } => {
                             serde_json::json!({
                                 "type": "redacted_thinking",
                                 "data": data,
@@ -640,21 +655,40 @@ pub(super) fn declare_deferred_tools(body: &mut serde_json::Value, deferred: &[T
 /// A Claude `stop_reason` as Meka's own.
 pub(super) fn parse_claude_stop_reason(reason: &str) -> StopReason {
     match reason {
-        "end_turn" => StopReason::EndTurn,
+        // A stop sequence ends the reply where the request asked; `stop_sequence` in the details
+        // says which.
+        "end_turn" | "stop_sequence" => StopReason::EndTurn,
         "tool_use" => StopReason::ToolUse,
         "max_tokens" => StopReason::MaxTokens,
-        // Claude does not include the refusal text alongside the streaming `stop_reason` delta; the
-        // model's text content is what the user sees as the refusal. Surface an empty refusal
-        // payload; the assistant message blocks carry the human-readable explanation already.
-        "refusal" => StopReason::Refusal(String::new()),
-        // Log unrecognized reasons (e.g. `pause_turn`) so a recurrence is diagnosable; the raw
-        // string is otherwise discarded once mapped to `Unknown`.
+        "model_context_window_exceeded" => StopReason::ContextWindow,
+        "refusal" => StopReason::Refusal,
+        // Logged so a recurrence is diagnosable; the word itself is recorded with the reply.
         other => {
             tracing::warn!(
                 "Claude returned unrecognized stop_reason {other:?}; mapping to Unknown"
             );
-            StopReason::Unknown(other.to_string())
+            StopReason::Unknown
         }
+    }
+}
+
+/// How a Claude reply ended, from the `message_delta` that says so: its `stop_reason` classed, the
+/// word itself, and beside it `stop_details` (a refusal's category and explanation) and
+/// `stop_sequence` when the delta carries them.
+fn claude_stop(delta: &serde_json::Value, word: &str) -> Stop {
+    let details: serde_json::Map<String, serde_json::Value> = ["stop_details", "stop_sequence"]
+        .into_iter()
+        .filter_map(|field| {
+            delta
+                .get(field)
+                .filter(|value| !value.is_null())
+                .map(|value| (field.to_string(), value.clone()))
+        })
+        .collect();
+    Stop {
+        reason: parse_claude_stop_reason(word),
+        word: Some(word.to_string()),
+        details: (!details.is_empty()).then_some(details),
     }
 }
 
@@ -818,34 +852,45 @@ pub(super) async fn drive_claude_sse_stream(
         previous_message,
         ..ClaudeStream::default()
     };
-    match crate::provider::sse::drive(
+    let ended = crate::provider::sse::drive(
         response,
         "Claude",
         &event_sender,
         &cancellation,
         &mut protocol,
     )
-    .await?
-    {
-        End::Finished | End::ReceiverGone => Ok(()),
+    .await;
+    let ended = match ended {
+        Ok(End::Finished | End::ReceiverGone) => Ok(()),
         // The byte stream ending is not the same as the message ending.
         //
         // An intermediary (a gateway named by `base_url`, a CDN edge, a load balancer closing an
         // idle connection) can terminate a chunked response cleanly mid-message. Treating that as
         // success hands the agent a half-written answer with `stop_reason` left at its `EndTurn`
         // default: no error, so no retry, and nothing to distinguish a truncated reply from a
-        // complete one. Worse mid-tool-call, where the accumulated call is dropped entirely because
-        // `ToolUseEnd` never arrives. Reporting it as a `StreamError` routes it to the same retry
-        // path a dropped connection already takes.
+        // complete one. Worse mid-tool-call, whose arguments never finished. Reporting it as a
+        // `StreamError` routes it to the same retry path a dropped connection already takes.
         //
         // A stop reason already seen makes the message complete without `message_stop`: a gateway
         // that forwards the deltas and closes without the final frame delivers a whole answer.
-        End::Ended if protocol.saw_terminal_event => Ok(()),
-        End::Ended => Err(crate::provider::sse::stream_error(
+        Ok(End::Ended) if protocol.saw_terminal_event => Ok(()),
+        Ok(End::Ended) => Err(crate::provider::sse::stream_error(
             &event_sender,
             "stream ended before a stop reason".to_string(),
         )
         .await),
+        Err(error) => Err(error),
+    };
+    // What the stream held, a block it left open and the blocks held behind one, is handed over
+    // after the failure is said, so it goes to the attempt's partial reply and leaves the retry
+    // the failure allows.
+    match (ended, protocol.release_held(&event_sender).await) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(held)) => {
+            tracing::debug!("failed to fold a held block after the stream failed: {held}");
+            Err(error)
+        }
     }
 }
 
@@ -856,15 +901,132 @@ struct ClaudeStream {
     /// `diagnostics.previous_message_id`; `None` on a stream that is not a conversation turn.
     previous_message: Option<crate::provider::PreviousMessageSlot>,
     current_tool_input: String,
+    /// The `input` the call's block opened with when it held anything, which stands as its
+    /// arguments when no `input_json_delta` follows, as the reference client keeps it.
+    current_tool_start_input: Option<serde_json::Value>,
     in_tool_use: bool,
     /// Retained past `ToolUseStart` so a call whose arguments never parse can be *rejected* by id
     /// rather than silently run with `{}`.
     current_tool_id: String,
     current_tool_name: String,
+    /// Every field the call's block carried beyond its type, id, name and input.
+    current_tool_fields: Option<crate::conversation::ProviderFields>,
+    /// The fields of the text block in progress beyond its type and text, `Some` while one is
+    /// open, so its end closes it as one part with them.
+    current_text_fields: Option<Option<crate::conversation::ProviderFields>>,
     /// Whether the message reached its end rather than the byte stream simply stopping.
     saw_terminal_event: bool,
     in_thinking: bool,
     current_thinking_signature: Option<String>,
+    /// The fields of the thinking or redacted block in progress beyond those its block holds.
+    current_thinking_fields: Option<crate::conversation::ProviderFields>,
+    /// A block of a type Meka has no block for, `Some` while one is open: the events that start
+    /// it and carry its deltas, whole, as they came, each naming the block by its `index`.
+    unread_block: Option<Vec<serde_json::Value>>,
+    /// The events that arrived inside the open block and that the reference client does not fold
+    /// (a delta or an event of a type it does not know), kept whole after the block so the block
+    /// is not split.
+    unread: Vec<serde_json::Value>,
+    /// The message as `message_start` stated it and each `message_delta` updated it, folded as
+    /// the reference client folds them, without its content.
+    response: serde_json::Map<String, serde_json::Value>,
+    /// The `index` of the block whose frames fold now.
+    next_block: u64,
+    /// The frames of blocks after [`Self::next_block`], by index, each with its name, as they
+    /// came: a block's index is its place in the message's content, so one that opens while an
+    /// earlier one is open waits for every block before it to close.
+    held: std::collections::BTreeMap<u64, Vec<(String, serde_json::Value)>>,
+}
+
+impl ClaudeStream {
+    /// Whether a content block is open.
+    fn in_block(&self) -> bool {
+        self.current_text_fields.is_some()
+            || self.in_thinking
+            || self.in_tool_use
+            || self.unread_block.is_some()
+    }
+
+    /// The message's fields nothing else holds: all but its role, content, model and how it
+    /// stopped, which the reply and its record hold. The raw `usage` stays.
+    fn response_fields(&self) -> Option<crate::conversation::ProviderFields> {
+        crate::provider::fields_beyond(&self.response, &[
+            "role",
+            "content",
+            "model",
+            "stop_reason",
+            "stop_sequence",
+            "stop_details",
+        ])
+    }
+
+    /// Tell the message's fields as they stand; `false` once the receiver is gone.
+    async fn tell_response(&self, event_sender: &mpsc::Sender<StreamEvent>) -> bool {
+        match self.response_fields() {
+            Some(fields) => event_sender
+                .send(StreamEvent::ResponseFields(fields))
+                .await
+                .is_ok(),
+            None => true,
+        }
+    }
+
+    /// Close the block the stream left open as one that never finished: an unread block's frames
+    /// as they came, a text part with its fields, its reasoning unsigned, since a signature that
+    /// arrived before the block ended may not cover all of it, and a call refused with the
+    /// arguments that had streamed. What arrived unread inside it follows. Whether the receiver
+    /// is still there.
+    async fn close_unfinished(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> bool {
+        let events = if let Some(unread_block) = self.unread_block.take() {
+            unread_block
+                .into_iter()
+                .map(StreamEvent::Unrecognized)
+                .collect()
+        } else if let Some(provider_fields) = self.current_text_fields.take() {
+            vec![StreamEvent::TextEnd { provider_fields }]
+        } else if self.in_thinking {
+            self.in_thinking = false;
+            self.current_thinking_signature = None;
+            vec![StreamEvent::ThinkingComplete {
+                opaque: None,
+                provider_fields: self.current_thinking_fields.take(),
+            }]
+        } else if self.in_tool_use {
+            self.in_tool_use = false;
+            let arguments = match self.current_tool_start_input.take() {
+                Some(input) if self.current_tool_input.is_empty() => input.to_string(),
+                _ => std::mem::take(&mut self.current_tool_input),
+            };
+            vec![StreamEvent::ToolCallRefused {
+                id: self.current_tool_id.clone(),
+                name: self.current_tool_name.clone(),
+                unparsed: crate::provider::unfinished_call(arguments),
+                provider_fields: self.current_tool_fields.take(),
+            }]
+        } else {
+            Vec::new()
+        };
+        for event in events {
+            if event_sender.send(event).await.is_err() {
+                return false;
+            }
+        }
+        self.release_unread(event_sender).await
+    }
+
+    /// Hand over what arrived unread inside the block that just closed, after it.
+    async fn release_unread(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> bool {
+        for part in std::mem::take(&mut self.unread) {
+            if event_sender
+                .send(StreamEvent::Unrecognized(part))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[async_trait::async_trait]
@@ -874,10 +1036,87 @@ impl crate::provider::sse::Protocol for ClaudeStream {
         event: eventsource_stream::Event,
         event_sender: &mpsc::Sender<StreamEvent>,
     ) -> Result<Step> {
-        let Some(data) = crate::provider::sse::frame_json("Claude", &event.data) else {
-            return Ok(Step::Continue);
-        };
-        match claude_frame_name(&data, &event.event) {
+        let data = crate::provider::sse::frame_json("Claude", &event.data)?;
+        let name = claude_frame_name(&data, &event.event).to_string();
+        if name.starts_with("content_block_") {
+            let index = data.get("index").and_then(serde_json::Value::as_u64);
+            if let Some(index) = index
+                && index > self.next_block
+            {
+                self.held.entry(index).or_default().push((name, data));
+                return Ok(Step::Continue);
+            }
+            let closes =
+                name == "content_block_stop" && index.is_none_or(|index| index == self.next_block);
+            let step = self.fold(&name, data, event_sender).await?;
+            if !closes || !matches!(step, Step::Continue) {
+                return Ok(step);
+            }
+            return self.fold_next_blocks(event_sender).await;
+        }
+        // The message's end follows every block it holds.
+        if name == "message_delta" {
+            let step = self.release_held(event_sender).await?;
+            if !matches!(step, Step::Continue) {
+                return Ok(step);
+            }
+        }
+        self.fold(&name, data, event_sender).await
+    }
+}
+
+impl ClaudeStream {
+    /// Fold the blocks held for the ones after the block that just closed, in order, as far as
+    /// the frames that arrived reach.
+    async fn fold_next_blocks(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> Result<Step> {
+        loop {
+            self.next_block += 1;
+            let Some(frames) = self.held.remove(&self.next_block) else {
+                return Ok(Step::Continue);
+            };
+            let mut closed = false;
+            for (name, data) in frames {
+                closed |= name == "content_block_stop";
+                let step = self.fold(&name, data, event_sender).await?;
+                if !matches!(step, Step::Continue) {
+                    return Ok(step);
+                }
+            }
+            if !closed {
+                return Ok(Step::Continue);
+            }
+        }
+    }
+
+    /// Close the block left open and fold every block still held, in index order: the message is
+    /// over, or the stream broke off and what arrived of it is the reply so far.
+    async fn release_held(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> Result<Step> {
+        // A block that never closed closes first, as one that never finished: what it holds that
+        // only this fold has (an unread block's frames, a text part's citations) reaches the
+        // reply, and what was held behind it follows in its place.
+        if self.in_block() && !self.close_unfinished(event_sender).await {
+            return Ok(Step::ReceiverGone);
+        }
+        while let Some((index, frames)) = self.held.pop_first() {
+            self.next_block = index;
+            for (name, data) in frames {
+                let step = self.fold(&name, data, event_sender).await?;
+                if !matches!(step, Step::Continue) {
+                    return Ok(step);
+                }
+            }
+        }
+        Ok(Step::Continue)
+    }
+
+    /// Fold one frame into the reply, its blocks arriving one after another.
+    async fn fold(
+        &mut self,
+        name: &str,
+        data: serde_json::Value,
+        event_sender: &mpsc::Sender<StreamEvent>,
+    ) -> Result<Step> {
+        match name {
             "content_block_start" => {
                 let Some(content_block) = data.get("content_block") else {
                     return Ok(Step::Continue);
@@ -887,8 +1126,27 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     .and_then(|block_type| block_type.as_str())
                     .unwrap_or("");
 
-                if block_type == "thinking" {
+                if block_type == "text" {
+                    self.current_text_fields = Some(content_block.as_object().and_then(|block| {
+                        crate::provider::fields_beyond(block, &["type", "text"])
+                    }));
+                    // Text the block opens with is its first, as the reference client folds it.
+                    if let Some(text) = content_block
+                        .get("text")
+                        .and_then(|text| text.as_str())
+                        .filter(|text| !text.is_empty())
+                        && event_sender
+                            .send(StreamEvent::TextDelta(text.to_string()))
+                            .await
+                            .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
+                    }
+                } else if block_type == "thinking" {
                     self.in_thinking = true;
+                    self.current_thinking_fields = content_block.as_object().and_then(|block| {
+                        crate::provider::fields_beyond(block, &["type", "thinking", "signature"])
+                    });
                     // Both schemas make `signature` required on a thinking block
                     // sent back, and require it verbatim, but it does not always
                     // arrive as a `signature_delta`. Anthropic opens the block with
@@ -916,6 +1174,19 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     {
                         return Ok(Step::ReceiverGone);
                     }
+                    // Reasoning the block opens with is its first, as the reference client folds
+                    // it.
+                    if let Some(thinking) = content_block
+                        .get("thinking")
+                        .and_then(|thinking| thinking.as_str())
+                        .filter(|thinking| !thinking.is_empty())
+                        && event_sender
+                            .send(StreamEvent::ThinkingDelta(thinking.to_string()))
+                            .await
+                            .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
+                    }
                 } else if block_type == "redacted_thinking" {
                     // The opaque `data` arrives whole in the start event; forward
                     // it so the agent can replay it verbatim on later turns.
@@ -923,32 +1194,37 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                         && event_sender
                             .send(StreamEvent::RedactedThinking {
                                 data: data.to_string(),
+                                provider_fields: content_block.as_object().and_then(|block| {
+                                    crate::provider::fields_beyond(block, &["type", "data"])
+                                }),
                             })
                             .await
                             .is_err()
                     {
                         return Ok(Step::ReceiverGone);
                     }
-                } else if block_type == "tool_use" {
-                    let id = content_block
-                        .get("id")
-                        .and_then(|id| id.as_str())
-                        .ok_or_else(|| {
-                            MekaError::Provider("tool_use block missing 'id' field".to_string())
-                        })?
-                        .to_string();
-                    let name = content_block
-                        .get("name")
-                        .and_then(|name| name.as_str())
-                        .ok_or_else(|| {
-                            MekaError::Provider("tool_use block missing 'name' field".to_string())
-                        })?
-                        .to_string();
+                } else if block_type == "tool_use"
+                    && let (Some(id), Some(name)) = (
+                        content_block.get("id").and_then(|id| id.as_str()),
+                        content_block.get("name").and_then(|name| name.as_str()),
+                    )
+                {
+                    let (id, name) = (id.to_string(), name.to_string());
 
                     self.current_tool_input.clear();
+                    self.current_tool_start_input = content_block
+                        .get("input")
+                        .filter(|input| {
+                            !input.is_null()
+                                && input.as_object().is_none_or(|input| !input.is_empty())
+                        })
+                        .cloned();
                     self.in_tool_use = true;
                     self.current_tool_id = id.clone();
                     self.current_tool_name = name.clone();
+                    self.current_tool_fields = content_block.as_object().and_then(|block| {
+                        crate::provider::fields_beyond(block, &["type", "id", "name", "input"])
+                    });
                     if event_sender
                         .send(StreamEvent::ToolUseStart { id, name })
                         .await
@@ -956,12 +1232,20 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     {
                         return Ok(Step::ReceiverGone);
                     }
+                } else {
+                    // A block of a type Meka has no block for, or a call without the id and name
+                    // the spec requires, kept whole with its deltas and never run.
+                    self.unread_block = Some(vec![data.clone()]);
                 }
             }
             "content_block_delta" => {
                 let Some(delta) = data.get("delta") else {
                     return Ok(Step::Continue);
                 };
+                if let Some(unread_block) = self.unread_block.as_mut() {
+                    unread_block.push(data.clone());
+                    return Ok(Step::Continue);
+                }
                 let delta_type = delta
                     .get("type")
                     .and_then(|delta_type| delta_type.as_str())
@@ -1008,13 +1292,11 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                             return Ok(Step::ReceiverGone);
                         }
                     }
+                    // The delta states the signature whole, and replaces what the start held, as
+                    // the reference client folds it.
                     "signature_delta" => {
-                        if let Some(sig) = delta.get("signature").and_then(|s| s.as_str()) {
-                            self.current_thinking_signature = Some(
-                                self.current_thinking_signature
-                                    .take()
-                                    .map_or_else(|| sig.to_string(), |existing| existing + sig),
-                            );
+                        if let Some(signature) = delta.get("signature").and_then(|s| s.as_str()) {
+                            self.current_thinking_signature = Some(signature.to_string());
                         }
                     }
                     "input_json_delta" => {
@@ -1023,19 +1305,61 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                             .and_then(|partial_json| partial_json.as_str())
                         {
                             self.current_tool_input.push_str(partial_json);
+                            if event_sender
+                                .send(StreamEvent::ToolArgumentsDelta(partial_json.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(Step::ReceiverGone);
+                            }
                         }
                     }
-                    _ => {}
+                    // A citation goes on its text block's `citations`, as the reference client
+                    // folds it.
+                    "citations_delta" if self.current_text_fields.is_some() => {
+                        if let Some(citation) = delta.get("citation")
+                            && let Some(fields) = self.current_text_fields.as_mut()
+                        {
+                            let fields = fields.get_or_insert_with(Default::default);
+                            let citations = fields
+                                .entry("citations".to_string())
+                                .or_insert(serde_json::Value::Null);
+                            match citations.as_array_mut() {
+                                Some(citations) => citations.push(citation.clone()),
+                                None => *citations = serde_json::json!([citation]),
+                            }
+                        }
+                    }
+                    _ => self.unread.push(data.clone()),
                 }
             }
             "content_block_stop" => {
-                if self.in_thinking {
+                if let Some(mut unread_block) = self.unread_block.take() {
+                    for part in unread_block.drain(..) {
+                        if event_sender
+                            .send(StreamEvent::Unrecognized(part))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(Step::ReceiverGone);
+                        }
+                    }
+                } else if let Some(provider_fields) = self.current_text_fields.take() {
+                    if event_sender
+                        .send(StreamEvent::TextEnd { provider_fields })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
+                    }
+                } else if self.in_thinking {
                     self.in_thinking = false;
                     let signature = self.current_thinking_signature.take();
                     if event_sender
                         .send(StreamEvent::ThinkingComplete {
                             opaque: signature
                                 .map(|signature| OpaqueReasoning::Signed { signature }),
+                            provider_fields: self.current_thinking_fields.take(),
                         })
                         .await
                         .is_err()
@@ -1047,10 +1371,16 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     // becomes `{}`. Arguments that arrived but do not parse are a
                     // different thing entirely, and are rejected rather than
                     // replaced.
+                    let opened_with = self.current_tool_start_input.take();
+                    let raw = match opened_with {
+                        Some(input) if self.current_tool_input.is_empty() => input.to_string(),
+                        _ => std::mem::take(&mut self.current_tool_input),
+                    };
                     let event = crate::provider::tool_use_event(
                         self.current_tool_id.clone(),
                         self.current_tool_name.clone(),
-                        &self.current_tool_input,
+                        &raw,
+                        self.current_tool_fields.take(),
                     );
                     if event_sender.send(event).await.is_err() {
                         return Ok(Step::ReceiverGone);
@@ -1058,8 +1388,44 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     self.current_tool_input.clear();
                     self.in_tool_use = false;
                 }
+                if !self.release_unread(event_sender).await {
+                    return Ok(Step::ReceiverGone);
+                }
             }
             "message_delta" => {
+                // Folded into the message as the reference client folds it: the delta's fields and
+                // the event's own set the message's, and each usage field stated overwrites, since
+                // the counts are running totals. The reference sets only the fields it types; the
+                // rest (OpenRouter's `cost`, a later `service_tier`) are set the same way.
+                for (key, value) in data.as_object().into_iter().flatten() {
+                    match (key.as_str(), value) {
+                        ("type", _) => {}
+                        ("delta" | "usage", serde_json::Value::Object(fields)) => {
+                            let target = if key == "delta" {
+                                &mut self.response
+                            } else {
+                                let usage = self
+                                    .response
+                                    .entry("usage".to_string())
+                                    .or_insert(serde_json::Value::Null);
+                                if !usage.is_object() {
+                                    *usage = serde_json::Value::Object(serde_json::Map::new());
+                                }
+                                match usage.as_object_mut() {
+                                    Some(usage) => usage,
+                                    None => continue,
+                                }
+                            };
+                            for (field, value) in fields {
+                                crate::provider::state_latest(target, field, value);
+                            }
+                        }
+                        _ => crate::provider::state_latest(&mut self.response, key, value),
+                    }
+                }
+                if !self.tell_response(event_sender).await {
+                    return Ok(Step::ReceiverGone);
+                }
                 let Some(delta) = data.get("delta") else {
                     return Ok(Step::Continue);
                 };
@@ -1084,9 +1450,9 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     // every turn through it would fail. What the check is for (a
                     // cut mid-`content_block_delta`) never gets this far.
                     self.saw_terminal_event = true;
-                    let stop_reason = parse_claude_stop_reason(stop_reason_str);
+                    let stop = claude_stop(delta, stop_reason_str);
                     if event_sender
-                        .send(StreamEvent::MessageEnd { stop_reason })
+                        .send(StreamEvent::MessageEnd { stop })
                         .await
                         .is_err()
                     {
@@ -1099,6 +1465,12 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                 return Ok(Step::Finished);
             }
             "message_start" => {
+                if let Some(message) = data.get("message").and_then(|message| message.as_object()) {
+                    self.response = message.clone();
+                    if !self.tell_response(event_sender).await {
+                        return Ok(Step::ReceiverGone);
+                    }
+                }
                 if let (Some(slot), Some(message_id)) = (
                     &self.previous_message,
                     data.get("message")
@@ -1106,6 +1478,18 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                         .and_then(|id| id.as_str()),
                 ) {
                     crate::provider::record_message_id(slot, message_id);
+                }
+                if let Some(model) = data
+                    .get("message")
+                    .and_then(|message| message.get("model"))
+                    .and_then(|model| model.as_str())
+                    .filter(|model| !model.is_empty())
+                    && event_sender
+                        .send(StreamEvent::Model(model.to_string()))
+                        .await
+                        .is_err()
+                {
+                    return Ok(Step::ReceiverGone);
                 }
                 if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
                     let token_usage = parse_usage_object(usage);
@@ -1140,8 +1524,18 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     .to_string();
                 return Err(crate::error::provider_stream_error(&error_type, message));
             }
-            other => {
-                tracing::debug!("unknown Claude SSE event: {other}");
+            // An event of a type Meka does not read, kept whole where it came, or after the block
+            // it came inside.
+            _ => {
+                if self.in_block() {
+                    self.unread.push(data);
+                } else if event_sender
+                    .send(StreamEvent::Unrecognized(data))
+                    .await
+                    .is_err()
+                {
+                    return Ok(Step::ReceiverGone);
+                }
             }
         }
         Ok(Step::Continue)
@@ -1434,8 +1828,10 @@ mod tests {
                 },
                 ContentBlock::Text {
                     text: "[Message from test, arrived now]\nalso, what is 17*3?".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let converted =
             convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::Ephemeral));
@@ -1485,12 +1881,15 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "answer".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::Thinking {
-                    thinking: "trailing".to_string(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning("trailing")],
                     opaque: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let converted =
             convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::Ephemeral));
@@ -1513,14 +1912,18 @@ mod tests {
     #[test]
     fn a_thinking_only_reply_followed_by_a_nudge_keeps_its_thinking() {
         let signed = ContentBlock::Thinking {
-            thinking: "the reasoning".to_string(),
+            parts: vec![crate::conversation::ReasoningPart::reasoning(
+                "the reasoning",
+            )],
             opaque: Some(OpaqueReasoning::Signed {
                 signature: "sig".to_string(),
             }),
+            provider_fields: None,
         };
         let reply = Message {
             role: Role::Assistant,
             content: vec![signed.clone()],
+            provider_fields: None,
         };
         let nudged = convert_messages_to_claude_content(
             &[
@@ -1540,9 +1943,11 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "an answer".to_string(),
+                    provider_fields: None,
                 },
                 signed,
             ],
+            provider_fields: None,
         };
         let ended =
             convert_messages_to_claude_content(&[Message::user("a question"), ending], None);
@@ -1588,6 +1993,7 @@ mod tests {
                     display: None,
                 },
             ],
+            provider_fields: None,
         };
         let converted =
             convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::Ephemeral));
@@ -1612,7 +2018,9 @@ mod tests {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "x".repeat(2_000),
+                provider_fields: None,
             }],
+            provider_fields: None,
         };
         let build = |messages: &[Message]| {
             serde_json::to_string(messages).map_err(|error| MekaError::Provider(error.to_string()))
@@ -1729,7 +2137,7 @@ mod tests {
         events
             .iter()
             .find_map(|event| match event {
-                StreamEvent::ThinkingComplete { opaque } => Some(opaque.clone()),
+                StreamEvent::ThinkingComplete { opaque, .. } => Some(opaque.clone()),
                 _ => None,
             })
             .expect("a thinking block must complete")
@@ -1763,17 +2171,17 @@ mod tests {
         );
     }
 
-    /// Anthropic sends the real signature as trailing deltas, so the start event must seed the
-    /// accumulator rather than displace what those deltas append.
+    /// A `signature_delta` states the signature whole and replaces what the start held, as the
+    /// reference client folds it, so a signature restated by a later delta is kept once.
     #[tokio::test]
-    async fn a_thinking_signature_sent_as_deltas_still_accumulates() {
+    async fn a_signature_delta_replaces_the_signature_before_it() {
         let (events, outcome) = decode_sse(concat!(
             "event: content_block_start\n",
             "data: {\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
             "event: content_block_delta\n",
             "data: {\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\n\n",
             "event: content_block_delta\n",
-            "data: {\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"def\"}}\n\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\n\n",
             "event: content_block_stop\n",
             "data: {\"index\":0}\n\n",
             "event: message_delta\n",
@@ -1785,7 +2193,7 @@ mod tests {
         assert_eq!(
             thinking_opaque(&events),
             Some(OpaqueReasoning::Signed {
-                signature: "abcdef".to_string(),
+                signature: "abc".to_string(),
             }),
             "{events:?}",
         );
@@ -1920,11 +2328,14 @@ mod tests {
             content: vec![
                 ContentBlock::RedactedThinking {
                     data: "ENCRYPTED_OPAQUE_BLOB".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::Text {
                     text: "hi".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let converted =
             convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
@@ -1982,6 +2393,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         };
         let mut body = serde_json::json!({
             "messages": convert_messages_to_claude_content(
@@ -2074,6 +2486,7 @@ mod tests {
                 is_error,
                 display: None,
             }],
+            provider_fields: None,
         };
         let ok = convert_messages_to_claude_content(&[result(false)], None);
         assert!(ok[0]["content"][0].get("is_error").is_none(), "{ok:?}");
@@ -2109,6 +2522,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         };
         let converted = convert_messages_to_claude_content(&[message], None);
         let content = &converted[0]["content"][0]["content"];
@@ -2135,15 +2549,20 @@ mod tests {
                 role: crate::conversation::Role::Assistant,
                 content: vec![
                     ContentBlock::Thinking {
-                        thinking: "the reasoning".to_string(),
+                        parts: vec![crate::conversation::ReasoningPart::reasoning(
+                            "the reasoning",
+                        )],
                         opaque: Some(opaque.clone()),
+                        provider_fields: None,
                     },
                     // Trailing thinking is stripped from the last assistant message, so the block
                     // has to be followed by something for this to be testing the encoder at all.
                     ContentBlock::Text {
                         text: "answer".to_string(),
+                        provider_fields: None,
                     },
                 ],
+                provider_fields: None,
             };
             let converted =
                 convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
@@ -2170,13 +2589,18 @@ mod tests {
             role: crate::conversation::Role::Assistant,
             content: vec![
                 ContentBlock::Thinking {
-                    thinking: "unsigned reasoning".to_string(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning(
+                        "unsigned reasoning",
+                    )],
                     opaque: None,
+                    provider_fields: None,
                 },
                 ContentBlock::Text {
                     text: "answer".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let converted =
             convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
@@ -2192,34 +2616,89 @@ mod tests {
     }
 
     /// OpenRouter answers for a non-Anthropic model with `signature: ""`, which the accumulator
-    /// keeps as the value the API returned. To Claude an empty signature is no signature, so the
-    /// block is left out the same way.
+    /// keeps as the value the API returned, and it goes back so: the endpoint that returned it
+    /// takes it, and one that refuses it says so.
     #[test]
-    fn an_empty_signature_is_no_signature_to_claude() {
+    fn an_empty_signature_goes_back_as_returned() {
         let message = crate::conversation::Message {
             role: crate::conversation::Role::Assistant,
             content: vec![
                 ContentBlock::Thinking {
-                    thinking: "openrouter reasoning".to_string(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning(
+                        "openrouter reasoning",
+                    )],
                     opaque: Some(OpaqueReasoning::Signed {
                         signature: String::new(),
                     }),
+                    provider_fields: None,
                 },
                 ContentBlock::Text {
                     text: "answer".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let converted =
             convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
         let content = converted[0]["content"].as_array().expect("content");
 
-        assert_eq!(content.len(), 1, "{content:?}");
-        assert_eq!(content[0]["text"], "answer");
-        assert!(
-            !serde_json::to_string(&converted)
-                .expect("serialize")
-                .contains("openrouter reasoning")
+        assert_eq!(content.len(), 2, "{content:?}");
+        assert_eq!(
+            content[0],
+            serde_json::json!({"type": "thinking", "thinking": "openrouter reasoning",
+                "signature": ""})
+        );
+        assert_eq!(content[1]["text"], "answer");
+    }
+
+    /// The citations a text block came with go back on it, where the Messages request defines
+    /// them; an empty list and the block's other fields do not.
+    #[test]
+    fn a_text_block_s_citations_go_back_on_it() {
+        let citation = serde_json::json!({"type": "web_search_result_location", "url": "u",
+            "title": "t", "encrypted_index": "E", "cited_text": "c"});
+        let text = |fields: serde_json::Value| ContentBlock::Text {
+            text: "cited".to_string(),
+            provider_fields: fields.as_object().cloned(),
+        };
+        let message = crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
+            content: vec![
+                text(serde_json::json!({"citations": [citation.clone()], "other": 1})),
+                text(serde_json::json!({"citations": []})),
+            ],
+            provider_fields: None,
+        };
+        let converted = convert_messages_to_claude_content(&[message], None);
+        let content = converted[0]["content"].as_array().expect("content");
+        assert_eq!(
+            content[0],
+            serde_json::json!({"type": "text", "text": "cited", "citations": [citation]})
+        );
+        assert_eq!(
+            content[1],
+            serde_json::json!({"type": "text", "text": "cited"})
+        );
+    }
+
+    /// A reply recorded with nothing in it goes back as the placeholder, since Claude requires
+    /// every message to hold a block.
+    #[test]
+    fn an_empty_reply_goes_out_as_the_placeholder() {
+        let messages = [
+            crate::conversation::Message::user("hi"),
+            crate::conversation::Message {
+                role: crate::conversation::Role::Assistant,
+                content: Vec::new(),
+                provider_fields: None,
+            },
+            crate::conversation::Message::user("again"),
+        ];
+        let converted = convert_messages_to_claude_content(&messages, None);
+        assert_eq!(
+            converted[1]["content"],
+            serde_json::json!([{"type": "text", "text": "[No message content]"}])
         );
     }
 
@@ -2232,9 +2711,13 @@ mod tests {
             crate::conversation::Message {
                 role: crate::conversation::Role::Assistant,
                 content: vec![ContentBlock::Thinking {
-                    thinking: "unsigned reasoning".to_string(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning(
+                        "unsigned reasoning",
+                    )],
                     opaque: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             crate::conversation::Message::user("next"),
             crate::conversation::Message::assistant_text("later"),
@@ -2271,6 +2754,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
         let converted = convert_messages_to_claude_content(&messages, None);
@@ -2290,15 +2774,18 @@ mod tests {
             role: crate::conversation::Role::Assistant,
             content: vec![
                 ContentBlock::Thinking {
-                    thinking: String::new(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning("")],
                     opaque: Some(OpaqueReasoning::Signed {
                         signature: "SIG620".to_string(),
                     }),
+                    provider_fields: None,
                 },
                 ContentBlock::Text {
                     text: "answer".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let converted =
             convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
@@ -2306,6 +2793,32 @@ mod tests {
         assert_eq!(block["type"], "thinking");
         assert_eq!(block["thinking"], "");
         assert_eq!(block["signature"], "SIG620");
+    }
+
+    /// What Meka writes into a conversation reaches this wire rendered: the summary, a note behind
+    /// Meka's label, a call whose arguments were not an object with `{}`, the protocol's own
+    /// placeholder for a call's input, and a result's caption and large output's reference.
+    #[test]
+    fn what_meka_wrote_reaches_the_wire_rendered() {
+        let sent = serde_json::to_string(&convert_messages_to_claude_content(
+            &Message::typed_content_for_test(),
+            None,
+        ))
+        .expect("json");
+        for needle in [
+            "the summary",
+            "[Meka harness] the note",
+            r#""input":{}"#,
+            "[Meka harness] the schema note",
+            "[Image: a.png]",
+            r#"<large-output name=\"the_entry\""#,
+        ] {
+            assert!(sent.contains(needle), "{needle} is not sent: {sent}");
+        }
+        assert!(
+            !sent.contains("path"),
+            "nothing of what the model sent: {sent}"
+        );
     }
 
     #[test]
@@ -2322,8 +2835,11 @@ mod tests {
         let (redacted, stats) = redact_oldest_images(&messages, 1_000);
         assert_eq!(stats.images_redacted, 1);
         assert!(stats.bytes_freed >= 2_000);
-        // The input image block became a text placeholder.
-        assert!(matches!(&redacted[0].content[1], ContentBlock::Text { .. }));
+        // The input image block became Meka's note.
+        assert!(matches!(
+            &redacted[0].content[1],
+            ContentBlock::HarnessNote { .. }
+        ));
     }
 
     #[test]
@@ -2531,6 +3047,458 @@ mod tests {
         }
     }
 
+    /// Every field a Claude reply returns has a home: a citation folds onto its text block as the
+    /// reference client folds it, a block and a delta Meka has no block for are kept whole after
+    /// the block they came in without splitting its text, and the message's own fields, folded
+    /// with its `message_delta`, are the record's, with the raw usage and without what the reply
+    /// holds.
+    #[tokio::test]
+    async fn every_field_a_claude_reply_returns_has_a_home() {
+        let frames = [
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+                "type": "message", "role": "assistant", "model": "claude-x", "content": [],
+                "stop_reason": null, "stop_sequence": null,
+                "usage": {"input_tokens": 5, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": "", "citations": null}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "Per the "}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "citations_delta", "citation": {"cited_text": "a"}}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "future_delta", "x": 1}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "docs."}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "server_tool_use", "id": "srv_1", "name": "web_search",
+                    "input": {}}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({"type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null, "container": {"id": "c1"}},
+                "usage": {"output_tokens": 9}}),
+            serde_json::json!({"type": "message_stop"}),
+        ];
+        let mut protocol = super::ClaudeStream::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        for frame in frames {
+            let name = frame["type"].as_str().expect("a type").to_string();
+            let event = eventsource_stream::Event {
+                event: name,
+                data: frame.to_string(),
+                id: String::new(),
+                retry: None,
+            };
+            crate::provider::sse::Protocol::frame(&mut protocol, event, &sender)
+                .await
+                .expect("frame");
+        }
+        drop(sender);
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        while let Some(event) = receiver.recv().await {
+            accumulator.push(event);
+        }
+        let completion = accumulator.finish();
+        let [
+            ContentBlock::Text {
+                text,
+                provider_fields: Some(text_fields),
+            },
+            ContentBlock::Unrecognized { parts },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(text, "Per the docs.", "one block, unsplit");
+        assert_eq!(
+            text_fields["citations"],
+            serde_json::json!([{"cited_text": "a"}])
+        );
+        assert_eq!(
+            parts[0],
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "future_delta", "x": 1}}),
+            "kept as the event it came in, so it names its block"
+        );
+        assert_eq!(parts[1]["content_block"]["type"], "server_tool_use");
+        assert_eq!(parts[2]["delta"]["type"], "input_json_delta");
+        let record = completion
+            .response_fields
+            .expect("the message's own fields");
+        assert_eq!(record["id"], "msg_1");
+        assert_eq!(record["container"], serde_json::json!({"id": "c1"}));
+        assert_eq!(record["usage"]["output_tokens"], 9);
+        assert_eq!(record["usage"]["input_tokens"], 5);
+        for held in ["content", "model", "role", "stop_reason", "stop_sequence"] {
+            assert!(
+                !record.contains_key(held),
+                "{held} is the reply's: {record:?}"
+            );
+        }
+    }
+
+    /// The completion `frames` fold to, each sent as the SSE event its `type` names.
+    async fn claude_completion(frames: &[serde_json::Value]) -> crate::provider::Completion {
+        let mut protocol = super::ClaudeStream::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        for frame in frames {
+            let event = eventsource_stream::Event {
+                event: frame["type"].as_str().expect("a type").to_string(),
+                data: frame.to_string(),
+                id: String::new(),
+                retry: None,
+            };
+            crate::provider::sse::Protocol::frame(&mut protocol, event, &sender)
+                .await
+                .expect("frame");
+        }
+        drop(sender);
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        while let Some(event) = receiver.recv().await {
+            accumulator.push(event);
+        }
+        accumulator.finish()
+    }
+
+    /// A block's `index` is its place in the message, so blocks that overlap on the wire (as
+    /// OpenRouter streams them) fold in index order, each whole: a text block that holds only its
+    /// citations keeps them, and a block that opens inside another follows it.
+    #[tokio::test]
+    async fn blocks_fold_in_index_order_when_they_overlap() {
+        let start = serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+            "type": "message", "role": "assistant", "model": "m", "content": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1}}});
+        let end = serde_json::json!({"type": "message_delta",
+            "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 9}});
+        let citation = serde_json::json!({"type": "web_search_result_location", "url": "u"});
+        let completion = claude_completion(&[
+            start.clone(),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": "", "citations": []}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "citations_delta", "citation": citation}}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "thinking_delta", "thinking": "hmm"}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "signature_delta", "signature": "S"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({"type": "content_block_start", "index": 2,
+                "content_block": {"type": "text", "text": "", "citations": []}}),
+            serde_json::json!({"type": "content_block_delta", "index": 2,
+                "delta": {"type": "text_delta", "text": "The answer."}}),
+            serde_json::json!({"type": "content_block_stop", "index": 2}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            end.clone(),
+        ])
+        .await;
+        let [
+            ContentBlock::Text {
+                text: cited,
+                provider_fields: Some(cited_fields),
+            },
+            ContentBlock::Thinking {
+                parts,
+                opaque: Some(OpaqueReasoning::Signed { signature }),
+                ..
+            },
+            ContentBlock::Text { text: answer, .. },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(cited, "");
+        assert_eq!(cited_fields["citations"], serde_json::json!([citation]));
+        assert_eq!(crate::conversation::reasoning_text(parts), "hmm");
+        assert_eq!(signature, "S");
+        assert_eq!(answer, "The answer.");
+
+        let completion = claude_completion(&[
+            start,
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "summary"}}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "redacted_thinking", "data": "SEALED"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "content_block_start", "index": 2,
+                "content_block": {"type": "text", "text": "", "citations": []}}),
+            serde_json::json!({"type": "content_block_delta", "index": 2,
+                "delta": {"type": "text_delta", "text": "899"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 2}),
+            end,
+        ])
+        .await;
+        let kinds: Vec<_> = completion
+            .message
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Thinking { .. } => "thinking",
+                ContentBlock::RedactedThinking { .. } => "redacted_thinking",
+                ContentBlock::Text { .. } => "text",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["thinking", "redacted_thinking", "text"]);
+    }
+
+    /// A block whose opening event already carries content keeps it, as the reference client
+    /// does: text and reasoning start with what the start held, and a call that streams no
+    /// argument deltas runs with the input its start carried.
+    #[tokio::test]
+    async fn a_block_that_arrives_whole_in_its_opening_event_keeps_what_it_carried() {
+        let completion = claude_completion(&[
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+                "type": "message", "role": "assistant", "model": "m", "content": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": "whole", "signature": "S"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": "Hello "}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "world"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({"type": "content_block_start", "index": 2,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "file_read",
+                    "input": {"path": "a"}}}),
+            serde_json::json!({"type": "content_block_stop", "index": 2}),
+            serde_json::json!({"type": "message_delta",
+                "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9}}),
+        ])
+        .await;
+        let [
+            ContentBlock::Thinking {
+                parts,
+                opaque: Some(OpaqueReasoning::Signed { signature }),
+                ..
+            },
+            ContentBlock::Text { text, .. },
+            ContentBlock::ToolUse {
+                input, unparsed, ..
+            },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(crate::conversation::reasoning_text(parts), "whole");
+        assert_eq!(signature, "S");
+        assert_eq!(text, "Hello world");
+        assert_eq!(input, &serde_json::json!({"path": "a"}));
+        assert!(unparsed.is_none());
+    }
+
+    /// A block that never closed before the message ended closes ahead of the blocks held behind
+    /// it, so each keeps its own place and words, and its reasoning goes unsigned, since a
+    /// signature that arrived before the block ended may not cover all of it.
+    #[tokio::test]
+    async fn a_block_left_open_closes_before_the_ones_held_behind_it() {
+        let start = serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+            "type": "message", "role": "assistant", "model": "m", "content": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1}}});
+        let held_text = [
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "held"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+        ];
+        let end = serde_json::json!({"type": "message_delta",
+            "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 9}});
+        let mut frames = vec![
+            start.clone(),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "open"}}),
+        ];
+        frames.extend(held_text.clone());
+        frames.push(end.clone());
+        let completion = claude_completion(&frames).await;
+        let texts: Vec<_> = completion
+            .message
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text, .. } => text.as_str(),
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(texts, ["open", "held"]);
+
+        let mut frames = vec![
+            start,
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "partial"}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "S"}}),
+        ];
+        frames.extend(held_text);
+        frames.push(end);
+        let completion = claude_completion(&frames).await;
+        let [
+            ContentBlock::Thinking { parts, opaque, .. },
+            ContentBlock::Text { text, .. },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(crate::conversation::reasoning_text(parts), "partial");
+        assert_eq!(opaque, &None);
+        assert_eq!(text, "held");
+    }
+
+    /// A stream that ends inside a block says it failed before it hands the block over, so a retry
+    /// the failure allows stays possible, and the block goes over as one that never finished: a
+    /// call refused with the arguments that had streamed, reasoning unsigned.
+    #[tokio::test]
+    async fn a_stream_cut_inside_a_block_says_it_failed_first_and_leaves_the_block_unfinished() {
+        let start = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",",
+            "\"role\":\"assistant\",\"model\":\"m\",\"content\":[],",
+            "\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let kinds = |events: &[StreamEvent]| -> Vec<&'static str> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::Error(_) => Some("error"),
+                    StreamEvent::ToolUseEnd { .. } => Some("end"),
+                    StreamEvent::ToolCallRefused { .. } => Some("refused"),
+                    StreamEvent::ThinkingComplete { opaque: None, .. } => Some("unsigned"),
+                    StreamEvent::ThinkingComplete { .. } => Some("signed"),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (events, outcome) = decode_sse(&format!(
+            "{start}{}",
+            concat!(
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+                "{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"file_read\",\"input\":{}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pa\"}}\n\n",
+            )
+        ))
+        .await;
+        assert!(outcome.is_err(), "a stream that ends early fails");
+        assert_eq!(kinds(&events), ["error", "refused"], "{events:?}");
+        assert!(
+            events.iter().any(|event| matches!(event,
+                StreamEvent::ToolCallRefused { unparsed, .. }
+                    if unparsed.text.as_deref() == Some("{\"pa")
+                        && unparsed.error == crate::provider::unfinished_call(String::new()).error)),
+            "{events:?}"
+        );
+        let (events, outcome) = decode_sse(&format!(
+            "{start}{}",
+            concat!(
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+                "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{\"type\":\"signature_delta\",\"signature\":\"S\"}}\n\n",
+            )
+        ))
+        .await;
+        assert!(outcome.is_err(), "a stream that ends early fails");
+        assert_eq!(kinds(&events), ["error", "unsigned"], "{events:?}");
+    }
+
+    /// A stream that breaks off inside a block of a type Meka reads nothing from, with nothing held
+    /// behind it, still keeps the block as it came; and a call without the id or name the spec
+    /// requires is kept the same way and never run, rather than failing the reply.
+    #[tokio::test]
+    async fn a_block_kept_as_it_came_survives_a_cut_and_an_unnamed_call_is_one() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let mut protocol = super::ClaudeStream::default();
+        let frames = [
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+                "type": "message", "role": "assistant", "model": "m", "content": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "server_tool_use", "id": "srv_1", "name": "web_search"}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"query\""}}),
+        ];
+        for frame in &frames {
+            let event = eventsource_stream::Event {
+                event: frame["type"].as_str().expect("a type").to_string(),
+                data: frame.to_string(),
+                id: String::new(),
+                retry: None,
+            };
+            crate::provider::sse::Protocol::frame(&mut protocol, event, &sender)
+                .await
+                .expect("frame");
+        }
+        protocol.release_held(&sender).await.expect("released");
+        drop(sender);
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        while let Some(event) = receiver.recv().await {
+            accumulator.push(event);
+        }
+        let partial = accumulator.partial().expect("what arrived");
+        assert!(
+            matches!(&partial.message.content[..], [ContentBlock::Unrecognized { parts }] if parts.len() == 2),
+            "{:?}",
+            partial.message.content
+        );
+
+        let completion = claude_completion(&[
+            frames[0].clone(),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "name": "file_read", "input": {}}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "message_delta",
+                "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9}}),
+        ])
+        .await;
+        assert!(completion.message.tool_uses().is_empty());
+        assert!(
+            matches!(&completion.message.content[..], [
+                ContentBlock::Unrecognized { .. }
+            ]),
+            "{:?}",
+            completion.message.content
+        );
+    }
+
+    /// A refusal's stop keeps what Claude said beside the word, the category and explanation of
+    /// its `stop_details`, for a surface to show; the reply's words stay the model's alone.
+    #[test]
+    fn a_stop_keeps_what_claude_said_beside_its_word() {
+        let stop = claude_stop(
+            &serde_json::json!({
+                "stop_reason": "refusal",
+                "stop_sequence": null,
+                "stop_details": {"type": "refusal", "category": "cyber", "explanation": "no"},
+            }),
+            "refusal",
+        );
+        assert_eq!(stop.reason, StopReason::Refusal);
+        assert_eq!(stop.word.as_deref(), Some("refusal"));
+        assert_eq!(
+            stop.details,
+            Some(serde_json::Map::from_iter([(
+                "stop_details".to_string(),
+                serde_json::json!({"type": "refusal", "category": "cyber", "explanation": "no"}),
+            )]))
+        );
+    }
+
     #[test]
     fn parse_claude_stop_reason_all_variants() {
         assert_eq!(parse_claude_stop_reason("end_turn"), StopReason::EndTurn);
@@ -2539,19 +3507,20 @@ mod tests {
             parse_claude_stop_reason("max_tokens"),
             StopReason::MaxTokens
         );
+        assert_eq!(parse_claude_stop_reason("refusal"), StopReason::Refusal);
         assert_eq!(
-            parse_claude_stop_reason("refusal"),
-            StopReason::Refusal(String::new())
+            parse_claude_stop_reason("stop_sequence"),
+            StopReason::EndTurn
         );
-        // `pause_turn` is unrecognized and maps to `Unknown` carrying the raw string, so the
-        // literal reaches the warn log and the empty-turn stand-in intact.
         assert_eq!(
-            parse_claude_stop_reason("pause_turn"),
-            StopReason::Unknown("pause_turn".to_string())
+            parse_claude_stop_reason("model_context_window_exceeded"),
+            StopReason::ContextWindow
         );
+        // A word Meka has no class for is `Unknown`; the word itself is kept in the stop record.
+        assert_eq!(parse_claude_stop_reason("pause_turn"), StopReason::Unknown);
         assert_eq!(
             parse_claude_stop_reason("something_else"),
-            StopReason::Unknown("something_else".to_string())
+            StopReason::Unknown
         );
     }
 
@@ -2573,6 +3542,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![block],
+            provider_fields: None,
         }
     }
 
@@ -2581,7 +3551,9 @@ mod tests {
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
+                provider_fields: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -2624,8 +3596,8 @@ mod tests {
         // message[0] image redacted to placeholder text.
         match &owned[0].content[0] {
             ContentBlock::ToolResult { content, .. } => match &content[0] {
-                ToolResultContent::Text { text } => {
-                    assert_eq!(text, IMAGE_REDACTION_PLACEHOLDER);
+                ToolResultContent::HarnessNote { note } => {
+                    assert_eq!(note, crate::conversation::BUDGET_REDACTION_NOTE);
                 }
                 other => panic!("expected text placeholder, got {other:?}"),
             },
@@ -2666,8 +3638,8 @@ mod tests {
         // First image redacted.
         match &owned[0].content[0] {
             ContentBlock::ToolResult { content, .. } => match &content[0] {
-                ToolResultContent::Text { text } => {
-                    assert_eq!(text, IMAGE_REDACTION_PLACEHOLDER);
+                ToolResultContent::HarnessNote { note } => {
+                    assert_eq!(note, crate::conversation::BUDGET_REDACTION_NOTE);
                 }
                 _ => panic!("first should be redacted"),
             },
@@ -2756,6 +3728,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         }
     }
 

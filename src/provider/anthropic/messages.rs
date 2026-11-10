@@ -633,15 +633,18 @@ mod tests {
             content: vec![crate::conversation::ContentBlock::ToolUse {
                 id: "call_1".to_string(),
                 name: "file_read".to_string(),
-                // What the repair leaves behind: nothing the tool's schema declares.
-                input: serde_json::json!({"[meka harness]": "arguments removed"}),
+                // What the repair leaves behind: no arguments, its result saying what was taken.
+                input: serde_json::json!({}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         }];
         let body = provider.build_request_body("be nice", &messages, &[], false);
 
         let serialized = serde_json::to_string(&body).expect("serialize");
         assert!(
-            serialized.contains("[meka harness]"),
+            serialized.contains(r#""input":{}"#),
             "the repaired input must survive to the wire verbatim: {serialized}"
         );
         assert!(
@@ -834,7 +837,7 @@ mod tests {
         assert_eq!(body["stream"], true, "one request shape: {body}");
         assert_eq!(completion.message.text_content(), "hi");
         assert_eq!(
-            completion.stop_reason,
+            completion.stop.reason,
             crate::provider::StopReason::MaxTokens
         );
         assert_eq!(completion.usage.input_tokens, 7);

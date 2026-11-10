@@ -272,7 +272,7 @@ pub(crate) async fn run_interactive(
         });
     }
     // Typed words are drawn as typed; an invocation is said where its message is appended.
-    if let Some(crate::conversation::ContentBlock::Text { text }) = opening {
+    if let Some(crate::conversation::ContentBlock::Text { text, .. }) = opening {
         transcript.push(model::Item::Prompt {
             text,
             class: None,

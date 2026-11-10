@@ -220,9 +220,11 @@ pub(crate) async fn compact(
             let recorder = entry.frontend.drain();
             {
                 use crate::host::http::handlers::turn::{terminal_event_parts, usage_from};
-                let compacted = crate::agent::TurnOutcome::EndTurn;
+                let compacted = outcome
+                    .as_ref()
+                    .map(|record| crate::agent::TurnOutcome::of(record.last_stop()));
                 let (event_type, data) = terminal_event_parts(
-                    Ok(outcome.as_ref().map(|_| &compacted)),
+                    Ok(compacted.as_ref().map_err(|error| *error)),
                     cancellation
                         .reason()
                         .unwrap_or(crate::store::turns::CancelReason::Client),
@@ -277,8 +279,9 @@ pub(crate) async fn compact(
             .with("session_id", id.to_string()));
         }
     };
+    // The compaction turn's terminal logged the failure.
     let (compaction, position) = answered.map_err(|error| {
-        ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+        ProblemDetail::for_logged_error(&error, state.config.relay_provider_errors)
             .with("session_id", id.to_string())
     })?;
     tracing::info!("compacted session {id} via HTTP");
@@ -1089,7 +1092,7 @@ mod tests {
             .close_turn(
                 said,
                 &crate::store::turns::TurnEnding::succeeded(
-                    "end_turn",
+                    crate::conversation::StopReason::EndTurn,
                     crate::store::turns::TurnUsage::default(),
                 ),
             )
@@ -1164,7 +1167,7 @@ mod tests {
             .expect("the turn's items")
             .into_iter()
             .filter_map(|entry| match entry.kind {
-                crate::store::HistoryKind::Message(message) => Some(message.text_content()),
+                crate::store::HistoryKind::Message { message, .. } => Some(message.text_content()),
                 _ => None,
             })
             .collect();
@@ -1184,7 +1187,7 @@ mod tests {
             .expect("the history")
             .entries
             .into_iter()
-            .filter(|entry| matches!(entry.kind, crate::store::HistoryKind::Message(_)))
+            .filter(|entry| matches!(entry.kind, crate::store::HistoryKind::Message { .. }))
             .map(|entry| entry.turn_id)
             .collect();
         assert_eq!(history, [

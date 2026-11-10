@@ -587,7 +587,10 @@ async fn async_main(
             .request
             .prompt
             .clone()
-            .map(|text| conversation::ContentBlock::Text { text })
+            .map(|text| conversation::ContentBlock::Text {
+                text,
+                provider_fields: None,
+            })
     });
     if config.request.oneshot {
         // Startup already refused `--oneshot` without a prompt or `--skill`; this is the same

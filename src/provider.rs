@@ -43,6 +43,7 @@ mod types;
 pub(crate) mod wire_names;
 
 pub(crate) use self::{registry::*, types::*};
+pub(crate) use crate::conversation::{Stop, StopReason};
 use crate::{
     config::{Backend, ThinkingMode},
     conversation::{ContentBlock, Message, OpaqueReasoning, Role},
@@ -564,10 +565,22 @@ pub(crate) trait Provider: Send + Sync {
     }
 }
 
+#[derive(Default)]
 struct ToolCallAccumulator {
-    id: String,
-    name: String,
+    /// The call's fragments as they came, which are what is kept of a call that never names the
+    /// id or the name the spec requires.
+    fragments: Vec<serde_json::Value>,
+    id: Option<String>,
+    name: Option<String>,
     arguments: String,
+    /// Whether a fragment carried `arguments` as the string the spec defines; a call none did
+    /// carried no arguments, which a whole reply's call may not either.
+    carried_arguments: bool,
+    /// Arguments a fragment carried as something other than the string the spec defines, which
+    /// refuse the call with what they were.
+    unread_arguments: Option<serde_json::Value>,
+    /// Every field the call's fragments carried beyond its index, id, type and function.
+    provider_fields: Option<crate::conversation::ProviderFields>,
 }
 
 /// The response if it succeeded, else the classified HTTP error carrying whatever body could be
@@ -623,39 +636,222 @@ pub(crate) async fn succeeded(
 }
 
 /// What a tool call's raw argument text becomes, for every driver. An empty body is a legitimate
-/// zero-argument call (a tool with no parameters streams `""`, not `{}`); anything else must parse,
-/// and what does not parse is rejected with the reason rather than replaced with `{}`, which would
-/// run the tool on whatever defaults it tolerates: a valid call the model never made. Truncated
-/// argument JSON is the ordinary shape of a `max_tokens` cutoff mid-call, so this is not an exotic
-/// path.
+/// zero-argument call (a tool with no parameters streams `""`, not `{}`); anything else must be a
+/// JSON object, and what is not is refused with the text the model sent and why, rather than
+/// replaced with `{}`, which would run the tool on whatever defaults it tolerates: a valid call the
+/// model never made. Truncated argument JSON is the ordinary shape of a `max_tokens` cutoff
+/// mid-call, so this is not an exotic path.
 pub(crate) fn finalize_tool_arguments(
     name: &str,
     raw: &str,
-) -> std::result::Result<serde_json::Value, String> {
+) -> std::result::Result<serde_json::Value, crate::conversation::UnparsedArguments> {
     if raw.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    serde_json::from_str(raw).map_err(|error| {
-        tracing::warn!("refusing tool call '{name}' with unparseable JSON arguments: {error}");
-        format!("invalid JSON arguments: {error}")
+    let error = match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) if value.is_object() => return Ok(value),
+        Ok(_) => "the arguments are not a JSON object".to_string(),
+        Err(error) => format!("invalid JSON arguments: {error}"),
+    };
+    // A diagnostic: the refusal is the call's result, which the model and every surface read.
+    tracing::debug!("refusing tool call '{name}': {error}");
+    Err(crate::conversation::UnparsedArguments {
+        text: Some(raw.to_string()),
+        error,
     })
 }
 
-/// [`finalize_tool_arguments`] as the streaming drivers emit it: the call's end, or its refusal.
-pub(crate) fn tool_use_event(id: String, name: String, raw: &str) -> StreamEvent {
-    match finalize_tool_arguments(&name, raw) {
-        Ok(input) => StreamEvent::ToolUseEnd { input },
-        Err(reason) => StreamEvent::ToolCallRefused { id, name, reason },
+/// What a call the reply ended inside of is refused with: the arguments that had streamed, as the
+/// model sent them.
+pub(crate) fn unfinished_call(arguments: String) -> crate::conversation::UnparsedArguments {
+    crate::conversation::UnparsedArguments {
+        text: Some(arguments),
+        error: "the reply ended before the call's arguments did".to_string(),
     }
 }
 
-/// A refused call as a content block: the reason rides under [`INVALID_TOOL_ARGS_MARKER`] so the
-/// dispatch loop refuses it and the model is told why.
-pub(crate) fn refused_tool_use(id: String, name: String, reason: String) -> ContentBlock {
+/// A call's `arguments` as a whole reply carries it, which the OpenAI wires define as a string:
+/// that string through [`finalize_tool_arguments`]. A value of another type, or none, is not
+/// arguments, and the call is refused with what was there.
+pub(crate) fn arguments_from_reply(
+    name: &str,
+    arguments: Option<&serde_json::Value>,
+) -> std::result::Result<serde_json::Value, crate::conversation::UnparsedArguments> {
+    let (text, error) = match arguments {
+        Some(serde_json::Value::String(raw)) => return finalize_tool_arguments(name, raw),
+        Some(serde_json::Value::Null) | None => (None, "the call carried no arguments"),
+        Some(other) => (Some(other.to_string()), "the arguments are not a string"),
+    };
+    // A diagnostic, as in `finalize_tool_arguments`.
+    tracing::debug!("refusing tool call '{name}': {error}");
+    Err(crate::conversation::UnparsedArguments {
+        text,
+        error: error.to_string(),
+    })
+}
+
+/// [`finalize_tool_arguments`] as the streaming drivers emit it: the call's end, or its refusal,
+/// with the fields the provider put on the call.
+pub(crate) fn tool_use_event(
+    id: String,
+    name: String,
+    raw: &str,
+    provider_fields: Option<crate::conversation::ProviderFields>,
+) -> StreamEvent {
+    let arguments = finalize_tool_arguments(&name, raw);
+    call_event(id, name, arguments, provider_fields)
+}
+
+/// A call's end as the streaming drivers emit it, from what its arguments became: the call with
+/// them, or its refusal with what the model sent.
+pub(crate) fn call_event(
+    id: String,
+    name: String,
+    arguments: std::result::Result<serde_json::Value, crate::conversation::UnparsedArguments>,
+    provider_fields: Option<crate::conversation::ProviderFields>,
+) -> StreamEvent {
+    match arguments {
+        Ok(input) => StreamEvent::ToolUseEnd {
+            input,
+            provider_fields,
+        },
+        Err(unparsed) => StreamEvent::ToolCallRefused {
+            id,
+            name,
+            unparsed,
+            provider_fields,
+        },
+    }
+}
+
+/// A refused call as a content block: `{}` for its arguments and what the model sent beside it, so
+/// the dispatch loop refuses it and the model is told why.
+pub(crate) fn refused_tool_use(
+    id: String,
+    name: String,
+    unparsed: crate::conversation::UnparsedArguments,
+    provider_fields: Option<crate::conversation::ProviderFields>,
+) -> ContentBlock {
     ContentBlock::ToolUse {
         id,
         name,
-        input: serde_json::json!({ INVALID_TOOL_ARGS_MARKER: reason }),
+        input: serde_json::json!({}),
+        unparsed: Some(unparsed),
+        provider_fields,
+    }
+}
+
+/// The fields of `object` beyond `read`, the ones Meka reads, or `None` when there are none.
+pub(crate) fn fields_beyond(
+    object: &serde_json::Map<String, serde_json::Value>,
+    read: &[&str],
+) -> Option<crate::conversation::ProviderFields> {
+    let fields: crate::conversation::ProviderFields = object
+        .iter()
+        .filter(|(key, _)| !read.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    (!fields.is_empty()).then_some(fields)
+}
+
+/// Fold `delta` into `snapshot` as the reference client folds a streamed object (openai-python
+/// `lib/streaming/_deltas.py`, `accumulate_delta`): a key first stated, or stated over a null,
+/// takes the delta's value; strings concatenate, numbers add, objects fold, a list of objects
+/// merges entry by entry on the entry's `index`, any other list extends, and `index` and `type`
+/// take the latest value. A list entry the reference refuses (an object without an `index`, or one
+/// whose place holds no object) is kept at the end, so nothing that arrived is lost; a value of
+/// another type than the one it would fold into is dropped, as the reference drops it.
+pub(crate) fn accumulate_delta(
+    snapshot: &mut serde_json::Map<String, serde_json::Value>,
+    delta: &serde_json::Map<String, serde_json::Value>,
+) {
+    use serde_json::Value;
+    for (key, value) in delta {
+        let slot = snapshot.entry(key.clone()).or_insert(Value::Null);
+        if slot.is_null() {
+            if has_indexed_entries(value) {
+                *slot = Value::Array(Vec::new());
+            } else {
+                *slot = value.clone();
+                continue;
+            }
+        }
+        if key == "index" || key == "type" {
+            *slot = value.clone();
+            continue;
+        }
+        match (slot, value) {
+            (Value::String(held), Value::String(more)) => held.push_str(more),
+            (Value::Number(held), Value::Number(more)) => *held = add_numbers(held, more),
+            (Value::Object(held), Value::Object(more)) => accumulate_delta(held, more),
+            (Value::Array(held), Value::Array(more)) => accumulate_list(held, more),
+            _ => {}
+        }
+    }
+}
+
+/// [`accumulate_delta`] for a list: scalars extend, objects merge on their `index`.
+fn accumulate_list(held: &mut Vec<serde_json::Value>, more: &[serde_json::Value]) {
+    use serde_json::Value;
+    let scalars = held
+        .iter()
+        .all(|entry| matches!(entry, Value::String(_) | Value::Number(_)));
+    if scalars && (!held.is_empty() || !more.iter().any(is_indexed_entry)) {
+        held.extend(more.iter().cloned());
+        return;
+    }
+    for entry in more {
+        let place = entry
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok());
+        match (entry, place.and_then(|place| held.get_mut(place))) {
+            (Value::Object(fragment), Some(Value::Object(existing))) => {
+                accumulate_delta(existing, fragment);
+            }
+            _ => held.push(entry.clone()),
+        }
+    }
+}
+
+/// Whether `value` is a list holding an object with an `index`, which folds entry by entry.
+fn has_indexed_entries(value: &serde_json::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|entries| entries.iter().any(is_indexed_entry))
+}
+
+fn is_indexed_entry(entry: &serde_json::Value) -> bool {
+    entry
+        .as_object()
+        .is_some_and(|entry| entry.contains_key("index"))
+}
+
+/// `held` plus `more`, as integers while both are and the sum fits, else as floats.
+fn add_numbers(held: &serde_json::Number, more: &serde_json::Number) -> serde_json::Number {
+    if let (Some(held), Some(more)) = (held.as_i64(), more.as_i64())
+        && let Some(sum) = held.checked_add(more)
+    {
+        return sum.into();
+    }
+    if let (Some(held), Some(more)) = (held.as_u64(), more.as_u64())
+        && let Some(sum) = held.checked_add(more)
+    {
+        return sum.into();
+    }
+    serde_json::Number::from_f64(held.as_f64().unwrap_or(0.0) + more.as_f64().unwrap_or(0.0))
+        .unwrap_or_else(|| held.clone())
+}
+
+/// Set `key` in `object` to `value` unless `value` is null over a value already stated: the latest
+/// statement of a field a stream restates, as the reference clients keep one.
+pub(crate) fn state_latest(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    if !value.is_null() || !object.contains_key(key) {
+        object.insert(key.to_string(), value.clone());
     }
 }
 
@@ -663,10 +859,25 @@ pub(crate) fn refused_tool_use(id: String, name: String, reason: String) -> Cont
 #[derive(Debug)]
 pub(crate) struct Completion {
     pub(crate) message: Message,
-    pub(crate) stop_reason: StopReason,
+    /// How the reply ended, as the provider said and as Meka classes it.
+    pub(crate) stop: Stop,
+    /// The model the response names; `None` when it names none.
+    pub(crate) model: Option<String>,
     pub(crate) usage: TokenUsage,
+    /// The response's own fields nothing else holds; see [`StreamEvent::ResponseFields`].
+    pub(crate) response_fields: Option<crate::conversation::ProviderFields>,
     /// Advisories the provider raised while building or sending the request, for the frontend.
     pub(crate) notices: Vec<Notice>,
+}
+
+/// What a stream that failed had returned: the reply so far, the model the response named, and what
+/// it reported spending.
+#[derive(Debug, Clone)]
+pub(crate) struct PartialReply {
+    pub(crate) message: Message,
+    pub(crate) model: Option<String>,
+    pub(crate) usage: TokenUsage,
+    pub(crate) response_fields: Option<crate::conversation::ProviderFields>,
 }
 
 /// How a stream of [`StreamEvent`]s becomes the message it described.
@@ -679,10 +890,18 @@ pub(crate) struct Completion {
 pub(crate) struct MessageAccumulator {
     content: Vec<ContentBlock>,
     text: String,
-    thinking: String,
+    refusal: String,
+    /// The parts of the thinking block in progress.
+    thinking: Vec<crate::conversation::ReasoningPart>,
     tool_id: String,
     tool_name: String,
-    stop_reason: Option<StopReason>,
+    stop: Option<Stop>,
+    model: Option<String>,
+    message_fields: Option<crate::conversation::ProviderFields>,
+    response_fields: Option<crate::conversation::ProviderFields>,
+    /// The arguments of the call in progress as they streamed, kept for a reply that ends before
+    /// the call does.
+    tool_arguments: String,
     usage: TokenUsage,
     notices: Vec<Notice>,
 }
@@ -692,9 +911,21 @@ impl MessageAccumulator {
         Self::default()
     }
 
-    /// The thinking of the block in progress, whole once `ThinkingComplete` arrives.
-    pub(crate) fn pending_thinking(&self) -> &str {
-        &self.thinking
+    /// The thinking of the block in progress as a reader sees it, whole once `ThinkingComplete`
+    /// arrives.
+    pub(crate) fn pending_thinking(&self) -> String {
+        crate::conversation::reasoning_text(&self.thinking)
+    }
+
+    /// Whether the next reasoning delta is the first text of a part that follows one with text,
+    /// which a reader sees after a blank line.
+    pub(crate) fn opens_a_later_part(&self) -> bool {
+        match self.thinking.split_last() {
+            Some((last, earlier)) => {
+                last.text.is_empty() && earlier.iter().any(|part| !part.text.is_empty())
+            }
+            None => false,
+        }
     }
 
     /// The `(id, name)` of the tool call whose arguments are in progress.
@@ -704,11 +935,39 @@ impl MessageAccumulator {
 
     /// Close the text in progress as a block, ahead of whatever block comes next, so the message
     /// holds its blocks in the order the wire sent them and a replay reads as the live turn did.
+    /// A refusal in progress closes the same way.
     fn flush_text(&mut self) {
-        if !self.text.is_empty() {
+        self.close_text(None);
+        if !self.refusal.is_empty() {
+            self.content.push(ContentBlock::Refusal {
+                text: std::mem::take(&mut self.refusal),
+                provider_fields: None,
+            });
+        }
+    }
+
+    /// Close the text in progress as a block with the fields the provider put on its part.
+    fn close_text(&mut self, provider_fields: Option<crate::conversation::ProviderFields>) {
+        // A part with no words is still the provider's when it carries fields of its own: a text
+        // block holding only its citations.
+        if !self.text.is_empty() || provider_fields.is_some() {
             self.content.push(ContentBlock::Text {
                 text: std::mem::take(&mut self.text),
+                provider_fields,
             });
+        }
+    }
+
+    /// Close the part in progress with the fields the provider put on it: its text, else the
+    /// refusal it held instead.
+    fn close_part(&mut self, provider_fields: Option<crate::conversation::ProviderFields>) {
+        if self.text.is_empty() && !self.refusal.is_empty() {
+            self.content.push(ContentBlock::Refusal {
+                text: std::mem::take(&mut self.refusal),
+                provider_fields,
+            });
+        } else {
+            self.close_text(provider_fields);
         }
     }
 
@@ -716,20 +975,63 @@ impl MessageAccumulator {
     /// `Notice` is kept for [`Self::finish`].
     pub(crate) fn push(&mut self, event: StreamEvent) {
         match event {
-            StreamEvent::TextDelta(text) => self.text.push_str(&text),
-            StreamEvent::ThinkingDelta(text) => self.thinking.push_str(&text),
-            StreamEvent::ThinkingComplete { opaque } => {
+            StreamEvent::TextDelta(text) => {
+                if !self.refusal.is_empty() {
+                    self.flush_text();
+                }
+                self.text.push_str(&text);
+            }
+            StreamEvent::TextEnd { provider_fields } => self.close_part(provider_fields),
+            StreamEvent::RefusalDelta(text) => {
+                self.close_text(None);
+                self.refusal.push_str(&text);
+            }
+            // What arrives together stays together: a reply in an unread shape streams one piece
+            // per chunk, which are one part of the reply.
+            StreamEvent::Unrecognized(part) => {
+                self.flush_text();
+                match self.content.last_mut() {
+                    Some(ContentBlock::Unrecognized { parts }) => parts.push(part),
+                    _ => self
+                        .content
+                        .push(ContentBlock::Unrecognized { parts: vec![part] }),
+                }
+            }
+            StreamEvent::ThinkingDelta(text) => match self.thinking.last_mut() {
+                Some(part) => part.text.push_str(&text),
+                None => self
+                    .thinking
+                    .push(crate::conversation::ReasoningPart::reasoning(text)),
+            },
+            StreamEvent::ThinkingPart(kind) => {
+                self.thinking.push(crate::conversation::ReasoningPart {
+                    kind,
+                    text: String::new(),
+                });
+            }
+            StreamEvent::ThinkingComplete {
+                opaque,
+                provider_fields,
+            } => {
                 let thinking = std::mem::take(&mut self.thinking);
                 // Only a block that is kept closes the text: one that is dropped must not split
                 // the text around nothing.
-                if let Some(block) = ContentBlock::replayable_thinking(thinking, opaque) {
+                if let Some(block) =
+                    ContentBlock::replayable_thinking(thinking, opaque, provider_fields)
+                {
                     self.flush_text();
                     self.content.push(block);
                 }
             }
-            StreamEvent::RedactedThinking { data } => {
+            StreamEvent::RedactedThinking {
+                data,
+                provider_fields,
+            } => {
                 self.flush_text();
-                self.content.push(ContentBlock::RedactedThinking { data });
+                self.content.push(ContentBlock::RedactedThinking {
+                    data,
+                    provider_fields,
+                });
             }
             StreamEvent::ThinkingProgress { .. } | StreamEvent::Error(_) => {}
             StreamEvent::ToolUseStart { id, name } => {
@@ -738,20 +1040,40 @@ impl MessageAccumulator {
                 self.flush_text();
                 self.tool_id = id;
                 self.tool_name = name;
+                self.tool_arguments.clear();
             }
-            StreamEvent::ToolUseEnd { input } => self.content.push(ContentBlock::ToolUse {
+            StreamEvent::ToolArgumentsDelta(fragment) => self.tool_arguments.push_str(&fragment),
+            StreamEvent::ToolUseEnd {
+                input,
+                provider_fields,
+            } => self.content.push(ContentBlock::ToolUse {
                 id: std::mem::take(&mut self.tool_id),
                 name: std::mem::take(&mut self.tool_name),
                 input,
+                unparsed: None,
+                provider_fields,
             }),
-            StreamEvent::ToolCallRefused { id, name, reason } => {
+            StreamEvent::ToolCallRefused {
+                id,
+                name,
+                unparsed,
+                provider_fields,
+            } => {
                 // A malformed call keeps the assistant message's shape valid for the round trip;
-                // the marker is what `resolve_and_execute_tool` refuses to run.
-                self.content.push(refused_tool_use(id, name, reason));
+                // what the model sent is what dispatch refuses to run.
+                self.flush_text();
+                self.content
+                    .push(refused_tool_use(id, name, unparsed, provider_fields));
                 self.tool_id.clear();
                 self.tool_name.clear();
             }
-            StreamEvent::MessageEnd { stop_reason } => self.stop_reason = Some(stop_reason),
+            StreamEvent::MessageEnd { stop } => self.stop = Some(stop),
+            // The first name stands: a wire that names the model on every chunk names one.
+            StreamEvent::Model(model) => {
+                self.model.get_or_insert(model);
+            }
+            StreamEvent::MessageFields(fields) => self.message_fields = Some(fields),
+            StreamEvent::ResponseFields(fields) => self.response_fields = Some(fields),
             // Merged rather than overwritten: Anthropic streams the input and cache tiers on
             // `message_start` and the output on `message_delta`, so last-event-wins would drop the
             // input count.
@@ -760,30 +1082,59 @@ impl MessageAccumulator {
         }
     }
 
-    /// What arrived before a stream failed, for a caller that keeps a partial answer: `None`
-    /// unless some text did.
-    pub(crate) fn partial(mut self) -> Option<Message> {
+    /// Close what is still open as the reply returned it: the text and the refusal, thinking
+    /// that never finished, which carries nothing a provider would take back, and a call whose
+    /// arguments never finished, refused with what had streamed of them.
+    fn close_open_blocks(&mut self) {
         self.flush_text();
-        let has_text = self
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::Text { .. }));
-        has_text.then(|| Message {
-            role: Role::Assistant,
-            content: self.content,
+        let thinking = std::mem::take(&mut self.thinking);
+        if let Some(block) = ContentBlock::replayable_thinking(thinking, None, None) {
+            self.content.push(block);
+        }
+        if !self.tool_id.is_empty() {
+            self.content.push(refused_tool_use(
+                std::mem::take(&mut self.tool_id),
+                std::mem::take(&mut self.tool_name),
+                unfinished_call(std::mem::take(&mut self.tool_arguments)),
+                None,
+            ));
+        }
+    }
+
+    /// What arrived before a stream failed, as it arrived, for a caller that keeps a partial
+    /// reply: `None` when nothing did.
+    pub(crate) fn partial(mut self) -> Option<PartialReply> {
+        self.close_open_blocks();
+        (!self.content.is_empty()).then(|| PartialReply {
+            message: Message {
+                role: Role::Assistant,
+                content: self.content,
+                provider_fields: self.message_fields,
+            },
+            model: self.model,
+            usage: self.usage,
+            response_fields: self.response_fields,
         })
     }
 
-    /// The message, with `EndTurn` for a stream that never said how it ended.
+    /// The message and how it ended. A stream that never stated its stop ends the turn, with no
+    /// word of the provider's recorded for it.
     pub(crate) fn finish(mut self) -> Completion {
-        self.flush_text();
+        self.close_open_blocks();
+        let stop = self
+            .stop
+            .unwrap_or(Stop::of(StopReason::EndTurn))
+            .with_refusal_of(&self.content);
         Completion {
             message: Message {
                 role: Role::Assistant,
                 content: self.content,
+                provider_fields: self.message_fields,
             },
-            stop_reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
+            stop,
+            model: self.model,
             usage: self.usage,
+            response_fields: self.response_fields,
             notices: self.notices,
         }
     }
@@ -791,9 +1142,9 @@ impl MessageAccumulator {
 
 /// Fold a [`StreamEvent`] stream into the [`Completion`] a [`Provider::complete`] returns, with
 /// nobody watching: how a wire with one request shape answers a non-streaming call. A
-/// `StreamEvent::Error` is logged at debug, not returned: every producer sends it right before its
-/// own typed `Err`, which surfaces from the concurrently awaited `stream` and is said once there,
-/// as a warning by the retry or by the host.
+/// `StreamEvent::Error` is logged at debug, not returned: every producer sends it ahead of its own
+/// typed `Err`, which surfaces from the concurrently awaited `stream` and is said once there, as a
+/// warning by the retry or by the host.
 pub(crate) async fn aggregate_stream(mut receiver: mpsc::Receiver<StreamEvent>) -> Completion {
     let mut accumulator = MessageAccumulator::new();
     while let Some(event) = receiver.recv().await {
@@ -805,41 +1156,60 @@ pub(crate) async fn aggregate_stream(mut receiver: mpsc::Receiver<StreamEvent>) 
     accumulator.finish()
 }
 
+/// Hand over each call the fragments assembled, in index order, read as a whole reply's call is
+/// read: one without the id or the name the spec requires is kept as its fragments came and never
+/// run, and one whose fragments carried no arguments is refused for it. Whether any call was made.
 async fn finalize_tool_call_accumulators(
     accumulators: &mut std::collections::HashMap<i64, ToolCallAccumulator>,
     event_sender: &mpsc::Sender<StreamEvent>,
 ) -> bool {
-    let has_tools = !accumulators.is_empty();
+    let mut has_calls = false;
     let mut indices: Vec<i64> = accumulators.keys().copied().collect();
     indices.sort();
     for index in indices {
-        if let Some(accumulator) = accumulators.remove(&index) {
-            if event_sender
-                .send(StreamEvent::ToolUseStart {
-                    id: accumulator.id.clone(),
-                    name: accumulator.name.clone(),
-                })
-                .await
-                .is_err()
-            {
-                tracing::trace!("stream event receiver dropped");
-                return has_tools;
+        let Some(accumulator) = accumulators.remove(&index) else {
+            continue;
+        };
+        let (Some(id), Some(name)) = (accumulator.id, accumulator.name) else {
+            for fragment in accumulator.fragments {
+                if event_sender
+                    .send(StreamEvent::Unrecognized(fragment))
+                    .await
+                    .is_err()
+                {
+                    tracing::trace!("stream event receiver dropped");
+                    return has_calls;
+                }
             }
-            if event_sender
-                .send(tool_use_event(
-                    accumulator.id.clone(),
-                    accumulator.name.clone(),
-                    &accumulator.arguments,
-                ))
-                .await
-                .is_err()
-            {
-                tracing::trace!("stream event receiver dropped");
-                return has_tools;
-            }
+            continue;
+        };
+        has_calls = true;
+        if event_sender
+            .send(StreamEvent::ToolUseStart {
+                id: id.clone(),
+                name: name.clone(),
+            })
+            .await
+            .is_err()
+        {
+            tracing::trace!("stream event receiver dropped");
+            return has_calls;
+        }
+        let arguments = match (&accumulator.unread_arguments, accumulator.carried_arguments) {
+            (Some(unread), _) => arguments_from_reply(&name, Some(unread)),
+            (None, true) => finalize_tool_arguments(&name, &accumulator.arguments),
+            (None, false) => arguments_from_reply(&name, None),
+        };
+        if event_sender
+            .send(call_event(id, name, arguments, accumulator.provider_fields))
+            .await
+            .is_err()
+        {
+            tracing::trace!("stream event receiver dropped");
+            return has_calls;
         }
     }
-    has_tools
+    has_calls
 }
 
 #[cfg(test)]
@@ -848,6 +1218,51 @@ mod tests {
 
     use super::*;
     use crate::{conversation::Role, image::ImageSource};
+
+    /// A call whose arguments do not parse is refused as its result, which the model and every
+    /// surface read; the log says nothing above a diagnostic, so a live screen draws no row its
+    /// replay would not.
+    #[test]
+    fn a_refused_call_is_no_warning() {
+        let logs = crate::streams::capture::capture_logs(tracing::Level::WARN);
+        assert!(finalize_tool_arguments("shell_execute", "{\"command\": \"echo lor").is_err());
+        assert!(arguments_from_reply("shell_execute", None).is_err());
+        assert!(!logs.logged().contains("refusing"), "{}", logs.logged());
+    }
+
+    /// A stream folds as the reference client folds it: strings concatenate, numbers add, objects
+    /// fold, objects in a list merge on their `index`, scalars extend, `index` and `type` take the
+    /// latest value, a null is replaced, and an entry the reference refuses is kept at the end.
+    #[test]
+    fn a_streamed_object_folds_as_the_reference_client_folds_it() {
+        let mut snapshot = serde_json::Map::new();
+        for delta in [
+            serde_json::json!({"text": "a", "n": 1, "tags": ["x"], "late": null,
+                "details": [{"index": 0, "type": "reasoning.text", "text": "Th"}]}),
+            serde_json::json!({"text": "b", "n": 2, "tags": ["y"], "late": "now",
+                "details": [{"index": 0, "text": "ink"}, {"index": 1, "type": "reasoning.encrypted", "data": "E"}],
+                "loose": [{"no": "index"}]}),
+            serde_json::json!({"loose": [{"also": "none"}], "nested": {"k": "v"}}),
+            serde_json::json!({"nested": {"k": "w"}}),
+        ] {
+            accumulate_delta(&mut snapshot, delta.as_object().expect("an object"));
+        }
+        assert_eq!(
+            serde_json::Value::Object(snapshot),
+            serde_json::json!({
+                "text": "ab",
+                "n": 3,
+                "tags": ["x", "y"],
+                "late": "now",
+                "details": [
+                    {"index": 0, "type": "reasoning.text", "text": "Think"},
+                    {"index": 1, "type": "reasoning.encrypted", "data": "E"},
+                ],
+                "loose": [{"no": "index"}, {"also": "none"}],
+                "nested": {"k": "vw"},
+            })
+        );
+    }
 
     /// The two clocks a reply could run out are the whole-request `timeout` and `read_timeout`,
     /// and reqwest renders each in the client's debug output when it is set (`TotalTimeout` by its
@@ -1600,7 +2015,7 @@ mod tests {
         assert_eq!(message.role, Role::User);
         assert_eq!(message.content.len(), 3);
         assert!(
-            matches!(&message.content[0], ContentBlock::Text { text } if text == "look at these")
+            matches!(&message.content[0], ContentBlock::Text { text, .. } if text == "look at these")
         );
         assert!(
             matches!(&message.content[1], ContentBlock::Image { source } if source.media_type() == "image/png")
@@ -1644,13 +2059,13 @@ mod tests {
     fn every_opaque_shape_round_trips_and_an_absent_id_is_not_written() {
         for (stored, expected) in [
             (
-                r#"{"type":"thinking","thinking":"hmm","opaque":{"type":"signed","signature":"SIG"}}"#,
+                r#"{"type":"thinking","parts":[{"kind":"reasoning","text":"hmm"}],"opaque":{"type":"signed","signature":"SIG"}}"#,
                 OpaqueReasoning::Signed {
                     signature: "SIG".to_string(),
                 },
             ),
             (
-                r#"{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E","origin":"https://chatgpt.com"}}"#,
+                r#"{"type":"thinking","parts":[{"kind":"reasoning","text":"s"}],"opaque":{"type":"sealed","encrypted_content":"E","origin":"https://chatgpt.com"}}"#,
                 OpaqueReasoning::Sealed {
                     encrypted_content: "E".to_string(),
                     id: None,
@@ -1658,7 +2073,7 @@ mod tests {
                 },
             ),
             (
-                r#"{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E","origin":null}}"#,
+                r#"{"type":"thinking","parts":[{"kind":"reasoning","text":"s"}],"opaque":{"type":"sealed","encrypted_content":"E","origin":null}}"#,
                 OpaqueReasoning::Sealed {
                     encrypted_content: "E".to_string(),
                     id: None,
@@ -1666,7 +2081,7 @@ mod tests {
                 },
             ),
             (
-                r#"{"type":"thinking","thinking":"r","opaque":{"type":"verbatim"}}"#,
+                r#"{"type":"thinking","parts":[{"kind":"reasoning","text":"r"}],"opaque":{"type":"verbatim"}}"#,
                 OpaqueReasoning::Verbatim,
             ),
         ] {
@@ -1689,7 +2104,7 @@ mod tests {
     /// place that knows the old shape.
     #[test]
     fn a_sealed_block_without_its_origin_does_not_load() {
-        let stored = r#"{"type":"thinking","thinking":"s","opaque":{"type":"sealed","encrypted_content":"E"}}"#;
+        let stored = r#"{"type":"thinking","parts":[{"kind":"reasoning","text":"s"}],"opaque":{"type":"sealed","encrypted_content":"E"}}"#;
         assert!(serde_json::from_str::<ContentBlock>(stored).is_err());
     }
 
@@ -1699,18 +2114,23 @@ mod tests {
             role: Role::Assistant,
             content: vec![
                 ContentBlock::Thinking {
-                    thinking: "hmm".to_string(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning("hmm")],
                     opaque: None,
+                    provider_fields: None,
                 },
                 ContentBlock::Text {
                     text: "let me check".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let stripped = message.without_tool_use();
         assert_eq!(stripped.role, Role::Assistant);
@@ -1720,7 +2140,7 @@ mod tests {
             ContentBlock::Thinking { .. }
         ));
         assert!(
-            matches!(&stripped.content[1], ContentBlock::Text { text } if text == "let me check")
+            matches!(&stripped.content[1], ContentBlock::Text { text, .. } if text == "let me check")
         );
         // A tool-use-only message strips to empty content.
         let only_tool = Message {
@@ -1729,7 +2149,10 @@ mod tests {
                 id: "call_2".to_string(),
                 name: "x".to_string(),
                 input: serde_json::json!({}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         };
         assert!(only_tool.without_tool_use().content.is_empty());
     }
@@ -1809,6 +2232,31 @@ mod tests {
         }
     }
 
+    /// Arguments are a JSON object or the call is refused with what the model sent: valid JSON of
+    /// another type is not arguments, nor, in a whole reply, a value that is not the string the
+    /// wire defines, nor none at all. An empty string is a call with no arguments.
+    #[test]
+    fn arguments_that_are_not_an_object_are_refused_with_what_was_sent() {
+        assert_eq!(
+            finalize_tool_arguments("t", "  ").expect("no arguments"),
+            serde_json::json!({})
+        );
+        let refused = finalize_tool_arguments("t", "[1, 2]").expect_err("a list");
+        assert_eq!(refused.text.as_deref(), Some("[1, 2]"));
+        assert_eq!(refused.error, "the arguments are not a JSON object");
+        let object = serde_json::json!({"path": "a"});
+        let refused = arguments_from_reply("t", Some(&object)).expect_err("not a string");
+        assert_eq!(refused.text.as_deref(), Some(r#"{"path":"a"}"#));
+        assert_eq!(refused.error, "the arguments are not a string");
+        let refused = arguments_from_reply("t", None).expect_err("none");
+        assert_eq!(refused.text, None);
+        assert_eq!(
+            arguments_from_reply("t", Some(&serde_json::json!(r#"{"path": "a"}"#)))
+                .expect("a string of an object"),
+            object
+        );
+    }
+
     /// Regression test for the "silent `{}` fallback" bug: a tool call with unparseable JSON
     /// arguments must be refused via [`StreamEvent::ToolCallRefused`] rather than replayed with
     /// an empty input object (which would run the tool on whatever defaults it happens to
@@ -1817,9 +2265,11 @@ mod tests {
     async fn finalize_tool_call_accumulators_rejects_invalid_json() {
         let mut accumulators = std::collections::HashMap::new();
         accumulators.insert(0, ToolCallAccumulator {
-            id: "call-1".to_string(),
-            name: "file_read".to_string(),
+            id: Some("call-1".to_string()),
+            name: Some("file_read".to_string()),
             arguments: "{not json".to_string(),
+            carried_arguments: true,
+            ..ToolCallAccumulator::default()
         });
 
         let (sender, mut receiver) = mpsc::channel::<StreamEvent>(16);
@@ -1834,10 +2284,17 @@ mod tests {
 
         let second = receiver.try_recv().expect("follow-up event");
         match second {
-            StreamEvent::ToolCallRefused { id, name, reason } => {
+            StreamEvent::ToolCallRefused {
+                id, name, unparsed, ..
+            } => {
                 assert_eq!(id, "call-1");
                 assert_eq!(name, "file_read");
-                assert!(reason.starts_with("invalid JSON arguments"));
+                assert!(unparsed.error.starts_with("invalid JSON arguments"));
+                assert_eq!(
+                    unparsed.text.as_deref(),
+                    Some("{not json"),
+                    "what was sent is kept"
+                );
             }
             other => panic!("expected ToolCallRefused, got {other:?}"),
         }
@@ -1852,9 +2309,11 @@ mod tests {
     async fn finalize_tool_call_accumulators_passes_valid_json() {
         let mut accumulators = std::collections::HashMap::new();
         accumulators.insert(0, ToolCallAccumulator {
-            id: "call-2".to_string(),
-            name: "file_read".to_string(),
+            id: Some("call-2".to_string()),
+            name: Some("file_read".to_string()),
             arguments: r#"{"path": "/tmp/x"}"#.to_string(),
+            carried_arguments: true,
+            ..ToolCallAccumulator::default()
         });
 
         let (sender, mut receiver) = mpsc::channel::<StreamEvent>(16);
@@ -1864,7 +2323,7 @@ mod tests {
         assert!(matches!(first, StreamEvent::ToolUseStart { .. }));
 
         match receiver.try_recv().expect("ToolUseEnd") {
-            StreamEvent::ToolUseEnd { input } => {
+            StreamEvent::ToolUseEnd { input, .. } => {
                 assert_eq!(input["path"], "/tmp/x");
             }
             other => panic!("expected ToolUseEnd, got {other:?}"),
@@ -1892,13 +2351,17 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "I'll read that file.".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         assert_eq!(message.tool_uses().len(), 1);
     }
@@ -1907,11 +2370,12 @@ mod tests {
     fn a_text_block_round_trips_through_serde() {
         let block = ContentBlock::Text {
             text: "hello".to_string(),
+            provider_fields: None,
         };
         let json = serde_json::to_string(&block).expect("should serialize");
         let deserialized: ContentBlock = serde_json::from_str(&json).expect("should deserialize");
 
-        if let ContentBlock::Text { text } = deserialized {
+        if let ContentBlock::Text { text, .. } = deserialized {
             assert_eq!(text, "hello");
         } else {
             panic!("expected Text block");
@@ -1925,13 +2389,17 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "Let me read that.".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test"}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
 
         let json = serde_json::to_string(&message).expect("should serialize");
@@ -2198,10 +2666,14 @@ mod tests {
         for event in [
             StreamEvent::TextDelta("Short".into()),
             StreamEvent::ThinkingDelta(" it.".into()),
-            StreamEvent::ThinkingComplete { opaque: None },
+            StreamEvent::ThinkingComplete {
+                opaque: None,
+                provider_fields: None,
+            },
             StreamEvent::TextDelta(" answer".into()),
             StreamEvent::RedactedThinking {
                 data: "sealed".into(),
+                provider_fields: None,
             },
             StreamEvent::TextDelta(" done".into()),
         ] {
@@ -2209,20 +2681,25 @@ mod tests {
         }
         assert_eq!(accumulator.finish().message.content, vec![
             ContentBlock::Text {
-                text: "Short".into()
+                text: "Short".into(),
+                provider_fields: None,
             },
             ContentBlock::Thinking {
-                thinking: " it.".into(),
+                parts: vec![crate::conversation::ReasoningPart::reasoning(" it.")],
                 opaque: None,
+                provider_fields: None,
             },
             ContentBlock::Text {
-                text: " answer".into()
+                text: " answer".into(),
+                provider_fields: None,
             },
             ContentBlock::RedactedThinking {
                 data: "sealed".into(),
+                provider_fields: None,
             },
             ContentBlock::Text {
-                text: " done".into()
+                text: " done".into(),
+                provider_fields: None,
             },
         ]);
     }
@@ -2234,14 +2711,18 @@ mod tests {
         let mut accumulator = MessageAccumulator::new();
         for event in [
             StreamEvent::TextDelta("one ".into()),
-            StreamEvent::ThinkingComplete { opaque: None },
+            StreamEvent::ThinkingComplete {
+                opaque: None,
+                provider_fields: None,
+            },
             StreamEvent::TextDelta("piece".into()),
         ] {
             accumulator.push(event);
         }
         assert_eq!(accumulator.finish().message.content, vec![
             ContentBlock::Text {
-                text: "one piece".into()
+                text: "one piece".into(),
+                provider_fields: None,
             }
         ]);
     }

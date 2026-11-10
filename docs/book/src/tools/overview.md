@@ -339,6 +339,11 @@ conversation_read({"start": 47, "limit": 3})
 - `limit`: number of consecutive messages to read (max 20). Default: 1.
 - `scratchpad`: save the output to a scratchpad entry instead of returning it inline.
 
+A reply that did not end as an answer or a round of calls is read with how it stopped under it,
+`[stop: max_tokens]` for one cut at the output limit, and one cut short before its provider said
+with what cut it, `[cut: interrupted]`. A reply's words that follow its reasoning or a call are
+read under `[text]`, and reasoning with no words in it (sealed, with no summary) is left out.
+
 After a compaction, the summary message reminds the agent that these tools exist. Large tool outputs appear as `<large-output>` references in both `conversation_search` and `conversation_read` results (rather than inlining the full payload); read their full content with `scratchpad_read`.
 
 **Which sessions a call may read** is one rule, shared with `session_list` and `session_search` below: the calling session and its direct sub-agents, by full id or by a prefix unique among them, or every session in the store when the session runs at [`unrestricted`](../usage/permissions.md), the level at which the shell reaches the store anyway. The level is the live one, so a sub-agent at `unrestricted` reads its parent and its siblings; below it the read is one way, parent to sub-agent, because a parent's log may hold reads from outside the sub-agent's boundary. Below `unrestricted`, an id that is not readable gets the same refusal whether or not it exists, so the tool does not reveal which sessions are there. With approvals on this refusal is not put to you, as a path refusal is not.

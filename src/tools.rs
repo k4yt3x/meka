@@ -198,12 +198,13 @@ pub(crate) fn take_background_flag(
 }
 
 /// What every door does with a call's arguments before a tool sees them, so no door can forget a
-/// step. A call the provider rejected (see [`crate::provider::finalize_tool_arguments`]) is refused
-/// with its reason. Meka's own parameters are type-checked, because a wrong type read as absent
-/// would be a silent no-op the model has no way to notice. And `background` is taken out, since it
-/// is spliced into the schema by the registry and consumed by the dispatcher, so no tool, least of
-/// all a remote MCP server, sees a key it never advertised; a tool that declares `background`
-/// itself keeps its argument.
+/// step. A call whose arguments were not a JSON object (see
+/// [`crate::provider::finalize_tool_arguments`]) is refused with the reason, `unparsed` being what
+/// the model sent; a door with no call behind it, the job gate, passes `None`. Meka's own
+/// parameters are type-checked, because a wrong type read as absent would be a silent no-op the
+/// model has no way to notice. And `background` is taken out, since it is spliced into the schema
+/// by the registry and consumed by the dispatcher, so no tool, least of all a remote MCP server,
+/// sees a key it never advertised; a tool that declares `background` itself keeps its argument.
 ///
 /// Returns the arguments the tool receives and whether the call asked to detach; the error is the
 /// output the model reads instead. `definition` is `tool`'s own, which the caller already holds.
@@ -211,14 +212,12 @@ pub(crate) fn admit_arguments(
     tool: &dyn Tool,
     definition: &ToolDefinition,
     input: &serde_json::Value,
+    unparsed: Option<&crate::conversation::UnparsedArguments>,
 ) -> std::result::Result<(serde_json::Value, bool), ToolOutput> {
     let (name, schema) = (&definition.name, &definition.parameters);
-    if let Some(reason) = input
-        .get(crate::provider::INVALID_TOOL_ARGS_MARKER)
-        .and_then(|value| value.as_str())
-    {
+    if let Some(unparsed) = unparsed {
         return Err(ToolOutput::text(
-            format!("Tool call refused: {reason}"),
+            format!("Tool call refused: {}", unparsed.error),
             true,
         ));
     }
@@ -300,8 +299,8 @@ static BACKGROUND_PROPERTY_TOKENS: std::sync::LazyLock<u64> = std::sync::LazyLoc
     ))
 });
 
-/// An advisory appended to a `tool_result` when the call and the tool's advertised schema disagree,
-/// or `None` when they don't.
+/// The note added to a `tool_result` when the call and the tool's advertised schema disagree, or
+/// `None` when they don't.
 ///
 /// Two disagreements are worth reporting, and they are mirror images:
 ///
@@ -400,11 +399,7 @@ pub(crate) fn schema_disagreement(
             "Call `tool_load` with \"{tool_name}\" for the full contract.",
         ));
     }
-    Some(format!(
-        "\n\n{} {}",
-        crate::conversation::HARNESS_NOTE,
-        lines.join("\n")
-    ))
+    Some(lines.join("\n"))
 }
 
 /// `" Did you mean `a` or `b`?"` for a tool name that isn't registered, or `""` when nothing is
@@ -764,12 +759,11 @@ impl ToolOutput {
         self
     }
 
-    /// Append harness-authored text to the model-visible result, extending the trailing text block
-    /// rather than adding one. An MCP result can be a mix of text and images, and a bare text block
-    /// tacked onto the end of that is easy to read as part of the tool's own output. A result made
-    /// of tool references takes none: the wire refuses text beside a reference, and the endpoint
-    /// expands the references into the very schemas a notice would describe.
-    pub(crate) fn append_notice(&mut self, notice: &str) {
+    /// Add a note Meka writes to the model-visible result, as an item of its own that every wire
+    /// renders behind Meka's label, so it never reads as part of the tool's own output. A result
+    /// made of tool references takes none: the wire refuses text beside a reference, and the
+    /// endpoint expands the references into the very schemas a note would describe.
+    pub(crate) fn push_note(&mut self, note: String) {
         if self
             .content
             .iter()
@@ -777,12 +771,7 @@ impl ToolOutput {
         {
             return;
         }
-        match self.content.last_mut() {
-            Some(ToolResultContent::Text { text }) => text.push_str(notice),
-            _ => self.content.push(ToolResultContent::Text {
-                text: notice.trim_start().to_string(),
-            }),
-        }
+        self.content.push(ToolResultContent::HarnessNote { note });
     }
 }
 
@@ -1014,20 +1003,22 @@ pub(crate) async fn start_and_run(
     }
 }
 
-/// The text blocks of a tool result, concatenated. Images carry nothing a predicate can judge.
+/// The text of a tool result, concatenated, without a note Meka added to it. Images carry nothing
+/// a predicate can judge.
 fn flatten_tool_text(output: &ToolOutput) -> String {
     output
         .content
         .iter()
-        .filter_map(|block| match block {
-            crate::conversation::ToolResultContent::Text { text } => Some(text.as_str()),
-            crate::conversation::ToolResultContent::Image { .. } => None,
-            crate::conversation::ToolResultContent::ToolReference { tool_name } => {
-                Some(tool_name.as_str())
+        .filter(|block| !matches!(block, ToolResultContent::HarnessNote { .. }))
+        .filter_map(|block| match block.wire_part() {
+            crate::conversation::ResultPart::Text(text) => Some(text),
+            crate::conversation::ResultPart::ToolReference(tool_name) => {
+                Some(std::borrow::Cow::Borrowed(tool_name))
             }
+            crate::conversation::ResultPart::Image(_) => None,
         })
         .collect::<Vec<_>>()
-        .join("")
+        .concat()
 }
 
 /// The argument of a built-in that is a program, and the language it is written in: what the
@@ -1075,9 +1066,6 @@ pub(crate) fn builtin_change_params(name: &str) -> &'static [&'static str] {
 pub(crate) fn resolve_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
     if registry::server_of_tool(name).is_some() {
         let meka_s_own = |key: &str, value: &serde_json::Value| match key {
-            // A call whose arguments did not parse holds the reason in their place, which is no
-            // argument of the call's.
-            crate::provider::INVALID_TOOL_ARGS_MARKER => true,
             BACKGROUND_PARAMETER => value.is_boolean(),
             SCRATCHPAD_PARAMETER => value.is_string(),
             _ => false,
@@ -1374,6 +1362,7 @@ mod tests {
             &quick,
             &definition,
             &serde_json::json!({"background": true}),
+            None,
         );
         assert!(
             matches!(refused, Err(ref output) if output.is_error && output.text_content().contains("`quick` cannot run in the background")),
@@ -1383,6 +1372,7 @@ mod tests {
             &quick,
             &definition,
             &serde_json::json!({"background": false}),
+            None,
         )
         .expect("not asking is no ask");
         assert!(!detach);
@@ -1391,6 +1381,7 @@ mod tests {
             &detachable,
             &definition,
             &serde_json::json!({"background": true}),
+            None,
         )
         .expect("a tool with a start step detaches");
         assert!(detach);
@@ -1461,6 +1452,7 @@ mod tests {
                 &*tool,
                 &tool.definition(),
                 &serde_json::json!({"background": true}),
+                None,
             );
             assert!(refused.is_err(), "{name}: {refused:?}");
         }
@@ -2662,20 +2654,23 @@ mod tests {
         }
     }
 
-    /// A notice extends the trailing text and never rides beside a reference: the wire refuses
-    /// text in a result that carries one.
+    /// A note is an item of its own, read behind Meka's label, and never rides beside a reference:
+    /// the wire refuses text in a result that carries one.
     #[test]
-    fn a_notice_never_joins_a_result_made_of_references() {
+    fn a_note_never_joins_a_result_made_of_references() {
         let mut textual = ToolOutput::text("done".to_string(), false);
-        textual.append_notice("\n\n[meka harness] note");
-        assert_eq!(textual.content.len(), 1);
-        assert!(ContentBlock::tool_result_text_content(&textual.content).ends_with("note"));
+        textual.push_note("note".to_string());
+        assert_eq!(textual.content.len(), 2);
+        assert_eq!(
+            ContentBlock::tool_result_text_content(&textual.content),
+            "done\n\n[Meka harness] note"
+        );
 
         let mut referenced = ToolOutput::text(String::new(), false);
         referenced.content = vec![ToolResultContent::ToolReference {
             tool_name: "mcp__x__y".to_string(),
         }];
-        referenced.append_notice("\n\n[meka harness] note");
+        referenced.push_note("note".to_string());
         assert_eq!(referenced.content.len(), 1, "{:?}", referenced.content);
     }
 
@@ -2901,13 +2896,6 @@ mod tests {
         );
         assert_eq!(shown(serde_json::json!({"config": {"nested": 1}})), None);
         assert_eq!(shown(serde_json::json!({})), None);
-        assert_eq!(
-            shown(serde_json::json!({
-                crate::provider::INVALID_TOOL_ARGS_MARKER: "expected value at line 1"
-            })),
-            None,
-            "a call whose arguments did not parse holds the reason, which is no argument"
-        );
         assert_eq!(
             shown(serde_json::json!({
                 "background": true,

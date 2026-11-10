@@ -3,6 +3,7 @@
 pub(crate) mod frontend;
 
 use super::{terminal::*, *};
+use crate::conversation::StopReason;
 
 /// The frontend a `--format json` run drives: nothing reaches stdout during the turn, and what the
 /// turn produced is read back afterwards to assemble the one object the run prints.
@@ -37,6 +38,9 @@ impl crate::frontend::Frontend for JsonFrontend {
 struct ToolCallReport {
     name: String,
     input: serde_json::Value,
+    /// What the model sent as the arguments when it was not a JSON object; `input` is `{}` then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unparsed: Option<crate::conversation::UnparsedArguments>,
     is_error: bool,
 }
 
@@ -48,7 +52,8 @@ struct TurnReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<uuid::Uuid>,
     profile: String,
-    /// `end_turn`, `max_tokens`, `refusal`, or `interrupted`.
+    /// The class the turn's last reply stopped on (`end_turn`, `tool_use`, `max_tokens`,
+    /// `context_window`, `refusal`, `content_filter`, `unknown`), or `interrupted`.
     stop_reason: &'static str,
     /// The assistant's text, the rounds joined by a blank line.
     text: String,
@@ -98,13 +103,18 @@ fn assemble_report(
                 round_boundary = true;
             }
             FrontendEvent::ToolCallStarted {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                unparsed,
+                ..
             } => {
                 round_boundary = true;
                 started.insert(id, tool_calls.len());
                 tool_calls.push(ToolCallReport {
                     name,
                     input,
+                    unparsed,
                     is_error: false,
                 });
             }
@@ -132,11 +142,7 @@ fn assemble_report(
         }
     }
     let (stop_reason, refusal_text) = match outcome {
-        Some(crate::agent::TurnOutcome::EndTurn) => ("end_turn", None),
-        Some(crate::agent::TurnOutcome::MaxTokens) => ("max_tokens", None),
-        Some(crate::agent::TurnOutcome::Refusal(reason)) => {
-            ("refusal", (!reason.is_empty()).then_some(reason))
-        }
+        Some(outcome) => (outcome.stop_reason.name(), outcome.refusal_text),
         None => ("interrupted", None),
     };
     TurnReport {
@@ -382,16 +388,28 @@ pub(crate) async fn run_oneshot(
             write_error = Some(error);
         }
         // The JSON report carries the stop reason; the plain answer alone would read as complete.
-        match &outcome {
-            Some(crate::agent::TurnOutcome::MaxTokens) => {
+        if plain_frontend.answered_nothing() {
+            tracing::warn!("the model returned no answer");
+        }
+        match outcome.as_ref().map(|outcome| outcome.stop_reason) {
+            Some(StopReason::MaxTokens) => {
                 tracing::warn!(
                     "the answer stopped at the model's output limit and may be cut short"
                 );
             }
-            Some(crate::agent::TurnOutcome::Refusal(_)) => {
-                tracing::warn!("the model declined to answer");
+            Some(StopReason::ContextWindow) => {
+                tracing::warn!(
+                    "the answer stopped at the model's context window and may be cut short"
+                );
             }
-            _ => {}
+            Some(StopReason::Refusal) => tracing::warn!("the model declined to answer"),
+            Some(StopReason::ContentFilter) => {
+                tracing::warn!("a content filter stopped the answer, which may be cut short");
+            }
+            Some(StopReason::Unknown) => {
+                tracing::warn!("the answer stopped for a reason Meka does not recognize");
+            }
+            Some(StopReason::EndTurn | StopReason::ToolUse) | None => {}
         }
     }
     // The report goes out for a turn that ended, whichever way, an interrupt included: its
@@ -536,7 +554,7 @@ mod tests {
                 },
                 FrontendEvent::AssistantTextDelta("Done.".to_string()),
             ],
-            Some(crate::agent::TurnOutcome::EndTurn),
+            Some(crate::agent::TurnOutcome::of(StopReason::EndTurn)),
             None,
             "work".to_string(),
         );
@@ -563,6 +581,7 @@ mod tests {
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "a.txt"}),
                     display_summary: None,
+                    unparsed: None,
                 },
                 FrontendEvent::ToolCallCompleted {
                     id: "tu_1".to_string(),
@@ -583,13 +602,14 @@ mod tests {
                         kept_recent: true,
                         written_summary: String::new(),
                         checkpoint: Vec::new(),
+                        summarizer: Vec::new(),
                     },
                     generation: 1,
                 },
                 FrontendEvent::AssistantTextDelta("Missing.".to_string()),
                 FrontendEvent::TokenUsage(usage(5, 4)),
             ],
-            Some(crate::agent::TurnOutcome::EndTurn),
+            Some(crate::agent::TurnOutcome::of(StopReason::EndTurn)),
             None,
             "work".to_string(),
         );

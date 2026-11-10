@@ -45,7 +45,23 @@ pub(crate) fn content_hash(bytes: &[u8]) -> String {
 fn messages_in(event: &mut Event) -> Vec<&mut Message> {
     match event {
         Event::Append(message) => vec![message],
-        Event::CompactBoundary { summary, .. } => vec![summary],
+        Event::CompactBoundary {
+            summary, record, ..
+        } => std::iter::once(summary)
+            .chain(
+                record
+                    .checkpoint
+                    .iter_mut()
+                    .chain(&mut record.summarizer)
+                    .map(|recorded| &mut recorded.message),
+            )
+            .collect(),
+        Event::CompactionFailed(failure) => failure
+            .checkpoint
+            .iter_mut()
+            .chain(&mut failure.summarizer)
+            .map(|recorded| &mut recorded.message)
+            .collect(),
         Event::Repair { messages, .. } => messages.iter_mut().collect(),
         Event::Redact { .. } | Event::Unsign => Vec::new(),
     }
@@ -364,6 +380,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
         store.save_event(session, &first, None).await.expect("save");
         store

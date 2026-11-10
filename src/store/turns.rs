@@ -38,9 +38,10 @@ pub(crate) struct TurnRecord {
     #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<TurnStatus>,
-    /// `end_turn`, `max_tokens` or `refusal`, on a turn that succeeded.
+    /// The class of the stop the turn's last reply ended on, on a turn that succeeded.
+    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) stop_reason: Option<String>,
+    pub(crate) stop_reason: Option<crate::conversation::StopReason>,
     /// What a turn that failed failed on, in the words a Problem Detail uses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<TurnError>,
@@ -322,7 +323,7 @@ impl From<CancelReason> for String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnEnding {
     pub(crate) status: TurnStatus,
-    pub(crate) stop_reason: Option<String>,
+    pub(crate) stop_reason: Option<crate::conversation::StopReason>,
     pub(crate) error: Option<TurnError>,
     pub(crate) reason: Option<CancelReason>,
     /// See [`TurnRecord::profile`].
@@ -338,7 +339,7 @@ impl TurnRecord {
         Self {
             ended_at: Some(ended_at),
             status: Some(ending.status),
-            stop_reason: ending.stop_reason.clone(),
+            stop_reason: ending.stop_reason,
             error: ending.error.clone(),
             reason: ending.reason,
             profile: ending.profile.clone(),
@@ -350,10 +351,13 @@ impl TurnRecord {
 
 impl TurnEnding {
     /// A turn that ran to its stop reason.
-    pub(crate) fn succeeded(stop_reason: &str, usage: TurnUsage) -> Self {
+    pub(crate) fn succeeded(
+        stop_reason: crate::conversation::StopReason,
+        usage: TurnUsage,
+    ) -> Self {
         Self {
             status: TurnStatus::Succeeded,
-            stop_reason: Some(stop_reason.to_string()),
+            stop_reason: Some(stop_reason),
             error: None,
             reason: None,
             profile: None,
@@ -444,6 +448,16 @@ pub(super) fn turn_from_row(
         },
         _ => None,
     };
+    let stop_reason = match row.get::<_, Option<String>>(offset + 5)? {
+        Some(word) => match word.parse::<crate::conversation::StopReason>() {
+            Ok(stop_reason) => Some(stop_reason),
+            Err(error) => {
+                tracing::warn!("turn {id} records a stop reason Meka cannot read: {error}");
+                None
+            }
+        },
+        None => None,
+    };
     let reason = match row.get::<_, Option<String>>(offset + 12)? {
         Some(word) => match word.parse::<CancelReason>() {
             Ok(reason) => Some(reason),
@@ -479,7 +493,7 @@ pub(super) fn turn_from_row(
             })?,
         ended_at: row.get(offset + 3)?,
         status,
-        stop_reason: row.get(offset + 5)?,
+        stop_reason,
         error,
         reason,
         profile: row.get(offset + 13)?,
@@ -573,7 +587,9 @@ impl TurnStore {
                         turn_id.to_string(),
                         ended_at,
                         ending.status.name(),
-                        ending.stop_reason,
+                        ending
+                            .stop_reason
+                            .map(crate::conversation::StopReason::name),
                         ending.error.as_ref().map(|error| error.kind.name()),
                         ending.error.as_ref().map(|error| error.detail.clone()),
                         ending.usage.input_tokens as i64,

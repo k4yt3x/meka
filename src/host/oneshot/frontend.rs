@@ -27,6 +27,8 @@ struct Answer {
     current: String,
     /// The last block that ended with words in it, for a turn whose final block has none.
     settled: String,
+    /// Whether the latest reply answered nothing: no words and no call.
+    answered_nothing: bool,
 }
 
 impl Answer {
@@ -59,6 +61,11 @@ impl PlainFrontend {
     pub(crate) fn answer(&self) -> String {
         crate::sync::lock(&self.answer).last_block().to_string()
     }
+
+    /// Whether the turn's last reply answered nothing: no words and no call.
+    pub(crate) fn answered_nothing(&self) -> bool {
+        crate::sync::lock(&self.answer).answered_nothing
+    }
 }
 
 #[async_trait]
@@ -66,11 +73,16 @@ impl Frontend for PlainFrontend {
     async fn emit(&self, event: FrontendEvent) {
         match event {
             FrontendEvent::AssistantTextDelta(text) => {
-                crate::sync::lock(&self.answer).current.push_str(&text);
+                let mut answer = crate::sync::lock(&self.answer);
+                answer.current.push_str(&text);
+                answer.answered_nothing = false;
             }
+            FrontendEvent::NoAnswer => crate::sync::lock(&self.answer).answered_nothing = true,
             FrontendEvent::ToolCallStarted { name, .. } => {
                 tracing::info!("calling tool '{name}'");
-                crate::sync::lock(&self.answer).boundary();
+                let mut answer = crate::sync::lock(&self.answer);
+                answer.boundary();
+                answer.answered_nothing = false;
             }
             FrontendEvent::Nudged { .. }
             | FrontendEvent::BackgroundReported { .. }
@@ -135,6 +147,7 @@ mod tests {
             name: "schedule_list".into(),
             input: serde_json::json!({}),
             display_summary: None,
+            unparsed: None,
         }
     }
 

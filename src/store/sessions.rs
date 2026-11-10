@@ -19,9 +19,27 @@ pub(super) struct StoredMessage {
     pub(super) said_turn_id: Option<String>,
     /// For a copy a compaction kept, when it was said; see [`SaidStamp`].
     pub(super) said_at: Option<String>,
+    /// For a reply, its [`crate::conversation::ReplyRecord`] as JSON.
+    pub(super) reply: Option<String>,
+    /// For an appended message, its own fields ([`crate::conversation::Message::provider_fields`])
+    /// as JSON, beside the blocks `content` holds.
+    pub(super) provider_fields: Option<String>,
 }
 
 impl StoredMessage {
+    /// What the provider said about the reply the row `id` appends, when it recorded that. A
+    /// record this build cannot read is warned about and read as none, as a row is.
+    fn reply_record(&self, id: i64) -> Option<crate::conversation::ReplyRecord> {
+        let reply = self.reply.as_deref()?;
+        match serde_json::from_str(reply) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                tracing::warn!("failed to read the reply record of row {id}: {error}");
+                None
+            }
+        }
+    }
+
     /// Where the row was said, for a copy a compaction kept.
     fn said(&self) -> Option<SaidStamp> {
         self.said_at.as_ref().map(|at| SaidStamp {
@@ -47,10 +65,37 @@ pub(crate) struct SaidStamp {
 /// Where a copy a compaction kept was said, as its row stores it: the turn's id and the time.
 type StoredSaid = (Option<String>, String);
 
+/// An event on its way to its row, with what the provider said about the reply it appends when it
+/// appends one.
+#[derive(Debug, Clone)]
+pub(crate) struct RecordedEvent {
+    pub(crate) event: crate::conversation::Event,
+    pub(crate) reply: Option<crate::conversation::ReplyRecord>,
+}
+
+impl RecordedEvent {
+    /// The append of `message`, a reply the provider said `record` about.
+    pub(crate) fn reply(
+        message: crate::conversation::Message,
+        record: crate::conversation::ReplyRecord,
+    ) -> Self {
+        Self {
+            event: crate::conversation::Event::Append(message),
+            reply: Some(record),
+        }
+    }
+}
+
+impl From<crate::conversation::Event> for RecordedEvent {
+    fn from(event: crate::conversation::Event) -> Self {
+        Self { event, reply: None }
+    }
+}
+
 /// The columns a reader of `messages` takes into a [`StoredMessage`] with its id, in the order
 /// [`stored_row_with_id`] reads them.
-const STORED_COLUMNS: &str =
-    "id, kind, content, created_at, turn_id, copy_of, said_turn_id, said_at";
+const STORED_COLUMNS: &str = "id, kind, content, created_at, turn_id, copy_of, said_turn_id, \
+     said_at, reply, provider_fields";
 
 /// Which row a stored event is, when it was written, and under which turn, for a reader of the
 /// whole log.
@@ -64,6 +109,8 @@ pub(crate) struct EventStamp {
     pub(crate) copy_of: Option<i64>,
     /// Where a copy a compaction kept was said, standing alone or not.
     pub(crate) said: Option<SaidStamp>,
+    /// What the provider said about the reply the row appends, when it recorded that.
+    pub(crate) reply: Option<crate::conversation::ReplyRecord>,
 }
 
 /// One row of the log with its id, for a reader that walks the log in pages.
@@ -79,6 +126,8 @@ pub(crate) struct LogRow {
     /// it stands alone.
     pub(crate) said: Option<SaidStamp>,
     pub(crate) event: crate::conversation::Event,
+    /// What the provider said about the reply the row appends, when it recorded that.
+    pub(crate) reply: Option<crate::conversation::ReplyRecord>,
 }
 
 /// What a row of the log is in the session's history, the one statement of it for every surface
@@ -89,6 +138,10 @@ pub(crate) enum Said<'a> {
     /// A compaction, where it happened.
     Compaction {
         record: &'a crate::conversation::CompactionRecord,
+    },
+    /// A compaction that failed or was stopped, where it ended.
+    CompactionFailed {
+        failure: &'a crate::conversation::FailedCompaction,
     },
     /// A rewind: the runs of history rows it took, and how many turns they held.
     Rewind {
@@ -130,6 +183,7 @@ impl LogRow {
         match &self.event {
             Event::Append(message) => Said::Message(message),
             Event::CompactBoundary { record, .. } => Said::Compaction { record },
+            Event::CompactionFailed(failure) => Said::CompactionFailed { failure },
             // A rewind that took nothing says nothing, and every other repair, a redaction and an
             // unsign only rewrite the context.
             Event::Repair { .. } | Event::Redact { .. } | Event::Unsign => Said::Nothing,
@@ -162,11 +216,19 @@ pub(crate) struct HistoryEntry {
 /// What a [`HistoryEntry`] is.
 #[derive(Debug, Clone)]
 pub(crate) enum HistoryKind {
-    Message(crate::conversation::Message),
+    /// A message, with what the provider said about it when it is a reply that recorded that.
+    Message {
+        message: crate::conversation::Message,
+        reply: Option<Box<crate::conversation::ReplyRecord>>,
+    },
     /// A compaction: its record, and which compaction it was, counting from 1.
     Compaction {
         record: crate::conversation::CompactionRecord,
         generation: u64,
+    },
+    /// A compaction that failed or was stopped, with what it did on the way.
+    CompactionFailed {
+        failure: crate::conversation::FailedCompaction,
     },
     /// A rewind, the runs of positions it took out of the history, and how many turns they held.
     Rewind {
@@ -179,6 +241,13 @@ pub(crate) enum HistoryKind {
         rows: Vec<std::ops::RangeInclusive<i64>>,
     },
 }
+
+/// A message of a session's history, with what its provider said about it when it is a reply that
+/// recorded that.
+pub(crate) type HistoryReply = (
+    crate::conversation::Message,
+    Option<Box<crate::conversation::ReplyRecord>>,
+);
 
 /// Which way a page of history is read: below a position (from the end when `None`), or above one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,10 +281,16 @@ pub(crate) fn history_entries(
             generation = generation.saturating_add(1);
         }
         let kind = match row.said(rewound) {
-            Said::Message(message) => HistoryKind::Message(message.clone()),
+            Said::Message(message) => HistoryKind::Message {
+                message: message.clone(),
+                reply: row.reply.clone().map(Box::new),
+            },
             Said::Compaction { record } => HistoryKind::Compaction {
                 record: record.clone(),
                 generation,
+            },
+            Said::CompactionFailed { failure } => HistoryKind::CompactionFailed {
+                failure: failure.clone(),
             },
             Said::Rewind { rows, turns } => HistoryKind::Rewind {
                 rows: rows.to_vec(),
@@ -443,6 +518,8 @@ pub(crate) struct ImportedEvent {
     pub(crate) copy_of: Option<usize>,
     /// Where a copy a compaction kept was said, its turn one of the record's `turns`.
     pub(crate) said: Option<SaidStamp>,
+    /// What the provider said about the reply the event appends, as the archive recorded it.
+    pub(crate) reply: Option<crate::conversation::ReplyRecord>,
 }
 /// A row's evidence that another session spawned it. See [`Store::spawn_terms`].
 #[derive(Debug, Clone, Copy)]
@@ -930,11 +1007,9 @@ pub(crate) const PREFIX_MATCH_CAP: usize = 17;
 /// The `kind` a `messages` row carries for `Event::CompactBoundary`, distinct from every role an
 /// `Event::Append` is stored under.
 pub(super) const COMPACT_BOUNDARY_KIND: &str = "compact_boundary";
-/// The `kind` for a `Role::User` message that carries non-text blocks: every turn's message, whose
-/// context block comes first, and any input images. Its full `Vec<ContentBlock>` is stored as JSON,
-/// because flattening to `text_content()` (as the plain `user` kind does) would drop them. A
-/// text-only user message, which is one Meka authored (a nudge, a summary), stays plaintext under
-/// `user`. Mirrors [`COMPACT_BOUNDARY_KIND`].
+/// The `kind` for a `Role::User` message that is not a round's results: a turn's opening, whose
+/// context block comes first, a nudge, a summary. Its blocks are stored as JSON, as an assistant
+/// message's are. Mirrors [`COMPACT_BOUNDARY_KIND`].
 pub(super) const USER_BLOCKS_KIND: &str = "user_blocks";
 /// The `kind` for `Event::Repair` rows, mirroring [`COMPACT_BOUNDARY_KIND`]. The superseded
 /// messages keep their own rows, so `meka session export` still shows what was replaced.
@@ -945,41 +1020,32 @@ pub(super) const REDACT_KIND: &str = "redact";
 /// The `kind` for `Event::Unsign` rows, mirroring [`REDACT_KIND`]: the messages it changes keep
 /// their rows, and the replay takes their Claude thinking out.
 pub(super) const UNSIGN_KIND: &str = "unsign";
+/// The `kind` for `Event::CompactionFailed` rows: a compaction that ended without replacing the
+/// window, which changes nothing in the view.
+pub(super) const COMPACTION_FAILED_KIND: &str = "compaction_failed";
 /// The `messages` row a session's title is read from, as a `WHERE` over `messages` correlated to
-/// `sessions s`: the first user message that carries words. A `user` row is text by construction; a
-/// `user_blocks` row is a JSON array of blocks and is passed over while none of them carries a
-/// person's words, a `text` block, an `inbox` item's body, a `scheduled` fire's prompt or an
-/// `invocation`, which always names what it invoked
-/// ([`crate::conversation::ContentBlock::spoken_words`] spelled in SQL), so an image sent alone
-/// does not leave the session unlabeled once words follow. Blank text and a stand-in Meka wrote
-/// do not count as words in either shape, which is [`crate::conversation::is_harness_stand_in`]
-/// spelled in SQL. A compaction summary is under its
-/// own kind and is never selected. This is [`crate::conversation::Conversation::title`]'s
-/// rule over the log, and [`title_of_first_user_row`] then applies that function to the row it
-/// selects, so the two cannot pick different rows.
+/// `sessions s`: the first user message that carries words. A `user_blocks` row is a JSON array
+/// of blocks and is passed over while none of them carries a person's words, a `text` block, an
+/// `inbox` item's body, a `scheduled` fire's prompt or an `invocation`, which always names what it
+/// invoked ([`crate::conversation::ContentBlock::spoken_words`] spelled in SQL), so an image sent
+/// alone does not leave the session unlabeled once words follow. Blank text is not words; a note
+/// Meka wrote is a block of its own type and never selected. A compaction summary
+/// is under its own kind and is never selected either. This is
+/// [`crate::conversation::Conversation::title`]'s rule over the log, and
+/// [`title_of_first_user_row`] then applies that function to the row it selects, so the two cannot
+/// pick different rows.
 static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let quoted = |text: &str| format!("'{}'", text.replace('\'', "''"));
     // What `Conversation::title` takes as words, over one SQL expression holding the text.
-    let is_words = |text: &str| {
-        format!(
-            "(trim({text}, ' ' || char(9, 10, 11, 12, 13)) <> '' AND {text} <> {placeholder} \
-             AND substr({text}, 1, {note_chars}) <> {note})",
-            placeholder = quoted(crate::conversation::IMAGE_REDACTION_PLACEHOLDER),
-            note_chars = crate::conversation::HARNESS_NOTE.chars().count(),
-            note = quoted(crate::conversation::HARNESS_NOTE),
-        )
-    };
+    let is_words = |text: &str| format!("trim({text}, ' ' || char(9, 10, 11, 12, 13)) <> ''");
     format!(
         "session_id = s.id
-         AND ((kind = 'user' AND {user_words})
-              OR (kind = 'user_blocks'
-                  AND json_valid(messages.content)
-                  AND EXISTS (SELECT 1 FROM json_each(messages.content)
-                              WHERE ({kind} = 'text' AND {text_words})
-                                 OR ({kind} = 'inbox' AND {body_words})
-                                 OR ({kind} = 'scheduled' AND {prompt_words})
-                                 OR {kind} = 'invocation')))",
-        user_words = is_words("messages.content"),
+         AND kind = 'user_blocks'
+         AND json_valid(messages.content)
+         AND EXISTS (SELECT 1 FROM json_each(messages.content)
+                     WHERE ({kind} = 'text' AND {text_words})
+                        OR ({kind} = 'inbox' AND {body_words})
+                        OR ({kind} = 'scheduled' AND {prompt_words})
+                        OR {kind} = 'invocation')",
         kind = "json_extract(CASE WHEN json_each.type = 'object' THEN json_each.value END, \
                 '$.type')",
         text_words = is_words("json_extract(json_each.value, '$.text')"),
@@ -1017,44 +1083,34 @@ pub(crate) fn normalize_title(raw: &str) -> Result<Option<String>> {
 
 /// The title every surface shows: the one a user set, else the first words a user said, cut to
 /// `chars`, from the row [`TITLE_ROW_WHERE_SQL`] selected.
-fn effective_title(
-    set: Option<String>,
-    session: &str,
-    kind: &str,
-    content: String,
-    chars: usize,
-) -> String {
-    set.unwrap_or_else(|| title_of_first_user_row(session, kind, content, chars))
+fn effective_title(set: Option<String>, session: &str, content: String, chars: usize) -> String {
+    set.unwrap_or_else(|| title_of_first_user_row(session, &content, chars))
 }
 
-/// A session's title from the row [`TITLE_ROW_WHERE_SQL`] selects, cut to `chars`, through the
-/// one definition in [`crate::conversation::Conversation::title_within`]. A `user_blocks` row
-/// holds the message's blocks as JSON; a `user` row is the text itself.
-pub(super) fn title_of_first_user_row(
-    session: &str,
-    kind: &str,
-    content: String,
-    chars: usize,
-) -> String {
+/// A session's title from the `user_blocks` row [`TITLE_ROW_WHERE_SQL`] selects, its blocks as
+/// JSON, cut to `chars`, through the one definition in
+/// [`crate::conversation::Conversation::title_within`]. Empty when no row was selected.
+pub(super) fn title_of_first_user_row(session: &str, content: &str, chars: usize) -> String {
     use crate::conversation::{ContentBlock, Conversation, Event, Message, Role};
-    let message = if kind == USER_BLOCKS_KIND {
-        match serde_json::from_str::<Vec<ContentBlock>>(&content) {
-            Ok(blocks) => Message {
-                role: Role::User,
-                content: blocks,
-            },
-            Err(error) => {
-                tracing::warn!(
-                    "failed to decode the first user message of session {session} for its title: \
-                     {error}"
-                );
-                return String::new();
-            }
+    if content.is_empty() {
+        return String::new();
+    }
+    let content = match serde_json::from_str::<Vec<ContentBlock>>(content) {
+        Ok(blocks) => blocks,
+        Err(error) => {
+            tracing::warn!(
+                "failed to decode the first user message of session {session} for its title: \
+                 {error}"
+            );
+            return String::new();
         }
-    } else {
-        Message::user(content)
     };
-    Conversation::from_events(vec![Event::Append(message)]).title_within(chars)
+    Conversation::from_events(vec![Event::Append(Message {
+        role: Role::User,
+        content,
+        provider_fields: None,
+    })])
+    .title_within(chars)
 }
 /// An event as the `messages` table takes it: its images taken out into blobs and its references
 /// read. Built on the caller's thread rather than the database's, since decoding and hashing the
@@ -1072,6 +1128,8 @@ pub(super) struct PreparedEvent {
     /// A copy a compaction kept, whose row [`link_kept_copies`] finds in the transaction that
     /// writes it.
     kept: bool,
+    /// What the provider said about the reply the event appends, for its row.
+    reply: Option<crate::conversation::ReplyRecord>,
 }
 
 impl PreparedEvent {
@@ -1085,6 +1143,15 @@ impl PreparedEvent {
             copy_of: None,
             said: None,
             kept: false,
+            reply: None,
+        }
+    }
+
+    /// `recorded` on its way to its row.
+    pub(super) fn from_recorded(recorded: &RecordedEvent) -> Self {
+        Self {
+            reply: recorded.reply.clone(),
+            ..Self::from_event(&recorded.event)
         }
     }
 
@@ -1136,6 +1203,19 @@ pub(super) fn insert_event(
 ) -> rusqlite::Result<i64> {
     let (kind, content) = encode_event_for_db(&prepared.event)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let reply = prepared
+        .reply
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let provider_fields = match &prepared.event {
+        crate::conversation::Event::Append(message) => message.provider_fields.as_ref(),
+        _ => None,
+    }
+    .map(serde_json::to_string)
+    .transpose()
+    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     super::blobs::insert_blobs(transaction, &prepared.blobs, created_at)?;
     let message_id =
         super::search::insert_message(transaction, session_id, &super::search::NewMessage {
@@ -1146,6 +1226,8 @@ pub(super) fn insert_event(
             copy_of: prepared.copy_of,
             said_turn_id: prepared.said.as_ref().and_then(|(turn, _)| turn.as_deref()),
             said_at: prepared.said.as_ref().map(|(_, at)| at.as_str()),
+            reply: reply.as_deref(),
+            provider_fields: provider_fields.as_deref(),
         })?;
     super::blobs::link_message_blobs(transaction, message_id, &prepared.references)?;
     Ok(message_id)
@@ -1162,15 +1244,24 @@ pub(super) fn insert_event(
 /// message and draw the copies before it onto older rows too. History then shows each row once, so
 /// words said again and never saved show only where they were first said, and a turn sweep that
 /// takes the older rows and leaves the newer shows a kept message twice.
+///
+/// Each copy that names a row then holds what that row holds, with what its provider said about
+/// it, so a copy that outlives the row is a faithful record of it. Where the view had rewritten a
+/// copied message, a repair after the copies restates the view, which is what the model goes on
+/// reading.
 fn link_kept_copies(
     transaction: &rusqlite::Transaction<'_>,
     session_id: &str,
-    prepared: &mut [PreparedEvent],
+    prepared: &mut Vec<PreparedEvent>,
 ) -> rusqlite::Result<()> {
     use crate::conversation::Event;
     if !prepared.iter().any(|event| event.kept) {
         return Ok(());
     }
+    let mut originals: std::collections::HashMap<
+        i64,
+        (Event, Option<crate::conversation::ReplyRecord>),
+    > = std::collections::HashMap::new();
     // Each row with whether it holds a message, and where it was said: its own turn and time, or
     // for a copy an earlier compaction kept, where that copy says, so a copy of a copy says what
     // the first row did. A row this build cannot decode holds nothing a copy could, and every load
@@ -1191,11 +1282,14 @@ fn link_kept_copies(
                 Ok(Some(event)) => event,
                 Ok(None) | Err(_) => return None,
             };
+            let holds_a_message = matches!(event, Event::Append(_));
+            if holds_a_message {
+                originals.insert(id, (event.clone(), row.reply_record(id)));
+            }
             let said = match row.said_at {
                 Some(at) => (row.said_turn_id, at),
                 None => (row.turn_id, row.created_at),
             };
-            let holds_a_message = matches!(event, Event::Append(_));
             Some(((id, holds_a_message, said), event))
         })
         .collect();
@@ -1228,6 +1322,37 @@ fn link_kept_copies(
         let source = row.and_then(|row| shown.get(row));
         copy.copy_of = source.map(|(id, ..)| *id);
         copy.said = source.map(|(_, _, said)| said.clone());
+    }
+    // The view each copy was made from, and whether any copy now holds something else.
+    let mut view = Vec::with_capacity(copies.len());
+    let mut rewritten = false;
+    for copy in &mut copies {
+        if let Event::Append(message) = &copy.event {
+            view.push(message.clone());
+        }
+        let Some((original, reply)) = copy.copy_of.and_then(|id| originals.get(&id)) else {
+            continue;
+        };
+        if encode_event_for_db(original).ok() != encode_event_for_db(&copy.event).ok() {
+            rewritten = true;
+        }
+        let mut restored = PreparedEvent {
+            copy_of: copy.copy_of,
+            said: copy.said.take(),
+            kept: true,
+            reply: reply.clone(),
+            ..PreparedEvent::from_event(original)
+        };
+        // The view's images, which the repair after the copies references, stored with the copy.
+        restored.blobs.append(&mut copy.blobs);
+        **copy = restored;
+    }
+    if rewritten && let Some(last) = prepared.iter().rposition(|event| event.kept) {
+        let repair = PreparedEvent::from_event(&Event::Repair {
+            replaced_count: view.len(),
+            messages: view,
+        });
+        prepared.insert(last + 1, repair);
     }
     Ok(())
 }
@@ -1298,6 +1423,10 @@ pub(super) fn encode_event_for_db(
             let content = serde_json::to_string(event)?;
             Ok((UNSIGN_KIND.to_string(), content))
         }
+        Event::CompactionFailed(_) => {
+            let content = serde_json::to_string(event)?;
+            Ok((COMPACTION_FAILED_KIND.to_string(), content))
+        }
     }
 }
 /// The kind and content of the row an appended `message` is stored as.
@@ -1313,16 +1442,8 @@ pub(super) fn encode_message_for_db(
                 .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
             {
                 ("tool_results", serde_json::to_string(&message.content)?)
-            } else if message
-                .content
-                .iter()
-                .any(|block| !matches!(block, ContentBlock::Text { .. }))
-            {
-                // A user turn carrying non-text blocks (input images) can't be flattened to plain
-                // text without losing them, so persist the full block list as JSON.
-                (USER_BLOCKS_KIND, serde_json::to_string(&message.content)?)
             } else {
-                ("user", message.text_content())
+                (USER_BLOCKS_KIND, serde_json::to_string(&message.content)?)
             }
         }
         Role::Assistant => ("assistant", serde_json::to_string(&message.content)?),
@@ -1337,12 +1458,25 @@ pub(super) fn decode_event_from_row(
 ) -> std::result::Result<Option<crate::conversation::Event>, serde_json::Error> {
     use crate::conversation::{ContentBlock, Event, Message, Role};
 
+    // A message's own fields this build cannot read are said and read as none, rather than
+    // costing the message.
+    let provider_fields = || {
+        row.provider_fields
+            .as_deref()
+            .and_then(|fields| match serde_json::from_str(fields) {
+                Ok(fields) => Some(fields),
+                Err(error) => {
+                    tracing::warn!("failed to read a message's own fields: {error}");
+                    None
+                }
+            })
+    };
     match row.kind.as_str() {
-        "user" => Ok(Some(Event::Append(Message::user(&row.content)))),
         "assistant" => match serde_json::from_str::<Vec<ContentBlock>>(&row.content) {
             Ok(content) => Ok(Some(Event::Append(Message {
                 role: Role::Assistant,
                 content,
+                provider_fields: provider_fields(),
             }))),
             Err(_) => {
                 // Deliberately softer than the `tool_results` and `user_blocks` arms below, which
@@ -1356,6 +1490,7 @@ pub(super) fn decode_event_from_row(
             Ok(content) => Ok(Some(Event::Append(Message {
                 role: Role::User,
                 content,
+                provider_fields: provider_fields(),
             }))),
             Err(error) => Err(error),
         },
@@ -1364,6 +1499,7 @@ pub(super) fn decode_event_from_row(
                 Ok(content) => Ok(Some(Event::Append(Message {
                     role: Role::User,
                     content,
+                    provider_fields: provider_fields(),
                 }))),
                 Err(error) => Err(error),
             }
@@ -1371,7 +1507,8 @@ pub(super) fn decode_event_from_row(
         kind if kind == COMPACT_BOUNDARY_KIND
             || kind == REPAIR_KIND
             || kind == REDACT_KIND
-            || kind == UNSIGN_KIND =>
+            || kind == UNSIGN_KIND
+            || kind == COMPACTION_FAILED_KIND =>
         {
             let event: Event = serde_json::from_str(&row.content)?;
             Ok(Some(event))
@@ -1414,6 +1551,8 @@ fn stored_row_with_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, StoredM
         copy_of: row.get(5)?,
         said_turn_id: row.get(6)?,
         said_at: row.get(7)?,
+        reply: row.get(8)?,
+        provider_fields: row.get(9)?,
     }))
 }
 
@@ -1484,6 +1623,7 @@ fn decode_log_rows(stored: Vec<(i64, StoredMessage)>, warned: &WarnedRows) -> Ve
                     .turn_id
                     .as_deref()
                     .and_then(|id| Uuid::parse_str(id).ok()),
+                reply: row.reply_record(id),
                 created_at: row.created_at,
                 event,
             }),
@@ -1512,6 +1652,7 @@ fn decode_rows(
                 EventStamp {
                     id,
                     said: row.said(),
+                    reply: row.reply_record(id),
                     created_at: row.created_at,
                     turn_id: row.turn_id.as_deref().and_then(session_id_in),
                     copy_of: row.copy_of,
@@ -2591,6 +2732,8 @@ impl Store {
                                         .and_then(|old| turn_ids.get(&old))
                                         .map(String::as_str),
                                     said_at: row.said_at.as_deref(),
+                                    reply: row.reply.as_deref(),
+                                    provider_fields: row.provider_fields.as_deref(),
                                 },
                             )?;
                             link.execute(rusqlite::params![message_id, source_message_id])?;
@@ -2836,7 +2979,7 @@ impl Store {
     pub(crate) async fn save_events_atomic(
         &self,
         session_id: Uuid,
-        events: Vec<crate::conversation::Event>,
+        events: Vec<impl Into<RecordedEvent>>,
         turn: Option<Uuid>,
     ) -> Result<()> {
         self.save_events_atomic_marking_inbox(session_id, events, &[], turn)
@@ -2848,11 +2991,14 @@ impl Store {
     pub(crate) async fn save_events_atomic_marking_inbox(
         &self,
         session_id: Uuid,
-        events: Vec<crate::conversation::Event>,
+        events: Vec<impl Into<RecordedEvent>>,
         inbox_items: &[Uuid],
         turn: Option<Uuid>,
     ) -> Result<()> {
-        let prepared: Vec<PreparedEvent> = events.iter().map(PreparedEvent::from_event).collect();
+        let prepared: Vec<PreparedEvent> = events
+            .into_iter()
+            .map(|event| PreparedEvent::from_recorded(&event.into()))
+            .collect();
         self.save_prepared_atomic(session_id, prepared, inbox_items, turn)
             .await
     }
@@ -2992,8 +3138,11 @@ impl Store {
                 // carry bytes; either way the row gets a reference and the bytes a blob. The
                 // bytes join the archive's, stored ahead of the rows, so the check below sees
                 // them.
-                let mut prepared =
-                    PreparedEvent::from_event(&imported.event).said(imported.said.as_ref());
+                let mut prepared = PreparedEvent::from_recorded(&RecordedEvent {
+                    event: imported.event,
+                    reply: imported.reply,
+                })
+                .said(imported.said.as_ref());
                 archive_blobs.append(&mut prepared.take_blobs());
                 events.push((
                     imported.at,
@@ -3188,17 +3337,17 @@ impl Store {
             .collect())
     }
 
-    /// The log as history: every event but the copies a compaction kept, so a kept turn is said
-    /// once, where it was first said. For a Markdown export, which records each repair beside
-    /// what it replaced.
-    pub(crate) async fn load_history(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::conversation::Event>> {
+    /// The log as history, each event with what its provider said about the reply it appends:
+    /// every event but the copies a compaction kept, so a kept turn is said once, where it was
+    /// first said. For a Markdown export, which records each repair beside what it replaced.
+    pub(crate) async fn load_history(&self, session_id: Uuid) -> Result<Vec<RecordedEvent>> {
         let stored = self.load_rows(session_id, RowRange::History).await?;
-        Ok(decode_rows(stored, &self.warned_rows)
+        Ok(decode_log_rows(stored, &self.warned_rows)
             .into_iter()
-            .map(|(_, event)| event)
+            .map(|row| RecordedEvent {
+                event: row.event,
+                reply: row.reply,
+            })
             .collect())
     }
 
@@ -3209,6 +3358,17 @@ impl Store {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<crate::conversation::Message>> {
+        Ok(self
+            .history_replies(session_id)
+            .await?
+            .into_iter()
+            .map(|(message, _)| message)
+            .collect())
+    }
+
+    /// [`Self::history_messages`], each with what its provider said about it when it is a reply
+    /// that recorded that.
+    pub(crate) async fn history_replies(&self, session_id: Uuid) -> Result<Vec<HistoryReply>> {
         let stored = self.load_rows(session_id, RowRange::History).await?;
         // After the rows, as a page of history reads them.
         let rewound = self.rewound(session_id).await?;
@@ -3216,7 +3376,7 @@ impl Store {
             history_entries(decode_log_rows(stored, &self.warned_rows), &rewound, 0)
                 .into_iter()
                 .filter_map(|entry| match entry.kind {
-                    HistoryKind::Message(message) => Some(message),
+                    HistoryKind::Message { message, reply } => Some((message, reply)),
                     _ => None,
                 })
                 .collect(),
@@ -3413,6 +3573,8 @@ impl Store {
                         copy_of: None,
                         said_turn_id: None,
                         said_at: None,
+                        reply: None,
+                        provider_fields: None,
                     },
                 )?;
                 transaction.execute(
@@ -4423,12 +4585,6 @@ impl Store {
                                ORDER BY id ASC LIMIT 1),
                               ''
                             ) AS title_content,
-                            COALESCE(
-                              (SELECT kind FROM messages
-                               WHERE {title_row}
-                               ORDER BY id ASC LIMIT 1),
-                              ''
-                            ) AS title_kind,
                             {SPENT_COLUMNS},
                             {turn_columns}
                      FROM sessions s
@@ -4473,16 +4629,9 @@ impl Store {
                     let set_title: Option<String> = row.get(11)?;
                     let pinned_at: Option<String> = row.get(12)?;
                     let project: String = row.get(13)?;
-                    let title_kind: String = row.get(15)?;
-                    let title = effective_title(
-                        set_title,
-                        &id_str,
-                        &title_kind,
-                        row.get(14)?,
-                        title_chars,
-                    );
-                    let spent = spent_from_row(row, 16)?;
-                    let last_turn = turn_from_row(row, 21)?;
+                    let title = effective_title(set_title, &id_str, row.get(14)?, title_chars);
+                    let spent = spent_from_row(row, 15)?;
+                    let last_turn = turn_from_row(row, 20)?;
                     Ok((
                         id_str,
                         created_at,
@@ -4582,12 +4731,6 @@ impl Store {
                                ORDER BY id ASC LIMIT 1),
                               ''
                             ) AS title_content,
-                            COALESCE(
-                              (SELECT kind FROM messages
-                               WHERE {title_row}
-                               ORDER BY id ASC LIMIT 1),
-                              ''
-                            ) AS title_kind,
                             {SPENT_COLUMNS},
                             {turn_columns}
                      FROM sessions s
@@ -4609,16 +4752,9 @@ impl Store {
                     let set_title: Option<String> = row.get(11)?;
                     let pinned_at: Option<String> = row.get(12)?;
                     let project: String = row.get(13)?;
-                    let title_kind: String = row.get(15)?;
-                    let title = effective_title(
-                        set_title,
-                        &id_str,
-                        &title_kind,
-                        row.get(14)?,
-                        crate::conversation::TITLE_CHARS,
-                    );
-                    let spent = spent_from_row(row, 16)?;
-                    let last_turn = turn_from_row(row, 21)?;
+                    let title = effective_title(set_title, &id_str, row.get(14)?, crate::conversation::TITLE_CHARS);
+                    let spent = spent_from_row(row, 15)?;
+                    let last_turn = turn_from_row(row, 20)?;
                     Ok((
                         id_str,
                         created_at,
@@ -5463,7 +5599,14 @@ mod tests {
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create");
-        store.save_message(id, "user", words).await.expect("seed");
+        store
+            .save_event(
+                id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user(words)),
+                None,
+            )
+            .await
+            .expect("seed");
         id
     }
 
@@ -5479,7 +5622,13 @@ mod tests {
             .expect("create");
         for n in 1..=7 {
             store
-                .save_message(id, "user", &format!("message {n}"))
+                .save_event(
+                    id,
+                    &crate::conversation::Event::Append(crate::conversation::Message::user(
+                        format!("message {n}"),
+                    )),
+                    None,
+                )
                 .await
                 .expect("seed");
         }
@@ -5593,7 +5742,10 @@ mod tests {
         };
         store
             .turn_store()
-            .close_turn(first, &TurnEnding::succeeded("max_tokens", usage))
+            .close_turn(
+                first,
+                &TurnEnding::succeeded(crate::conversation::StopReason::MaxTokens, usage),
+            )
             .await
             .expect("close");
         store
@@ -5602,7 +5754,10 @@ mod tests {
             .expect("save");
         let ended = row(&store, id).await.last_turn.expect("recorded");
         assert_eq!(ended.status, Some(TurnStatus::Succeeded));
-        assert_eq!(ended.stop_reason.as_deref(), Some("max_tokens"));
+        assert_eq!(
+            ended.stop_reason,
+            Some(crate::conversation::StopReason::MaxTokens)
+        );
         assert_eq!(ended.usage, usage);
         assert!(ended.ended_at.is_some());
 
@@ -5944,8 +6099,11 @@ mod tests {
             .turn_store()
             .close_turn(
                 turn,
-                &TurnEnding::succeeded("end_turn", TurnUsage::default())
-                    .served_by(Some("backup".to_string())),
+                &TurnEnding::succeeded(
+                    crate::conversation::StopReason::EndTurn,
+                    TurnUsage::default(),
+                )
+                .served_by(Some("backup".to_string())),
             )
             .await
             .expect("close");
@@ -5965,7 +6123,10 @@ mod tests {
             .turn_store()
             .close_turn(
                 own,
-                &TurnEnding::succeeded("end_turn", TurnUsage::default()),
+                &TurnEnding::succeeded(
+                    crate::conversation::StopReason::EndTurn,
+                    TurnUsage::default(),
+                ),
             )
             .await
             .expect("close");
@@ -6416,7 +6577,10 @@ mod tests {
                 id: "call-1".to_string(),
                 name: "shell_execute".to_string(),
                 input: serde_json::json!({"command": "true"}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         };
         for (turn, message) in [
             (crashed, Message::user("run it")),
@@ -6465,7 +6629,7 @@ mod tests {
         assert!(
             history.entries.iter().any(|entry| matches!(
                 &entry.kind,
-                HistoryKind::Message(message) if message.role == Role::Assistant
+                HistoryKind::Message { message, .. } if message.role == Role::Assistant
                     && message.text_content().is_empty()
             )),
             "the call stays where it was said: {history:?}"
@@ -6582,6 +6746,7 @@ mod tests {
         let mut joined = prompt.clone();
         joined.content.push(ContentBlock::Text {
             text: "and a message joined to it".to_string(),
+            provider_fields: None,
         });
         for event in [Event::Append(prompt), Event::Repair {
             replaced_count: 1,
@@ -6695,12 +6860,13 @@ mod tests {
             entries
                 .iter()
                 .map(|entry| match &entry.kind {
-                    HistoryKind::Message(message) => message.text_content(),
+                    HistoryKind::Message { message, .. } => message.text_content(),
                     HistoryKind::Compaction { generation, .. } => {
                         format!("compaction {generation}")
                     }
                     HistoryKind::Rewind { turns, .. } => format!("rewind {turns}"),
                     HistoryKind::Join { .. } => "join".to_string(),
+                    HistoryKind::CompactionFailed { .. } => "compaction failed".to_string(),
                 })
                 .collect()
         };
@@ -6840,10 +7006,11 @@ mod tests {
             .entries
             .iter()
             .map(|entry| match &entry.kind {
-                HistoryKind::Message(message) => message.text_content(),
+                HistoryKind::Message { message, .. } => message.text_content(),
                 HistoryKind::Compaction { generation, .. } => format!("compaction {generation}"),
                 HistoryKind::Rewind { turns, .. } => format!("rewind {turns}"),
                 HistoryKind::Join { .. } => "join".to_string(),
+                HistoryKind::CompactionFailed { .. } => "compaction failed".to_string(),
             })
             .collect();
         assert_eq!(said, [
@@ -6942,6 +7109,7 @@ mod tests {
         let mut joined = prompt.clone();
         joined.content.push(ContentBlock::Text {
             text: "and this".to_string(),
+            provider_fields: None,
         });
         for event in [
             Event::Append(prompt),
@@ -6961,7 +7129,7 @@ mod tests {
         assert!(
             matches!(&page.entries[..], [
                 HistoryEntry {
-                    kind: HistoryKind::Message(_),
+                    kind: HistoryKind::Message { .. },
                     ..
                 },
                 HistoryEntry {
@@ -6969,7 +7137,7 @@ mod tests {
                     ..
                 },
                 HistoryEntry {
-                    kind: HistoryKind::Message(_),
+                    kind: HistoryKind::Message { .. },
                     ..
                 },
             ]),
@@ -7010,7 +7178,7 @@ mod tests {
             .entries
             .iter()
             .filter_map(|entry| match &entry.kind {
-                HistoryKind::Message(message) => Some(message.text_content()),
+                HistoryKind::Message { message, .. } => Some(message.text_content()),
                 _ => None,
             })
             .collect();
@@ -7053,6 +7221,7 @@ mod tests {
         let mut both = prompt.clone();
         both.content.push(ContentBlock::Text {
             text: "and this".to_string(),
+            provider_fields: None,
         });
         for (turn, event) in [
             (
@@ -7157,6 +7326,7 @@ mod tests {
         let mut joined = prompt.clone();
         joined.content.push(ContentBlock::Text {
             text: "and this".to_string(),
+            provider_fields: None,
         });
         for event in [
             Event::Append(prompt),
@@ -7305,7 +7475,13 @@ mod tests {
             .await
             .expect("insert the corrupt rows");
         store
-            .save_message(id, "user", "the words")
+            .save_event(
+                id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user(
+                    "the words",
+                )),
+                None,
+            )
             .await
             .expect("seed");
         let (rows, _) = store
@@ -7609,6 +7785,113 @@ mod tests {
             .await
             .expect("stats");
         id
+    }
+
+    /// A reply's own fields and its record's are kept with its row, read back with it, and carried
+    /// by a fork and by an archive, so nothing a provider returned is lost on the way.
+    #[tokio::test]
+    async fn a_reply_keeps_its_own_fields_and_its_record_wherever_its_row_goes() {
+        use crate::conversation::{ContentBlock, Event, Message, Role};
+        let store = Store::for_test().await;
+        let source = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("session");
+        let fields = |value: serde_json::Value| value.as_object().cloned();
+        let reply = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "hi".to_string(),
+                provider_fields: None,
+            }],
+            provider_fields: fields(serde_json::json!({"reasoning_details": [{"index": 0}]})),
+        };
+        let record = crate::conversation::ReplyRecord {
+            stop: Some(crate::conversation::Stop::of(
+                crate::conversation::StopReason::EndTurn,
+            )),
+            cut: None,
+            model: None,
+            profile: None,
+            usage: None,
+            provider_fields: fields(serde_json::json!({"id": "gen-1"})),
+        };
+        store
+            .save_events_atomic(
+                source,
+                vec![
+                    RecordedEvent::from(Event::Append(Message::user("hello"))),
+                    RecordedEvent::reply(reply.clone(), record.clone()),
+                ],
+                None,
+            )
+            .await
+            .expect("save");
+        let held = |events: Vec<(EventStamp, Event)>| {
+            events
+                .into_iter()
+                .find_map(|(stamp, event)| match event {
+                    Event::Append(message) if message.role == Role::Assistant => {
+                        Some((message, stamp.reply))
+                    }
+                    _ => None,
+                })
+                .expect("the reply")
+        };
+        let expected = (reply, Some(record));
+        assert_eq!(
+            held(
+                store
+                    .load_events_with_timestamps(source)
+                    .await
+                    .expect("load")
+            ),
+            expected
+        );
+        let forked = store
+            .fork_session_for_test(source, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("source exists");
+        assert_eq!(
+            held(
+                store
+                    .load_events_with_timestamps(forked.id)
+                    .await
+                    .expect("load")
+            ),
+            expected,
+            "a fork carries them"
+        );
+        let archive = crate::store::export::build_session_export(&store, source)
+            .await
+            .expect("export");
+        let plan = crate::store::export::plan_import(
+            archive,
+            crate::store::export::ImportInstallation {
+                selected: None,
+                default: None,
+                configured: None,
+                projects: Vec::new(),
+            },
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plans");
+        let imported = plan.root_new_id;
+        store
+            .import_sessions(plan.records, plan.blobs)
+            .await
+            .expect("import");
+        assert_eq!(
+            held(
+                store
+                    .load_events_with_timestamps(imported)
+                    .await
+                    .expect("load")
+            ),
+            expected,
+            "an archive carries them"
+        );
     }
 
     #[tokio::test]
@@ -8710,8 +8993,6 @@ mod tests {
     /// `CompactBoundary`, matches the in-memory shape.
     #[tokio::test]
     async fn save_and_load_events_round_trip() {
-        use std::collections::HashSet;
-
         use crate::conversation::{ContentBlock, Event, Message, Role, ToolResultContent};
 
         let store = Store::for_test().await;
@@ -8726,13 +9007,17 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "thinking aloud".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "u1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         });
         let tool_result_event = Event::Append(Message {
             role: Role::User,
@@ -8744,8 +9029,10 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
-        let snapshot: HashSet<String> = ["mcp__notion__fetch".to_string()].into_iter().collect();
+        let snapshot: std::collections::BTreeSet<String> =
+            ["mcp__notion__fetch".to_string()].into_iter().collect();
         let boundary_event = Event::CompactBoundary {
             summary: Message::user("[summary]"),
             replaced_count: 3,
@@ -8854,15 +9141,17 @@ mod tests {
             .await
             .expect("save text event");
 
-        // Stored kinds: the image-bearing turn is JSON under `user_blocks`; the text-only turn
-        // stays plaintext under `user`.
+        // Every person's message is its blocks, an image among them or not.
         let rows = store
             .load_messages(sid, RowRange::All)
             .await
             .expect("load messages");
         assert_eq!(rows[0].kind, "user_blocks");
-        assert_eq!(rows[1].kind, "user");
-        assert_eq!(rows[1].content, "plain text only");
+        assert_eq!(rows[1].kind, "user_blocks");
+        assert_eq!(
+            rows[1].content,
+            r#"[{"type":"text","text":"plain text only"}]"#
+        );
 
         // The row holds a reference rather than the bytes, and the bytes come back on hydration.
         assert!(
@@ -8881,7 +9170,7 @@ mod tests {
                 assert_eq!(message.content.len(), 2);
                 assert!(matches!(
                     &message.content[0],
-                    ContentBlock::Text { text } if text == "look at this"
+                    ContentBlock::Text { text, .. } if text == "look at this"
                 ));
                 assert!(matches!(
                     &message.content[1],
@@ -8898,7 +9187,7 @@ mod tests {
         }
     }
 
-    /// The plain `user` and `assistant` roles are what `encode_event_for_db` writes for an
+    /// The `user_blocks` and `assistant` kinds are what `encode_event_for_db` writes for an
     /// `Event::Append`, so `load_events` must hand every such row back as one: this is the primary
     /// live path through the decoder, not a fallback.
     #[tokio::test]
@@ -8916,7 +9205,11 @@ mod tests {
         // `user_input_image_round_trips_via_user_blocks_role` is the test that closes that
         // loop.
         store
-            .save_message(sid, "user", "first")
+            .save_event(
+                sid,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("first")),
+                None,
+            )
             .await
             .expect("save user");
         let assistant_blocks = serde_json::json!([
@@ -9049,7 +9342,10 @@ mod tests {
                     id: "u9".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             }),
         ] {
             store
@@ -9090,7 +9386,11 @@ mod tests {
             .await
             .expect("create session");
         store
-            .save_message(sid, "user", "real")
+            .save_event(
+                sid,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("real")),
+                None,
+            )
             .await
             .expect("save real row");
         store
@@ -9312,7 +9612,11 @@ mod tests {
             .expect("failed to create session");
 
         store
-            .save_message(session_id, "user", "hello")
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("hello")),
+                None,
+            )
             .await
             .expect("failed to save message");
         store
@@ -9326,8 +9630,8 @@ mod tests {
             .expect("failed to load messages");
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].kind, "user");
-        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[0].kind, "user_blocks");
+        assert_eq!(messages[0].content, r#"[{"type":"text","text":"hello"}]"#);
         assert_eq!(messages[1].kind, "assistant");
         assert_eq!(messages[1].content, "hi there");
     }
@@ -10076,11 +10380,19 @@ mod tests {
             .expect("failed");
 
         store
-            .save_message(session1, "user", "msg1")
+            .save_event(
+                session1,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("msg1")),
+                None,
+            )
             .await
             .expect("failed");
         store
-            .save_message(session2, "user", "msg2")
+            .save_event(
+                session2,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("msg2")),
+                None,
+            )
             .await
             .expect("failed");
 
@@ -10094,9 +10406,9 @@ mod tests {
             .expect("failed");
 
         assert_eq!(messages1.len(), 1);
-        assert_eq!(messages1[0].content, "msg1");
+        assert_eq!(messages1[0].content, r#"[{"type":"text","text":"msg1"}]"#);
         assert_eq!(messages2.len(), 1);
-        assert_eq!(messages2[0].content, "msg2");
+        assert_eq!(messages2[0].content, r#"[{"type":"text","text":"msg2"}]"#);
     }
 
     #[tokio::test]
@@ -10107,7 +10419,11 @@ mod tests {
             .await
             .expect("failed");
         store
-            .save_message(session_id, "user", "hello")
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("hello")),
+                None,
+            )
             .await
             .expect("failed");
 
@@ -10289,11 +10605,19 @@ mod tests {
             .expect("failed");
 
         store
-            .save_message(old_session, "user", "old")
+            .save_event(
+                old_session,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("old")),
+                None,
+            )
             .await
             .expect("failed");
         store
-            .save_message(new_session, "user", "new")
+            .save_event(
+                new_session,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("new")),
+                None,
+            )
             .await
             .expect("failed");
 
@@ -10331,7 +10655,11 @@ mod tests {
             .await
             .expect("create");
         store
-            .save_message(session_id, "user", "hello")
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("hello")),
+                None,
+            )
             .await
             .expect("save");
 
@@ -10356,7 +10684,11 @@ mod tests {
             .expect("failed");
 
         store
-            .save_message(session_id, "user", "hello")
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user("hello")),
+                None,
+            )
             .await
             .expect("failed");
         store
@@ -10560,7 +10892,13 @@ mod tests {
             .expect("create_session");
         let cap = crate::conversation::TITLE_CHARS;
         store
-            .save_message(session_id, "user", &"a".repeat(cap + 150))
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user(
+                    "a".repeat(cap + 150),
+                )),
+                None,
+            )
             .await
             .expect("save_message");
         let (wire, _) = store
@@ -10697,11 +11035,11 @@ mod tests {
         );
     }
 
-    /// The SQL twin of `Conversation::title` skips what it skips: a turn whose only text is the
-    /// placeholder a redaction left, and a compaction summary, so the title is the first words a
-    /// user said even when the store replays a redacted, compacted session.
+    /// The SQL twin of `Conversation::title` skips what it skips: a turn whose only other block is
+    /// a note Meka wrote, and a compaction summary, so the title is the first words a user said
+    /// even when the store replays a redacted, compacted session.
     #[tokio::test]
-    async fn list_sessions_title_skips_a_placeholder_and_a_compaction_summary() {
+    async fn list_sessions_title_skips_a_note_and_a_compaction_summary() {
         use crate::conversation::{ContentBlock, Event, Message, Role};
         let store = Store::for_test().await;
         let session_id = store
@@ -10714,22 +11052,32 @@ mod tests {
                 ContentBlock::TurnContext {
                     text: "<context/>".to_string(),
                 },
-                ContentBlock::Text {
-                    text: crate::conversation::IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                ContentBlock::HarnessNote {
+                    note: crate::conversation::BUDGET_REDACTION_NOTE.to_string(),
                 },
             ],
+            provider_fields: None,
         };
         let events = [
             Event::Append(placeholder_only),
-            Event::Append(Message::user(format!(
-                "{} An image here was removed.",
-                crate::conversation::HARNESS_NOTE
-            ))),
+            Event::Append(Message {
+                role: Role::User,
+                content: vec![ContentBlock::HarnessNote {
+                    note: "An image here was removed.".to_string(),
+                }],
+                provider_fields: None,
+            }),
             Event::CompactBoundary {
-                summary: Message::user("[Conversation summary from session compaction] nothing"),
+                summary: Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Summary {
+                        text: "[Conversation summary from session compaction] nothing".to_string(),
+                    }],
+                    provider_fields: None,
+                },
                 replaced_count: 2,
                 record: crate::conversation::CompactionRecord::for_test(),
-                loaded_tools_snapshot: std::collections::HashSet::new(),
+                loaded_tools_snapshot: Default::default(),
                 checklist_snapshot: Default::default(),
             },
             Event::Append(mock_run_turn_user_message(
@@ -10759,6 +11107,40 @@ mod tests {
             info.title, summary.title,
             "both readers select the same row"
         );
+    }
+
+    /// Words a person typed are words in the SQL twin too: a prompt that opens with Meka's label,
+    /// or spells a note's sentence, titles its session.
+    #[tokio::test]
+    async fn list_sessions_titles_a_prompt_that_looks_like_a_note() {
+        use crate::conversation::{BUDGET_REDACTION_NOTE, Event, harness_note_text};
+        let store = Store::for_test().await;
+        for words in [
+            harness_note_text("what does this label mean?"),
+            BUDGET_REDACTION_NOTE.to_string(),
+        ] {
+            let session_id = store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create_session");
+            store
+                .save_event(
+                    session_id,
+                    &Event::Append(mock_run_turn_user_message(
+                        crate::permission::Permission::Read,
+                        &words,
+                    )),
+                    None,
+                )
+                .await
+                .expect("save");
+            let info = store
+                .session_info(session_id)
+                .await
+                .expect("session_info")
+                .expect("row");
+            assert_eq!(info.title, words);
+        }
     }
 
     /// A copy a fork or an import has not finished is listed by nothing: not the listing, the
@@ -11031,7 +11413,15 @@ mod tests {
         );
         let history = ["first", "one", "second", "pelicans", "boundary", "second"];
         assert_eq!(
-            texts(store.load_history(session).await.expect("history")),
+            texts(
+                store
+                    .load_history(session)
+                    .await
+                    .expect("history")
+                    .into_iter()
+                    .map(|recorded| recorded.event)
+                    .collect()
+            ),
             history
         );
         let page = store
@@ -11061,7 +11451,15 @@ mod tests {
             .expect("fork")
             .expect("the source exists");
         assert_eq!(
-            texts(store.load_history(forked.id).await.expect("history")),
+            texts(
+                store
+                    .load_history(forked.id)
+                    .await
+                    .expect("history")
+                    .into_iter()
+                    .map(|recorded| recorded.event)
+                    .collect()
+            ),
             history
         );
         let archive = crate::store::export::build_session_export(&store, session)
@@ -11099,7 +11497,15 @@ mod tests {
             .await
             .expect("import");
         assert_eq!(
-            texts(store.load_history(imported).await.expect("history")),
+            texts(
+                store
+                    .load_history(imported)
+                    .await
+                    .expect("history")
+                    .into_iter()
+                    .map(|recorded| recorded.event)
+                    .collect()
+            ),
             history
         );
     }
@@ -11259,11 +11665,14 @@ mod tests {
             content: vec![
                 ContentBlock::RedactedThinking {
                     data: "sealed".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::Text {
                     text: "Seen.".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         for event in [
             Event::Append(Message::user("look?")),
@@ -11315,10 +11724,14 @@ mod tests {
             })
             .map(|(stamp, _)| stamp.id)
             .collect();
-        let copies: Vec<(Option<i64>, Option<Uuid>)> = rows
+        let after: Vec<&(EventStamp, Event)> = rows
             .iter()
             .skip_while(|(_, event)| !matches!(event, Event::CompactBoundary { .. }))
             .skip(1)
+            .collect();
+        let copies: Vec<(Option<i64>, Option<Uuid>)> = after
+            .iter()
+            .filter(|(_, event)| matches!(event, Event::Append(_)))
             .map(|(stamp, _)| {
                 (
                     stamp.copy_of,
@@ -11335,12 +11748,44 @@ mod tests {
             ],
             "each copy stands for the row it was said in"
         );
+        // Each copy holds what its row holds, and a repair after them restates the view the
+        // model reads, which the rewrites had made of them.
+        let held: Vec<&Message> = after
+            .iter()
+            .filter_map(|(_, event)| match event {
+                Event::Append(message) => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(held[1].content[0], ContentBlock::RedactedThinking { .. }),
+            "{held:?}"
+        );
+        assert_eq!(held[2].text_content(), "next?");
+        assert!(
+            matches!(
+                after.last(),
+                Some((_, Event::Repair {
+                    replaced_count: 3,
+                    ..
+                }))
+            ),
+            "{after:?}"
+        );
+        let view = store.load_view_events(id).await.expect("view");
+        let view = crate::conversation::Conversation::from_events(view);
+        let tail: Vec<&Message> = view.as_slice().iter().skip(1).collect();
+        assert_eq!(
+            tail,
+            kept.iter().collect::<Vec<_>>(),
+            "the view is as it was"
+        );
         let history: Vec<String> = store
             .load_history(id)
             .await
             .expect("history")
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|recorded| match &recorded.event {
                 Event::Append(message) => Some(message.text_content()),
                 _ => None,
             })
@@ -11376,7 +11821,7 @@ mod tests {
             .await
             .expect("history")
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|recorded| match &recorded.event {
                 Event::Append(message) => Some(message.text_content()),
                 _ => None,
             })
@@ -11433,7 +11878,7 @@ mod tests {
             .await
             .expect("history")
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|recorded| match &recorded.event {
                 Event::Append(message) => Some(message.text_content()),
                 _ => None,
             })
@@ -11476,7 +11921,7 @@ mod tests {
             .await
             .expect("history")
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|recorded| match &recorded.event {
                 Event::Append(message) => Some(message.text_content()),
                 _ => None,
             })
@@ -11507,6 +11952,7 @@ mod tests {
                     text: "Base directory for this skill: /skills/review".to_string(),
                 },
             ],
+            provider_fields: None,
         };
         store
             .save_event(session_id, &Event::Append(opening), None)
@@ -11566,6 +12012,7 @@ mod tests {
                 turn_id: None,
                 copy_of: None,
                 said: None,
+                reply: None,
             }],
             scratchpad_entries: Vec::new(),
         };
@@ -11661,7 +12108,13 @@ mod tests {
         let summary_message = "[Conversation summary from session compaction]\n\nSummary text here\n\n\
              [Post-compaction context]\n\n…";
         store
-            .save_message(session_id, "user", summary_message)
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user(
+                    summary_message,
+                )),
+                None,
+            )
             .await
             .expect("save_message");
 
@@ -11680,16 +12133,22 @@ mod tests {
 
     #[tokio::test]
     async fn list_sessions_title_unwrapped_user_message() {
-        // The `<context>` block is added by `Agent::run_turn`, not by storage. A `user` row written
-        // by any other path carries none -- `import_sessions` replays whatever an archive held --
-        // and then the stored string IS the prompt, so the title equals it.
+        // The context block is added by `Agent::run_turn`, not by storage. A message written by
+        // any other path carries none (`import_sessions` replays whatever an archive held), and
+        // then its text is the prompt, so the title equals it.
         let store = Store::for_test().await;
         let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create_session");
         store
-            .save_message(session_id, "user", "prompt without any wrapper")
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(crate::conversation::Message::user(
+                    "prompt without any wrapper",
+                )),
+                None,
+            )
             .await
             .expect("save_message");
 
@@ -12012,7 +12471,13 @@ mod tests {
         // Populate the child with a message and a tool_output so the cascade has something to clean
         // up. This proves the descendant deletions run, not just the parent row.
         store
-            .save_message(child, "user", "hello from sub-agent")
+            .save_event(
+                child,
+                &crate::conversation::Event::Append(crate::conversation::Message::user(
+                    "hello from sub-agent",
+                )),
+                None,
+            )
             .await
             .expect("save_message");
         store
@@ -12112,7 +12577,7 @@ mod tests {
             .close_turn(
                 turn,
                 &super::super::turns::TurnEnding::succeeded(
-                    "end_turn",
+                    crate::conversation::StopReason::EndTurn,
                     super::super::turns::TurnUsage::default(),
                 ),
             )
@@ -12274,7 +12739,7 @@ mod tests {
             .await
             .expect("history")
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|recorded| match &recorded.event {
                 Event::Append(message) => Some(message.text_content()),
                 _ => None,
             })

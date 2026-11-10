@@ -4996,6 +4996,14 @@ mod tests {
     #[cfg(unix)]
     impl StubServer {
         async fn prepare(state: serde_json::Value) -> Self {
+            Self::prepare_timed(state, crate::config::DEFAULT_MCP_TOOL_TIMEOUT).await
+        }
+
+        /// [`Self::prepare`] with the call deadline `tool_call_timeout`.
+        async fn prepare_timed(
+            state: serde_json::Value,
+            tool_call_timeout: std::time::Duration,
+        ) -> Self {
             let temp = tempfile::tempdir().expect("tempdir");
             let path = temp.path().join("stub.json");
             let log = temp.path().join("requests.jsonl");
@@ -5016,7 +5024,7 @@ mod tests {
                 None,
                 None,
                 Arc::clone(&context),
-                crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+                tool_call_timeout,
             )
             .await
             .expect("prepare");
@@ -5501,6 +5509,35 @@ mod tests {
         assert!(
             matches!(outcome, Err(MekaError::Interrupted)),
             "an interrupted call is interrupted: {outcome:?}"
+        );
+    }
+
+    /// A call that outlives its deadline fails, worded by Meka, and is not taken for an
+    /// interrupt: the two are Meka's own stops, told apart by type rather than by a reason string.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_past_its_deadline_fails_and_is_not_an_interrupt() {
+        let stub = StubServer::prepare_timed(
+            serde_json::json!({"tools": ["search"], "call_delay_ms": 3000}),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        stub.connect().await;
+        let tool = stub.tool("search").await;
+        let context = CallContext {
+            session_id: None,
+            tool_call_id: Some("tu-1".to_string()),
+            live_call_id: Some("tu-1".to_string()),
+            frontend: Arc::new(AbsentFrontend),
+            cancellation: CancellationToken::new(),
+        };
+        let outcome = tool.call(None, &context).await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(MekaError::McpToolExecution { message, .. }) if message == "timed out after 1s"
+            ),
+            "{outcome:?}"
         );
     }
 

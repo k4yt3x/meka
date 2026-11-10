@@ -458,6 +458,16 @@ pub(crate) enum FrontendEvent {
     /// A streamed chunk of assistant text. Multiple deltas concatenate into one logical text run;
     /// any non-text event closes the run.
     AssistantTextDelta(String),
+    /// A reply that made calls stopped for a reason that is not a round's (the output limit, a
+    /// content filter, a word Meka has no class for). Its calls run and the turn goes on, so a
+    /// surface that tells a person how replies end says so here rather than at the turn's end.
+    ReplyStopped {
+        stop_reason: crate::conversation::StopReason,
+    },
+    /// The reply answered nothing: no words and no call, its reasoning aside. It is recorded as it
+    /// came; a surface that tells a person what happened says so in its own words, where one that
+    /// relays the conversation relays what the reply held.
+    NoAnswer,
     /// The model is thinking, with the server's running token estimate when it offers one.
     ///
     /// A transient indicator, not content: it is expected to be drawn in place and erased when
@@ -495,6 +505,9 @@ pub(crate) enum FrontendEvent {
     /// Claude MAC or OpenAI sealed reasoning, which is the conflation that shape exists to
     /// prevent, and it cloned kilobytes per block for a reader that never came.
     ThinkingBlock { content: String },
+    /// A thinking block whose text the provider withheld (Claude's `redacted_thinking`): there is
+    /// nothing to show but that it happened, which each surface says in its own way.
+    RedactedThinking,
     /// The model has started composing a tool call: the name has arrived, the arguments have not.
     ///
     /// Pairs with [`Self::ToolCallStarted`] on the same `id`, which marks the end of composition
@@ -515,16 +528,18 @@ pub(crate) enum FrontendEvent {
     /// [`Self::ToolCallCompleted`]. `display_summary` is the agent-resolved primary argument for
     /// display (e.g. the path for `file_read`, the command for `shell_execute`), pre-computed via
     /// [`crate::tools::resolve_primary_param`] so every frontend shows the same argument. `None`
-    /// means "no obvious primary arg". Render the bare tool name.
+    /// means "no obvious primary arg". Render the bare tool name. `unparsed` is what the model
+    /// sent when it was not a JSON object, in which case `input` is `{}` and the call is refused.
     ToolCallStarted {
         id: String,
         name: String,
         input: serde_json::Value,
         display_summary: Option<String>,
+        unparsed: Option<crate::conversation::UnparsedArguments>,
     },
     /// A call the stream announced that nothing will run: its round was cut, or ended on an error
     /// the turn recovered from, and the turn went on, or its stream was retried and the call did
-    /// not come again. Nothing completes it, and the conversation keeps no trace of it. A call the
+    /// not come again. Nothing completes it, and the context keeps no trace of it. A call the
     /// turn's last round left is the turn's end to settle.
     ToolCallDropped {
         id: String,
@@ -588,8 +603,8 @@ pub(crate) enum FrontendEvent {
     /// User-visible advisory raised by Meka itself or by the provider layer (e.g. image redaction
     /// when the request body would exceed the API limit). The terminal frontends render it in the
     /// color its [`NoticeLevel`] asks for; `AcpFrontend` sends it as a `notice` to a client that
-    /// advertised `session.notices`, and otherwise as an `AgentMessageChunk` with a `[meka] ` or
-    /// `[meka warn] ` prefix so the editor's transcript records the side-effect; the HTTP and
+    /// advertised `session.notices`, and otherwise as an `AgentMessageChunk` with a `[Meka] ` or
+    /// `[Meka warn] ` prefix so the editor's transcript records the side-effect; the HTTP and
     /// one-shot JSON surfaces carry it as a [`NoticeView`]. `SilentFrontend` drops it.
     Notice(crate::frontend::Notice),
     /// Incremental progress from an in-flight MCP tool (`notifications/progress`). Routed
@@ -1398,6 +1413,7 @@ mod tests {
                 name: "file_read".to_string(),
                 input: input.clone(),
                 display_summary: display_summary.clone(),
+                unparsed: None,
             })
             .await;
         let events = recorder.events();
@@ -1518,6 +1534,7 @@ mod tests {
                     name: name.to_string(),
                     input: serde_json::json!({}),
                     display_summary: summary,
+                    unparsed: None,
                 })
                 .await;
         }
@@ -1555,6 +1572,7 @@ mod tests {
                     name: "file_read".to_string(),
                     input: serde_json::json!({}),
                     display_summary: Some(format!("/file{i}")),
+                    unparsed: None,
                 })
                 .await;
         }
@@ -1593,6 +1611,7 @@ mod tests {
                 name: "file_read".into(),
                 input: serde_json::json!({}),
                 display_summary: Some("/etc/hosts".into()),
+                unparsed: None,
             })
             .await;
 

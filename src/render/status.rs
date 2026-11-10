@@ -270,14 +270,45 @@ pub(crate) fn render_profile_setup_hint(missing: MissingSessionProfile<'_>) {
     ));
 }
 
+/// How a reply that did not end as an answer or ask for its calls stopped, in the words the row
+/// that closes a turn and the row of a reply inside it both say; `None` for any other.
+fn stop_words(stop_reason: crate::conversation::StopReason) -> Option<&'static str> {
+    use crate::conversation::StopReason;
+    match stop_reason {
+        StopReason::MaxTokens => Some("hit the output limit"),
+        StopReason::ContextWindow => Some("hit the context window"),
+        StopReason::Refusal => Some("declined by the model"),
+        StopReason::ContentFilter => Some("stopped by a content filter"),
+        StopReason::Unknown => Some("stopped for an unrecognized reason"),
+        StopReason::EndTurn | StopReason::ToolUse => None,
+    }
+}
+
+/// `words` led by a capital.
+fn capitalized(words: &str) -> String {
+    let mut characters = words.chars();
+    characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect())
+        .unwrap_or_default()
+}
+
+/// The row a reply that made calls says when it stopped for a reason that is not a round's: its
+/// calls run, and the turn goes on, so the row that closes the turn does not say it. `None` for a
+/// round that stopped to have its calls run, or ended as an answer.
+pub(crate) fn reply_stop_direction(stop_reason: crate::conversation::StopReason) -> Option<String> {
+    stop_words(stop_reason).map(|words| format!("Reply {words}"))
+}
+
 /// The row that closes a turn: how it ended, then the facts `facts` lists, in their order. `None`
 /// when nothing is listed. A fact with nothing to say, a duration with no start or a usage of
-/// nothing, is left out rather than stated as zero. A turn that ended on the model's output limit
-/// or its refusal says so, since its last answer would otherwise read as complete.
+/// nothing, is left out rather than stated as zero. A turn whose last reply was cut, refused or
+/// stopped for a reason Meka has no class for says so, since its last answer would otherwise read
+/// as complete.
 pub(crate) fn turn_end_summary(
     facts: &[crate::config::TurnEndFact],
     status: crate::store::turns::TurnStatus,
-    stop_reason: Option<&str>,
+    stop_reason: Option<crate::conversation::StopReason>,
     ended_at: chrono::DateTime<chrono::Utc>,
     elapsed: Option<std::time::Duration>,
     usage: &crate::store::turns::TurnUsage,
@@ -287,14 +318,14 @@ pub(crate) fn turn_end_summary(
     if facts.is_empty() {
         return None;
     }
-    let mut sentence = match (status, stop_reason) {
-        (TurnStatus::Succeeded, Some("max_tokens")) => "Hit the output limit",
-        (TurnStatus::Succeeded, Some("refusal")) => "Declined by the model",
-        (TurnStatus::Succeeded, _) => "Finished",
-        (TurnStatus::Failed, _) => "Failed",
-        (TurnStatus::Canceled, _) => "Interrupted",
-    }
-    .to_string();
+    let mut sentence = match status {
+        TurnStatus::Succeeded => match stop_reason.and_then(stop_words) {
+            Some(words) => capitalized(words),
+            None => "Finished".to_string(),
+        },
+        TurnStatus::Failed => "Failed".to_string(),
+        TurnStatus::Canceled => "Interrupted".to_string(),
+    };
     for fact in facts {
         let segment = match fact {
             TurnEndFact::Time => {
@@ -535,8 +566,8 @@ mod tests {
         );
     }
 
-    /// A turn that ran into the output limit, or that the model declined, says so where the row
-    /// would otherwise call it finished, since its last answer reads as complete.
+    /// A turn whose last reply was cut, declined or stopped for a reason Meka has no class for says
+    /// so where the row would otherwise call it finished, since its last answer reads as complete.
     #[test]
     fn a_turn_cut_at_the_output_limit_says_so() {
         let usage = crate::store::turns::TurnUsage::default();
@@ -553,9 +584,13 @@ mod tests {
             )
             .expect("a row")
         };
-        assert!(row(Some("max_tokens")).starts_with("Hit the output limit"));
-        assert!(row(Some("refusal")).starts_with("Declined by the model"));
-        assert!(row(Some("end_turn")).starts_with("Finished"));
+        use crate::conversation::StopReason;
+        assert!(row(Some(StopReason::MaxTokens)).starts_with("Hit the output limit"));
+        assert!(row(Some(StopReason::ContextWindow)).starts_with("Hit the context window"));
+        assert!(row(Some(StopReason::Refusal)).starts_with("Declined by the model"));
+        assert!(row(Some(StopReason::ContentFilter)).starts_with("Stopped by a content filter"));
+        assert!(row(Some(StopReason::Unknown)).starts_with("Stopped for an unrecognized reason"));
+        assert!(row(Some(StopReason::EndTurn)).starts_with("Finished"));
     }
 
     /// The row that closes a turn reads as one sentence: how it ended, then the facts listed in

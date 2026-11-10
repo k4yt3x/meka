@@ -1364,15 +1364,11 @@ pub(crate) fn render_inbox_item(item: &crate::store::inbox::InboxItem, mid_turn:
     } else {
         arrived
     };
+    // The client named the sender, or nobody: then the name is left out rather than guessed, so
+    // the model is never told a sender nobody chose.
     let header = match &item.source {
-        Some(source) => format!(
-            "{}{source}, arrived {when}]",
-            crate::conversation::INBOX_HEADER_PREFIX
-        ),
-        None => format!(
-            "{}{when}]",
-            crate::conversation::UNNAMED_INBOX_HEADER_PREFIX
-        ),
+        Some(source) => format!("[Message from {source}, arrived {when}]"),
+        None => format!("[Message arrived {when}]"),
     };
     format!("{header}\n{}", item.body)
 }
@@ -5668,10 +5664,7 @@ mod tests {
             last_error: None,
         };
         let rendered = render_inbox_item(&item, false);
-        assert!(
-            rendered.starts_with(crate::conversation::UNNAMED_INBOX_HEADER_PREFIX),
-            "{rendered}"
-        );
+        assert!(rendered.starts_with("[Message arrived "), "{rendered}");
         assert!(
             !rendered.contains("from") && rendered.ends_with("]\nwhat's your workspace?"),
             "{rendered}"

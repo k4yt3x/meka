@@ -1238,7 +1238,10 @@ mod tests {
                     id: "toolu_1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -1250,6 +1253,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
 
@@ -1366,7 +1370,10 @@ mod tests {
                     id: "toolu_1".to_string(),
                     name: "bash".to_string(),
                     input: serde_json::json!({"command": "echo cch=00000"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -1378,6 +1385,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
         let provider = provider_for_test();
@@ -3230,7 +3238,10 @@ mod tests {
                     id: "toolu_1".to_string(),
                     name: "tool_load".to_string(),
                     input: serde_json::json!({"name": "fixture_deferred"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -3242,6 +3253,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
         // System prompt is rebuilt the same way every turn; its content is a function of the
@@ -3491,7 +3503,10 @@ mod tests {
                 id: "u1".to_string(),
                 name: "tool_load".to_string(),
                 input: serde_json::json!({"name": "fixture_deferred"}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         });
         log.append(Message {
             role: Role::User,
@@ -3503,6 +3518,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
 
         let pre_loaded = extract_loaded_tool_names_from_events(
@@ -3679,7 +3695,10 @@ mod tests {
                     id: "toolu_1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -3691,6 +3710,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
         let body_iter2 = provider.build_request_body(
@@ -3710,7 +3730,10 @@ mod tests {
                     id: "toolu_1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -3722,6 +3745,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::Assistant,
@@ -3729,7 +3753,10 @@ mod tests {
                     id: "toolu_2".to_string(),
                     name: "shell_execute".to_string(),
                     input: serde_json::json!({"command": "wc -l /tmp/test.txt"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -3741,6 +3768,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
         let body_iter3 = provider.build_request_body(
@@ -3798,7 +3826,10 @@ mod tests {
                         id: "t1".to_string(),
                         name: "file_read".to_string(),
                         input: serde_json::json!({"path": "/tmp/x"}),
+                        unparsed: None,
+                        provider_fields: None,
                     }],
+                    provider_fields: None,
                 },
                 Message {
                     role: Role::User,
@@ -3810,6 +3841,7 @@ mod tests {
                         is_error: false,
                         display: None,
                     }],
+                    provider_fields: None,
                 },
                 Message::assistant_text("Here's the file."),
                 Message::user("thanks"),
@@ -3968,13 +4000,17 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "Let me read that file.".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "toolu_1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         }];
         let body = provider.build_request_body(
             "system",
@@ -4070,7 +4106,10 @@ mod tests {
                     id: format!("toolu_{i}"),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": format!("/tmp/file{}", i)}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             });
             messages.push(Message {
                 role: Role::User,
@@ -4082,6 +4121,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             });
         }
 
@@ -4125,7 +4165,10 @@ mod tests {
                     id: "t1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -4137,6 +4180,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
         let body = provider.build_request_body(

@@ -46,6 +46,7 @@ struct ContextCompacted {
 pub(crate) enum SseEventType {
     AssistantTextDelta,
     ThinkingDelta,
+    ThinkingRedacted,
     ToolCallComposing,
     ToolCallExecuting,
     ToolCallCompleted,
@@ -104,6 +105,7 @@ impl SseEventType {
         match self {
             Self::AssistantTextDelta => "assistant_text.delta",
             Self::ThinkingDelta => "thinking.delta",
+            Self::ThinkingRedacted => "thinking.redacted",
             Self::ToolCallComposing => "tool_call.composing",
             Self::ToolCallExecuting => "tool_call.executing",
             Self::ToolCallCompleted => "tool_call.completed",
@@ -246,6 +248,9 @@ pub(crate) fn translate(
         }
         // The level is a fact of the turn, which its record carries.
         FrontendEvent::TurnOpened { .. } => return None,
+        // A client mirrors the conversation, where an empty reply holds nothing to send; the
+        // turn's terminal carries its stop, and the history every reply's record.
+        FrontendEvent::NoAnswer | FrontendEvent::ReplyStopped { .. } => return None,
         // A dropped call is settled by the turn's terminal, as one the turn's last round left is,
         // and a compaction's checkpoint is the record `GET /history` carries.
         FrontendEvent::ToolCallDropped { .. } | FrontendEvent::CheckpointCallCompleted { .. } => {
@@ -316,6 +321,13 @@ pub(crate) fn translate(
                 serde_json::json!({ "text": text }),
             )
         }
+        // Typed as the history types the block, so a client tells it from reasoning it can read.
+        FrontendEvent::RedactedThinking => {
+            if !capabilities.supports_reasoning_stream {
+                return None;
+            }
+            (SseEventType::ThinkingRedacted, serde_json::json!({}))
+        }
         FrontendEvent::ThinkingBlock { .. } => {
             // Not forwarded. The deltas above already carried this text, and the agent emits them
             // for every block that has any -- including the ones a non-streaming provider hands
@@ -336,12 +348,16 @@ pub(crate) fn translate(
             name,
             input,
             display_summary,
+            unparsed,
         } => {
             let mut data = serde_json::Map::from_iter([
                 ("id".into(), serde_json::json!(id)),
                 ("name".into(), serde_json::json!(name)),
                 ("input".into(), serde_json::json!(input)),
             ]);
+            if let Some(unparsed) = unparsed {
+                data.insert("unparsed".into(), serde_json::json!(unparsed));
+            }
             // Omitted, not `null`, when the tool has no label: the rule every optional field on
             // this API follows, and `json!` would write the `None` out.
             if let Some(display_summary) = display_summary {
@@ -367,7 +383,7 @@ pub(crate) fn translate(
                 ("is_error".into(), serde_json::json!(is_error)),
                 (
                     "content".into(),
-                    serde_json::json!(tool_result_content_view(&content)),
+                    serde_json::json!(super::handlers::messages::tool_result_views(&content)),
                 ),
             ]);
             // Omitted, not `null`, for a call that changed nothing, like every optional field.
@@ -474,27 +490,6 @@ pub(crate) fn translate(
     Some(pair)
 }
 
-fn tool_result_content_view(
-    content: &[crate::conversation::ToolResultContent],
-) -> Vec<TextOrImage> {
-    content
-        .iter()
-        .map(|item| match item {
-            crate::conversation::ToolResultContent::Text { text } => {
-                TextOrImage::Text { text: text.clone() }
-            }
-            crate::conversation::ToolResultContent::Image { source } => TextOrImage::Image {
-                media_type: source.media_type().to_string(),
-            },
-            crate::conversation::ToolResultContent::ToolReference { tool_name } => {
-                TextOrImage::ToolReference {
-                    tool_name: tool_name.clone(),
-                }
-            }
-        })
-        .collect()
-}
-
 /// The `tool_call.progress` event's payload. The two optional fields are omitted rather than
 /// `null`, like every optional field on this API.
 #[derive(Debug, Serialize)]
@@ -532,24 +527,31 @@ struct ChangeView {
     new: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum TextOrImage {
-    Text {
-        text: String,
-    },
-    Image {
-        media_type: String,
-    },
-    /// A deferred tool the result made callable, by name.
-    ToolReference {
-        tool_name: String,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reasoning the provider withheld reaches the feed as an event of its own, as the history
+    /// types the block, and only for a client that asked for reasoning.
+    #[test]
+    fn withheld_reasoning_is_its_own_event() {
+        let capabilities = SessionCapabilities {
+            supports_reasoning_stream: true,
+            ..SessionCapabilities::default()
+        };
+        let Some((kind, data)) = translate(FrontendEvent::RedactedThinking, capabilities) else {
+            panic!("a client that asked for reasoning hears of it");
+        };
+        assert_eq!(kind.as_str(), "thinking.redacted");
+        assert_eq!(data, serde_json::json!({}));
+        assert!(
+            translate(
+                FrontendEvent::RedactedThinking,
+                SessionCapabilities::default()
+            )
+            .is_none()
+        );
+    }
 
     /// The opening is one shape on this API, the one `GET /history` reads back, and an image
     /// attached to it is named by the hash the store files its bytes under, though the message in
@@ -562,6 +564,7 @@ mod tests {
             "[Context]",
             vec![crate::conversation::ContentBlock::Text {
                 text: "look".into(),
+                provider_fields: None,
             }],
             vec![crate::image::ImageSource::Base64 {
                 media_type: "image/png".into(),
@@ -621,6 +624,7 @@ mod tests {
                     kept_recent: false,
                     written_summary: String::new(),
                     checkpoint: Vec::new(),
+                    summarizer: Vec::new(),
                 },
                 generation: 2,
             },
@@ -716,6 +720,7 @@ mod tests {
             name: "file_read".into(),
             input: serde_json::json!({"path": "/etc/hosts"}),
             display_summary: Some("/etc/hosts".into()),
+            unparsed: None,
         };
         let (event_type, data) =
             translate(event, SessionCapabilities::default()).expect("translates");
@@ -733,6 +738,7 @@ mod tests {
             name: "checklist_add".into(),
             input: serde_json::json!({}),
             display_summary: None,
+            unparsed: None,
         };
         let (_, data) = translate(event, SessionCapabilities::default()).expect("translates");
         assert!(

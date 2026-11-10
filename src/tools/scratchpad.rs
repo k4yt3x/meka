@@ -34,7 +34,10 @@ const PREVIEW_BYTES: usize = 2_000;
 fn build_tool_use_map(assistant_message: &Message) -> HashMap<String, (String, serde_json::Value)> {
     let mut map = HashMap::new();
     for block in &assistant_message.content {
-        if let ContentBlock::ToolUse { id, name, input } = block {
+        if let ContentBlock::ToolUse {
+            id, name, input, ..
+        } = block
+        {
             map.insert(id.clone(), (name.clone(), input.clone()));
         }
     }
@@ -49,40 +52,15 @@ pub(crate) fn build_scratchpad_reference(name: &str, size: usize) -> String {
     )
 }
 
-fn build_large_output_preview(name: &str, text: &str) -> String {
-    let size = text.len();
-    let preview_end = text.floor_char_boundary(PREVIEW_BYTES.min(size));
-    let preview = &text[..preview_end];
-    let has_more = preview_end < size;
-
-    let mut replacement = format!(
-        "<large-output name=\"{}\" size=\"{}\">\n\
-         Output too large ({}). Read it with `scratchpad_read`: a read returns as much as fits \
-         in the context window and says where to continue; `start` and `end` name a line \
-         range.\n\n\
-         Preview (first {} bytes):\n\
-         {}",
-        name,
-        size,
-        format_size(size),
-        preview_end,
-        preview,
-    );
-    if has_more {
-        replacement.push_str("\n...");
+/// What a result too large to keep inline becomes once its text is saved under `scratchpad_entry`:
+/// the entry, the size and the opening, which every wire renders as a reference to read it by.
+fn large_output(scratchpad_entry: String, text: &str) -> ToolResultContent {
+    let preview_end = text.floor_char_boundary(PREVIEW_BYTES.min(text.len()));
+    ToolResultContent::LargeOutput {
+        scratchpad_entry,
+        size_bytes: text.len(),
+        preview: text[..preview_end].to_string(),
     }
-    replacement.push_str("\n</large-output>");
-    replacement
-}
-
-/// The opening a `<large-output>` reference [`build_large_output_preview`] wrote in place of a
-/// result shows of the output, when `text` is one: what a screen shows of the result, without the
-/// directions written for the model or the marker that says the opening stops short.
-pub(crate) fn large_output_preview(text: &str) -> Option<&str> {
-    let rest = text.strip_prefix("<large-output name=\"")?;
-    let body = rest.strip_suffix("\n</large-output>")?;
-    let (_, preview) = body.split_once(" bytes):\n")?;
-    Some(preview.strip_suffix("\n...").unwrap_or(preview))
 }
 
 /// Save tool results to the scratchpad when the agent explicitly requested it via the `scratchpad`
@@ -141,7 +119,10 @@ pub(crate) async fn save_explicit_scratchpad_results(
                     store
                         .save_scratchpad_entry(session_id, &name, &text)
                         .await?;
-                    *content = vec![ToolResultContent::Text { text: reference }];
+                    let notes = notes_of(content);
+                    *content = std::iter::once(ToolResultContent::Text { text: reference })
+                        .chain(notes)
+                        .collect();
                 }
             }
         }
@@ -164,13 +145,20 @@ pub(crate) enum Redirect {
 }
 
 /// The [`Redirect`] for output `content` asked to go under `name`, or `None` when it says
-/// nothing to save. `inherited_names` are the entries a parent lent this session read-only.
+/// nothing to save. What goes to the entry is the tool's output; a note Meka wrote about the call
+/// is not output, and stays with the call (see [`notes_of`]). `inherited_names` are the entries a
+/// parent lent this session read-only.
 pub(crate) fn redirect(
     inherited_names: &[String],
     name: &str,
     content: &[ToolResultContent],
 ) -> Option<Redirect> {
-    let text = ContentBlock::tool_result_text_content(content);
+    let output: Vec<ToolResultContent> = content
+        .iter()
+        .filter(|item| !matches!(item, ToolResultContent::HarnessNote { .. }))
+        .cloned()
+        .collect();
+    let text = ContentBlock::tool_result_text_content(&output);
     if text.is_empty() {
         return None;
     }
@@ -185,6 +173,16 @@ pub(crate) fn redirect(
         reference: build_scratchpad_reference(name, text.len()),
         text,
     })
+}
+
+/// The notes Meka wrote in `content` about the call, which stay with it when its output goes to an
+/// entry.
+pub(crate) fn notes_of(content: &[ToolResultContent]) -> Vec<ToolResultContent> {
+    content
+        .iter()
+        .filter(|item| matches!(item, ToolResultContent::HarnessNote { .. }))
+        .cloned()
+        .collect()
 }
 
 /// Save `text` whole under a fresh entry named after `wanted`, for a result over its bound: the
@@ -297,7 +295,7 @@ pub(crate) async fn persist_oversized_results(
                     let wanted =
                         format!("{}_{}_{}", base_name, short_call_id(tool_use_id), counter);
                     let name = spill(store, session_id, text, wanted).await?;
-                    *text = build_large_output_preview(&name, text);
+                    *item = large_output(name, text);
                 }
             }
         }
@@ -1492,19 +1490,32 @@ mod tests {
     use super::*;
     use crate::conversation::{ContentBlock, Role};
 
-    /// A screen reads back the opening the spill wrote of an output, without the marker that
-    /// says the opening stops short of the whole.
+    /// A spilled output keeps its entry, its size and its opening as fields, and reads as the
+    /// reference the model follows, with `...` only where the opening stops short of the whole.
     #[test]
-    fn a_large_output_reference_reads_back_its_opening() {
+    fn a_large_output_keeps_its_opening_and_reads_as_a_reference() {
         let output = format!("{}\nlast line\n", "x".repeat(PREVIEW_BYTES));
-        let written = build_large_output_preview("shell_execute_abc_1", &output);
-        assert_eq!(
-            large_output_preview(&written),
-            Some(&output[..PREVIEW_BYTES])
+        let spilled = large_output("shell_execute_abc_1".to_string(), &output);
+        let ToolResultContent::LargeOutput {
+            scratchpad_entry,
+            size_bytes,
+            preview,
+        } = &spilled
+        else {
+            panic!("a large output, got {spilled:?}");
+        };
+        assert_eq!(scratchpad_entry, "shell_execute_abc_1");
+        assert_eq!(*size_bytes, output.len());
+        assert_eq!(preview, &output[..PREVIEW_BYTES]);
+        let rendered = ContentBlock::tool_result_text_content(std::slice::from_ref(&spilled));
+        assert!(
+            rendered.starts_with("<large-output name=\"shell_execute_abc_1\"")
+                && rendered.ends_with("\n...\n</large-output>"),
+            "{rendered}"
         );
-        let short = build_large_output_preview("entry", "whole");
-        assert_eq!(large_output_preview(&short), Some("whole"));
-        assert_eq!(large_output_preview("plain output"), None);
+        let whole = large_output("entry".to_string(), "whole");
+        let rendered = ContentBlock::tool_result_text_content(std::slice::from_ref(&whole));
+        assert!(rendered.ends_with("whole\n</large-output>"), "{rendered}");
     }
 
     fn session_id_for_test(uuid: Uuid) -> crate::session::SharedSessionId {
@@ -1520,8 +1531,11 @@ mod tests {
                     id: id.to_string(),
                     name: name.to_string(),
                     input,
+                    unparsed: None,
+                    provider_fields: None,
                 })
                 .collect(),
+            provider_fields: None,
         }
     }
 
@@ -2094,11 +2108,17 @@ mod tests {
             serde_json::json!({"command": "echo hi", "scratchpad": "cmd_output"}),
         )]);
 
+        let note = ToolResultContent::HarnessNote {
+            note: "Called without loading its schema.".to_string(),
+        };
         let mut results = vec![ContentBlock::ToolResult {
             tool_use_id: "call-1".to_string(),
-            content: vec![ToolResultContent::Text {
-                text: "hi\n".to_string(),
-            }],
+            content: vec![
+                ToolResultContent::Text {
+                    text: "hi\n".to_string(),
+                },
+                note.clone(),
+            ],
             is_error: false,
             display: None,
         }];
@@ -2114,13 +2134,15 @@ mod tests {
         .await
         .expect("save");
 
-        // Result should be replaced with a reference
-        if let ContentBlock::ToolResult { content, .. } = &results[0] {
-            let text = ContentBlock::tool_result_text_content(content);
-            assert!(text.contains("cmd_output"));
-            assert!(text.contains("scratchpad_read"));
-            assert!(!text.contains("hi\n"));
-        }
+        // The output is replaced with a reference, and the note about the call stays with it.
+        let ContentBlock::ToolResult { content, .. } = &results[0] else {
+            panic!("a result: {results:?}");
+        };
+        let text = ContentBlock::tool_result_text_content(&content[..1]);
+        assert!(text.contains("cmd_output"));
+        assert!(text.contains("scratchpad_read"));
+        assert!(!text.contains("hi\n"));
+        assert_eq!(content[1..], [note]);
 
         // Content should be in the DB
         let loaded = manager

@@ -94,8 +94,8 @@ pub(crate) struct HttpFrontend {
 #[serde(default)]
 pub(crate) struct SessionCapabilities {
     /// When `true`, the SSE stream includes `thinking.delta` events for extended-thinking
-    /// content. Default `false` so chat-transcript clients (Telegram bridges, etc.) don't
-    /// surface reasoning text inline.
+    /// content and `thinking.redacted` for a block the provider withheld. Default `false` so
+    /// chat-transcript clients (Telegram bridges, etc.) don't surface reasoning inline.
     pub(crate) supports_reasoning_stream: bool,
     /// When `false`, a mid-turn permission request is denied immediately with a notice instead of
     /// parking on the SSE channel for [`APPROVAL_TIMEOUT`].
@@ -840,9 +840,9 @@ impl HttpFrontend {
     /// broadcast.
     fn event_passes_capability_filter(&self, event: &FrontendEvent) -> bool {
         match event {
-            FrontendEvent::ThinkingDelta(_) | FrontendEvent::ThinkingBlock { .. } => {
-                self.capabilities.supports_reasoning_stream
-            }
+            FrontendEvent::ThinkingDelta(_)
+            | FrontendEvent::ThinkingBlock { .. }
+            | FrontendEvent::RedactedThinking => self.capabilities.supports_reasoning_stream,
             _ => true,
         }
     }
@@ -1397,7 +1397,11 @@ pub(crate) fn subagent_terminal(
         TurnStatus::Succeeded => {
             data.insert(
                 "stop_reason".into(),
-                serde_json::Value::from(ending.stop_reason.clone()),
+                serde_json::Value::from(
+                    ending
+                        .stop_reason
+                        .map(crate::conversation::StopReason::name),
+                ),
             );
             data.insert(
                 "usage".into(),
@@ -1732,6 +1736,7 @@ mod tests {
             name: name.into(),
             input: serde_json::Value::Null,
             display_summary: None,
+            unparsed: None,
         };
         let output = |id: &str, chunk: &str| FrontendEvent::ToolCallOutputDelta {
             id: id.into(),
@@ -1948,7 +1953,7 @@ mod tests {
             .emit(FrontendEvent::TurnEnded {
                 turn_id,
                 ending: crate::store::turns::TurnEnding::succeeded(
-                    "end_turn",
+                    crate::conversation::StopReason::EndTurn,
                     crate::store::turns::TurnUsage::default(),
                 ),
             })
@@ -1977,7 +1982,10 @@ mod tests {
         let opening = || FrontendEvent::MessageAppended {
             message: crate::conversation::Message::turn_opening(
                 "[Context]",
-                vec![crate::conversation::ContentBlock::Text { text: "hi".into() }],
+                vec![crate::conversation::ContentBlock::Text {
+                    text: "hi".into(),
+                    provider_fields: None,
+                }],
                 Vec::new(),
             ),
             outcomes: Vec::new(),
@@ -2163,6 +2171,7 @@ mod tests {
             name: "shell_execute".into(),
             input: serde_json::Value::Null,
             display_summary: None,
+            unparsed: None,
         });
         frontend.push_event(output("one\n"));
         // Inside the coalescing interval: buffered, not sent.

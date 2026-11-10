@@ -995,11 +995,7 @@ fn worker_report(
                 true,
             ));
         }
-        Ok(crate::agent::TurnOutcome::EndTurn) => None,
-        Ok(crate::agent::TurnOutcome::MaxTokens) => {
-            Some("It stopped at its output limit, so this may be cut short.\n")
-        }
-        Ok(crate::agent::TurnOutcome::Refusal(_)) => Some("It refused the task.\n"),
+        Ok(outcome) => stop_line(outcome.stop_reason),
     };
     let report = messages
         .last_assistant_text()
@@ -1013,6 +1009,25 @@ fn worker_report(
         )
     };
     Ok(ToolOutput::text(output, false))
+}
+
+/// The line a report opens with when the sub-agent's last reply did not end as an answer.
+fn stop_line(stop_reason: crate::conversation::StopReason) -> Option<&'static str> {
+    use crate::conversation::StopReason;
+    match stop_reason {
+        StopReason::EndTurn | StopReason::ToolUse => None,
+        StopReason::MaxTokens => {
+            Some("It stopped at its output limit, so this may be cut short.\n")
+        }
+        StopReason::ContextWindow => {
+            Some("It stopped at its context window, so this may be cut short.\n")
+        }
+        StopReason::Refusal => Some("It refused the task.\n"),
+        StopReason::ContentFilter => {
+            Some("A content filter stopped it, so this may be cut short.\n")
+        }
+        StopReason::Unknown => Some("It stopped for a reason Meka does not recognize.\n"),
+    }
 }
 
 /// Register `agent_spawn` and the three lifecycle tools that operate on what it produced.
@@ -2537,6 +2552,7 @@ fn compose_subagent_task(
         )),
         (Some(prompt), None) => Some(crate::conversation::ContentBlock::Text {
             text: prompt.to_string(),
+            provider_fields: None,
         }),
         (None, None) => None,
     }
@@ -2627,7 +2643,8 @@ mod tests {
         assert_eq!(
             compose_subagent_task(Some("just a prompt"), None),
             Some(ContentBlock::Text {
-                text: "just a prompt".to_string()
+                text: "just a prompt".to_string(),
+                provider_fields: None,
             }),
         );
         assert_eq!(
@@ -3698,7 +3715,9 @@ mod tests {
         let cut = worker_report(
             id,
             "Permission: read",
-            Ok(crate::agent::TurnOutcome::MaxTokens),
+            Ok(crate::agent::TurnOutcome::of(
+                crate::conversation::StopReason::MaxTokens,
+            )),
             &messages,
             false,
         )
@@ -3832,7 +3851,7 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|block| match block {
-                crate::conversation::ContentBlock::Text { text }
+                crate::conversation::ContentBlock::Text { text, .. }
                 | crate::conversation::ContentBlock::TurnContext { text } => Some(text.as_str()),
                 _ => None,
             })
@@ -5263,6 +5282,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
         let steered = Event::Append(Message {
             role: Role::User,
@@ -5277,8 +5297,10 @@ mod tests {
                 },
                 ContentBlock::Text {
                     text: "and hurry".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         });
         let turn = uuid::Uuid::new_v4();
         store
@@ -5297,11 +5319,14 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "the one and only task".to_string(),
+                    provider_fields: None,
                 },
                 ContentBlock::Text {
                     text: "and one thing more".to_string(),
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         });
         for event in [
             Event::Append(Message::user("the one and only task")),
@@ -5524,7 +5549,7 @@ mod tests {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        crate::conversation::ContentBlock::Text { text }
+                        crate::conversation::ContentBlock::Text { text, .. }
                         | crate::conversation::ContentBlock::Inbox { text, .. } => {
                             Some(text.clone())
                         }

@@ -682,7 +682,7 @@ fn acp_first_turn_emits_session_info_update_title() {
     );
 }
 
-/// A provider advisory reaches the editor as an assistant-message chunk prefixed `[meka]`.
+/// A provider advisory reaches the editor as an assistant-message chunk prefixed `[Meka]`.
 ///
 /// A client that did not advertise `session.notices` has no other door for an advisory, and the
 /// prefix is the only thing letting it filter or style one. The degrade-and-retry uses it to
@@ -709,7 +709,7 @@ fn acp_forwards_a_provider_notice_as_a_prefixed_assistant_chunk() {
         .filter_map(|value| value["params"]["update"]["content"]["text"].as_str())
         .collect();
     assert!(
-        chunks.contains(&"[meka] context is filling up"),
+        chunks.contains(&"[Meka] context is filling up"),
         "the advisory must reach the client, prefixed: {chunks:?}"
     );
 }
@@ -745,7 +745,7 @@ fn acp_sends_an_advisory_as_a_notice_to_a_client_that_advertises_it() {
         !updates.iter().any(|value| {
             value["params"]["update"]["content"]["text"]
                 .as_str()
-                .is_some_and(|text| text.starts_with("[meka]"))
+                .is_some_and(|text| text.starts_with("[Meka]"))
         }),
         "the notice replaces the chunk rather than doubling it: {updates:?}"
     );
@@ -886,8 +886,8 @@ fn a_loaded_session_says_its_recorded_occupancy_ahead_of_any_turn() {
 /// A turn that reports `tool_use` but carries no tool-call block leaves the agent with nothing to
 /// run and nothing to show. It happens for real: an OpenAI-compatible endpoint that coalesces its
 /// final delta into the `finish_reason` chunk can have that delta dropped, so the tool call
-/// vanishes and only the stop reason survives. The client must still get a visible message and a
-/// terminal stop reason rather than a silent turn it waits on forever.
+/// vanishes and only the stop reason survives. The client gets a terminal stop reason rather than
+/// a silent turn it waits on forever, and no words Meka would put in the model's mouth.
 #[test]
 fn acp_turn_with_tool_use_stop_but_no_tool_call_still_reports_to_the_client() {
     let script = serde_json::json!([[
@@ -898,18 +898,11 @@ fn acp_turn_with_tool_use_stop_but_no_tool_call_still_reports_to_the_client() {
     let id = harness.prompt(&session_id, "search the web");
     let (updates, response) = harness.collect_updates(&session_id, id);
 
-    let chunk = updates
-        .iter()
-        .find(|value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
-        .unwrap_or_else(|| {
-            panic!("expected an agent_message_chunk standing in for the empty turn; updates: {updates:?}")
-        });
-    let text = chunk["params"]["update"]["content"]["text"]
-        .as_str()
-        .unwrap_or_default();
     assert!(
-        text.contains("empty response"),
-        "the stand-in notice must reach the client verbatim; got {text:?}"
+        !updates
+            .iter()
+            .any(|value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk"),
+        "an empty reply has no words to relay; updates: {updates:?}"
     );
 
     // No tool call was made, so the turn ends normally. A client that saw `tool_use` with no
@@ -3179,10 +3172,11 @@ model = "claude-sonnet-4-5"
     );
 }
 
-/// Regression: a turn interrupted mid-stream must persist the partial assistant text so it survives
-/// resume. Previously the partial was appended only in memory and discarded on exit, so resume
-/// showed only the user prompt. Round 1 streams a partial answer then stalls in a `sleep`; the test
-/// fires `session/cancel` once the partial has streamed. Round 2 loads the session and asserts the
+/// A turn interrupted mid-stream persists the partial assistant text so it survives a resume, and
+/// the replay says of the cut reply what the live run sent: its words, and neither the thought
+/// nor the call the stream had not finished, which an editor only ever gets whole. Round 1 streams
+/// a partial answer, opens a thought and a call, then stalls in a `sleep`; the test fires
+/// `session/cancel` once the partial has streamed. Round 2 loads the session and asserts the
 /// replay carries the partial answer (and not the post-interrupt text, which never streamed).
 #[test]
 fn acp_interrupted_turn_persists_partial_assistant_text() {
@@ -3204,6 +3198,8 @@ model = "claude-sonnet-4-5"
     let script = serde_json::json!([
         [
             { "type": "text", "text": "partial answer before interrupt" },
+            { "type": "thinking_delta", "text": "UNFINISHED-THOUGHT" },
+            { "type": "tool_use_start", "id": "call-open", "name": "file_write" },
             { "type": "sleep", "ms": 5000 },
             { "type": "text", "text": "TEXT-AFTER-INTERRUPT-MUST-NOT-PERSIST" },
             { "type": "message_end", "stop_reason": "end_turn" }
@@ -3362,6 +3358,10 @@ model = "claude-sonnet-4-5"
     assert!(
         !replay.contains("TEXT-AFTER-INTERRUPT-MUST-NOT-PERSIST"),
         "post-interrupt text must not be persisted; stream:\n{replay}",
+    );
+    assert!(
+        !replay.contains("UNFINISHED-THOUGHT") && !replay.contains("file_write"),
+        "the replay sends nothing the live run did not; stream:\n{replay}",
     );
 }
 
@@ -5754,11 +5754,10 @@ fn acp_session_prompt_refusal_stop_reason() {
 }
 
 /// An *empty* refusal: Claude streams `stop_reason: "refusal"` with no body (as fable-5 does after
-/// a search surfaces disallowed content). Meka must still surface a visible stand-in message
-/// instead of a blank turn. Regression for session fad3ed41, where the turn rendered nothing and
-/// persisted an empty `[]` assistant message.
+/// a search surfaces disallowed content). The turn stops as a refusal, and nothing streams as the
+/// model's words, since the model wrote none.
 #[test]
-fn acp_empty_refusal_surfaces_standin_message() {
+fn acp_empty_refusal_stops_as_a_refusal_and_streams_no_words() {
     let script = serde_json::json!([[
         { "type": "message_end", "stop_reason": "refusal" }
     ]]);
@@ -5770,10 +5769,11 @@ fn acp_empty_refusal_surfaces_standin_message() {
         response["result"]["stopReason"], "refusal",
         "empty refusal must still surface as ACP `refusal`: {response}",
     );
-    let dump = format!("{updates:?}");
     assert!(
-        dump.contains("declined to respond"),
-        "empty refusal must surface a stand-in agent_message_chunk; updates: {dump}",
+        !updates
+            .iter()
+            .any(|value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk"),
+        "an empty refusal has no words to relay; updates: {updates:?}",
     );
 }
 
@@ -6447,7 +6447,7 @@ fn acp_scheduled_job_fires_without_a_prompt() {
 
 /// A scheduled turn has no `session/prompt` response to carry its outcome, so when it fails the
 /// editor would otherwise show the job's prompt and nothing under it. The failure is said as a
-/// `[meka warn]` chunk, the way the screen shows it and `meka serve` posts a `failed` webhook.
+/// `[Meka warn]` chunk, the way the screen shows it and `meka serve` posts a `failed` webhook.
 #[test]
 fn acp_reports_a_failed_scheduled_turn_as_a_warn_notice() {
     let script = serde_json::json!([
@@ -6492,7 +6492,7 @@ fn acp_reports_a_failed_scheduled_turn_as_a_warn_notice() {
                 .filter_map(|update| update["content"]["text"].as_str())
                 .map(str::to_string),
         );
-        if chunks.iter().any(|chunk| chunk.starts_with("[meka warn]")) {
+        if chunks.iter().any(|chunk| chunk.starts_with("[Meka warn]")) {
             break;
         }
         assert!(
@@ -6503,7 +6503,7 @@ fn acp_reports_a_failed_scheduled_turn_as_a_warn_notice() {
     }
     let notice = chunks
         .iter()
-        .find(|chunk| chunk.starts_with("[meka warn]"))
+        .find(|chunk| chunk.starts_with("[Meka warn]"))
         .expect("checked by the loop");
     assert!(
         notice.contains("Scheduled job") && notice.contains("failed"),
@@ -6560,7 +6560,7 @@ fn acp_withholds_a_failed_fires_upstream_text_when_relaying_is_off() {
                 .filter_map(|update| update["content"]["text"].as_str())
                 .map(str::to_string),
         );
-        if chunks.iter().any(|chunk| chunk.starts_with("[meka warn]")) {
+        if chunks.iter().any(|chunk| chunk.starts_with("[Meka warn]")) {
             break;
         }
         assert!(
@@ -6571,7 +6571,7 @@ fn acp_withholds_a_failed_fires_upstream_text_when_relaying_is_off() {
     }
     let notice = chunks
         .iter()
-        .find(|chunk| chunk.starts_with("[meka warn]"))
+        .find(|chunk| chunk.starts_with("[Meka warn]"))
         .expect("checked by the loop");
     assert!(
         notice.contains("Scheduled job") && notice.contains("failed"),
@@ -6646,7 +6646,7 @@ fn a_client_without_the_compaction_entry_sees_a_compaction_as_a_card() {
             value["params"]["update"]["sessionUpdate"] == "compaction_update"
                 || value["params"]["update"]["content"]["text"]
                     .as_str()
-                    .is_some_and(|text| text.starts_with("[meka]"))
+                    .is_some_and(|text| text.starts_with("[Meka]"))
         }),
         "a client that did not advertise the entry is never sent one, and the card is all it is \
          told: {updates:?}"

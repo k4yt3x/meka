@@ -47,21 +47,22 @@ fn compute_fingerprint(message_text: &str, version: &str) -> String {
 }
 
 /// The text of the first user message as the model read it, past Meka's context block: the words
-/// as typed, or the inbox item, scheduled fire or background report Meka relayed in their place.
-/// A session opened on an item or a fire has no typed words, and the fingerprint has to hold
-/// still across its turns, so the relayed block counts as the words do.
+/// as typed, the inbox item, scheduled fire or background report Meka relayed in their place, or
+/// after a compaction the summary that stands first. A session opened on an item or a fire has no
+/// typed words, and the fingerprint has to hold still across its turns, so the relayed block
+/// counts as the words do.
 fn extract_first_user_message_text(messages: &[Message]) -> String {
     for message in messages {
         if message.role == Role::User {
             for block in &message.content {
-                if let ContentBlock::Text { text }
-                | ContentBlock::Inbox { text, .. }
-                | ContentBlock::Scheduled { text, .. }
-                | ContentBlock::BackgroundReport { text, .. }
-                | ContentBlock::Invocation { text, .. }
-                | ContentBlock::Resource { text, .. } = block
-                {
-                    return text.clone();
+                if matches!(
+                    block,
+                    ContentBlock::TurnContext { .. } | ContentBlock::Nudge { .. }
+                ) {
+                    continue;
+                }
+                if let Some(text) = block.model_text() {
+                    return text.into_owned();
                 }
             }
         }
@@ -683,7 +684,9 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text {
                     text: "assistant text".to_string(),
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message::user("user text"),
         ];
@@ -712,6 +715,7 @@ mod tests {
                         text: "[Message from a client, arrived now]\nhello".to_string(),
                     },
                 ],
+                provider_fields: None,
             },
             Message::user("typed later"),
         ];
@@ -765,6 +769,23 @@ mod tests {
         assert_ne!(fp_a, fp_b);
     }
 
+    /// After a compaction the first user message is the summary, which the fingerprint reads as
+    /// the model reads it.
+    #[test]
+    fn the_fingerprint_reads_a_compaction_s_summary() {
+        let summary = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Summary {
+                text: "[Conversation summary from session compaction]\n\nwhat came".to_string(),
+            }],
+            provider_fields: None,
+        };
+        assert_eq!(
+            extract_first_user_message_text(&[summary]),
+            "[Conversation summary from session compaction]\n\nwhat came"
+        );
+    }
+
     #[test]
     fn extract_first_user_message_text_no_text_block() {
         use crate::conversation::ToolResultContent;
@@ -778,6 +799,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         }];
         assert_eq!(extract_first_user_message_text(&messages), "");
     }

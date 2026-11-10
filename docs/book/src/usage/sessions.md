@@ -59,10 +59,9 @@ When a prefix matches multiple sessions, Meka prints the matching ids (most-rece
 A session records what it runs on, and a resume brings all of it back:
 
 - **The profile.** A session started with `--profile openai` resumes on `openai`, whatever
-  `default_profile` says. This matters beyond the surprise: a thinking block is tagged with the
-  backend that produced it and is not replayed to a different one, so resuming on another profile
-  could silently discard the reasoning the conversation recorded, and a different account would be
-  billed.
+  `default_profile` says. This matters beyond the surprise: another profile may not carry the
+  reasoning the conversation recorded ([what a switch carries](#what-a-profile-switch-carries)),
+  and a different account would be billed.
 - **The permission level, and the approvals switch.** A session created at `unrestricted` resumes there without the flag, and one that had `/approvals on` comes back asking.
 
 Everything the profile and its account state comes with it: the model, the endpoint, the context
@@ -83,8 +82,27 @@ That `PATCH` is also how you rescue a session over HTTP when its profile has lef
 body naming only a profile moves the row without building an agent for it, so it works on a session
 that cannot currently run. From the CLI the equivalent is `meka -r <id> --profile <name>`.
 
-Switching profile mid-conversation is allowed and is your call. From the next turn the model no
-longer sees the reasoning recorded under the old profile, for the reason above.
+Switching profile mid-conversation is allowed and is your call.
+
+### What a profile switch carries
+
+From the next turn, each request carries everything the conversation holds that its protocol has a
+place for, whichever profile produced it:
+
+- Text, tool calls and their results go to every backend.
+- Reasoning returned in the clear, DeepSeek's `reasoning_content`, Claude's thinking and a Responses
+  summary alike, goes back to any Chat Completions endpoint as `reasoning_content`.
+- Claude's thinking goes back over Claude's protocol, the subscription's and the API's alike, with
+  its signature.
+- Reasoning a Responses endpoint sealed goes back to that endpoint alone, since no other can open
+  it.
+- What a protocol has no place for is not sent there: a Claude signature or sealed reasoning on Chat
+  Completions, sealed reasoning on Claude. The history keeps it, and a switch back sends it again.
+
+An endpoint that refuses something the conversation carries fails the turn with its own error.
+Compact the session, [rewind](#rewinding-a-session) past what it refuses, or start a new one. One
+refusal Meka answers itself: when Claude rejects a thinking block's signature, it sends the
+conversation again without its thinking.
 
 ### What a resume does not restore
 
@@ -160,10 +178,9 @@ nothing. When the whole chain refuses, the turn fails on the last profile tried 
 error. A compaction's checkpoint and summarizer fall back the same way, and a compaction run between
 turns puts the named profile back when it ends.
 
-A fallback crosses backends when the profiles do. A thinking block is tagged with the backend that
-produced it and is not replayed to a different one, so from the switch the model no longer sees the
-reasoning recorded under the earlier profile, which is the same loss a `PATCH` to another profile
-takes.
+A fallback crosses backends when the profiles do, and carries what a switch to its profile would
+([what a switch carries](#what-a-profile-switch-carries)): reasoning its protocol has no place for
+is not sent while it serves.
 
 A fallback must be able to carry what the session holds: the same `vision`, and a window and a
 request cap no smaller ([`fallbacks`](../configuration/config-file.md#fallbacks)). While a fallback
@@ -249,9 +266,11 @@ process's PID and lock a session forever.
 |--------|------|-------------|
 | `id` | INTEGER | Auto-incrementing primary key |
 | `session_id` | TEXT (UUID) | Foreign key to `sessions.id` |
-| `kind` | TEXT | `user_blocks` (a turn: its `turn_context` and `text` blocks and any images), `user` (a plain text message Meka wrote), `assistant`, `tool_results`, `compact_boundary`, `repair`, `redact`, or `unsign` |
-| `content` | TEXT | Message content (plain text or JSON) |
+| `kind` | TEXT | `user_blocks` (a user message that is not a round's results: a turn's opening with its `turn_context` block, a nudge, a summary), `assistant`, `tool_results`, `compact_boundary`, `compaction_failed`, `repair`, `redact`, or `unsign` |
+| `content` | TEXT | The message's blocks, or the event, as JSON |
 | `created_at` | TEXT (RFC 3339) | When the message was saved |
+| `reply` | TEXT | A reply's record as JSON: how it stopped, the model, the profile and the usage |
+| `provider_fields` | TEXT | What a provider put on the message beyond its blocks, as JSON |
 
 **scratchpad_entries**, one row per entry:
 
@@ -587,7 +606,7 @@ You can export any session as a Markdown file:
 meka session export 550e8400-e29b-41d4-a716-446655440000
 ```
 
-This writes `session-550e8400-e29b-41d4-a716-446655440000.md` in the current directory with the full conversation. User and assistant messages are rendered as Markdown sections, while tool calls and results are wrapped in collapsible `<details>` blocks. The export always covers the **entire** session, including turns that were later hidden from the model by [compaction](interactive-mode.md#compact) (each compaction point is marked with its summary).
+This writes `session-550e8400-e29b-41d4-a716-446655440000.md` in the current directory with the full conversation. User and assistant messages are rendered as Markdown sections, while tool calls and results are wrapped in collapsible `<details>` blocks. A reply that did not end as an answer or a round of calls is marked with how it stopped, `[stop: max_tokens]`, or what cut it short, `[cut: interrupted]`. The export always covers the **entire** session, including turns that were later hidden from the model by [compaction](interactive-mode.md#compact) (each compaction point is marked with its summary, and a compaction that failed or was stopped with what ended it and the memories its checkpoint saved).
 
 To write to a specific file:
 
@@ -609,7 +628,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 22`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 21), which is brought forward as it is read. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 25`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 24), which is brought forward as it is read. A reply's event carries its record as `reply`. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 
@@ -689,7 +708,7 @@ Neither step changes the shape of the conversation: a tool call stays a tool cal
 
 Nothing a repair removes is deleted. The log is append-only (within [turn retention](#turn-retention), when set), so the superseded messages stay on disk and [`meka session export`](#exporting-a-session) renders them above a marker saying what replaced them. Use `--format json` to get a removed attachment back: the markdown export writes each message as a person said it, an invoked skill or prompt as the invocation rather than the body it expanded to and an attached file by its mention, and leaves image blocks out. Only the conversation the model sees is changed.
 
-Whatever is removed is restored untouched if the retry carrying it is refused too. That restore is what bounds the risk, and it bounds it only in that direction: each step spends a fresh retry sequence rather than a single request, and a step whose retry *succeeds* keeps the loss, so the trigger is deliberately narrow. The words you typed are never rewritten by either step, though an image you attached to that prompt is exactly what the first one removes, replacing it with a note. Notes Meka inserts into a conversation are prefixed `[meka harness]`.
+Whatever is removed is restored untouched if the retry carrying it is refused too. That restore is what bounds the risk, and it bounds it only in that direction: each step spends a fresh retry sequence rather than a single request, and a step whose retry *succeeds* keeps the loss, so the trigger is deliberately narrow. The words you typed are never rewritten by either step, though an image you attached to that prompt is exactly what the first one removes, replacing it with a note. Notes Meka inserts into a conversation reach the model behind the label `[Meka harness]`.
 
 Both steps run whether the provider answered `400` or spent every retry on a `5xx`. A gateway in front of a model reports a payload its own decoder choked on as a server error, which is indistinguishable from being overloaded, so Meka honors the retries in full and treats a refusal that outlives them as one the content may explain.
 

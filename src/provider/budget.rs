@@ -51,7 +51,7 @@ pub(super) fn redaction_target(max_request_bytes: usize) -> usize {
     max_request_bytes - headroom
 }
 
-pub(super) use crate::conversation::IMAGE_REDACTION_PLACEHOLDER;
+use crate::conversation::BUDGET_REDACTION_NOTE;
 
 /// The request body as the bytes that go on the wire, which is what the budget measures.
 pub(super) fn serialize_body(body: &serde_json::Value) -> Result<String> {
@@ -70,9 +70,9 @@ pub(super) struct RedactionStats {
 }
 
 /// Walk `messages` oldest-first and replace `ToolResultContent::Image` payloads with
-/// [`IMAGE_REDACTION_PLACEHOLDER`] until at least `bytes_to_drop` base64 bytes have been removed.
-/// The LAST message is never touched: it is the request the model is about to answer, and on the
-/// Claude backends it carries the moving `cache_control` breakpoint, which disturbing would
+/// a note ([`BUDGET_REDACTION_NOTE`]) until at least `bytes_to_drop` base64 bytes have been
+/// removed. The LAST message is never touched: it is the request the model is about to answer, and
+/// on the Claude backends it carries the moving `cache_control` breakpoint, which disturbing would
 /// invalidate the cache for the new turn unnecessarily.
 ///
 /// Returns `Cow::Borrowed` if no work was needed (`bytes_to_drop == 0`). Otherwise returns
@@ -130,8 +130,8 @@ fn redact_oldest_images_until(
                                 block: block_index,
                                 item: Some(item_index),
                             });
-                            *item = ToolResultContent::Text {
-                                text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                            *item = ToolResultContent::HarnessNote {
+                                note: BUDGET_REDACTION_NOTE.to_string(),
                             };
                             if done(&stats) {
                                 break 'outer;
@@ -139,8 +139,8 @@ fn redact_oldest_images_until(
                         }
                     }
                 }
-                // Input images (ACP @-mentions) count toward the same 32 MiB cap; collapse them to
-                // the placeholder text just like tool-result images.
+                // Input images (ACP @-mentions) count toward the same 32 MiB cap; replace them with
+                // the note just like tool-result images.
                 ContentBlock::Image { source } => {
                     let freed = source.base64_data().map_or(0, str::len);
                     stats.bytes_freed = stats.bytes_freed.saturating_add(freed);
@@ -150,8 +150,8 @@ fn redact_oldest_images_until(
                         block: block_index,
                         item: None,
                     });
-                    *block = ContentBlock::Text {
-                        text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                    *block = ContentBlock::HarnessNote {
+                        note: BUDGET_REDACTION_NOTE.to_string(),
                     };
                     if done(&stats) {
                         break 'outer;
@@ -253,7 +253,9 @@ mod tests {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
+                provider_fields: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -308,11 +310,13 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![image(), image()],
+                provider_fields: None,
             },
             message("between"),
             Message {
                 role: Role::User,
                 content: vec![image()],
+                provider_fields: None,
             },
         ];
         let mut sent = Vec::new();
@@ -323,7 +327,7 @@ mod tests {
         .expect("fits");
         assert_eq!(image_count(&sent), 2, "{sent:?}");
         assert!(
-            matches!(sent[0].content[0], ContentBlock::Text { .. }),
+            matches!(sent[0].content[0], ContentBlock::HarnessNote { .. }),
             "the oldest image goes first: {sent:?}"
         );
         assert!(matches!(sent[2].content[0], ContentBlock::Image { .. }));

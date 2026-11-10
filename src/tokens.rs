@@ -12,7 +12,7 @@
 //! This mirrors Codex's "4 bytes per token" heuristic. It is deliberately approximate; precision is
 //! not needed for a transient interim value.
 
-use crate::conversation::{ContentBlock, Message, ToolResultContent};
+use crate::conversation::{ContentBlock, Message};
 
 /// UTF-8 bytes of text per estimated token.
 const BYTES_PER_TOKEN: u64 = 4;
@@ -107,15 +107,22 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
     let mut total = MESSAGE_OVERHEAD_TOKENS;
     for block in &message.content {
         let block_tokens = match block {
-            ContentBlock::Text { text } => estimate_text(text),
-            // Sent as text, so each costs what text costs.
-            ContentBlock::TurnContext { text }
-            | ContentBlock::Nudge { text, .. }
-            | ContentBlock::Inbox { text, .. }
-            | ContentBlock::Scheduled { text, .. }
-            | ContentBlock::BackgroundReport { text, .. }
-            | ContentBlock::Invocation { text, .. }
-            | ContentBlock::Resource { text, .. } => estimate_text(text),
+            // Sent as text, so each costs what its text costs.
+            ContentBlock::Text { .. }
+            | ContentBlock::TurnContext { .. }
+            | ContentBlock::Nudge { .. }
+            | ContentBlock::HarnessNote { .. }
+            | ContentBlock::Summary { .. }
+            | ContentBlock::Inbox { .. }
+            | ContentBlock::Scheduled { .. }
+            | ContentBlock::BackgroundReport { .. }
+            | ContentBlock::Invocation { .. }
+            | ContentBlock::Resource { .. }
+            | ContentBlock::Refusal { .. } => {
+                block.model_text().map_or(0, |text| estimate_text(&text))
+            }
+            // Never sent.
+            ContentBlock::Unrecognized { .. } => 0,
             ContentBlock::Image { .. } => IMAGE_TOKENS,
             // The readable half only, which is the whole cost under `Signed` and an under-read
             // under `Sealed`: there the text is a summary and the reasoning is the sealed blob
@@ -127,20 +134,30 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
             // callers correct against the provider's reported usage on the next response;
             // `compute_compaction_split` does not, so a reasoning-heavy tail is kept larger than
             // its budget rather than smaller: the safe direction, but not a free one.
-            ContentBlock::Thinking { thinking, .. } => estimate_text(thinking),
+            ContentBlock::Thinking { parts, .. } => parts
+                .iter()
+                .map(|part| estimate_text(&part.text))
+                .fold(0, u64::saturating_add),
             // Same shape, same reasoning: opaque encrypted reasoning whose on-wire token cost isn't
             // derivable from `data` length.
             ContentBlock::RedactedThinking { .. } => 0,
             // Tool-call args are serialized JSON on the wire; count the name plus the compact JSON.
-            ContentBlock::ToolUse { name, input, .. } => {
-                estimate_text(name).saturating_add(estimate_text(&input.to_string()))
-            }
+            ContentBlock::ToolUse {
+                name,
+                input,
+                unparsed,
+                ..
+            } => estimate_text(name).saturating_add(estimate_text(
+                &crate::conversation::call_arguments_text(input, unparsed.as_ref()),
+            )),
             ContentBlock::ToolResult { content, .. } => content
                 .iter()
-                .map(|item| match item {
-                    ToolResultContent::Text { text } => estimate_text(text),
-                    ToolResultContent::Image { .. } => IMAGE_TOKENS,
-                    ToolResultContent::ToolReference { tool_name } => estimate_text(tool_name),
+                .map(|item| match item.wire_part() {
+                    crate::conversation::ResultPart::Text(text) => estimate_text(&text),
+                    crate::conversation::ResultPart::Image(_) => IMAGE_TOKENS,
+                    crate::conversation::ResultPart::ToolReference(tool_name) => {
+                        estimate_text(tool_name)
+                    }
                 })
                 .fold(0u64, u64::saturating_add),
         };
@@ -247,13 +264,17 @@ mod tests {
             content: vec![
                 ContentBlock::Text {
                     text: "abcdefgh".to_string(), // 2
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "1".to_string(),
                     name: "read".to_string(), // 1 (4 bytes -> 1)
                     input: serde_json::json!({"path": "a"}), // compact JSON bytes/4
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let json_tokens = estimate_text(&serde_json::json!({"path": "a"}).to_string());
         let expected = MESSAGE_OVERHEAD_TOKENS + 2 + 1 + json_tokens;
@@ -288,6 +309,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         };
         assert_eq!(
             estimate_message(&message),

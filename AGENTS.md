@@ -39,6 +39,36 @@ only confirm the sites you thought of.
 **A guard sits ahead of every side effect it protects**, not merely ahead of the failure. Refusing
 after a write leaves the write behind.
 
+## Meka's own content is typed
+
+What Meka writes into a conversation, or anywhere a reader will later need to tell it from someone
+else's words, is a block type or a field, rendered to text only at a provider or client boundary.
+Nothing outside the migration module reads meaning back out of text Meka wrote: no prefix check, no
+comparison with a placeholder, no pattern over a tag. A label in rendered text (`[Meka harness]`, an
+inbox header, a summary's headings) is formatting, spelled only by the function that renders it;
+`tests/layering.rs` holds each to its renderer through its `LABELS` ledger. A new label is a new
+ledger entry, never a new reader.
+
+## What a model returns is recorded as returned
+
+What a provider returns is recorded as it returned it, part for part, with how it stopped, the
+model it names, the profile that sent the request and what it spent. Each object it returns maps
+to the element that stands for it (the response to the reply's record, a message to its `Message`,
+a part to its block), which keeps what nothing else holds as `provider_fields`; an object with no
+element is `Unrecognized`. A stream is folded as the protocol's reference client folds it, never
+by a rule of Meka's, and what restates Meka's own request is not the response's. Nothing Meka writes is
+recorded as the model's: a reply with nothing in it is stored with nothing in it. A rewrite of the
+context (a repair, a redaction, an unsign, a compaction's kept tail) never changes the record; it
+is a row of its own over the view. What a surface shows of a reply, how it joins parts or words an
+empty one, is decided where it is drawn. What only a provider can read (sealed reasoning) goes back
+only to the origin that returned it; everything else the context holds goes back on any wire with a
+slot for it, and an endpoint that refuses it is reported, not worked around.
+
+Meka implements each protocol as its spec defines. An endpoint that claims a protocol and deviates
+from it is not accommodated, and a shape the spec does not allow is recorded verbatim, not parsed.
+A vendor's documented extension is supported as users need it. A session that moves between
+protocols drops what the target cannot carry; the record keeps it.
+
 ## Verification
 
 Verification is graded by what it catches, not by how much of it there is.
@@ -80,7 +110,8 @@ A hardcoded fact about an external system expires, and nothing in the build noti
 
 A guess is tolerable when its wrong answer is a *rejected request* and it fails toward omission. A
 guess that fails toward *sending* survives only where the endpoint cannot vary, so never introduce one
-on a backend reachable via a user-supplied `base_url`. A value verified against a captured wire is a
+on a backend reachable via a user-supplied `base_url`. This is about request fields Meka adds; what
+the conversation already holds goes back as the context holds it. A value verified against a captured wire is a
 fact about the protocol rather than a prediction; pin it deliberately and cite the capture. A
 capture pins a fact about the endpoint captured: on a backend whose endpoint varies, the captured
 value is the default of a user-owned key, never a bare pin (`interleaved_thinking` on an

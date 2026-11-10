@@ -144,7 +144,7 @@ async fn resolve_readable_session(
 /// labels the non-text ones so a match is identifiable and skips what holds no words.
 fn searchable_text(message: &Message) -> String {
     message
-        .content
+        .shown_content()
         .iter()
         .filter_map(ContentBlock::search_text)
         .collect::<Vec<_>>()
@@ -154,24 +154,49 @@ fn searchable_text(message: &Message) -> String {
 /// Full, untruncated rendering of a message for `conversation_read`.
 fn render_message_full(message: &Message) -> String {
     let mut segments: Vec<String> = Vec::new();
-    for block in &message.content {
+    for block in message.shown_content().iter() {
         match block {
-            ContentBlock::Text { text } => segments.push(text.clone()),
+            // Labeled when another part comes first, so the words read apart from the reasoning
+            // or call ahead of them.
+            ContentBlock::Text { text, .. } if crate::text::is_blank(text) => {}
+            ContentBlock::Text { text, .. } if segments.is_empty() => segments.push(text.clone()),
+            ContentBlock::Text { text, .. } => segments.push(format!("[text]\n{text}")),
             // Meka's own per-turn preamble, restated every turn; not part of the conversation.
             ContentBlock::TurnContext { .. } => {}
             // What the model was sent back to work with, and what arrived for it, as it read them.
-            ContentBlock::Nudge { text, .. }
-            | ContentBlock::Inbox { text, .. }
-            | ContentBlock::Scheduled { text, .. }
-            | ContentBlock::BackgroundReport { text, .. }
-            | ContentBlock::Invocation { text, .. }
-            | ContentBlock::Resource { text, .. } => segments.push(text.clone()),
-            ContentBlock::Thinking { thinking, .. } => {
-                segments.push(format!("[thinking]\n{thinking}"))
+            ContentBlock::Nudge { .. }
+            | ContentBlock::HarnessNote { .. }
+            | ContentBlock::Summary { .. }
+            | ContentBlock::Inbox { .. }
+            | ContentBlock::Scheduled { .. }
+            | ContentBlock::BackgroundReport { .. }
+            | ContentBlock::Invocation { .. }
+            | ContentBlock::Resource { .. } => {
+                segments.extend(block.model_text().map(std::borrow::Cow::into_owned));
+            }
+            ContentBlock::Refusal { text, .. } => segments.push(format!("[refusal]\n{text}")),
+            ContentBlock::Unrecognized { parts } => segments.push(format!(
+                "[unrecognized]\n{}",
+                serde_json::Value::Array(parts.clone())
+            )),
+            ContentBlock::Thinking { parts, .. } => {
+                let reasoning = crate::conversation::reasoning_text(parts);
+                if !crate::text::is_blank(&reasoning) {
+                    segments.push(format!("[thinking]\n{reasoning}"));
+                }
             }
             ContentBlock::RedactedThinking { .. } => {
                 segments.push("[redacted thinking]".to_string())
             }
+            ContentBlock::ToolUse {
+                name,
+                unparsed: Some(unparsed),
+                ..
+            } => segments.push(format!(
+                "[tool call: {name}, refused: {}]\n{}",
+                unparsed.error,
+                unparsed.text.as_deref().unwrap_or_default()
+            )),
             ContentBlock::ToolUse { name, input, .. } => {
                 let pretty =
                     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
@@ -396,9 +421,10 @@ fn search_named(
     Ok(output)
 }
 
-/// `count` messages from `start`, headed by which session they are from when the call named one.
+/// `count` messages from `start`, headed by which session they are from when the call named one,
+/// a reply that did not end as an answer or a round of calls followed by how it stopped.
 fn read_messages(
-    messages: &[Message],
+    messages: &[crate::store::HistoryReply],
     start: usize,
     count: usize,
     session: Option<Uuid>,
@@ -424,7 +450,7 @@ fn read_messages(
         .ok(),
         None => writeln!(output, "Messages #{start}..#{end} of {total}:\n").ok(),
     };
-    for (position, message) in messages
+    for (position, (message, reply)) in messages
         .iter()
         .enumerate()
         .skip(start - 1)
@@ -433,6 +459,13 @@ fn read_messages(
         let index = position + 1;
         writeln!(output, "#{index} [{}]", message.role.name()).ok();
         output.push_str(&render_message_full(message));
+        if let Some(stopped) = reply
+            .as_deref()
+            .and_then(crate::conversation::ReplyRecord::unfinished_label)
+        {
+            output.push('\n');
+            output.push_str(&stopped);
+        }
         output.push_str("\n\n");
     }
     Ok(output)
@@ -630,7 +663,7 @@ impl Tool for ConversationReadTool {
             Some(session) => session,
             None => resolve_session_id(&self.site.session_id, "conversation_read")?,
         };
-        let messages = self.store.history_messages(session_id).await?;
+        let messages = self.store.history_replies(session_id).await?;
         Ok(ToolOutput::text(
             read_messages(&messages, start, limit, named)?,
             false,
@@ -819,7 +852,6 @@ impl Tool for SessionSearchTool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
 
     use super::*;
     use crate::conversation::Event;
@@ -829,7 +861,7 @@ mod tests {
             summary: Message::user("[summary]"),
             replaced_count: replaced,
             record: crate::conversation::CompactionRecord::for_test(),
-            loaded_tools_snapshot: HashSet::new(),
+            loaded_tools_snapshot: Default::default(),
             checklist_snapshot: Default::default(),
         }
     }
@@ -897,7 +929,10 @@ mod tests {
                 id: "call-1".to_string(),
                 name: "shell_execute".to_string(),
                 input: serde_json::json!({"command": "true"}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         };
         store
             .save_event(session, &Event::Append(cut), None)
@@ -920,9 +955,17 @@ mod tests {
         );
     }
 
+    /// A history as `conversation_read` reads it, with no reply records.
+    fn unrecorded(messages: Vec<Message>) -> Vec<crate::store::HistoryReply> {
+        messages
+            .into_iter()
+            .map(|message| (message, None))
+            .collect()
+    }
+
     #[test]
     fn read_messages_returns_full_turns_by_index() {
-        let messages = compacted_history();
+        let messages = unrecorded(compacted_history());
         let out = read_messages(&messages, 1, 2, None).expect("read");
         assert!(
             out.contains("#1 [user]") && out.contains("auth token expired"),
@@ -934,9 +977,81 @@ mod tests {
         );
     }
 
+    /// A reply that did not end as an answer or a round of calls is read with how it stopped, and
+    /// one cut short with what cut it; any other with nothing added.
+    #[test]
+    fn a_reply_is_read_with_how_it_stopped_when_it_did_not_end_as_an_answer() {
+        use crate::conversation::{ReplyCut, ReplyRecord, Stop, StopReason};
+        let record = |stop: Option<StopReason>, cut: Option<ReplyCut>| {
+            Some(Box::new(ReplyRecord {
+                stop: stop.map(Stop::of),
+                cut,
+                model: None,
+                profile: None,
+                usage: None,
+                provider_fields: None,
+            }))
+        };
+        let messages = vec![
+            (
+                Message::assistant_text("half"),
+                record(Some(StopReason::MaxTokens), None),
+            ),
+            (
+                Message::assistant_text("so far"),
+                record(None, Some(ReplyCut::Interrupted)),
+            ),
+            (
+                Message::assistant_text("done"),
+                record(Some(StopReason::EndTurn), None),
+            ),
+        ];
+        let out = read_messages(&messages, 1, 3, None).expect("read");
+        assert!(
+            out.contains("#1 [assistant]\nhalf\n[stop: max_tokens]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("#2 [assistant]\nso far\n[cut: interrupted]"),
+            "{out}"
+        );
+        assert!(out.contains("#3 [assistant]\ndone\n\n"), "{out}");
+    }
+
+    /// A reply's words read apart from its reasoning, and reasoning with no words in it (sealed,
+    /// with no summary) reads as nothing rather than claiming the words after it.
+    #[test]
+    fn a_reply_s_words_read_apart_from_its_reasoning() {
+        use crate::conversation::{ContentBlock, OpaqueReasoning, ReasoningPart, Role};
+        let reply = |thinking: &str| Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    parts: vec![ReasoningPart::reasoning(thinking)],
+                    opaque: Some(OpaqueReasoning::Sealed {
+                        encrypted_content: "E".to_string(),
+                        id: None,
+                        origin: None,
+                    }),
+                    provider_fields: None,
+                },
+                ContentBlock::Text {
+                    text: "The answer.".to_string(),
+                    provider_fields: None,
+                },
+            ],
+            provider_fields: None,
+        };
+        assert_eq!(
+            render_message_full(&reply("Worked it out.")),
+            "[thinking]\nWorked it out.\n[text]\nThe answer."
+        );
+        assert_eq!(render_message_full(&reply("")), "The answer.");
+    }
+
     #[test]
     fn read_messages_out_of_range_errors() {
-        let messages = compacted_history();
+        let messages = unrecorded(compacted_history());
         assert!(read_messages(&messages, 0, 1, None).is_err());
         assert!(read_messages(&messages, 99, 1, None).is_err());
     }

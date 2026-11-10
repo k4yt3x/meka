@@ -40,6 +40,14 @@ pub(crate) enum MockEvent {
     Text {
         text: String,
     },
+    /// Words in the field a provider keeps for declining (OpenAI's `refusal`).
+    Refusal {
+        text: String,
+    },
+    /// A part Meka reads nothing from, kept as the provider sent it.
+    Unrecognized {
+        value: serde_json::Value,
+    },
     ThinkingDelta {
         text: String,
     },
@@ -144,6 +152,14 @@ pub(crate) enum MockEvent {
     FailStream {
         message: String,
     },
+    /// [`Self::FailStream`] from a driver that held part of the reply when its stream broke: the
+    /// failure is said, then `held` is handed over, as a driver delivers what it assembled (the
+    /// calls a Chat Completions stream builds to its end, a block a Claude stream left open and
+    /// those held behind it).
+    FailStreamHolding {
+        message: String,
+        held: Vec<MockEvent>,
+    },
     /// Synthetic *context-window overflow*. The stream returns `Err(MekaError::ContextOverflow)`,
     /// which is the one recovery path in `Agent::run_turn` nothing else can drive: the emergency
     /// compact-and-retry only fires on this error. Each
@@ -177,8 +193,8 @@ pub(crate) enum MockStopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
-    /// Model-side refusal. Maps to `StopReason::Refusal("")`; the text content of the assistant
-    /// message is what the user sees as the refusal explanation.
+    /// Model-side refusal, as Claude's classifier states one: the stop alone, whatever text
+    /// streamed before it.
     Refusal,
 }
 
@@ -188,7 +204,7 @@ impl From<MockStopReason> for StopReason {
             MockStopReason::EndTurn => StopReason::EndTurn,
             MockStopReason::ToolUse => StopReason::ToolUse,
             MockStopReason::MaxTokens => StopReason::MaxTokens,
-            MockStopReason::Refusal => StopReason::Refusal(String::new()),
+            MockStopReason::Refusal => StopReason::Refusal,
         }
     }
 }
@@ -373,6 +389,7 @@ impl Provider for MockProvider {
 
         let mut content: Vec<ContentBlock> = Vec::new();
         let mut text = String::new();
+        let mut refusal = String::new();
         let mut thinking = String::new();
         let mut pending_tool: Option<(String, String)> = None;
         let mut stop_reason = StopReason::EndTurn;
@@ -391,7 +408,8 @@ impl Provider for MockProvider {
                         )));
                     }
                 }
-                MockEvent::FailStream { message } => {
+                MockEvent::FailStream { message }
+                | MockEvent::FailStreamHolding { message, .. } => {
                     return Err(crate::error::MekaError::StreamError(message));
                 }
                 // No channel on the non-streaming path: advisories ride on the return, as the real
@@ -456,6 +474,10 @@ impl Provider for MockProvider {
                     }
                 }
                 MockEvent::Text { text: chunk } => text.push_str(&chunk),
+                MockEvent::Refusal { text: chunk } => refusal.push_str(&chunk),
+                MockEvent::Unrecognized { value } => {
+                    content.push(ContentBlock::Unrecognized { parts: vec![value] })
+                }
                 MockEvent::ThinkingDelta { text: chunk } => thinking.push_str(&chunk),
                 // A live indicator's running estimate. Nothing survives a non-streaming turn, which
                 // has no indicator to feed.
@@ -469,11 +491,16 @@ impl Provider for MockProvider {
                     if !text.is_empty() {
                         content.push(ContentBlock::Text {
                             text: std::mem::take(&mut text),
+                            provider_fields: None,
                         });
                     }
-                    if let Some(block) =
-                        ContentBlock::replayable_thinking(std::mem::take(&mut thinking), opaque)
-                    {
+                    if let Some(block) = ContentBlock::replayable_thinking(
+                        vec![crate::conversation::ReasoningPart::reasoning(
+                            std::mem::take(&mut thinking),
+                        )],
+                        opaque,
+                        None,
+                    ) {
                         content.push(block);
                     }
                 }
@@ -484,13 +511,20 @@ impl Provider for MockProvider {
                     if !text.is_empty() {
                         content.push(ContentBlock::Text {
                             text: std::mem::take(&mut text),
+                            provider_fields: None,
                         });
                     }
                     pending_tool = Some((id, name));
                 }
                 MockEvent::ToolUseEnd { input } => {
                     if let Some((id, name)) = pending_tool.take() {
-                        content.push(ContentBlock::ToolUse { id, name, input });
+                        content.push(ContentBlock::ToolUse {
+                            id,
+                            name,
+                            input,
+                            unparsed: None,
+                            provider_fields: None,
+                        });
                     }
                 }
                 MockEvent::MessageEnd {
@@ -501,17 +535,31 @@ impl Provider for MockProvider {
         }
 
         if !text.is_empty() {
-            content.push(ContentBlock::Text { text });
+            content.push(ContentBlock::Text {
+                text,
+                provider_fields: None,
+            });
+        }
+        if !refusal.is_empty() {
+            content.push(ContentBlock::Refusal {
+                text: refusal,
+                provider_fields: None,
+            });
         }
 
+        // Classed as every whole-reply parser classes it, a refusal block making a refusal.
+        let stop = crate::provider::Stop::of(stop_reason).with_refusal_of(&content);
         Ok(crate::provider::Completion {
             message: Message {
                 role: Role::Assistant,
                 content,
+                provider_fields: None,
             },
-            stop_reason,
+            stop,
+            model: None,
             usage,
             notices,
+            response_fields: None,
         })
     }
 
@@ -568,6 +616,15 @@ impl Provider for MockProvider {
                 }
                 MockEvent::FailStream { message } => {
                     send_stream_error(&event_sender, &message).await;
+                    return Err(crate::error::MekaError::StreamError(message));
+                }
+                MockEvent::FailStreamHolding { message, held } => {
+                    send_stream_error(&event_sender, &message).await;
+                    for event in held.into_iter().filter_map(stream_event_of) {
+                        if event_sender.send(event).await.is_err() {
+                            break;
+                        }
+                    }
                     return Err(crate::error::MekaError::StreamError(message));
                 }
                 MockEvent::Notice { message } => {
@@ -652,50 +709,8 @@ impl Provider for MockProvider {
                     continue;
                 }
                 event => {
-                    let stream_event = match event {
-                        MockEvent::Notice { message } => {
-                            StreamEvent::Notice(crate::frontend::Notice::info(message))
-                        }
-                        MockEvent::Redaction {
-                            images,
-                            bytes,
-                            positions,
-                        } => StreamEvent::Notice(redaction_notice(images, bytes, positions)),
-                        MockEvent::Text { text } => StreamEvent::TextDelta(text),
-                        MockEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
-                        MockEvent::ThinkingProgress { estimated_tokens } => {
-                            StreamEvent::ThinkingProgress { estimated_tokens }
-                        }
-                        MockEvent::ThinkingComplete { opaque } => {
-                            StreamEvent::ThinkingComplete { opaque }
-                        }
-                        MockEvent::ToolUseStart { id, name } => {
-                            StreamEvent::ToolUseStart { id, name }
-                        }
-                        MockEvent::ToolUseEnd { input } => StreamEvent::ToolUseEnd { input },
-                        MockEvent::MessageEnd { stop_reason } => StreamEvent::MessageEnd {
-                            stop_reason: stop_reason.into(),
-                        },
-                        MockEvent::Usage { input_tokens } => StreamEvent::Usage(TokenUsage {
-                            input_tokens,
-                            ..TokenUsage::default()
-                        }),
-                        #[allow(
-                            clippy::unreachable,
-                            reason = "the control events are consumed by the match above this one"
-                        )]
-                        MockEvent::Sleep { .. }
-                        | MockEvent::Stall { .. }
-                        | MockEvent::Hold { .. }
-                        | MockEvent::Fail { .. }
-                        | MockEvent::ExpectSystemPrompt { .. }
-                        | MockEvent::FailStream { .. }
-                        | MockEvent::FailRetryable { .. }
-                        | MockEvent::FailExhausted { .. }
-                        | MockEvent::FailInvalidRequest { .. }
-                        | MockEvent::FailContextOverflow { .. } => {
-                            unreachable!("handled above")
-                        }
+                    let Some(stream_event) = stream_event_of(event) else {
+                        continue;
                     };
                     if event_sender.send(stream_event).await.is_err() {
                         // Receiver dropped; the test ended early. Not an error.
@@ -706,6 +721,55 @@ impl Provider for MockProvider {
         }
         Ok(())
     }
+}
+
+/// The event a scripted step streams as, or `None` for a step that only steers the script (a
+/// sleep, a hold, a failure), which the stream loop acts on itself.
+fn stream_event_of(event: MockEvent) -> Option<StreamEvent> {
+    Some(match event {
+        MockEvent::Notice { message } => {
+            StreamEvent::Notice(crate::frontend::Notice::info(message))
+        }
+        MockEvent::Redaction {
+            images,
+            bytes,
+            positions,
+        } => StreamEvent::Notice(redaction_notice(images, bytes, positions)),
+        MockEvent::Text { text } => StreamEvent::TextDelta(text),
+        MockEvent::Refusal { text } => StreamEvent::RefusalDelta(text),
+        MockEvent::Unrecognized { value } => StreamEvent::Unrecognized(value),
+        MockEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
+        MockEvent::ThinkingProgress { estimated_tokens } => {
+            StreamEvent::ThinkingProgress { estimated_tokens }
+        }
+        MockEvent::ThinkingComplete { opaque } => StreamEvent::ThinkingComplete {
+            opaque,
+            provider_fields: None,
+        },
+        MockEvent::ToolUseStart { id, name } => StreamEvent::ToolUseStart { id, name },
+        MockEvent::ToolUseEnd { input } => StreamEvent::ToolUseEnd {
+            input,
+            provider_fields: None,
+        },
+        MockEvent::MessageEnd { stop_reason } => StreamEvent::MessageEnd {
+            stop: crate::provider::Stop::of(stop_reason.into()),
+        },
+        MockEvent::Usage { input_tokens } => StreamEvent::Usage(TokenUsage {
+            input_tokens,
+            ..TokenUsage::default()
+        }),
+        MockEvent::Sleep { .. }
+        | MockEvent::Stall { .. }
+        | MockEvent::Hold { .. }
+        | MockEvent::Fail { .. }
+        | MockEvent::ExpectSystemPrompt { .. }
+        | MockEvent::FailStream { .. }
+        | MockEvent::FailStreamHolding { .. }
+        | MockEvent::FailRetryable { .. }
+        | MockEvent::FailExhausted { .. }
+        | MockEvent::FailInvalidRequest { .. }
+        | MockEvent::FailContextOverflow { .. } => return None,
+    })
 }
 
 /// The JSON-encoded script at `path`, which `MEKA_MOCK_PROVIDER_SCRIPT` named.
@@ -935,11 +999,7 @@ mod tests {
             }],
         ]);
 
-        let crate::provider::Completion {
-            message,
-            stop_reason,
-            ..
-        } = provider
+        let crate::provider::Completion { message, stop, .. } = provider
             .complete(
                 CompletionRequest::new("", &[], &[]),
                 tokio_util::sync::CancellationToken::new(),
@@ -948,12 +1008,14 @@ mod tests {
             .expect("complete");
         assert!(matches!(message.role, Role::Assistant));
         assert_eq!(message.content.len(), 3);
-        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "before "));
+        assert!(
+            matches!(&message.content[0], ContentBlock::Text { text, .. } if text == "before ")
+        );
         assert!(
             matches!(&message.content[1], ContentBlock::ToolUse { id, name, .. } if id == "call-1" && name == "file_read")
         );
-        assert!(matches!(&message.content[2], ContentBlock::Text { text } if text == "after"));
-        assert!(matches!(stop_reason, StopReason::ToolUse));
+        assert!(matches!(&message.content[2], ContentBlock::Text { text, .. } if text == "after"));
+        assert_eq!(stop.reason, StopReason::ToolUse);
 
         // The queue is shared with `stream`, so the first round is gone for both paths.
         let message = provider
@@ -965,7 +1027,7 @@ mod tests {
             .expect("second round")
             .message;
         assert!(
-            matches!(&message.content[0], ContentBlock::Text { text } if text == "second round")
+            matches!(&message.content[0], ContentBlock::Text { text, .. } if text == "second round")
         );
     }
 
@@ -974,11 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn mock_provider_complete_on_exhausted_script_is_empty() {
         let provider = MockProvider::from_rounds(vec![]);
-        let crate::provider::Completion {
-            message,
-            stop_reason,
-            ..
-        } = provider
+        let crate::provider::Completion { message, stop, .. } = provider
             .complete(
                 CompletionRequest::new("", &[], &[]),
                 tokio_util::sync::CancellationToken::new(),
@@ -986,7 +1044,7 @@ mod tests {
             .await
             .expect("complete");
         assert!(message.content.is_empty());
-        assert!(matches!(stop_reason, StopReason::EndTurn));
+        assert_eq!(stop.reason, StopReason::EndTurn);
     }
 
     /// `ThinkingDelta` + `ThinkingComplete` map straight through to the same-named `StreamEvent`
@@ -1022,7 +1080,7 @@ mod tests {
         ));
         assert!(matches!(
             rx.recv().await,
-            Some(StreamEvent::ThinkingComplete { opaque: None })
+            Some(StreamEvent::ThinkingComplete { opaque: None, .. })
         ));
         assert!(matches!(
             rx.recv().await,

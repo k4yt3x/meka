@@ -23,11 +23,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    conversation::{ContentBlock, Message, OpaqueReasoning, Role, ToolResultContent},
-    error::{MekaError, Result},
+    conversation::{ContentBlock, Message, OpaqueReasoning, ResultPart, Role, ToolResultContent},
+    error::Result,
     provider::{
-        CompletionRequest, DeferredToolDelivery, LOAD_TOOL_NAME, SEARCH_TOOL_NAME, StopReason,
-        StreamEvent, ToolDefinition, search_tool_parameters,
+        CompletionRequest, DeferredToolDelivery, LOAD_TOOL_NAME, SEARCH_TOOL_NAME, Stop,
+        StopReason, StreamEvent, ToolDefinition, search_tool_parameters,
         sse::{End, Step},
     },
     stats::TokenUsage,
@@ -168,13 +168,13 @@ fn build_tool_result_output(content: &[ToolResultContent]) -> serde_json::Value 
 
     let parts: Vec<serde_json::Value> = content
         .iter()
-        .map(|block| match block {
-            ToolResultContent::Text { text } => serde_json::json!({
+        .map(|block| match block.wire_part() {
+            ResultPart::Text(text) => serde_json::json!({
                 "type": "input_text",
                 "text": text,
             }),
-            ToolResultContent::Image { source } => input_image_part(source),
-            ToolResultContent::ToolReference { tool_name } => serde_json::json!({
+            ResultPart::Image(source) => input_image_part(source),
+            ResultPart::ToolReference(tool_name) => serde_json::json!({
                 "type": "input_text",
                 "text": tool_name,
             }),
@@ -256,21 +256,23 @@ fn encode_user_message(
     tools: &[ToolDefinition],
     deferred_tools: &[ToolDefinition],
 ) {
-    let mut text_parts: Vec<&str> = Vec::new();
+    let mut text_parts: Vec<std::borrow::Cow<'_, str>> = Vec::new();
     let mut image_parts: Vec<serde_json::Value> = Vec::new();
 
     for block in &message.content {
         match block {
-            // The context block, a nudge and what arrived for the model are text on this wire
-            // too, in the order the message holds them.
-            ContentBlock::Text { text }
-            | ContentBlock::TurnContext { text }
-            | ContentBlock::Nudge { text, .. }
-            | ContentBlock::Inbox { text, .. }
-            | ContentBlock::Scheduled { text, .. }
-            | ContentBlock::BackgroundReport { text, .. }
-            | ContentBlock::Invocation { text, .. }
-            | ContentBlock::Resource { text, .. } => text_parts.push(text),
+            // The context block, a nudge, a note and what arrived for the model are text on this
+            // wire too, in the order the message holds them.
+            ContentBlock::Text { .. }
+            | ContentBlock::TurnContext { .. }
+            | ContentBlock::Nudge { .. }
+            | ContentBlock::HarnessNote { .. }
+            | ContentBlock::Summary { .. }
+            | ContentBlock::Inbox { .. }
+            | ContentBlock::Scheduled { .. }
+            | ContentBlock::BackgroundReport { .. }
+            | ContentBlock::Invocation { .. }
+            | ContentBlock::Resource { .. } => text_parts.extend(block.model_text()),
             // Responses takes `input_image` content parts on the user message. No model gate;
             // non-vision models return a clear error.
             ContentBlock::Image { source } => image_parts.push(input_image_part(source)),
@@ -303,9 +305,9 @@ fn encode_user_message(
                     // The output item carries definitions and nothing else, so what the search
                     // said in words, a match list or why nothing was loaded, follows as the
                     // message's text.
-                    text_parts.extend(content.iter().filter_map(|item| match item {
-                        ToolResultContent::Text { text } => Some(text.as_str()),
-                        _ => None,
+                    text_parts.extend(content.iter().filter_map(|item| match item.wire_part() {
+                        ResultPart::Text(text) => Some(text),
+                        ResultPart::Image(_) | ResultPart::ToolReference(_) => None,
                     }));
                 } else {
                     input.push(serde_json::json!({
@@ -317,7 +319,11 @@ fn encode_user_message(
             }
             // ToolUse / Thinking on a user message would be malformed; ignore defensively to match
             // the Chat Completions encoder's behavior.
-            _ => {}
+            ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::Refusal { .. }
+            | ContentBlock::Unrecognized { .. } => {}
         }
     }
 
@@ -349,31 +355,75 @@ fn encode_assistant_message(
     searched: &std::collections::HashSet<String>,
     replays_reasoning_from: Option<&str>,
 ) {
-    let mut pending_text = String::new();
-
     for (index, block) in message.content.iter().enumerate() {
         match block {
-            ContentBlock::Text { text } => pending_text.push_str(text),
+            // One `message` item per part, as the server returned them, each with its `phase`,
+            // which the spec asks to be sent back on every assistant message.
+            ContentBlock::Text {
+                text,
+                provider_fields,
+            } => {
+                if text.is_empty() {
+                    continue;
+                }
+                // The fields the spec defines on an `output_text` part go back as the part held
+                // them.
+                let mut part = serde_json::Map::from_iter([
+                    ("type".to_string(), serde_json::json!("output_text")),
+                    ("text".to_string(), serde_json::json!(text)),
+                ]);
+                if let Some(held) = provider_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("content"))
+                    .and_then(|parts| parts.get(0))
+                    .and_then(serde_json::Value::as_object)
+                {
+                    for key in ["annotations", "logprobs"] {
+                        if let Some(value) = held.get(key) {
+                            part.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                let mut item = serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [part],
+                });
+                if let Some(phase) = provider_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("phase"))
+                    .filter(|phase| phase.is_string())
+                    && let Some(object) = item.as_object_mut()
+                {
+                    object.insert("phase".to_string(), phase.clone());
+                }
+                input.push(item);
+            }
+            ContentBlock::Refusal { text, .. } => input.push(serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": text}],
+            })),
             // Replayed only when it carries `encrypted_content`, which is the reasoning itself and
             // the only part the model can resume from, and only to the endpoint that sealed it. A
             // summary without it is a digest written for a human, so sending one back buys
             // nothing and would put an item shape on the wire for endpoints that were never asked
             // for reasoning in the first place.
             ContentBlock::Thinking {
-                thinking,
+                parts,
                 opaque:
                     Some(OpaqueReasoning::Sealed {
                         encrypted_content,
                         id,
                         origin: Some(origin),
                     }),
+                ..
             } if replays_reasoning_from == Some(origin.as_str())
                 && an_emitted_item_follows(&message.content, index) =>
             {
-                flush_assistant_text(&mut pending_text, input);
                 input.push(reasoning_input_item(
                     id.as_deref(),
-                    thinking,
+                    parts,
                     encrypted_content,
                 ));
             }
@@ -381,8 +431,9 @@ fn encode_assistant_message(
                 id,
                 name,
                 input: arguments,
+                unparsed,
+                ..
             } => {
-                flush_assistant_text(&mut pending_text, input);
                 if searched.contains(id) {
                     input.push(serde_json::json!({
                         "type": "tool_search_call",
@@ -396,30 +447,31 @@ fn encode_assistant_message(
                         "type": "function_call",
                         "name": name,
                         "call_id": id,
-                        "arguments": arguments.to_string(),
+                        "arguments": crate::conversation::call_arguments_text(
+                            arguments,
+                            unparsed.as_ref(),
+                        ),
                     }));
                 }
             }
-            _ => {}
+            // Reasoning another endpoint sealed, or none, is not this wire's to resume from, and
+            // what Meka could not read is never sent; the rest belongs to a user message.
+            ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::Unrecognized { .. }
+            | ContentBlock::TurnContext { .. }
+            | ContentBlock::Nudge { .. }
+            | ContentBlock::HarnessNote { .. }
+            | ContentBlock::Summary { .. }
+            | ContentBlock::Inbox { .. }
+            | ContentBlock::Scheduled { .. }
+            | ContentBlock::BackgroundReport { .. }
+            | ContentBlock::Invocation { .. }
+            | ContentBlock::Resource { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::ToolResult { .. } => {}
         }
     }
-
-    flush_assistant_text(&mut pending_text, input);
-}
-
-/// Emit the assistant text accumulated so far as one `message` item, and clear it.
-fn flush_assistant_text(pending: &mut String, input: &mut Vec<serde_json::Value>) {
-    if pending.is_empty() {
-        return;
-    }
-    input.push(serde_json::json!({
-        "type": "message",
-        "role": "assistant",
-        "content": [{
-            "type": "output_text",
-            "text": std::mem::take(pending),
-        }],
-    }));
 }
 
 /// Whether anything this encoder will actually emit follows `index` in the same turn.
@@ -433,28 +485,30 @@ fn flush_assistant_text(pending: &mut String, input: &mut Vec<serde_json::Value>
 /// be replayed in. What this refuses is a turn that ends in reasoning with no output at all.
 fn an_emitted_item_follows(content: &[ContentBlock], index: usize) -> bool {
     content.iter().skip(index + 1).any(|block| match block {
-        ContentBlock::Text { text } => !text.is_empty(),
-        ContentBlock::ToolUse { .. } => true,
+        ContentBlock::Text { text, .. } => !text.is_empty(),
+        ContentBlock::ToolUse { .. } | ContentBlock::Refusal { .. } => true,
         _ => false,
     })
 }
 
-/// A `reasoning` item, shaped as the server sent it so it can be replayed verbatim.
-///
-/// Meka flattens a multi-part summary into one string as it streams (the parts are display
-/// sections, separated by a blank line), and does not try to reconstruct the original parts here:
-/// splitting back on the separator would invent boundaries wherever a single part contained a
-/// paragraph break. The whole text goes back as one part, which preserves what was said.
+/// A `reasoning` item, shaped as the server sent it so it can be replayed verbatim: each summary
+/// part as a `summary_text` entry and each part of reasoning as a `reasoning_text` one, in the
+/// order they came.
 fn reasoning_input_item(
     id: Option<&str>,
-    summary: &str,
+    parts: &[crate::conversation::ReasoningPart],
     encrypted_content: &str,
 ) -> serde_json::Value {
-    let summary = if summary.is_empty() {
-        serde_json::json!([])
-    } else {
-        serde_json::json!([{ "type": "summary_text", "text": summary }])
+    use crate::conversation::ReasoningKind;
+    let entries = |kind: ReasoningKind, entry_type: &str| -> Vec<serde_json::Value> {
+        parts
+            .iter()
+            .filter(|part| part.kind == kind)
+            .map(|part| serde_json::json!({ "type": entry_type, "text": part.text }))
+            .collect()
     };
+    let summary = entries(ReasoningKind::Summary, "summary_text");
+    let content = entries(ReasoningKind::Reasoning, "reasoning_text");
     let mut item = serde_json::Map::from_iter([
         ("type".into(), serde_json::json!("reasoning")),
         ("summary".into(), serde_json::json!(summary)),
@@ -463,6 +517,9 @@ fn reasoning_input_item(
             serde_json::json!(encrypted_content),
         ),
     ]);
+    if !content.is_empty() {
+        item.insert("content".into(), serde_json::json!(content));
+    }
     if let Some(id) = id {
         item.insert("id".into(), serde_json::Value::String(id.to_string()));
     }
@@ -508,6 +565,9 @@ fn encode_tools(
 pub(super) struct SseState {
     active_tool_call: Option<ActiveToolCall>,
     in_reasoning: bool,
+    /// The kind of the reasoning item's part in progress, so a delta of another kind opens a part
+    /// of its own.
+    reasoning_part: Option<crate::conversation::ReasoningKind>,
     /// Whether this response emitted any `function_call` output item. The Responses API reports
     /// `status: "completed"` even for tool-call turns, so the stop reason has to be inferred from
     /// the presence of function calls rather than the status (mirrors the Chat Completions
@@ -518,10 +578,86 @@ pub(super) struct SseState {
     pub(super) finished: bool,
     /// The origin of the endpoint answering, which every sealed reasoning block records.
     pub(super) origin: Option<String>,
+    /// The fields Meka's request set, which the response object restates and which are not the
+    /// response's own to record.
+    pub(super) restated: Vec<String>,
+}
+
+/// The fields of the response object that are the response's own: all but its output, which the
+/// reply holds, its model and how it ended, which the reply's record holds, and what restates the
+/// request. `service_tier` is the response's even when the request set it: the spec defines it
+/// there as the tier actually used, which may differ from the one asked for.
+fn response_fields(
+    response: &serde_json::Value,
+    restated: &[String],
+) -> Option<crate::conversation::ProviderFields> {
+    let response = response.as_object()?;
+    let fields: crate::conversation::ProviderFields = response
+        .iter()
+        .filter(|(key, _)| {
+            !["output", "model", "status", "incomplete_details"].contains(&key.as_str())
+                && (*key == "service_tier" || !restated.contains(key))
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    (!fields.is_empty()).then_some(fields)
+}
+
+/// An output item's fields beyond `held`, the ones its blocks hold, with each list of parts under
+/// a key of `parts` kept as the parts' own remainders, in place: each part's fields beyond those
+/// listed beside the key. A part left with nothing is an empty object, so the places hold; a list
+/// whose parts all are is left out.
+fn item_fields(
+    item: &serde_json::Value,
+    held: &[&str],
+    parts: &[(&str, &[&str])],
+) -> Option<crate::conversation::ProviderFields> {
+    let item = item.as_object()?;
+    let mut fields = crate::provider::fields_beyond(item, held).unwrap_or_default();
+    for (key, part_held) in parts {
+        fields.remove(*key);
+        let Some(list) = item.get(*key).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let remainders: Vec<serde_json::Value> = list
+            .iter()
+            .map(|part| {
+                serde_json::Value::Object(
+                    part.as_object()
+                        .and_then(|part| crate::provider::fields_beyond(part, part_held))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        if remainders
+            .iter()
+            .any(|part| part.as_object().is_some_and(|part| !part.is_empty()))
+        {
+            fields.insert((*key).to_string(), serde_json::Value::Array(remainders));
+        }
+    }
+    (!fields.is_empty()).then_some(fields)
 }
 
 struct ActiveToolCall {
+    /// The call's id and name as the item that opened it named them; `None` when it did not,
+    /// which leaves the call to the item that finishes it.
+    opened: Option<(String, String)>,
     arguments_buffer: String,
+}
+
+/// The id and name a call item names, which the spec has the item that opens a call and the one
+/// that finishes it both carry. The endpoint's search item has no name of its own; it dispatches
+/// as Meka's search tool, which answers both a query and a list of names.
+fn call_identity(item: &serde_json::Value) -> Option<(String, String)> {
+    let text = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("tool_search_call") => Some((
+            text("call_id").or_else(|| text("id"))?.to_string(),
+            SEARCH_TOOL_NAME.to_string(),
+        )),
+        _ => Some((text("call_id")?.to_string(), text("name")?.to_string())),
+    }
 }
 
 /// Which Responses frame this is: the payload's `type`, falling back to the SSE `event:` line.
@@ -548,7 +684,25 @@ pub(super) fn process_event(
 ) -> Result<Vec<StreamEvent>> {
     let mut out = Vec::new();
     match event_name {
-        "response.created" | "response.in_progress" => {}
+        // The model the response names, which the accumulator keeps the first of.
+        "response.created" | "response.in_progress" => {
+            if let Some(model) = data
+                .get("response")
+                .and_then(|response| response.get("model"))
+                .and_then(|model| model.as_str())
+                .filter(|model| !model.is_empty())
+            {
+                out.push(StreamEvent::Model(model.to_string()));
+            }
+            // Told as soon as it is known, so a reply cut short keeps it; the terminal event's
+            // response is the whole of it.
+            if let Some(fields) = data
+                .get("response")
+                .and_then(|response| response_fields(response, &state.restated))
+            {
+                out.push(StreamEvent::ResponseFields(fields));
+            }
+        }
 
         "response.output_text.delta" => {
             if let Some(delta) = data.get("delta").and_then(|v| v.as_str())
@@ -558,24 +712,39 @@ pub(super) fn process_event(
             }
         }
 
+        "response.refusal.delta" => {
+            if let Some(delta) = data.get("delta").and_then(|v| v.as_str())
+                && !delta.is_empty()
+            {
+                out.push(StreamEvent::RefusalDelta(delta.to_string()));
+            }
+        }
+
         "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
             if let Some(delta) = data.get("delta").and_then(|v| v.as_str())
                 && !delta.is_empty()
             {
+                let kind = if event_name == "response.reasoning_text.delta" {
+                    crate::conversation::ReasoningKind::Reasoning
+                } else {
+                    crate::conversation::ReasoningKind::Summary
+                };
+                if state.reasoning_part != Some(kind) {
+                    state.reasoning_part = Some(kind);
+                    out.push(StreamEvent::ThinkingPart(kind));
+                }
                 state.in_reasoning = true;
                 out.push(StreamEvent::ThinkingDelta(delta.to_string()));
             }
         }
 
-        // A reasoning summary arrives as several parts, each its own section with its own heading,
-        // and the deltas carry no separator of their own. Codex renders a break here
-        // (`on_reasoning_section_break`); Meka's thinking is flat text, so the break is a blank
-        // line. The first part opens the block rather than separating anything, which is what
-        // `in_reasoning` distinguishes.
+        // A reasoning summary arrives as several parts, each its own section, and the deltas carry
+        // no separator of their own: each part is recorded as the part it is.
         "response.reasoning_summary_part.added" => {
-            if state.in_reasoning {
-                out.push(StreamEvent::ThinkingDelta("\n\n".to_string()));
-            }
+            state.reasoning_part = Some(crate::conversation::ReasoningKind::Summary);
+            out.push(StreamEvent::ThinkingPart(
+                crate::conversation::ReasoningKind::Summary,
+            ));
         }
 
         "response.output_item.added" => {
@@ -584,26 +753,15 @@ pub(super) fn process_event(
             };
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if item_type == "function_call" || item_type == "tool_search_call" {
-                let id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                // The endpoint's search item has no name of its own; it dispatches as Meka's
-                // search tool, which answers both a query and a list of names.
-                let name = if item_type == "tool_search_call" {
-                    SEARCH_TOOL_NAME.to_string()
-                } else {
-                    item.get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string()
-                };
+                let opened = call_identity(item);
+                if let Some((id, name)) = opened.clone() {
+                    state.emitted_tool_call = true;
+                    out.push(StreamEvent::ToolUseStart { id, name });
+                }
                 state.active_tool_call = Some(ActiveToolCall {
+                    opened,
                     arguments_buffer: String::new(),
                 });
-                state.emitted_tool_call = true;
-                out.push(StreamEvent::ToolUseStart { id, name });
             }
         }
 
@@ -613,6 +771,7 @@ pub(super) fn process_event(
                 && let Some(tool) = state.active_tool_call.as_mut()
             {
                 tool.arguments_buffer.push_str(delta);
+                out.push(StreamEvent::ToolArgumentsDelta(delta.to_string()));
             }
         }
 
@@ -621,16 +780,33 @@ pub(super) fn process_event(
                 return Ok(out);
             };
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if item_type == "tool_search_call" {
+            // The call is the one the item that opened it named; one it did not name is named by
+            // the item that finishes it. A call neither names is in a shape the spec does not
+            // define, kept as it came and never run.
+            let call = if item_type == "tool_search_call" || item_type == "function_call" {
+                let buffered = state.active_tool_call.take();
+                let opened = buffered.as_ref().and_then(|tool| tool.opened.clone());
+                let Some((call_id, call_name)) = opened.clone().or_else(|| call_identity(item))
+                else {
+                    out.push(StreamEvent::Unrecognized(item.clone()));
+                    return Ok(out);
+                };
+                if opened.is_none() {
+                    state.emitted_tool_call = true;
+                    out.push(StreamEvent::ToolUseStart {
+                        id: call_id.clone(),
+                        name: call_name.clone(),
+                    });
+                }
+                Some((call_id, call_name, buffered))
+            } else {
+                None
+            };
+            if item_type == "tool_search_call"
+                && let Some((call_id, ..)) = call
+            {
                 // Arrives whole: the arguments are an object on the done item, with no deltas
                 // before it.
-                state.active_tool_call.take();
-                let call_id = item
-                    .get("call_id")
-                    .or_else(|| item.get("id"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
                 let arguments = match item.get("arguments") {
                     Some(serde_json::Value::String(raw)) => raw.clone(),
                     Some(value) if !value.is_null() => value.to_string(),
@@ -640,40 +816,53 @@ pub(super) fn process_event(
                     call_id,
                     SEARCH_TOOL_NAME.to_string(),
                     &arguments,
+                    item.as_object().and_then(|item| {
+                        crate::provider::fields_beyond(item, &["type", "call_id", "arguments"])
+                    }),
                 ));
-            } else if item_type == "function_call" {
-                let buffered = state.active_tool_call.take();
-                // Read off the completed item: `ActiveToolCall` carries only the argument buffer,
-                // and the item is the authoritative copy of the identity anyway.
-                let call_id = item
-                    .get("call_id")
-                    .or_else(|| item.get("id"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let call_name = item
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                // The final `arguments` string from the item wins over the accumulated buffer;
-                // the server may normalize it.
-                let arguments_str = item
-                    .get("arguments")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| buffered.map(|tool| tool.arguments_buffer))
-                    .unwrap_or_default();
-                out.push(crate::provider::tool_use_event(
+            } else if let Some((call_id, call_name, buffered)) = call {
+                // The final `arguments` from the item wins over the accumulated buffer, since the
+                // server may normalize it; one that is not the string the spec defines refuses
+                // the call with what it was.
+                let arguments = match item.get("arguments") {
+                    Some(serde_json::Value::Null) | None => {
+                        crate::provider::finalize_tool_arguments(
+                            &call_name,
+                            &buffered
+                                .map(|tool| tool.arguments_buffer)
+                                .unwrap_or_default(),
+                        )
+                    }
+                    arguments => crate::provider::arguments_from_reply(&call_name, arguments),
+                };
+                out.push(crate::provider::call_event(
                     call_id,
                     call_name,
-                    &arguments_str,
+                    arguments,
+                    item.as_object().and_then(|item| {
+                        crate::provider::fields_beyond(item, &[
+                            "type",
+                            "call_id",
+                            "name",
+                            "arguments",
+                        ])
+                    }),
                 ));
+            } else if item_type == "message" {
+                // One part of the reply: its text closes as a block of its own, with what the
+                // item carries beside what its blocks hold, `phase` among it, and each content
+                // part's own fields, `annotations` among them.
+                out.push(StreamEvent::TextEnd {
+                    provider_fields: item_fields(item, &["type", "role"], &[("content", &[
+                        "type", "text", "refusal",
+                    ])]),
+                });
             } else if item_type == "reasoning" {
                 // True when this item streamed anything readable, by either spelling: a requested
                 // summary, or the raw reasoning text a local server emits unprompted.
                 let showed_its_reasoning = state.in_reasoning;
                 state.in_reasoning = false;
+                state.reasoning_part = None;
                 let encrypted_content = item
                     .get("encrypted_content")
                     .and_then(|v| v.as_str())
@@ -688,6 +877,17 @@ pub(super) fn process_event(
                         .get("id")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
+                    // What the block does not hold: the id when nothing sealed it, and each summary
+                    // and reasoning part's own fields.
+                    let held: &[&str] = if encrypted_content.is_some() {
+                        &["type", "id", "encrypted_content"]
+                    } else {
+                        &["type"]
+                    };
+                    let provider_fields = item_fields(item, held, &[
+                        ("summary", &["type", "text"]),
+                        ("content", &["type", "text"]),
+                    ]);
                     out.push(StreamEvent::ThinkingComplete {
                         opaque: encrypted_content.map(|encrypted_content| {
                             OpaqueReasoning::Sealed {
@@ -696,8 +896,16 @@ pub(super) fn process_event(
                                 origin: state.origin.clone(),
                             }
                         }),
+                        provider_fields,
                     });
+                } else {
+                    // Nothing to read and nothing to carry: no block stands for it, so it is kept
+                    // as it came.
+                    out.push(StreamEvent::Unrecognized(item.clone()));
                 }
+            } else {
+                // An item of a type Meka reads nothing from, kept as it came.
+                out.push(StreamEvent::Unrecognized(item.clone()));
             }
         }
 
@@ -710,23 +918,21 @@ pub(super) fn process_event(
                 // The Responses API reports `status: "completed"` even when the output is function
                 // calls, so a tool-call turn must be surfaced as `ToolUse` regardless of status;
                 // otherwise the agent warns and mislabels the turn as `EndTurn`.
-                let stop_reason = if state.emitted_tool_call {
-                    StopReason::ToolUse
-                } else {
-                    response
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .map(parse_response_status)
-                        .unwrap_or(StopReason::EndTurn)
-                };
-                out.push(StreamEvent::MessageEnd { stop_reason });
+                let mut stop = responses_stop(response, "completed");
+                if state.emitted_tool_call {
+                    stop.reason = StopReason::ToolUse;
+                }
+                if let Some(fields) = response_fields(response, &state.restated) {
+                    out.push(StreamEvent::ResponseFields(fields));
+                }
+                out.push(StreamEvent::MessageEnd { stop });
             } else if state.emitted_tool_call {
                 out.push(StreamEvent::MessageEnd {
-                    stop_reason: StopReason::ToolUse,
+                    stop: crate::provider::Stop::of(StopReason::ToolUse),
                 });
             } else {
                 out.push(StreamEvent::MessageEnd {
-                    stop_reason: StopReason::EndTurn,
+                    stop: crate::provider::Stop::of(StopReason::EndTurn),
                 });
             }
         }
@@ -764,31 +970,21 @@ pub(super) fn process_event(
             ));
         }
 
+        // An incomplete response is a stop, not a failure: the output cap, a content filter or a
+        // reason Meka has no class for each end the reply where it stopped, with what streamed.
         "response.incomplete" => {
             state.finished = true;
-            let response = data.get("response");
-            let reason = response
-                .and_then(|response| response.get("incomplete_details"))
-                .and_then(|details| details.get("reason"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            // The output cap is a stop reason, not a failure: the two sibling protocols report it
-            // as `MaxTokens` and commit the message, and the agent labels the turn so the user
-            // sees a truncated answer rather than an error. Reported as an error, a
-            // `max_output_tokens` profile loses every answer that reaches it, whole on the blocking
-            // path. Anything else (a content filter, an unknown reason) is deterministic on the
-            // request and ends the turn; never retryable.
-            if reason == "max_output_tokens" {
-                if let Some(usage) = response.and_then(|response| response.get("usage")) {
-                    out.push(StreamEvent::Usage(usage_from(usage)));
-                }
-                out.push(StreamEvent::MessageEnd {
-                    stop_reason: StopReason::MaxTokens,
-                });
-                return Ok(out);
+            let response = data.get("response").unwrap_or(&serde_json::Value::Null);
+            if let Some(usage) = response.get("usage") {
+                out.push(StreamEvent::Usage(usage_from(usage)));
             }
-            let message = format!("response.incomplete: {reason}");
-            return Err(MekaError::Provider(message));
+            if let Some(fields) = response_fields(response, &state.restated) {
+                out.push(StreamEvent::ResponseFields(fields));
+            }
+            out.push(StreamEvent::MessageEnd {
+                stop: responses_stop(response, "incomplete"),
+            });
+            return Ok(out);
         }
 
         other => {
@@ -823,16 +1019,37 @@ fn usage_from(usage: &serde_json::Value) -> TokenUsage {
     )
 }
 
-fn parse_response_status(status: &str) -> StopReason {
-    match status {
+/// How a response ended: its `status` as the word, classed by the reason `incomplete_details`
+/// gives for an incomplete one, which is recorded beside it. `ended` is the status the terminal
+/// event itself stands for, which classes a response that states none.
+fn responses_stop(response: &serde_json::Value, ended: &str) -> Stop {
+    let word = response.get("status").and_then(|status| status.as_str());
+    let incomplete_details = response
+        .get("incomplete_details")
+        .filter(|details| !details.is_null());
+    let reason = match word.unwrap_or(ended) {
         "completed" => StopReason::EndTurn,
-        "incomplete" => StopReason::MaxTokens,
+        "incomplete" => match incomplete_details
+            .and_then(|details| details.get("reason"))
+            .and_then(|reason| reason.as_str())
+        {
+            Some("max_output_tokens") => StopReason::MaxTokens,
+            Some("content_filter") => StopReason::ContentFilter,
+            _ => StopReason::Unknown,
+        },
         other => {
             tracing::warn!(
                 "the Responses endpoint returned an unrecognized response status {other:?}; mapping to Unknown"
             );
-            StopReason::Unknown(other.to_string())
+            StopReason::Unknown
         }
+    };
+    Stop {
+        reason,
+        word: word.map(str::to_string),
+        details: incomplete_details.map(|details| {
+            serde_json::Map::from_iter([("incomplete_details".to_string(), details.clone())])
+        }),
     }
 }
 
@@ -936,7 +1153,25 @@ pub(super) async fn stream<B: ResponsesBackend>(
         &cancellation,
     )
     .await?;
-    drive_responses_sse_stream(response, backend.origin(), event_sender, cancellation).await
+    drive_responses_sse_stream(
+        response,
+        backend.origin(),
+        restated_fields(&body_json),
+        event_sender,
+        cancellation,
+    )
+    .await
+}
+
+/// The top-level fields of the serialized request `body`, which a response object restates.
+fn restated_fields(body: &str) -> Vec<String> {
+    match serde_json::from_str::<std::collections::BTreeMap<String, serde::de::IgnoredAny>>(body) {
+        Ok(fields) => fields.into_keys().collect(),
+        Err(error) => {
+            tracing::warn!("failed to read the request's fields back: {error}");
+            Vec::new()
+        }
+    }
 }
 
 /// The serialized request, within the profile's ceiling when it states one.
@@ -981,12 +1216,14 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
 pub(super) async fn drive_responses_sse_stream(
     response: reqwest::Response,
     origin: Option<String>,
+    restated: Vec<String>,
     event_sender: mpsc::Sender<StreamEvent>,
     cancellation: CancellationToken,
 ) -> Result<()> {
     let mut protocol = ResponsesStream {
         state: SseState {
             origin,
+            restated,
             ..SseState::default()
         },
     };
@@ -1025,9 +1262,7 @@ impl crate::provider::sse::Protocol for ResponsesStream {
         event: eventsource_stream::Event,
         event_sender: &mpsc::Sender<StreamEvent>,
     ) -> Result<Step> {
-        let Some(data) = crate::provider::sse::frame_json("Responses", &event.data) else {
-            return Ok(Step::Continue);
-        };
+        let data = crate::provider::sse::frame_json("Responses", &event.data)?;
         let events = process_event(frame_name(&data, &event.event), &data, &mut self.state)?;
         for emit in events {
             if event_sender.send(emit).await.is_err() {
@@ -1046,7 +1281,7 @@ impl crate::provider::sse::Protocol for ResponsesStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::ToolResultContent;
+    use crate::{conversation::ToolResultContent, error::MekaError};
 
     /// The origin every sealed block these tests write records, as ChatGPT's would.
     const CHATGPT_ORIGIN: &str = "https://chatgpt.com";
@@ -1073,6 +1308,33 @@ mod tests {
             stream,
             Some(CHATGPT_ORIGIN),
         )
+    }
+
+    /// What Meka writes into a conversation reaches this wire rendered: the summary, a note behind
+    /// Meka's label, a call's arguments as the model sent them, which the spec defines as a
+    /// string, and a result's caption and large output's reference.
+    #[test]
+    fn what_meka_wrote_reaches_the_wire_rendered() {
+        let body = build_request_body(
+            "gpt-5",
+            "",
+            &Message::typed_content_for_test(),
+            &[],
+            None,
+            None,
+            true,
+        );
+        let sent = body["input"].to_string();
+        for needle in [
+            "the summary",
+            "[Meka harness] the note",
+            r#""arguments":"{\"path\": ""#,
+            "[Meka harness] the schema note",
+            "[Image: a.png]",
+            "<large-output name=\\\"the_entry\\\"",
+        ] {
+            assert!(sent.contains(needle), "{needle} is not sent: {sent}");
+        }
     }
 
     /// An invocation and an attached resource are text on this wire, in the order the message
@@ -1198,7 +1460,10 @@ mod tests {
                     id: "call_abc".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -1213,8 +1478,10 @@ mod tests {
                     },
                     ContentBlock::Text {
                         text: "[Message from test, arrived now]\nalso, what is 17*3?".to_string(),
+                        provider_fields: None,
                     },
                 ],
+                provider_fields: None,
             },
         ];
 
@@ -1242,7 +1509,10 @@ mod tests {
                     id: "call_abc".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -1254,6 +1524,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
 
@@ -1378,6 +1649,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         }];
         let body = build_request_body("gpt-5", "", &messages, &[], None, None, true);
         let input = body["input"].as_array().expect("input array");
@@ -1491,8 +1763,16 @@ mod tests {
             &mut state,
         )
         .expect("ok");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], StreamEvent::ThinkingDelta(ref t) if t == "hmm"));
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    StreamEvent::ThinkingPart(crate::conversation::ReasoningKind::Reasoning),
+                    StreamEvent::ThinkingDelta(text),
+                ] if text == "hmm"
+            ),
+            "{events:?}"
+        );
         assert!(state.in_reasoning);
     }
 
@@ -1540,14 +1820,26 @@ mod tests {
             events[0],
             StreamEvent::ToolUseStart { ref id, ref name } if id == "c1" && name == "file_read"
         ));
-        match &events[1] {
-            StreamEvent::ToolUseEnd { input } => assert_eq!(input["path"], "/tmp/x"),
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolArgumentsDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, ["{\"path\":", "\"/tmp/x\"}"]);
+        match &events[3] {
+            StreamEvent::ToolUseEnd { input, .. } => assert_eq!(input["path"], "/tmp/x"),
             other => panic!("expected ToolUseEnd, got {other:?}"),
         }
         // The Responses API reports `status: "completed"` even for tool-call turns; the presence of
         // the function call must still surface as `ToolUse`, not `EndTurn`.
-        assert!(matches!(events[2], StreamEvent::MessageEnd {
-            stop_reason: StopReason::ToolUse
+        assert!(matches!(&events[4], StreamEvent::ResponseFields(fields) if fields["id"] == "r1"));
+        assert!(matches!(events[5], StreamEvent::MessageEnd {
+            stop: crate::provider::Stop {
+                reason: StopReason::ToolUse,
+                ..
+            },
         }));
     }
 
@@ -1621,7 +1913,7 @@ mod tests {
         let paths: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                StreamEvent::ToolUseEnd { input } => input["path"].as_str(),
+                StreamEvent::ToolUseEnd { input, .. } => input["path"].as_str(),
                 _ => None,
             })
             .collect();
@@ -1629,7 +1921,10 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(StreamEvent::MessageEnd {
-                stop_reason: StopReason::ToolUse
+                stop: crate::provider::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                },
             })
         ));
     }
@@ -1649,6 +1944,7 @@ mod tests {
         let outcome = drive_responses_sse_stream(
             response,
             Some(CHATGPT_ORIGIN.to_string()),
+            Vec::new(),
             sender,
             CancellationToken::new(),
         )
@@ -1793,7 +2089,10 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(StreamEvent::MessageEnd {
-                stop_reason: StopReason::EndTurn
+                stop: crate::provider::Stop {
+                    reason: StopReason::EndTurn,
+                    ..
+                },
             })
         ));
     }
@@ -1828,7 +2127,7 @@ mod tests {
         let input = events
             .iter()
             .find_map(|event| match event {
-                StreamEvent::ToolUseEnd { input } => Some(input),
+                StreamEvent::ToolUseEnd { input, .. } => Some(input),
                 _ => None,
             })
             .expect("ToolUseEnd present");
@@ -1989,6 +2288,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
             Message::user("and now this"),
         ];
@@ -2003,7 +2303,7 @@ mod tests {
         )
         .expect("fits after redaction");
         assert!(
-            body.contains(crate::provider::budget::IMAGE_REDACTION_PLACEHOLDER),
+            body.contains(crate::conversation::BUDGET_REDACTION_NOTE),
             "the old image is redacted: {body}"
         );
         assert!(notice.is_some(), "the redaction is announced");
@@ -2038,38 +2338,56 @@ mod tests {
         assert!(state.finished);
         assert!(
             matches!(
-                events.as_slice(),
-                [
-                    StreamEvent::Usage(usage),
-                    StreamEvent::MessageEnd {
-                        stop_reason: StopReason::MaxTokens
-                    }
-                ] if usage.output_tokens == 512
-            ),
+                            events.as_slice(),
+                            [
+                                StreamEvent::Usage(usage),
+                                StreamEvent::ResponseFields(fields),
+                                StreamEvent::MessageEnd {
+             stop: crate::provider::Stop { reason: StopReason::MaxTokens, .. },
+            }
+                            ] if usage.output_tokens == 512
+                                && fields["usage"]["output_tokens"] == 512
+                                && !fields.contains_key("incomplete_details")
+                        ),
             "{events:?}"
         );
     }
 
-    /// Any other reason is deterministic on the request and fails the turn.
+    /// A content filter ends the reply where it stopped, as a stop of its own class with the
+    /// details recorded, rather than failing the turn.
     #[test]
-    fn process_event_incomplete_for_a_content_filter_yields_error() {
+    fn process_event_incomplete_for_a_content_filter_is_a_stop() {
         let mut state = SseState::default();
-        let result = process_event(
+        let events = process_event(
             "response.incomplete",
             &serde_json::json!({
-                "response": {"incomplete_details": {"reason": "content_filter"}}
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "content_filter"}
+                }
             }),
             &mut state,
-        );
+        )
+        .expect("a stop, not a failure");
         assert!(state.finished);
-        assert!(matches!(
-            result,
-            Err(MekaError::Provider(ref message)) if message.contains("content_filter")
-        ));
+        let [StreamEvent::MessageEnd { stop }] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(stop.reason, StopReason::ContentFilter);
+        assert_eq!(stop.word.as_deref(), Some("incomplete"));
+        assert_eq!(
+            stop.details,
+            Some(serde_json::Map::from_iter([(
+                "incomplete_details".to_string(),
+                serde_json::json!({"reason": "content_filter"})
+            )]))
+        );
     }
 
+    /// An incomplete response that gives no reason is one Meka cannot class, recorded with its
+    /// word rather than guessed to be the output cap.
     #[test]
-    fn process_event_status_incomplete_maps_to_max_tokens() {
+    fn an_incomplete_status_without_a_reason_is_unknown() {
         let mut state = SseState::default();
         let events = process_event(
             "response.completed",
@@ -2083,8 +2401,9 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, StreamEvent::MessageEnd {
-                    stop_reason: StopReason::MaxTokens
-                }))
+                stop: crate::provider::Stop { reason: StopReason::Unknown, word: Some(word), .. },
+            } if word == "incomplete")),
+            "{events:?}"
         );
     }
 
@@ -2129,6 +2448,7 @@ mod tests {
                         id,
                         ..
                     }),
+                ..
             } => {
                 assert_eq!(encrypted_content, "OPAQUE");
                 assert_eq!(id.as_deref(), Some("rs_123"));
@@ -2165,56 +2485,444 @@ mod tests {
                         encrypted_content,
                         id,
                         ..
-                    }),
-                }] if id.as_deref() == Some("rs_silent") && encrypted_content == "OPAQUE"
+                    }), .. }] if id.as_deref() == Some("rs_silent") && encrypted_content == "OPAQUE"
             ),
             "silent reasoning must still be captured, got {events:?}"
         );
     }
 
     /// A reasoning item with neither summary nor encrypted content has nothing to render and
-    /// nothing to replay, so it should not manufacture a block.
+    /// nothing to replay, so no block stands for it, and it is kept as it came.
     #[test]
-    fn an_empty_reasoning_item_produces_no_event() {
+    fn an_empty_reasoning_item_is_kept_as_it_came() {
         let mut state = SseState::default();
+        let item = serde_json::json!({ "type": "reasoning", "id": "rs_1", "summary": [] });
         let events = process_event(
             "response.output_item.done",
-            &serde_json::json!({ "item": { "type": "reasoning", "summary": [] } }),
-            &mut state,
-        )
-        .expect("ok");
-        assert!(events.is_empty(), "got {events:?}");
-    }
-
-    /// Each summary part is its own section. Without a break between them the parts run together
-    /// into one paragraph, and the first part must not be preceded by one.
-    #[test]
-    fn summary_parts_are_separated_but_the_first_one_is_not() {
-        let mut state = SseState::default();
-        let opening = process_event(
-            "response.reasoning_summary_part.added",
-            &serde_json::json!({ "summary_index": 0 }),
-            &mut state,
-        )
-        .expect("ok");
-        assert!(opening.is_empty(), "got {opening:?}");
-
-        process_event(
-            "response.reasoning_summary_text.delta",
-            &serde_json::json!({ "delta": "**First**\nthinking" }),
-            &mut state,
-        )
-        .expect("ok");
-
-        let between = process_event(
-            "response.reasoning_summary_part.added",
-            &serde_json::json!({ "summary_index": 1 }),
+            &serde_json::json!({ "item": item }),
             &mut state,
         )
         .expect("ok");
         assert!(
-            matches!(between.as_slice(), [StreamEvent::ThinkingDelta(text)] if text == "\n\n"),
-            "got {between:?}"
+            matches!(events.as_slice(), [StreamEvent::Unrecognized(kept)] if *kept == item),
+            "got {events:?}"
+        );
+    }
+
+    /// Two message items are two parts, each with the `phase` its item carried, and they go back
+    /// as two items with their phases; a refusal part is the model's words, classed a refusal, and
+    /// goes back as a refusal part.
+    #[test]
+    fn message_items_stay_apart_with_their_phase_and_a_refusal_is_its_own() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_text.delta",
+                serde_json::json!({"delta": "Looking."}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"item": {
+                    "type": "message", "role": "assistant", "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "Looking."}],
+                }}),
+            ),
+            (
+                "response.output_text.delta",
+                serde_json::json!({"delta": "Done."}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"item": {
+                    "type": "message", "role": "assistant", "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }}),
+            ),
+            (
+                "response.refusal.delta",
+                serde_json::json!({"delta": "Not that part."}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        for event in events {
+            accumulator.push(event);
+        }
+        let completion = accumulator.finish();
+        assert_eq!(completion.stop.reason, StopReason::Refusal);
+        let phases: Vec<(&str, Option<&serde_json::Value>)> = completion
+            .message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text {
+                    text,
+                    provider_fields,
+                } => Some((
+                    text.as_str(),
+                    provider_fields
+                        .as_ref()
+                        .and_then(|fields| fields.get("phase")),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(phases, [
+            ("Looking.", Some(&serde_json::json!("commentary"))),
+            ("Done.", Some(&serde_json::json!("final_answer"))),
+        ]);
+        let input = input_of(&[Message::user("hi"), completion.message]);
+        let sent: Vec<&serde_json::Value> = input
+            .iter()
+            .filter(|item| item["role"] == "assistant")
+            .collect();
+        assert_eq!(sent.len(), 3, "{input:?}");
+        assert_eq!(sent[0]["phase"], "commentary");
+        assert_eq!(sent[1]["phase"], "final_answer");
+        assert_eq!(sent[2]["content"][0]["type"], "refusal");
+        assert_eq!(sent[2]["content"][0]["refusal"], "Not that part.");
+    }
+
+    /// Every field a Responses reply returns has a home: a message item's own fields and each
+    /// content part's beyond its words ride its text, a reasoning item's own ride its thinking,
+    /// and the response object's are the record's, without what restates the request, save the
+    /// tier actually used.
+    #[test]
+    fn every_field_a_responses_reply_returns_has_a_home() {
+        let mut state = SseState {
+            restated: ["model", "instructions", "tools", "service_tier"]
+                .map(str::to_string)
+                .to_vec(),
+            ..SseState::default()
+        };
+        let mut events = Vec::new();
+        for (name, data) in [
+            (
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({"delta": "Plan"}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"item": {"type": "reasoning", "id": "rs_1", "status": "completed",
+                    "summary": [{"type": "summary_text", "text": "Plan"}],
+                    "encrypted_content": "E"}}),
+            ),
+            (
+                "response.output_text.delta",
+                serde_json::json!({"delta": "Done."}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"item": {"type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed", "content": [{"type": "output_text", "text": "Done.",
+                    "annotations": [{"type": "url_citation", "url": "u"}]}]}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"id": "resp_1", "object": "response",
+                    "status": "completed", "model": "gpt-x", "instructions": "a long prompt",
+                    "tools": [{"type": "function", "name": "t"}], "service_tier": "default",
+                    "temperature": 1.0, "output": [], "usage": {"input_tokens": 3,
+                    "output_tokens": 2, "output_tokens_details": {"reasoning_tokens": 1}}}}),
+            ),
+        ] {
+            events.extend(process_event(name, &data, &mut state).expect("a frame"));
+        }
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        for event in events {
+            accumulator.push(event);
+        }
+        let completion = accumulator.finish();
+        let [
+            ContentBlock::Thinking {
+                provider_fields: Some(thinking_fields),
+                ..
+            },
+            ContentBlock::Text {
+                provider_fields: Some(text_fields),
+                ..
+            },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(
+            serde_json::Value::Object(thinking_fields.clone()),
+            serde_json::json!({"status": "completed"})
+        );
+        assert_eq!(
+            serde_json::Value::Object(text_fields.clone()),
+            serde_json::json!({"id": "msg_1", "status": "completed",
+                "content": [{"annotations": [{"type": "url_citation", "url": "u"}]}]})
+        );
+        let record = completion
+            .response_fields
+            .expect("the response's own fields");
+        assert_eq!(record["id"], "resp_1");
+        assert_eq!(
+            record["service_tier"], "default",
+            "the tier used is the response's"
+        );
+        assert_eq!(
+            record["temperature"], 1.0,
+            "a default the request did not set is stated"
+        );
+        assert_eq!(
+            record["usage"]["output_tokens_details"]["reasoning_tokens"],
+            1
+        );
+        for held in ["instructions", "tools", "model", "status", "output"] {
+            assert!(!record.contains_key(held), "{held}: {record:?}");
+        }
+    }
+
+    /// A call is the one the item that opened it names, and one it did not name is named by the
+    /// item that finishes it; a call neither names is kept as it came and never run. Each way the
+    /// reply holds the call once.
+    #[test]
+    fn a_call_is_named_by_the_item_that_opens_or_finishes_it() {
+        let blocks = |added: serde_json::Value, done: serde_json::Value| {
+            let (events, outcome) = run_events(&[
+                (
+                    "response.output_item.added",
+                    serde_json::json!({"output_index": 0, "item": added}),
+                ),
+                (
+                    "response.function_call_arguments.delta",
+                    serde_json::json!({"output_index": 0, "delta": "{}"}),
+                ),
+                (
+                    "response.output_item.done",
+                    serde_json::json!({"output_index": 0, "item": done}),
+                ),
+            ]);
+            if let Err(error) = outcome {
+                panic!("{error}");
+            }
+            let mut accumulator = crate::provider::MessageAccumulator::new();
+            for event in events {
+                accumulator.push(event);
+            }
+            accumulator
+                .finish()
+                .message
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::ToolUse {
+                        id, name, unparsed, ..
+                    } => format!("call {id} {name} refused={}", unparsed.is_some()),
+                    ContentBlock::Unrecognized { .. } => "unrecognized".to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let named = serde_json::json!({"type": "function_call", "call_id": "c1",
+            "name": "file_read", "arguments": "{}"});
+        let unnamed = serde_json::json!({"type": "function_call", "arguments": "{}"});
+        assert_eq!(blocks(named.clone(), unnamed.clone()), [
+            "call c1 file_read refused=false"
+        ]);
+        assert_eq!(blocks(unnamed.clone(), named), [
+            "call c1 file_read refused=false"
+        ]);
+        assert_eq!(blocks(unnamed.clone(), unnamed), ["unrecognized"]);
+    }
+
+    /// A finished call whose `arguments` is not the string the spec defines is refused with what
+    /// was there, never run with arguments it did not send; one that sends none reads what its
+    /// deltas carried.
+    #[test]
+    fn a_finished_call_s_arguments_are_read_as_the_spec_defines_them() {
+        let call = |arguments: Option<serde_json::Value>| {
+            let mut item = serde_json::json!({"type": "function_call", "call_id": "c1",
+                "name": "file_read"});
+            if let Some(arguments) = arguments {
+                item["arguments"] = arguments;
+            }
+            let (events, outcome) = run_events(&[
+                (
+                    "response.output_item.added",
+                    serde_json::json!({"output_index": 0, "item": {"type": "function_call",
+                        "call_id": "c1", "name": "file_read"}}),
+                ),
+                (
+                    "response.function_call_arguments.delta",
+                    serde_json::json!({"output_index": 0, "delta": "{\"path\":\"a\"}"}),
+                ),
+                (
+                    "response.output_item.done",
+                    serde_json::json!({"output_index": 0, "item": item}),
+                ),
+            ]);
+            if let Err(error) = outcome {
+                panic!("{error}");
+            }
+            events
+                .into_iter()
+                .find_map(|event| match event {
+                    StreamEvent::ToolUseEnd { input, .. } => Some(Ok(input)),
+                    StreamEvent::ToolCallRefused { unparsed, .. } => Some(Err(unparsed)),
+                    _ => None,
+                })
+                .expect("the call ends")
+        };
+        assert_eq!(call(None), Ok(serde_json::json!({"path": "a"})));
+        assert_eq!(
+            call(Some(serde_json::Value::Null)),
+            Ok(serde_json::json!({"path": "a"}))
+        );
+        let refused = call(Some(serde_json::json!({"path": "b"}))).expect_err("refused");
+        assert_eq!(refused.text.as_deref(), Some("{\"path\":\"b\"}"));
+    }
+
+    /// The fields the spec defines on an `output_text` part, its `annotations` and `logprobs`, go
+    /// back on the part as it held them; its other fields do not.
+    #[test]
+    fn a_text_part_s_annotations_go_back_on_it() {
+        let annotations = serde_json::json!([{"type": "url_citation", "url": "u"}]);
+        let input = input_of(&[Message::user("hi"), Message {
+            role: crate::conversation::Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "Done.".to_string(),
+                provider_fields: serde_json::json!({"id": "msg_1",
+                        "content": [{"annotations": annotations, "logprobs": [], "other": 1}]})
+                .as_object()
+                .cloned(),
+            }],
+            provider_fields: None,
+        }]);
+        assert_eq!(
+            input[1]["content"],
+            serde_json::json!([{"type": "output_text", "text": "Done.",
+                "annotations": annotations, "logprobs": []}])
+        );
+    }
+
+    /// A reply recorded with nothing in it puts no item on the wire, which carries no empty output,
+    /// whether it holds no part or a `message` item that streamed no words.
+    #[test]
+    fn an_empty_reply_puts_no_item_on_the_wire() {
+        let reply = |content| crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
+            content,
+            provider_fields: None,
+        };
+        let input = input_of(&[
+            Message::user("hi"),
+            reply(Vec::new()),
+            Message::user("again"),
+            reply(vec![ContentBlock::Text {
+                text: String::new(),
+                provider_fields: Some(serde_json::Map::from_iter([(
+                    "phase".to_owned(),
+                    serde_json::json!("final_answer"),
+                )])),
+            }]),
+            Message::user("once more"),
+        ]);
+        assert_eq!(input.len(), 3, "{input:?}");
+        assert!(input.iter().all(|item| item["role"] == "user"), "{input:?}");
+    }
+
+    /// An output item of a type Meka reads nothing from is kept as it came, and never sent back.
+    #[test]
+    fn an_unknown_output_item_is_kept_and_never_sent() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.done",
+                serde_json::json!({"item": {"type": "web_search_call", "id": "ws_1"}}),
+            ),
+            (
+                "response.output_text.delta",
+                serde_json::json!({"delta": "Found it."}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        for event in events {
+            accumulator.push(event);
+        }
+        let message = accumulator.finish().message;
+        assert!(
+            matches!(&message.content[0], ContentBlock::Unrecognized { parts }
+                if parts[0]["type"] == "web_search_call"),
+            "{:?}",
+            message.content
+        );
+        let input = input_of(&[Message::user("hi"), message]);
+        assert!(
+            !input.iter().any(|item| item["type"] == "web_search_call"),
+            "{input:?}"
+        );
+    }
+
+    /// Each summary part and each part of raw reasoning is recorded as the part it is, with
+    /// nothing Meka wrote between them, and goes back in the arrays it came in.
+    #[test]
+    fn reasoning_parts_are_kept_as_returned_and_go_back_as_returned() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.reasoning_summary_part.added",
+                serde_json::json!({ "summary_index": 0 }),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({ "delta": "**First**\nthinking" }),
+            ),
+            (
+                "response.reasoning_summary_part.added",
+                serde_json::json!({ "summary_index": 1 }),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({ "delta": "**Second**" }),
+            ),
+            (
+                "response.reasoning_text.delta",
+                serde_json::json!({ "delta": "raw" }),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({ "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "SEALED",
+                }}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        for event in events {
+            accumulator.push(event);
+        }
+        let message = accumulator.finish().message;
+        let [ContentBlock::Thinking { parts, .. }] = message.content.as_slice() else {
+            panic!("{:?}", message.content);
+        };
+        assert_eq!(parts, &[
+            crate::conversation::ReasoningPart::summary("**First**\nthinking"),
+            crate::conversation::ReasoningPart::summary("**Second**"),
+            crate::conversation::ReasoningPart::reasoning("raw"),
+        ]);
+        let item = reasoning_input_item(Some("rs_1"), parts, "SEALED");
+        assert_eq!(
+            item["summary"],
+            serde_json::json!([
+                {"type": "summary_text", "text": "**First**\nthinking"},
+                {"type": "summary_text", "text": "**Second**"},
+            ])
+        );
+        assert_eq!(
+            item["content"],
+            serde_json::json!([{"type": "reasoning_text", "text": "raw"}])
         );
     }
 
@@ -2280,7 +2988,10 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "screenshot".to_string(),
                 input: serde_json::json!({}),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         }];
         messages.push(Message {
             role: Role::User,
@@ -2290,6 +3001,7 @@ mod tests {
                 is_error: false,
                 display: None,
             }],
+            provider_fields: None,
         });
         let body = build_request_body("gpt-5", "", &messages, &[], None, None, true);
         let input = body["input"].as_array().expect("input array");
@@ -2307,12 +3019,16 @@ mod tests {
 
     fn thinking(summary: &str, encrypted: Option<&str>, id: Option<&str>) -> ContentBlock {
         ContentBlock::Thinking {
-            thinking: summary.to_string(),
+            parts: (!summary.is_empty())
+                .then(|| crate::conversation::ReasoningPart::summary(summary))
+                .into_iter()
+                .collect(),
             opaque: encrypted.map(|encrypted_content| OpaqueReasoning::Sealed {
                 encrypted_content: encrypted_content.to_string(),
                 id: id.map(str::to_string),
                 origin: Some("https://chatgpt.com".to_string()),
             }),
+            provider_fields: None,
         }
     }
 
@@ -2321,6 +3037,8 @@ mod tests {
             id: id.to_string(),
             name: "file_read".to_string(),
             input: serde_json::json!({}),
+            unparsed: None,
+            provider_fields: None,
         }
     }
 
@@ -2423,6 +3141,8 @@ mod tests {
                 id: "call_1".to_string(),
                 name: SEARCH_TOOL_NAME.to_string(),
                 input: serde_json::json!({"names": ["mcp__kv__probe"]}),
+                unparsed: None,
+                provider_fields: None,
             }]),
             Message {
                 role: Role::User,
@@ -2434,6 +3154,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
         let body = build_request_body_for(
@@ -2469,6 +3190,8 @@ mod tests {
                 id: "call_1".to_string(),
                 name: SEARCH_TOOL_NAME.to_string(),
                 input: serde_json::json!({"names": ["mcp__kv__probe"]}),
+                unparsed: None,
+                provider_fields: None,
             }]),
             Message {
                 role: Role::User,
@@ -2485,6 +3208,7 @@ mod tests {
                     is_error: false,
                     display: None,
                 }],
+                provider_fields: None,
             },
         ];
         let deferred = [definition("mcp__kv__probe")];
@@ -2551,13 +3275,16 @@ mod tests {
         outcome.expect("clean stream");
         assert!(
             matches!(
-                events.as_slice(),
-                [
-                    StreamEvent::ToolUseStart { id, name },
-                    StreamEvent::ToolUseEnd { input },
-                    StreamEvent::MessageEnd { stop_reason: StopReason::ToolUse },
-                ] if id == "call_1" && name == SEARCH_TOOL_NAME && input["names"][0] == "mcp__kv__probe"
-            ),
+                            events.as_slice(),
+                            [
+                                StreamEvent::ToolUseStart { id, name },
+                                StreamEvent::ToolUseEnd { input, .. },
+                                StreamEvent::ResponseFields(_),
+                                StreamEvent::MessageEnd {
+             stop: crate::provider::Stop { reason: StopReason::ToolUse, .. },
+            },
+                            ] if id == "call_1" && name == SEARCH_TOOL_NAME && input["names"][0] == "mcp__kv__probe"
+                        ),
             "{events:?}"
         );
     }
@@ -2566,6 +3293,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content,
+            provider_fields: None,
         }
     }
 
@@ -2645,12 +3373,14 @@ mod tests {
             assistant(vec![
                 ContentBlock::Text {
                     text: "let me look".to_string(),
+                    provider_fields: None,
                 },
                 thinking("first", Some("ONE"), Some("rs_1")),
                 tool_call("call_1"),
                 thinking("second", Some("TWO"), Some("rs_2")),
                 ContentBlock::Text {
                     text: "done".to_string(),
+                    provider_fields: None,
                 },
             ]),
         ]);
@@ -2675,7 +3405,7 @@ mod tests {
 
     /// A session is not bound to the provider that recorded it: `meka -c -p other` resumes one
     /// under anything. A thinking block another wire recorded must not be replayed here. A Claude
-    /// signature is a MAC from another cryptosystem and its `thinking` is the reasoning itself,
+    /// signature is a MAC from another cryptosystem and its parts are the reasoning itself,
     /// so sending them as `encrypted_content` and a `summary` hands OpenAI a blob it cannot
     /// decrypt and leaks the whole Claude reasoning beside it; a Chat Completions block is the
     /// reasoning in the clear with nothing sealed to replay at all.
@@ -2689,11 +3419,15 @@ mod tests {
         ] {
             let foreign_turn = assistant(vec![
                 ContentBlock::Thinking {
-                    thinking: "the full reasoning".to_string(),
+                    parts: vec![crate::conversation::ReasoningPart::reasoning(
+                        "the full reasoning",
+                    )],
                     opaque: Some(opaque.clone()),
+                    provider_fields: None,
                 },
                 ContentBlock::Text {
                     text: "answer".to_string(),
+                    provider_fields: None,
                 },
             ]);
             let serialized = serde_json::to_string(&serde_json::Value::Array(input_of(&[
@@ -2805,7 +3539,13 @@ mod tests {
             .expect("the turn's reasoning must reach the next request");
         assert_eq!(reasoning["id"], "rs_live");
         assert_eq!(reasoning["encrypted_content"], "OPAQUE");
-        assert_eq!(reasoning["summary"][0]["text"], "**Plan**\n\n**Act**");
+        assert_eq!(
+            reasoning["summary"],
+            serde_json::json!([
+                {"type": "summary_text", "text": "**Plan**"},
+                {"type": "summary_text", "text": "**Act**"},
+            ])
+        );
         // And ahead of the answer it produced, which is what the API pairs it with.
         let shape: Vec<&str> = input
             .iter()

@@ -116,11 +116,14 @@ When the turn ends, a row closes it, in the same dim register as the other stage
 • Finished at 19:28 after 19m 19s
 ```
 
-The opening words say how the turn ended (`Finished`, `Interrupted`, `Failed`, or `Hit the output
-limit` and `Declined by the model` for an answer that stopped short of being one), and
+The opening words say how the turn ended (`Finished`, `Interrupted`, `Failed`, or, for an answer
+that stopped short of being one, `Hit the output limit`, `Hit the context window`, `Declined by the
+model`, `Stopped by a content filter` or `Stopped for an unrecognized reason`), and
 [`display.turn_end_summary`](../configuration/config-file.md#displayturn_end_summary) picks the
 facts after it: the time, the duration, the tokens used. A resumed session closes every recorded
-turn the same way, so the scrollback says when each one ended.
+turn the same way, so the scrollback says when each one ended. A reply inside the turn that made
+calls and stopped the same way says so in a row of its own, `Reply hit the output limit`, since its
+calls run and the turn goes on.
 
 ## Expanding and collapsing
 

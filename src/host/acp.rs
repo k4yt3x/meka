@@ -894,7 +894,7 @@ mod tests {
 
     /// The nudge's stage direction arrives between two replies in one agent message, so it
     /// carries paragraph breaks and stays a chunk whatever the client renders; an advisory is a
-    /// `notice` at its level's severity for a client that renders one, else its `[meka]` line.
+    /// `notice` at its level's severity for a client that renders one, else its `[Meka]` line.
     #[test]
     fn a_stage_direction_is_a_paragraph_of_its_own_and_an_advisory_a_notice_where_rendered() {
         let update = |notice: &crate::frontend::Notice, renders_notices: bool| {
@@ -915,14 +915,14 @@ mod tests {
             false,
         );
         assert_eq!(chunk["sessionUpdate"], "agent_message_chunk", "{chunk}");
-        assert_eq!(chunk["content"]["text"], "[meka] context is filling up");
+        assert_eq!(chunk["content"]["text"], "[Meka] context is filling up");
         let warned = update(
             &crate::frontend::Notice::warn("the provider retried"),
             false,
         );
         assert_eq!(
             warned["content"]["text"],
-            "[meka warn] the provider retried"
+            "[Meka warn] the provider retried"
         );
         let notice = update(
             &crate::frontend::Notice::info("context is filling up"),
@@ -1812,16 +1812,70 @@ mod tests {
             created_at: String::new(),
             said: None,
             event,
+            reply: None,
         })
         .collect();
         let said: Vec<String> = replay_entries(&rows, &[], 3)
             .iter()
             .map(|entry| match entry {
-                Replayed::Message(message) => message.text_content(),
+                Replayed::Message { message, .. } => message.text_content(),
                 Replayed::Compaction { generation, .. } => format!("compaction {generation}"),
+                Replayed::CompactionFailed { .. } => "compaction failed".to_string(),
             })
             .collect();
         assert_eq!(said, ["first", "one", "compaction 3", "third"]);
+    }
+
+    /// A replay sends a reply's words and reasoning as the live turn sent them: a refusal's words
+    /// as the model's, nothing for a part with nothing to read, and a thought that follows another
+    /// starting apart from it.
+    #[test]
+    fn a_replay_sends_what_a_reply_holds_as_the_live_turn_did() {
+        use crate::conversation::{ContentBlock, ReasoningPart};
+        let blocks = [
+            ContentBlock::Thinking {
+                parts: vec![ReasoningPart::reasoning("")],
+                opaque: None,
+                provider_fields: None,
+            },
+            ContentBlock::Thinking {
+                parts: vec![ReasoningPart::reasoning("Weighing it.")],
+                opaque: None,
+                provider_fields: None,
+            },
+            ContentBlock::RedactedThinking {
+                data: "SEALED".to_string(),
+                provider_fields: None,
+            },
+            ContentBlock::Text {
+                text: "  ".to_string(),
+                provider_fields: None,
+            },
+            ContentBlock::Refusal {
+                text: "I can't help with that.".to_string(),
+                provider_fields: None,
+            },
+        ];
+        let mut after_thought = false;
+        let said: Vec<serde_json::Value> = blocks
+            .iter()
+            .filter_map(|block| frontend::reply_update(block, &mut after_thought))
+            .map(|update| serde_json::to_value(update).expect("serializes"))
+            .collect();
+        let chunks: Vec<(&str, &str)> = said
+            .iter()
+            .map(|update| {
+                (
+                    update["sessionUpdate"].as_str().expect("a kind"),
+                    update["content"]["text"].as_str().expect("text"),
+                )
+            })
+            .collect();
+        assert_eq!(chunks, [
+            ("agent_thought_chunk", "Weighing it."),
+            ("agent_thought_chunk", "\n\n[redacted thinking]"),
+            ("agent_message_chunk", "I can't help with that."),
+        ]);
     }
 
     /// A client that advertised `session.compaction` gets the protocol's entry: no error beside a
@@ -1971,6 +2025,8 @@ mod tests {
             id: "call_0".to_string(),
             name: name.to_string(),
             input: serde_json::json!({ key: "notes" }),
+            unparsed: None,
+            provider_fields: None,
         };
         let result = |text: &str, is_error: bool| MekaContentBlock::ToolResult {
             tool_use_id: "call_0".to_string(),
@@ -1985,42 +2041,55 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![
                     MekaContentBlock::Thinking {
-                        thinking: "saving".to_string(),
+                        parts: vec![crate::conversation::ReasoningPart::reasoning("saving")],
                         opaque: None,
+                        provider_fields: None,
                     },
                     MekaContentBlock::Text {
                         text: "noting it".to_string(),
+                        provider_fields: None,
                     },
                     call("memory_read", "name"),
                 ],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
                 content: vec![result("the note", false)],
+                provider_fields: None,
             },
             Message {
                 role: Role::Assistant,
                 content: vec![call("memory_write", "name")],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
                 content: vec![result("refused", true)],
+                provider_fields: None,
             },
             // Two calls of one round under one id, paired with their results by place.
             Message {
                 role: Role::Assistant,
                 content: vec![call("memory_write", "name"), call("memory_read", "name")],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
                 content: vec![result("first", false), result("second", false)],
+                provider_fields: None,
             },
             Message {
                 role: Role::Assistant,
                 content: vec![call("memory_write", "name")],
+                provider_fields: None,
             },
         ];
         let cwd = SharedCwd::new(PathBuf::from("/"));
+        let rounds: Vec<crate::conversation::RecordedMessage> = rounds
+            .into_iter()
+            .map(crate::conversation::RecordedMessage::unrecorded)
+            .collect();
         let calls: Vec<serde_json::Value> = frontend::checkpoint_calls("c1", &rounds, &cwd)
             .into_iter()
             .map(|call| serde_json::to_value(call).expect("serializes"))
@@ -2199,6 +2268,7 @@ mod tests {
     fn words(text: &str) -> Vec<crate::conversation::ContentBlock> {
         vec![crate::conversation::ContentBlock::Text {
             text: text.to_string(),
+            provider_fields: None,
         }]
     }
 
@@ -2219,6 +2289,7 @@ mod tests {
         let parts = vec![
             crate::conversation::ContentBlock::Text {
                 text: "/demo compare ".to_string(),
+                provider_fields: None,
             },
             crate::conversation::ContentBlock::Resource {
                 uri: "file:///a.rs".to_string(),
@@ -2227,6 +2298,7 @@ mod tests {
             },
             crate::conversation::ContentBlock::Text {
                 text: " with the old one".to_string(),
+                provider_fields: None,
             },
         ];
         let Some(crate::conversation::ContentBlock::Invocation {
@@ -2250,9 +2322,11 @@ mod tests {
         let split = vec![
             crate::conversation::ContentBlock::Text {
                 text: "/demo fix".to_string(),
+                provider_fields: None,
             },
             crate::conversation::ContentBlock::Text {
                 text: "this".to_string(),
+                provider_fields: None,
             },
         ];
         let Some(crate::conversation::ContentBlock::Invocation { directive, .. }) =

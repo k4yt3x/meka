@@ -82,7 +82,9 @@ pub(crate) fn extract_loaded_tool_names(messages: &[Message]) -> HashSet<String>
     for message in messages {
         for block in &message.content {
             match block {
-                ContentBlock::ToolUse { id, name, input } if name == LOAD_TOOL_NAME => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } if name == LOAD_TOOL_NAME => {
                     let names = load_tool_names(input);
                     if !names.is_empty() {
                         pending.insert(id.clone(), names);
@@ -1907,7 +1909,10 @@ mod tests {
                 id: id.to_string(),
                 name: LOAD_TOOL_NAME.to_string(),
                 input: serde_json::json!({ "name": target }),
+                unparsed: None,
+                provider_fields: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -1922,6 +1927,7 @@ mod tests {
                 is_error,
                 display: None,
             }],
+            provider_fields: None,
         }
     }
 
@@ -1969,7 +1975,10 @@ mod tests {
                     id: "u1".to_string(),
                     name: LOAD_TOOL_NAME.to_string(),
                     input: serde_json::json!({"name": ["alpha", "beta"]}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             tool_result("u1", "loaded", false),
         ];
@@ -2050,7 +2059,10 @@ mod tests {
                     id: "u1".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({ "name": "anything" }),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             tool_result("u1", "ok", false),
         ];
@@ -2067,7 +2079,10 @@ mod tests {
                     id: "u1".to_string(),
                     name: LOAD_TOOL_NAME.to_string(),
                     input: serde_json::json!({}),
+                    unparsed: None,
+                    provider_fields: None,
                 }],
+                provider_fields: None,
             },
             tool_result("u1", "Error", true),
         ];
@@ -2101,13 +2116,18 @@ mod tests {
                     id: "u1".to_string(),
                     name: LOAD_TOOL_NAME.to_string(),
                     input: serde_json::json!({"name": "scratchpad_read"}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
                 ContentBlock::ToolUse {
                     id: "u2".to_string(),
                     name: LOAD_TOOL_NAME.to_string(),
                     input: serde_json::json!({"name": "scratchpad_edit"}),
+                    unparsed: None,
+                    provider_fields: None,
                 },
             ],
+            provider_fields: None,
         };
         let user_results = Message {
             role: Role::User,
@@ -2129,6 +2149,7 @@ mod tests {
                     display: None,
                 },
             ],
+            provider_fields: None,
         };
         let loaded = extract_loaded_tool_names(&[assistant, user_results]);
         assert_eq!(loaded.len(), 2);
@@ -2159,13 +2180,18 @@ mod tests {
                         id: "u1".to_string(),
                         name: "file_read".to_string(),
                         input: serde_json::json!({"path": "/tmp/x"}),
+                        unparsed: None,
+                        provider_fields: None,
                     },
                     ContentBlock::ToolUse {
                         id: "u2".to_string(),
                         name: LOAD_TOOL_NAME.to_string(),
                         input: serde_json::json!({"name": "scratchpad_read"}),
+                        unparsed: None,
+                        provider_fields: None,
                     },
                 ],
+                provider_fields: None,
             },
             Message {
                 role: Role::User,
@@ -2187,6 +2213,7 @@ mod tests {
                         display: None,
                     },
                 ],
+                provider_fields: None,
             },
         ];
         let loaded = extract_loaded_tool_names(&messages);

@@ -613,7 +613,10 @@ impl Screen {
         } else if let Some((id, text)) = self.followups.pop_front() {
             self.launch.transcript.send_followup(id, text.clone());
             self.ask_host(HostEvent::UserInput {
-                parts: vec![crate::conversation::ContentBlock::Text { text }],
+                parts: vec![crate::conversation::ContentBlock::Text {
+                    text,
+                    provider_fields: None,
+                }],
                 images: Vec::new(),
             });
         }
@@ -1916,7 +1919,10 @@ impl Screen {
                 parts: if trimmed.is_empty() {
                     Vec::new()
                 } else {
-                    vec![crate::conversation::ContentBlock::Text { text: trimmed }]
+                    vec![crate::conversation::ContentBlock::Text {
+                        text: trimmed,
+                        provider_fields: None,
+                    }]
                 },
                 images: attachments
                     .into_iter()
@@ -1942,7 +1948,10 @@ impl Screen {
             ran_under: super::model::RanUnder::Pending,
         });
         self.ask_host(HostEvent::UserInput {
-            parts: vec![crate::conversation::ContentBlock::Text { text: trimmed }],
+            parts: vec![crate::conversation::ContentBlock::Text {
+                text: trimmed,
+                provider_fields: None,
+            }],
             images: Vec::new(),
         });
     }

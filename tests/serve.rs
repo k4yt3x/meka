@@ -252,6 +252,17 @@ scopes = [{scopes_str}]
         panic!("meka serve lost the port race {MAX_ATTEMPTS} times in a row");
     }
 
+    /// Stop the server and hand back everything it logged.
+    fn stop(mut self) -> String {
+        self.child.kill().expect("kill meka serve");
+        self.child.wait().expect("reap meka serve");
+        self.stderr_handle
+            .take()
+            .expect("the log reader")
+            .join()
+            .expect("the log")
+    }
+
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
         self.client
             .request(method, format!("{}{}", self.base_url, path))
@@ -2246,6 +2257,49 @@ fn re_attach_to_evicted_session_continues_conversation() {
         user_messages.iter().any(|t| t.contains("again")),
         "post-reattach turn's user message should be in history; got {user_messages:?}",
     );
+}
+
+/// One provider failure is one line in the log, however many views of it the server renders: a
+/// held turn's answer beside its terminal, and a compaction's answer beside its turn's terminal.
+#[test]
+fn a_provider_failure_is_logged_once() {
+    let script = serde_json::json!([
+        [{ "type": "fail", "message": "scripted turn failure" }],
+        [{ "type": "text", "text": "answered" }],
+        [{ "type": "fail", "message": "scripted summarizer failure" }]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", script);
+    let id = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send")
+        .json::<serde_json::Value>()
+        .expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    for (message, status) in [("go", 502), ("again", 200)] {
+        let response = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turns"))
+            .json(&serde_json::json!({"message": message, "stream": false}))
+            .send()
+            .expect("send");
+        assert_eq!(response.status().as_u16(), status, "{message}");
+    }
+    let compacted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
+        .send()
+        .expect("send");
+    assert_eq!(compacted.status().as_u16(), 502);
+    let logs = harness.stop();
+    for failure in ["scripted turn failure", "scripted summarizer failure"] {
+        assert_eq!(
+            logs.matches(&format!("provider error: {failure}")).count(),
+            1,
+            "{logs}"
+        );
+    }
 }
 
 /// Server-side errors (5xx) are NOT cached by the idempotency layer: a transient provider
@@ -6110,7 +6164,10 @@ fn blocking_turn_with_reasoning_stream_includes_thinking() {
         .iter()
         .find(|block| block["type"] == "thinking")
         .expect("the reply must include a thinking block when capability is on");
-    assert_eq!(thinking["thinking"], "let me reason about this");
+    assert_eq!(
+        thinking["parts"],
+        serde_json::json!([{"kind": "reasoning", "text": "let me reason about this"}])
+    );
     let text = blocks
         .iter()
         .find(|block| block["type"] == "text")

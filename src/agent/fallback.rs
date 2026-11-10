@@ -246,7 +246,7 @@ mod tests {
     use super::*;
     use crate::{
         agent::{TurnCancellation, TurnInput, TurnOutcome, tests::build_test_agent_on},
-        conversation::Conversation,
+        conversation::{Conversation, StopReason},
         provider::{
             ProviderRegistry,
             mock::{MockEvent, MockProvider, MockStopReason},
@@ -406,7 +406,7 @@ mod tests {
     async fn a_turn_whose_profile_is_exhausted_continues_on_its_fallback() {
         let family = family(vec![exhausted()], vec![answer("from backup")]).await;
         let outcome = run(&family).await.expect("the fallback answers");
-        assert_eq!(outcome, TurnOutcome::EndTurn);
+        assert_eq!(outcome, TurnOutcome::of(StopReason::EndTurn));
         assert_eq!(
             family.main.streams().len(),
             1,

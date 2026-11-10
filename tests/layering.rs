@@ -64,13 +64,15 @@ const RANKS: &[(&str, u32)] = &[
     ("schedule", 15),
     // The model: vocabulary every layer above may hold.
     ("conversation", 16),
-    ("stats", 16),
     ("config", 16),
     ("memory", 16),
+    // What a reply spent, which the conversation records beside each reply.
+    ("stats", 17),
     ("entry", 17),
     ("permission", 17),
     ("checklist", 17),
-    ("image", 17),
+    // The redaction a stat counts.
+    ("image", 18),
     // Leaves. `process` is the one door for every process Meka starts, below `sandbox`, which
     // takes its job definition from it.
     ("fs", 18),
@@ -528,6 +530,85 @@ fn production_code_reads_meka_variables_only_where_the_ledger_says() {
     assert!(
         violations.is_empty(),
         "environment reads outside the ledger:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// Every label Meka renders into text a model or a client reads, and the one file whose production
+/// code may spell it, the file that renders it. The migration module reads the old spellings
+/// through frozen copies of its own and is not listed. An entry that stops being true fails the
+/// test too.
+const LABELS: &[(&str, &str)] = &[
+    ("[Meka harness]", "src/conversation.rs"),
+    // With its attribute: a tool's description names the tag to the model as `<large-output>`.
+    ("<large-output name=", "src/conversation.rs"),
+    (
+        "[Conversation summary from session compaction]",
+        "src/agent/compaction.rs",
+    ),
+    (
+        "[Messages received, as written, oldest first]",
+        "src/agent/compaction.rs",
+    ),
+    ("[End of messages received]", "src/agent/compaction.rs"),
+    ("[Message from ", "src/prompt.rs"),
+    ("[Message arrived ", "src/prompt.rs"),
+    ("[Meka]", "src/host/acp/frontend.rs"),
+    ("[Meka warn]", "src/host/acp/frontend.rs"),
+];
+
+/// A label is spelled by the file that renders it and nowhere else, so nothing reads meaning back
+/// out of text Meka wrote: what a reader needs to know is a block's type or a field. Matched by
+/// the label's literal text, which a comparison, a prefix check, a regular expression and a
+/// query would all have to spell.
+#[test]
+fn a_label_is_spelled_only_where_it_is_rendered() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    source_files(&root.join("src"), &mut files);
+    files.sort();
+
+    let mut seen: BTreeSet<(&str, String)> = BTreeSet::new();
+    let mut violations = Vec::new();
+    for path in &files {
+        let relative = path
+            .strip_prefix(root)
+            .expect("a path under the manifest directory")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "src/store/migrations.rs" {
+            continue;
+        }
+        let source = fs::read_to_string(path).expect("read a source file");
+        let code = strip_test_code(&source)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (label, renderer) in LABELS {
+            if !code.contains(label) {
+                continue;
+            }
+            if relative == *renderer {
+                seen.insert((label, relative.clone()));
+            } else {
+                violations.push(format!(
+                    "{relative} spells {label:?}, which {renderer} renders"
+                ));
+            }
+        }
+    }
+    for (label, renderer) in LABELS {
+        if !seen.contains(&(*label, renderer.to_string())) {
+            violations.push(format!(
+                "{renderer} no longer spells {label:?}; remove it from the ledger"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "labels spelled outside their renderer:\n  {}",
         violations.join("\n  ")
     );
 }

@@ -29,17 +29,6 @@ use crate::{
     provider::ToolDefinition,
 };
 
-/// The line `file_read` answers an image with beside the image itself, naming the file it read,
-/// which a screen counting the images leaves out.
-pub(crate) fn image_marker(path: &str) -> String {
-    format!("[Image: {path}]")
-}
-
-/// Whether `line` is an [`image_marker`].
-pub(crate) fn is_image_marker(line: &str) -> bool {
-    line.starts_with("[Image: ") && line.ends_with(']')
-}
-
 /// Record `canonical` as read, stamped with what the file looks like right now.
 ///
 /// A path that cannot be stated is simply not recorded, so the next `file_edit` asks for a re-read.
@@ -1087,8 +1076,9 @@ impl Tool for ReadFileTool {
 
                 return Ok(ToolOutput {
                     content: vec![
-                        ToolResultContent::Text {
-                            text: image_marker(&path),
+                        // The caption naming the file read, beside the image itself.
+                        ToolResultContent::ImageCaption {
+                            caption: format!("Image: {path}"),
                         },
                         ToolResultContent::Image {
                             source: ImageSource::Base64 {

@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 23;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 25;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -174,6 +174,10 @@ pub(crate) struct ExportedEvent {
     /// For a copy a compaction kept, when it was said; absent on every other event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) said_at: Option<String>,
+    /// For a reply, what its provider said about it beside its content; absent on every other
+    /// event and on a reply written before Meka recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reply: Option<crate::conversation::ReplyRecord>,
 }
 /// A turn as its row records it: the stored names (`status`, `error_type`) rather than the API's
 /// spellings, so an import writes the row back as it was.
@@ -206,7 +210,9 @@ impl From<crate::store::turns::TurnRecord> for ExportedTurn {
             started_at: turn.started_at,
             ended_at: turn.ended_at,
             status: turn.status.map(|status| status.name().to_string()),
-            stop_reason: turn.stop_reason,
+            stop_reason: turn
+                .stop_reason
+                .map(|stop_reason| stop_reason.name().to_string()),
             error_type,
             detail,
             cancel_reason: turn.reason.map(|reason| reason.name().to_string()),
@@ -247,6 +253,7 @@ pub(crate) async fn build_session_export(
                     .and_then(|said| said.turn_id)
                     .map(|id| id.to_string()),
                 said_at: stamp.said.map(|said| said.created_at),
+                reply: stamp.reply,
             })
             .collect();
         let turns: Vec<ExportedTurn> = store
@@ -664,6 +671,7 @@ pub(crate) fn plan_import(
                 turn_id: turn,
                 copy_of: event.copy_of,
                 said,
+                reply: event.reply,
             });
         }
         let permission = match (session.permission, default_permission) {
@@ -799,6 +807,131 @@ pub(crate) fn parents_first_order(
 mod tests {
     use super::*;
 
+    /// A turn a compaction kept that the turn sweep then takes is told by its copy, which holds
+    /// what was said, not the context's rewrite of it: the reasoning the view took out, and the
+    /// reply's record.
+    #[tokio::test]
+    async fn a_released_copy_holds_what_its_row_held() {
+        use crate::conversation::{
+            ContentBlock, Event, Message, ReplyRecord, Role, Stop, StopReason,
+        };
+        let store = crate::store::Store::for_test().await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("session");
+        let (old, new) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let long_ago = (chrono::Utc::now() - chrono::TimeDelta::days(90)).to_rfc3339();
+        let recent = chrono::Utc::now().to_rfc3339();
+        for (turn, at) in [(old, &long_ago), (new, &recent)] {
+            store
+                .turn_store()
+                .open_turn(
+                    id,
+                    turn,
+                    crate::store::turns::TurnSource::Client,
+                    crate::permission::Permission::Read,
+                    at,
+                )
+                .await
+                .expect("turn");
+        }
+        let answer = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::RedactedThinking {
+                    data: "sealed".to_string(),
+                    provider_fields: None,
+                },
+                ContentBlock::Text {
+                    text: "Seen.".to_string(),
+                    provider_fields: None,
+                },
+            ],
+            provider_fields: None,
+        };
+        let record = ReplyRecord {
+            stop: Some(Stop::of(StopReason::EndTurn)),
+            cut: None,
+            model: Some("a-model".to_string()),
+            profile: None,
+            usage: None,
+            provider_fields: None,
+        };
+        store
+            .save_events_atomic(
+                id,
+                vec![
+                    crate::store::RecordedEvent::from(Event::Append(Message::user("look?"))),
+                    crate::store::RecordedEvent::reply(answer.clone(), record.clone()),
+                    // Claude refused a signature: the view takes the thinking out.
+                    Event::Unsign.into(),
+                ],
+                Some(old),
+            )
+            .await
+            .expect("save");
+        store
+            .turn_store()
+            .close_turn(
+                old,
+                &crate::store::turns::TurnEnding::succeeded(
+                    StopReason::EndTurn,
+                    crate::store::turns::TurnUsage::default(),
+                ),
+            )
+            .await
+            .expect("close");
+        store
+            .run_sql_for_test(&format!(
+                "UPDATE turns SET ended_at = '{long_ago}' WHERE id = '{old}'"
+            ))
+            .await;
+        store
+            .save_event(id, &Event::Append(Message::user("next?")), Some(new))
+            .await
+            .expect("save");
+        let boundary = Event::CompactBoundary {
+            summary: Message::user("summary"),
+            replaced_count: 3,
+            record: crate::conversation::CompactionRecord::for_test(),
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+        };
+        // The view's tail, as the compaction copies it: the reply without its thinking.
+        store
+            .save_compaction(
+                id,
+                &boundary,
+                &[
+                    Message::user("look?"),
+                    Message::assistant_text("Seen."),
+                    Message::user("next?"),
+                ],
+                Some(new),
+            )
+            .await
+            .expect("compaction");
+        let swept = store
+            .delete_expired_turns(chrono::Utc::now() - chrono::TimeDelta::days(30), None)
+            .await
+            .expect("sweep");
+        assert!(swept.rows > 0, "the earlier turn goes");
+        let told = store
+            .load_events_with_timestamps(id)
+            .await
+            .expect("load")
+            .into_iter()
+            .find_map(|(stamp, event)| match event {
+                Event::Append(message) if message.role == Role::Assistant => {
+                    Some((message, stamp.reply))
+                }
+                _ => None,
+            })
+            .expect("the copy tells the reply");
+        assert_eq!(told, (answer, Some(record)));
+    }
+
     /// A turn sweep that takes the turns a retry's rewrite reached back into leaves that rewrite
     /// unable to replay below the compaction that kept its message, and the archive of what is
     /// left still imports, the copy still standing for the row it was said in.
@@ -837,7 +970,7 @@ mod tests {
             .close_turn(
                 old,
                 &crate::store::turns::TurnEnding::succeeded(
-                    "end_turn",
+                    crate::conversation::StopReason::EndTurn,
                     crate::store::turns::TurnUsage::default(),
                 ),
             )
@@ -885,8 +1018,8 @@ mod tests {
             .collect();
         assert_eq!(
             links,
-            [None, None, None, Some(0)],
-            "the copy stands for its row"
+            [None, None, None, Some(0), None],
+            "the copy stands for its row, and the repair after it restates the view"
         );
         let plan = plan_import(
             archive,
@@ -1243,7 +1376,7 @@ mod tests {
             event: crate::conversation::Event::CompactBoundary {
                 summary: crate::conversation::Message::user("summary"),
                 replaced_count: 0,
-                loaded_tools_snapshot: std::collections::HashSet::new(),
+                loaded_tools_snapshot: Default::default(),
                 checklist_snapshot: crate::checklist::ChecklistState::default(),
                 record: crate::conversation::CompactionRecord::for_test(),
             },
@@ -1251,6 +1384,7 @@ mod tests {
             copy_of: None,
             said_turn_id: None,
             said_at: None,
+            reply: None,
         });
         let whole = serde_json::to_value(&archive).expect("json");
         parse_session_export(whole.to_string().as_bytes()).expect("the whole archive reads");

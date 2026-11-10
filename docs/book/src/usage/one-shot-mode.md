@@ -84,10 +84,12 @@ meka --oneshot -p "how many files are here?" --format json
 }
 ```
 
-`stop_reason` is `end_turn`, `max_tokens`, `refusal` (with `refusal_text` beside it when the model
-gave one) or `interrupted`. `session_id` is omitted, not `null`, for a turn interrupted before the
-session existed, which is the one way a run prints a report without one; every other field is always
-present. `text` is the assistant's text with the rounds joined by a blank line,
+`stop_reason` is `end_turn`, `tool_use`, `max_tokens`, `context_window`, `refusal` (with
+`refusal_text` beside it when the model wrote words), `content_filter`, `unknown` (a stop the
+provider named that Meka has no class for) or `interrupted`. `session_id` is omitted, not `null`,
+for a turn interrupted before the session existed, which is the one way a run prints a report
+without one, and a call in `tool_calls` carries `unparsed` only when its arguments did not parse,
+as the HTTP history's `tool_use` does; every other field is always present. `text` is the assistant's text with the rounds joined by a blank line,
 `tool_calls` lists every call in the order it was dispatched, and `usage` sums the rounds and the
 compactions the turn ran. `notices`
 is what Meka itself said during the turn (a refused approval, a lost write, a declined MCP

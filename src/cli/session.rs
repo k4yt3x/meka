@@ -550,7 +550,13 @@ pub(crate) async fn export_session(
                 .into_iter()
                 .collect();
             (
-                conversation::format_session_as_markdown(session_id, &events, &scratchpad_entries),
+                conversation::format_session_as_markdown(
+                    session_id,
+                    events
+                        .iter()
+                        .map(|recorded| (&recorded.event, recorded.reply.as_ref())),
+                    &scratchpad_entries,
+                ),
                 "md",
             )
         }

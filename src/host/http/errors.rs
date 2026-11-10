@@ -271,6 +271,27 @@ pub(crate) fn api_wording(error: &MekaError) -> String {
     api_sentence(error).unwrap_or_else(|| error.sentence())
 }
 
+/// Log a failure for the operator, with the upstream's text where it has one.
+fn log_failure(error: &MekaError) {
+    let kind = error.kind();
+    match error {
+        MekaError::Provider(message)
+        | MekaError::InvalidRequest(message)
+        | MekaError::StreamError(message)
+        | MekaError::RetryableProvider { message, .. }
+        | MekaError::ProviderExhausted { message, .. } => {
+            tracing::warn!("provider error: {message}");
+        }
+        MekaError::ContextOverflow(message) => tracing::warn!("context overflow: {message}"),
+        MekaError::McpTurnGated { .. } => tracing::warn!("mcp gate declined a turn: {error}"),
+        MekaError::Installation(message) => tracing::error!("installation error: {message}"),
+        other if kind == ErrorKind::Internal => {
+            tracing::error!("unhandled agent error mapped to 500: {other}");
+        }
+        _ => {}
+    }
+}
+
 /// The status each catalog entry answers with where the kind alone decides it. Two vary by site
 /// and take their common one here: `Idempotency` is 429 at the cache cap, and `InvalidBody` is
 /// 400 for a path or query the router refused; those sites say so themselves.
@@ -350,27 +371,21 @@ impl ProblemDetail {
     ///
     /// Deliberately not extended to [`MekaError::McpTurnGated`], whose reasons are Meka's own
     /// subprocess text rather than a provider's response; see the key's own documentation.
+    ///
+    /// The failure is logged here, where it is concluded, whatever the surface shows: the
+    /// upstream's text goes to the log unconditionally, and a fault that reaches a caller as a 500
+    /// is the operator's to read about there. Another view of a failure concluded elsewhere is
+    /// [`Self::for_logged_error`], so each is logged once.
     pub(crate) fn for_error(error: &MekaError, relay_provider_errors: bool) -> Self {
+        log_failure(error);
+        Self::for_logged_error(error, relay_provider_errors)
+    }
+
+    /// [`Self::for_error`] for a failure already logged where it was concluded: a turn's, by the
+    /// terminal every turn records; an inbox item's, by the scheduler that gave it up or deferred
+    /// it.
+    pub(crate) fn for_logged_error(error: &MekaError, relay_provider_errors: bool) -> Self {
         let kind = error.kind();
-        // Logged here, once, whatever the surface shows: the upstream's text goes to the log
-        // unconditionally, and a fault that reaches a caller as a 500 is the operator's to read
-        // about there.
-        match error {
-            MekaError::Provider(message)
-            | MekaError::InvalidRequest(message)
-            | MekaError::StreamError(message)
-            | MekaError::RetryableProvider { message, .. }
-            | MekaError::ProviderExhausted { message, .. } => {
-                tracing::warn!("provider error: {message}");
-            }
-            MekaError::ContextOverflow(message) => tracing::warn!("context overflow: {message}"),
-            MekaError::McpTurnGated { .. } => tracing::warn!("mcp gate declined a turn: {error}"),
-            MekaError::Installation(message) => tracing::error!("installation error: {message}"),
-            other if kind == ErrorKind::Internal => {
-                tracing::error!("unhandled agent error mapped to 500: {other}");
-            }
-            _ => {}
-        }
         let mut problem = Self::new(kind, status_of(kind), api_wording(error));
         // An extension member rather than a replacement for `detail`, because the two carry
         // different things and neither substitutes for the other. `detail` is Meka's own sentence

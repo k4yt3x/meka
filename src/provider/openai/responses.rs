@@ -400,17 +400,20 @@ mod tests {
                     role: crate::conversation::Role::Assistant,
                     content: vec![
                         crate::conversation::ContentBlock::Thinking {
-                            thinking: "summary".to_string(),
+                            parts: vec![crate::conversation::ReasoningPart::reasoning("summary")],
                             opaque: Some(crate::conversation::OpaqueReasoning::Sealed {
                                 encrypted_content: "SEALED".to_string(),
                                 id: Some("rs_1".to_string()),
                                 origin: Some(origin.to_string()),
                             }),
+                            provider_fields: None,
                         },
                         crate::conversation::ContentBlock::Text {
                             text: "answer".to_string(),
+                            provider_fields: None,
                         },
                     ],
+                    provider_fields: None,
                 },
                 Message::user("go on"),
             ]

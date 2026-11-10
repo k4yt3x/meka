@@ -128,9 +128,9 @@ pub(crate) struct TurnOptions {
 pub(crate) struct TurnResponse {
     #[serde(flatten)]
     pub(crate) record: crate::store::turns::TurnRecord,
-    /// Refusal explanation when `stop_reason == "refusal"`; omitted otherwise. Mirrors the
-    /// `refusal_text` field on the streaming `turn.finished` event, so blocking and streaming
-    /// clients share the same shape.
+    /// The model's words when `stop_reason` is `refusal` and it wrote any: its refusal, else the
+    /// text it wrote before the stop; omitted otherwise. Mirrors the `refusal_text` field on the
+    /// streaming `turn.finished` event, so blocking and streaming clients share the same shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) refusal_text: Option<String>,
     /// What the turn wrote, as `GET /v1/sessions/{id}/history` lists it: the message it opened
@@ -949,7 +949,9 @@ async fn run_json_turn(
                     crate::host::http::sse::SseEventType::TurnFailed
                 };
                 notify_turn_end(&state.webhooks, event_type, turn_id, session_id);
-                let problem = ProblemDetail::for_error(&error, state.config.relay_provider_errors);
+                // The turn's terminal, recorded above, logged the failure.
+                let problem =
+                    ProblemDetail::for_logged_error(&error, state.config.relay_provider_errors);
                 Err(match message_withdrawn(&recorder) {
                     Some(withdrawn) => problem.with("message_withdrawn", withdrawn),
                     None => problem,
@@ -1458,14 +1460,12 @@ fn finished_parts(
     turn_id: Uuid,
     session_id: Uuid,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
-    let stop_reason = outcome.stop_reason();
     let mut data = serde_json::json!({
         "turn_id": turn_id.to_string(),
         "session_id": session_id.to_string(),
-        "stop_reason": stop_reason,
+        "stop_reason": outcome.stop_reason.name(),
     });
-    if let TurnOutcome::Refusal(text) = outcome
-        && !text.is_empty()
+    if let Some(text) = &outcome.refusal_text
         && let Some(obj) = data.as_object_mut()
     {
         obj.insert(
@@ -1584,10 +1584,7 @@ async fn turn_response(
 
 /// The refusal's words, on a refusal that gave any, and the notices Meka said during the turn.
 fn reply_parts(outcome: &TurnOutcome, recorder: &Recorder) -> (Option<String>, Vec<NoticeView>) {
-    let refusal_text = match outcome {
-        TurnOutcome::Refusal(text) if !text.is_empty() => Some(text.clone()),
-        _ => None,
-    };
+    let refusal_text = outcome.refusal_text.clone();
     let notices = recorder
         .iter()
         .filter_map(|event| match event {
@@ -2202,13 +2199,19 @@ mod tests {
             FrontendEvent::AssistantTextDelta("I cannot help with that.".into()),
             FrontendEvent::Notice(Notice::warn("auto-denied tool")),
         ];
-        let (refusal, notices) =
-            reply_parts(&TurnOutcome::Refusal("policy violation".into()), &recorder);
+        let refused = TurnOutcome {
+            stop_reason: crate::conversation::StopReason::Refusal,
+            refusal_text: Some("policy violation".into()),
+        };
+        let (refusal, notices) = reply_parts(&refused, &recorder);
         assert_eq!(refusal.as_deref(), Some("policy violation"));
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].level, "warn");
         assert_eq!(notices[0].text, "auto-denied tool");
-        let (refusal, _) = reply_parts(&TurnOutcome::EndTurn, &recorder);
+        let (refusal, _) = reply_parts(
+            &TurnOutcome::of(crate::conversation::StopReason::EndTurn),
+            &recorder,
+        );
         assert_eq!(refusal, None);
     }
 
@@ -2236,7 +2239,7 @@ mod tests {
         };
         let recorder: Recorder = vec![FrontendEvent::TurnEnded {
             turn_id: turn,
-            ending: TurnEnding::succeeded("end_turn", TurnUsage {
+            ending: TurnEnding::succeeded(crate::conversation::StopReason::EndTurn, TurnUsage {
                 input_tokens: 7,
                 ..Default::default()
             }),
@@ -2246,7 +2249,7 @@ mod tests {
             session,
             turn,
             Some(opened),
-            &TurnOutcome::EndTurn,
+            &TurnOutcome::of(crate::conversation::StopReason::EndTurn),
             &recorder,
         )
         .await
@@ -2260,7 +2263,7 @@ mod tests {
                 session,
                 turn,
                 None,
-                &TurnOutcome::EndTurn,
+                &TurnOutcome::of(crate::conversation::StopReason::EndTurn),
                 &recorder
             )
             .await
@@ -2288,7 +2291,7 @@ mod tests {
             session,
             turn,
             None,
-            &TurnOutcome::EndTurn,
+            &TurnOutcome::of(crate::conversation::StopReason::EndTurn),
             &recorder,
         )
         .await
