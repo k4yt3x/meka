@@ -24,11 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** An empty reply streams nothing to ACP or the feed.
 - **Breaking:** `refusal_text` holds only the model's own words.
 - **Breaking:** ACP's fallback prefix is `[Meka]` or `[Meka warn]`; read severity from a `notice`.
+- **Breaking:** ACP refuses a request sent before `initialize` is answered, and a JSON-RPC batch.
 - Replies go back to the provider with their reasoning and citations wherever the protocol allows.
 - Meka's notes to the model read `[Meka harness]`, and the screen leaves them out of tool output.
 - Meka is written with a capital wherever a person reads it; the command stays `meka`.
 - Session archives are `format_version` 25; older archives are brought forward on import.
 - Session search no longer finds compaction summaries written before 0.13.
+- Upgrade `agent-client-protocol` to 5.1, `rmcp` to 3.9, `similar` to 3 and `toml` to 1.2.
+- An MCP server is told when Meka stops waiting on a read, a prompt, a list or a subscription.
+- An MCP message over 16 MiB is refused; over stdio, the call it answers then times out.
+- MCP OAuth refuses a link-local address, and a loopback one unless the `url` names loopback.
+- A change diff that runs out of time stays a diff rather than replacing the whole file.
 
 ### Fixed
 
@@ -46,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A prompt that opens like one of Meka's notes titles its session.
 - `tool_search` finds a tool whose name is longer than 128 bytes.
 - `meka serve` logs each provider failure once.
+- An ACP `initialize` asking for a newer protocol without `clientInfo` is answered with version 1.
+- A scheduled job in the hour before a daylight-saving jump no longer also runs right after it.
+- A schedule that names Sunday as `7` with `L` (`7L`, `7#L`) runs on the last Sunday; it never ran.
 
 ## [0.91.0] - 2026-11-08
 

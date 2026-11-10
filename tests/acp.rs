@@ -4799,8 +4799,8 @@ fn acp_session_prompt_surfaces_provider_error_as_jsonrpc_error() {
         response["result"].is_null(),
         "JSON-RPC response carries either result or error, not both; got: {response}",
     );
-    // `agent_client_protocol::util::internal_error` sets the standard `"Internal error"` JSON-RPC
-    // message and stuffs the explanatory string into `data`.
+    // `agent_client_protocol::Error::internal_error` sets the standard `"Internal error"` JSON-RPC
+    // message, and Meka puts the explanatory string into `data`.
     let message = response["error"]["message"]
         .as_str()
         .unwrap_or_else(|| panic!("error.message must be a string: {response}"));

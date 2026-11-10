@@ -395,7 +395,7 @@ pub(super) async fn slash_to_invocation(
 pub(super) async fn run_prompt_turn(
     state: Arc<ServerState>,
     request: PromptRequest,
-    responder: agent_client_protocol::Responder<PromptResponse>,
+    responder: agent_client_protocol::v1::Responder<PromptResponse>,
     admitted: Option<crate::host::TurnGuard>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
@@ -580,7 +580,7 @@ pub(super) async fn run_prompt_turn(
             &frontend.connection,
             &frontend.session_id,
             SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                agent_client_protocol::schema::v1::TextContent::new(body),
+                agent_client_protocol::v1::schema::TextContent::new(body),
             ))),
         );
         // A local command spends nothing, and says so: `usage` is the turn's own.
@@ -611,9 +611,9 @@ pub(super) async fn run_prompt_turn(
             // the correct classification; `InvalidParams` would mislead the client into thinking
             // the user's request was malformed. The reason names a path, so it stays in the log.
             tracing::warn!("failed to load skill '{name}': {source}");
-            return responder.respond_with_error(agent_client_protocol::util::internal_error(
-                format!("failed to load skill '{name}'"),
-            ));
+            return responder.respond_with_error(super::internal_error(format!(
+                "failed to load skill '{name}'"
+            )));
         }
     };
 

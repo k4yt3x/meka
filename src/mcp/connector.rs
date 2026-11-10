@@ -694,14 +694,12 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
                 // rmcp makes the spawn, so the door's two halves are called here, around it.
                 crate::process::prepare(&mut command);
 
-                // No bound on an incoming line: rmcp 3.1's `TokioChildProcess` builds its
-                // transport with no seam to configure, and that transport's `receive` reads until
-                // newline into an unbounded `Vec` (`JsonRpcMessageCodec::max_length` applies to
-                // the write side only). Bounding it means spawning the child and building the
-                // transport here, which also means reimplementing the `ChildWithCleanup` drop
-                // guard that kills the child; getting that wrong is worse than the exposure,
-                // which is a buggy server the user chose to run rather than a hostile one.
-                // Revisit when rmcp exposes the read length.
+                // An incoming line is bounded at rmcp's `DEFAULT_MAX_LINE_LENGTH` (16 MiB, an HTTP
+                // event's bound too): `TokioChildProcess` builds its transport with that default
+                // and no seam to change it, and drops a longer line with an error in the log, so
+                // the call it answers runs to its timeout. Choosing another bound means spawning
+                // the child and building the transport here, reimplementing the `ChildWithCleanup`
+                // drop guard that kills the child.
                 //
                 // Stderr is piped rather than inherited because an MCP server that logs to
                 // stderr would otherwise write straight onto Meka's terminal and corrupt the

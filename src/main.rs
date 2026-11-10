@@ -460,7 +460,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
 ///    display forwarded over SSH does, while the OSC 52 sequence written beside it carries the text
 ///    wherever the terminal allows. An `=error` floor keeps the clipboard thread's own failures.
 ///
-/// Verified against rmcp 2.1 and arboard 3.6.
+/// Verified against rmcp 3.9 and arboard 3.7.
 fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
     if let Some(value) = rust_log

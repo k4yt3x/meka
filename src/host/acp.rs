@@ -30,27 +30,31 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Agent as AcpAgentRole, ByteStreams, Client, ConnectionTo,
-    schema::v1::{
-        AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-        CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
-        CompactionStatus, CompactionUpdate, ConfigOptionUpdate, ContentBlock, ContentChunk,
-        CurrentModeUpdate, Diff, EmbeddedResource, EmbeddedResourceResource, ForkSessionRequest,
-        ForkSessionResponse, ImageContent, Implementation, InitializeRequest, InitializeResponse,
-        ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-        NewSessionRequest, NewSessionResponse, NoticeSeverity, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-        PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, ResumeSessionRequest,
-        ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-        SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-        SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
-        SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeId,
-        SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-        SetSessionModeResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-        Usage, UsageUpdate, WriteTextFileRequest,
+    Agent as AcpAgentRole, ByteStreams, Client,
+    v1::{
+        ConnectionTo,
+        schema::{
+            AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+            CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
+            CompactionStatus, CompactionUpdate, ConfigOptionUpdate, ContentBlock, ContentChunk,
+            CurrentModeUpdate, Diff, EmbeddedResource, EmbeddedResourceResource,
+            ForkSessionRequest, ForkSessionResponse, ImageContent, Implementation,
+            InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+            LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+            NoticeSeverity, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+            PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+            ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest, ResourceLink,
+            ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
+            SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+            SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+            SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
+            SessionListCapabilities, SessionMode, SessionModeId, SessionModeState,
+            SessionNotification, SessionResumeCapabilities, SessionUpdate,
+            SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+            SetSessionModeResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
+            ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+            UnstructuredCommandInput, Usage, UsageUpdate, WriteTextFileRequest,
+        },
     },
 };
 use async_trait::async_trait;
@@ -77,10 +81,15 @@ use crate::{
     workspace::{SharedCwd, SharedRoots, resolve_against_cwd},
 };
 
+/// An internal error (`-32603`) whose data is `message`.
+pub(super) fn internal_error(message: impl ToString) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::internal_error().data(message.to_string())
+}
+
 /// Build a JSON-RPC `InvalidParams` error (`-32602`) with a free-form human-readable message in the
-/// `data` field. Mirrors [`agent_client_protocol::util::internal_error`] but for the
-/// input-validation cases (unknown sessionId, malformed UUID, unsupported level, non-text content).
-/// Clients can rely on the JSON-RPC code to distinguish "bad input" from "server failure".
+/// `data` field. Mirrors [`internal_error`] but for the input-validation cases (unknown sessionId,
+/// malformed UUID, unsupported level, non-text content). Clients can rely on the JSON-RPC code to
+/// distinguish "bad input" from "server failure".
 fn invalid_params_error(message: impl ToString) -> agent_client_protocol::Error {
     agent_client_protocol::Error::invalid_params().data(message.to_string())
 }
@@ -124,7 +133,7 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
         } else {
             sentence.to_string()
         };
-        agent_client_protocol::util::internal_error(data)
+        internal_error(data)
     };
     // Classified by the kind every surface reads, so a refusal added to `MekaError` lands where
     // its kind says rather than in a catch-all here.
@@ -146,24 +155,20 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
         // failure complete with the command line and its path.
         crate::error::ErrorKind::McpUnavailable => {
             tracing::warn!("an MCP server kept the request from running: {error}");
-            agent_client_protocol::util::internal_error(error.sentence())
+            internal_error(error.sentence())
         }
         // The operator's `ca_cert_file`, proxy or `base_url`. Its own words are for the terminal
         // `meka acp` was started from, not for the editor on the other end of the pipe, which can
         // do nothing with a path in someone else's configuration file.
         _ if matches!(error, MekaError::Installation(_)) => {
             tracing::error!("installation error: {error}");
-            agent_client_protocol::util::internal_error(
-                "Meka is misconfigured; the detail is in the Meka log",
-            )
+            internal_error("Meka is misconfigured; the detail is in the Meka log")
         }
         // A store path, a filesystem path, or a fault nobody classified. The `Display` names
         // Meka's own directories either way.
         _ => {
             tracing::error!("agent error reported to the client: {error}");
-            agent_client_protocol::util::internal_error(
-                "Meka could not complete this request; the detail is in the Meka log",
-            )
+            internal_error("Meka could not complete this request; the detail is in the Meka log")
         }
     }
 }
@@ -195,9 +200,7 @@ fn build_failure_error(
         Some(error) => acp_error_for(error, relay_provider_errors),
         None => {
             tracing::error!("{context}: {error:#}");
-            agent_client_protocol::util::internal_error(format!(
-                "{context}; the detail is in the Meka log"
-            ))
+            internal_error(format!("{context}; the detail is in the Meka log"))
         }
     }
 }
@@ -264,7 +267,7 @@ pub(crate) async fn run_acp(
     });
 
     let acp_result = AcpAgentRole
-        .builder()
+        .v1()
         .name("meka")
         .on_receive_request(
             {
@@ -727,7 +730,7 @@ mod tests {
         );
         assert_eq!(
             reported.code,
-            agent_client_protocol::ErrorCode::InvalidParams
+            agent_client_protocol::ErrorCode::INVALID_PARAMS
         );
         let data = serde_json::to_string(&reported.data).unwrap_or_default();
         assert!(data.contains("work"), "{data}");
@@ -759,7 +762,7 @@ mod tests {
             assert!(!data.contains(leaky), "{error} reached the client: {data}");
             assert_eq!(
                 reported.code,
-                agent_client_protocol::ErrorCode::InternalError,
+                agent_client_protocol::ErrorCode::INTERNAL_ERROR,
                 "{error}"
             );
         }
@@ -842,7 +845,7 @@ mod tests {
         let reported = acp_error_for(&error, false);
         assert_eq!(
             reported.code,
-            agent_client_protocol::ErrorCode::InvalidParams
+            agent_client_protocol::ErrorCode::INVALID_PARAMS
         );
         let data = serde_json::to_string(&reported.data).unwrap_or_default();
         assert!(data.contains("max_request_bytes"), "{data}");
@@ -1033,7 +1036,7 @@ mod tests {
     #[test]
     fn format_embedded_resource_text_inlines_contents() {
         let embedded = EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
-            agent_client_protocol::schema::v1::TextResourceContents::new(
+            agent_client_protocol::v1::schema::TextResourceContents::new(
                 "fn main() {}",
                 "file:///proj/src/main.rs",
             )
@@ -1049,7 +1052,7 @@ mod tests {
     #[test]
     fn format_embedded_resource_blob_emits_marker_without_payload() {
         let embedded = EmbeddedResource::new(EmbeddedResourceResource::BlobResourceContents(
-            agent_client_protocol::schema::v1::BlobResourceContents::new(
+            agent_client_protocol::v1::schema::BlobResourceContents::new(
                 "QUJD",
                 "file:///proj/logo.png",
             )
@@ -1069,7 +1072,7 @@ mod tests {
         // A `<resource>` tag is part of the user's prompt body. Stored beside the agent's own
         // context block, the words come back intact.
         let embedded = EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
-            agent_client_protocol::schema::v1::TextResourceContents::new(
+            agent_client_protocol::v1::schema::TextResourceContents::new(
                 "hello",
                 "file:///note.txt",
             ),
@@ -1452,7 +1455,7 @@ mod tests {
 
     #[test]
     fn translate_permission_outcome_maps_each_option() {
-        use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
+        use agent_client_protocol::v1::schema::SelectedPermissionOutcome;
 
         // Capture sticky pushes via a `Cell` so each call site borrows it fresh; this sidesteps the
         // closure-vs-direct-read borrow conflict that comes from sharing one `&mut Vec`.
@@ -1527,7 +1530,7 @@ mod tests {
 
     #[test]
     fn translate_permission_outcome_unknown_option_denies() {
-        use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
+        use agent_client_protocol::v1::schema::SelectedPermissionOutcome;
         let result = translate_permission_outcome(
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("future_option")),
             "file_read",
@@ -1666,7 +1669,7 @@ mod tests {
     }
 
     fn select_options(option: &SessionConfigOption) -> Vec<(String, Option<String>)> {
-        use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
+        use agent_client_protocol::v1::schema::{SessionConfigKind, SessionConfigSelectOptions};
         match &option.kind {
             SessionConfigKind::Select(select) => match &select.options {
                 SessionConfigSelectOptions::Ungrouped(options) => options
@@ -1685,7 +1688,7 @@ mod tests {
     }
 
     fn current_value(option: &SessionConfigOption) -> String {
-        use agent_client_protocol::schema::v1::SessionConfigKind;
+        use agent_client_protocol::v1::schema::SessionConfigKind;
         match &option.kind {
             SessionConfigKind::Select(select) => select.current_value.0.as_ref().to_string(),
             other => panic!("expected a select option, got {other:?}"),
@@ -1736,7 +1739,7 @@ mod tests {
     /// The switch is advertised as a boolean option reading the same cell the dispatch door reads.
     #[test]
     fn the_approvals_config_option_reports_the_switch() {
-        use agent_client_protocol::schema::v1::SessionConfigKind;
+        use agent_client_protocol::v1::schema::SessionConfigKind;
 
         use crate::permission::{EnabledPermissions, SharedPermission};
         fn current(option: &SessionConfigOption) -> bool {
@@ -2505,7 +2508,7 @@ mod tests {
 
         let updated_caps = ClientCapabilities::new()
             .fs(
-                agent_client_protocol::schema::v1::FileSystemCapabilities::new()
+                agent_client_protocol::v1::schema::FileSystemCapabilities::new()
                     .read_text_file(true)
                     .write_text_file(true),
             )

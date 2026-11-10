@@ -31,6 +31,11 @@ mod support;
 const ROWS: u16 = 40;
 const COLUMNS: u16 = 100;
 
+/// `cells` as the screen size the emulator takes, which is never zero.
+fn screen_size(cells: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(cells).expect("a screen is at least one cell")
+}
+
 fn screen_install(permission: &str, extra_display: &str, extra_tables: &str) -> Install {
     let install = Install::new();
     install.write_config(&format!(
@@ -274,7 +279,7 @@ fn pump(
     kitty: bool,
     columns: u16,
 ) -> (Screens, bool, Option<String>, Vec<String>) {
-    let mut parser = vt100::Parser::new(ROWS, columns, 0);
+    let mut parser = vt100::Parser::new(screen_size(ROWS), screen_size(columns), 0);
     let mut screens = Vec::new();
     let mut enhanced = false;
     let mut raw: Vec<u8> = Vec::new();
@@ -377,7 +382,7 @@ fn last_clipboard_write(output: &[u8]) -> Option<String> {
 fn settled_rows(parser: &vt100::Parser) -> Vec<String> {
     parser
         .screen()
-        .rows(0, parser.screen().size().1)
+        .rows(0, parser.screen().size().1.get())
         .take(usize::from(ROWS) - 1)
         .map(|row| row.trim_end().to_string())
         // The working row turns its spinner and counts its seconds for as long as the agent
@@ -405,7 +410,7 @@ fn is_working_row(row: &str) -> bool {
 fn rows_of(parser: &vt100::Parser) -> Vec<String> {
     let mut rows: Vec<String> = parser
         .screen()
-        .rows(0, parser.screen().size().1)
+        .rows(0, parser.screen().size().1.get())
         .map(|row| row.trim_end().to_string())
         .collect();
     while rows.last().is_some_and(String::is_empty) {
@@ -1510,9 +1515,11 @@ fn a_resize_repaints_in_one_synchronized_update() {
     };
     let opening = read_until_quiet(Duration::from_millis(2500));
     let narrower = COLUMNS - 30;
-    let mut parser = vt100::Parser::new(ROWS, COLUMNS, 0);
+    let mut parser = vt100::Parser::new(screen_size(ROWS), screen_size(COLUMNS), 0);
     parser.process(&opening);
-    parser.screen_mut().set_size(ROWS, narrower);
+    parser
+        .screen_mut()
+        .set_size(screen_size(ROWS), screen_size(narrower));
     for row in 1..=ROWS {
         parser.process(
             format!("\x1b[{row};1H{}", "\u{2592}".repeat(usize::from(narrower))).as_bytes(),

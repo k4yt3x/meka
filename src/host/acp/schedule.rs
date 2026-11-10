@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
+use agent_client_protocol::v1::schema::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 
 use crate::{frontend::Frontend, scheduler::SchedulerScope};
 

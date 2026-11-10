@@ -598,6 +598,19 @@ pub(super) async fn connect_http_with_oauth(
         })
 }
 
+/// The OAuth manager for the server at `url`, for every flow that starts one. Where the server is
+/// reached is the user's to say, so it, and the hosts its metadata names, may sit at a private
+/// address under any name (a LAN host, a tailnet name); link-local and reserved addresses stay
+/// refused, and a loopback one still needs a loopback `url`, as rmcp holds them.
+async fn authorization_manager(url: &str, server_name: &str) -> Result<AuthorizationManager> {
+    AuthorizationManager::new_allowing_private_addresses(url)
+        .await
+        .map_err(|error| MekaError::McpAuth {
+            server_name: server_name.to_string(),
+            message: format!("failed to initialize OAuth: {error}"),
+        })
+}
+
 async fn authenticate_client_credentials(
     server_name: &str,
     url: &str,
@@ -615,12 +628,7 @@ async fn authenticate_client_credentials(
         resource: Some(canonical_endpoint(url)),
     };
 
-    let mut oauth_state = OAuthState::new(url, None)
-        .await
-        .map_err(|error| MekaError::McpAuth {
-            server_name: server_name.to_string(),
-            message: format!("failed to initialize OAuth: {error}"),
-        })?;
+    let mut oauth_state = OAuthState::Unauthorized(authorization_manager(url, server_name).await?);
 
     oauth_state
         .authenticate_client_credentials(config)
@@ -678,12 +686,7 @@ async fn authenticate_client_credentials_jwt(
         token_endpoint_audience: None,
     };
 
-    let mut oauth_state = OAuthState::new(url, None)
-        .await
-        .map_err(|error| MekaError::McpAuth {
-            server_name: server_name.to_string(),
-            message: format!("failed to initialize OAuth: {error}"),
-        })?;
+    let mut oauth_state = OAuthState::Unauthorized(authorization_manager(url, server_name).await?);
 
     oauth_state
         .authenticate_client_credentials(config)
@@ -782,12 +785,7 @@ async fn authenticate_oauth_authorization_code(
     } = login;
     let scope_strings: Vec<String> = scopes.map(|s| s.to_vec()).unwrap_or_default();
 
-    let mut manager = AuthorizationManager::new(url)
-        .await
-        .map_err(|error| MekaError::McpAuth {
-            server_name: server_name.to_string(),
-            message: format!("failed to initialize OAuth manager: {error}"),
-        })?;
+    let mut manager = authorization_manager(url, server_name).await?;
 
     // Set up persistent credential storage if available. The cell is held here as well as inside
     // the adapter, so the interactive flow below can clear it; see the reset after

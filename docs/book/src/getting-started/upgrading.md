@@ -89,6 +89,10 @@ agent-message chunk prefixed `[Meka]`, or `[Meka warn]` for a warning, where it 
 `[meka warn]`. The prefix is for the person reading the transcript; a client that wants the
 severity advertises `session.notices` and reads it from the `notice`.
 
+**ACP requests wait for `initialize`.** A request an ACP client sends before Meka has answered its
+`initialize`, or without sending one, is refused with `-32600`, as is a JSON-RPC batch. Send
+`initialize`, wait for its answer, then send each request on its own.
+
 ## 0.90 to 0.91
 
 Nothing in `config.toml` is renamed. The store moves forward on its first open: the result of

@@ -348,7 +348,7 @@ pub(super) fn context_seed(cells: &crate::session::SessionCells) -> FrontendEven
 pub(super) async fn handle_load_session(
     state: Arc<ServerState>,
     request: LoadSessionRequest,
-    responder: agent_client_protocol::Responder<LoadSessionResponse>,
+    responder: agent_client_protocol::v1::Responder<LoadSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id_str = request.session_id.0.as_ref().to_string();
@@ -550,7 +550,7 @@ pub(super) async fn handle_load_session(
 pub(super) async fn handle_list_sessions(
     state: Arc<ServerState>,
     request: ListSessionsRequest,
-    responder: agent_client_protocol::Responder<ListSessionsResponse>,
+    responder: agent_client_protocol::v1::Responder<ListSessionsResponse>,
 ) -> Result<(), agent_client_protocol::Error> {
     const PAGE_SIZE: u32 = 50;
     let cwd_filter = request.cwd.as_deref().map(crate::workspace::cwd_filter);
@@ -604,7 +604,7 @@ pub(super) async fn handle_list_sessions(
 pub(super) async fn handle_resume_session(
     state: Arc<ServerState>,
     request: ResumeSessionRequest,
-    responder: agent_client_protocol::Responder<ResumeSessionResponse>,
+    responder: agent_client_protocol::v1::Responder<ResumeSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id_str = request.session_id.0.as_ref().to_string();
@@ -776,7 +776,7 @@ pub(super) async fn discard_unusable_session(
 pub(super) async fn handle_fork_session(
     state: Arc<ServerState>,
     request: ForkSessionRequest,
-    responder: agent_client_protocol::Responder<ForkSessionResponse>,
+    responder: agent_client_protocol::v1::Responder<ForkSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let source_uuid = match parse_session_id(request.session_id.0.as_ref()) {
@@ -1054,7 +1054,7 @@ async fn replay_log(
 pub(super) async fn handle_close_session(
     state: Arc<ServerState>,
     request: CloseSessionRequest,
-    responder: agent_client_protocol::Responder<CloseSessionResponse>,
+    responder: agent_client_protocol::v1::Responder<CloseSessionResponse>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id_str = request.session_id.0.as_ref().to_string();
     let session_uuid = match parse_session_id(&session_id_str) {
@@ -1108,7 +1108,7 @@ fn unknown_level(given: &str, permission: &crate::permission::SharedPermission) 
 pub(super) async fn handle_set_session_mode(
     state: Arc<ServerState>,
     request: SetSessionModeRequest,
-    responder: agent_client_protocol::Responder<SetSessionModeResponse>,
+    responder: agent_client_protocol::v1::Responder<SetSessionModeResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id_str = request.session_id.0.as_ref().to_string();
@@ -1184,7 +1184,7 @@ pub(super) async fn handle_set_session_mode(
 pub(super) async fn handle_set_session_config_option(
     state: Arc<ServerState>,
     request: SetSessionConfigOptionRequest,
-    responder: agent_client_protocol::Responder<SetSessionConfigOptionResponse>,
+    responder: agent_client_protocol::v1::Responder<SetSessionConfigOptionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id_str = request.session_id.0.as_ref().to_string();

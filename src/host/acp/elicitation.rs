@@ -9,7 +9,7 @@
 //! Both functions here are pure, which is the point of the module: the risk in this feature is the
 //! schema translation, and it is testable without a live connection.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     BooleanPropertySchema, CreateElicitationRequest, ElicitationAcceptAction, ElicitationAction,
     ElicitationContentValue, ElicitationFormMode, ElicitationId, ElicitationMode,
     ElicitationPropertySchema, ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode,

@@ -567,9 +567,9 @@ pub(crate) struct BackgroundRetry {
 /// Whether the server rejected a request as unauthorized, by the HTTP status alone: rmcp reports a
 /// 401 down the chain of the transport error it wraps, as an `AuthRequiredError` when the server
 /// sent a challenge, as an unexpected response naming the status when it sent none, and as the
-/// client's own status error on the requests it checks that way. Never read from what an error
-/// says in words, which a tool's own failure or a URL's port can say too. A 401 whose body is a
-/// JSON-RPC error reaches Meka as that error with the status gone, and is not seen.
+/// client's own status error on the requests it checks that way, a 401 whose body is a JSON-RPC
+/// error included. Never read from what an error says in words, which a tool's own failure or a
+/// URL's port can say too.
 pub(crate) fn rejected_as_unauthorized(error: &ServiceError) -> bool {
     use rmcp::transport::streamable_http_client::StreamableHttpError;
     let ServiceError::TransportSend(error) = error else {

@@ -1916,9 +1916,9 @@ impl Change {
     /// Lines of unchanged text kept on either side of a change, so a short preview holds the line
     /// before, the line taken out and the line put in.
     pub(crate) const CONTEXT_LINES: usize = 1;
-    /// How long the diff may look for the fewest changed lines before it settles for more: it
-    /// runs as a call's result is recorded, and two large texts that differ throughout would
-    /// otherwise hold the call up for as long as the search takes.
+    /// How long the diff may search before it settles for a coarser one: it runs as a call's
+    /// result is recorded, and two large texts that differ throughout would otherwise hold the call
+    /// up for as long as the search takes.
     const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
     /// What a line costs in the record beside its text: its kind and its number, as the log
     /// writes them, which a line of a few characters or none is mostly made of.

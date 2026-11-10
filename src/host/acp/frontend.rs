@@ -20,7 +20,7 @@ pub(super) fn classify_fs_error(
     error: &agent_client_protocol::Error,
 ) -> FrontendError {
     let message = format!("{method} failed: {error}");
-    if error.code == agent_client_protocol::ErrorCode::ResourceNotFound {
+    if error.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND {
         FrontendError::unservable_path(message)
     } else {
         FrontendError::new(message)
@@ -185,8 +185,8 @@ pub(super) const META_BACKGROUND: &str = "background";
 pub(super) fn terminal_meta(
     key: &str,
     payload: serde_json::Value,
-) -> agent_client_protocol::schema::v1::Meta {
-    let mut meta = agent_client_protocol::schema::v1::Meta::new();
+) -> agent_client_protocol::v1::schema::Meta {
+    let mut meta = agent_client_protocol::v1::schema::Meta::new();
     meta.insert(key.to_string(), payload);
     meta
 }
@@ -585,7 +585,7 @@ impl Frontend for AcpFrontend {
         let update = match event {
             FrontendEvent::AssistantTextDelta(text) => {
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                    agent_client_protocol::schema::v1::TextContent::new(text),
+                    agent_client_protocol::v1::schema::TextContent::new(text),
                 )))
             }
             // Nothing to show, and no transient UI to close: ACP thought chunks accumulate, so a
@@ -654,7 +654,7 @@ impl Frontend for AcpFrontend {
                     let cwd = self.cwd.get();
                     call = call
                         .content(vec![ToolCallContent::Terminal(
-                            agent_client_protocol::schema::v1::Terminal::new(id.clone()),
+                            agent_client_protocol::v1::schema::Terminal::new(id.clone()),
                         )])
                         .meta(terminal_meta(
                             META_TERMINAL_INFO,
@@ -731,7 +731,7 @@ impl Frontend for AcpFrontend {
                     // swap a live, scrollable, color-rendered view for a
                     // flattened copy at the moment the command finishes.
                     fields = fields.content(vec![ToolCallContent::Terminal(
-                        agent_client_protocol::schema::v1::Terminal::new(id.clone()),
+                        agent_client_protocol::v1::schema::Terminal::new(id.clone()),
                     )]);
                     update_meta = Some(terminal_meta(
                         META_TERMINAL_EXIT,
@@ -1268,7 +1268,7 @@ pub(super) fn notice_update(
                 crate::frontend::NoticeLevel::Info => NoticeSeverity::Info,
                 crate::frontend::NoticeLevel::Warn => NoticeSeverity::Warning,
             };
-            return SessionUpdate::Notice(agent_client_protocol::schema::v1::Notice::new(
+            return SessionUpdate::Notice(agent_client_protocol::v1::schema::Notice::new(
                 severity,
                 notice.text.clone(),
             ));
@@ -1282,7 +1282,7 @@ pub(super) fn notice_update(
         }
     };
     SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-        agent_client_protocol::schema::v1::TextContent::new(text),
+        agent_client_protocol::v1::schema::TextContent::new(text),
     )))
 }
 /// The update that says what reported, in the screen's words. A `notice` when the client renders
@@ -1325,7 +1325,7 @@ pub(super) fn background_report_update(
         .map(crate::view::BackgroundTaskView::from)
         .collect();
     SessionUpdate::Notice(
-        agent_client_protocol::schema::v1::Notice::new(NoticeSeverity::Info, direction)
+        agent_client_protocol::v1::schema::Notice::new(NoticeSeverity::Info, direction)
             .description(description)
             .meta(terminal_meta(
                 META_BACKGROUND,
@@ -1603,7 +1603,7 @@ fn fence_for(text: &str) -> String {
 /// Wrap a string as a plain-text [`ToolCallContent`] block.
 pub(super) fn text_content_block(text: impl Into<String>) -> ToolCallContent {
     ToolCallContent::from(ContentBlock::Text(
-        agent_client_protocol::schema::v1::TextContent::new(text.into()),
+        agent_client_protocol::v1::schema::TextContent::new(text.into()),
     ))
 }
 /// Build the `tool_call_update` that carries a running command's output, in whichever shape the
@@ -1614,7 +1614,7 @@ pub(super) fn live_output_update(id: &str, mode: LiveOutputMode, text: &str) -> 
     match mode {
         LiveOutputMode::Terminal => {
             let fields = ToolCallUpdateFields::new().content(vec![ToolCallContent::Terminal(
-                agent_client_protocol::schema::v1::Terminal::new(id.to_string()),
+                agent_client_protocol::v1::schema::Terminal::new(id.to_string()),
             )]);
             ToolCallUpdate::new(id.to_string(), fields).meta(terminal_meta(
                 META_TERMINAL_OUTPUT,
@@ -1887,7 +1887,7 @@ pub(super) fn compacted_update(
             .meta(terminal_meta(META_COMPACTION, facts));
         if let Some(summary) = summary {
             update = update.summary(vec![ContentBlock::Text(
-                agent_client_protocol::schema::v1::TextContent::new(summary),
+                agent_client_protocol::v1::schema::TextContent::new(summary),
             )]);
         }
         return SessionUpdate::CompactionUpdate(update);
@@ -2108,7 +2108,7 @@ pub(super) fn replay_session_updates(
                                     session_id,
                                     SessionUpdate::UserMessageChunk(ContentChunk::new(
                                         ContentBlock::Text(
-                                            agent_client_protocol::schema::v1::TextContent::new(
+                                            agent_client_protocol::v1::schema::TextContent::new(
                                                 text.clone(),
                                             ),
                                         ),
@@ -2167,7 +2167,7 @@ pub(super) fn replay_session_updates(
                                     session_id,
                                     SessionUpdate::UserMessageChunk(ContentChunk::new(
                                         ContentBlock::Text(
-                                            agent_client_protocol::schema::v1::TextContent::new(
+                                            agent_client_protocol::v1::schema::TextContent::new(
                                                 words,
                                             ),
                                         ),
@@ -2182,7 +2182,7 @@ pub(super) fn replay_session_updates(
                                 session_id,
                                 SessionUpdate::UserMessageChunk(ContentChunk::new(
                                     ContentBlock::ResourceLink(
-                                        agent_client_protocol::schema::v1::ResourceLink::new(
+                                        agent_client_protocol::v1::schema::ResourceLink::new(
                                             name.clone(),
                                             uri.clone(),
                                         ),
@@ -2199,7 +2199,7 @@ pub(super) fn replay_session_updates(
                                 session_id,
                                 SessionUpdate::UserMessageChunk(ContentChunk::new(
                                     ContentBlock::Text(
-                                        agent_client_protocol::schema::v1::TextContent::new(
+                                        agent_client_protocol::v1::schema::TextContent::new(
                                             text.clone(),
                                         ),
                                     ),
@@ -2323,7 +2323,7 @@ pub(super) fn reply_update(
                 return None;
             }
             let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                agent_client_protocol::schema::v1::TextContent::new(text.clone()),
+                agent_client_protocol::v1::schema::TextContent::new(text.clone()),
             )));
             (update, false)
         }
@@ -2353,7 +2353,7 @@ fn thought_chunk(text: &str, after_thought: bool) -> SessionUpdate {
         text.to_string()
     };
     SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-        agent_client_protocol::schema::v1::TextContent::new(text),
+        agent_client_protocol::v1::schema::TextContent::new(text),
     )))
 }
 
