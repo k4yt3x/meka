@@ -288,27 +288,6 @@ impl TokenUsage {
             .cache_read_input_tokens
             .saturating_add(other.cache_read_input_tokens);
     }
-
-    /// Fold a streamed usage update into the running per-round total, taking each field from
-    /// `update` only when it is non-zero. Providers split usage across events: Anthropic reports
-    /// the input/cache tiers on `message_start` and the final `output_tokens` on
-    /// `message_delta` (the other fields absent, i.e. parsed as 0), while OpenAI/Codex send a
-    /// single usage event. The non-zero rule keeps the `message_start` input/cache values
-    /// instead of letting a later event that omits them clobber the count back to 0.
-    pub(crate) fn merge_stream(&mut self, update: &TokenUsage) {
-        if update.input_tokens > 0 {
-            self.input_tokens = update.input_tokens;
-        }
-        if update.output_tokens > 0 {
-            self.output_tokens = update.output_tokens;
-        }
-        if update.cache_creation_input_tokens > 0 {
-            self.cache_creation_input_tokens = update.cache_creation_input_tokens;
-        }
-        if update.cache_read_input_tokens > 0 {
-            self.cache_read_input_tokens = update.cache_read_input_tokens;
-        }
-    }
 }
 #[cfg(test)]
 mod tests {

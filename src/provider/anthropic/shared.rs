@@ -902,6 +902,8 @@ struct ClaudeStream {
     attribution: Option<crate::provider::Attribution>,
     /// Whether the message reached its end rather than the byte stream simply stopping.
     saw_terminal_event: bool,
+    /// Whether a `message_delta` has stated the stop, which the reply's record then holds.
+    stop_stated: bool,
     /// The message as `message_start` stated it and each `message_delta` updated it, folded as
     /// the reference client folds them, without its content.
     response: serde_json::Map<String, serde_json::Value>,
@@ -973,6 +975,12 @@ impl crate::provider::sse::Protocol for ClaudeStream {
             Some(index) => match name.as_str() {
                 "content_block_start" => self.start(index, data, event_sender).await,
                 "content_block_delta" => self.delta(index, data, event_sender).await,
+                // A stop for a block that is not open closes nothing and is kept where it names,
+                // as a delta for one is.
+                "content_block_stop" if !self.open.contains_key(&index) => {
+                    self.send(index, StreamEvent::Unrecognized(data), event_sender)
+                        .await
+                }
                 "content_block_stop" => self.close(index, true, event_sender).await,
                 _ => self.keep_unread(data, event_sender).await,
             },
@@ -988,16 +996,38 @@ impl crate::provider::sse::Protocol for ClaudeStream {
 
 impl ClaudeStream {
     /// The message's fields nothing else holds: all but its role, content, model and how it
-    /// stopped, which the reply and its record hold. The raw `usage` stays.
+    /// stopped, which the reply and its record hold. The raw `usage` stays, and so does a stop
+    /// the message states before any `message_delta` does, which the record never receives, and
+    /// content other than the empty list the spec opens the message with, which no block holds.
     fn response_fields(&self) -> Option<crate::conversation::ProviderFields> {
-        crate::provider::fields_beyond(&self.response, &[
-            "role",
-            "content",
-            "model",
-            "stop_reason",
-            "stop_sequence",
-            "stop_details",
-        ])
+        let mut held = vec!["role", "model"];
+        if self
+            .response
+            .get("content")
+            .is_none_or(|content| content.as_array().is_some_and(Vec::is_empty))
+        {
+            held.push("content");
+        }
+        held.extend(
+            ["stop_reason", "stop_sequence", "stop_details"]
+                .into_iter()
+                .filter(|key| {
+                    self.stop_stated || self.response.get(*key).is_none_or(|value| value.is_null())
+                }),
+        );
+        crate::provider::fields_beyond(&self.response, &held)
+    }
+
+    /// Tell the message's usage as it stands, folded from every statement of it so far, which the
+    /// reply's usage takes whole; `false` once the receiver is gone.
+    async fn tell_usage(&self, event_sender: &mpsc::Sender<StreamEvent>) -> bool {
+        match self.response.get("usage").filter(|usage| usage.is_object()) {
+            Some(usage) => event_sender
+                .send(StreamEvent::Usage(parse_usage_object(usage)))
+                .await
+                .is_ok(),
+            None => true,
+        }
     }
 
     /// Tell the message's fields as they stand; `false` once the receiver is gone.
@@ -1242,11 +1272,11 @@ impl ClaudeStream {
     }
 
     /// Close the block at `index` and hand it over, then what arrived unread inside it. A block
-    /// that `finished` is handed over as it stopped; one the message or the stream ended inside
-    /// as one that never finished: its reasoning unsigned, since a signature that arrived before
-    /// the block ended may not cover all of it, and a call refused with the arguments that had
-    /// streamed. A stop for a block that is not open closes nothing. Whether the receiver is
-    /// still there.
+    /// that `finished` is handed over as it stopped; one the stream ended inside, or a second
+    /// start at its index replaced, as one that never finished: its reasoning unsigned, since a
+    /// signature that arrived before the block ended may not cover all of it, and a call refused
+    /// with the arguments that had streamed. A block that is not open closes nothing. Whether the
+    /// receiver is still there.
     async fn close(
         &mut self,
         index: u64,
@@ -1305,9 +1335,9 @@ impl ClaudeStream {
         true
     }
 
-    /// Close every block still open as one that never finished, in index order: the message is
-    /// over, or the stream broke off and what arrived of it is the reply so far. Whether the
-    /// receiver is still there.
+    /// Close every block still open as one that never finished, in index order: the stream is
+    /// over, whether the message ended or the stream broke off and what arrived of it is the reply
+    /// so far. Whether the receiver is still there.
     async fn close_open(&mut self, event_sender: &mpsc::Sender<StreamEvent>) -> bool {
         let indices: Vec<u64> = self.open.keys().copied().collect();
         for index in indices {
@@ -1327,17 +1357,30 @@ impl ClaudeStream {
     ) -> Result<Step> {
         match name {
             "message_delta" => {
-                // The message's end follows every block it holds: one still open never finished.
-                if !self.close_open(event_sender).await {
-                    return Ok(Step::ReceiverGone);
-                }
-                // Folded into the message as the reference client folds it: the delta's fields and
+                // Folded into the message alone, as the reference client folds it, and no block is
+                // closed here: a gateway may restate the running usage between a block's deltas,
+                // and a block's own stop, else the stream's end, closes it. The delta's fields and
                 // the event's own set the message's, and each usage field stated overwrites, since
                 // the counts are running totals. The reference sets only the fields it types; the
-                // rest (OpenRouter's `cost`, a later `service_tier`) are set the same way.
+                // rest (OpenRouter's `cost`, a later `service_tier`) are set the same way. A null
+                // states nothing, so a stop once stated stands against a trailing delta that
+                // restates the fields as null.
+                if data
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .is_some_and(serde_json::Value::is_string)
+                {
+                    self.stop_stated = true;
+                }
+                // A `usage` that is not an object is a shape the spec does not define: kept as it
+                // came, it leaves the counts stated so far standing.
+                let unread_usage = data
+                    .get("usage")
+                    .is_some_and(|usage| !usage.is_object() && !usage.is_null());
                 for (key, value) in data.as_object().into_iter().flatten() {
                     match (key.as_str(), value) {
                         ("type", _) => {}
+                        ("usage", _) if unread_usage => {}
                         ("delta" | "usage", serde_json::Value::Object(fields)) => {
                             let target = if key == "delta" {
                                 &mut self.response
@@ -1361,22 +1404,15 @@ impl ClaudeStream {
                         _ => crate::provider::state_latest(&mut self.response, key, value),
                     }
                 }
-                if !self.tell_response(event_sender).await {
+                if !self.tell_response(event_sender).await
+                    || (data.get("usage").is_some() && !self.tell_usage(event_sender).await)
+                    || (unread_usage && !self.keep_unread(data.clone(), event_sender).await)
+                {
                     return Ok(Step::ReceiverGone);
                 }
                 let Some(delta) = data.get("delta") else {
                     return Ok(Step::Continue);
                 };
-                if let Some(usage) = data.get("usage") {
-                    let token_usage = parse_usage_object(usage);
-                    if event_sender
-                        .send(StreamEvent::Usage(token_usage))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(Step::ReceiverGone);
-                    }
-                }
                 if let Some(stop_reason_str) =
                     delta.get("stop_reason").and_then(|reason| reason.as_str())
                 {
@@ -1432,15 +1468,8 @@ impl ClaudeStream {
                 {
                     return Ok(Step::ReceiverGone);
                 }
-                if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
-                    let token_usage = parse_usage_object(usage);
-                    if event_sender
-                        .send(StreamEvent::Usage(token_usage))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(Step::ReceiverGone);
-                    }
+                if self.response.contains_key("usage") && !self.tell_usage(event_sender).await {
+                    return Ok(Step::ReceiverGone);
                 }
             }
             "ping" => {}
@@ -1790,7 +1819,7 @@ mod tests {
             .body(body.to_string())
             .expect("build response")
             .into();
-        let (sender, mut receiver) = mpsc::channel(64);
+        let (sender, mut receiver) = mpsc::channel(1024);
         let outcome =
             drive_claude_sse_stream(response, sender, CancellationToken::new(), None).await;
         let mut events = Vec::new();
@@ -2073,14 +2102,24 @@ mod tests {
     #[tokio::test]
     async fn a_stream_that_stops_after_its_stop_reason_is_complete() {
         let (events, outcome) = decode_sse(concat!(
+            "event: content_block_start\n",
+            "data: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\n",
-            "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"index\":0}\n\n",
             "event: message_delta\n",
             "data: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
         ))
         .await;
 
         assert!(outcome.is_ok(), "expected success, got {:?}", outcome.err());
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "hi")),
+            "the answer must arrive: {events:?}",
+        );
         assert!(
             events
                 .iter()
@@ -2134,10 +2173,18 @@ mod tests {
     #[tokio::test]
     async fn a_stream_cut_before_its_stop_reason_is_an_error() {
         let (events, outcome) = decode_sse(concat!(
+            "event: content_block_start\n",
+            "data: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\n",
-            "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"half an ans\"}}\n\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half an ans\"}}\n\n",
         ))
         .await;
+        assert!(
+            events.iter().any(
+                |event| matches!(event, StreamEvent::TextDelta(text) if text == "half an ans")
+            ),
+            "what arrived is the reply so far: {events:?}",
+        );
 
         assert!(
             matches!(outcome, Err(MekaError::StreamError(_))),
@@ -2238,10 +2285,11 @@ mod tests {
         assert_eq!(thinking_opaque(&events), None, "{events:?}");
     }
 
-    /// One accumulator serves every block, and only `content_block_stop` clears it. A gateway that
-    /// omits that event would otherwise hand the next block the previous one's signature, pairing a
-    /// signature with reasoning it does not authenticate -- which Anthropic rejects as a modified
-    /// block. `anthropic-messages` reaches any `base_url`, so the stream is untrusted input.
+    /// A signature belongs to the block whose `index` it arrived at. A gateway that omits a
+    /// block's `content_block_stop` must not have the next block take the previous one's
+    /// signature, pairing a signature with reasoning it does not authenticate, which Anthropic
+    /// rejects as a modified block. `anthropic-messages` reaches any `base_url`, so the stream is
+    /// untrusted input.
     #[tokio::test]
     async fn an_unterminated_thinking_block_does_not_lend_its_signature_to_the_next() {
         let (events, outcome) = decode_sse(concat!(
@@ -3163,26 +3211,20 @@ mod tests {
         }
     }
 
-    /// The events `frames` stream as, each sent as the SSE event its `type` names.
+    /// The events `frames` stream as through the driver, each sent as the SSE event its `type`
+    /// names, with whatever the stream's end closes; the stream must end as a message does.
     async fn claude_events(frames: &[serde_json::Value]) -> Vec<StreamEvent> {
-        let mut protocol = super::ClaudeStream::default();
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
-        for frame in frames {
-            let event = eventsource_stream::Event {
-                event: frame["type"].as_str().expect("a type").to_string(),
-                data: frame.to_string(),
-                id: String::new(),
-                retry: None,
-            };
-            crate::provider::sse::Protocol::frame(&mut protocol, event, &sender)
-                .await
-                .expect("frame");
-        }
-        drop(sender);
-        let mut events = Vec::new();
-        while let Some(event) = receiver.recv().await {
-            events.push(event);
-        }
+        let body: String = frames
+            .iter()
+            .map(|frame| {
+                format!(
+                    "event: {}\ndata: {frame}\n\n",
+                    frame["type"].as_str().expect("a type")
+                )
+            })
+            .collect();
+        let (events, outcome) = decode_sse(&body).await;
+        outcome.expect("the stream ends as a message");
         events
     }
 
@@ -3449,7 +3491,7 @@ mod tests {
                 "delta": {"type": "signature_delta", "signature": "S"}}),
         ];
         frames.extend(later_text);
-        frames.push(end);
+        frames.push(end.clone());
         let completion = claude_completion(&frames).await;
         let [
             ContentBlock::Thinking { parts, opaque, .. },
@@ -3461,6 +3503,251 @@ mod tests {
         assert_eq!(crate::conversation::reasoning_text(parts), "partial");
         assert_eq!(opaque, &None);
         assert_eq!(text, "later");
+
+        // Redacted reasoning arrives whole in its start and is handed over only when its block
+        // closes, which for one left open is the stream's end.
+        let completion = claude_completion(&[
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+                "type": "message", "role": "assistant", "model": "m", "content": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "redacted_thinking", "data": "SEALED"}}),
+            end,
+        ])
+        .await;
+        let [ContentBlock::RedactedThinking { data, .. }] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(data, "SEALED");
+    }
+
+    /// A `message_delta` without a stop reason between a block's deltas restates the running
+    /// usage, as a gateway may send one after every delta, and closes nothing: each block folds
+    /// whole, its reasoning signed, as the reference client folds it.
+    #[tokio::test]
+    async fn a_message_delta_without_a_stop_reason_leaves_its_blocks_open() {
+        let running = |output_tokens: u64| {
+            serde_json::json!({"type": "message_delta",
+                "delta": {"stop_reason": null, "stop_sequence": null},
+                "usage": {"input_tokens": 5, "output_tokens": output_tokens}})
+        };
+        let completion = claude_completion(&[
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+                "type": "message", "role": "assistant", "model": "m", "content": [],
+                "usage": {"input_tokens": 0, "output_tokens": 0}}}),
+            running(0),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "The"}}),
+            running(1),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": " user"}}),
+            running(2),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "S"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "**EPT"}}),
+            running(3),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "** is"}}),
+            running(4),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({"type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"input_tokens": 5, "output_tokens": 4}}),
+            serde_json::json!({"type": "message_stop"}),
+        ])
+        .await;
+        let [
+            ContentBlock::Thinking {
+                parts,
+                opaque: Some(OpaqueReasoning::Signed { signature }),
+                ..
+            },
+            ContentBlock::Text { text, .. },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(crate::conversation::reasoning_text(parts), "The user");
+        assert_eq!(signature, "S");
+        assert_eq!(text, "**EPT** is");
+        assert_eq!(completion.usage.output_tokens, 4);
+    }
+
+    /// A block whose stop arrives after the delta that states the message's stop is whole when it
+    /// stops, its reasoning signed and its call run, as the reference client folds it: the stop
+    /// reason closes no block.
+    #[tokio::test]
+    async fn a_block_that_stops_after_the_stop_reason_is_whole() {
+        let completion = claude_completion(&[
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+                "type": "message", "role": "assistant", "model": "m", "content": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "a"}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "S"}}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "tool_use", "id": "t1", "name": "n", "input": {}}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"a\": 1}"}}),
+            serde_json::json!({"type": "message_delta",
+                "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({"type": "message_stop"}),
+        ])
+        .await;
+        let [
+            ContentBlock::Thinking {
+                opaque: Some(OpaqueReasoning::Signed { signature }),
+                ..
+            },
+            ContentBlock::ToolUse {
+                input,
+                unparsed: None,
+                ..
+            },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(signature, "S");
+        assert_eq!(input, &serde_json::json!({"a": 1}));
+    }
+
+    /// The reply's usage is the message's as its statements fold: a count stated again replaces
+    /// the last, zero included, and one left out or null keeps it, which is the reference client's
+    /// fold of every count the spec lets a delta leave out. The reply's counts and the usage its
+    /// record keeps are one.
+    #[tokio::test]
+    async fn the_reply_s_usage_is_the_message_s_as_its_statements_fold() {
+        let completion = claude_completion(&[
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+                "type": "message", "role": "assistant", "model": "m", "content": [],
+                "usage": {"input_tokens": 10, "output_tokens": 1,
+                    "cache_creation_input_tokens": 2, "cache_read_input_tokens": 5}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "x"}}),
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": null},
+                "usage": {"input_tokens": null, "output_tokens": 3}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 7, "cache_read_input_tokens": 0}}),
+            serde_json::json!({"type": "message_stop"}),
+        ])
+        .await;
+        assert_eq!(completion.usage, TokenUsage {
+            input_tokens: 10,
+            output_tokens: 7,
+            cache_creation_input_tokens: 2,
+            cache_read_input_tokens: 0,
+        });
+        let recorded = completion.response_fields.expect("the response's fields");
+        assert_eq!(parse_usage_object(&recorded["usage"]), completion.usage);
+    }
+
+    /// A text block that opened and stopped with no words in it is the reply's as returned, ahead
+    /// of the call after it.
+    #[tokio::test]
+    async fn a_text_block_with_no_words_is_kept_as_returned() {
+        let completion = claude_completion(&[
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1",
+                "type": "message", "role": "assistant", "model": "m", "content": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "tool_use", "id": "t1", "name": "n", "input": {}}}),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({"type": "message_delta",
+                "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5}}),
+            serde_json::json!({"type": "message_stop"}),
+        ])
+        .await;
+        let [
+            ContentBlock::Text { text, .. },
+            ContentBlock::ToolUse { .. },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(text, "");
+    }
+
+    /// What the spec does not define is kept as it came: content the message states rather than
+    /// streams, by `message_start` or `message_delta`, a stop for a block that is not open, a stop
+    /// the message states before any `message_delta` does, which the reply's record never
+    /// receives, and a `usage` that is not an object, which leaves the counts stated so far
+    /// standing.
+    #[tokio::test]
+    async fn frames_the_spec_does_not_define_are_kept_as_they_came() {
+        let stray_stop = serde_json::json!({"type": "content_block_stop", "index": 0});
+        let text_block = [
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "hi"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+        ];
+        let mut frames = vec![serde_json::json!({"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "early"}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}}})];
+        frames.extend(text_block.clone());
+        frames.extend([
+            stray_stop.clone(),
+            serde_json::json!({"type": "message_stop"}),
+        ]);
+        let completion = claude_completion(&frames).await;
+        let [
+            ContentBlock::Text { text, .. },
+            ContentBlock::Unrecognized { parts: stopped },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(text, "hi");
+        assert_eq!(stopped, &vec![stray_stop]);
+        let fields = completion.response_fields.expect("the response's fields");
+        assert_eq!(
+            fields["content"],
+            serde_json::json!([{"type": "text", "text": "early"}])
+        );
+        assert_eq!(fields["stop_reason"], "end_turn");
+
+        let closing = serde_json::json!({"type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "content": "late"}, "usage": 5});
+        let mut frames = vec![serde_json::json!({"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m", "content": [],
+            "usage": {"input_tokens": 10, "output_tokens": 1}}})];
+        frames.extend(text_block);
+        frames.extend([closing.clone(), serde_json::json!({"type": "message_stop"})]);
+        let completion = claude_completion(&frames).await;
+        let [
+            ContentBlock::Text { .. },
+            ContentBlock::Unrecognized { parts },
+        ] = completion.message.content.as_slice()
+        else {
+            panic!("{:?}", completion.message.content);
+        };
+        assert_eq!(parts, &vec![closing]);
+        assert_eq!(completion.usage.input_tokens, 10);
+        let fields = completion.response_fields.expect("the response's fields");
+        assert_eq!(fields["content"], "late");
+        assert_eq!(fields["usage"]["input_tokens"], 10);
+        assert!(fields.get("stop_reason").is_none(), "{fields:?}");
     }
 
     /// A stream that ends inside a block says it failed before it hands the block over, so a retry

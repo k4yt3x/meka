@@ -980,7 +980,11 @@ async fn handle_stream_chunk(
         }
     }
 
-    if let Some(usage) = data.get("usage") {
+    // A chunk states the usage whole or not at all. `"usage": null` (OpenAI puts it on every chunk
+    // ahead of the usage chunk) states nothing, as the response's record reads a null, so a
+    // gateway that repeats it after the usage chunk leaves the reply's counts and its record
+    // agreeing.
+    if let Some(usage) = data.get("usage").filter(|usage| usage.is_object()) {
         tracing::debug!("chat completions usage: {usage}");
         let token_usage = super::parse_usage(
             usage,
@@ -1567,6 +1571,26 @@ mod tests {
             .map(|(key, value)| ((*key).to_string(), value.clone()))
             .collect();
         serde_json::json!({"choices": [{"index": 0, "delta": delta}]})
+    }
+
+    /// A chunk states the usage whole, and `"usage": null` on a later chunk states nothing, so the
+    /// reply keeps the usage the stream stated.
+    #[tokio::test]
+    async fn a_null_usage_on_a_later_chunk_keeps_the_stated_one() {
+        let (events, ..) = drive_chunks(&[
+            delta_chunk(&[("content", serde_json::json!("hi"))]),
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            serde_json::json!({"choices": [],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 4}}),
+            serde_json::json!({"choices": [], "usage": null}),
+        ])
+        .await;
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        for event in events {
+            accumulator.push(event);
+        }
+        let usage = accumulator.finish().usage;
+        assert_eq!((usage.input_tokens, usage.output_tokens), (9, 4));
     }
 
     /// The reasoning an endpoint streams ahead of its answer, under either spelling of the field,

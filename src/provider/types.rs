@@ -370,6 +370,9 @@ pub(crate) enum StreamEvent {
     /// The response's own fields nothing else holds, as its protocol folds them; the latest
     /// statement stands, so a reply cut short keeps what was known when it was cut.
     ResponseFields(crate::conversation::ProviderFields),
+    /// The reply's usage as it stands, whole: a wire that states it in pieces (Claude's
+    /// `message_start` and each `message_delta`) folds them as its protocol does before it tells
+    /// it, so the latest statement stands.
     Usage(TokenUsage),
     /// User-visible advisory from the provider layer (e.g. "redacted N old images to fit the
     /// 32 MiB request limit"). The agent translates this into

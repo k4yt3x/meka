@@ -1025,10 +1025,7 @@ impl MessageAccumulator {
             }
             StreamEvent::MessageFields(fields) => self.message_fields = Some(fields),
             StreamEvent::ResponseFields(fields) => self.response_fields = Some(fields),
-            // Merged rather than overwritten: Anthropic streams the input and cache tiers on
-            // `message_start` and the output on `message_delta`, so last-event-wins would drop the
-            // input count.
-            StreamEvent::Usage(usage) => self.usage.merge_stream(&usage),
+            StreamEvent::Usage(usage) => self.usage = usage,
             StreamEvent::Notice(notice) => self.notices.push(notice),
             StreamEvent::Error(_) => {}
             part => self.places.entry(self.place).or_default().push(part),
@@ -1113,7 +1110,8 @@ impl PartsAt {
     }
 
     /// Close the part in progress with the fields the provider put on it: its text, else the
-    /// refusal it held instead.
+    /// refusal it held instead. A part is the provider's from its start, so one that closes with
+    /// no words in it is kept, as the reference client keeps a text block it saw start.
     fn close_part(&mut self, provider_fields: Option<crate::conversation::ProviderFields>) {
         if self.text.is_empty() && !self.refusal.is_empty() {
             self.content.push(ContentBlock::Refusal {
@@ -1121,7 +1119,10 @@ impl PartsAt {
                 provider_fields,
             });
         } else {
-            self.close_text(provider_fields);
+            self.content.push(ContentBlock::Text {
+                text: std::mem::take(&mut self.text),
+                provider_fields,
+            });
         }
     }
 
@@ -2272,47 +2273,6 @@ mod tests {
             provider_fields: None,
         };
         assert!(only_tool.without_tool_use().content.is_empty());
-    }
-
-    #[test]
-    fn token_usage_merge_stream_keeps_input_from_start_output_from_delta() {
-        // Anthropic streaming: `message_start` carries the input/cache tiers (output a
-        // placeholder), `message_delta` carries the final output with the input/cache
-        // fields absent (parsed as 0).
-        let mut usage = TokenUsage::default();
-        usage.merge_stream(&TokenUsage {
-            input_tokens: 1000,
-            output_tokens: 1,
-            cache_creation_input_tokens: 200,
-            cache_read_input_tokens: 5000,
-        });
-        usage.merge_stream(&TokenUsage {
-            input_tokens: 0,
-            output_tokens: 250,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        });
-        assert_eq!(
-            usage.input_tokens, 1000,
-            "input retained from message_start"
-        );
-        assert_eq!(usage.cache_creation_input_tokens, 200);
-        assert_eq!(usage.cache_read_input_tokens, 5000);
-        assert_eq!(usage.output_tokens, 250, "output taken from message_delta");
-    }
-
-    #[test]
-    fn token_usage_merge_stream_single_event_is_verbatim() {
-        // OpenAI/Codex emit a single usage event; merging from default keeps it as-is.
-        let mut usage = TokenUsage::default();
-        usage.merge_stream(&TokenUsage {
-            input_tokens: 800,
-            output_tokens: 120,
-            ..Default::default()
-        });
-        assert_eq!(usage.input_tokens, 800);
-        assert_eq!(usage.output_tokens, 120);
-        assert_eq!(usage.cache_read_input_tokens, 0);
     }
 
     #[test]

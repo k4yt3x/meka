@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.92.1] - 2026-11-10
+
+### Fixed
+
+- A Messages stream that restates usage between deltas no longer cuts the reply after a word.
+- A reply's token counts take each figure the provider last stated, zero included.
+- History keeps a Claude text block with no words, and frames outside the protocol, as returned.
+
 ## [0.92.0] - 2026-11-10
 
 ### Added
@@ -3245,7 +3253,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.92.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.92.1...HEAD
+[0.92.1]: https://github.com/k4yt3x/meka/compare/0.92.0...0.92.1
 [0.92.0]: https://github.com/k4yt3x/meka/compare/0.91.0...0.92.0
 [0.91.0]: https://github.com/k4yt3x/meka/compare/0.90.0...0.91.0
 [0.90.0]: https://github.com/k4yt3x/meka/compare/0.89.0...0.90.0
