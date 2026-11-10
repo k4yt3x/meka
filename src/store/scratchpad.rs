@@ -147,8 +147,8 @@ impl Store {
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // Pre-check: target must not exist. `tokio_rusqlite` serializes connection access
-                // so this and the UPDATE share a consistent view; the `PRIMARY KEY (session_id,
+                // Pre-check: target must not exist. The connection runs one closure at a time, so
+                // this and the UPDATE share a consistent view; the `PRIMARY KEY (session_id,
                 // name)` constraint at the schema layer is the final backstop.
                 let target_exists: i64 = connection.query_row(
                     "SELECT COUNT(*) FROM scratchpad_entries WHERE session_id = ?1 AND name = ?2",

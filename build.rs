@@ -4,6 +4,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     embed_git_revision();
+    size_the_main_thread_stack();
 
     #[cfg(windows)]
     {
@@ -15,6 +16,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         resource.compile()?;
     }
     Ok(())
+}
+
+/// The stack the binary's main thread gets on every platform: what Linux and macOS give it.
+const MAIN_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Give the main thread [`MAIN_THREAD_STACK_BYTES`] on Windows too, where the linker sets it: 1 MiB
+/// from MSVC's, 2 MiB from MinGW's. The main thread polls a host's futures, and a sub-agent's turn
+/// runs nested inside its parent's, whose frames in a debug build need more than 1 MiB. Read from
+/// the target rather than `cfg(windows)`, which names the host the script runs on.
+fn size_the_main_thread_stack() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => println!("cargo:rustc-link-arg-bins=/STACK:{MAIN_THREAD_STACK_BYTES}"),
+        Ok("gnu") => {
+            println!("cargo:rustc-link-arg-bins=-Wl,--stack,{MAIN_THREAD_STACK_BYTES}");
+        }
+        _ => {}
+    }
 }
 
 /// Hand the binary the revision it was built from as `MEKA_GIT_REVISION`, which the screen's

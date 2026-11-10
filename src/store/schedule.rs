@@ -15,7 +15,7 @@ pub(crate) enum JobCreation {
 /// [`crate::store::Store::schedule_store`].
 #[derive(Clone)]
 pub(crate) struct ScheduleStore {
-    pub(crate) connection: std::sync::Arc<tokio_rusqlite::Connection>,
+    pub(crate) connection: std::sync::Arc<super::connection::Connection>,
     memory: std::sync::Arc<SchedulerMemory>,
 }
 /// The ids of jobs a listing could not decode and has already warned about, per process.
@@ -26,7 +26,7 @@ static UNREADABLE_JOBS_WARNED: std::sync::LazyLock<
 impl ScheduleStore {
     /// A handle on the table over `connection`, sharing the scheduler's memory of held jobs.
     pub(crate) fn new(
-        connection: std::sync::Arc<tokio_rusqlite::Connection>,
+        connection: std::sync::Arc<super::connection::Connection>,
         memory: std::sync::Arc<SchedulerMemory>,
     ) -> Self {
         Self { connection, memory }

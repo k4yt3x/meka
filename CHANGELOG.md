@@ -7,60 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.92.0] - 2026-11-10
+
 ### Added
 
-- Each reply is stored as returned, with how it stopped, the model, the profile and the usage.
-- History, `conversation_read` and Markdown exports say when a reply stopped short or was cut.
+- Each reply records how it stopped, its model, profile and usage; history and exports show a cut.
 - A compaction that fails stays in the history with what it did; editors and exports show it.
-- The ACP and MCP handshakes carry `Meka` as the `title`.
 
 ### Changed
 
-- **Breaking:** HTTP history and the feed type Meka's notes, summaries, captions and large outputs.
-- **Breaking:** History replies carry `reply`; `thinking` holds `parts`; there are new block kinds.
+- **Breaking:** HTTP history and the feed type Meka's notes and replies; see the upgrade guide.
 - **Breaking:** `stop_reason` gains `tool_use`, `context_window`, `content_filter` and `unknown`.
 - **Breaking:** An unparsable call's `input` is `{}`, with what the model sent under `unparsed`.
-- **Breaking:** A tool call in a shape its protocol does not define is kept and not run.
-- **Breaking:** An empty reply streams nothing to ACP or the feed.
 - **Breaking:** `refusal_text` holds only the model's own words.
-- **Breaking:** ACP's fallback prefix is `[Meka]` or `[Meka warn]`; read severity from a `notice`.
+- **Breaking:** An empty reply streams nothing to ACP or the feed.
+- **Breaking:** A tool call in a shape its protocol does not define is kept and not run.
 - **Breaking:** ACP refuses a request sent before `initialize` is answered, and a JSON-RPC batch.
+- **Breaking:** ACP's fallback prefix is `[Meka]` or `[Meka warn]`; read severity from a `notice`.
 - Replies go back to the provider with their reasoning and citations wherever the protocol allows.
-- Meka's notes to the model read `[Meka harness]`, and the screen leaves them out of tool output.
-- Meka is written with a capital wherever a person reads it; the command stays `meka`.
-- Session archives are `format_version` 26; older archives are brought forward on import.
-- `claude-subscription` matches Claude Code 2.1.322, naming the tools a session has called.
+- `claude-subscription` matches Claude Code 2.1.322.
 - A ChatGPT login redirects to `127.0.0.1` rather than `localhost`, as Codex 0.167 does.
 - `/resume` and `/fork` on the screen refuse while a sub-agent still runs.
-- A session whose usage row cannot be read is refused rather than resumed with fresh counters.
-- Session search no longer finds compaction summaries written before 0.13.
-- Upgrade `agent-client-protocol` to 5.1, `rmcp` to 3.9, `similar` to 3 and `toml` to 1.2.
-- An MCP server is told when Meka stops waiting on a read, a prompt, a list or a subscription.
-- An MCP message over 16 MiB is refused; over stdio, the call it answers then times out.
+- Session archives are `format_version` 26; older archives are brought forward on import.
+- An MCP server is told when Meka stops waiting on it; a message over 16 MiB is refused.
 - MCP OAuth refuses a link-local address, and a loopback one unless the `url` names loopback.
-- A change diff that runs out of time stays a diff rather than replacing the whole file.
 
 ### Fixed
 
-- A reply with nothing in it is no longer stored as a sentence Meka wrote.
-- A stopped, interrupted or failed reply keeps its reasoning and tool calls on record.
+- Empty, stopped and failed replies are recorded as returned, reasoning and tool calls included.
+- Fields a provider returns, such as `reasoning_details` and citations, are kept, streamed or not.
 - A tool call whose arguments are not a JSON object is refused rather than run without them.
 - Refusals, content filters and context-window cuts are reported as such, not as errors or answers.
-- Fields a provider returns, such as `reasoning_details` and citations, are kept, streamed or not.
-- A Claude reply whose blocks overlap on OpenRouter's stream keeps and shows every block, in order.
-- A Responses reply whose items stream at once keeps each item whole and in its numbered place.
-- A Responses message or reasoning item that arrives whole, unstreamed, keeps its words.
-- A malformed stream frame fails the attempt rather than leaving a hole in the reply.
 - The screen says when a round of tool calls stopped at the output limit.
+- Claude and Responses streams whose parts overlap or arrive unstreamed keep every part, in order.
+- A malformed stream frame fails the attempt rather than leaving a hole in the reply.
 - A turn kept through a compaction shows what was said, not the context's rewrite of it.
-- A prompt that opens like one of Meka's notes titles its session.
-- `tool_search` finds a tool whose name is longer than 128 bytes.
-- `meka serve` logs each provider failure once.
-- An ACP `initialize` asking for a newer protocol without `clientInfo` is answered with version 1.
-- A scheduled job in the hour before a daylight-saving jump no longer also runs right after it.
-- A schedule that names Sunday as `7` with `L` (`7L`, `7#L`) runs on the last Sunday; it never ran.
 - `/resume` on the screen no longer carries the last session's usage totals onto the new one.
-- ChatGPT usage stats read a profile whose daily buckets are `null`.
+- A schedule no longer fires twice across a daylight-saving jump, and `7L` runs on the last Sunday.
+- `tool_search` finds a tool whose name is longer than 128 bytes.
+- An ACP `initialize` asking for a newer protocol without `clientInfo` is answered with version 1.
+
+### Security
+
+- RUSTSEC-2026-0459 (CVE-2026-119375): the bundled SQLite is 3.54.1.
 
 ## [0.91.0] - 2026-11-08
 
@@ -3256,7 +3245,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.91.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.92.0...HEAD
+[0.92.0]: https://github.com/k4yt3x/meka/compare/0.91.0...0.92.0
 [0.91.0]: https://github.com/k4yt3x/meka/compare/0.90.0...0.91.0
 [0.90.0]: https://github.com/k4yt3x/meka/compare/0.89.0...0.90.0
 [0.89.0]: https://github.com/k4yt3x/meka/compare/0.88.3...0.89.0

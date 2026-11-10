@@ -11,7 +11,7 @@ use crate::error::{MekaError, Result};
 
 /// The turns table, on a store's connection.
 pub(crate) struct TurnStore {
-    connection: Arc<tokio_rusqlite::Connection>,
+    connection: Arc<super::connection::Connection>,
 }
 
 /// One turn as its row records it: when it began and, once it has, how it ended.
@@ -508,7 +508,7 @@ pub(super) fn turn_from_row(
 
 impl TurnStore {
     /// A handle on the table over `connection`.
-    pub(crate) fn new(connection: Arc<tokio_rusqlite::Connection>) -> Self {
+    pub(crate) fn new(connection: Arc<super::connection::Connection>) -> Self {
         Self { connection }
     }
 

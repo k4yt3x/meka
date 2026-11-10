@@ -23,6 +23,7 @@ use crate::fs::*;
 pub(crate) mod background;
 mod backup;
 mod blobs;
+pub(crate) mod connection;
 mod credentials;
 pub(crate) mod export;
 pub(crate) mod inbox;
@@ -42,9 +43,9 @@ use std::{
     sync::Arc,
 };
 
+use connection::Connection;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use tokio_rusqlite::Connection;
 use uuid::Uuid;
 
 use self::backup::*;
@@ -431,11 +432,11 @@ impl Store {
             })
             .await
             .map_err(|error| match error {
-                tokio_rusqlite::Error::Error(inner) => inner,
-                other => MekaError::Database(format!(
+                connection::Error::Error(inner) => inner,
+                closed @ connection::Error::ConnectionClosed => MekaError::Database(format!(
                     "failed to initialize schema in '{}': {}",
                     self.database_path.display(),
-                    other
+                    closed
                 )),
             })?;
 

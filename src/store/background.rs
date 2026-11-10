@@ -16,11 +16,11 @@ pub(crate) struct SavedOutput {
 /// [`crate::store::Store::background_store`].
 #[derive(Clone)]
 pub(crate) struct BackgroundStore {
-    pub(crate) connection: std::sync::Arc<tokio_rusqlite::Connection>,
+    pub(crate) connection: std::sync::Arc<super::connection::Connection>,
 }
 impl BackgroundStore {
     /// A handle on the table over `connection`.
-    pub(crate) fn new(connection: std::sync::Arc<tokio_rusqlite::Connection>) -> Self {
+    pub(crate) fn new(connection: std::sync::Arc<super::connection::Connection>) -> Self {
         Self { connection }
     }
 

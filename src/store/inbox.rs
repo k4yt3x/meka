@@ -162,7 +162,7 @@ pub(crate) enum Withdrawal {
 /// [`crate::store::Store::inbox_store`].
 #[derive(Clone)]
 pub(crate) struct InboxStore {
-    pub(crate) connection: std::sync::Arc<tokio_rusqlite::Connection>,
+    pub(crate) connection: std::sync::Arc<super::connection::Connection>,
 }
 
 const COLUMNS: &str = "id, session_id, class, source, body, created_at, attempts, appended_at, \
@@ -175,7 +175,7 @@ const PENDING: &str = "appended_at IS NULL AND withdrawn_at IS NULL \
 
 impl InboxStore {
     /// A handle on the table over `connection`.
-    pub(crate) fn new(connection: std::sync::Arc<tokio_rusqlite::Connection>) -> Self {
+    pub(crate) fn new(connection: std::sync::Arc<super::connection::Connection>) -> Self {
         Self { connection }
     }
 

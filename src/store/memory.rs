@@ -45,8 +45,8 @@ use std::{
 };
 
 use rusqlite::OptionalExtension;
-use tokio_rusqlite::Connection;
 
+use super::connection::Connection;
 use crate::{
     entry::{DEFAULT_PRIORITY, MAX_PRIORITY},
     error::{MekaError, Result},
@@ -1403,9 +1403,9 @@ impl MemoryStore {
             })
             .await
             .map_err(|error| match error {
-                tokio_rusqlite::Error::Error(inner) => inner,
-                other => {
-                    MekaError::Database(format!("failed to create the memory tables: {other}"))
+                super::connection::Error::Error(inner) => inner,
+                closed @ super::connection::Error::ConnectionClosed => {
+                    MekaError::Database(format!("failed to create the memory tables: {closed}"))
                 }
             })?;
         Ok(Arc::new(Self {
@@ -1780,11 +1780,10 @@ impl MemoryStore {
                     // variant that renders as one.
                     //
                     // Not `InvalidParameterName`, whose `Display` is "Invalid parameter name:
-                    // {name}". Wrapped by `tokio_rusqlite` and then by `MekaError::Database`,
-                    // the model would receive `database error: failed to write memory:
-                    // Error("Invalid parameter name: no memory named 'x' exists...")`, a
-                    // user-input mistake dressed as a database fault, with a prefix inviting a
-                    // retry under a different `name`.
+                    // {name}". Wrapped by `MekaError::Database`, the model would receive
+                    // `database error: failed to write memory: Invalid parameter name: no memory
+                    // named 'x' exists...`, a user-input mistake dressed as a database fault, with
+                    // a prefix inviting a retry under a different `name`.
                     return Err(rusqlite::Error::QueryReturnedNoRows);
                 }
                 // Measured ahead of the upsert and judged after it, inside the one transaction, so
@@ -1873,7 +1872,7 @@ impl MemoryStore {
                 // The sentinel the transaction raises when an omitted description would have to
                 // create the row. Mapped back here, at the boundary that owns the vocabulary, so
                 // the caller sees a refusal it can act on rather than a database fault.
-                tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows) => {
+                super::connection::Error::Error(rusqlite::Error::QueryReturnedNoRows) => {
                     MekaError::InvalidRequest(format!(
                         "no memory named '{name}' exists, so a description is required to create it"
                     ))
@@ -2410,10 +2409,9 @@ impl MemoryStore {
     ///
     /// Two things, because FTS5's own command is weaker than it reads. On an external-content
     /// table `INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')` verifies the
-    /// index's *internal structure* and nothing else: measured against real SQLite 3.53, a row
+    /// index's *internal structure* and nothing else: measured against SQLite 3.53 and 3.54, a row
     /// present in the index and absent from the table passes, and so does a body changed under the
-    /// index. Every documented argument form behaves the same. So the count comparison below is
-    /// what actually catches a trigger that stopped firing.
+    /// index. So the count comparison below is what actually catches a trigger that stopped firing.
     ///
     /// What neither can see is a *changed* document whose update trigger did not fire: the
     /// counts still match, and only searching for the new text reveals it. That is why the caller
@@ -3246,9 +3244,9 @@ mod tests {
 
     /// The integrity check detects a desync that FTS5's own command does not.
     ///
-    /// Measured against SQLite 3.53: on an external-content table, `integrity-check` verifies the
-    /// index's internal structure and never compares it to the content, so a row in the index and
-    /// not in the table passes -- in every documented argument form. The document count is what
+    /// Measured against SQLite 3.53 and 3.54: on an external-content table, the `integrity-check`
+    /// the check sends verifies the index's internal structure and never compares it to the
+    /// content, so a row in the index and not in the table passes. The document count is what
     /// catches a trigger that stopped firing, and this pins that it is actually checked.
     #[tokio::test]
     async fn a_desync_the_fts_command_ignores_is_still_reported() {

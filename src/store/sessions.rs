@@ -5066,7 +5066,7 @@ impl Store {
              FROM messages m WHERE m.session_id = latest.session_id AND m.id < latest.boundary \
              ORDER BY m.id LIMIT 1))"
         );
-        let failed = |error: tokio_rusqlite::Error| {
+        let failed = |error: super::connection::Error| {
             MekaError::Database(format!("failed to delete expired turns: {error}"))
         };
 
