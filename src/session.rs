@@ -647,9 +647,8 @@ pub(crate) struct CompactRequest {
     /// `context_compact`. Reaches the checkpoint turn and the fallback summarizer alike, so the
     /// channel works whichever strategy runs.
     pub(crate) instructions: Option<String>,
-    /// Whether to keep the recent turns verbatim after the summary. `None` means "unspecified",
-    /// which resolves to `true`; `context_replace` may override it with a better-informed answer,
-    /// since only the checkpoint turn knows whether the summary already covers them.
+    /// Whether to keep the recent turns verbatim after the summary, as asked; see
+    /// [`Self::person_keeps_recent`] for a compaction a person asked for.
     pub(crate) keep_recent: Option<bool>,
     /// The words of the request a turn still in progress is answering, when the compaction runs
     /// inside that turn. Quoted after the summary if the split takes the request into the head,
@@ -665,6 +664,15 @@ impl CompactRequest {
             keep_recent: None,
             request_in_flight: None,
         }
+    }
+
+    /// For a compaction a person asked for, whether it keeps a verbatim tail, which is theirs to
+    /// say and nothing else's: none unless they asked for one, since they are starting the next
+    /// stretch from the summary. `None` for every other compaction, whose `keep_recent` is a
+    /// request `context_replace` may answer better, and which otherwise keeps the tail.
+    pub(crate) fn person_keeps_recent(&self) -> Option<bool> {
+        (self.trigger == crate::conversation::CompactionTrigger::Manual)
+            .then(|| self.keep_recent.unwrap_or(false))
     }
 
     /// The request the running turn is answering; see [`Self::request_in_flight`].

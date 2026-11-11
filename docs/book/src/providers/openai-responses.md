@@ -84,7 +84,7 @@ below. Any other field goes in the profile's
 (`temperature`, `service_tier`, `text = { verbosity = "low" }`), and one Meka sets is refused there.
 
 OpenAI's own fields go out too, as `chatgpt-subscription` sends them, each with a switch for an
-endpoint or a model that refuses it:
+endpoint or a model that rejects it:
 
 | Field | What it does | Switch |
 |---|---|---|
@@ -92,10 +92,13 @@ endpoint or a model that refuses it:
 | `reasoning.summary: "auto"` | Asks for the digest Meka shows as the model's thinking | the profile's [`reasoning_summary`](../configuration/config-file.md#reasoning_summary) |
 | `prompt_cache_key` | Routes one conversation's requests to the cache holding its prefix; Meka sends the session's id | the account's [`prompt_cache_key`](../configuration/config-file.md#prompt_cache_key) |
 
-Most servers ignore a field they do not know, and one that refuses names the field in its error,
-which is the switch to turn off. Sealed reasoning goes back only to the endpoint that sealed it, so
-a session that ran on ChatGPT or another endpoint does not send that endpoint's reasoning here.
-Endpoints that stream reasoning unprompted (vLLM and Ollama emit `response.reasoning_text.delta`
-without being asked) render their thinking either way. The `cached_tokens` an endpoint reports
-inside `input_tokens` are counted as cache reads, so `/status` shows a hit rate on this backend
-too.
+Most servers ignore a field they do not know, and one that rejects it names the field in its error,
+which is the switch to turn off. Reasoning goes back as a `reasoning` item whichever endpoint
+returned it, its summary and reasoning text as they came; its `encrypted_content` and id go back
+only to the host that sealed it, whatever `encrypted_reasoning` says, so a session that ran on
+ChatGPT sends this endpoint ChatGPT's summaries without the seal. A reasoning item with nothing after it in its
+reply is not sent, since OpenAI rejects one, so an endpoint that returns reasoning after its output
+does not get that reasoning back. Endpoints that stream reasoning unprompted (vLLM and Ollama emit
+`response.reasoning_text.delta` without being asked) render their thinking either way. The
+`cached_tokens` and `cache_write_tokens` an endpoint reports inside `input_tokens` are counted as
+cache reads and cache writes, so `/status` shows a hit rate on this backend too.

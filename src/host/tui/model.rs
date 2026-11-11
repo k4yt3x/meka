@@ -2927,6 +2927,7 @@ mod tests {
             source: crate::conversation::CompactionSource::Checkpoint,
             memories_written: vec!["notes".to_string()],
             kept_recent: true,
+            person_keeps_recent: None,
             // A summary that carries an earlier summary's section heading over, as a second
             // compaction's often does: the record holds it as written.
             written_summary: "a summary\n\n[Checklist]\n\n1. carried over\n".to_string(),
@@ -4129,7 +4130,7 @@ mod tests {
     /// since a rewind is written between turns, and once, wherever a page's edge falls. A turn
     /// taking its prompt back to join a message to it is no rewind: the prompt shows once, in the
     /// message it joined, with no note, in a log that names its turns or one written before turns
-    /// were recorded. A prompt withdrawn because the provider refused it stays, as it did live,
+    /// were recorded. A prompt withdrawn because the provider rejected it stays, as it did live,
     /// with no note either.
     #[allow(
         clippy::single_range_in_vec_init,

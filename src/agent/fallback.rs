@@ -400,7 +400,7 @@ mod tests {
             .collect()
     }
 
-    /// A quota refusal is never retried in place: the turn continues on the fallback, the row
+    /// A quota rejection is never retried in place: the turn continues on the fallback, the row
     /// says so, the notice says so, and the session is back on its own profile afterwards.
     #[tokio::test]
     async fn a_turn_whose_profile_is_exhausted_continues_on_its_fallback() {
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(
             family.main.streams().len(),
             1,
-            "one refusal, no retry in place"
+            "one rejection, no retry in place"
         );
         assert_eq!(family.backup.streams().len(), 1);
         assert_eq!(last_turn_profile(&family).await.as_deref(), Some("backup"));
@@ -426,6 +426,164 @@ mod tests {
             notices(&family)
                 .iter()
                 .any(|text| text == "Profile 'main' is unavailable; this turn runs on 'backup'."),
+            "{:?}",
+            notices(&family)
+        );
+    }
+
+    /// A rejection of what a turn added, which the degrade tiers answer when nothing was switched.
+    fn rejected() -> Vec<MockEvent> {
+        vec![MockEvent::FailInvalidRequest {
+            message: "Invalid 'input[1].content': array too long.".to_string(),
+        }]
+    }
+
+    /// Run a turn on `messages` asking `words` with `images`.
+    async fn ask(
+        agent: &Agent,
+        messages: &mut Conversation,
+        words: &str,
+        images: Vec<crate::image::ImageSource>,
+    ) -> Result<TurnOutcome> {
+        agent
+            .run_turn(
+                messages,
+                TurnInput::from_parts(words.to_string(), images).expect("a prompt"),
+                TurnCancellation::new(),
+            )
+            .await
+    }
+
+    /// Whether anything told the person to switch back.
+    fn told_to_switch_back(notices: &[String]) -> bool {
+        notices
+            .iter()
+            .any(|text| text.contains("since switching from profile"))
+    }
+
+    /// A session's own profile coming back after a fallback served in its place is not a switch,
+    /// in the process the fallback served in or in the next, which reads what served the
+    /// conversation back from its replies: its rejection degrades what the turn added, and nobody
+    /// is told to switch back.
+    #[tokio::test]
+    async fn the_named_profile_coming_back_after_a_fallback_is_no_switch() {
+        for next_process in [false, true] {
+            let family = family(
+                vec![
+                    answer("one"),
+                    exhausted(),
+                    rejected(),
+                    answer("without the image"),
+                ],
+                vec![answer("two")],
+            )
+            .await;
+            let mut messages = Conversation::new();
+            for words in ["one", "two"] {
+                ask(&family.agent, &mut messages, words, Vec::new())
+                    .await
+                    .expect("answered");
+            }
+            assert_eq!(last_turn_profile(&family).await.as_deref(), Some("backup"));
+            family.providers.mark_available("main");
+            let next = build_test_agent_on(
+                crate::session::SessionMaterials {
+                    providers: Arc::clone(&family.providers),
+                    ..crate::session::SessionMaterials::for_test(family.store.clone())
+                },
+                resolved_profile(&family.providers, "main".to_string())
+                    .await
+                    .expect("main resolves"),
+                family.frontend.clone(),
+                crate::tools::ToolRegistry::new(),
+            );
+            next.cells().session_id.set(family.session);
+            let agent = if next_process {
+                messages = Conversation::from_events(
+                    family
+                        .store
+                        .load_events(family.session)
+                        .await
+                        .expect("load events"),
+                );
+                &next
+            } else {
+                &family.agent
+            };
+            ask(agent, &mut messages, "look", vec![
+                crate::agent::tests::image_source(),
+            ])
+            .await
+            .expect("the degraded retry answers");
+            assert_eq!(
+                family.main.streams().len(),
+                4,
+                "next process {next_process}"
+            );
+            assert!(
+                !told_to_switch_back(&notices(&family)),
+                "next process {next_process}: {:?}",
+                notices(&family)
+            );
+        }
+    }
+
+    /// A fallback serving the first turn after a switch is not the profile switched to having
+    /// served it: that profile's own first request is still the first since the switch.
+    #[tokio::test]
+    async fn a_fallback_serving_after_a_switch_leaves_the_switch_ahead() {
+        let family = family(
+            vec![exhausted(), rejected(), answer("without the image")],
+            vec![answer("one"), answer("two")],
+        )
+        .await;
+        let resolve = |profile: &str| resolved_profile(&family.providers, profile.to_string());
+        family
+            .agent
+            .set_provider(resolve("backup").await.expect("backup resolves"));
+        let mut messages = Conversation::new();
+        ask(&family.agent, &mut messages, "one", Vec::new())
+            .await
+            .expect("answered");
+        family
+            .agent
+            .set_provider(resolve("main").await.expect("main resolves"));
+        ask(&family.agent, &mut messages, "two", Vec::new())
+            .await
+            .expect("the fallback answers");
+        assert_eq!(last_turn_profile(&family).await.as_deref(), Some("backup"));
+        family.providers.mark_available("main");
+        ask(&family.agent, &mut messages, "look", vec![
+            crate::agent::tests::image_source(),
+        ])
+        .await
+        .expect_err("rejected");
+        assert_eq!(family.main.streams().len(), 2, "no degraded retry");
+        assert!(
+            notices(&family).contains(&crate::agent::recovery::switch_rejected_notice("backup")),
+            "{:?}",
+            notices(&family)
+        );
+    }
+
+    /// A rejection on a fallback is the operator's to handle, who tests the chain: nothing of the
+    /// turn is degraded, and nobody is told to switch back, since nobody switched.
+    #[tokio::test]
+    async fn a_rejection_a_fallback_serves_is_not_degraded_and_names_no_switch() {
+        let family = family(vec![exhausted()], vec![
+            rejected(),
+            answer("without the image"),
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        ask(&family.agent, &mut messages, "look", vec![
+            crate::agent::tests::image_source(),
+        ])
+        .await
+        .expect_err("rejected");
+        assert_eq!(family.backup.streams().len(), 1, "no degraded retry");
+        assert!(
+            !told_to_switch_back(&notices(&family)),
             "{:?}",
             notices(&family)
         );
@@ -460,13 +618,13 @@ mod tests {
         }
     }
 
-    /// A fallback onto a wire that refuses a tool the failed profile's wire carried sends what the
+    /// A fallback onto a wire that rejects a tool the failed profile's wire carried sends what the
     /// serving wire carries, not the request built for the profile that failed.
     #[tokio::test]
     async fn a_fallback_sends_the_tools_the_serving_wire_carries() {
         let family = family_over(
             MockProvider::from_rounds(vec![exhausted()]),
-            MockProvider::from_rounds(vec![answer("from backup")]).refusing("probe_inspect"),
+            MockProvider::from_rounds(vec![answer("from backup")]).rejecting("probe_inspect"),
         )
         .await;
         family
@@ -491,7 +649,7 @@ mod tests {
         assert!(carried(family.main.streams()).contains(&"probe_inspect".to_string()));
         assert!(
             !carried(family.backup.streams()).contains(&"probe_inspect".to_string()),
-            "the fallback was sent a tool its wire refuses"
+            "the fallback was sent a tool its wire rejects"
         );
     }
 
@@ -583,7 +741,7 @@ mod tests {
             .mark_unavailable("main", Duration::from_secs(300));
         run(&family)
             .await
-            .expect("the named profile answers after the fallback refused");
+            .expect("the named profile answers after the fallback failed");
         assert_eq!(
             family.backup.streams().len(),
             1,
@@ -672,7 +830,7 @@ mod tests {
         assert!(notices(&family).is_empty());
     }
 
-    /// Every profile in the chain refused: the turn fails on the last one tried, the row names
+    /// Every profile in the chain failed: the turn fails on the last one tried, the row names
     /// it, and every breaker is open.
     #[tokio::test]
     async fn the_chain_exhausted_fails_the_turn_on_the_last_profile() {

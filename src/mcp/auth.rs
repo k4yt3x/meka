@@ -535,7 +535,7 @@ pub(super) async fn connect_http_with_oauth(
     let auth_manager = match auth_config {
         McpAuthConfig::ClientCredentials { client_id, scopes } => {
             // Required for this flow, and there is nothing to fall back to: without it Meka cannot
-            // prove which client it is and the token endpoint will refuse.
+            // prove which client it is and the token endpoint will reject it.
             let secret = client_secret.as_deref().ok_or_else(|| MekaError::McpAuth {
                 server_name: server_name.to_string(),
                 message: format!(
@@ -1381,7 +1381,7 @@ impl SqliteCredentialStore {
 #[async_trait]
 impl CredentialStore for SqliteCredentialStore {
     /// Held across rmcp's load, token request and save, so two Meka processes on one server do not
-    /// both spend its refresh token, which an issuer that rotates them refuses as reuse: the second
+    /// both spend its refresh token, which an issuer that rotates them rejects as reuse: the second
     /// loads what the first stored and refreshes from that.
     async fn acquire_refresh_guard(
         &self,

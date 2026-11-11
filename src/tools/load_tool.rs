@@ -254,7 +254,7 @@ impl Tool for LoadToolTool {
             .len()
             .saturating_sub(names.len());
         // The wire expands a reference into the definition where the result sits, and takes a
-        // result made of references alone: text beside one is refused ("Tool definitions/code
+        // result made of references alone: text beside one is rejected ("Tool definitions/code
         // execution functions cannot be mixed with other content"). So a load the references can
         // answer says nothing else, and one they cannot (a name that resolved to nothing, a batch
         // past the cap) loads nothing and says why, as an error so no name is recorded as loaded.
@@ -379,7 +379,7 @@ impl Tool for ToolSearchTool {
         };
         // On a wire that declares its deferred tools, every deferred match is loaded with the
         // answer, as a reference the wire expands into the definition: a search is then one round
-        // trip, not two. The references stand alone, since the wire refuses text beside them; an
+        // trip, not two. The references stand alone, since the wire rejects text beside them; an
         // active match is in the model's catalog already.
         if delivery.declares() && !matched_deferred.is_empty() {
             let mut output = ToolOutput::text(String::new(), false);
@@ -900,12 +900,12 @@ mod tests {
         let _already_set = fixture.tool_load.profile.set(published);
     }
 
-    /// Put the fixture's tools on a wire that refuses `name`; both tools share the one cell.
-    fn refuse(fixture: &Fixture, name: &str) {
+    /// Put the fixture's tools on a wire that rejects `name`; both tools share the one cell.
+    fn reject(fixture: &Fixture, name: &str) {
         let published =
             crate::provider::PublishedProfile::detached(&crate::provider::ResolvedProfile {
                 provider: Arc::new(
-                    crate::provider::mock::MockProvider::from_rounds(Vec::new()).refusing(name),
+                    crate::provider::mock::MockProvider::from_rounds(Vec::new()).rejecting(name),
                 ),
                 profile: "test".to_string(),
                 context_window: 1_000,
@@ -914,15 +914,15 @@ mod tests {
         let _already_set = fixture.tool_load.profile.set(published);
     }
 
-    /// A name the wire refuses is not loadable and not searchable, while the rest of a batch
+    /// A name the wire rejects is not loadable and not searchable, while the rest of a batch
     /// still loads: the refusal is a sentence per name, not a failed call.
     #[tokio::test]
-    async fn a_name_the_wire_refuses_is_neither_loaded_nor_found() {
+    async fn a_name_the_wire_rejects_is_neither_loaded_nor_found() {
         let fixture = build_test_tool(vec![fake_tool("mcp_probe"), fake_tool("fixture_alpha")], &[
             "mcp_probe",
             "fixture_alpha",
         ]);
-        refuse(&fixture, "mcp_probe");
+        reject(&fixture, "mcp_probe");
         let alone = fixture
             .tool_load
             .execute(
@@ -959,14 +959,14 @@ mod tests {
     }
 
     /// A name that resolves to nothing is answered with the matches the wire carries, never with
-    /// a tool the wire refuses.
+    /// a tool the wire rejects.
     #[tokio::test]
     async fn a_load_miss_suggests_only_what_the_wire_carries() {
         let fixture = build_test_tool(vec![fake_tool("mcp_probe"), fake_tool("fixture_alpha")], &[
             "mcp_probe",
             "fixture_alpha",
         ]);
-        refuse(&fixture, "mcp_probe");
+        reject(&fixture, "mcp_probe");
         let missed = fixture
             .tool_load
             .execute(

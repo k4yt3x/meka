@@ -142,7 +142,7 @@ On the screen:
 
 ## Resources and prompts
 
-In addition to tools, Meka exposes MCP resources and prompts through several builtin tools (deferred: the agent finds them under `[Tool discovery]` or with `tool_search`, calls `tool_load` for the schema, then invokes them; absent on a `claude-subscription` profile, whose endpoint refuses tool names starting with `mcp_`; they follow [`[mcp].deferral`](../configuration/config-file.md#mcp-top-level-table), so `eager` declares them from the first request and `hidden` leaves them out):
+In addition to tools, Meka exposes MCP resources and prompts through several builtin tools (deferred: the agent finds them under `[Tool discovery]` or with `tool_search`, calls `tool_load` for the schema, then invokes them; absent on a `claude-subscription` profile, whose endpoint rejects tool names starting with `mcp_`; they follow [`[mcp].deferral`](../configuration/config-file.md#mcp-top-level-table), so `eager` declares them from the first request and `hidden` leaves them out):
 
 | Builtin | Purpose |
 |---------|---------|

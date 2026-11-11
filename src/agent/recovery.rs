@@ -1,4 +1,4 @@
-//! What a turn does when the provider refuses or fails: the degrade tiers, the content rewrites
+//! What a turn does when the provider rejects or fails: the degrade tiers, the content rewrites
 //! each tier applies, and the retry policy.
 
 use super::*;
@@ -32,7 +32,7 @@ pub(super) const DEGRADE_TIERS: [DegradeTier; 2] =
 /// create. That is the same reach the cross-turn `last_accepted_len` already has, and it is undone
 /// unless the retry carrying it succeeds.
 pub(super) const SUSPECT_FLOOR_AFTER_REWRITE: usize = 0;
-/// How far [`degrade_rejected_content`] goes when rewriting the content a request was refused for.
+/// How far [`degrade_rejected_content`] goes when rewriting the content a request was rejected for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DegradeTier {
     /// Replace non-text content (a tool result's images, a message's own attachments) with a
@@ -44,12 +44,27 @@ pub(super) enum DegradeTier {
     /// undone.
     ///
     /// Reaches content [`Self::Attachments`] cannot. A tool result is usually text, and a provider
-    /// that refuses one (a body it cannot encode, a filter, sheer size) leaves nothing for the
-    /// first tier to remove, so without a later tier the turn dies with the refused text still
+    /// that rejects one (a body it cannot encode, a filter, sheer size) leaves nothing for the
+    /// first tier to remove, so without a later tier the turn dies with the rejected text still
     /// committed and every later turn re-sends it. This also reaches the arguments, which no tier
     /// that preserves the call can: a `tool_use` the provider objects to is repaired only by
     /// ceasing to be one.
     ToolExchanges,
+}
+/// What the user is told when a request goes again without the conversation's Claude thinking,
+/// after Claude rejected a signature: the view changes, the record keeps the thinking. A
+/// compaction's own copies say nothing: they are thrown away after, and the view keeps its
+/// thinking.
+pub(super) const THINKING_RETRY_NOTICE: &str =
+    "Claude rejected a thinking signature; retrying without the conversation's thinking.";
+/// What the user is told when the first request since the session switched from `previous` is
+/// rejected. It names no command, since every surface compacts its own way and a one-shot run has
+/// none.
+pub(super) fn switch_rejected_notice(previous: &str) -> String {
+    format!(
+        "The first request since switching from profile '{previous}' was rejected; switch back, \
+         compact the session, then switch again."
+    )
 }
 /// Sentinel for [`Agent::last_accepted_len`] before any request has come back 2xx, and after a
 /// compaction rewrites the conversation and makes earlier lengths incomparable.
@@ -131,14 +146,14 @@ pub(super) struct TurnRecovery {
     pub(super) thinking_only_nudged: bool,
     /// Whether this turn has already spent its [`crate::provider::retry::OUTAGE_REPRIEVE`]: the
     /// one wait-and-re-send-unchanged that separates a provider having a moment from a
-    /// provider that cannot handle this body. Once per turn, on the first refusal that could
+    /// provider that cannot handle this body. Once per turn, on the first rejection that could
     /// be either, because a second would only re-measure what the first already answered.
     pub(super) outage_reprieve_used: bool,
 }
 impl TurnRecovery {
     /// Compact and retry after the provider reported an overflow the local pre-send estimate missed
     /// (it under-counts, having no view of tool schemas). Returns the overflow the turn should fail
-    /// with when the compaction itself failed, since re-sending would be refused identically.
+    /// with when the compaction itself failed, since re-sending would be rejected identically.
     ///
     /// Any pending repair is undone *before* the compaction, not dropped after it. A
     /// [`crate::conversation::Event::Repair`] is position-relative, so one persisted after the new
@@ -250,7 +265,8 @@ impl TurnRecovery {
         let Some(event) = messages.unsign_thinking() else {
             return false;
         };
-        tracing::warn!(
+        // The turn's notice is what the user reads; a warning beside it says the same twice.
+        tracing::debug!(
             "provider rejected a thinking block's signature; retrying without the thinking of \
              {carrying} message(s)"
         );
@@ -260,7 +276,7 @@ impl TurnRecovery {
     }
 
     /// Degrade the content appended since the last accepted request and retry, after the provider
-    /// refused the request in a way the content could explain.
+    /// rejected the request in a way the content could explain.
     ///
     /// Retrying it unchanged is pointless (a rejection earned by the body is deterministic on the
     /// body), and failing outright is worse than it looks: the content is already committed to the
@@ -270,7 +286,7 @@ impl TurnRecovery {
     ///
     /// Walks [`DEGRADE_TIERS`] from wherever the turn left off, taking the first tier that finds
     /// something to change. Skipping rather than failing on a tier with nothing to do matters:
-    /// a turn whose refused content is all text has no attachments to strip, and spending a round
+    /// a turn whose rejected content is all text has no attachments to strip, and spending a round
     /// trip to discover that would just delay the tier that can actually help.
     ///
     /// Returns `rejection` verbatim when no tier finds anything, which means the complaint was
@@ -310,7 +326,7 @@ impl TurnRecovery {
             })
         else {
             // Only once a tier has actually been spent, which is what makes this a report rather
-            // than a guess: the turn degraded real content, was refused anyway, and has just put
+            // than a guess: the turn degraded real content, was rejected anyway, and has just put
             // that content back where every later turn will re-send it. With no tier spent the
             // complaint was about the request and not its contents (a `max_tokens` over the
             // ceiling, an unknown header), and pointing at a rewind would send the user to delete
@@ -371,18 +387,18 @@ impl TurnRecovery {
         Ok(())
     }
 
-    /// Wait once, then re-send the request unchanged, for a refusal that might be an outage rather
-    /// than a verdict on the content. Returns whether the caller should do that instead of
+    /// Wait once, then re-send the request unchanged, for a rejection that might be an outage
+    /// rather than a verdict on the content. Returns whether the caller should do that instead of
     /// degrading.
     ///
     /// Granted only for the [`MekaError::RetryableProvider`] shape, and once per stretch of
     /// consecutive failure: a request the provider accepts makes it available again, because the
-    /// next refusal is then about content the first wait never weighed. A
+    /// next rejection is then about content the first wait never weighed. A
     /// [`MekaError::InvalidRequest`] is the provider stating that it read the body and would not
     /// take it, which no amount of waiting changes, so that path degrades immediately as before.
     ///
     /// A spent retry budget has two readings and the loop cannot see which it has:
-    /// `refusal_may_blame_content` admits a 5xx on a completion because a gateway reports its own
+    /// `rejection_may_blame_content` admits a 5xx on a completion because a gateway reports its own
     /// decoder's exception that way, but so does a gateway that is merely overloaded, and the retry
     /// sequence is two attempts across three seconds of backoff, which an ordinary burst outlasts.
     /// Degrading on the wrong reading is not a wasted round trip: the degraded retry succeeds
@@ -459,7 +475,7 @@ impl TurnRecovery {
 
     /// Put back a repair the provider never judged, because the request carrying it was dropped
     /// before an answer came. Unlike [`Self::undo_rejected_repair`], the repair is not counted as
-    /// tried: nothing disproved it, and the next refusal should try it again rather than skip to
+    /// tried: nothing disproved it, and the next rejection should try it again rather than skip to
     /// the tier after and destroy more than it had to.
     pub(super) fn unjudge_repair(&mut self, messages: &mut Conversation) {
         let thinking_removal = matches!(
@@ -482,7 +498,7 @@ impl TurnRecovery {
     /// repair because when the outage reprieve does its job no repair was ever applied, so there
     /// is nothing to vindicate, and the reprieve would stay spent for the rest of the turn. It also
     /// covers a tier applied, undone, and then followed by a successful unchanged re-send, which
-    /// leaving it counted would skip on the next refusal.
+    /// leaving it counted would skip on the next rejection.
     ///
     /// This cannot loop: every reset costs a round trip the provider accepted, so it happens only
     /// as often as the turn makes real progress, which the tool loop already bounds.
@@ -506,7 +522,7 @@ impl TurnRecovery {
     /// it.
     ///
     /// [`Self::tiers_tried`] resets, because a vindicated tier was not spent, it was right:
-    /// leaving it counted would make a second refusal in the same turn (over an image a later
+    /// leaving it counted would make a second rejection in the same turn (over an image a later
     /// `file_read` returned, which `Attachments` reaches) jump straight to `ToolExchanges` and
     /// destroy the tool result whole. The bound the counter exists for is unaffected: a reset
     /// costs a 2xx.
@@ -725,7 +741,7 @@ pub(super) const REJECTION_REASON_CHARS: usize = 600;
 /// the model can see what it sent, which a short prefix answers; carrying them whole would re-send
 /// the very bytes the provider may have objected to.
 pub(super) const QUOTED_ARGUMENTS_CHARS: usize = 400;
-/// Rewrite `messages` so nothing the provider can refuse on content grounds survives, to the depth
+/// Rewrite `messages` so nothing the provider can reject on content grounds survives, to the depth
 /// `tier` allows, replacing what it removes with a note carrying `reason`. Returns `None` when this
 /// tier found nothing to rewrite, which the caller reads as "try the next tier, and if there isn't
 /// one this rejection isn't about content".
@@ -734,10 +750,10 @@ pub(super) const QUOTED_ARGUMENTS_CHARS: usize = 400;
 /// willing to break: **neither changes the shape of the conversation**, and every `tool_use` /
 /// `tool_result` pair survives both of them intact. `Attachments` removes only non-text blocks,
 /// which leaves a text-only tool result and a call's arguments untouched; `ToolExchanges` exists
-/// because those are refusable too.
+/// because those can be rejected too.
 ///
 /// Neither tier ever touches a message's plain text outside a tool exchange. That is the user's own
-/// prompt, and a turn that answers a refusal by deleting what the user typed is not a recovery.
+/// prompt, and a turn that answers a rejection by deleting what the user typed is not a recovery.
 pub(super) fn degrade_rejected_content(
     messages: &[Message],
     reason: &str,
@@ -752,7 +768,7 @@ pub(super) fn degrade_rejected_content(
         DegradeTier::ToolExchanges => {
             // Declines unless there is an exchange to empty, which is the only thing this tier
             // adds. Falling back to what the tier before it does would re-send the body that tier
-            // just had refused, spending the turn's last attempt to change nothing.
+            // just had rejected, spending the turn's last attempt to change nothing.
             let emptied = neutralize_tool_exchanges(messages, &reason)?;
             // And having fired, it subsumes: a turn only reaches here by having `Attachments`
             // undone, so anything that tier had removed is back in `messages` and must go again.
@@ -854,7 +870,7 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
 /// Nothing here changes the shape of the conversation: a `tool_use` stays a `tool_use` and a
 /// `tool_result` stays a `tool_result`, so the one invariant both APIs enforce on replay (that the
 /// two are matched) cannot be broken by the repair. Replacing the pair with plain text would orphan
-/// any `tool_result` whose call sits in already-accepted history, and every provider refuses an
+/// any `tool_result` whose call sits in already-accepted history, and every provider rejects an
 /// orphan outright.
 ///
 /// Two more things fall out of the same choice. The turn still ends in a `tool_use`, so the
@@ -863,8 +879,8 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
 /// the model needs no new concept and no frontend needs new rendering.
 ///
 /// The arguments move into the result rather than staying on the call: size is the way a `tool_use`
-/// earns a refusal, so leaving it in place would leave the tier unable to reach the thing that may
-/// have caused the failure. They are quoted, truncated, in the result, which is where the model
+/// earns a rejection, so leaving it in place would leave the tier unable to reach the thing that
+/// may have caused the failure. They are quoted, truncated, in the result, which is where the model
 /// already looks to find out what happened to a call.
 pub(super) fn neutralize_tool_exchanges(
     messages: &[Message],
@@ -976,7 +992,7 @@ pub(super) fn elide(text: &str, limit: usize) -> String {
 /// user has already seen, whichever variant carried the news.
 /// `a_five_hundred_outliving_its_retries_degrades_rather_than_stranding_the_session` and
 /// `run_turn_does_not_retry_a_rejection_with_nothing_to_degrade` pin the rules.
-pub(super) fn refusal_may_blame_content(error: &MekaError, content_started: bool) -> bool {
+pub(super) fn rejection_may_blame_content(error: &MekaError, content_started: bool) -> bool {
     if content_started {
         return false;
     }
@@ -1315,7 +1331,8 @@ mod tests {
     /// The removal of the conversation's Claude thinking is tried once per stretch of failure: a
     /// request that carried it and was rejected leaves it spent, one dropped before the provider
     /// answered leaves it to try again without charging a tier for it, and either way the thinking
-    /// is back as it was. A conversation with no Claude thinking has nothing to remove.
+    /// is back as it was. A conversation with no Claude thinking has nothing to remove. The
+    /// removal warns of nothing itself, since the turn's notice tells the user.
     #[test]
     fn a_thinking_removal_is_spent_by_a_rejection_and_not_by_an_unjudged_request() {
         let signed = Message {
@@ -1363,7 +1380,10 @@ mod tests {
                 .any(|message| message.without_claude_thinking().is_some())
         };
 
+        let logs = crate::streams::capture::capture_logs(tracing::Level::WARN);
         assert!(recovery.remove_rejected_thinking(&mut messages));
+        assert_eq!(logs.logged(), "");
+        drop(logs);
         assert!(!carries_signed(&messages));
         assert_eq!(messages.len(), 3);
         recovery.unjudge_repair(&mut messages);
@@ -1490,11 +1510,11 @@ mod tests {
         );
     }
 
-    /// The reprieve is spent once per stretch of consecutive failure, not once per refusal.
+    /// The reprieve is spent once per stretch of consecutive failure, not once per rejection.
     ///
     /// It answers one question (is this provider failing, or is it failing on this body) and a
-    /// second wait against the same refusal re-asks what the first already answered while the
-    /// user watches. A turn refused twice more without an accepted request in between therefore
+    /// second wait against the same rejection re-asks what the first already answered while the
+    /// user watches. A turn rejected twice more without an accepted request in between therefore
     /// degrades on the spot; `note_request_accepted` is what makes it available again.
     #[tokio::test(start_paused = true)]
     async fn the_outage_reprieve_is_spent_once_per_stretch_of_failure() {
@@ -1531,7 +1551,7 @@ mod tests {
             recovery
                 .take_outage_reprieve(&agent, &outage, &cancellation)
                 .await,
-            "the first refusal that could be either buys the wait"
+            "the first rejection that could be either buys the wait"
         );
         assert!(
             !recovery
@@ -1540,7 +1560,7 @@ mod tests {
             "the second must degrade rather than wait again"
         );
 
-        // And a refusal the provider issued *about the body* never buys it at all: waiting cannot
+        // And a rejection the provider issued *about the body* never buys it at all: waiting cannot
         // change a verdict the provider has already reached on what it read.
         let mut fresh = TurnRecovery {
             outage_reprieve_used: false,
@@ -1562,7 +1582,7 @@ mod tests {
     ///
     /// A turn reaches it only by having `Attachments` undone, so anything that tier removed is back
     /// in the conversation. Emptying the exchange alone would hand the provider the very
-    /// attachment the first attempt had already been refused with.
+    /// attachment the first attempt had already been rejected with.
     ///
     /// The attachment has to be one emptying the exchange does *not* reach, or the test passes on
     /// the wrong mechanism: an image inside a tool result goes because the result is emptied. A
@@ -1590,7 +1610,7 @@ mod tests {
     }
 
     /// And it declines when there is no exchange to empty, rather than repeating the tier before
-    /// it. Reaching here means `Attachments` has already been refused, so re-sending what it
+    /// it. Reaching here means `Attachments` has already been rejected, so re-sending what it
     /// produced would spend the turn's last attempt to change nothing.
     #[test]
     fn the_second_tier_declines_rather_than_repeating_the_attachment_tier() {
@@ -1751,7 +1771,7 @@ mod tests {
     /// It has to hold for *every* tier, which is what makes the exhausted-tier path in
     /// [`TurnRecovery::repair_rejected_content`] reachable at all. It is also the guard on the
     /// user's own words: a conversation of plain prose offers `ToolExchanges` nothing to empty,
-    /// so no tier can answer a refusal by deleting what somebody typed.
+    /// so no tier can answer a rejection by deleting what somebody typed.
     #[test]
     fn degrade_rejected_content_reports_nothing_to_do_for_text_only() {
         let messages = vec![
@@ -1892,8 +1912,8 @@ mod tests {
     }
 
     /// The user's own words are not the turn's to destroy, at either tier. A prompt that opens a
-    /// turn sits inside the suspect window, so nothing but this keeps a refusal from being answered
-    /// by deleting what somebody typed.
+    /// turn sits inside the suspect window, so nothing but this keeps a rejection from being
+    /// answered by deleting what somebody typed.
     #[test]
     fn no_tier_rewrites_the_prompt_that_opened_the_turn() {
         let prompt = Message::user("summarize the notes for me");
@@ -2086,7 +2106,7 @@ mod tests {
 
         assert_eq!(
             recovery.tiers_tried, 0,
-            "a tier disproved before an accepted request says nothing about the next refusal"
+            "a tier disproved before an accepted request says nothing about the next rejection"
         );
         assert!(
             !recovery.outage_reprieve_used,
@@ -2097,30 +2117,30 @@ mod tests {
     /// The predicate that decides whether a turn is allowed to answer a failure by rewriting its
     /// own content.
     #[test]
-    fn refusal_may_blame_content_admits_a_spent_retry_budget_but_not_a_streamed_one() {
+    fn rejection_may_blame_content_admits_a_spent_retry_budget_but_not_a_streamed_one() {
         let retryable = |server_error_on_completion| MekaError::RetryableProvider {
             message: "API returned status 500 Internal Server Error".to_string(),
             retry_after: None,
             server_error_on_completion,
         };
-        assert!(refusal_may_blame_content(&retryable(true), false));
+        assert!(rejection_may_blame_content(&retryable(true), false));
         assert!(
-            !refusal_may_blame_content(&retryable(true), true),
+            !rejection_may_blame_content(&retryable(true), true),
             "retrying after output has reached the user would print it twice"
         );
         // The exclusion this predicate exists for. A dropped connection is the same variant, and
         // degrading on it answers an outage by deleting content: the retry can succeed simply
         // because the network came back, and the loss is then persisted as proven-good.
         assert!(
-            !refusal_may_blame_content(&retryable(false), false),
+            !rejection_may_blame_content(&retryable(false), false),
             "only a 5xx that answered a completion may blame the content"
         );
-        assert!(refusal_may_blame_content(
+        assert!(rejection_may_blame_content(
             &MekaError::InvalidRequest("400".to_string()),
             false
         ));
         assert!(
-            refusal_may_blame_content(&MekaError::RequestTooLarge("x".to_string()), false),
+            rejection_may_blame_content(&MekaError::RequestTooLarge("x".to_string()), false),
             "Meka's own budget refusal is answered by degrading the newest content"
         );
         // The same exclusion, on the variant whose classifier cannot reach it today. The rule is
@@ -2128,16 +2148,16 @@ mod tests {
         // backend that ever maps a mid-stream failure to a 400 inherits it rather than printing
         // the answer twice.
         assert!(
-            !refusal_may_blame_content(&MekaError::InvalidRequest("400".to_string()), true),
-            "no refusal may be answered by re-sending after output has reached the user"
+            !rejection_may_blame_content(&MekaError::InvalidRequest("400".to_string()), true),
+            "no rejection may be answered by re-sending after output has reached the user"
         );
         assert!(
-            !refusal_may_blame_content(&MekaError::Provider("403 forbidden".to_string()), false),
+            !rejection_may_blame_content(&MekaError::Provider("403 forbidden".to_string()), false),
             "an auth or routing fault is not something the content can explain"
         );
         assert!(
-            !refusal_may_blame_content(&MekaError::Interrupted, false),
-            "a user's Ctrl+C is not a refusal to recover from"
+            !rejection_may_blame_content(&MekaError::Interrupted, false),
+            "a user's Ctrl+C is not a rejection to recover from"
         );
     }
 

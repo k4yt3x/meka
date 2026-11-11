@@ -1913,11 +1913,11 @@ mod tests {
             &state,
             "c1".to_string(),
             CompactionTrigger::Requested,
-            "the provider refused".to_string(),
+            "the provider rejected".to_string(),
             false,
         ));
         assert_eq!(failed["status"], "failed", "{failed}");
-        assert_eq!(failed["error"], "the provider refused");
+        assert_eq!(failed["error"], "the provider rejected");
         let record = CompactionRecord {
             written_summary: " ".to_string(),
             ..CompactionRecord::for_test()
@@ -2009,12 +2009,12 @@ mod tests {
             &state,
             "c1".to_string(),
             CompactionTrigger::Requested,
-            "the provider refused".to_string(),
+            "the provider rejected".to_string(),
             false,
         ));
         assert_eq!(
             failed["content"][0]["content"]["text"],
-            "Compaction failed: the provider refused"
+            "Compaction failed: the provider rejected"
         );
     }
 

@@ -309,7 +309,7 @@ pub(super) fn wire_delivery(
         .unwrap_or(DeferredToolDelivery::Appended)
 }
 /// Whether the wire of the session that published `profile` carries the tool `name`. A backend
-/// may refuse a name outright, and a session can move onto one mid-conversation, so the tool stays
+/// may reject a name outright, and a session can move onto one mid-conversation, so the tool stays
 /// registered and every door that would carry, show, load or run it asks here, per request. A
 /// cell no session published to carries everything.
 pub(super) fn is_carried_by_wire(
@@ -318,7 +318,7 @@ pub(super) fn is_carried_by_wire(
 ) -> bool {
     !profile
         .get()
-        .is_some_and(|profile| profile.current().provider.refuses_tool_name(name))
+        .is_some_and(|profile| profile.current().provider.rejects_tool_name(name))
 }
 /// The one sentence a load or a call of a tool the wire does not carry is answered with.
 pub(crate) fn not_carried_refusal(name: &str) -> String {
@@ -648,7 +648,7 @@ struct Carried<'a> {
     /// them to find, and never on a wire whose own search item does both jobs.
     discovery_rides: bool,
     /// Whether the deferred tools are declared outright, schemas and all, because nothing else
-    /// rides. A declaring endpoint refuses an array that is deferred through, and an appending
+    /// rides. A declaring endpoint rejects an array that is deferred through, and an appending
     /// wire would leave such a scope (a sub-agent allow-listed to one MCP tool, with no
     /// `tool_load` in it) nothing it can call; with nothing active there is no prefix to keep
     /// stable either way.
@@ -2655,11 +2655,11 @@ mod tests {
         assert!(!with_discovery.definitions.is_empty());
     }
 
-    /// A name the wire refuses leaves the request, whether the tool is active, deferred, or
+    /// A name the wire rejects leaves the request, whether the tool is active, deferred, or
     /// deferred and loaded, and leaves the catalog with it; the rest of the registry is untouched,
     /// and the tool stays registered for the profile the session may move back to.
     #[tokio::test]
-    async fn a_name_the_wire_refuses_leaves_the_request_and_the_catalog() {
+    async fn a_name_the_wire_rejects_leaves_the_request_and_the_catalog() {
         use crate::provider::DeferredToolDelivery;
         let registry = tool_registry_for_test().await;
         registry.register_deferred_fixture("mcp_probe");
@@ -2673,8 +2673,8 @@ mod tests {
                     provider: std::sync::Arc::new(
                         crate::provider::mock::MockProvider::from_rounds(Vec::new())
                             .delivering(delivery)
-                            .refusing("mcp_probe")
-                            .refusing("file_read"),
+                            .rejecting("mcp_probe")
+                            .rejecting("file_read"),
                     ),
                     profile: "test".to_string(),
                     context_window: 1_000,
@@ -2743,11 +2743,11 @@ mod tests {
         assert!(!with_deferred.iter().any(|name| name == "fixture_alpha"));
     }
 
-    /// A deferred tool the wire refuses is nothing for the discovery tools to find: with no other
+    /// A deferred tool the wire rejects is nothing for the discovery tools to find: with no other
     /// deferred tool they leave the array, as they leave the context block, whose catalog never
     /// listed the refused tool.
     #[tokio::test]
-    async fn the_discovery_tools_do_not_ride_for_a_deferred_tool_the_wire_refuses() {
+    async fn the_discovery_tools_do_not_ride_for_a_deferred_tool_the_wire_rejects() {
         let registry = tool_registry_for_test().await;
         registry.register_deferred_fixture("mcp_probe");
         registry
@@ -2757,7 +2757,7 @@ mod tests {
             .store(&crate::provider::ResolvedProfile {
                 provider: std::sync::Arc::new(
                     crate::provider::mock::MockProvider::from_rounds(Vec::new())
-                        .refusing("mcp_probe"),
+                        .rejecting("mcp_probe"),
                 ),
                 profile: "test".to_string(),
                 context_window: 1_000,

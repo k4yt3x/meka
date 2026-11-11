@@ -210,7 +210,7 @@ impl Store {
     /// conversation for a turn needs: providers, the request budget and a replay all take bytes.
     ///
     /// A reference to a blob the store no longer holds is left as it is and warned about, rather
-    /// than replaced with something invented; the provider then refuses the block and the turn's
+    /// than replaced with something invented; the provider then rejects the block and the turn's
     /// own degrade path takes it out.
     pub(crate) async fn inline_blobs(&self, events: &mut [Event]) -> Result<()> {
         let mut wanted: Vec<String> = Vec::new();

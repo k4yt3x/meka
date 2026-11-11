@@ -200,7 +200,7 @@ OAuth client id override (advanced; `claude-subscription` / `chatgpt-subscriptio
 
 Whether the endpoint takes the `interleaved-thinking` beta header, which `anthropic-messages`
 sends whenever thinking is on. Unset is `true`, which is what Anthropic's own API needs to think
-between tool calls; an endpoint that refuses the header sets it `false`. The other backends never
+between tool calls; an endpoint that rejects the header sets it `false`. The other backends never
 read it, and `meka account add --interleaved-thinking` refuses it for them. The other switch an
 endpoint decides, the cache breakpoint, is a profile field, because its answer varies by model on
 a gateway; see [`cache_control`](#cache_control).
@@ -217,13 +217,13 @@ interleaved_thinking = false
 `openai-responses` only. Whether the request carries `prompt_cache_key`, OpenAI's hint for routing
 one conversation's requests to the cache holding its prefix; Meka sends the session's id, as
 `chatgpt-subscription` does. Unset is `true`, which is what OpenAI's own API takes. An endpoint
-that refuses the field sets it `false`; most servers ignore a field they do not know.
+that rejects the field sets it `false`; most servers ignore a field they do not know.
 
 ### `stream_usage`
 
 `openai-chat-completions` only. Whether a streamed request asks for its usage with
 `stream_options.include_usage`, without which OpenAI's own API reports none and the context gauge
-and automatic compaction read zero. Unset is `true`. An endpoint that refuses the field sets it
+and automatic compaction read zero. Unset is `true`. An endpoint that rejects the field sets it
 `false`, and its usage is then whatever it reports unasked (OpenRouter reports it either way).
 
 ```toml
@@ -273,9 +273,9 @@ Change it with `meka profile set <name> model <value>`.
 
 ### `fallbacks`
 
-Profiles to serve a turn from when this one cannot, in order of preference: list the profile you would rather run on first, since every turn starts on the first profile, this one included, whose upstream is not known to be down, and a switch rebuilds the prompt cache at the new profile once. A turn falls back when the profile's upstream is still failing once the retry budget is spent (an outage, a rate limit, a dropped stream), or when it refuses for quota or billing by a signal it documents (a 402, a quota code on a 429, the Claude subscription's exhausted window). It does not fall back on a context overflow, an invalid request, a tool refusal or an authentication failure, which another profile would not fix. The whole profile is swapped, so no setting of this one is ever mixed with another's. Each fallback must be able to carry the sessions of the profile it backs: the same `vision`, and a `context_window` and `max_request_bytes` no smaller, each resolved as a session resolves it. A larger window or cap on a fallback is never drawn on: while a fallback serves, the session keeps gauging against its own profile's window, so when it compacts does not depend on who answered.
+Profiles to serve a turn from when this one cannot, in order of preference: list the profile you would rather run on first, since every turn starts on the first profile, this one included, whose upstream is not known to be down, and a switch rebuilds the prompt cache at the new profile once. A turn falls back when the profile's upstream is still failing once the retry budget is spent (an outage, a rate limit, a dropped stream), or when it rejects the request for quota or billing by a signal it documents (a 402, a quota code on a 429, the Claude subscription's exhausted window). It does not fall back on a context overflow, an invalid request, a tool refusal or an authentication failure, which another profile would not fix. The whole profile is swapped, so no setting of this one is ever mixed with another's. Each fallback must be able to carry the sessions of the profile it backs: the same `vision`, and a `context_window` and `max_request_bytes` no smaller, each resolved as a session resolves it. A larger window or cap on a fallback is never drawn on: while a fallback serves, the session keeps gauging against its own profile's window, so when it compacts does not depend on who answered.
 
-The session keeps naming this profile. A fallback serves one turn, the rest of that turn stays on it, and the next turn starts here again, or on the first fallback whose upstream is not known to be down: a profile that failed over is skipped for five minutes, or until the upstream's stated reset when that is sooner, never longer. Once a turn is running, a failure moves it to the next profile in the list it has not tried, so it fails only when every one has refused it. What served a turn is on its record (`profile` on [`GET /v1/sessions/{id}/turns`](../usage/http-api.md#turns) and on `turn.finished`) and in a notice on the feed and the screen. See [Fallback profiles](../usage/sessions.md#fallback-profiles).
+The session keeps naming this profile. A fallback serves one turn, the rest of that turn stays on it, and the next turn starts here again, or on the first fallback whose upstream is not known to be down: a profile that failed over is skipped for five minutes, or until the upstream's stated reset when that is sooner, never longer. Once a turn is running, a failure moves it to the next profile in the list it has not tried, so it fails only when every one has failed it. What served a turn is on its record (`profile` on [`GET /v1/sessions/{id}/turns`](../usage/http-api.md#turns) and on `turn.finished`) and in a notice on the feed and the screen. See [Fallback profiles](../usage/sessions.md#fallback-profiles).
 
 Each entry must name another configured profile, once. `meka profile remove` refuses a profile another's `fallbacks` names, and `meka profile rename` moves the name.
 
@@ -488,17 +488,19 @@ thinking_display = "updates"
 ### `encrypted_reasoning`
 
 `openai-responses` only. Whether the request asks for the model's reasoning sealed, with `include:
-["reasoning.encrypted_content"]`, and sends it back on the turn's later requests, so the model
-reasons on between its own tool calls rather than starting over at each. Defaults to `true`, what
-OpenAI's own API carries for a reasoning model. A model or endpoint that refuses the field sets it
-`false`: OpenAI's API refuses it for a model that does not reason, such as `gpt-4.1` or `gpt-4o`,
-with `Encrypted content is not supported with this model` naming `include`. Reasoning goes back only to the endpoint that sealed it: a session that ran on another
-endpoint, `chatgpt-subscription` included, keeps its reasoning on that endpoint.
+["reasoning.encrypted_content"]`, which the turn's later requests send back so the model reasons on
+between its own tool calls rather than starting over at each. Defaults to `true`, what OpenAI's own
+API carries for a reasoning model. A model or endpoint that rejects the field sets it `false`:
+OpenAI's API rejects it for a model that does not reason, such as `gpt-4.1` or `gpt-4o`, with
+`Encrypted content is not supported with this model` naming `include`. It decides only what a reply
+returns. Sealed reasoning the conversation already holds goes back to the host that sealed it
+either way, and reasoning another host sealed, `chatgpt-subscription`'s included, goes back here as
+its summary and reasoning text without the seal.
 
 ### `reasoning_summary`
 
 `openai-responses` only. Whether the request asks for `reasoning.summary`, the digest of the
-model's reasoning Meka shows as its thinking. Defaults to `true`. A model or endpoint that refuses
+model's reasoning Meka shows as its thinking. Defaults to `true`. A model or endpoint that rejects
 the field sets it `false`, as a model that does not reason does on OpenAI's API, and the thinking
 then shows only what the endpoint streams unasked (vLLM and Ollama stream their reasoning text
 either way).
@@ -537,7 +539,7 @@ every request the profile makes, sent as written: sampling settings such as `tem
 `top_p`, and anything else the endpoint accepts, a server's own extensions included. Each key is
 one top-level field of the request body, spelled as the provider's API reference spells it, and
 its value is any TOML value: a string, a number, a boolean, an array or a table. Meka reads none
-of them, so a field the endpoint does not know is the endpoint's to refuse or ignore.
+of them, so a field the endpoint does not know is the endpoint's to reject or ignore.
 
 ```toml
 [profiles.qwen]
@@ -1226,7 +1228,7 @@ auto_compact = false
 
 The share of the context window Meka lets the conversation fill on its own. Two things happen at the line: with `auto_compact` on, the conversation is compacted once past it; and a whole `scratchpad_read` that would carry the context past it is cut there and says where to continue, whether or not compaction is on. Refused outside 1 through 100.
 
-What is left above the line has to hold the reply and one round's growth past it, so keep at least your output budget plus a round free: the API refuses a request whose input and output cap together exceed the window. The default leaves 150k tokens on a 1M window against a Claude reply budget of 128000; on a small window it needs lowering, or `max_output_tokens` does.
+What is left above the line has to hold the reply and one round's growth past it, so keep at least your output budget plus a round free: the API rejects a request whose input and output cap together exceed the window. The default leaves 150k tokens on a 1M window against a Claude reply budget of 128000; on a small window it needs lowering, or `max_output_tokens` does.
 
 Default: `85`
 

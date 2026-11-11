@@ -10612,7 +10612,7 @@ fn an_inbox_turn_that_fails_for_good_gives_the_item_up_at_once() {
     );
 }
 
-/// A quota refusal is a failure waiting can change: the item waits for the next attempt at the
+/// A quota rejection is a failure waiting can change: the item waits for the next attempt at the
 /// backoff, not the hour the upstream stated, the feed says until when and why, and the item
 /// record shows both while it waits.
 #[test]
@@ -16322,7 +16322,7 @@ fn a_resident_session_whose_row_vanished_is_a_404_rather_than_an_empty_profile()
 /// The operator's switch decides whether the upstream's own words reach the caller, and both
 /// settings are exercised because only one of them is the default.
 ///
-/// An upstream refusal can name the *operator's* provider account rather than anything about the
+/// An upstream rejection can name the *operator's* provider account rather than anything about the
 /// caller or the conversation, so `[serve] relay_provider_errors = false` exists for deployments
 /// whose tokens go to people not entitled to it. Nothing else in the suite covers the key: the
 /// resolution defaults it to `true`, and a regression flipping that, or dropping the member
@@ -19511,7 +19511,7 @@ fn wait_for_turn_ending(harness: &ServeTestHarness, id: &str, turn_id: &str) -> 
     }
 }
 
-/// A profile whose upstream refuses for quota hands the turn to its fallback: the feed says so, the
+/// A profile whose upstream rejects for quota hands the turn to its fallback: the feed says so, the
 /// terminal and the turn's record name the profile that served it, the session keeps naming its
 /// own, and the next turn starts on the fallback while the breaker is open.
 #[test]
@@ -22118,7 +22118,7 @@ fn mcp_credentials_are_managed_over_http() {
 }
 
 /// One stub playing an MCP server and its authorization server, for the OAuth logins: `/mcp`
-/// refuses a request without the bearer `tok-1` with a challenge, `/register` registers a client,
+/// rejects a request without the bearer `tok-1` with a challenge, `/register` registers a client,
 /// `/token` mints `tok-1`, and every request is recorded in `seen`.
 fn spawn_oauth_mcp_stub(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> u16 {
     support::spawn_http_listener({

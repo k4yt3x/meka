@@ -302,14 +302,23 @@ pub(crate) enum StreamEvent {
     /// Words the model returned in the field its provider keeps for declining (OpenAI's
     /// `refusal`), streamed like text.
     RefusalDelta(String),
+    /// The words that follow are the content part numbered so of the output item in progress, a
+    /// block of their own: a Responses message item's `output_text` or `refusal` part. The item's
+    /// `TextEnd` ends every part it marked, each with the fields its own part holds.
+    ContentPart(u64),
     /// Something the provider returned that Meka reads no block from, verbatim: an output item of
     /// a type Meka does not know, or a reply in a shape its protocol does not define.
     Unrecognized(serde_json::Value),
     /// Reasoning text, which goes on the part in progress, opening one of reasoning when none is.
     ThinkingDelta(String),
     /// A new part of the thinking block in progress begins, of `kind`: a Responses item's next
-    /// summary part, or its reasoning after its summary.
-    ThinkingPart(crate::conversation::ReasoningKind),
+    /// summary part, or its reasoning after its summary. `number` is its place among its item's
+    /// parts of its kind where the wire numbers them (a Responses `summary_index` or
+    /// `content_index`), by which the block orders them however they arrived.
+    ThinkingPart {
+        kind: crate::conversation::ReasoningKind,
+        number: Option<u64>,
+    },
     /// The model has entered a thinking block, carrying the server's running estimate of the
     /// thinking tokens spent so far when it offers one (`None` at the start of the block, before
     /// any estimate has arrived).

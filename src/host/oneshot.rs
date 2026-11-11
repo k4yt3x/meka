@@ -600,6 +600,7 @@ mod tests {
                         source: crate::conversation::CompactionSource::Checkpoint,
                         memories_written: vec!["notes".to_string()],
                         kept_recent: true,
+                        person_keeps_recent: None,
                         written_summary: String::new(),
                         checkpoint: Vec::new(),
                         summarizer: Vec::new(),

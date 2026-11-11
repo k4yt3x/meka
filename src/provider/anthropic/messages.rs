@@ -106,7 +106,7 @@ impl AnthropicMessagesProvider {
         }
         // Whether the endpoint takes the beta is the endpoint's fact, which this backend cannot
         // know from `base_url`; the account states it, defaulting to the direct API's answer, so
-        // a gateway that refuses the header has a key rather than a `thinking = off`.
+        // a gateway that rejects the header has a key rather than a `thinking = off`.
         if self.interleaved_thinking && self.thinking.is_on() {
             parts.push("interleaved-thinking-2025-05-14");
         }
@@ -245,6 +245,10 @@ impl shared::ClaudeBackend for AnthropicMessagesProvider {
 
 #[async_trait]
 impl Provider for AnthropicMessagesProvider {
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
         match self.deferred_tools {
             crate::config::DeferredTools::Native => {

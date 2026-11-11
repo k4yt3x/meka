@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 26;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 27;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -864,7 +864,7 @@ mod tests {
                 vec![
                     crate::store::RecordedEvent::from(Event::Append(Message::user("look?"))),
                     crate::store::RecordedEvent::reply(answer.clone(), record.clone()),
-                    // Claude refused a signature: the view takes the thinking out.
+                    // Claude rejected a signature: the view takes the thinking out.
                     Event::Unsign.into(),
                 ],
                 Some(old),

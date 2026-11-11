@@ -64,7 +64,7 @@ impl Tool for McpToolAdapter {
 #[async_trait]
 impl crate::tools::Detachable for McpToolAdapter {
     /// The arguments as the server receives them; the run makes the request, whose arguments are
-    /// the server's to refuse.
+    /// the server's to reject.
     async fn start(
         &self,
         input: serde_json::Value,

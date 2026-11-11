@@ -257,7 +257,7 @@ pub(crate) enum CompactionKind {
     Manual,
     /// A measured or projected occupancy crossed the ceiling.
     Auto,
-    /// The provider refused the request as too large.
+    /// The provider rejected the request as too large.
     Reactive,
 }
 
@@ -611,10 +611,10 @@ pub(crate) trait Provider: Send + Sync {
         DeferredToolDelivery::Appended
     }
 
-    /// Whether this wire refuses a tool by its name alone, whatever its definition. Default: no
-    /// name is refused. A session can move onto such a wire mid-conversation, so the registry
+    /// Whether this wire rejects a tool by its name alone, whatever its definition. Default: no
+    /// name is rejected. A session can move onto such a wire mid-conversation, so the registry
     /// keeps the tool and asks per request rather than at registration.
-    fn refuses_tool_name(&self, _name: &str) -> bool {
+    fn rejects_tool_name(&self, _name: &str) -> bool {
         false
     }
 
@@ -623,6 +623,13 @@ pub(crate) trait Provider: Send + Sync {
     /// (the `/status` model block); the request path reads the same settled slot. Default: `None`
     /// (providers with no effort knob).
     fn resolved_effort(&self) -> Option<String> {
+        None
+    }
+
+    /// The model this provider's requests name, which together with the profile says what a
+    /// request went to: a change of either is a switch the conversation's next request answers
+    /// for. `None` for a provider that names none of its own.
+    fn model(&self) -> Option<&str> {
         None
     }
 }
@@ -971,8 +978,19 @@ struct PartsAt {
     content: Vec<ContentBlock>,
     text: String,
     refusal: String,
+    /// Whether the part in progress is a refusal, which one with no words yet still is.
+    refusing: bool,
+    /// The content part the text or refusal in progress is, when the wire numbers its item's
+    /// parts; see [`StreamEvent::ContentPart`].
+    part: Option<u64>,
+    /// The blocks the item in progress has closed so far, by their place in `content`, with the
+    /// part each is, which take their fields when the item ends.
+    item_parts: Vec<(usize, u64)>,
     /// The parts of the thinking block in progress.
     thinking: Vec<crate::conversation::ReasoningPart>,
+    /// The number each of `thinking`'s parts has among its item's parts of its kind, where the
+    /// wire numbers them; see [`StreamEvent::ThinkingPart`].
+    thinking_numbers: Vec<Option<u64>>,
     tool_id: String,
     tool_name: String,
     /// The arguments of the call in progress as they streamed, kept for a reply that ends before
@@ -995,7 +1013,12 @@ impl MessageAccumulator {
     pub(crate) fn pending_thinking(&self) -> String {
         self.places
             .get(&self.place)
-            .map(|parts| crate::conversation::reasoning_text(&parts.thinking))
+            .map(|parts| {
+                crate::conversation::reasoning_text(&ordered_thinking(
+                    parts.thinking.clone(),
+                    &parts.thinking_numbers,
+                ))
+            })
             .unwrap_or_default()
     }
 
@@ -1083,18 +1106,156 @@ impl MessageAccumulator {
     }
 }
 
+/// A thinking block's `parts`: each kind's in the order of their `numbers` where every one of them
+/// has one, else as they arrived. What a reader is shown of the block and what it records are the
+/// same parts in the same order.
+fn ordered_thinking(
+    mut parts: Vec<crate::conversation::ReasoningPart>,
+    numbers: &[Option<u64>],
+) -> Vec<crate::conversation::ReasoningPart> {
+    use crate::conversation::ReasoningKind;
+    for kind in [ReasoningKind::Summary, ReasoningKind::Reasoning] {
+        let places: Vec<usize> = (0..parts.len())
+            .filter(|place| parts.get(*place).is_some_and(|part| part.kind == kind))
+            .collect();
+        let numbered: Option<Vec<(u64, crate::conversation::ReasoningPart)>> = places
+            .iter()
+            .map(|place| Some((numbers.get(*place).copied()??, parts.get(*place)?.clone())))
+            .collect();
+        let Some(mut numbered) = numbered else {
+            continue;
+        };
+        numbered.sort_by_key(|(number, _)| *number);
+        for (place, (_, part)) in places.iter().zip(numbered) {
+            if let Some(slot) = parts.get_mut(*place) {
+                *slot = part;
+            }
+        }
+    }
+    parts
+}
+
+/// The fields of content part `part` of an item of several parts whose fields are `item`: the
+/// item's own, with only that part's fields under `content`, and none there when the item lists
+/// none for it. A `content` that is no list stays as it came.
+fn fields_of_part(
+    item: Option<&crate::conversation::ProviderFields>,
+    part: u64,
+) -> Option<crate::conversation::ProviderFields> {
+    let mut fields = item?.clone();
+    if let Some(serde_json::Value::Array(parts)) = fields.get("content") {
+        match usize::try_from(part)
+            .ok()
+            .and_then(|part| parts.get(part))
+            .cloned()
+        {
+            Some(own) => {
+                fields.insert("content".to_string(), serde_json::Value::Array(vec![own]));
+            }
+            None => {
+                fields.remove("content");
+            }
+        }
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
 impl PartsAt {
     /// Close the text in progress as a block, ahead of whatever block comes next, so the message
     /// holds its blocks in the order the wire sent them and a replay reads as the live turn did.
     /// A refusal in progress closes the same way.
     fn flush_text(&mut self) {
         self.close_text(None);
-        if !self.refusal.is_empty() {
+        if !self.refusal.is_empty() || self.refusing {
             self.content.push(ContentBlock::Refusal {
                 text: std::mem::take(&mut self.refusal),
                 provider_fields: None,
             });
         }
+        self.refusing = false;
+        self.part = None;
+        self.item_parts.clear();
+    }
+
+    /// Close the part in progress where the next content part of its item begins, one with no
+    /// words included, keeping its place so the item's end gives it its fields.
+    fn begin_content_part(&mut self, number: u64) {
+        if let Some(part) = self.part {
+            self.close_part(None);
+            self.item_parts
+                .push((self.content.len().saturating_sub(1), part));
+        } else if !self.text.is_empty() || !self.refusal.is_empty() {
+            self.close_part(None);
+        }
+        self.part = Some(number);
+    }
+
+    /// End the item in progress. An item of one part closes it as the item came; an item of
+    /// several puts its parts in the order of their numbers, as its done item lists them, and
+    /// gives each the item's fields with only its own part's fields under `content`.
+    fn end_item(&mut self, provider_fields: Option<crate::conversation::ProviderFields>) {
+        let Some(last) = self.part.take() else {
+            self.close_part(provider_fields);
+            return;
+        };
+        if self.item_parts.is_empty() {
+            self.close_part(provider_fields);
+            return;
+        }
+        self.close_part(None);
+        let mut parts = std::mem::take(&mut self.item_parts);
+        parts.push((self.content.len().saturating_sub(1), last));
+        let start = self.content.len().saturating_sub(parts.len());
+        // The item's blocks are the last it closed, since any other block ends the item first.
+        let laid_end_to_end = parts
+            .iter()
+            .enumerate()
+            .all(|(offset, (position, _))| *position == start + offset);
+        if !laid_end_to_end {
+            for (position, number) in parts {
+                if let Some(
+                    ContentBlock::Text {
+                        provider_fields: held,
+                        ..
+                    }
+                    | ContentBlock::Refusal {
+                        provider_fields: held,
+                        ..
+                    },
+                ) = self.content.get_mut(position)
+                {
+                    *held = fields_of_part(provider_fields.as_ref(), number);
+                }
+            }
+            return;
+        }
+        let mut blocks: Vec<(u64, ContentBlock)> = parts
+            .iter()
+            .map(|(_, number)| *number)
+            .zip(self.content.drain(start..))
+            .collect();
+        blocks.sort_by_key(|(number, _)| *number);
+        for (number, mut block) in blocks {
+            if let ContentBlock::Text {
+                provider_fields: held,
+                ..
+            }
+            | ContentBlock::Refusal {
+                provider_fields: held,
+                ..
+            } = &mut block
+            {
+                *held = fields_of_part(provider_fields.as_ref(), number);
+            }
+            self.content.push(block);
+        }
+    }
+
+    /// The thinking block's parts, taken, in the order [`ordered_thinking`] gives them.
+    fn take_thinking(&mut self) -> Vec<crate::conversation::ReasoningPart> {
+        let parts = std::mem::take(&mut self.thinking);
+        let numbers = std::mem::take(&mut self.thinking_numbers);
+        ordered_thinking(parts, &numbers)
     }
 
     /// Close the text in progress as a block with the fields the provider put on its part.
@@ -1113,7 +1274,8 @@ impl PartsAt {
     /// refusal it held instead. A part is the provider's from its start, so one that closes with
     /// no words in it is kept, as the reference client keeps a text block it saw start.
     fn close_part(&mut self, provider_fields: Option<crate::conversation::ProviderFields>) {
-        if self.text.is_empty() && !self.refusal.is_empty() {
+        let refusing = std::mem::take(&mut self.refusing);
+        if self.text.is_empty() && (refusing || !self.refusal.is_empty()) {
             self.content.push(ContentBlock::Refusal {
                 text: std::mem::take(&mut self.refusal),
                 provider_fields,
@@ -1130,15 +1292,17 @@ impl PartsAt {
     fn push(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::TextDelta(text) => {
-                if !self.refusal.is_empty() {
+                if self.refusing || !self.refusal.is_empty() {
                     self.flush_text();
                 }
                 self.text.push_str(&text);
             }
-            StreamEvent::TextEnd { provider_fields } => self.close_part(provider_fields),
+            StreamEvent::TextEnd { provider_fields } => self.end_item(provider_fields),
+            StreamEvent::ContentPart(number) => self.begin_content_part(number),
             StreamEvent::RefusalDelta(text) => {
                 self.close_text(None);
                 self.refusal.push_str(&text);
+                self.refusing = true;
             }
             // What arrives together stays together: a reply in an unread shape streams one piece
             // per chunk, which are one part of the reply.
@@ -1153,21 +1317,38 @@ impl PartsAt {
             }
             StreamEvent::ThinkingDelta(text) => match self.thinking.last_mut() {
                 Some(part) => part.text.push_str(&text),
-                None => self
-                    .thinking
-                    .push(crate::conversation::ReasoningPart::reasoning(text)),
+                None => {
+                    self.thinking
+                        .push(crate::conversation::ReasoningPart::reasoning(text));
+                    self.thinking_numbers.push(None);
+                }
             },
-            StreamEvent::ThinkingPart(kind) => {
+            StreamEvent::ThinkingPart { kind, number } => {
+                // A part opened before and left with no words gives way to the one its number
+                // names again with them.
+                if number.is_some()
+                    && let Some(place) = (0..self.thinking.len()).find(|place| {
+                        self.thinking_numbers.get(*place).copied().flatten() == number
+                            && self
+                                .thinking
+                                .get(*place)
+                                .is_some_and(|part| part.kind == kind && part.text.is_empty())
+                    })
+                {
+                    self.thinking.remove(place);
+                    self.thinking_numbers.remove(place);
+                }
                 self.thinking.push(crate::conversation::ReasoningPart {
                     kind,
                     text: String::new(),
                 });
+                self.thinking_numbers.push(number);
             }
             StreamEvent::ThinkingComplete {
                 opaque,
                 provider_fields,
             } => {
-                let thinking = std::mem::take(&mut self.thinking);
+                let thinking = self.take_thinking();
                 // Only a block that is kept closes the text: one that is dropped must not split
                 // the text around nothing.
                 if let Some(block) =
@@ -1243,7 +1424,7 @@ impl PartsAt {
     /// arguments never finished, refused with what had streamed of them.
     fn close_open_blocks(&mut self) {
         self.flush_text();
-        let thinking = std::mem::take(&mut self.thinking);
+        let thinking = self.take_thinking();
         if let Some(block) = ContentBlock::replayable_thinking(thinking, None, None) {
             self.content.push(block);
         }

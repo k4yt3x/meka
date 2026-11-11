@@ -766,6 +766,10 @@ pub(crate) struct CompactionView {
     pub(crate) memories_written: Vec<String>,
     /// Whether the recent turns were kept verbatim after the summary.
     pub(crate) kept_recent: bool,
+    /// For a compaction a person asked for, whether they asked for the recent turns to be kept;
+    /// absent for one nobody asked for, and for a person's recorded before Meka kept the answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) person_keeps_recent: Option<bool>,
     /// Which compaction this was, counting from 1. Fidelity degrades with each pass, so a client
     /// rendering a transcript can say how far from the original it is.
     pub(crate) generation: u64,
@@ -779,6 +783,7 @@ impl CompactionView {
             source: record.source.name().to_string(),
             memories_written: record.memories_written.clone(),
             kept_recent: record.kept_recent,
+            person_keeps_recent: record.person_keeps_recent,
             generation,
         }
     }

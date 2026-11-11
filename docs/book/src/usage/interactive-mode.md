@@ -423,7 +423,7 @@ This is distinct from `/status`, which reports this session's own token counters
 
 ### `/compact`
 
-The `/compact` command asks the LLM to summarize the entire conversation, then replaces the messages the model sees with a single summary message followed by the recent tail. This is useful for long sessions that are approaching the context window limit or becoming expensive.
+The `/compact` command asks the LLM to summarize the entire conversation, then replaces the messages the model sees with that summary alone: a compaction you ask for keeps no turn verbatim, so the next stretch starts from the summary. The automatic compactions and the ones the agent asks for may keep recent turns after it. This is useful for long sessions that are approaching the context window limit or becoming expensive.
 
 After compacting, the session continues with the summary as context. The pre-compaction messages are never deleted: they stay in the underlying event log on disk (the model just no longer sees them). `meka session export` walks that full log, so an export always contains the entire conversation including the compacted-away turns, with a marker at each compaction point.
 
@@ -445,7 +445,7 @@ A mislabeled image already committed to the session is repaired when you resume 
 
 ### Recovering from a call that got no answer
 
-A refusal is one thing the provider says; a request that never got a usable reply at all is another. A connection that fails or is reset while the request is going out is retried with backoff (up to twice, waiting 1s then 2s), and so is a response body that could not be read back. The turn continues as if the failed attempt had not happened, and nothing about it enters the conversation. Only when the retries run out does the turn report the error.
+A rejection is one thing the provider says; a request that never got a usable reply at all is another. A connection that fails or is reset while the request is going out is retried with backoff (up to twice, waiting 1s then 2s), and so is a response body that could not be read back. The turn continues as if the failed attempt had not happened, and nothing about it enters the conversation. Only when the retries run out does the turn report the error.
 
 Worth knowing what a retry can cost. When the failure was a body that could not be read, the provider had already generated the response and billed you for it, so the retry pays a second time. Meka does it anyway, because the alternative is losing the turn for content you have already been charged for once, but it is not free.
 

@@ -43,7 +43,7 @@ const ORIGINATOR: &str = "meka_cli";
 /// The `chatgpt-subscription` backend: one profile's model and the OAuth credential it bills.
 pub(crate) struct ChatGptSubscriptionProvider {
     client: reqwest::Client,
-    /// The token, its refresh gate, the refused slot and the row, in the one machine both
+    /// The token, its refresh gate, the rejected slot and the row, in the one machine both
     /// subscription backends run.
     credential: crate::oauth::SubscriptionCredential,
     base_url: String,
@@ -234,7 +234,7 @@ impl ChatGptSubscriptionProvider {
             .map_err(|error| MekaError::Provider(format!("invalid Codex usage JSON: {error}")))
     }
 
-    /// Record that the backend refused the bearer a request carried, so every credential read
+    /// Record that the backend rejected the bearer a request carried, so every credential read
     /// until it is replaced refreshes it instead of trusting the stored expiry.
     async fn note_credential_rejected(&self, sent_authorization: Option<&str>) {
         tracing::warn!(
@@ -292,7 +292,7 @@ impl ChatGptSubscriptionProvider {
     }
 
     /// The `(bearer_token, account_id)` to send, refreshed first when the token is due or was
-    /// refused; see [`crate::oauth::SubscriptionCredential::ensure_valid`]. The account id is
+    /// rejected; see [`crate::oauth::SubscriptionCredential::ensure_valid`]. The account id is
     /// `Option<String>` because free-tier accounts may not have one (Codex's auth/manager.rs
     /// treats the missing claim as non-fatal).
     async fn ensure_valid_credential(&self) -> Result<(String, Option<String>)> {
@@ -384,7 +384,7 @@ impl ChatGptSubscriptionProvider {
             .header("Accept", "text/event-stream");
         // No `Content-Type` here: the shared send in `responses_wire` sets it when it attaches the
         // serialized body, and `reqwest` appends a second header rather than replacing the first,
-        // which the backend refuses as an unsupported content type.
+        // which the backend rejects as an unsupported content type.
         if let Some(account_id) = account_id {
             request = request.header("ChatGPT-Account-ID", account_id);
         }
@@ -436,7 +436,7 @@ impl super::responses_wire::ResponsesBackend for ChatGptSubscriptionProvider {
 
 #[async_trait]
 impl crate::oauth::RefreshesCredential for ChatGptSubscriptionProvider {
-    /// Sent once more after a 401, on a credential refreshed for the purpose. A second refusal
+    /// Sent once more after a 401, on a credential refreshed for the purpose. A second rejection
     /// gets the login remedy instead.
     async fn refresh_after_rejection(&self, sent_authorization: Option<&str>) -> bool {
         self.note_credential_rejected(sent_authorization).await;
@@ -450,6 +450,10 @@ impl crate::oauth::RefreshesCredential for ChatGptSubscriptionProvider {
 
 #[async_trait]
 impl Provider for ChatGptSubscriptionProvider {
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
         match self.deferred_tools {
             crate::config::DeferredTools::Native => crate::provider::DeferredToolDelivery::Searched,
@@ -842,7 +846,7 @@ mod tests {
     }
 
     /// A mock endpoint that captures the head of the one request it receives, lowercased, and
-    /// refuses it: the request is the point of the tests that use it, not an answer.
+    /// rejects it: the request is the point of the tests that use it, not an answer.
     async fn mock_endpoint_capturing_the_head()
     -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -872,7 +876,7 @@ mod tests {
                 .position(|window| window == b"\r\n\r\n")
                 .unwrap_or(buffer.len());
             let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
-            // The test does not need an answer, so the shortest refusal will do.
+            // The test does not need an answer, so the shortest rejection will do.
             let response =
                 "HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
             if socket.write_all(response.as_bytes()).await.is_err() {
@@ -891,7 +895,7 @@ mod tests {
 
     /// The turn request names its content type once. `apply_headers` used to set it too, beside
     /// the shared send that attaches the serialized body; `reqwest` appends rather than replaces,
-    /// and the backend refuses a request with two of them as an unsupported content type.
+    /// and the backend rejects a request with two of them as an unsupported content type.
     #[tokio::test]
     async fn a_turn_request_carries_one_content_type_header() {
         let (local, head_receiver) = mock_endpoint_capturing_the_head().await;
@@ -911,7 +915,7 @@ mod tests {
         )
         .expect("provider");
         let (sender, _receiver) = mpsc::channel(8);
-        // The refusal is the point of the mock, not of the test.
+        // The rejection is the point of the mock, not of the test.
         if let Ok(()) = provider
             .stream(
                 CompletionRequest::new("", &[Message::user("hello")], &[]),
@@ -1003,7 +1007,7 @@ mod tests {
             ..Default::default()
         };
         let (sender, _receiver) = mpsc::channel(8);
-        // The refusal is the point of the mock, not of the test.
+        // The rejection is the point of the mock, not of the test.
         if let Ok(()) = provider
             .stream(
                 CompletionRequest::new("", &[Message::user("hello")], &[]).attributed(attribution),
@@ -1710,7 +1714,7 @@ mod tests {
     }
 
     /// A rejection buys one forced refresh whatever the stored expiry says, and only one: the
-    /// refresh that replaces the refused token clears it.
+    /// refresh that replaces the rejected token clears it.
     #[tokio::test]
     async fn a_rejection_forces_one_refresh_despite_a_valid_expiry() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1774,9 +1778,9 @@ mod tests {
         );
     }
 
-    /// Two requests refused in the same window both get the replacement, for one refresh. With a
+    /// Two requests rejected in the same window both get the replacement, for one refresh. With a
     /// flag in place of the token's identity, the second read found the flag spent, trusted the
-    /// stored expiry, and sent the refused bearer again.
+    /// stored expiry, and sent the rejected bearer again.
     #[tokio::test]
     async fn two_rejections_of_one_token_cost_one_refresh_and_both_get_the_new_one() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1807,7 +1811,7 @@ mod tests {
         )
         .expect("provider");
 
-        // Two request sites, both refused for "stale".
+        // Two request sites, both rejected for "stale".
         provider.note_credential_rejected(None).await;
         provider.note_credential_rejected(None).await;
         let (first, second) = tokio::join!(
@@ -1819,14 +1823,14 @@ mod tests {
         assert_eq!(first, "fresh-access");
         assert_eq!(
             second, "fresh-access",
-            "the refused bearer is never sent again"
+            "the rejected bearer is never sent again"
         );
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// A rejection that lands after a sibling request has already refreshed the token it names
-    /// records that token, not the replacement: the refused bearer is the one the request carried,
-    /// and a slot that took whatever was current would refresh a token nothing refused, rotating
+    /// records that token, not the replacement: the rejected bearer is the one the request carried,
+    /// and a slot that took whatever was current would refresh a token nothing rejected, rotating
     /// the refresh token a second time for one rejection.
     #[tokio::test]
     async fn a_late_rejection_of_a_replaced_token_does_not_refresh_the_replacement() {
@@ -1858,7 +1862,7 @@ mod tests {
         )
         .expect("provider");
 
-        // Request A, refused for "stale", refreshes.
+        // Request A, rejected for "stale", refreshes.
         provider
             .note_credential_rejected(Some("Bearer stale"))
             .await;
@@ -1869,7 +1873,7 @@ mod tests {
         assert_eq!(token, "fresh-access");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // Request B, sent on "stale" before the refresh, has its refusal land after it.
+        // Request B, sent on "stale" before the refresh, has its rejection land after it.
         provider
             .note_credential_rejected(Some("Bearer stale"))
             .await;
@@ -1881,17 +1885,17 @@ mod tests {
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "a token nothing refused is not refreshed"
+            "a token nothing rejected is not refreshed"
         );
     }
 
-    /// A refusal of a token already replaced must not erase a live refusal of its replacement:
-    /// request D was refused on the current token and recorded it, and request B's refusal of
+    /// A rejection of a token already replaced must not erase a live rejection of its replacement:
+    /// request D was rejected on the current token and recorded it, and request B's rejection of
     /// the token before it lands late. Taken at face value it would overwrite the slot with a
-    /// token that is gone, and D's retry would then trust the expiry, re-send the refused
+    /// token that is gone, and D's retry would then trust the expiry, re-send the rejected
     /// bearer and fail with the login remedy where a refresh recovers.
     #[tokio::test]
-    async fn a_late_refusal_of_an_old_token_keeps_a_live_refusal_of_the_current_one() {
+    async fn a_late_rejection_of_an_old_token_keeps_a_live_rejection_of_the_current_one() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock token endpoint");
@@ -1926,11 +1930,11 @@ mod tests {
         let (token, _) = provider
             .ensure_valid_credential()
             .await
-            .expect("the first refusal refreshes");
+            .expect("the first rejection refreshes");
         assert_eq!(token, "fresh-access");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // The replacement is refused by a request that carried it; then the old refusal lands.
+        // The replacement is rejected by a request that carried it; then the old rejection lands.
         provider
             .note_credential_rejected(Some("Bearer fresh-access"))
             .await;
@@ -1940,19 +1944,19 @@ mod tests {
         provider
             .ensure_valid_credential()
             .await
-            .expect("the live refusal still refreshes");
+            .expect("the live rejection still refreshes");
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "the refusal of the current token stands; the late one records nothing"
+            "the rejection of the current token stands; the late one records nothing"
         );
     }
 
-    /// A grant the issuer refuses because a sibling process spent it first is not a dead login:
+    /// A grant the issuer rejects because a sibling process spent it first is not a dead login:
     /// the row has moved past what this refresh set out from, and what the sibling stored there
-    /// is adopted. The endpoint stands in for the sibling, writing the row before it refuses.
+    /// is adopted. The endpoint stands in for the sibling, writing the row before it rejects.
     #[tokio::test]
-    async fn a_refused_refresh_adopts_the_credential_a_sibling_stored() {
+    async fn a_rejected_refresh_adopts_the_credential_a_sibling_stored() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let store = crate::store::Store::for_test().await;
@@ -2003,7 +2007,7 @@ mod tests {
                         .as_bytes(),
                     )
                     .await
-                    .expect("refuse the grant");
+                    .expect("reject the grant");
             }
         });
 
@@ -2025,7 +2029,7 @@ mod tests {
         let (token, _) = provider
             .ensure_valid_credential()
             .await
-            .expect("the sibling's credential is adopted rather than the refusal reported");
+            .expect("the sibling's credential is adopted rather than the rejection reported");
         assert_eq!(token, "fresh-from-sibling");
     }
 

@@ -1487,7 +1487,7 @@ mod tests {
                 tokio_util::sync::CancellationToken::new(),
             )
             .await;
-        assert!(outcome.is_err(), "the endpoint refuses the request");
+        assert!(outcome.is_err(), "the endpoint rejects the request");
         serde_json::from_str(&body_seen.await.expect("the request arrives")).expect("json")
     }
 

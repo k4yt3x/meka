@@ -85,7 +85,7 @@ async fn is_modern(entry: &ServerEntry) -> bool {
 
 /// Ask `entry`'s server for updates to `uri` from now on.
 ///
-/// Succeeds only when the server will send them: a legacy server's refusal is its error, a modern
+/// Succeeds only when the server will send them: a legacy server's rejection is its error, a modern
 /// server's is the acknowledgment leaving the URI out. The set keeps neither, so a URI the server
 /// will not watch is not asked for again on every later connection.
 pub(crate) async fn subscribe(
@@ -150,7 +150,7 @@ pub(super) fn resumption(entry: Arc<ServerEntry>) -> futures::future::BoxFuture<
 }
 
 /// Carry the set over onto the connection `entry` has just adopted, and open the stream a modern
-/// one delivers on. What a legacy server refuses is logged: the model asked on a connection that
+/// one delivers on. What a legacy server rejects is logged: the model asked on a connection that
 /// is gone, and nothing is waiting on the answer.
 ///
 /// Runs beside the connection rather than ahead of it, so by the time it runs a shutdown may have

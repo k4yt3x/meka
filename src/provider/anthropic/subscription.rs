@@ -70,7 +70,7 @@ impl WireThinkingDisplay {
 /// The `claude-subscription` backend: one profile's model and the OAuth credential it bills.
 pub(crate) struct ClaudeSubscriptionProvider {
     client: reqwest::Client,
-    /// The token, its refresh gate, the refused slot and the row, in the one machine both
+    /// The token, its refresh gate, the rejected slot and the row, in the one machine both
     /// subscription backends run.
     credential: crate::oauth::SubscriptionCredential,
     base_url: String,
@@ -339,7 +339,7 @@ impl ClaudeSubscriptionProvider {
         }
     }
 
-    /// The `Authorization` header to send, refreshed first when the token is due or was refused;
+    /// The `Authorization` header to send, refreshed first when the token is due or was rejected;
     /// see [`crate::oauth::SubscriptionCredential::ensure_valid`].
     async fn ensure_valid_credential(&self) -> Result<(&'static str, String)> {
         let access = self
@@ -352,7 +352,7 @@ impl ClaudeSubscriptionProvider {
         Ok(("Authorization", crate::text::bearer(&access.access_token)))
     }
 
-    /// Record that the backend refused the bearer a request carried, so every credential read
+    /// Record that the backend rejected the bearer a request carried, so every credential read
     /// until it is replaced refreshes it instead of trusting the stored expiry.
     async fn note_credential_rejected(&self, sent_authorization: Option<&str>) {
         tracing::warn!(
@@ -623,7 +623,7 @@ impl ClaudeSubscriptionProvider {
 #[async_trait]
 impl crate::oauth::RefreshesCredential for ClaudeSubscriptionProvider {
     /// Sent once more after a 401, on a credential refreshed for the purpose; see
-    /// [`crate::oauth::SubscriptionCredential`]. A second refusal gets the login remedy instead.
+    /// [`crate::oauth::SubscriptionCredential`]. A second rejection gets the login remedy instead.
     async fn refresh_after_rejection(&self, sent_authorization: Option<&str>) -> bool {
         self.note_credential_rejected(sent_authorization).await;
         true
@@ -696,6 +696,10 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
         ))
     }
 
+    fn summarizes_thinking(&self) -> bool {
+        self.wire_thinking_display(self.thinking.is_on()) == Some(WireThinkingDisplay::Summarized)
+    }
+
     fn remember_request_id(
         &self,
         attribution: &crate::provider::Attribution,
@@ -707,6 +711,10 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
 
 #[async_trait]
 impl Provider for ClaudeSubscriptionProvider {
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
         match self.deferred_tools {
             crate::config::DeferredTools::Native => {
@@ -720,8 +728,8 @@ impl Provider for ClaudeSubscriptionProvider {
     /// extra usage", whatever the tool's definition carries, while a server's
     /// `mcp__<server>__<tool>` names pass; so Meka's MCP meta-tools are never put on this wire.
     /// Established by replaying captured requests with the name as the one variable, 2026-10-16.
-    fn refuses_tool_name(&self, name: &str) -> bool {
-        endpoint_refuses_tool_name(name)
+    fn rejects_tool_name(&self, name: &str) -> bool {
+        endpoint_rejects_tool_name(name)
     }
 
     async fn complete(
@@ -874,8 +882,8 @@ impl OAuthUsageResponse {
 /// place, which is what Claude Code's "last assistant message that has one" does too.
 /// Whether this endpoint answers a request naming `name` as a tool with "You're out of extra
 /// usage": a name with the `mcp_` prefix that is not a server's `mcp__<server>__<tool>`. See
-/// [`ClaudeSubscriptionProvider::refuses_tool_name`].
-fn endpoint_refuses_tool_name(name: &str) -> bool {
+/// [`ClaudeSubscriptionProvider::rejects_tool_name`].
+fn endpoint_rejects_tool_name(name: &str) -> bool {
     name.starts_with("mcp_") && !name.starts_with("mcp__")
 }
 
@@ -1727,6 +1735,28 @@ mod tests {
             .max_request_bytes(None),
         )
         .expect("build test provider")
+    }
+
+    /// Claude's thinking text is the summary the request asked for only under the `summarized`
+    /// display with thinking on; the other modes return no text, and thinking off returns none.
+    #[test]
+    fn thinking_is_a_summary_only_under_the_summarized_display() {
+        use shared::ClaudeBackend as _;
+
+        use crate::config::ThinkingDisplay;
+        for (thinking, display, summarizes) in [
+            (true, ThinkingDisplay::Summarized, true),
+            (true, ThinkingDisplay::Updates, false),
+            (true, ThinkingDisplay::Redacted, false),
+            (false, ThinkingDisplay::Summarized, false),
+        ] {
+            let provider = provider_full("claude-opus-5-5", thinking, "high", display);
+            assert_eq!(
+                provider.summarizes_thinking(),
+                summarizes,
+                "{thinking} {display:?}"
+            );
+        }
     }
 
     /// `thinking` is a bool here because every caller is asserting on a beta or on `temperature`,
@@ -2586,8 +2616,8 @@ mod tests {
     #[test]
     fn the_endpoint_s_name_reservation_is_mirrored_by_prefix() {
         let provider = provider_for_test();
-        for refused in ["mcp_resource_list", "mcp_prompt_get", "mcp_anything"] {
-            assert!(provider.refuses_tool_name(refused), "{refused}");
+        for rejected in ["mcp_resource_list", "mcp_prompt_get", "mcp_anything"] {
+            assert!(provider.rejects_tool_name(rejected), "{rejected}");
         }
         for carried in [
             "mcp__kv_probe__kv_probe_fetch",
@@ -2595,7 +2625,7 @@ mod tests {
             "resource_list",
             "file_read",
         ] {
-            assert!(!provider.refuses_tool_name(carried), "{carried}");
+            assert!(!provider.rejects_tool_name(carried), "{carried}");
         }
     }
 
@@ -4378,7 +4408,7 @@ mod tests {
     /// Answer every refresh with one fixed status and body, so a test can pin what the classifier
     /// is handed. `truncate` overstates `Content-Length`, which is how a *successful* exchange
     /// whose body never arrives is reproduced.
-    async fn run_mock_refusing_refresh_endpoint(
+    async fn run_mock_rejecting_refresh_endpoint(
         listener: tokio::net::TcpListener,
         status_line: &'static str,
         body: &'static str,
@@ -4454,7 +4484,7 @@ mod tests {
                 .await
                 .expect("bind mock OAuth endpoint");
             let local = listener.local_addr().expect("local addr");
-            tokio::spawn(run_mock_refusing_refresh_endpoint(
+            tokio::spawn(run_mock_rejecting_refresh_endpoint(
                 listener,
                 status_line,
                 body,
@@ -4671,7 +4701,7 @@ mod tests {
     }
 
     /// One listener standing in for both the API and the token endpoint, so a request that is
-    /// refused, refreshed and sent again can be watched end to end.
+    /// rejected, refreshed and sent again can be watched end to end.
     struct RejectingApi {
         /// How many `/v1/messages` calls to answer 401 before answering 200.
         reject_first: usize,
@@ -4830,7 +4860,7 @@ mod tests {
         assert_eq!(
             api.messages_hits.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "one refused call, one retried"
+            "one rejected call, one retried"
         );
         assert_eq!(
             api.token_hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -4843,11 +4873,11 @@ mod tests {
                 "Bearer stale-token".to_string(),
                 "Bearer fresh-token-xyz".to_string()
             ],
-            "the retry carries the refreshed token, not the refused one"
+            "the retry carries the refreshed token, not the rejected one"
         );
     }
 
-    /// A second refusal is the account, not the token: the grant behind the refresh is gone and
+    /// A second rejection is the account, not the token: the grant behind the refresh is gone and
     /// only signing in again produces one the backend will take, so the error says so rather than
     /// refreshing forever.
     #[tokio::test]
@@ -4871,7 +4901,7 @@ mod tests {
                 tokio_util::sync::CancellationToken::new(),
             )
             .await
-            .expect_err("a token refused after its refresh is a failure");
+            .expect_err("a token rejected after its refresh is a failure");
         match error {
             MekaError::Provider(message) => assert!(
                 message.contains("meka account login work"),
@@ -4882,7 +4912,7 @@ mod tests {
         assert_eq!(
             api.messages_hits.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "refused, refreshed, refused again, and no third attempt"
+            "rejected, refreshed, rejected again, and no third attempt"
         );
         assert_eq!(api.token_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

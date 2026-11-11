@@ -20,7 +20,8 @@ module. Never keep a worse design to spare users an upgrade step.
 - Comments explain *why*, never *what*: a constraint from outside this file, or why an
   obvious-looking alternative is wrong. Not history, not user-facing documentation, not argument for
   the choice; `git log` and `docs/book/src/` hold those. If it restates the code, delete it.
-- Add functionality to existing files unless it is genuinely a new component. Avoid many small files.
+- Add functionality to existing files unless it is genuinely a new component. Avoid many small
+  files.
 - No creative additions beyond what was asked.
 - Full words in names, no abbreviations.
 
@@ -32,9 +33,9 @@ Before writing a guard, list every path that reaches the thing being guarded (cr
 import, re-root, resume, re-attach, patch, delete) and decide for each. Place the check where those
 paths converge. A rule placed at a door is a rule the next door forgets.
 
-**Prefer one definition over many checks.** When an invariant is asked in more than one place, give it
-a single named predicate and call that everywhere. Consolidation beats a test per site, because tests
-only confirm the sites you thought of.
+**Prefer one definition over many checks.** When an invariant is asked in more than one place, give
+it a single named predicate and call that everywhere. Consolidation beats a test per site, because
+tests only confirm the sites you thought of.
 
 **A guard sits ahead of every side effect it protects**, not merely ahead of the failure. Refusing
 after a write leaves the write behind.
@@ -56,18 +57,85 @@ model it names, the profile that sent the request and what it spent. Each object
 to the element that stands for it (the response to the reply's record, a message to its `Message`,
 a part to its block), which keeps what nothing else holds as `provider_fields`; an object with no
 element is `Unrecognized`. A stream is folded as the protocol's reference client folds it, never
-by a rule of Meka's, and what restates Meka's own request is not the response's. Nothing Meka writes is
-recorded as the model's: a reply with nothing in it is stored with nothing in it. A rewrite of the
-context (a repair, a redaction, an unsign, a compaction's kept tail) never changes the record; it
-is a row of its own over the view. What a surface shows of a reply, how it joins parts or words an
-empty one, is decided where it is drawn. What only a provider can read (sealed reasoning) goes back
-only to the origin that returned it; everything else the context holds goes back on any wire with a
-slot for it, and an endpoint that refuses it is reported, not worked around.
+by a rule of Meka's, and what restates Meka's own request is not the response's. Nothing Meka writes
+is recorded as the model's: a reply with nothing in it is stored with nothing in it. A rewrite of
+the context (a repair, a redaction, an unsign, a compaction's kept tail) never changes the record;
+it is a row of its own over the view. What a surface shows of a reply, how it joins parts or words
+an empty one, is decided where it is drawn. What goes back on each wire is the next section's.
 
 Meka implements each protocol as its spec defines. An endpoint that claims a protocol and deviates
 from it is not accommodated, and a shape the spec does not allow is recorded verbatim, not parsed.
-A vendor's documented extension is supported as users need it. A session that moves between
-protocols drops what the target cannot carry; the record keeps it.
+A vendor's documented extension is supported as users need it.
+
+## What goes back to a provider
+
+Meka is built for users who know what they are doing. It follows each protocol's spec exactly and
+carries as much of the conversation as each protocol has room for. What it does when a provider
+rejects part of that turns on who chose the thing that broke: a person's choice is theirs to
+handle, and what nobody chose, Meka repairs where the provider sees it and says so.
+
+1. **Faithful mapping.** Every request sends the conversation the context holds, whichever
+   provider, host or model produced each part, and each part goes into the slot its protocol's
+   spec, or a vendor's documented extension of it Meka supports, defines for that kind of part.
+   What the current protocol has no slot for stays in the record, and a switch back sends it
+   again, unless a repair took it out of the view.
+   - Text, tool calls and tool results have a slot on every protocol, and images wherever the
+     protocol carries them.
+   - Readable reasoning goes into the protocol's slot for reasoning: DeepSeek's
+     `reasoning_content` on Chat Completions, a `reasoning` item on Responses. A part keeps its
+     kind: a summary (a Responses summary, Claude's thinking text when the request asked for it
+     summarized) goes as one, and raw reasoning (DeepSeek's, a Responses reasoning text, Claude's
+     otherwise) as raw. Claude's protocol requires a signature on every thinking block, so it has
+     no slot for reasoning that came without one.
+   - Opaque reasoning goes only into a slot of the protocol that issued it. A Responses blob goes
+     in a `reasoning` item's `encrypted_content`, with the id it came with, to the host that
+     issued it, under any model there: only its issuer can open it, and as far as Meka can see
+     the host is the issuer. A Claude signature goes on its thinking block, and a redacted block
+     as itself, to any Claude endpoint; one that cannot verify them rejects them, and rule 4's
+     retry takes them out.
+2. **No guessing for the provider.** Beyond rule 1's binding of a blob to its host and rule 4's
+   repairs, Meka never drops or alters what the conversation holds because a provider might
+   reject it, and binds no part to a model or an account. Whether a provider accepts a part is the
+   provider's fact; one that rejects what it returned itself, sent back as the spec allows,
+   deviates from its protocol, and its rejection is reported.
+3. **What a person chose, they handle.** A switch of the session's own profile, or of that profile's
+   model, is a person's choice, and so is the switch of every sub-agent that follows its parent's
+   profile. A change of model is seen only by the agent that had a request accepted on the old one:
+   a stored reply records the model its response named, which need not spell the configured one, so
+   a fresh process, an HTTP re-attach or an ACP load compares profile names alone, and a rejection
+   after a model change there takes rule 4's path. When the provider rejects the first request after
+   a switch (a 400 or 422; an outage is no verdict and takes rule 4's path), the turn fails with the
+   provider's own error, nothing of it is degraded, and Meka adds how to go on: switch back,
+   compact, switch again. A sub-agent adds nothing, since its failure reaches its parent. A
+   compaction a person asks for keeps nothing verbatim (only `POST …/compact` can ask for a tail),
+   so the new provider receives the summary and nothing the old one returned; compacting after the
+   switch sends the same history and fails the same way. A fallback is a switch the operator
+   configured, so the operator tests that the profiles in a chain survive switching between them
+   before relying on it: a rejection while a fallback serves is not degraded, and the session's own
+   profile coming back after one is no switch.
+4. **What nobody chose, Meka repairs in the view, and says so.** When what breaks a request is
+   nobody's choice (a tool's output, a provider's own odd reply, Meka's own edit), Meka changes
+   what the provider sees so the session goes on, and leaves the record whole. A repair the
+   session keeps is announced with a warning or by the event that caused it; a repair to a
+   compaction's own request, a copy thrown away after, is only logged. An unattended agent must
+   not stall on something no one could have prevented. The cases:
+   - **Degrade and retry.** Content added since the last request a provider accepted, which no
+     provider has accepted yet (a tool's result, an attachment), is degraded when a provider
+     rejects it: attachments first, then the tool exchanges, each tried once and undone if it
+     does not help. Without it, an agent that read one file a provider will not take could not go
+     on without someone editing its history by hand. After a compaction the window is all the
+     summary did not replace; after a switch, rule 3 applies instead.
+   - **Claude's signature retry.** Claude binds a signature to the conversation before it, which
+     Meka's own compaction or repair changes, so a rejected signature is retried without the
+     conversation's thinking, recorded as an `Unsign` repair. The rejection does not say whether
+     an edit or a switch caused it, so the retry takes out both.
+   - **Dangling reasoning on Responses.** A reasoning item with no output after it is not sent,
+     since OpenAI rejects one, and Meka's cut replies and nudges and a reply that stopped
+     mid-reasoning all leave one. An endpoint that returns reasoning after its output does not get
+     that reasoning back.
+   - **An empty assistant message on Claude.** One left with nothing Claude's protocol carries
+     goes as `[No message content]`, since Claude rejects an empty one.
+5. **The record is never healed.** It keeps what was returned; a repair is a row over the view.
 
 ## Verification
 
@@ -75,8 +143,8 @@ Verification is graded by what it catches, not by how much of it there is.
 
 **Per change**: build, test suite, and the project's exact CI lint gate. Then:
 
-- **Fake-guard every test written to protect a fix**: neuter the fix, confirm the test fails, restore.
-  A test that cannot fail is worse than no test, because it reads as coverage.
+- **Fake-guard every test written to protect a fix**: neuter the fix, confirm the test fails,
+  restore. A test that cannot fail is worse than no test, because it reads as coverage.
 - Enumerate the doors, as above.
 
 **Per release**: one structural review, docs and changelog. Don't run a cross-platform suite by hand
@@ -101,27 +169,28 @@ implementation before relying on it, and correct the comment when it is wrong.
 If another system is the authority for a fact, ask it or let the user state it. Never encode it.
 A hardcoded fact about an external system expires, and nothing in the build notices.
 
-- **The provider/service owns it**: a request parameter it defaults sensibly. Omit it unless the user
-  asked for a value; omitting *is* how you request their default.
-- **The user owns it**: anything neither side can determine, or where a wrong guess is invisible. One
-  config key, one documented default. Don't infer, probe, or cache. State that default in the docs
-  and, where a setup flow exists, on screen.
+- **The provider/service owns it**: a request parameter it defaults sensibly. Omit it unless the
+  user asked for a value; omitting *is* how you request their default.
+- **The user owns it**: anything neither side can determine, or where a wrong guess is invisible.
+  One config key, one documented default. Don't infer, probe, or cache. State that default in the
+  docs and, where a setup flow exists, on screen.
 - **We own it**: our own names, schema, and defaults for our own behavior. Encoding these is fine.
 
 A guess is tolerable when its wrong answer is a *rejected request* and it fails toward omission. A
-guess that fails toward *sending* survives only where the endpoint cannot vary, so never introduce one
-on a backend reachable via a user-supplied `base_url`. This is about request fields Meka adds; what
-the conversation already holds goes back as the context holds it. A value verified against a captured wire is a
-fact about the protocol rather than a prediction; pin it deliberately and cite the capture. A
-capture pins a fact about the endpoint captured: on a backend whose endpoint varies, the captured
-value is the default of a user-owned key, never a bare pin (`interleaved_thinking` on an
-`anthropic-messages` account is the pattern).
+guess that fails toward *sending* survives only where the endpoint cannot vary, so never introduce
+one on a backend reachable via a user-supplied `base_url`. This is about request fields Meka adds;
+what the conversation already holds goes back as the context holds it. A value verified against a
+captured wire is a fact about the protocol rather than a prediction; pin it deliberately and cite
+the capture. A capture pins a fact about the endpoint captured: on a backend whose endpoint varies,
+the captured value is the default of a user-owned key, never a bare pin (`interleaved_thinking` on
+an `anthropic-messages` account is the pattern).
 
 ## Compatibility
 
-Backwards compatibility spread across readers costs one shim per reader per superseded shape, forever.
-Convert once, in one place, so every other reader may assume the current shape unconditionally. That
-assumption is the entire return, and it is lost the moment a second place tolerates an old shape.
+Backwards compatibility spread across readers costs one shim per reader per superseded shape,
+forever. Convert once, in one place, so every other reader may assume the current shape
+unconditionally. That assumption is the entire return, and it is lost the moment a second place
+tolerates an old shape.
 
 ## Changelog
 
@@ -157,8 +226,8 @@ assumption is the entire return, and it is lost the moment a second place tolera
 
 - Avoid panicking calls (`unwrap()`, `expect()`, unchecked indexing). Propagate with `?`. The lints
   are `warn` in `Cargo.toml` and relaxed under `cfg(test)`, where panicking on failure is the point.
-- Never discard errors with `let _ =`. Propagate with `?`, log explicitly when ignoring is correct, or
-  handle with `match` / `if let Err(..)`.
+- Never discard errors with `let _ =`. Propagate with `?`, log explicitly when ignoring is correct,
+  or handle with `match` / `if let Err(..)`.
 - Errors from fallible async work must reach the UI layer so the user gets real feedback.
 
 ## Layout and style
@@ -212,8 +281,8 @@ cargo +nightly fmt --check
 cargo sort -w --check
 cargo clippy --locked --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
-cargo test --locked                  # CI adds --features mock-provider; debug builds carry it anyway
-cargo check --locked --all-targets   # on the MSRV in Cargo.toml's rust-version
+cargo test --locked                 # CI adds --features mock-provider; debug builds carry it anyway
+cargo check --locked --all-targets  # on the MSRV in Cargo.toml's rust-version
 mdbook build docs/book
 ```
 
@@ -358,15 +427,16 @@ output; don't demote it to `info!`.
   only by an explicit act (`--profile` on a resume, `/profile`, `PATCH /v1/sessions/{id}`, ACP
   `session/set_config_option`). What a *new* session records follows `--profile` > `default_profile`
   > the sole profile; a sub-agent's row records the profile its `agent_spawn` call named, else its
-  parent's live profile, which it keeps following. Accounts are managed by `meka account` (`add`/`login`/`list`/`rename`/`remove`) and
-  profiles by `meka profile` (`add`/`set`/`use`/`list`/`rename`/`remove`), mirroring `meka mcp`: `use` is the
-  command that points `default_profile` at a profile (`profile remove` refuses the default while
-  two or more profiles would remain and drops the key when one would; `profile add` names the
-  profile that was alone when a second joins it, so the default stays put), `account login`
-  rotates a credential without touching the account or its profiles,
-  `account remove` refuses while a profile names the account, and a `rename` moves the name
-  everywhere it is recorded (the credential row and every profile's `account`; `default_profile`,
-  every session row and each pinned sub-agent spec) and changes no setting.
+  parent's live profile, which it keeps following. Accounts are managed by `meka account`
+  (`add`/`login`/`list`/`rename`/`remove`) and profiles by `meka profile`
+  (`add`/`set`/`use`/`list`/`rename`/`remove`), mirroring `meka mcp`: `use` is the command that
+  points `default_profile` at a profile (`profile remove` refuses the default while two or more
+  profiles would remain and drops the key when one would; `profile add` names the profile that was
+  alone when a second joins it, so the default stays put), `account login` rotates a credential
+  without touching the account or its profiles, `account remove` refuses while a profile names the
+  account, and a `rename` moves the name everywhere it is recorded (the credential row and every
+  profile's `account`; `default_profile`, every session row and each pinned sub-agent spec) and
+  changes no setting.
 - **Secrets live in the database**: `account_credentials` keyed by account name and
   `mcp_credentials` keyed by `(server_name, kind)`, so two accounts, or a client secret and its
   refreshable bundle, can coexist. Every secret is read from stdin, never taken
@@ -420,7 +490,7 @@ typed key only when it answers yes to one of three questions:
 
 1. **Is it Meka's own?** Meka acts on the value (computes from it, decides by it, or changes how it
    builds, reads or replays the conversation), or sends the field unasked for a feature of its own,
-   where the key is the switch an endpoint that refuses the field needs. `thinking`,
+   where the key is the switch an endpoint that rejects the field needs. `thinking`,
    `max_output_tokens` on a Messages wire, `encrypted_reasoning`, `reasoning_summary` and
    `deferred_tools` are Meka's own. Typed, on the backends where that holds.
 2. **Does every backend have it?** One concept every wire states, under whatever names: `effort`,
@@ -451,18 +521,18 @@ load, which is a `**Breaking:**` change.
 `src/store/migrations.rs` is an append-only ledger applied on open inside the schema lock, in one
 transaction, behind an automatic backup. Four rules:
 
-1. **Only the migration module may know an older Meka wrote the store.** No fallback readers, version
-   sniffing, or "this column used to be called X" branches anywhere else. If a reader seems to need
-   one, a migration is missing.
-2. **A migration is frozen once any store has run it**, including a development store. `user_version`
-   is a positional index, so removing or reordering an entry makes some store skip a step and then
-   stamp itself current. Append; never edit a released entry.
+1. **Only the migration module may know an older Meka wrote the store.** No fallback readers,
+   version sniffing, or "this column used to be called X" branches anywhere else. If a reader seems
+   to need one, a migration is missing.
+2. **A migration is frozen once any store has run it**, including a development store.
+   `user_version` is a positional index, so removing or reordering an entry makes some store skip a
+   step and then stamp itself current. Append; never edit a released entry.
 3. **A migration must be safe to run twice.** A `.dump`/restore round trip drops `user_version`, so
-   steps replay over data that already has them. Guard `ALTER TABLE` on the current column set, prefer
-   `IF NOT EXISTS`, and have conversions test for the shape they convert *from*. A frozen step names
-   objects by the names they had, so a step that renames or drops one a frozen step reads must also
-   move the floor in `classify_by_shape`, which classifies an unversioned store past every step before
-   the rename by a marker the rename leaves, so no replay reaches the name that is gone.
+   steps replay over data that already has them. Guard `ALTER TABLE` on the current column set,
+   prefer `IF NOT EXISTS`, and have conversions test for the shape they convert *from*. A frozen
+   step names objects by the names they had, so a step that renames or drops one a frozen step reads
+   must also move the floor in `classify_by_shape`, which classifies an unversioned store past every
+   step before the rename by a marker the rename leaves, so no replay reaches the name that is gone.
 4. **A migration may receive data it cannot work out, but may not call Meka's own code** to get it.
    Only `rusqlite`, `serde_json` and the like. A function can change meaning years later; a `String`
    cannot. `Step::Contextual` takes plain data from the caller, and its `Context` is append-only for
@@ -498,9 +568,9 @@ minutes ago defends against corruption and hand-editing; deleting it turns a fai
 fail-open one. Keep those where the data is read.
 
 Practical notes. The version is `PRAGMA user_version` (transactional, survives `VACUUM INTO`); never
-write SQLite's unrelated `PRAGMA schema_version`. Numbers are list indices, not releases. Migration is
-forward-only: downgrading means restoring the backup, and each new copy supersedes the last, so only
-the most recent schema-changing upgrade is undoable. The head shape is pinned by
+write SQLite's unrelated `PRAGMA schema_version`. Numbers are list indices, not releases. Migration
+is forward-only: downgrading means restoring the backup, and each new copy supersedes the last, so
+only the most recent schema-changing upgrade is undoable. The head shape is pinned by
 `HEAD_SCHEMA_FINGERPRINT` over `HEAD_TABLES`; after any schema change run
 `the_head_schema_fingerprint_is_pinned`, whose failure prints the new value, and give a renamed
 baseline object its new name in `BASELINE_OBJECTS` beside the old one.
@@ -616,11 +686,11 @@ the door deciding on the parse it hands over, and a browser login commits throug
 `cli` both call `agent`, which calls `tools`, which calls `provider` and `mcp`, which call `store`.
 `mcp` publishes its tools and never names a registry; `tools/mcp_adapter.rs` is where they become
 `Tool`s. `render` is reached only from `host`, `cli` and the frontend implementations; `streams` is
-the leaf that writes stderr for everyone. `tests/layering.rs` ranks every top-level module and lets a `crate::<module>` edge point
-only at a strictly lower rank, so siblings cannot name each other. Its tolerated list is empty; one
-edge is by design, `tools/subagent` reaching up to `agent`, because a sub-agent is an agent. A new
-module fails the test until it is placed. Put new code where its callers already are: a type
-read by `store` and `host` belongs in `store` or below, never in `host`.
+the leaf that writes stderr for everyone. `tests/layering.rs` ranks every top-level module and lets
+a `crate::<module>` edge point only at a strictly lower rank, so siblings cannot name each other.
+Its tolerated list is empty; one edge is by design, `tools/subagent` reaching up to `agent`, because
+a sub-agent is an agent. A new module fails the test until it is placed. Put new code where its
+callers already are: a type read by `store` and `host` belongs in `store` or below, never in `host`.
 
 Meka ships as one crate. The provider layer serves Meka's own wires and is not a library: the
 Messages driver and the Claude subscription driver share one wire module, and the harness reads

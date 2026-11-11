@@ -1251,7 +1251,7 @@ impl Agent {
     ///
     /// Claiming the lock in the screen's post-turn block instead would leave no lock file for the
     /// whole of a first turn, so a second `meka -c --oneshot` in that window would write into the
-    /// same conversation and leave a log with non-alternating roles that the provider refuses.
+    /// same conversation and leave a log with non-alternating roles that the provider rejects.
     ///
     /// `None` means the claim could not be made at all, which
     /// [`crate::store::Store::create_session_locked`] has already warned about. The turn runs
@@ -1895,12 +1895,12 @@ impl Agent {
                 }
                 Err(error) => {
                     // Unconditionally, before deciding anything else. A repair still applied here
-                    // is one the provider has just refused a second time, so it was not the fix
+                    // is one the provider has just rejected a second time, so it was not the fix
                     // whatever happens next: another tier measures itself against the
                     // conversation as it really is, and a turn that gives up leaves memory and
                     // store agreeing.
                     run.recovery.undo_rejected_repair(messages);
-                    if !refusal_may_blame_content(&error, progress.content_started) {
+                    if !rejection_may_blame_content(&error, progress.content_started) {
                         // The same treatment an interrupt gives a half-streamed answer: what
                         // arrived is recorded, and the context keeps it without the calls that
                         // never ran.
@@ -1936,7 +1936,36 @@ impl Agent {
                     if error.rejects_thinking_signature()
                         && run.recovery.remove_rejected_thinking(messages)
                     {
+                        self.cells
+                            .frontend
+                            .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
+                                THINKING_RETRY_NOTICE.to_string(),
+                            )))
+                            .await;
                         continue;
+                    }
+                    // A rejection of a conversation another profile or model produced is the
+                    // switcher's to handle, so nothing of the turn is degraded for it: a fallback's
+                    // is the operator's, who tests the chain, and the first request since the
+                    // session's own switch is the person's, who is told how to go on. A sub-agent
+                    // says nothing: its failure reaches its parent, whose screen a notice would
+                    // reach, where compacting compacts the parent. An outage is no verdict on the
+                    // conversation, so it takes the reprieve and the degrade below.
+                    if matches!(error, MekaError::InvalidRequest(_)) {
+                        if self.serving_fallback().is_some() {
+                            return Err(error);
+                        }
+                        if let Some(previous) = self.switched_from().await {
+                            if self.role.is_root() {
+                                self.cells
+                                    .frontend
+                                    .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
+                                        switch_rejected_notice(&previous),
+                                    )))
+                                    .await;
+                            }
+                            return Err(error);
+                        }
                     }
                     run.recovery
                         .repair_rejected_content(self, messages, error, run.cancellation.token())
@@ -2420,6 +2449,7 @@ impl Agent {
         // reload brought back included.
         self.last_accepted_len
             .store(sent_len, std::sync::atomic::Ordering::Relaxed);
+        self.note_served();
         *crate::sync::lock(&self.unaccepted_from) = None;
         run.recovery.note_request_accepted();
 
@@ -2589,7 +2619,7 @@ impl Agent {
         // The results reach memory *before* the save is judged, for the same reason. The tools have
         // run, so the only conversation that describes what happened is one that ends on their
         // results; breaking out with the assistant's calls still unanswered left the session
-        // refused by the provider on every later turn until a `/rewind`. A store that cannot take
+        // rejected by the provider on every later turn until a `/rewind`. A store that cannot take
         // the round leaves disk one round behind memory until the next turn, which starts from what
         // the store holds, as a resume does: a prompt with no reply, never a half round, since the
         // pair is written as one unit or not at all.
@@ -3446,7 +3476,8 @@ impl Agent {
                 // What Meka reads nothing from is kept, not shown, and a call's arguments are drawn
                 // whole, when the call starts.
                 StreamEvent::Place(_)
-                | StreamEvent::ThinkingPart(_)
+                | StreamEvent::ThinkingPart { .. }
+                | StreamEvent::ContentPart(_)
                 | StreamEvent::Unrecognized(_)
                 | StreamEvent::ToolArgumentsDelta(_)
                 | StreamEvent::MessageEnd { .. }
@@ -3934,7 +3965,7 @@ mod tests {
         ));
     }
 
-    /// The driver opens a turn on items with `Withdraw` retention. When the provider refuses
+    /// The driver opens a turn on items with `Withdraw` retention. When the provider rejects
     /// everything, the prompt leaves the conversation and the items are offered again, counted.
     #[tokio::test]
     async fn an_inbox_turn_that_fails_before_anything_is_appended_resets_its_items() {
@@ -3976,7 +4007,7 @@ mod tests {
                 crate::agent::TurnCancellation::new(),
             )
             .await;
-        assert!(outcome.is_err(), "the provider refused: {outcome:?}");
+        assert!(outcome.is_err(), "the provider rejected: {outcome:?}");
         assert_eq!(messages.len(), 0, "the prompt was withdrawn");
         let item = inbox.get(id).await.expect("get").expect("row");
         assert_eq!(item.state(), InboxState::Pending);
@@ -4029,7 +4060,20 @@ mod tests {
         uuid::Uuid,
         Arc<crate::frontend::testing::RecordingFrontend>,
     ) {
-        let provider = Arc::new(MockProvider::from_rounds(rounds));
+        agent_with_session_over(MockProvider::from_rounds(rounds)).await
+    }
+
+    /// [`agent_with_session`] on `provider`.
+    async fn agent_with_session_over(
+        provider: MockProvider,
+    ) -> (
+        Agent,
+        Arc<MockProvider>,
+        Store,
+        uuid::Uuid,
+        Arc<crate::frontend::testing::RecordingFrontend>,
+    ) {
+        let provider = Arc::new(provider);
         let (mut agent, store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
         let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
         agent.cells.frontend = frontend.clone();
@@ -4301,7 +4345,7 @@ mod tests {
         agent_with_a_tool_on(MockProvider::from_rounds(rounds)).await
     }
 
-    /// [`agent_with_a_tool`] on `provider` as given, for one that refuses a name.
+    /// [`agent_with_a_tool`] on `provider` as given, for one that rejects a name.
     async fn agent_with_a_tool_on(
         provider: MockProvider,
     ) -> (Agent, Arc<MockProvider>, Store, uuid::Uuid) {
@@ -4440,7 +4484,7 @@ mod tests {
     async fn a_tool_the_wire_does_not_carry_is_never_called() {
         let (agent, provider, _store, _session) = agent_with_a_tool_on(
             MockProvider::from_rounds(vec![call_round("memory_read"), text_round("ok")])
-                .refusing("memory_read"),
+                .rejecting("memory_read"),
         )
         .await;
         let mut messages = Conversation::new();
@@ -6126,7 +6170,7 @@ mod tests {
             )
             .await;
         let interrupt = enqueued.await.expect("enqueued");
-        assert!(outcome.is_err(), "the provider refused: {outcome:?}");
+        assert!(outcome.is_err(), "the provider rejected: {outcome:?}");
         assert_eq!(messages.len(), 0, "the prompt was withdrawn");
         for id in [opener, interrupt] {
             let item = inbox.get(id).await.expect("get").expect("row");
@@ -6234,7 +6278,7 @@ mod tests {
             )
             .await;
         let interrupt = enqueued.await.expect("enqueued");
-        assert!(outcome.is_err(), "the provider refused: {outcome:?}");
+        assert!(outcome.is_err(), "the provider rejected: {outcome:?}");
         assert_eq!(
             messages.len(),
             1,
@@ -7332,7 +7376,7 @@ mod tests {
     ///
     /// The tools have run, so the only conversation that describes what happened is one that ends
     /// on their results; breaking out with the assistant's calls unanswered would leave the
-    /// provider refusing every later request until a `/rewind`. Disk may be one round behind; what
+    /// provider rejecting every later request until a `/rewind`. Disk may be one round behind; what
     /// it must never hold is half a round.
     #[tokio::test]
     async fn a_tool_round_whose_save_fails_still_answers_its_calls_in_memory() {
@@ -9043,7 +9087,7 @@ mod tests {
         );
 
         // And the one attempt carried the turn Meka meant to send, which is what distinguishes
-        // "the provider refused a real request" from "Meka sent something malformed and the
+        // "the provider rejected a real request" from "Meka sent something malformed and the
         // overflow was incidental".
         let attempt = &requests[0];
         assert!(
@@ -9927,7 +9971,9 @@ mod tests {
                 },
             ],
         ]));
-        let (agent, store) = agent_for_test(provider.clone()).await;
+        let (mut agent, store) = agent_for_test(provider.clone()).await;
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = frontend.clone();
         let mut messages = Conversation::new();
         for prompt in ["first", "second"] {
             let outcome = agent
@@ -9950,6 +9996,11 @@ mod tests {
         );
         assert!(carries_claude_thinking(&streams[1].messages));
         assert!(!carries_claude_thinking(&streams[2].messages));
+        assert!(
+            notices(&frontend).contains(&THINKING_RETRY_NOTICE.to_string()),
+            "the retry says so: {:?}",
+            notices(&frontend)
+        );
         assert_eq!(
             streams[2].messages.last().map(Message::text_content),
             Some("second".to_string()),
@@ -9995,6 +10046,341 @@ mod tests {
                     ..
                 })),
             "no signature survives"
+        );
+    }
+
+    /// A rejection of what a turn added, which the degrade tiers answer when nothing was switched.
+    fn rejected() -> Vec<MockEvent> {
+        vec![MockEvent::FailInvalidRequest {
+            message: "Invalid 'input[1].content': array too long.".to_string(),
+        }]
+    }
+
+    /// Run a turn on `messages` asking `words` with `images`.
+    async fn ask(
+        agent: &Agent,
+        messages: &mut Conversation,
+        words: &str,
+        images: Vec<ImageSource>,
+    ) -> Result<TurnOutcome> {
+        agent
+            .run_turn(
+                messages,
+                crate::agent::TurnInput::from_parts(words.to_string(), images).expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+    }
+
+    /// Whether `frontend` was told how to go on after a switch from `previous`.
+    fn told_to_switch_back(
+        frontend: &crate::frontend::testing::RecordingFrontend,
+        previous: &str,
+    ) -> bool {
+        notices(frontend).contains(&switch_rejected_notice(previous))
+    }
+
+    /// The first request after a switch carries a conversation another profile produced, so its
+    /// rejection is the switcher's to handle: nothing of the turn is degraded, and the warning
+    /// says how to go on. Without the switch, the same rejection degrades the turn's attachment.
+    #[tokio::test]
+    async fn a_rejection_right_after_a_switch_is_not_degraded_and_says_how_to_go_on() {
+        for switched in [true, false] {
+            let (agent, provider, _store, _session_id, frontend) = agent_with_session(vec![
+                text_round("first answer"),
+                rejected(),
+                text_round("without the image"),
+            ])
+            .await;
+            let mut messages = Conversation::new();
+            ask(&agent, &mut messages, "first", Vec::new())
+                .await
+                .expect("the first turn");
+            if switched {
+                agent.set_provider(crate::provider::ResolvedProfile {
+                    provider: provider.clone(),
+                    profile: "other".to_string(),
+                    context_window: 200_000,
+                    vision: true,
+                });
+            }
+            let outcome = ask(&agent, &mut messages, "look", vec![image_source()]).await;
+            assert_eq!(
+                outcome.is_ok(),
+                !switched,
+                "switched {switched}: {outcome:?}"
+            );
+            assert_eq!(
+                provider.streams().len(),
+                if switched { 2 } else { 3 },
+                "switched {switched}: a degraded retry only without the switch"
+            );
+            assert_eq!(
+                told_to_switch_back(&frontend, "test-profile"),
+                switched,
+                "{:?}",
+                notices(&frontend)
+            );
+        }
+    }
+
+    /// A compaction that kept no turn leaves nothing another profile produced in the context, so
+    /// the first request after a switch that follows it is no switch: its rejection degrades the
+    /// turn's attachment, and nothing is said of switching back.
+    #[tokio::test]
+    async fn a_switch_after_a_compaction_that_kept_no_turn_is_no_switch() {
+        let (agent, provider, _store, _session_id, frontend) = agent_with_session(vec![
+            text_round("first answer"),
+            text_round("a summary"),
+            rejected(),
+            text_round("without the image"),
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        ask(&agent, &mut messages, "first", Vec::new())
+            .await
+            .expect("the first turn");
+        agent
+            .compact_session(
+                &mut messages,
+                crate::session::CompactRequest::new(crate::conversation::CompactionTrigger::Manual),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the compaction");
+        agent.set_provider(crate::provider::ResolvedProfile {
+            provider: provider.clone(),
+            profile: "other".to_string(),
+            context_window: 200_000,
+            vision: true,
+        });
+        ask(&agent, &mut messages, "look", vec![image_source()])
+            .await
+            .expect("the degraded retry answers");
+        assert!(
+            provider
+                .streams()
+                .last()
+                .and_then(|request| request.messages.last())
+                .is_some_and(|prompt| prompt
+                    .content
+                    .iter()
+                    .all(|block| !matches!(block, ContentBlock::Image { .. }))),
+            "the retry that answered went without the image"
+        );
+        assert!(
+            !told_to_switch_back(&frontend, "test-profile"),
+            "{:?}",
+            notices(&frontend)
+        );
+    }
+
+    /// A change of the profile's model is a switch too, within one process, where the model the
+    /// provider names is known on both sides.
+    #[tokio::test]
+    async fn a_model_change_within_one_process_is_a_switch() {
+        let (agent, _provider, _store, _session_id, frontend) = agent_with_session_over(
+            MockProvider::from_rounds(vec![text_round("first answer")]).naming_model("model-a"),
+        )
+        .await;
+        let mut messages = Conversation::new();
+        ask(&agent, &mut messages, "first", Vec::new())
+            .await
+            .expect("the first turn");
+        let changed = Arc::new(
+            MockProvider::from_rounds(vec![rejected(), text_round("without the image")])
+                .naming_model("model-b"),
+        );
+        agent.set_provider(crate::provider::ResolvedProfile {
+            provider: changed.clone(),
+            profile: "test-profile".to_string(),
+            context_window: 200_000,
+            vision: true,
+        });
+        ask(&agent, &mut messages, "look", vec![image_source()])
+            .await
+            .expect_err("rejected");
+        assert_eq!(changed.streams().len(), 1, "no degraded retry");
+        assert!(
+            told_to_switch_back(&frontend, "test-profile"),
+            "{:?}",
+            notices(&frontend)
+        );
+    }
+
+    /// An outage is no verdict on the conversation, so one that outlives its retries right after
+    /// a switch takes the reprieve and then degrades, as it would without the switch.
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_right_after_a_switch_takes_the_reprieve_then_degrades() {
+        let (agent, _provider, _store, _session_id, frontend) =
+            agent_with_session(vec![text_round("first answer")]).await;
+        let mut messages = Conversation::new();
+        ask(&agent, &mut messages, "first", Vec::new())
+            .await
+            .expect("the first turn");
+        let mut rounds = one_spent_retry_sequence();
+        rounds.extend(one_spent_retry_sequence());
+        rounds.push(text_round("I could not see that image."));
+        let other = Arc::new(MockProvider::from_rounds(rounds));
+        agent.set_provider(crate::provider::ResolvedProfile {
+            provider: other.clone(),
+            profile: "other".to_string(),
+            context_window: 200_000,
+            vision: true,
+        });
+        ask(&agent, &mut messages, "look", vec![image_source()])
+            .await
+            .expect("degraded, not failed");
+        let sent = other.streams();
+        assert!(
+            sent.last()
+                .and_then(|request| request.messages.last())
+                .is_some_and(|prompt| prompt
+                    .content
+                    .iter()
+                    .all(|block| !matches!(block, ContentBlock::Image { .. }))),
+            "the retry that answered went without the image"
+        );
+        assert!(
+            !told_to_switch_back(&frontend, "test-profile"),
+            "{:?}",
+            notices(&frontend)
+        );
+    }
+
+    /// A sub-agent's rejection after a switch fails its turn undegraded, and says nothing: the
+    /// failure reaches its parent, on whose screen a notice to compact would compact the parent.
+    #[tokio::test]
+    async fn a_sub_agent_s_rejection_right_after_a_switch_says_nothing() {
+        let (mut agent, provider, _store, _session_id, frontend) = agent_with_session(vec![
+            text_round("first answer"),
+            rejected(),
+            text_round("without the image"),
+        ])
+        .await;
+        agent.role = crate::agent::AgentRole::Worker(crate::agent::WorkerLineage {
+            prompt_id: None,
+            parent_agent_id: None,
+        });
+        let mut messages = Conversation::new();
+        ask(&agent, &mut messages, "first", Vec::new())
+            .await
+            .expect("the first turn");
+        agent.set_provider(crate::provider::ResolvedProfile {
+            provider: provider.clone(),
+            profile: "other".to_string(),
+            context_window: 200_000,
+            vision: true,
+        });
+        ask(&agent, &mut messages, "look", vec![image_source()])
+            .await
+            .expect_err("rejected");
+        assert_eq!(provider.streams().len(), 2, "no degraded retry");
+        assert!(
+            !told_to_switch_back(&frontend, "test-profile"),
+            "{:?}",
+            notices(&frontend)
+        );
+    }
+
+    /// A profile the stored replies name that is no longer configured, as a rename leaves its old
+    /// name in the history, says nothing of what serves now: no switch is assumed, and the
+    /// rejection degrades the turn's attachment.
+    #[tokio::test]
+    async fn a_reply_from_a_profile_no_longer_configured_is_no_switch() {
+        let (agent, _provider, store, session_id, _frontend) =
+            agent_with_session(vec![text_round("first answer")]).await;
+        let mut messages = Conversation::new();
+        ask(&agent, &mut messages, "first", Vec::new())
+            .await
+            .expect("the first turn");
+        drop(agent);
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            rejected(),
+            text_round("without the image"),
+        ]));
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        let renamed = crate::agent::tests::build_test_agent_on(
+            crate::session::SessionMaterials {
+                providers: Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["renamed"],
+                )),
+                ..crate::session::SessionMaterials::for_test(store.clone())
+            },
+            crate::provider::ResolvedProfile {
+                provider: provider.clone(),
+                profile: "renamed".to_string(),
+                context_window: 200_000,
+                vision: true,
+            },
+            frontend.clone(),
+            crate::tools::ToolRegistry::new(),
+        );
+        renamed.cells().session_id.set(session_id);
+        let mut messages =
+            Conversation::from_events(store.load_events(session_id).await.expect("load events"));
+        ask(&renamed, &mut messages, "look", vec![image_source()])
+            .await
+            .expect("the degraded retry answers");
+        assert_eq!(provider.streams().len(), 2, "a degraded retry");
+        assert!(
+            !told_to_switch_back(&frontend, "test-profile"),
+            "{:?}",
+            notices(&frontend)
+        );
+    }
+
+    /// A session resumed under another profile has its first request after the switch judged as
+    /// one, though this process sent nothing before it: the stored replies say what served the
+    /// conversation.
+    #[tokio::test]
+    async fn a_rejection_right_after_a_resume_under_another_profile_is_not_degraded() {
+        let (agent, _provider, store, session_id, _frontend) =
+            agent_with_session(vec![text_round("first answer")]).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("the first turn");
+        drop(agent);
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![rejected(), rejected()]));
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        let resumed = crate::agent::tests::build_test_agent_on(
+            crate::session::SessionMaterials::for_test(store.clone()),
+            crate::provider::ResolvedProfile {
+                provider: provider.clone(),
+                profile: "other".to_string(),
+                context_window: 200_000,
+                vision: true,
+            },
+            frontend.clone(),
+            crate::tools::ToolRegistry::new(),
+        );
+        resumed.cells().session_id.set(session_id);
+        let mut messages =
+            Conversation::from_events(store.load_events(session_id).await.expect("load events"));
+        resumed
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("look".to_string(), vec![image_source()])
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("rejected");
+        assert_eq!(provider.streams().len(), 1, "no degraded retry");
+        assert!(
+            told_to_switch_back(&frontend, "test-profile"),
+            "{:?}",
+            notices(&frontend)
         );
     }
 
@@ -10148,11 +10534,11 @@ mod tests {
         );
     }
 
-    /// One refused round, as the mock's script sees it: a `500` shaped like the incident.
+    /// One failed round, as the mock's script sees it: a `500` shaped like the incident.
     ///
     /// `retry_after_secs: Some(0)` is honored verbatim by `backoff_delay`, so a test using this
     /// spends no wall clock proving something about classification.
-    fn refused_with_a_five_hundred() -> Vec<crate::provider::mock::MockEvent> {
+    fn failed_with_a_five_hundred() -> Vec<crate::provider::mock::MockEvent> {
         vec![crate::provider::mock::MockEvent::FailRetryable {
             message: "API returned status 500 Internal Server Error: {\"error\":\"An exception \
                       occurred while loading IMAGE data at index 21\"}"
@@ -10168,7 +10554,7 @@ mod tests {
     /// instead.
     fn one_spent_retry_sequence() -> Vec<Vec<crate::provider::mock::MockEvent>> {
         (0..=crate::provider::retry::MAX_PROVIDER_RETRIES)
-            .map(|_| refused_with_a_five_hundred())
+            .map(|_| failed_with_a_five_hundred())
             .collect()
     }
 
@@ -10220,7 +10606,7 @@ mod tests {
             user.content
                 .iter()
                 .all(|block| !matches!(block, ContentBlock::Image { .. })),
-            "the content the provider kept refusing must not survive the turn"
+            "the content the provider kept rejecting must not survive the turn"
         );
         assert!(
             user.wire_text().contains("500"),
@@ -10581,9 +10967,9 @@ mod tests {
 
     /// The rewind hint reports, so it must fire exactly when there is something to report.
     ///
-    /// It is earned by having spent a tier: real content was degraded, refused anyway, and put
+    /// It is earned by having spent a tier: real content was degraded, rejected anyway, and put
     /// back where every later turn re-sends it. A turn that never found a tier to spend was
-    /// refused over the request rather than its contents, and sending that user to delete a turn
+    /// rejected over the request rather than its contents, and sending that user to delete a turn
     /// would be advice to destroy the wrong thing.
     #[tokio::test]
     async fn the_rewind_hint_is_earned_by_a_tier_that_did_not_help() {
@@ -10931,7 +11317,7 @@ mod tests {
                     },
                 ],
             ])
-            .refusing("mcp__bridge__send_file"),
+            .rejecting("mcp__bridge__send_file"),
         );
         let registry = send_file_registry();
         registry.publish_profile(&crate::provider::PublishedProfile::detached(

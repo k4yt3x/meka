@@ -51,7 +51,7 @@ pub(crate) fn oauth_needs_refresh(
         None => has_refresh_token,
     }
 }
-/// Whether a response is the backend refusing the credential it was sent.
+/// Whether a response is the backend rejecting the credential it was sent.
 ///
 /// One predicate for every request site on the two subscription backends, so a 401 means the same
 /// thing on a completion, a usage probe and a profile read: refresh once and send again. A 403 is
@@ -61,13 +61,13 @@ pub(crate) fn credential_was_rejected(status: reqwest::StatusCode) -> bool {
 }
 /// A request site's answer to a rejected credential.
 ///
-/// The API-key backends take the defaults: nothing to refresh, nothing to add to the refusal. The
-/// subscription backends replace the token once and name the login remedy on the second refusal.
+/// The API-key backends take the defaults: nothing to refresh, nothing to add to the rejection. The
+/// subscription backends replace the token once and name the login remedy on the second rejection.
 #[async_trait::async_trait]
 pub(crate) trait RefreshesCredential {
     /// Whether a rejected credential has been replaced for one more attempt. `sent_authorization`
-    /// is the `Authorization` header the refused request carried, so the backend records the
-    /// token that was refused rather than whatever is current when the refusal lands.
+    /// is the `Authorization` header the rejected request carried, so the backend records the
+    /// token that was rejected rather than whatever is current when the rejection lands.
     async fn refresh_after_rejection(&self, _sent_authorization: Option<&str>) -> bool {
         false
     }
@@ -77,15 +77,16 @@ pub(crate) trait RefreshesCredential {
     }
 }
 
-/// Send a request, and once more on a credential the backend refused if `refresher` can replace it.
+/// Send a request, and once more on a credential the backend rejected if `refresher` can replace
+/// it.
 ///
 /// One rule for every request to a subscription backend, so a 401 means the same thing on a
 /// completion, a usage probe and a profile read: refresh once and send again, and on the second
-/// refusal return the error with the login remedy. `build` produces each attempt's request, so a
+/// rejection return the error with the login remedy. `build` produces each attempt's request, so a
 /// backend that refreshes does it there. `transport_error` names a send that never got an answer;
 /// any status other than a rejection is the caller's to read.
 ///
-/// `cancellation` ends the wait for the response headers, and the read of a reply that refused the
+/// `cancellation` ends the wait for the response headers, and the read of a reply that rejected the
 /// credential for good; `crate::error::read_whole_reply` is the other half for every other body.
 /// Dropping the send is what aborts a
 /// request on the wire, so a stop reaches a whole reply the provider is still generating as fast as
@@ -109,7 +110,7 @@ where
     loop {
         // Built ahead of the send so the bearer this attempt carries is known to the rejection
         // it may get: by the time a 401 lands, a sibling request may have refreshed the token,
-        // and the backend must record the one that was refused, not the replacement.
+        // and the backend must record the one that was rejected, not the replacement.
         let (client, http_request) = build().await?.build_split();
         let http_request = http_request.map_err(|error| transport_error(&error))?;
         let sent_authorization = http_request
@@ -150,9 +151,9 @@ where
     }
 }
 
-/// The error for a credential the backend refused *after* the one refresh a rejection buys.
+/// The error for a credential the backend rejected *after* the one refresh a rejection buys.
 ///
-/// Names the remedy, because at this point the token was minted moments ago and refused anyway:
+/// Names the remedy, because at this point the token was minted moments ago and rejected anyway:
 /// the grant behind it is gone, and only signing in again produces one the backend will take. The
 /// same words `oauth_refresh_error` uses, so a user greps for one phrase.
 pub(crate) fn with_login_remedy(error: MekaError, account: &str) -> MekaError {
@@ -227,7 +228,7 @@ pub(crate) fn row_is_at_least_as_new(memory: &AuthCredential, row: &AuthCredenti
 }
 /// How long to wait for another process's refresh of the same credential: past the refresh's own
 /// timeout and its write, so a slow holder is waited out rather than raced. Racing it posts the
-/// refresh token the holder is spending, which an issuer refuses as reused, and the refusal reads
+/// refresh token the holder is spending, which an issuer rejects as reused, and the rejection reads
 /// as a dead login while the holder has just stored a live one.
 pub(crate) const CREDENTIAL_LOCK_WAIT: Duration =
     Duration::from_secs(REFRESH_TIMEOUT.as_secs() + 5);
@@ -581,7 +582,7 @@ pub(crate) struct OAuthAccess {
 }
 
 /// The credential half of a subscription backend: the live token, the gate that serializes
-/// refreshes, the slot naming a token the backend refused, and the row the token is kept on. One
+/// refreshes, the slot naming a token the backend rejected, and the row the token is kept on. One
 /// machine for both subscription backends, which each supply the exchange that mints a
 /// replacement, so a rule about when a token is refreshed, re-read, adopted or stored is written
 /// once and a race closed here is closed for both.
@@ -600,11 +601,11 @@ pub(crate) struct SubscriptionCredential {
     /// issuer shortened lifetimes. The expiry alone would keep presenting the dead token until it
     /// passed, which can be hours or, for an expiry Meka had to assume, a full lifetime. The
     /// token's identity rather than a flag, because a flag was spent by whichever read came first:
-    /// two requests refused in the same window left one of them re-sending the dead bearer and
+    /// two requests rejected in the same window left one of them re-sending the dead bearer and
     /// failing with the login remedy while the other's refresh succeeded beside it. Recorded only
-    /// when the bearer the refused request carried is still the current one: a refusal that lands
-    /// after its token was replaced is about a token that is gone, and writing it here would
-    /// rotate the replacement for a rejection nothing made of it, or erase a live refusal of the
+    /// when the bearer the rejected request carried is still the current one: a rejection that
+    /// lands after its token was replaced is about a token that is gone, and writing it here would
+    /// rotate the replacement for a rejection nothing made of it, or erase a live rejection of the
     /// replacement that another request just recorded.
     rejected_access_token: std::sync::Mutex<Option<String>>,
     token_store: Option<Arc<TokenStore>>,
@@ -637,9 +638,9 @@ impl SubscriptionCredential {
         &self.account
     }
 
-    /// Record that the backend refused a bearer, so every read until a refresh replaces it
+    /// Record that the backend rejected a bearer, so every read until a refresh replaces it
     /// refreshes instead of trusting the stored expiry. `sent_authorization` is the
-    /// `Authorization` header the refused request carried, which names the token refused; a
+    /// `Authorization` header the rejected request carried, which names the token rejected; a
     /// bearer that is no longer current records nothing, for the reason
     /// [`Self::rejected_access_token`] gives. Without it the current token is taken, which is
     /// right only while no refresh has landed in between.
@@ -657,7 +658,7 @@ impl SubscriptionCredential {
     }
 
     /// The row's credential, installed and returned, when the row has moved past `observed_version`
-    /// to a live token other than the one this refresh set out from; `None` leaves the refusal
+    /// to a live token other than the one this refresh set out from; `None` leaves the rejection
     /// to stand.
     async fn adopt_a_row_moved_past(
         &self,
@@ -670,7 +671,7 @@ impl SubscriptionCredential {
             Ok(None) => return None,
             Err(error) => {
                 tracing::warn!(
-                    "failed to re-read the {backend} credential after a refused refresh: {error}",
+                    "failed to re-read the {backend} credential after a rejected refresh: {error}",
                     backend = self.backend
                 );
                 return None;
@@ -713,7 +714,7 @@ impl SubscriptionCredential {
         ))
     }
 
-    /// The access token to send, refreshed first when it is due or was refused.
+    /// The access token to send, refreshed first when it is due or was rejected.
     ///
     /// A stalled refresh blocks only another refresh, and the bounded HTTP timeout ends even
     /// that. `refresh` is the backend's exchange: given the refresh token and the account id the
@@ -724,7 +725,7 @@ impl SubscriptionCredential {
         Fut: Future<Output = Result<AuthCredential>>,
     {
         // Compared, not consumed: the rejection stands until a refresh replaces the token it
-        // names, so a second request carrying the same refused bearer refreshes too instead of
+        // names, so a second request carrying the same rejected bearer refreshes too instead of
         // finding a flag the first one spent.
         let refused = crate::sync::lock(&self.rejected_access_token).clone();
         let (rejected, entry_access_token) = {
@@ -752,7 +753,7 @@ impl SubscriptionCredential {
             (rejected, entry_access_token)
         };
 
-        // Token expired or refused: attempt refresh. Only refreshers queue here; readers are
+        // Token expired or rejected: attempt refresh. Only refreshers queue here; readers are
         // untouched.
         let _refreshing = self.refresh_gate.lock().await;
 
@@ -813,7 +814,7 @@ impl SubscriptionCredential {
                 account_id,
             } = &*credential
             {
-                // After a rejection the expiry is not trusted, but a token that is not the refused
+                // After a rejection the expiry is not trusted, but a token that is not the rejected
                 // one is: a sibling process may already have rotated past it.
                 let usable = if rejected {
                     *access_token != entry_access_token
@@ -852,7 +853,7 @@ impl SubscriptionCredential {
         let refreshed = match refresh(refresh_token, prior_account_id).await {
             Ok(refreshed) => refreshed,
             Err(error) => {
-                // The issuer refused the grant. A sibling process may have spent it first and
+                // The issuer rejected the grant. A sibling process may have spent it first and
                 // stored what it got: adopted when the row has moved past what this refresh was
                 // derived from, so one refresh token spent twice costs a round trip, not the
                 // login.
@@ -910,7 +911,7 @@ impl SubscriptionCredential {
         };
 
         *self.credential.write().await = new_credential;
-        // The refused token is gone, whatever the issuer minted; a rejection of the replacement is
+        // The rejected token is gone, whatever the issuer minted; a rejection of the replacement is
         // recorded afresh by the request that meets it.
         crate::sync::lock(&self.rejected_access_token).take();
         Ok(access)
@@ -1018,9 +1019,9 @@ mod tests {
         peer.abort();
     }
 
-    /// The refresher is told the bearer the refused request carried, read off the request as
+    /// The refresher is told the bearer the rejected request carried, read off the request as
     /// built rather than off the credential, which a sibling request may have refreshed by the
-    /// time the refusal lands; and the retry goes out on what the refresher installed.
+    /// time the rejection lands; and the retry goes out on what the refresher installed.
     #[tokio::test]
     async fn the_refresher_is_told_the_bearer_the_refused_request_carried() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1040,7 +1041,7 @@ mod tests {
             .await
             .expect("bind");
         let address = listener.local_addr().expect("address");
-        // The refusal closes its connection, so the retry opens another and is the second accept.
+        // The rejection closes its connection, so the retry opens another and is the second accept.
         let peer = tokio::spawn(async move {
             let mut bearers = Vec::new();
             for status in ["401 Unauthorized", "200 OK"] {
@@ -1095,7 +1096,7 @@ mod tests {
         assert_eq!(
             crate::sync::lock(&recording.seen).clone(),
             vec![Some("Bearer token-0".to_string())],
-            "the refresher is told the bearer the refused request carried"
+            "the refresher is told the bearer the rejected request carried"
         );
         assert_eq!(
             peer.await.expect("the peer saw both requests"),
@@ -1107,7 +1108,7 @@ mod tests {
         );
     }
 
-    /// A credential the backend refuses for good has its reply read here, and that read is raced
+    /// A credential the backend rejects for good has its reply read here, and that read is raced
     /// against the token like the send: a peer that sent the 401 and withheld the body held a
     /// canceled turn for as long as it pleased.
     #[tokio::test]

@@ -243,6 +243,10 @@ impl CutRequest {
 
 #[async_trait]
 impl Provider for ToolNameCap {
+    fn model(&self) -> Option<&str> {
+        self.inner.model()
+    }
+
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
@@ -306,8 +310,8 @@ impl Provider for ToolNameCap {
         self.inner.deferred_tool_delivery()
     }
 
-    fn refuses_tool_name(&self, name: &str) -> bool {
-        self.inner.refuses_tool_name(name)
+    fn rejects_tool_name(&self, name: &str) -> bool {
+        self.inner.rejects_tool_name(name)
     }
 
     fn resolved_effort(&self) -> Option<String> {

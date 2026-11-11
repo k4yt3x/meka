@@ -39,7 +39,7 @@ pub(crate) enum MekaError {
     /// Its own variant rather than [`Self::Config`] because nothing about the installation is
     /// wrong: `Config`'s `Display` opens with "configuration error", which is what a CLI user would
     /// read, and it is the wrong diagnosis. Nor is it [`Self::InvalidRequest`], which means the
-    /// *provider* refused a body and arms the turn's degrade path.
+    /// *provider* rejected a body and arms the turn's degrade path.
     ///
     /// Raised by the two agent builders as a backstop, and by the doors that have to refuse before
     /// they write anything. Mapped to 422 by [`crate::host::http::reattach::agent_build_problem`].
@@ -72,7 +72,7 @@ pub(crate) enum MekaError {
     /// Meka's own refusal to send a body still over the profile's `max_request_bytes` once every
     /// older image has been redacted.
     ///
-    /// Not [`Self::InvalidRequest`], which means the *provider* refused a body and is published
+    /// Not [`Self::InvalidRequest`], which means the *provider* rejected a body and is published
     /// with the provider's response beside it: this request never left the process and the
     /// sentence is Meka's own, naming the ceiling and the remedy, so every host relays it verbatim
     /// as the caller's to act on. The agent loop answers it as it answers `InvalidRequest`, by
@@ -637,7 +637,7 @@ pub(crate) enum ErrorKind {
     /// `should_retry_provider_error` declines to retry at all once any output has reached the
     /// stream or the retry budget is spent, so this can arrive after three attempts or after none.
     ProviderUnavailable,
-    /// The upstream refused the request for quota or billing, by a signal it documents: a 402, a
+    /// The upstream rejected the request for quota or billing, by a signal it documents: a 402, a
     /// quota code on a 429, or the Claude subscription's exhausted window.
     ///
     /// A 502 like [`Self::Provider`], and a distinct `type` because the remedy differs from both
@@ -648,13 +648,13 @@ pub(crate) enum ErrorKind {
     /// The conversation no longer fits the model's context window, and Meka could not compact it
     /// down far enough (or `auto_compact` is off).
     ///
-    /// A 502 like [`Self::Provider`], because the upstream is what refused the turn, but a distinct
-    /// `type` so a client can tell the two apart. They call for opposite responses: `provider` is
-    /// "the upstream is unwell, try the same request again", while this one will refuse the same
-    /// request forever. A client that cannot distinguish them retries an oversized conversation
-    /// until it gives up on wall-clock, which is the failure this variant exists to prevent. The
-    /// remedy is to shorten the conversation: `POST /v1/sessions/{id}/compact`, or `/rewind`, or a
-    /// smaller message.
+    /// A 502 like [`Self::Provider`], because the upstream is what rejected the turn, but a
+    /// distinct `type` so a client can tell the two apart. They call for opposite responses:
+    /// `provider` is "the upstream is unwell, try the same request again", while this one will
+    /// reject the same request forever. A client that cannot distinguish them retries an oversized
+    /// conversation until it gives up on wall-clock, which is the failure this variant exists to
+    /// prevent. The remedy is to shorten the conversation: `POST /v1/sessions/{id}/compact`, or
+    /// `/rewind`, or a smaller message.
     ///
     /// Not [`Self::PayloadTooLarge`], which is Meka's own `max_body_bytes` on the HTTP request and
     /// has nothing to do with the model's window; a request well under one limit routinely exceeds
@@ -990,9 +990,9 @@ impl MekaError {
     }
 
     /// Whether this failure says the profile cannot serve a request right now, which is what a
-    /// fallback profile is for: the transient class once its retries are spent, and a refusal for
+    /// fallback profile is for: the transient class once its retries are spent, and a rejection for
     /// quota or billing. Not a request the upstream judged wrong, which another profile would
-    /// judge the same, and not a credential it refused, which only the operator can fix.
+    /// judge the same, and not a credential it rejected, which only the operator can fix.
     pub(crate) fn is_profile_unavailable(&self) -> bool {
         matches!(
             self,
@@ -1001,13 +1001,17 @@ impl MekaError {
     }
 
     /// Whether Claude rejected the request over the signature of a `thinking` block it was sent
-    /// back, which the same conversation without its thinking answers. Two rejections open with
+    /// back, or over a `redacted_thinking` block, which is all signature: the same conversation
+    /// without its thinking answers either. Two rejections open with
     /// [`THINKING_SIGNATURE_REJECTION`]: a block whose earlier conversation has changed since it
     /// was produced (on an account that enforces the check), and one whose signature the API
-    /// cannot verify at all. The text is all there is to match: the API gives either no code
-    /// beyond `invalid_request_error`.
+    /// cannot verify at all. A redacted block it cannot verify is
+    /// [`REDACTED_THINKING_REJECTION`]. The text is all there is to match: the API gives none of
+    /// them a code beyond `invalid_request_error`.
     pub(crate) fn rejects_thinking_signature(&self) -> bool {
-        matches!(self, Self::InvalidRequest(message) if message.contains(THINKING_SIGNATURE_REJECTION))
+        matches!(self, Self::InvalidRequest(message)
+            if message.contains(THINKING_SIGNATURE_REJECTION)
+                || message.contains(REDACTED_THINKING_REJECTION))
     }
 
     /// When the upstream said the profile would serve again, for the breaker that skips the
@@ -1044,6 +1048,11 @@ pub(crate) type Result<T> = std::result::Result<T, MekaError>;
 /// "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a
 /// different conversation." The second sentence is absent when the signature cannot be verified.
 pub(crate) const THINKING_SIGNATURE_REJECTION: &str = "Invalid `signature` in `thinking` block";
+
+/// How Claude's rejection of a replayed `redacted_thinking` block it cannot verify opens, as
+/// `claude-subscription` answered one OpenRouter returned for Gemini on 2026-11-11:
+/// "messages.1.content.0: Invalid `data` in `redacted_thinking` block".
+pub(crate) const REDACTED_THINKING_REJECTION: &str = "Invalid `data` in `redacted_thinking` block";
 
 /// The message [`provider_http_error`] builds from Claude's rejection of a thinking block bound to
 /// a different conversation, as `claude-subscription` answered it on 2026-10-29 for Haiku 5.5
@@ -1413,7 +1422,7 @@ fn is_exhaustion_code(word: &str) -> bool {
     )
 }
 
-/// A refusal for quota or billing, and when the upstream said access resumes.
+/// A rejection for quota or billing, and when the upstream said access resumes.
 struct Exhaustion {
     resets_after: Option<Duration>,
 }
@@ -1550,7 +1559,7 @@ pub(crate) fn provider_stream_error_object(
 /// the server has read it, it is spent and its replacement is in a response Meka may not be
 /// holding. Sending it again is a replay, and §4.14.2 has the server revoke the whole token family
 /// on one, which costs a browser login rather than a round trip. So the split is by what the answer
-/// implies about the token, not by whether one arrived: a 429 was refused before the grant was
+/// implies about the token, not by whether one arrived: a 429 was rejected before the grant was
 /// read and a 5xx usually means the server is unwell rather than that the grant is bad, so both
 /// retry in the ordinary way; that accepts the issuer that rotates and *then* fails. Everything
 /// else is terminal and names the login that recovers it. A success whose body cannot be decoded
@@ -1688,9 +1697,10 @@ mod tests {
 
     use super::*;
 
-    /// Both of Claude's rejections over a thinking block's signature are recognized from the 400 it
-    /// answers: one bound to a different conversation and one it cannot verify at all. Another
-    /// invalid request, or the same words on another kind of failure, is not one.
+    /// Each of Claude's rejections over a thinking block's signature is recognized from the 400 it
+    /// answers: one bound to a different conversation, one it cannot verify at all, and a redacted
+    /// block it cannot verify. Another invalid request, or the same words on another kind of
+    /// failure, is not one.
     #[test]
     fn a_rejected_thinking_signature_is_told_from_other_rejections() {
         let rejection = |body: &str| {
@@ -1708,6 +1718,8 @@ mod tests {
                 .rejects_thinking_signature()
         );
         assert!(rejection(unverifiable).rejects_thinking_signature());
+        let redacted = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `data` in `redacted_thinking` block"},"request_id":"req_011CgvgfGN7ezzCytXL8vfZC"}"#;
+        assert!(rejection(redacted).rejects_thinking_signature());
 
         let other = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 900000 > 128000"}}"#;
         assert!(!rejection(other).rejects_thinking_signature());
@@ -2059,8 +2071,8 @@ mod tests {
         ));
     }
 
-    /// The Claude subscription states its window's reset in a header on the refused 429; a 429
-    /// without it is an ordinary rate limit.
+    /// The Claude subscription states its window's reset in a header on the 429 that rejects the
+    /// request; a 429 without it is an ordinary rate limit.
     #[test]
     fn a_429_beside_the_window_reset_is_exhausted() {
         assert!(matches!(

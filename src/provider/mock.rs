@@ -127,7 +127,7 @@ pub(crate) enum MockEvent {
         message: String,
         retry_after_secs: Option<u64>,
     },
-    /// Synthetic quota or billing refusal. The stream returns
+    /// Synthetic quota or billing rejection. The stream returns
     /// `Err(MekaError::ProviderExhausted { .. })` at once, which is never retried in place, so a
     /// profile with fallbacks hands the turn to the next one and the next round is theirs.
     FailExhausted {
@@ -259,8 +259,10 @@ pub(crate) struct MockProvider {
     /// How this mock says its wire carries deferred tools; unset reads as appended, like a wire
     /// with no declaration of its own.
     delivery: Mutex<Option<crate::provider::DeferredToolDelivery>>,
-    /// Tool names this mock's wire refuses; empty, like a wire that refuses none.
-    refused_names: Mutex<Vec<String>>,
+    /// Tool names this mock's wire rejects; empty, like a wire that rejects none.
+    rejected_names: Mutex<Vec<String>>,
+    /// The model this mock's requests name; unset, like a provider that names none.
+    model: Option<String>,
 }
 
 /// One recorded [`Provider::stream`] call. Owned rather than borrowed because a test inspects it
@@ -361,24 +363,37 @@ impl MockProvider {
         self
     }
 
-    /// The same mock refusing the tool `name` by its name.
+    /// The same mock rejecting the tool `name` by its name.
     #[cfg(test)]
-    pub(crate) fn refusing(self, name: &str) -> Self {
-        crate::sync::lock(&self.refused_names).push(name.to_string());
+    pub(crate) fn rejecting(self, name: &str) -> Self {
+        crate::sync::lock(&self.rejected_names).push(name.to_string());
         self
+    }
+
+    /// The same mock naming `model` in its requests.
+    #[cfg(test)]
+    pub(crate) fn naming_model(self, model: &str) -> Self {
+        Self {
+            model: Some(model.to_string()),
+            ..self
+        }
     }
 }
 
 #[async_trait]
 impl Provider for MockProvider {
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
         crate::sync::lock(&self.delivery).unwrap_or(crate::provider::DeferredToolDelivery::Appended)
     }
 
-    fn refuses_tool_name(&self, name: &str) -> bool {
-        crate::sync::lock(&self.refused_names)
+    fn rejects_tool_name(&self, name: &str) -> bool {
+        crate::sync::lock(&self.rejected_names)
             .iter()
-            .any(|refused| refused == name)
+            .any(|rejected| rejected == name)
     }
 
     /// Drains one round and folds it into a finished message, so a single script drives either

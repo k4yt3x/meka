@@ -80,11 +80,11 @@ pub(crate) struct AccountConfig {
     pub(crate) interleaved_thinking: Option<bool>,
     /// `openai-responses` only: whether the endpoint takes `prompt_cache_key`, OpenAI's hint for
     /// routing a conversation's requests to one prompt cache. Unset is `true`, OpenAI's own API;
-    /// an endpoint that refuses the field sets it `false`.
+    /// an endpoint that rejects the field sets it `false`.
     pub(crate) prompt_cache_key: Option<bool>,
     /// `openai-chat-completions` only: whether a streamed request asks for its usage with
     /// `stream_options.include_usage`, without which OpenAI's own API reports none. Unset is
-    /// `true`; an endpoint that refuses the field sets it `false`, and its usage then reads zero
+    /// `true`; an endpoint that rejects the field sets it `false`, and its usage then reads zero
     /// unless it reports it unasked.
     pub(crate) stream_usage: Option<bool>,
     /// The longest tool name the endpoint takes, in bytes, on the three backends whose endpoint
@@ -125,9 +125,9 @@ pub(crate) struct ProfileConfig {
     pub(crate) account: String,
     pub(crate) model: Option<String>,
     /// Profiles to serve a turn from when this one cannot, in order: its upstream still failing
-    /// once the retry budget is spent, or refusing for quota or billing. Each is a whole other
-    /// profile, so no field of this one is ever overridden. The session's row keeps naming this
-    /// profile; the turn that fell back records which one served it.
+    /// once the retry budget is spent, or rejecting the request for quota or billing. Each is a
+    /// whole other profile, so no field of this one is ever overridden. The session's row keeps
+    /// naming this profile; the turn that fell back records which one served it.
     #[serde(default)]
     pub(crate) fallbacks: Vec<String>,
     /// The model's context window (total tokens it can hold), used for the context gauge and
@@ -181,7 +181,7 @@ pub(crate) struct ProfileConfig {
     /// `openai-responses` only: whether a request asks for the model's reasoning sealed, with
     /// `include: ["reasoning.encrypted_content"]`, and sends it back on the turn's later requests
     /// so the model reasons on from where it was. Defaults to `true`, what OpenAI's own API
-    /// carries for a reasoning model; a model or endpoint that refuses the field sets it `false`.
+    /// carries for a reasoning model; a model or endpoint that rejects the field sets it `false`.
     pub(crate) encrypted_reasoning: Option<bool>,
     /// `openai-responses` only: whether a request asks for `reasoning.summary`, the digest of the
     /// model's reasoning Meka shows as its thinking. Defaults to `true`; a model or endpoint that

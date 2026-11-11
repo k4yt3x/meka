@@ -706,7 +706,7 @@ mod tests {
         );
     }
 
-    /// A quota or billing refusal is 502 under its own type, with the upstream's reset as
+    /// A quota or billing rejection is 502 under its own type, with the upstream's reset as
     /// `Retry-After` when it stated one and no header invented when it did not.
     #[test]
     fn a_quota_refusal_is_502_under_its_own_type_with_its_reset() {
@@ -736,11 +736,11 @@ mod tests {
 
     /// A conversation that will not fit is 502 like its neighbors but says so under its own type.
     ///
-    /// The status is shared because the upstream is what refused the turn. The type is not, because
-    /// the remedies are opposites: `/errors/provider` means "the upstream is unwell, send it
-    /// again", and a client reading this as that retries an oversized conversation until it gives
-    /// up on wall-clock. Nothing else on the wire distinguishes them, so if this assertion is ever
-    /// relaxed to make a match arm simpler, that loop comes back.
+    /// The status is shared because the upstream is what rejected the turn. The type is not,
+    /// because the remedies are opposites: `/errors/provider` means "the upstream is unwell, send
+    /// it again", and a client reading this as that retries an oversized conversation until it
+    /// gives up on wall-clock. Nothing else on the wire distinguishes them, so if this assertion is
+    /// ever relaxed to make a match arm simpler, that loop comes back.
     #[test]
     fn a_context_overflow_is_502_under_its_own_type() {
         let problem = ProblemDetail::for_error(

@@ -804,7 +804,7 @@ impl Agent {
 }
 
 /// A result with nothing in it, said as one: an empty result at the end of a request reads to
-/// the model as the end of its turn, and a wire may refuse the empty text block it would be.
+/// the model as the end of its turn, and a wire may reject the empty text block it would be.
 fn said_even_when_empty(name: &str, output: crate::tools::ToolOutput) -> crate::tools::ToolOutput {
     let empty = output.content.iter().all(|item| {
         matches!(item, crate::conversation::ToolResultContent::Text { text } if crate::text::is_blank(text))

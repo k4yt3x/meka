@@ -234,7 +234,7 @@ enabled = ["read", "unrestricted"]
 
     /// Every message role in the store, oldest first. The shape of a conversation two processes
     /// wrote into is the whole finding: `user, user, assistant, assistant` is what interleaving
-    /// looks like, and the Anthropic Messages API refuses it outright, so the session is not merely
+    /// looks like, and the Anthropic Messages API rejects it outright, so the session is not merely
     /// muddled but unusable from that point on.
     fn message_roles(&self) -> Vec<String> {
         self.read(|connection| {

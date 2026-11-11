@@ -52,8 +52,8 @@ pub(crate) struct CompactRequestBody {
     /// <instructions>`. Reaches the checkpoint turn and the fallback summarizer alike.
     #[serde(default)]
     pub(crate) instructions: Option<String>,
-    /// Whether to keep the most recent turns verbatim after the summary. Omit to let Meka decide;
-    /// the checkpoint turn overrides this when it knows better, having just read the conversation.
+    /// Whether to keep the most recent turns verbatim after the summary. Defaults to `false`, no
+    /// tail; `true` keeps one, whatever the checkpoint turn answers.
     #[serde(default)]
     pub(crate) keep_recent: Option<bool>,
 }

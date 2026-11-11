@@ -10,8 +10,8 @@
 //! [`super::responses_wire::request_reasoning_summary`] behind the profile's `encrypted_reasoning`
 //! and `reasoning_summary`, since a model that does not reason may refuse them where one that
 //! does needs them, and `prompt_cache_key` behind the account's, since only the endpoint decides
-//! that one. Most servers ignore a field they do not know, and the one that refuses names it, so a
-//! switch turned off is the remedy rather than a guess made for every endpoint.
+//! that one. Most servers ignore a field they do not know, and the one that rejects it names it, so
+//! a switch turned off is the remedy rather than a guess made for every endpoint.
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -121,7 +121,9 @@ impl OpenAiResponsesProvider {
         deferred_tools: &[ToolDefinition],
         attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        let origin = self.encrypted_reasoning.then(|| self.origin()).flatten();
+        // A blob in the conversation goes back to the host that sealed it whatever the profile
+        // asks of this request: `encrypted_reasoning` decides only whether the reply is sealed.
+        let origin = self.origin();
         let mut body = build_request_body_for(
             self.deferred_tool_delivery(),
             deferred_tools,
@@ -199,6 +201,10 @@ impl ResponsesBackend for OpenAiResponsesProvider {
 
 #[async_trait]
 impl Provider for OpenAiResponsesProvider {
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
         match self.deferred_tools {
             crate::config::DeferredTools::Native => crate::provider::DeferredToolDelivery::Searched,
@@ -388,9 +394,11 @@ mod tests {
         assert!(body.get("prompt_cache_key").is_none(), "{body}");
     }
 
-    /// Sealed reasoning goes back only to the endpoint that sealed it, and only while the profile
-    /// asks for reasoning to be carried: a session resumed here after a `chatgpt-subscription`
-    /// turn holds ChatGPT's blobs, which this endpoint cannot open.
+    /// Sealed reasoning goes back sealed only to the host that sealed it: a session resumed here
+    /// after a `chatgpt-subscription` turn holds ChatGPT's blobs, which this endpoint cannot open.
+    /// The host's own blob goes back even on a profile that does not ask for sealed reasoning,
+    /// since that setting decides only what the reply returns. Its readable parts go back either
+    /// way.
     #[test]
     fn sealed_reasoning_goes_back_only_to_the_endpoint_that_sealed_it() {
         let history = |origin: &str| {
@@ -418,12 +426,23 @@ mod tests {
                 Message::user("go on"),
             ]
         };
-        let replayed = |body: &serde_json::Value| {
+        let reasoning = |body: &serde_json::Value| {
             body["input"]
                 .as_array()
                 .expect("input")
                 .iter()
-                .any(|item| item["type"] == "reasoning")
+                .find(|item| item["type"] == "reasoning")
+                .cloned()
+                .unwrap_or_else(|| panic!("{body}"))
+        };
+        let replayed = |body: &serde_json::Value| {
+            let reasoning = reasoning(body);
+            assert_eq!(
+                reasoning["content"],
+                serde_json::json!([{"type": "reasoning_text", "text": "summary"}]),
+                "{body}"
+            );
+            reasoning.get("encrypted_content").is_some()
         };
         let attribution = crate::provider::Attribution::default();
         let own = provider(None, None).build_body(
@@ -457,7 +476,7 @@ mod tests {
             &[],
             &attribution,
         );
-        assert!(!replayed(&off), "{off}");
+        assert!(replayed(&off), "{off}");
     }
 
     /// Effort is sent only when the profile asks, and with the summary off nothing pulls a

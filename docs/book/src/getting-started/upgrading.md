@@ -10,6 +10,47 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 Meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.92 to 0.93
+
+Nothing in `config.toml` changes shape. The store moves forward on its first open, behind the
+automatic backup: a compaction you ask for now records whether you asked for a tail, and an older
+compaction that kept only an unanswered prompt now says it kept no recent turns, as one does now.
+0.92 refuses a store 0.93 has opened; downgrading means restoring the backup the upgrade took.
+Session archives are `format_version` 27; a 0.92 archive (26) is brought forward the same way on
+import, and 0.92 refuses a 27.
+
+**`/compact` keeps no turn verbatim.** A compaction you ask for, the screen's `/compact` or
+`POST /v1/sessions/{id}/compact`, now replaces the conversation with its summary alone, where it
+kept a tail of recent turns; the next stretch starts from the summary. Pass `"keep_recent": true`
+to `POST …/compact` to keep a tail; the screen's `/compact` cannot ask for one. The automatic
+compactions and the ones the agent asks for keep theirs as before.
+
+**Switching a session to a Responses endpoint carries its reasoning.** Reasoning another provider
+returned in the clear now goes to a Responses endpoint as a `reasoning` item, as it already went to
+Chat Completions. OpenAI's endpoints, ChatGPT's included, reject raw reasoning text another
+provider returned (`Invalid 'input[N].content'`), so a session moved to one from DeepSeek,
+OpenRouter or a local server fails until it is compacted: compact it on the profile you are
+leaving, then switch. Claude's summarized thinking, and OpenRouter's, now goes as a summary, which
+they accept. A Claude subscription session recorded before 0.93, and every session from the
+`anthropic-messages` backend, holds Claude's thinking as raw reasoning, which 0.92 left out on the
+way to ChatGPT or OpenAI and 0.93 sends, so compact such a session before switching it there too.
+
+**A request a fallback serves is not degraded.** When the provider of a fallback rejects a request,
+the turn fails with its error, where 0.92 took the turn's attachments or tool results out and
+retried. A fallback chain that moves a session to an OpenAI profile fails the same way the switch
+above does, so keep a chain to profiles a session survives moving between.
+
+**The first request after a switch is not degraded.** When the provider rejects the first request
+after a session's profile, or that profile's model, changed, the turn fails with its error and Meka
+says how to go on, where 0.92 took the turn's attachments or tool results out, retried, and could
+finish the turn. An HTTP client or a scheduler that moves a session with
+`PATCH /v1/sessions/{id}` now gets that failure where it got an answer: compact the session on the
+profile it is leaving before moving it, or switch it back, compact it, then switch it again.
+
+**`encrypted_reasoning = false` no longer withholds sealed reasoning.** A blob the conversation
+already holds goes back to the host that sealed it either way; the setting decides only whether a
+reply returns one.
+
 ## 0.91 to 0.92
 
 Nothing in `config.toml` is renamed. The store moves forward on its first open, behind the
@@ -263,13 +304,13 @@ field and a tool's argument types are refused or read differently.
 **`openai-responses` asks for encrypted reasoning, a reasoning summary and a cache key.** Every
 request carries `include: ["reasoning.encrypted_content"]`, `reasoning.summary` and a
 `prompt_cache_key` naming the session, as OpenAI's own client sends them. A model that does not
-reason refuses the first two, on OpenAI's own API as well (`gpt-4.1`, `gpt-4o`): set
+reason rejects the first two, on OpenAI's own API as well (`gpt-4.1`, `gpt-4o`): set
 `encrypted_reasoning = false` and `reasoning_summary = false` on its profile (`meka profile set`).
-An endpoint behind `base_url` that refuses one is answered by turning that one off the same way,
+An endpoint behind `base_url` that rejects one is answered by turning that one off the same way,
 and `prompt_cache_key = false` in the account's table of `config.toml`.
 
 **`openai-chat-completions` asks for usage on every streamed request**
-(`stream_options.include_usage`), where it asked only some endpoints. An endpoint that refuses the
+(`stream_options.include_usage`), where it asked only some endpoints. An endpoint that rejects the
 field is answered by `stream_usage = false` in the account's table of `config.toml`.
 
 **A relative `MEKA_CONFIG_DIR` or `MEKA_DATA_DIR` is refused.** Meka stops at startup naming the
@@ -541,7 +582,7 @@ the shape of a successful tool result both change, so a session resumed on 0.77 
 on its first request and everything from the second.
 
 **A `claude-subscription` session has no MCP meta-tools.** The `mcp_resource_*` and
-`mcp_prompt_*` tools leave the request and the catalog on that backend, because its endpoint refuses
+`mcp_prompt_*` tools leave the request and the catalog on that backend, because its endpoint rejects
 their names; see [Deferred tools](../tools/overview.md#deferred-tools). They are back the moment the
 session moves to another profile.
 
@@ -817,7 +858,7 @@ header a skill is served with now says.
 
 **`interleaved_thinking` on an account.** `anthropic-messages` still sends the
 `interleaved-thinking` beta whenever thinking is on; `[accounts.<name>] interleaved_thinking = false`,
-or `meka account add --interleaved-thinking false`, withholds it for an endpoint that refuses the
+or `meka account add --interleaved-thinking false`, withholds it for an endpoint that rejects the
 header. Nothing changes for an account that does not set it.
 
 **Wire changes.** `schedule.fired` carries `status: "not_run"` for a job whose session could not
@@ -1511,7 +1552,7 @@ always handed the same text to its client, so withholding it on HTTP left the te
 while making the one surface quieter. What it cost was the upstream's error type, which is the one
 part of a failed turn a client can act on.
 
-**Know who can read it before you leave it on.** An upstream refusal can name your account with the provider,
+**Know who can read it before you leave it on.** An upstream rejection can name your account with the provider,
 your organization, and your rate-limit posture. Submitting a turn takes `sessions:w`, but the
 failure is also carried by the terminal `turn.failed` event, and re-attaching to a stream takes only
 `sessions:r`, so a read-only token sees it too. If you issue read-only tokens to people who may
@@ -1638,10 +1679,10 @@ The script finds Meka's own directories by default, honoring `MEKA_CONFIG_DIR` a
 | **B.** Thinking blocks | A stored block's bare `signature` becomes an `opaque` object naming which provider it belongs to: `signed` for a Claude signature, `sealed` for OpenAI's encrypted reasoning. 0.41 wrote both to the same field and recorded nothing about which was which, so the script tells them apart by the shape of the blob and **reports the counts before it writes**. A blob it does not recognize is left exactly as it is. | The block loses its opaque half, so that reasoning stops being replayed to the provider. The session still loads and still runs; it just resumes without the chain of thought behind those turns. |
 | **C.** A skill's `version:` / `author:` | Both move from the top level of a `SKILL.md`'s frontmatter under `metadata:`, keeping their names, which is where the Agent Skills spec puts them. | Nothing. Meka reads a top-level `version:` and `author:` permanently, because Claude Code's plugin skills declare `version:` there. This conversion is cosmetic. |
 | **D.** A skill's `priority:` | Moves under `metadata:` **and is renamed** to `meka-priority:`. | The skill silently drops to the default rank of 5. A rank is read from `metadata.meka-priority` and nowhere else, so the `[Skills]` index comes out in a different order and its cap drops different skills. Nothing warns. |
-| **E.** A stored `tool_result` | Content held as a bare JSON string becomes a list of typed blocks, `[{"type": "text", "text": ...}]`. | The affected session breaks. The row will not deserialize, so it is dropped as the session loads, which orphans the `tool_use` it answered, and the provider then refuses the next turn. |
+| **E.** A stored `tool_result` | Content held as a bare JSON string becomes a list of typed blocks, `[{"type": "text", "text": ...}]`. | The affected session breaks. The row will not deserialize, so it is dropped as the session loads, which orphans the `tool_use` it answered, and the provider then rejects the next turn. |
 
 ### The two that matter
 
 A and B announce themselves: a memory you saved is missing from the index, or a thinking block is not replayed. Both are recoverable by running the script later.
 
-**D and E are the ones that damage silently.** D changes which skills the `[Skills]` index shows first and which its cap drops, with nothing on screen to say the rank it used was not the one in your file. **E can leave a session unusable**: it loads cleanly, and then the next turn is refused by the provider because a `tool_use` in the history has no matching result. See [Sessions](../usage/sessions.md#rewinding-a-session) if you have already met that error.
+**D and E are the ones that damage silently.** D changes which skills the `[Skills]` index shows first and which its cap drops, with nothing on screen to say the rank it used was not the one in your file. **E can leave a session unusable**: it loads cleanly, and then the next turn is rejected by the provider because a `tool_use` in the history has no matching result. See [Sessions](../usage/sessions.md#rewinding-a-session) if you have already met that error.

@@ -3879,12 +3879,52 @@ impl Store {
             .map_err(|error| MekaError::Database(format!("failed to read the log's end: {error}")))
     }
 
+    /// The profile that sent the request behind the latest reply the session's context holds that
+    /// its own profile served, as the reply's record names it: what the conversation's next
+    /// request is a switch from. The context is the rows after the latest compaction, the copies
+    /// of a turn it kept among them; a reply a rewind took is not in it, and one a fallback served
+    /// in a turn its row says so of was not the session's own, so neither counts. `None` when the
+    /// context holds no such reply, as after a compaction that kept no turn.
+    pub(crate) async fn last_context_reply_profile(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<String>> {
+        let rewound = self.rewound(session_id).await?;
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(
+                    "SELECT m.id, json_extract(m.reply, '$.profile') FROM messages m \
+                     LEFT JOIN turns t \
+                     ON t.id = CASE WHEN m.said_at IS NULL THEN m.turn_id ELSE m.said_turn_id END \
+                     WHERE m.session_id = ?1 AND m.reply IS NOT NULL AND m.id > COALESCE(( \
+                     SELECT MAX(b.id) FROM messages b WHERE b.session_id = ?1 AND b.kind = ?2), 0) \
+                     AND t.profile IS NULL ORDER BY m.id DESC",
+                )?;
+                let mut rows = statement.query(rusqlite::params![
+                    session_id.to_string(),
+                    COMPACT_BOUNDARY_KIND
+                ])?;
+                while let Some(row) = rows.next()? {
+                    if !is_rewound(&rewound, row.get(0)?) {
+                        return row.get::<_, Option<String>>(1);
+                    }
+                }
+                Ok(None)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to read the latest reply's profile: {error}"
+                ))
+            })
+    }
+
     /// The stretches of the session's log its history no longer holds, for every surface that
     /// shows the history: the screen, an editor's replay, the HTTP history and session search.
     ///
     /// A rewind is written between turns, and takes what it took and any rewind inside it. A turn
     /// writes the same repair to take its prompt back: to join a message to it, which brings the
-    /// prompt straight back in the joined message, or to withdraw it when the provider refused it,
+    /// prompt straight back in the joined message, or to withdraw it when the provider rejected it,
     /// which the live run left on the screen and so does a replay. Only an empty repair takes
     /// anything, so a session without one answers without decoding its log, and one with one
     /// decodes it once for as long as the part of the log its stretches come from holds
@@ -7141,7 +7181,7 @@ mod tests {
 
     /// A prompt a turn took back to join a message to it is out of the history, and the row that
     /// took it says which positions it took, ahead of the message it joined; one withdrawn because
-    /// the provider refused it stays, as the screen leaves it.
+    /// the provider rejected it stays, as the screen leaves it.
     #[allow(
         clippy::single_range_in_vec_init,
         reason = "a stretch's rows are a list of runs, and these hold one run"
@@ -7234,7 +7274,7 @@ mod tests {
     /// What a session's conversation no longer holds is read back by row. A rewind, written
     /// between turns, takes the turns it took and says how many; a turn taking its prompt back to
     /// join a message to it takes the prompt and its own row; a prompt withdrawn because the
-    /// provider refused it takes nothing, since the live run left it on the screen. A session with
+    /// provider rejected it takes nothing, since the live run left it on the screen. A session with
     /// no empty repair has nothing taken.
     #[allow(
         clippy::single_range_in_vec_init,
@@ -7416,6 +7456,140 @@ mod tests {
                 .expect("save");
         }
         assert_eq!(store.rewound(refused).await.expect("read"), Vec::new());
+    }
+
+    /// What the session's own profile served last is its latest reply's profile, past a reply a
+    /// rewind took out of the history and one a fallback served.
+    #[tokio::test]
+    async fn the_last_context_reply_profile_skips_a_rewound_reply_and_a_fallback_s() {
+        use crate::conversation::{Conversation, Event, Message, ReplyRecord};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let turns = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        for turn in turns {
+            store
+                .turn_store()
+                .open_turn(
+                    id,
+                    turn,
+                    crate::store::turns::TurnSource::Client,
+                    crate::permission::Permission::Read,
+                    "2026-11-11T00:00:00+00:00",
+                )
+                .await
+                .expect("open");
+        }
+        let mut conversation = Conversation::new();
+        for (turn, profile) in turns.into_iter().zip(["work", "side", "backup"]) {
+            let (prompt, answer) = (Message::user("again?"), Message::assistant_text("Again."));
+            store
+                .save_events_atomic(
+                    id,
+                    vec![
+                        RecordedEvent::from(Event::Append(prompt.clone())),
+                        RecordedEvent::reply(answer.clone(), ReplyRecord {
+                            stop: None,
+                            cut: None,
+                            model: None,
+                            profile: Some(profile.to_string()),
+                            usage: None,
+                            provider_fields: None,
+                        }),
+                    ],
+                    Some(turn),
+                )
+                .await
+                .expect("save");
+            conversation = Conversation::from_events(
+                conversation
+                    .events()
+                    .iter()
+                    .cloned()
+                    .chain([Event::Append(prompt), Event::Append(answer)])
+                    .collect(),
+            );
+            if profile == "side" {
+                let rewind = conversation.rewind(1).expect("a turn to rewind");
+                store
+                    .save_rewind(id, &rewind)
+                    .await
+                    .expect("save the rewind");
+            }
+        }
+        store
+            .turn_store()
+            .close_turn(
+                turns[2],
+                &crate::store::turns::TurnEnding::succeeded(
+                    crate::conversation::StopReason::EndTurn,
+                    Default::default(),
+                )
+                .served_by(Some("backup".to_string())),
+            )
+            .await
+            .expect("close");
+        assert_eq!(
+            store
+                .last_context_reply_profile(id)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("work")
+        );
+    }
+
+    /// The context a compaction leaves holds the copies of the turn it kept and nothing before its
+    /// boundary, so a kept reply still names its profile and a compaction that kept no turn
+    /// leaves none.
+    #[tokio::test]
+    async fn the_last_context_reply_profile_reads_only_what_the_latest_compaction_left() {
+        use crate::conversation::{Conversation, Event, Message, ReplyRecord};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let (prompt, answer) = (Message::user("again?"), Message::assistant_text("Again."));
+        store
+            .save_events_atomic(
+                id,
+                vec![
+                    RecordedEvent::from(Event::Append(prompt.clone())),
+                    RecordedEvent::reply(answer.clone(), ReplyRecord {
+                        stop: None,
+                        cut: None,
+                        model: None,
+                        profile: Some("work".to_string()),
+                        usage: None,
+                        provider_fields: None,
+                    }),
+                ],
+                None,
+            )
+            .await
+            .expect("save");
+        for (kept, profile) in [(vec![prompt, answer], Some("work")), (Vec::new(), None)] {
+            let conversation =
+                Conversation::from_events(store.load_events(id).await.expect("load"));
+            let boundary = Event::CompactBoundary {
+                summary: Message::user("the summary"),
+                replaced_count: conversation.len(),
+                record: crate::conversation::CompactionRecord::for_test(),
+                loaded_tools_snapshot: Default::default(),
+                checklist_snapshot: Default::default(),
+            };
+            store
+                .save_compaction(id, &boundary, &kept, None)
+                .await
+                .expect("compact");
+            assert_eq!(
+                store
+                    .last_context_reply_profile(id)
+                    .await
+                    .expect("read")
+                    .as_deref(),
+                profile,
+                "{} kept",
+                kept.len()
+            );
+        }
     }
 
     /// A rewind and a withdrawal take the one door into `messages`, so an image inside the repair
@@ -11737,7 +11911,7 @@ mod tests {
         for event in [
             Event::Append(Message::user("look?")),
             Event::Append(answer),
-            // Claude refused a signature: the view takes the thinking out of every message.
+            // Claude rejected a signature: the view takes the thinking out of every message.
             Event::Unsign,
         ] {
             store

@@ -6,7 +6,7 @@
 //! [`Conversation::replace_tail`], [`Conversation::pop_repair`], [`Conversation::rewind`],
 //! [`Conversation::sanitize_orphans`]) remains an explicit, named method; the compiler refuses
 //! casual mutation. The one exception is [`repair_invalid_images`], which runs on every
-//! materialization because a rebuild must not be able to reinstate content the provider refuses.
+//! materialization because a rebuild must not be able to reinstate content the provider rejects.
 //!
 //! On disk, events are stored row-per-event in the `messages` table; the encoding lives in
 //! `store::sessions`'s `encode_event_for_db` / `decode_event_from_row` helpers, behind the
@@ -106,7 +106,7 @@ impl From<CompactionSource> for String {
 ///
 /// Every trigger but [`Self::Emergency`] can afford the checkpoint turn. `Emergency` cannot: it
 /// runs *after* the provider rejected the request for exceeding the window, and a checkpoint turn
-/// sends the same conversation again, so it would be refused for the same reason. That path needs
+/// sends the same conversation again, so it would be rejected for the same reason. That path needs
 /// a call that is deliberately smaller than the one that just failed, which is exactly what
 /// `Agent::summarize_via_provider` is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +120,7 @@ pub(crate) enum CompactionTrigger {
     Manual,
     /// The agent asked, via `context_compact`.
     Requested,
-    /// The provider refused the request as too large.
+    /// The provider rejected the request as too large.
     Emergency,
     /// A turn in the model's view is older than `[session].turn_retention`, so the sweep that
     /// deletes it needs a summary to stand in for it first.
@@ -204,8 +204,13 @@ pub(crate) struct CompactionRecord {
     pub(crate) memories_written: Vec<String>,
     /// The outcome, not the intent: the split yields an empty tail whenever the snapped boundary
     /// lands below the minimum worth summarizing, which is routine in a session whose user turns
-    /// are separated by long tool runs.
+    /// are separated by long tool runs. An unanswered prompt kept alone is no recent turn.
     pub(crate) kept_recent: bool,
+    /// For a compaction a person asked for, whether they asked for a verbatim tail; one that asked
+    /// for none keeps none as its ordinary course. `None` where no answer is recorded: every
+    /// compaction nobody asked for, and a person's written before the answer was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) person_keeps_recent: Option<bool>,
     /// The checkpoint turn's rounds as they happened: each reply as its provider returned it, with
     /// what the provider said about it, and the results Meka sent back, the call that handed the
     /// summary in included. Never sent to a provider; empty when no checkpoint round ran, or none
@@ -332,7 +337,7 @@ impl CompactionRecord {
             CompactionTrigger::Manual => "Compacted the conversation on user request.",
             CompactionTrigger::Requested => "The agent compacted the conversation.",
             CompactionTrigger::Emergency => {
-                "Compacted the conversation after the provider refused the request as too large."
+                "Compacted the conversation after the provider rejected the request as too large."
             }
             CompactionTrigger::Retention => {
                 "Autocompacted the conversation to summarize turns older than the retention window."
@@ -342,10 +347,11 @@ impl CompactionRecord {
 
     /// What differs from the ordinary compaction, a sentence each: that no recent turns were kept
     /// verbatim after the summary, so the summary is all the model has of the conversation, and
-    /// that the standalone summarizer wrote it rather than the agent.
+    /// that the standalone summarizer wrote it rather than the agent. A person who asked for no
+    /// tail got what they asked for, so keeping none is no departure for them.
     pub(crate) fn departures(&self) -> Vec<&'static str> {
         let mut departures = Vec::new();
-        if !self.kept_recent {
+        if !self.kept_recent && self.person_keeps_recent != Some(false) {
             departures.push("No recent turns were kept.");
         }
         if self.source == CompactionSource::Summarizer {
@@ -364,6 +370,7 @@ impl CompactionRecord {
             source: CompactionSource::Checkpoint,
             memories_written: Vec::new(),
             kept_recent: true,
+            person_keeps_recent: None,
             written_summary: String::new(),
             checkpoint: Vec::new(),
             summarizer: Vec::new(),
@@ -1225,7 +1232,7 @@ struct Placed {
 /// of, so none of those is left in the view either.
 ///
 /// A rewind is one such repair. A turn writes others: taking its prompt back to join a message
-/// that arrived behind it, and withdrawing a prompt the provider refused so its items can be
+/// that arrived behind it, and withdrawing a prompt the provider rejected so its items can be
 /// offered again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Rewind<Stamp> {
@@ -1583,7 +1590,7 @@ fn repair_invalid_images(messages: &mut [Message]) -> usize {
     let note = |source: &crate::image::ImageSource| {
         format!(
             "An image here was removed: it is declared {} but the bytes are something else, \
-             which the provider refuses.",
+             which the provider rejects.",
             source.media_type()
         )
     };
@@ -2469,6 +2476,7 @@ impl ContentBlock {
     }
 
     /// A thinking block of one part of reasoning, `text`.
+    #[cfg(test)]
     pub(crate) fn reasoning(text: impl Into<String>, opaque: Option<OpaqueReasoning>) -> Self {
         Self::Thinking {
             parts: vec![ReasoningPart::reasoning(text)],
@@ -5802,6 +5810,7 @@ mod tests {
             source,
             memories_written: memories.iter().map(|name| name.to_string()).collect(),
             kept_recent,
+            person_keeps_recent: None,
             written_summary: String::new(),
             checkpoint: Vec::new(),
             summarizer: Vec::new(),
@@ -5879,7 +5888,7 @@ mod tests {
         );
         assert_eq!(
             note(CompactionTrigger::Emergency),
-            "Compacted the conversation after the provider refused the request as too large."
+            "Compacted the conversation after the provider rejected the request as too large."
         );
         assert_eq!(
             note(CompactionTrigger::Retention),
@@ -5900,8 +5909,64 @@ mod tests {
         .note();
         assert_eq!(
             line,
-            "Compacted the conversation after the provider refused the request as too large. No \
+            "Compacted the conversation after the provider rejected the request as too large. No \
              recent turns were kept. Written by the standalone summarizer."
+        );
+    }
+
+    /// A compaction a person asks for keeps no tail unless asked, so keeping none when they asked
+    /// for none is no departure, and keeping none when they asked for a tail is, as it is for a
+    /// person's compaction that recorded no answer. The answer survives the row.
+    #[test]
+    fn a_person_s_compaction_says_it_kept_no_tail_only_when_they_asked_for_one() {
+        let asked = |person_keeps_recent: Option<bool>| CompactionRecord {
+            person_keeps_recent,
+            ..record(
+                CompactionTrigger::Manual,
+                CompactionSource::Checkpoint,
+                &[],
+                false,
+            )
+        };
+        let unasked = asked(Some(false));
+        assert!(
+            unasked.departures().is_empty(),
+            "{:?}",
+            unasked.departures()
+        );
+        assert_eq!(
+            unasked.note(),
+            "Compacted the conversation on user request."
+        );
+        for answer in [Some(true), None] {
+            assert_eq!(
+                asked(answer).departures(),
+                ["No recent turns were kept."],
+                "{answer:?}"
+            );
+        }
+
+        let boundary = |record: CompactionRecord| Event::CompactBoundary {
+            summary: Message::user("summary"),
+            replaced_count: 2,
+            loaded_tools_snapshot: Default::default(),
+            checklist_snapshot: Default::default(),
+            record,
+        };
+        let encoded = serde_json::to_value(boundary(unasked.clone())).expect("encodes");
+        assert_eq!(encoded["CompactBoundary"]["person_keeps_recent"], false);
+        let Event::CompactBoundary { record, .. } =
+            serde_json::from_value(encoded).expect("decodes")
+        else {
+            panic!("a boundary decodes as one");
+        };
+        assert_eq!(record, unasked);
+        let unrecorded = serde_json::to_value(boundary(asked(None))).expect("encodes");
+        assert!(
+            unrecorded["CompactBoundary"]
+                .get("person_keeps_recent")
+                .is_none(),
+            "{unrecorded}"
         );
     }
 
@@ -5919,6 +5984,7 @@ mod tests {
                 source: CompactionSource::Summarizer,
                 memories_written: vec!["notes".to_string()],
                 kept_recent: false,
+                person_keeps_recent: None,
                 written_summary: "what was done".to_string(),
                 checkpoint: Vec::new(),
                 summarizer: Vec::new(),

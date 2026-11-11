@@ -338,7 +338,7 @@ pub(crate) fn read_image_dimensions(
 /// requests). Other providers shouldn't need this.
 ///
 /// A photograph (a JPEG or WebP source) comes back as JPEG: as PNG, a 2000 px photo is several
-/// megabytes past the per-image ceiling, which the provider refuses. Anything else comes back as
+/// megabytes past the per-image ceiling, which the provider rejects. Anything else comes back as
 /// PNG, whose screenshots and diagrams compress well, and as JPEG only when the PNG does not fit.
 pub(crate) fn downscale_to_dim_cap(
     bytes: &[u8],
@@ -1198,7 +1198,7 @@ mod tests {
     }
 
     /// A photograph downscaled to the cap stays a JPEG inside the per-image ceiling: as a PNG, a
-    /// photo at 2000 px is several megabytes past it, and the provider refuses an image over it.
+    /// photo at 2000 px is several megabytes past it, and the provider rejects an image over it.
     #[test]
     fn a_downscaled_photo_stays_a_jpeg_inside_the_ceiling() {
         let mut seed: u32 = 0x2545_F491;

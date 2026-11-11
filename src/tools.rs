@@ -761,7 +761,7 @@ impl ToolOutput {
 
     /// Add a note Meka writes to the model-visible result, as an item of its own that every wire
     /// renders behind Meka's label, so it never reads as part of the tool's own output. A result
-    /// made of tool references takes none: the wire refuses text beside a reference, and the
+    /// made of tool references takes none: the wire rejects text beside a reference, and the
     /// endpoint expands the references into the very schemas a note would describe.
     pub(crate) fn push_note(&mut self, note: String) {
         if self
@@ -2655,7 +2655,7 @@ mod tests {
     }
 
     /// A note is an item of its own, read behind Meka's label, and never rides beside a reference:
-    /// the wire refuses text in a result that carries one.
+    /// the wire rejects text in a result that carries one.
     #[test]
     fn a_note_never_joins_a_result_made_of_references() {
         let mut textual = ToolOutput::text("done".to_string(), false);

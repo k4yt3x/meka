@@ -815,7 +815,7 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
                     .await
                     .map_err(|error| {
                         // A server that asks for a login before an `[auth]` block says so is one
-                        // a login, which assumes `oauth`, connects; one that refuses a stored
+                        // a login, which assumes `oauth`, connects; one that rejects a stored
                         // bearer wants another bearer, which is a connection failure as written.
                         if !presented_a_bearer && challenged(&error) {
                             MekaError::McpLoginRequired {

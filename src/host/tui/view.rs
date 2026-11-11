@@ -3814,6 +3814,7 @@ mod tests {
         let record = CompactionRecord {
             trigger: CompactionTrigger::Requested,
             kept_recent: false,
+            person_keeps_recent: None,
             checkpoint: [
                 Message {
                     role: Role::Assistant,

@@ -622,6 +622,7 @@ mod tests {
                     source: CompactionSource::Checkpoint,
                     memories_written: vec!["notes".to_string()],
                     kept_recent: false,
+                    person_keeps_recent: None,
                     written_summary: String::new(),
                     checkpoint: Vec::new(),
                     summarizer: Vec::new(),
@@ -637,12 +638,40 @@ mod tests {
         assert_eq!(data["source"], "checkpoint");
         assert_eq!(data["memories_written"], serde_json::json!(["notes"]));
         assert_eq!(data["kept_recent"], false);
+        assert!(
+            data.get("person_keeps_recent").is_none(),
+            "nobody asked for this one: {data}"
+        );
         assert!(data.get("replaced_count").is_none());
         assert_eq!(data["generation"], 2);
         assert!(
             data.get("summary").is_none(),
             "the summary is on `GET /history`: {data}"
         );
+
+        // A person's compaction says what they asked for, which is what tells a default
+        // `/compact` from one that asked for a tail and found none fitting.
+        for asked in [false, true] {
+            let (_, data) = translate(
+                FrontendEvent::Compacted {
+                    id: "c2".to_string(),
+                    record: CompactionRecord {
+                        trigger: CompactionTrigger::Manual,
+                        source: CompactionSource::Checkpoint,
+                        memories_written: Vec::new(),
+                        kept_recent: false,
+                        person_keeps_recent: Some(asked),
+                        written_summary: String::new(),
+                        checkpoint: Vec::new(),
+                        summarizer: Vec::new(),
+                    },
+                    generation: 3,
+                },
+                SessionCapabilities::default(),
+            )
+            .expect("an event");
+            assert_eq!(data["person_keeps_recent"], asked, "{data}");
+        }
 
         let (kind, data) = translate(
             FrontendEvent::CompactionFailed {

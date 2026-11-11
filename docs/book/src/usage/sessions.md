@@ -87,22 +87,59 @@ Switching profile mid-conversation is allowed and is your call.
 ### What a profile switch carries
 
 From the next turn, each request carries everything the conversation holds that its protocol has a
-place for, whichever profile produced it:
+place for, whichever profile produced it. A change of a profile's model is a switch too, and so is
+the switch of every sub-agent that follows its parent's profile. Meka sees a change of model only
+in the process that had a request accepted on the old model: a stored reply records the model its
+provider named, which need not match the one configured, so a resume in a new process, an editor's
+load or an HTTP session re-attached after it went idle compares profile names alone. There a model
+changed under the same profile is no switch, and a request the new model rejects takes the
+[repair path](#rewinding-a-session).
 
-- Text, tool calls and their results go to every backend.
-- Reasoning returned in the clear, DeepSeek's `reasoning_content`, Claude's thinking and a Responses
-  summary alike, goes back to any Chat Completions endpoint as `reasoning_content`.
+- Text, tool calls and their results go to every backend, and images to every backend that carries
+  them; on Chat Completions an image in a tool's result goes as a line of text.
+- Reasoning returned in the clear (DeepSeek's reasoning, Claude's thinking text, a Responses summary
+  or reasoning text) goes to any Chat Completions endpoint as `reasoning_content`, and to any
+  Responses endpoint as a `reasoning` item holding its summary and reasoning text as they came.
+  Claude's thinking text is a summary when the subscription's `thinking_display` is `summarized`,
+  and so is reasoning OpenRouter's `reasoning_details` call a `reasoning.summary`; each goes as one.
+  Claude's protocol requires a signature on every thinking block, so it takes none of these.
 - Claude's thinking goes back over Claude's protocol, the subscription's and the API's alike, with
-  its signature.
-- Reasoning a Responses endpoint sealed goes back to that endpoint alone, since no other can open
-  it.
-- What a protocol has no place for is not sent there: a Claude signature or sealed reasoning on Chat
-  Completions, sealed reasoning on Claude. The history keeps it, and a switch back sends it again.
+  its signature, and a redacted block as it came.
+- Reasoning a Responses endpoint sealed goes back sealed only to the host that sealed it, under any
+  model there; elsewhere its summary and reasoning text go without the seal, since no other host
+  can open it.
+- What a protocol has no place for is not sent there. The history keeps it, and a switch back sends
+  it again, unless Meka took it out of the conversation, as it does a rejected signature's thinking.
 
-An endpoint that refuses something the conversation carries fails the turn with its own error.
-Compact the session, [rewind](#rewinding-a-session) past what it refuses, or start a new one. One
-refusal Meka answers itself: when Claude rejects a thinking block's signature, it sends the
-conversation again without its thinking.
+A provider that rejects something the conversation carries fails the turn with its own error, and
+when that is the first request after a switch, Meka adds how to go on: switch back, compact the
+session, then switch again. An outage is not a rejection: a request that outlives its retries on a
+`5xx` takes the [repair path](#rewinding-a-session) whether or not you switched. A sub-agent adds
+nothing, since its failure reaches its parent. To switch without it, compact the session on the
+profile you are leaving (the screen's `/compact`, or `POST /v1/sessions/{id}/compact`), then
+switch: a compaction you ask for keeps no turn verbatim, so the new provider receives the summary
+and nothing the old one returned. Compacting after the switch sends the same history to the new
+provider and fails the same way; [rewinding](#rewinding-a-session) past it or starting a new
+session also works. What served the session last is read from the latest reply its context holds,
+so after a compaction that kept no turn there is nothing to switch from, and a reply from a profile
+no longer configured, such as one since renamed, names no switch.
+
+OpenAI's endpoints, ChatGPT's included, reject raw reasoning text another provider returned
+(`Invalid 'input[N].content'`), so compact before switching to one from DeepSeek, OpenRouter or a
+local server. The same holds for a session from the API's `anthropic-messages` backend, and for a
+Claude subscription session recorded before 0.93, both of which hold Claude's thinking as raw
+reasoning.
+
+A fallback switches profile mid-turn, with no chance to compact, so a chain is yours to test: put
+profiles in one only when a session survives moving between them, such as one model served by two
+providers. A request a fallback serves is not degraded when its provider rejects it, and nobody is
+told to switch back; the session's own profile taking over again after a fallback is not a switch.
+
+Meka repairs what nobody chose, says so, and keeps the history whole: a tool's result or attachment
+a provider will not take is degraded and retried (not on the first request after a switch, nor
+while a fallback serves), and a thinking block whose signature Claude rejects, which its own
+compaction or a change of tools causes, or a redacted block it cannot verify, is sent again without
+the conversation's thinking.
 
 ### What a resume does not restore
 
@@ -143,7 +180,7 @@ fallbacks = ["backup"]
 ```
 
 A turn falls back when the profile's upstream is still failing once the retry budget is spent (an
-outage, a rate limit, a dropped stream), or when it refuses for quota or billing by a signal it
+outage, a rate limit, a dropped stream), or when it rejects for quota or billing by a signal it
 documents (a 402, a quota code on a 429, the Claude subscription's exhausted usage window). It does
 not fall back on a context overflow, an invalid request, a tool refusal or an authentication
 failure, which another profile would not fix, and never once any of the reply has been shown, the
@@ -335,7 +372,7 @@ With `auto_compact = false` the conversation grows until the provider rejects a 
 
 ### Compacting a session
 
-When a session becomes too long, `/compact` replaces the older turns with a summary. A token-budgeted tail of recent messages may be kept verbatim, without splitting tool calls from their results. If too little older history remains to summarize, the whole conversation is summarized instead; an unanswered trailing prompt is still kept.
+`/compact` replaces the conversation the model sees with a summary and keeps no turn verbatim, so the next stretch starts from the summary alone; only `POST /v1/sessions/{id}/compact` with `"keep_recent": true` keeps a tail of a compaction you ask for. That holds when its checkpoint turn fails too and the standalone summarizer, which works from a copy with every long block truncated, writes the summary; the history keeps everything. A compaction Meka runs on its own, at the ceiling or at the agent's request, may keep a token-budgeted tail of recent messages verbatim, without splitting tool calls from their results; if too little older history remains to summarize, the whole conversation is summarized instead. Such a compaction always keeps a trailing prompt nobody has answered yet, since it may run while that prompt waits to be sent; `/compact` summarizes one a failed or canceled turn left with the rest.
 
 The kept tail is written after the summary as copies the model alone reads. Everything that shows the session's history (the screen on a resume, an editor's reload, `GET /v1/sessions/{id}/history`, `conversation_search` and `conversation_read`, the session search and a Markdown export) shows each kept turn once, where it was first said, and shows the copy, under the turn and at the time it was said, once turn retention has taken the turn's own rows. A kept message the view had rewritten on its way to the model (thinking it stripped, an image it replaced) is shown as it was said, and once retention has taken that row, as the model last saw it.
 
@@ -371,7 +408,7 @@ Internally, compaction does not delete pre-compaction rows from the store. It ap
 
 A standalone summarizer, with no tools and none of the standing instructions, is the fallback. It runs when:
 
-- The compaction is an **emergency** one, i.e. the provider has already rejected the request for exceeding the window. A checkpoint turn re-sends that same conversation, so it would be refused identically; the summarizer strips images and truncates long blocks, which is what lets it get through.
+- The compaction is an **emergency** one, i.e. the provider has already rejected the request for exceeding the window. A checkpoint turn re-sends that same conversation, so it would be rejected identically; the summarizer strips images and truncates long blocks, which is what lets it get through.
 - The checkpoint turn **fails or ends without calling `context_replace`**. `tool_choice` isn't available across Meka's backends, so the call can't be forced, and a turn that ends on prose instead is not trusted to have written a summary: that prose is as often an answer to the conversation, or a sentence cut off at the checkpoint's round limit, as a summary, and nothing can tell which. Memories the checkpoint wrote before it ended are kept either way.
 - `compact_checkpoint` is off.
 
@@ -628,7 +665,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 26`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 25), which is brought forward as it is read. A reply's event carries its record as `reply`. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 27`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 26), which is brought forward as it is read. A reply's event carries its record as `reply`. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 
@@ -704,21 +741,21 @@ Its main use is recovering a session a provider has started rejecting. A provide
 
 Meka repairs a rejection caused by content added since the last request the provider accepted, and repairs a mislabeled image on resume, but anything older than that needs rewinding past. That window is usually the current turn, and it reaches back into the previous one when a turn failed mid-tool-loop and left it unaccepted. A compaction widens it to the whole conversation, because a compaction replaces that conversation wholesale and nothing in the result has been accepted yet. The repair escalates: first it removes the attachments the turn added and leaves everything else alone, and only if that is refused as well does it empty the turn's tool calls, moving each call's arguments into the result that reports it and replacing the result's body with an explanation. The second step exists because a tool result is usually text, which the first step cannot touch, and because a call's own arguments can be what the provider objected to. A step the provider then accepts is not counted as spent, so the cheap one stays available if the turn is refused again later.
 
-Neither step changes the shape of the conversation: a tool call stays a tool call and its result stays its result, marked as an error. That is deliberate. Removing one half of a pair is the one thing every provider refuses outright, so a repair that could do it might turn a recoverable rejection into a permanent one. The model sees a failed tool call, which it already knows how to read, with the arguments it sent quoted in the failure so it can tell which call not to repeat.
+Neither step changes the shape of the conversation: a tool call stays a tool call and its result stays its result, marked as an error. That is deliberate. Removing one half of a pair is the one thing every provider rejects outright, so a repair that could do it might turn a recoverable rejection into a permanent one. The model sees a failed tool call, which it already knows how to read, with the arguments it sent quoted in the failure so it can tell which call not to repeat.
 
 Nothing a repair removes is deleted. The log is append-only (within [turn retention](#turn-retention), when set), so the superseded messages stay on disk and [`meka session export`](#exporting-a-session) renders them above a marker saying what replaced them. Use `--format json` to get a removed attachment back: the markdown export writes each message as a person said it, an invoked skill or prompt as the invocation rather than the body it expanded to and an attached file by its mention, and leaves image blocks out. Only the conversation the model sees is changed.
 
-Whatever is removed is restored untouched if the retry carrying it is refused too. That restore is what bounds the risk, and it bounds it only in that direction: each step spends a fresh retry sequence rather than a single request, and a step whose retry *succeeds* keeps the loss, so the trigger is deliberately narrow. The words you typed are never rewritten by either step, though an image you attached to that prompt is exactly what the first one removes, replacing it with a note. Notes Meka inserts into a conversation reach the model behind the label `[Meka harness]`.
+Whatever is removed is restored untouched if the retry carrying it is rejected too. That restore is what bounds the risk, and it bounds it only in that direction: each step spends a fresh retry sequence rather than a single request, and a step whose retry *succeeds* keeps the loss, so the trigger is deliberately narrow. The words you typed are never rewritten by either step, though an image you attached to that prompt is exactly what the first one removes, replacing it with a note. Notes Meka inserts into a conversation reach the model behind the label `[Meka harness]`.
 
-Both steps run whether the provider answered `400` or spent every retry on a `5xx`. A gateway in front of a model reports a payload its own decoder choked on as a server error, which is indistinguishable from being overloaded, so Meka honors the retries in full and treats a refusal that outlives them as one the content may explain.
+Both steps run whether the provider answered `400` or spent every retry on a `5xx`. A gateway in front of a model reports a payload its own decoder choked on as a server error, which is indistinguishable from being overloaded, so Meka honors the retries in full and treats a failure that outlives them as one the content may explain. A `400` or `422` to the first request after a [profile switch](#what-a-profile-switch-carries), or to a request a fallback serves, takes neither step: the turn fails with the provider's error.
 
-On the `5xx` path it does one thing more before touching anything. The retry sequence is short by design (two attempts across three seconds of backoff), which an ordinary overload outlasts, so Meka waits eight seconds and sends the *same* request one last time. If that succeeds the outage was the whole story and nothing is lost; if it fails too, the reading that the body is the problem has been earned rather than assumed. The wait is paid only by a turn that was otherwise about to start deleting things, and only once per run of consecutive failures: a request the provider accepts makes it available again, since a later refusal is about work the earlier wait never saw. A `400` skips it, because the provider has already read the body and said no.
+On the `5xx` path it does one thing more before touching anything. The retry sequence is short by design (two attempts across three seconds of backoff), which an ordinary overload outlasts, so Meka waits eight seconds and sends the *same* request one last time. If that succeeds the outage was the whole story and nothing is lost; if it fails too, the reading that the body is the problem has been earned rather than assumed. The wait is paid only by a turn that was otherwise about to start deleting things, and only once per run of consecutive failures: a request the provider accepts makes it available again, since a later rejection is about work the earlier wait never saw. A `400` skips it, because the provider has already read the body and said no.
 
 Nothing outside those two shapes degrades at all, because a degraded retry that succeeds only because the network came back would keep the loss. Excluded, then: a dropped connection, which never delivered the request for anything to judge; a `429`, which is a statement about rate rather than about what was sent; a failure that arrives partway through a stream, after some of the answer has reached you, both because re-sending would print it twice and because the stream cannot tell an overload from anything else; and anything at all once the retries have *not* been exhausted. If a step it did try does not help, it says so and points here before the turn fails.
 
 One cause of that refusal has its own fix. A session recorded by 0.41 can hold a `tool_result` whose content is a bare JSON string, a shape Meka does not read: the row is dropped as the session loads, which leaves the `tool_use` it answered unanswered, and the provider rejects the next turn over the mismatch. Run the [one-shot upgrade script](../getting-started/upgrading.md), which converts those rows in place, rather than rewinding past a turn you wanted to keep.
 
-One rejection reaches past the window those steps work in, and Meka answers it on its own. Claude ties each thinking block to the conversation ahead of it, the tool list included, and on the accounts where Anthropic enforces that check it rejects a request that sends a block back after that conversation changed: most changes to the tool list, a compaction that keeps recent turns verbatim behind its summary, or a repair above can each make every later request fail. When Claude rejects a thinking block that way, or one whose signature it cannot verify at all, Meka sends the conversation again without its thinking, back to the last compaction. The model no longer gets that reasoning back, and the turn goes on. Nothing on disk is rewritten: an accepted resend is recorded in the log as the point the thinking stopped being sent, so a resume sends the same, and an export marks that point and still shows the reasoning's readable text. A rejected one restores the thinking, and the steps above take their turn. A compaction does the same for its own requests, the checkpoint's and the summarizer's. On an account that does not enforce the check the rejection never comes, and nothing changes.
+One rejection reaches past the window those steps work in, and Meka answers it on its own. Claude ties each thinking block to the conversation ahead of it, the tool list included, and on the accounts where Anthropic enforces that check it rejects a request that sends a block back after that conversation changed: most changes to the tool list, a compaction that keeps recent turns verbatim behind its summary, or a repair above can each make every later request fail. When Claude rejects a thinking block that way, or one whose signature it cannot verify at all, Meka sends the conversation again without its thinking, back to the last compaction. The model no longer gets that reasoning back, a warning says so, and the turn goes on. Nothing on disk is rewritten: an accepted resend is recorded in the log as the point the thinking stopped being sent, so a resume sends the same, and an export marks that point and still shows the reasoning's readable text. A rejected one restores the thinking, and the steps above take their turn. A compaction does the same for its own requests, the checkpoint's and the summarizer's, and only logs it, since those copies are thrown away after. On an account that does not enforce the check the rejection never comes, and nothing changes.
 
 ## Removing sessions
 

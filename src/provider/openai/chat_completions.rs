@@ -307,7 +307,7 @@ impl OpenAiChatCompletionsProvider {
 
         // OpenAI omits `usage` from streamed responses unless explicitly asked; without this the
         // final usage-only chunk never arrives and token accounting (the `/status` context gauge,
-        // auto-compact) silently reads zero for streaming turns. An endpoint that refuses the field
+        // auto-compact) silently reads zero for streaming turns. An endpoint that rejects the field
         // is the account's `stream_usage` to turn off.
         if stream && self.stream_usage {
             body.insert(
@@ -374,10 +374,15 @@ impl OpenAiChatCompletionsProvider {
 
         let reasoning = reasoning_of(assistant_message);
         if let Some((_, reasoning)) = reasoning {
-            content_blocks.push(ContentBlock::reasoning(
-                reasoning,
-                Some(OpaqueReasoning::Verbatim),
-            ));
+            content_blocks.push(ContentBlock::Thinking {
+                parts: vec![crate::conversation::ReasoningPart {
+                    kind: reasoning_kind(assistant_message)
+                        .unwrap_or(crate::conversation::ReasoningKind::Reasoning),
+                    text: reasoning.to_string(),
+                }],
+                opaque: Some(OpaqueReasoning::Verbatim),
+                provider_fields: None,
+            });
         }
 
         match assistant_message.get("content") {
@@ -490,6 +495,10 @@ impl crate::oauth::RefreshesCredential for OpenAiChatCompletionsProvider {}
 
 #[async_trait]
 impl Provider for OpenAiChatCompletionsProvider {
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
@@ -714,6 +723,8 @@ struct ChatCompletionsStream {
     /// wire marks no end of reasoning, so the first content or tool-call delta closes it, and the
     /// stream's end closes one that nothing followed.
     reasoning_open: bool,
+    /// The kind of the open block's part in progress, once a delta has said it.
+    reasoning_kind: Option<crate::conversation::ReasoningKind>,
     /// The `index` of the choice this stream follows: the first one it names. A profile's
     /// `parameters` may ask for `n` answers, which stream interleaved, one choice per chunk.
     choice_index: Option<u64>,
@@ -775,6 +786,24 @@ fn reasoning_of(carrier: &serde_json::Value) -> Option<(&'static str, &str)> {
                 .and_then(|reasoning| reasoning.as_str())
                 .filter(|reasoning| !reasoning.is_empty())
                 .map(|reasoning| (field, reasoning))
+        })
+}
+
+/// What kind of reasoning `carrier`'s reasoning field holds, as OpenRouter's `reasoning_details`
+/// beside it says: a summary when its readable entry is a `reasoning.summary`, raw reasoning when
+/// it is a `reasoning.text`. `None` when no entry says, which for a whole message, and every other
+/// endpoint's reasoning field, is raw reasoning.
+fn reasoning_kind(carrier: &serde_json::Value) -> Option<crate::conversation::ReasoningKind> {
+    carrier
+        .get("reasoning_details")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|detail| detail.get("type").and_then(serde_json::Value::as_str))
+        .find_map(|kind| match kind {
+            "reasoning.summary" => Some(crate::conversation::ReasoningKind::Summary),
+            "reasoning.text" => Some(crate::conversation::ReasoningKind::Reasoning),
+            _ => None,
         })
 }
 
@@ -1046,14 +1075,24 @@ async fn handle_stream_chunk(
 
     if let Some((field, reasoning)) = reasoning_of(delta) {
         stream.reasoning_field.get_or_insert(field);
+        // A block's words open a part of raw reasoning unless a part of another kind opens first;
+        // a delta whose details state no kind continues the part in progress.
+        let current = stream
+            .reasoning_kind
+            .filter(|_| stream.reasoning_open)
+            .unwrap_or(crate::conversation::ReasoningKind::Reasoning);
+        let kind = reasoning_kind(delta).unwrap_or(current);
         stream.reasoning_open = true;
-        if event_sender
-            .send(StreamEvent::ThinkingDelta(reasoning.to_string()))
-            .await
-            .is_err()
+        stream.reasoning_kind = Some(kind);
+        let opens = (kind != current).then_some(StreamEvent::ThinkingPart { kind, number: None });
+        for event in opens
+            .into_iter()
+            .chain([StreamEvent::ThinkingDelta(reasoning.to_string())])
         {
-            tracing::trace!("stream event receiver dropped");
-            return ChunkOutcome::Stop;
+            if event_sender.send(event).await.is_err() {
+                tracing::trace!("stream event receiver dropped");
+                return ChunkOutcome::Stop;
+            }
         }
     }
 
@@ -1450,6 +1489,81 @@ mod tests {
         assert_eq!(record["choices"], serde_json::json!([{"index": 0}]));
     }
 
+    /// OpenRouter says beside its reasoning what kind it is, and a part keeps its kind: reasoning
+    /// whose `reasoning_details` entry is a `reasoning.summary` is recorded as a summary, streamed
+    /// or whole, so a Responses endpoint gets it as one, and the details stay the message's.
+    #[tokio::test]
+    async fn reasoning_openrouter_calls_a_summary_is_recorded_as_one() {
+        let summary = |text: &str| {
+            serde_json::json!({"type": "reasoning.summary", "summary": text,
+                "format": "azure-openai-responses-v1", "index": 0})
+        };
+        let sealed =
+            serde_json::json!({"type": "reasoning.encrypted", "data": "SEALED", "index": 1});
+        let thinking = |message: &Message| match message.content.first() {
+            Some(ContentBlock::Thinking { parts, .. }) => parts.clone(),
+            _ => panic!("{:?}", message.content),
+        };
+
+        let whole = serde_json::json!({"choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "Done.", "reasoning": "Plan.",
+                "reasoning_details": [summary("Plan."), sealed]}}]});
+        let (message, ..) = provider_for_test()
+            .parse_non_streaming_response(&whole)
+            .expect("parses");
+        assert_eq!(thinking(&message), [
+            crate::conversation::ReasoningPart::summary("Plan.")
+        ]);
+        assert!(
+            message
+                .provider_fields
+                .as_ref()
+                .is_some_and(|fields| fields.contains_key("reasoning_details")),
+            "{:?}",
+            message.provider_fields
+        );
+
+        let chunk = |delta: serde_json::Value| {
+            serde_json::json!({"choices": [{"index": 0, "delta": delta,
+                "finish_reason": null}]})
+        };
+        let (sender, mut receiver) = mpsc::channel::<StreamEvent>(64);
+        let mut stream = ChatCompletionsStream::default();
+        for data in [
+            chunk(serde_json::json!({"role": "assistant", "content": "",
+                "reasoning": "**Plan**\n\nThe",
+                "reasoning_details": [summary("**Plan**\n\nThe")]})),
+            chunk(serde_json::json!({"content": "", "reasoning": " plan.",
+                "reasoning_details": [summary(" plan.")]})),
+            chunk(serde_json::json!({"content": "", "reasoning": null,
+                "reasoning_details": [sealed]})),
+            chunk(serde_json::json!({"content": "Done."})),
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ] {
+            handle_stream_chunk(&data, &mut stream, &sender).await;
+        }
+        conclude_stream(End::Finished, stream, &sender)
+            .await
+            .expect("a whole stream");
+        drop(sender);
+        let mut accumulator = crate::provider::MessageAccumulator::new();
+        while let Some(event) = receiver.recv().await {
+            accumulator.push(event);
+        }
+        let message = accumulator.finish().message;
+        assert_eq!(thinking(&message), [
+            crate::conversation::ReasoningPart::summary("**Plan**\n\nThe plan.")
+        ]);
+        assert!(
+            message
+                .provider_fields
+                .as_ref()
+                .is_some_and(|fields| fields.contains_key("reasoning_details")),
+            "{:?}",
+            message.provider_fields
+        );
+    }
+
     /// A reply recorded with nothing in it goes back as the wire's own empty message.
     #[test]
     fn an_empty_reply_goes_out_as_an_empty_message() {
@@ -1525,7 +1639,7 @@ mod tests {
         assert!(at("fn a() {}") < at(" with the old one"), "{sent}");
     }
 
-    /// A streamed request asks for its usage unless the account says its endpoint refuses the
+    /// A streamed request asks for its usage unless the account says its endpoint rejects the
     /// field, and an unstreamed one never asks.
     #[test]
     fn a_streamed_request_asks_for_its_usage_unless_the_account_turns_it_off() {
@@ -1591,6 +1705,37 @@ mod tests {
         }
         let usage = accumulator.finish().usage;
         assert_eq!((usage.input_tokens, usage.output_tokens), (9, 4));
+        // The response's record reads the null the same way.
+        let mut completion = serde_json::Map::new();
+        for chunk in [
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 4}}),
+            serde_json::json!({"choices": [], "usage": null}),
+        ] {
+            fold_chunk(&mut completion, &chunk);
+        }
+        assert_eq!(completion["usage"]["prompt_tokens"], 9);
+    }
+
+    /// A call is the one its first chunk names: an id or a name restated by a later chunk does
+    /// not rename it.
+    #[tokio::test]
+    async fn a_call_keeps_the_id_and_name_its_first_chunk_names() {
+        let call = |id: &str, name: &str, arguments: &str| {
+            delta_chunk(&[(
+                "tool_calls",
+                serde_json::json!([{"index": 0, "id": id, "type": "function",
+                    "function": {"name": name, "arguments": arguments}}]),
+            )])
+        };
+        let (_, accumulators, _) = drive_chunks(&[
+            call("call_1", "file_read", "{\"path\":"),
+            call("call_2", "file_write", "\"a\"}"),
+        ])
+        .await;
+        let call = accumulators.get(&0).expect("the call");
+        assert_eq!(call.id.as_deref(), Some("call_1"));
+        assert_eq!(call.name.as_deref(), Some("file_read"));
+        assert_eq!(call.arguments, "{\"path\":\"a\"}");
     }
 
     /// The reasoning an endpoint streams ahead of its answer, under either spelling of the field,

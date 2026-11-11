@@ -993,7 +993,7 @@ pub(crate) const DEFAULT_MCP_TOOL_TIMEOUT: std::time::Duration =
 pub(crate) const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
 /// `[session].context_ceiling_percent` when unset: the share of the window the conversation may
 /// fill before auto-compaction fires and past which a whole read is cut. What is left has to hold
-/// the reply and one round's growth past the line, because the API refuses a request whose input
+/// the reply and one round's growth past the line, because the API rejects a request whose input
 /// and `max_tokens` together exceed the window; on the default window this leaves 150k tokens
 /// against the Claude reply budget of 128k.
 pub(crate) const DEFAULT_CONTEXT_CEILING_PERCENT: u64 = 85;

@@ -7,13 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.92.1] - 2026-11-10
+## [0.93.0] - 2026-11-11
+
+### Added
+
+- A compaction's JSON says whether the person asked to keep recent turns: `person_keeps_recent`.
+
+### Changed
+
+- **Breaking:** Other providers' reasoning goes to Responses endpoints; see the upgrade guide.
+- **Breaking:** `/compact` keeps only its summary, as does `POST /compact` without `keep_recent`.
+- **Breaking:** `encrypted_reasoning = false` no longer keeps encrypted reasoning from its host.
+- **Breaking:** A rejected request on a fallback fails instead of retrying with content removed.
+- **Breaking:** A request rejected right after a profile or model switch fails and says what to do.
+- A Responses endpoint gets its own readable reasoning back, as Chat Completions endpoints do.
+- Claude's and OpenRouter's summarized reasoning is recorded as a summary, which OpenAI accepts.
+- A request retried without Claude's thinking, after a rejected signature, now says so.
+- Session archives are `format_version` 27; older archives are brought forward on import.
 
 ### Fixed
 
 - A Messages stream that restates usage between deltas no longer cuts the reply after a word.
 - A reply's token counts take each figure the provider last stated, zero included.
 - History keeps a Claude text block with no words, and frames outside the protocol, as returned.
+- A Responses reply keeps words a server sends only when a part or an item ends.
+- A Responses reply sent only in its final event, an incomplete or failed one too, is kept.
+- A Responses message of several parts keeps each part's citations and goes back as one message.
+- A Responses refusal goes back with its `phase`, and a call takes its id and name from its end.
+- OpenAI usage counts cache writes, and a failed Responses reply keeps its usage.
+- History keeps the Responses events Meka does not read, such as ChatGPT's metadata.
+- A compaction that kept only an unanswered prompt reports `kept_recent` as `false`, old ones too.
+- A redacted thinking block Claude cannot verify is retried without thinking, as a signature is.
 
 ## [0.92.0] - 2026-11-10
 
@@ -3253,8 +3277,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.92.1...HEAD
-[0.92.1]: https://github.com/k4yt3x/meka/compare/0.92.0...0.92.1
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.93.0...HEAD
+[0.93.0]: https://github.com/k4yt3x/meka/compare/0.92.0...0.93.0
 [0.92.0]: https://github.com/k4yt3x/meka/compare/0.91.0...0.92.0
 [0.91.0]: https://github.com/k4yt3x/meka/compare/0.90.0...0.91.0
 [0.90.0]: https://github.com/k4yt3x/meka/compare/0.89.0...0.90.0

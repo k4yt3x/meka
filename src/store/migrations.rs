@@ -622,6 +622,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_record_the_tools_they_used",
         step: Step::Rust(sessions_record_the_tools_they_used),
     },
+    // 0.93 records on the boundary of a compaction a person asked for whether they asked for a
+    // verbatim tail, which a build before it does not know and would drop on a rewrite. Nothing to
+    // convert: a boundary written before records no answer, and one that kept no recent turns
+    // says so, as it did.
+    Migration {
+        name: "compact_boundaries_record_whether_a_tail_was_asked_for",
+        step: Step::Sql(""),
+    },
+    // 0.93 counts an unanswered prompt a compaction kept alone as no recent turn kept, where 0.92
+    // counted it as one. A boundary written before that kept nothing else says so, as one written
+    // now does.
+    Migration {
+        name: "compact_boundaries_count_a_lone_prompt_as_no_recent_turn",
+        step: Step::Rust(compact_boundaries_count_a_lone_prompt_as_no_recent_turn),
+    },
 ];
 
 /// See the ledger entry. Safe to replay: a `user` row and a thinking block's text exist only
@@ -887,6 +902,113 @@ fn sessions_record_the_tools_they_used(
         )?;
     }
     Ok(())
+}
+
+/// Every `compact_boundary` row whose compaction kept an unanswered prompt alone says it kept no
+/// recent turns; see [`boundaries_that_kept_a_lone_prompt_0_93`]. Safe to replay: a boundary that
+/// says so already is left as it is.
+fn compact_boundaries_count_a_lone_prompt_as_no_recent_turn(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let sessions: Vec<String> = transaction
+        .prepare("SELECT DISTINCT session_id FROM messages WHERE kind = 'compact_boundary'")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut rows_of = transaction.prepare(
+        "SELECT id, kind, content, copy_of IS NOT NULL OR said_at IS NOT NULL, created_at, \
+         turn_id FROM messages WHERE session_id = ?1 ORDER BY id",
+    )?;
+    let mut rewrite = transaction.prepare("UPDATE messages SET content = ?1 WHERE id = ?2")?;
+    for session in sessions {
+        let rows: Vec<(i64, String, String, bool, String, Option<String>)> = rows_of
+            .query_map([&session], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let facts: Vec<RowFacts093<'_>> = rows
+            .iter()
+            .map(|(_, kind, _, copy, created_at, turn_id)| {
+                (
+                    kind == "compact_boundary",
+                    *copy,
+                    kind == "user_blocks",
+                    created_at.as_str(),
+                    turn_id.as_deref(),
+                )
+            })
+            .collect();
+        for at in boundaries_that_kept_a_lone_prompt_0_93(&facts) {
+            let Some((id, _, content, ..)) = rows.get(at) else {
+                continue;
+            };
+            let Ok(mut event) = serde_json::from_str::<serde_json::Value>(content) else {
+                continue;
+            };
+            if !count_a_lone_prompt_as_no_recent_turn_0_93(&mut event) {
+                continue;
+            }
+            let encoded = match serde_json::to_string(&event) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+                }
+            };
+            rewrite.execute(rusqlite::params![encoded, id])?;
+        }
+    }
+    Ok(())
+}
+
+/// What [`boundaries_that_kept_a_lone_prompt_0_93`] reads of a row: whether it is a compaction's
+/// boundary, whether it is a copy a compaction kept (one linked to its row, or one that says where
+/// it was said), whether it is a prompt, and the time and turn it was written under.
+type RowFacts093<'a> = (bool, bool, bool, &'a str, Option<&'a str>);
+
+/// The boundaries, by position, whose compaction kept a prompt and nothing else: an unanswered
+/// prompt kept alone, which 0.92 counted as recent turns kept and 0.93 counts as none. A
+/// compaction writes what it keeps right after its boundary, in the one write that gives them all
+/// the boundary's time and turn, so what it kept is every row after the boundary that is a copy or
+/// shares that write. A copy no step could link to its row still shares it, so a boundary is
+/// counted only where that is one prompt. One reading serves the ledger step and the archive door.
+fn boundaries_that_kept_a_lone_prompt_0_93(rows: &[RowFacts093<'_>]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, (boundary, ..))| *boundary)
+        .filter_map(|(at, (_, _, _, written_at, written_in))| {
+            let kept: Vec<&RowFacts093<'_>> = rows
+                .get(at + 1..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|(boundary, copy, _, row_at, row_turn)| {
+                    !*boundary && (*copy || (row_at == written_at && row_turn == written_in))
+                })
+                .collect();
+            matches!(kept.as_slice(), [(_, _, true, ..)]).then_some(at)
+        })
+        .collect()
+}
+
+/// Say on a `CompactBoundary` event that it kept no recent turns, where it says it kept some, and
+/// report whether it changed.
+fn count_a_lone_prompt_as_no_recent_turn_0_93(event: &mut serde_json::Value) -> bool {
+    let Some(boundary) = event
+        .get_mut("CompactBoundary")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    if boundary.get("kept_recent") != Some(&serde_json::Value::Bool(true)) {
+        return false;
+    }
+    boundary.insert("kept_recent".to_string(), serde_json::Value::Bool(false));
+    true
 }
 
 /// The column a message's own fields are kept in. Safe to replay: the column is added once.
@@ -5003,6 +5125,10 @@ const ARCHIVE_FORMAT_0_92_DEVELOPMENT: u64 = 24;
 /// The archive `format_version` 0.92's later development builds wrote, whose sessions' counters
 /// carry no tools the session called.
 const ARCHIVE_FORMAT_0_92_DEVELOPMENT_2: u64 = 25;
+/// The archive `format_version` 0.92 wrote, whose boundaries record no answer to whether a person
+/// asked for a tail, as a boundary the store held then does after its ledger step, and count an
+/// unanswered prompt kept alone as recent turns kept.
+const ARCHIVE_FORMAT_0_92: u64 = 26;
 
 /// How the text Meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -5591,7 +5717,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_90)
         | Some(ARCHIVE_FORMAT_0_91)
         | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT)
-        | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT_2) => {}
+        | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT_2)
+        | Some(ARCHIVE_FORMAT_0_92) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -5646,8 +5773,68 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     if from <= ARCHIVE_FORMAT_0_92_DEVELOPMENT_2 {
         record_tools_used_in_archive_0_92(document);
     }
+    if from <= ARCHIVE_FORMAT_0_92 {
+        count_lone_prompts_in_archive_0_93(document);
+    }
     document["format_version"] = current.into();
     true
+}
+
+/// Each boundary in an archive from before 0.93 whose compaction kept an unanswered prompt alone
+/// says it kept no recent turns, as a row the store held then does after its ledger step.
+fn count_lone_prompts_in_archive_0_93(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        else {
+            continue;
+        };
+        let facts: Vec<RowFacts093<'_>> = events
+            .iter()
+            .map(|event| {
+                let inner = event.get("event");
+                let given = |key: &str| event.get(key).is_some_and(|value| !value.is_null());
+                let prompt = inner
+                    .and_then(|inner| inner.get("Append"))
+                    .filter(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                    })
+                    .and_then(|message| message.get("content"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|blocks| {
+                        !blocks.iter().any(|block| {
+                            block.get("type").and_then(serde_json::Value::as_str)
+                                == Some("tool_result")
+                        })
+                    });
+                (
+                    inner
+                        .and_then(|inner| inner.get("CompactBoundary"))
+                        .is_some(),
+                    given("copy_of") || given("said_at"),
+                    prompt,
+                    event
+                        .get("at")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    event.get("turn_id").and_then(serde_json::Value::as_str),
+                )
+            })
+            .collect();
+        let lone = boundaries_that_kept_a_lone_prompt_0_93(&facts);
+        for at in lone {
+            if let Some(inner) = events.get_mut(at).and_then(|event| event.get_mut("event")) {
+                count_a_lone_prompt_as_no_recent_turn_0_93(inner);
+            }
+        }
+    }
 }
 
 /// Each session's counters in an archive from before 0.92 name no tool it called, as a row the
@@ -7142,6 +7329,14 @@ mod tests {
             (
                 "sessions_record_the_tools_they_used",
                 15382173615299672697_u64,
+            ),
+            (
+                "compact_boundaries_record_whether_a_tail_was_asked_for",
+                9052938040928972348_u64,
+            ),
+            (
+                "compact_boundaries_count_a_lone_prompt_as_no_recent_turn",
+                7542107224716512193_u64,
             ),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or
@@ -12616,6 +12811,174 @@ mod tests {
             "as written".into();
         let converted = document.clone();
         record_written_summaries_0_88(&mut document);
+        assert_eq!(document, converted, "a replay changes nothing");
+    }
+
+    /// A boundary from before 0.93 whose compaction kept an unanswered prompt alone says it kept
+    /// no recent turns, whether its copy is linked to its row or only says where it was said. One
+    /// that kept more, a reply alone, or nothing it shows keeps what it says, and so does one whose
+    /// lone linked copy shares its write with a row no step linked. A replay rewrites nothing.
+    #[tokio::test]
+    async fn a_boundary_from_before_0_93_that_kept_a_lone_prompt_kept_no_recent_turn() {
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        let boundary = serde_json::json!({"CompactBoundary": {
+            "summary": {"role": "user", "content": [{"type": "text", "text": "summary"}]},
+            "replaced_count": 2,
+            "loaded_tools_snapshot": [],
+            "checklist_snapshot": {"next_id": 1, "items": []},
+            "trigger": "reactive",
+            "source": "checkpoint",
+            "memories_written": [],
+            "kept_recent": true,
+            "checkpoint": [],
+            "written_summary": "summary",
+        }})
+        .to_string();
+        let words = r#"[{"type":"text","text":"words"}]"#;
+        // Each row's kind, when it was written, and how it is a copy: linked to its row, saying
+        // only where it was said, or neither.
+        let rows = [
+            ("compact_boundary", "t1", None),
+            ("user_blocks", "t1", Some("copy_of")),
+            ("user_blocks", "t2", None),
+            ("compact_boundary", "t3", None),
+            ("assistant", "t3", Some("copy_of")),
+            ("user_blocks", "t3", Some("copy_of")),
+            ("compact_boundary", "t4", None),
+            ("assistant", "t4", Some("copy_of")),
+            ("compact_boundary", "t5", None),
+            ("user_blocks", "t6", None),
+            ("compact_boundary", "t7", None),
+            ("user_blocks", "t7", Some("copy_of")),
+            ("user_blocks", "t7", None),
+            ("compact_boundary", "t8", None),
+            ("user_blocks", "t9", Some("said_at")),
+        ];
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(
+                &mut connection,
+                "compact_boundaries_count_a_lone_prompt_as_no_recent_turn",
+            );
+            plant_session(&connection, &session);
+            for (kind, written_at, copy) in rows {
+                let content = if kind == "compact_boundary" {
+                    boundary.as_str()
+                } else {
+                    words
+                };
+                connection
+                    .execute(
+                        "INSERT INTO messages (session_id, kind, content, created_at, copy_of, \
+                         said_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            session,
+                            kind,
+                            content,
+                            written_at,
+                            (copy == Some("copy_of")).then_some(1),
+                            (copy == Some("said_at")).then_some("t0"),
+                        ],
+                    )
+                    .expect("a message to carry forward");
+            }
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let kept: Vec<serde_json::Value> = stored_messages(&connection)
+            .into_iter()
+            .filter(|(kind, _)| kind == "compact_boundary")
+            .map(|(_, content)| {
+                serde_json::from_str::<serde_json::Value>(&content).expect("json")
+                    ["CompactBoundary"]["kept_recent"]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(kept, [false, true, true, true, true, false]);
+
+        let after = stored_messages(&connection);
+        let transaction = connection.transaction().expect("transaction");
+        compact_boundaries_count_a_lone_prompt_as_no_recent_turn(&transaction).expect("replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            after,
+            "a replay rewrites nothing"
+        );
+    }
+
+    /// A format 26 archive's boundary that kept an unanswered prompt alone says it kept no recent
+    /// turns, its copy linked or saying only where it was said, as the store's step reads it; one
+    /// that kept a reply too, or whose copy shares its write with a row no step linked, keeps what
+    /// it says. None is given an answer to whether a person asked for a tail, and a replay changes
+    /// nothing.
+    #[test]
+    fn a_format_26_archive_counts_a_lone_prompt_as_no_recent_turn() {
+        let boundary = serde_json::json!({"CompactBoundary": {
+            "summary": {"role": "user", "content": [{"type": "text", "text": "summary"}]},
+            "replaced_count": 2,
+            "loaded_tools_snapshot": [],
+            "checklist_snapshot": {"next_id": 1, "items": []},
+            "trigger": "reactive",
+            "source": "checkpoint",
+            "memories_written": [],
+            "kept_recent": true,
+            "checkpoint": [],
+            "written_summary": "summary",
+        }});
+        let event = |inner: serde_json::Value, at: &str, copy_of: Option<u64>| serde_json::json!({"at": at, "turn_id": null, "copy_of": copy_of, "event": inner});
+        let message = |role: &str| {
+            serde_json::json!({"Append": {"role": role,
+                "content": [{"type": "text", "text": "words"}]}})
+        };
+        let mut said_alone = event(message("user"), "2020-01-01T00:00:09Z", None);
+        said_alone["said_at"] = "2020-01-01T00:00:00Z".into();
+        let mut document = serde_json::json!({
+            "format_version": 26,
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "permission": "read",
+                "turns": [],
+                "events": [
+                    event(boundary.clone(), "2020-01-01T00:00:01Z", None),
+                    event(message("user"), "2020-01-01T00:00:01Z", Some(0)),
+                    event(message("user"), "2020-01-01T00:00:02Z", None),
+                    event(boundary.clone(), "2020-01-01T00:00:03Z", None),
+                    event(message("assistant"), "2020-01-01T00:00:03Z", Some(1)),
+                    event(message("user"), "2020-01-01T00:00:03Z", Some(2)),
+                    event(boundary.clone(), "2020-01-01T00:00:07Z", None),
+                    event(message("user"), "2020-01-01T00:00:07Z", Some(2)),
+                    event(message("user"), "2020-01-01T00:00:07Z", None),
+                    event(boundary, "2020-01-01T00:00:08Z", None),
+                    said_alone,
+                ],
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let kept: Vec<&serde_json::Value> = [0, 3, 6, 9]
+            .iter()
+            .map(|at: &usize| {
+                &document["sessions"][0]["events"][*at]["event"]["CompactBoundary"]["kept_recent"]
+            })
+            .collect();
+        assert_eq!(kept, [false, true, true, false]);
+        assert!(
+            document["sessions"][0]["events"][0]["event"]["CompactBoundary"]
+                .get("person_keeps_recent")
+                .is_none(),
+            "no answer is invented for a boundary that records none: {document}"
+        );
+        let converted = document.clone();
+        count_lone_prompts_in_archive_0_93(&mut document);
         assert_eq!(document, converted, "a replay changes nothing");
     }
 

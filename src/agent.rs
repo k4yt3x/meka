@@ -32,6 +32,23 @@ pub(crate) use self::{compaction::compaction_refusal, turn::*};
 use self::{compaction::*, recovery::*};
 use crate::session::{AgentOptions, SessionCells};
 
+/// What a request went to: the profile, and the model it named where that is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServedBy {
+    pub(crate) profile: String,
+    pub(crate) model: Option<String>,
+}
+
+impl ServedBy {
+    /// Whether a request to `other` switches from `self`: another profile, or another model where
+    /// both name one. A model read back from a stored reply is the one the response named, which
+    /// need not spell the configured one, so it is never compared.
+    fn differs_from(&self, other: &Self) -> bool {
+        self.profile != other.profile
+            || matches!((&self.model, &other.model), (Some(was), Some(is)) if was != is)
+    }
+}
+
 /// Driver for a single conversation. One [`Agent`] handles one or more sequential turns against a
 /// single provider, with a shared tool registry, shared permission state, and a persistent SQLite
 /// session. A turn fans out tool calls (in parallel via `join_all`) and persists every assistant
@@ -80,7 +97,7 @@ pub(crate) struct Agent {
     store_behind: std::sync::atomic::AtomicBool,
     /// Where the view stops being known accepted after [`Agent::match_the_store`] replaced it:
     /// the first position at which what the store held differed from what memory had sent, so
-    /// content a provider refused and a repair the store never took had degraded can be degraded
+    /// content a provider rejected and a repair the store never took had degraded can be degraded
     /// again. Every turn's degrade reaches from there at the furthest until a request is accepted;
     /// a compaction, which moves every position, widens it to the whole view.
     unaccepted_from: std::sync::Mutex<Option<usize>>,
@@ -154,6 +171,9 @@ pub(crate) struct Agent {
     /// Atomic rather than `&mut` because `run_turn` takes `&self`; never shared between agents
     /// (sub-agents construct their own through [`Self::new`]).
     last_accepted_len: std::sync::atomic::AtomicUsize,
+    /// What the session's own profile served last, once this agent has had a request accepted by
+    /// it; see [`Agent::switched_from`].
+    served_by: std::sync::Mutex<Option<ServedBy>>,
     /// Every profile the process configured, for the fallbacks a turn may move to and the breaker
     /// that says which of them failed lately.
     providers: Arc<crate::provider::ProviderRegistry>,
@@ -268,6 +288,7 @@ impl Agent {
             context_compacted: std::sync::Mutex::new(None),
             main_thread: crate::provider::MainThreadResponses::default(),
             last_accepted_len: std::sync::atomic::AtomicUsize::new(LAST_ACCEPTED_UNKNOWN),
+            served_by: std::sync::Mutex::new(None),
             providers: Arc::clone(&materials.providers),
             profiles_tried: std::sync::Mutex::new(Vec::new()),
         }
@@ -276,6 +297,67 @@ impl Agent {
     /// The cells this agent drives, for a host that reads them without going through a turn.
     pub(crate) fn cells(&self) -> &SessionCells {
         &self.cells
+    }
+
+    /// What the session's own profile sends to: its name and the model its provider names. A
+    /// fallback serving in its place is not the session's, so it is never what a switch is from.
+    fn own_server(&self) -> ServedBy {
+        let named = self.cells.profile.named();
+        ServedBy {
+            model: named.provider.model().map(str::to_string),
+            profile: named.profile,
+        }
+    }
+
+    /// The profile the session's own last accepted request went to, when its own profile or that
+    /// profile's model has changed since: a switch, whose rejection is the switcher's to handle
+    /// (AGENTS.md, "What goes back to a provider", rule 3). `None` when nothing was accepted yet,
+    /// nothing changed, or the profile is no longer configured, since a rename leaves the old name
+    /// in the history and nothing tells it from a profile removed.
+    ///
+    /// Before this agent has a request accepted, the replies the context holds say what served
+    /// it: every door that makes a stored conversation resident (a resume under `--profile`, an
+    /// editor's load, a re-attach, a reopened sub-agent, a rewrite of the log) reaches a turn
+    /// with nothing sent from this process yet. A context that holds none, as after a compaction
+    /// that kept no turn, carries nothing another profile produced, so it is no switch.
+    pub(crate) async fn switched_from(&self) -> Option<String> {
+        let known = crate::sync::lock(&self.served_by).clone();
+        let last = match known {
+            Some(last) => last,
+            None => self.recorded_server().await?,
+        };
+        (last.differs_from(&self.own_server())
+            && self
+                .providers
+                .catalog()
+                .profiles
+                .contains_key(&last.profile))
+        .then_some(last.profile)
+    }
+
+    /// The profile the latest reply in the context the session's own profile served names as the
+    /// one that sent its request ([`Store::last_context_reply_profile`]), with no model, since the
+    /// one a response names need not spell the configured one.
+    async fn recorded_server(&self) -> Option<ServedBy> {
+        let session_id = self.session_id()?;
+        match self.store.last_context_reply_profile(session_id).await {
+            Ok(profile) => profile.map(|profile| ServedBy {
+                profile,
+                model: None,
+            }),
+            Err(error) => {
+                tracing::warn!("failed to read the latest reply's profile: {error}");
+                None
+            }
+        }
+    }
+
+    /// Note that a request was accepted, by the session's own profile unless a fallback serves in
+    /// its place, which records nothing: the profile coming back after it is no switch.
+    pub(crate) fn note_served(&self) {
+        if self.serving_fallback().is_none() {
+            *crate::sync::lock(&self.served_by) = Some(self.own_server());
+        }
     }
 
     /// The session this agent is on, or `None` before its first turn has created one.
@@ -744,6 +826,9 @@ impl Agent {
         self.hydrate_checklist(conversation).await;
         self.last_accepted_len
             .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
+        // What served the conversation is read back from its replies when next asked: they may
+        // now be another session's, or the rewrite may have taken the one last accepted here.
+        *crate::sync::lock(&self.served_by) = None;
         *self.last_rendered_world.write().await = None;
         *crate::sync::lock(&self.context_compacted) = None;
         *crate::sync::lock(&self.main_thread.before_compaction) = None;

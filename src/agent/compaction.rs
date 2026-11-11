@@ -85,7 +85,11 @@ pub(super) fn checkpoint_instruction(
     }
     instruction.push_str("Then call `context_replace` once, last, with your summary. ");
     instruction.push_str(SUMMARY_SHAPE);
-    if request.keep_recent == Some(false) {
+    if request
+        .person_keeps_recent()
+        .or(request.keep_recent)
+        .is_some_and(|keep| !keep)
+    {
         instruction.push_str(
             " Recent rounds will not be kept verbatim; cover what still matters from them.",
         );
@@ -266,6 +270,15 @@ fn quote_lines(text: &str) -> String {
         .join("\n")
 }
 
+/// What a compaction keeps verbatim after its summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kept {
+    /// Nothing: the summary stands in for the whole conversation.
+    Nothing,
+    /// The largest recent stretch the verbatim budget holds.
+    Recent,
+}
+
 /// The head to summarize, the tail to keep, and the messages received to copy.
 ///
 /// Two passes rather than one, so the copy's share of the verbatim budget is spent only when there
@@ -279,24 +292,30 @@ fn quote_lines(text: &str) -> String {
 /// sweep that follows would make untrue.
 fn split_and_retain(
     view: &[Message],
-    keep_recent: bool,
+    kept: Kept,
     quote_received: bool,
     request: Option<&str>,
     context_window: u64,
 ) -> (Vec<Message>, Vec<Message>, Vec<String>) {
     let copy_budget = compaction_retained_budget(context_window);
-    if !keep_recent {
-        // Keeping nothing means the summary has to cover everything, tail included. Only the
-        // checkpoint turn is in a position to ask for this, because it read the whole
-        // conversation; the summarizer is handed the head alone and would drop the rest on the
-        // floor. Honored on the summarizer path anyway by widening what it summarizes.
-        let head = view.to_vec();
-        let retained = if quote_received {
-            retained_messages(&head, request, copy_budget)
+    let retained_from = |head: &[Message]| {
+        if quote_received {
+            retained_messages(head, request, copy_budget)
         } else {
             Vec::new()
-        };
-        return (head, Vec::new(), retained);
+        }
+    };
+    match kept {
+        // Keeping nothing means the summary has to cover everything, tail included. The
+        // checkpoint turn may ask for this, having read the whole conversation, and a person's
+        // compaction does unless they asked for a tail. The summarizer is handed the head alone
+        // and would drop the rest on the floor, so its head widens to the whole conversation.
+        Kept::Nothing => {
+            let head = view.to_vec();
+            let retained = retained_from(&head);
+            return (head, Vec::new(), retained);
+        }
+        Kept::Recent => {}
     }
     let full = compute_compaction_split(view, compaction_verbatim_budget(context_window));
     if !quote_received {
@@ -723,10 +742,13 @@ impl Agent {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        let keep_recent = match &checkpoint {
+        let keep_recent = match (request.person_keeps_recent(), &checkpoint) {
+            // A person who asked for the compaction decided what is kept, whatever the checkpoint
+            // answered and whether one ran: the record holds every turn the summary stands in for.
+            (Some(keep), _) => keep,
             // `context_replace` decided last and knew most, having just read the conversation, so
             // its answer outranks the one the caller guessed at.
-            Some(checkpoint) => checkpoint
+            (None, Some(checkpoint)) => checkpoint
                 .keep_recent
                 .or(request.keep_recent)
                 .unwrap_or(true),
@@ -735,7 +757,7 @@ impl Agent {
             // was saved, and the summarizer works from a copy with every long block truncated.
             // Honoring the request here would discard the verbatim tail *and* summarize the rest
             // from an excerpt, compounding a failure into real data loss. Keep the tail instead.
-            None => true,
+            (None, None) => true,
         };
 
         // A trailing user message is one nobody has answered yet. `CompactionTrigger::Proactive`
@@ -745,16 +767,25 @@ impl Agent {
         //
         // Phrased as a property of the conversation rather than a check on the origin, so a future
         // call site cannot reintroduce it by picking a different one.
-        let keep_recent = keep_recent
-            || messages
-                .as_slice()
-                .last()
-                .is_some_and(|last| last.is_prompt());
-        // A retention compaction exists so the sweep after it can take the turns the summary
-        // stands in for. A tail kept verbatim is re-appended under this turn's id and dated today,
-        // which would carry the oldest rounds past the window for one more cycle, so none is
-        // kept, whatever the checkpoint answered; the split still quotes an unanswered prompt.
-        let keep_recent = keep_recent && request.trigger != CompactionTrigger::Retention;
+        let unanswered = messages
+            .as_slice()
+            .last()
+            .is_some_and(|last| last.is_prompt());
+        let kept = match request.person_keeps_recent() {
+            // A person who asked for no tail starts the next stretch from the summary alone, which
+            // is what lets a switch after it send the new provider none of what the old one
+            // returned. No turn is in flight when a person compacts, so a trailing prompt is one a
+            // failed or canceled turn left, and the summary covers it with the rest.
+            Some(false) => Kept::Nothing,
+            // A retention compaction exists so the sweep after it can take the turns the summary
+            // stands in for. A tail kept verbatim is re-appended under this turn's id and dated
+            // today, which would carry the oldest rounds past the window for one more cycle, so
+            // none is kept, whatever the checkpoint answered; the split still quotes an
+            // unanswered prompt.
+            _ if request.trigger == CompactionTrigger::Retention => Kept::Nothing,
+            _ if keep_recent || unanswered => Kept::Recent,
+            _ => Kept::Nothing,
+        };
 
         // Split into a head to summarize and a recent tail to keep verbatim, and copy the
         // messages received from the head alone: the tail is carried as it is, so a message there
@@ -764,7 +795,7 @@ impl Agent {
         // consumes the head.
         let (to_summarize, to_keep, retained) = split_and_retain(
             messages.as_slice(),
-            keep_recent,
+            kept,
             request.trigger != CompactionTrigger::Retention,
             request.request_in_flight.as_deref(),
             self.context_window(),
@@ -934,7 +965,9 @@ impl Agent {
             trigger: request.trigger,
             source,
             memories_written: progress.memories_written.clone(),
-            kept_recent: !to_keep.is_empty(),
+            // A prompt nobody answered yet is kept as the request, not as a recent turn.
+            kept_recent: to_keep.len() > usize::from(unanswered),
+            person_keeps_recent: request.person_keeps_recent(),
             written_summary: summary_text,
             checkpoint: std::mem::take(&mut progress.checkpoint),
             summarizer: std::mem::take(&mut progress.summarizer),
@@ -1389,7 +1422,7 @@ impl Agent {
     /// agent's own identity, asked once more when its answer holds no text.
     ///
     /// This is the original compaction mechanism, kept for the two cases the checkpoint turn cannot
-    /// serve: [`CompactionTrigger::Emergency`], where the provider has already refused a request
+    /// serve: [`CompactionTrigger::Emergency`], where the provider has already rejected a request
     /// this size, and any checkpoint that fails or comes back empty. Both want the same thing,
     /// a call deliberately smaller than the conversation, which is what stripping images and
     /// truncating long blocks buys.
@@ -1667,7 +1700,7 @@ mod tests {
             .expect_err("three failures spend the cap, so the fourth round is never asked for");
         assert!(
             matches!(error, MekaError::RetryableProvider { .. }),
-            "the provider's own last refusal is what the caller has to see: {error}"
+            "the provider's own last failure is what the caller has to see: {error}"
         );
         assert_eq!(
             mock.completions().len(),
@@ -3672,7 +3705,7 @@ mod tests {
     }
 
     /// The emergency path runs after the provider rejected the request for being too large. A
-    /// checkpoint turn re-sends that same conversation, so it would be refused identically; the
+    /// checkpoint turn re-sends that same conversation, so it would be rejected identically; the
     /// degraded summarizer is the only call that can still get through.
     #[tokio::test]
     async fn emergency_skips_the_checkpoint_even_when_it_is_enabled() {
@@ -3913,6 +3946,97 @@ mod tests {
         assert_eq!(stats.tools_used, tools);
     }
 
+    /// A compaction a person asks for keeps nothing verbatim unless they ask for a tail, whatever
+    /// the checkpoint answers and whether one runs: they are starting the next stretch from the
+    /// summary, which is what lets a switch to another provider send it nothing of the old one.
+    /// Its record keeps their answer, which decides whether keeping none is a departure.
+    #[tokio::test]
+    async fn a_compaction_a_person_asks_for_keeps_a_tail_only_when_asked() {
+        let summarized = || {
+            vec![
+                MockEvent::Text {
+                    text: "summary".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        };
+        for (checkpoint, asked, kept) in [
+            (true, None, false),
+            (false, None, false),
+            (true, Some(true), true),
+        ] {
+            let round = if checkpoint {
+                replace_round("summary", Some(true))
+            } else {
+                summarized()
+            };
+            let provider = Arc::new(MockProvider::from_rounds(vec![round]));
+            let (agent, store) = agent_with_checkpoint(provider, checkpoint).await;
+            let mut messages = conversation();
+            let outcome = compact(&agent, &store, &mut messages, CompactRequest {
+                keep_recent: asked,
+                ..CompactRequest::new(CompactionTrigger::Manual)
+            })
+            .await;
+            assert_eq!(
+                outcome.kept_recent, kept,
+                "checkpoint {checkpoint}, asked {asked:?}"
+            );
+            assert_eq!(
+                outcome.person_keeps_recent,
+                Some(asked.unwrap_or(false)),
+                "checkpoint {checkpoint}, asked {asked:?}"
+            );
+        }
+    }
+
+    /// A person's compaction after a turn that failed keeps nothing verbatim, the prompt that went
+    /// unanswered included: whoever writes the summary reads that prompt with the rest, and the
+    /// summary alone is what the next request carries.
+    #[tokio::test]
+    async fn a_compaction_a_person_asks_for_keeps_not_even_an_unanswered_prompt() {
+        for checkpoint in [true, false] {
+            let round = if checkpoint {
+                replace_round("summary", Some(true))
+            } else {
+                text_round("summary")
+            };
+            let provider = Arc::new(MockProvider::from_rounds(vec![round]));
+            let (agent, store) = agent_with_checkpoint(provider.clone(), checkpoint).await;
+            let mut messages = conversation();
+            messages.append(Message::user("the request that failed"));
+            let outcome = compact(
+                &agent,
+                &store,
+                &mut messages,
+                CompactRequest::new(CompactionTrigger::Manual),
+            )
+            .await;
+            assert!(!outcome.kept_recent, "checkpoint {checkpoint}");
+            assert_eq!(messages.len(), 1, "checkpoint {checkpoint}");
+            assert!(
+                matches!(messages.as_slice()[0].content.as_slice(), [
+                    ContentBlock::Summary { .. }
+                ]),
+                "checkpoint {checkpoint}: {:?}",
+                messages.as_slice()
+            );
+            let read: Vec<Message> = provider
+                .streams()
+                .into_iter()
+                .flat_map(|request| request.messages)
+                .chain(provider.completions().into_iter().flatten())
+                .collect();
+            assert!(
+                read.iter()
+                    .any(|message| message.text_content().contains("the request that failed")),
+                "checkpoint {checkpoint}: the summary covers the unanswered prompt: {read:?}"
+            );
+        }
+    }
+
     /// The previous message and request ids name a response the request still carries.
     /// Summarizing it away clears both, the way a first request has neither; a kept tail keeps
     /// both.
@@ -3929,7 +4053,7 @@ mod tests {
             let mut messages = conversation();
 
             let outcome = compact(&agent, &store, &mut messages, CompactRequest {
-                trigger: CompactionTrigger::Manual,
+                trigger: CompactionTrigger::Requested,
                 instructions: None,
                 keep_recent: None,
                 request_in_flight: None,
@@ -4054,7 +4178,7 @@ mod tests {
         for pair in sent.windows(2) {
             assert!(
                 !(pair[0].role == Role::User && pair[1].role == Role::User),
-                "two consecutive user messages would be refused by the provider"
+                "two consecutive user messages would be rejected by the provider"
             );
         }
         let last = sent.last().expect("non-empty");
@@ -4323,8 +4447,13 @@ mod tests {
             cut_tail.len()
         );
 
-        let (head, tail, retained) =
-            split_and_retain(view, true, true, Some("the trailing prompt"), window);
+        let (head, tail, retained) = split_and_retain(
+            view,
+            Kept::Recent,
+            true,
+            Some("the trailing prompt"),
+            window,
+        );
 
         assert_eq!(retained, vec!["> a rule stated late".to_string()]);
         assert_eq!(tail.len(), 1, "everything but the prompt is summarized");
@@ -4541,7 +4670,8 @@ mod tests {
         let view = messages.as_slice();
         let window = 40_000;
 
-        let (head, tail, retained) = split_and_retain(view, true, true, Some(prompt), window);
+        let (head, tail, retained) =
+            split_and_retain(view, Kept::Recent, true, Some(prompt), window);
 
         assert!(retained.is_empty(), "{retained:?}");
         let (_, full_tail) =
@@ -4562,7 +4692,7 @@ mod tests {
         let view = messages.as_slice();
         let window = 40_000;
 
-        let (head, tail, retained) = split_and_retain(view, true, true, None, window);
+        let (head, tail, retained) = split_and_retain(view, Kept::Recent, true, None, window);
 
         assert!(!retained.is_empty());
         let (_, cut_tail) = compute_compaction_split(view, compaction_tail_budget(window));
@@ -5334,7 +5464,11 @@ mod tests {
             agent
                 .compact_session(
                     &mut messages,
-                    CompactRequest::new(origin),
+                    CompactRequest {
+                        // A person's compaction keeps a tail only when asked for one.
+                        keep_recent: (origin == CompactionTrigger::Manual).then_some(true),
+                        ..CompactRequest::new(origin)
+                    },
                     CancellationToken::new(),
                 )
                 .await
@@ -5350,7 +5484,11 @@ mod tests {
             let outcome = agent
                 .compact_session(
                     &mut messages,
-                    CompactRequest::new(origin),
+                    CompactRequest {
+                        // A person's compaction keeps a tail only when asked for one.
+                        keep_recent: (origin == CompactionTrigger::Manual).then_some(true),
+                        ..CompactRequest::new(origin)
+                    },
                     CancellationToken::new(),
                 )
                 .await

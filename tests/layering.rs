@@ -555,6 +555,7 @@ const LABELS: &[(&str, &str)] = &[
     ("[Message arrived ", "src/prompt.rs"),
     ("[Meka]", "src/host/acp/frontend.rs"),
     ("[Meka warn]", "src/host/acp/frontend.rs"),
+    ("[No message content]", "src/provider/anthropic/shared.rs"),
 ];
 
 /// A label is spelled by the file that renders it and nowhere else, so nothing reads meaning back

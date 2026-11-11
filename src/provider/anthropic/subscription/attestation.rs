@@ -20,7 +20,7 @@ use crate::{
 };
 
 /// Claude Code version whose wire this module mirrors. A bump is verified against a capture of
-/// the real client first, because the server refuses a version too old for a new model.
+/// the real client first, because the server rejects a version too old for a new model.
 pub(super) const CC_VERSION: &str = "2.1.322";
 
 /// Fingerprint salt. `MHE` in the shipped 2.1.241 binary, present unchanged in 2.1.263.
@@ -216,15 +216,15 @@ const UNREADABLE_TOOL_NAME: &str = "unreadable-tools-used-before-summary";
 /// `^[A-Za-z0-9_.:-]{1,256}$` is listed as one entry of [`UNREADABLE_TOOL_NAME`]. When the whole
 /// list passes either cap, that name leads it, whether or not it is among them already, and as
 /// many entries as fit follow. Claude Code moves its own built-in tools' names to the end, which
-/// no name of Meka's is. A name the endpoint refuses as a tool is left out.
+/// no name of Meka's is. A name the endpoint rejects as a tool is left out.
 fn render_tools_used(tools: &[crate::stats::ToolUsed]) -> String {
     let mut entries: Vec<String> = Vec::with_capacity(tools.len());
     let mut names: Vec<&str> = Vec::with_capacity(tools.len());
-    // A tool this endpoint refuses to see declared is not named here either, so a session that
+    // A tool this endpoint rejects when declared is not named here either, so a session that
     // called one on another backend does not put it in front of this one.
     for tool in tools
         .iter()
-        .filter(|tool| !super::endpoint_refuses_tool_name(&tool.name))
+        .filter(|tool| !super::endpoint_rejects_tool_name(&tool.name))
     {
         let readable = is_readable_tool_name(&tool.name);
         let name = if readable {
@@ -1335,10 +1335,10 @@ mod tests {
         );
     }
 
-    /// A tool this endpoint refuses to see declared, called on another backend before a profile
+    /// A tool this endpoint rejects when declared, called on another backend before a profile
     /// switch, is not named to it either.
     #[test]
-    fn a_tool_the_endpoint_refuses_is_not_listed() {
+    fn a_tool_the_endpoint_rejects_is_not_listed() {
         let tool = |name: &str| crate::stats::ToolUsed {
             name: name.to_string(),
             mcp: false,

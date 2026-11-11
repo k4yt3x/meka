@@ -400,7 +400,7 @@ pub(super) fn convert_messages_to_claude_content(
                     Some(match block {
                         // The turn's context block, a nudge, a note and what arrived for the model
                         // are text on this wire, in the order the message holds them.
-                        // A blank one is left out: the API refuses a text block with no
+                        // A blank one is left out: the API rejects a text block with no
                         // non-whitespace text in it, and a reply that streamed a newline before
                         // it was cut is saved as one.
                         ContentBlock::Text { .. }
@@ -606,7 +606,7 @@ pub(super) fn convert_deferred_tools_to_claude_tools(
 
 /// Append `deferred` to the body's `tools`, creating the array for a request whose active tools
 /// are none, and keep a `tool_reference` block in the history only where this request can send it.
-/// The API refuses a reference to a tool its `tools` array lacks (a server withdrew or renamed it,
+/// The API rejects a reference to a tool its `tools` array lacks (a server withdrew or renamed it,
 /// or the session moved to a profile that appends), and a result mixing references with anything
 /// else. So a result of references keeps those this request declares and leaves the rest out (a
 /// tool now active is in the array whole); one with none declared, or with other content beside
@@ -737,6 +737,13 @@ pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync 
         stream: bool,
         attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder>;
+    /// Whether a thinking block's text is the summary the request asked for (Claude's
+    /// `thinking.display = "summarized"`) rather than the reasoning itself, which the fold then
+    /// records as a summary part. `false` where the request states no display, since what the
+    /// endpoint returns is then its own fact.
+    fn summarizes_thinking(&self) -> bool {
+        false
+    }
     /// Record the response's request id where the next request can name it; a no-op for a backend
     /// whose wire carries none.
     fn remember_request_id(
@@ -842,7 +849,14 @@ pub(super) async fn stream<B: ClaudeBackend>(
     if response.status().is_success() {
         attribution.note_response_arrived();
     }
-    drive_claude_sse_stream(response, event_sender, cancellation, Some(attribution)).await
+    drive_claude_sse_stream(
+        response,
+        event_sender,
+        cancellation,
+        Some(attribution),
+        backend.summarizes_thinking(),
+    )
+    .await
 }
 
 /// Read a Claude SSE response to its end, forwarding each event on the channel.
@@ -851,9 +865,11 @@ pub(super) async fn drive_claude_sse_stream(
     event_sender: mpsc::Sender<StreamEvent>,
     cancellation: CancellationToken,
     attribution: Option<crate::provider::Attribution>,
+    summarized_thinking: bool,
 ) -> Result<()> {
     let mut protocol = ClaudeStream {
         attribution,
+        summarized_thinking,
         ..ClaudeStream::default()
     };
     let ended = crate::provider::sse::drive(
@@ -902,6 +918,8 @@ struct ClaudeStream {
     attribution: Option<crate::provider::Attribution>,
     /// Whether the message reached its end rather than the byte stream simply stopping.
     saw_terminal_event: bool,
+    /// Whether a thinking block's text is a summary; see [`ClaudeBackend::summarizes_thinking`].
+    summarized_thinking: bool,
     /// Whether a `message_delta` has stated the stop, which the reply's record then holds.
     stop_stated: bool,
     /// The message as `message_start` stated it and each `message_delta` updated it, folded as
@@ -1123,6 +1141,12 @@ impl ClaudeStream {
                 events.push(StreamEvent::ThinkingProgress {
                     estimated_tokens: None,
                 });
+                if self.summarized_thinking {
+                    events.push(StreamEvent::ThinkingPart {
+                        kind: crate::conversation::ReasoningKind::Summary,
+                        number: None,
+                    });
+                }
                 events.extend(opening("thinking").map(StreamEvent::ThinkingDelta));
                 // Both schemas make `signature` required on a thinking block sent back, and
                 // require it verbatim, but it does not always arrive as a `signature_delta`.
@@ -1776,6 +1800,7 @@ mod tests {
             sender,
             CancellationToken::new(),
             Some(attribution.clone()),
+            false,
         )
         .await;
         assert!(outcome.is_err(), "the stream ended before a stop reason");
@@ -1821,7 +1846,7 @@ mod tests {
             .into();
         let (sender, mut receiver) = mpsc::channel(1024);
         let outcome =
-            drive_claude_sse_stream(response, sender, CancellationToken::new(), None).await;
+            drive_claude_sse_stream(response, sender, CancellationToken::new(), None, false).await;
         let mut events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             events.push(event);
@@ -2081,7 +2106,7 @@ mod tests {
             refused.to_string().contains("max_request_bytes"),
             "{refused}"
         );
-        // The variant the turn's `refusal_may_blame_content` keys on: as `Provider` the refusal
+        // The variant the turn's `rejection_may_blame_content` keys on: as `Provider` the refusal
         // ended the turn with nothing degraded, and the next turn carried the same body.
         //
         // `RequestTooLarge` rather than `InvalidRequest`, which means the *provider* refused a
@@ -2439,7 +2464,7 @@ mod tests {
     }
 
     /// A result whose references outlive some of their tools (a server renamed or withdrew one)
-    /// keeps the references the request declares and leaves the rest out: the API refuses a
+    /// keeps the references the request declares and leaves the rest out: the API rejects a
     /// reference it cannot find in `tools`, and text beside a reference as well. The result block
     /// keeps the breakpoint the converter set on it.
     #[test]
@@ -2683,7 +2708,7 @@ mod tests {
 
     /// OpenRouter answers for a non-Anthropic model with `signature: ""`, which the accumulator
     /// keeps as the value the API returned, and it goes back so: the endpoint that returned it
-    /// takes it, and one that refuses it says so.
+    /// takes it, and one that rejects it says so.
     #[test]
     fn an_empty_signature_goes_back_as_returned() {
         let message = crate::conversation::Message {
@@ -3520,6 +3545,50 @@ mod tests {
             panic!("{:?}", completion.message.content);
         };
         assert_eq!(data, "SEALED");
+    }
+
+    /// A thinking block whose text the request asked to be summarized is recorded as a summary
+    /// part, and as the reasoning itself otherwise; what goes back to Claude is the same text.
+    #[tokio::test]
+    async fn summarized_thinking_is_recorded_as_a_summary() {
+        for (summarized, kind) in [
+            (true, crate::conversation::ReasoningKind::Summary),
+            (false, crate::conversation::ReasoningKind::Reasoning),
+        ] {
+            let body = concat!(
+                "event: content_block_start\n",
+                "data: {\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"a plan\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"S\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            );
+            let response: reqwest::Response = http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.to_string())
+                .expect("build response")
+                .into();
+            let (sender, mut receiver) = mpsc::channel(64);
+            drive_claude_sse_stream(response, sender, CancellationToken::new(), None, summarized)
+                .await
+                .expect("a whole stream");
+            let mut accumulator = crate::provider::MessageAccumulator::new();
+            while let Ok(event) = receiver.try_recv() {
+                accumulator.push(event);
+            }
+            let content = accumulator.finish().message.content;
+            let [ContentBlock::Thinking { parts, .. }] = content.as_slice() else {
+                panic!("{content:?}");
+            };
+            assert_eq!(parts.len(), 1, "{parts:?}");
+            assert_eq!(parts[0].kind, kind);
+            assert_eq!(crate::conversation::reasoning_as_streamed(parts), "a plan");
+        }
     }
 
     /// A `message_delta` without a stop reason between a block's deltas restates the running

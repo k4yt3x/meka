@@ -27,10 +27,10 @@ pub(crate) use subscription::ChatGptSubscriptionProvider;
 
 /// A `usage` object of either OpenAI wire as the agent counts it.
 ///
-/// Both wires fold the cached tokens into the total (`input_tokens` on Responses, `prompt_tokens`
-/// on Chat Completions) and name the cached subset under a `*_details` object, while the agent
-/// counts each tier once, so the cached count comes out of the total here. The endpoint fills its
-/// cache on its own and bills nothing for it, so the cache-write tier stays at zero.
+/// Both wires fold the cache tiers into the total (`input_tokens` on Responses, `prompt_tokens` on
+/// Chat Completions) and break them out under a `*_details` object, `cached_tokens` read from the
+/// cache and `cache_write_tokens` written to it, while the agent counts each tier once, so both
+/// come out of the total here.
 pub(super) fn parse_usage(
     usage: &serde_json::Value,
     input_key: &str,
@@ -38,17 +38,20 @@ pub(super) fn parse_usage(
     output_key: &str,
 ) -> crate::stats::TokenUsage {
     let field = |key: &str| usage.get(key).and_then(|value| value.as_u64()).unwrap_or(0);
+    let detail = |key: &str| {
+        usage
+            .get(input_details_key)
+            .and_then(|details| details.get(key))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
     let input = field(input_key);
-    let cached = usage
-        .get(input_details_key)
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0)
-        .min(input);
+    let cached = detail("cached_tokens").min(input);
+    let written = detail("cache_write_tokens").min(input - cached);
     crate::stats::TokenUsage {
-        input_tokens: input - cached,
+        input_tokens: input - cached - written,
         output_tokens: field(output_key),
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens: written,
         cache_read_input_tokens: cached,
     }
 }
@@ -105,6 +108,25 @@ mod tests {
         assert_eq!(usage.input_tokens, 176);
         assert_eq!(usage.cache_read_input_tokens, 1024);
         assert_eq!(usage.output_tokens, 40);
+    }
+
+    /// The tokens an endpoint wrote to its cache are part of the input total too, and count once,
+    /// as writes, on either wire.
+    #[test]
+    fn cache_writes_come_out_of_the_input_total() {
+        let usage = parse_usage(
+            &serde_json::json!({
+                "prompt_tokens": 1000,
+                "prompt_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 800},
+                "completion_tokens": 5,
+            }),
+            "prompt_tokens",
+            "prompt_tokens_details",
+            "completion_tokens",
+        );
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cache_read_input_tokens, 100);
+        assert_eq!(usage.cache_creation_input_tokens, 800);
     }
 
     /// An endpoint that reports no details, or a cached count past the total, leaves the input
