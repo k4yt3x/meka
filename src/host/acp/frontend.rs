@@ -764,12 +764,12 @@ impl Frontend for AcpFrontend {
                 tool_call_id,
                 summary,
             } => {
-                // ACP has no sub-agent primitive -- no nested sessions, no nested tool calls -- so
-                // a sub-agent is one tool call and its progress is that call's content. Updating
-                // content while the call is still `in_progress` is what turns an opaque spinner
-                // into a live view of what the sub-agent is doing. The client replaces the content
-                // array on each update, which is why `summary` is the whole block.
-                // Already the id the card was sent under; see `for_subagent`.
+                // Meka does not implement ACP's sub-agent sessions, an unstable RFD, so a sub-agent
+                // is one tool call and its progress is that call's content. Updating content while
+                // the call is still `in_progress` is what turns an opaque spinner into a live view
+                // of what the sub-agent is doing. The client replaces the content array on each
+                // update, which is why `summary` is the whole block. `tool_call_id` is already the
+                // id the card was sent under; see `for_subagent`.
                 let fields = ToolCallUpdateFields::new().content(vec![text_content_block(summary)]);
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id, fields))
             }
