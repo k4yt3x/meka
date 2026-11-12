@@ -1351,12 +1351,11 @@ the context gauge and the running work stand against the right edge.
 - `tasks`: `2 background tasks`, while any run
 - `subagents`: `1 sub-agent`, while any run
 
-A hint (`Copied 3 rows`, `The question was withdrawn`) takes the status row's right side while it
-stands, whatever the list says. Where the row is narrow, the level stays whole and the readings give
-way to it, each shown whole or not at all, from the last, since a reading cut short reads as another
-number; the facts after the level give way from the last too: the one that no longer fits is cut
-(a path from its start), or dropped when too little of it would show. A word that is not one of
-these, or one listed twice, is refused by name.
+Where the row is narrow, the level stays whole and the readings give way to it, each shown whole or
+not at all, from the last, since a reading cut short reads as another number; the facts after the
+level give way from the last too: the one that no longer fits is cut (a path from its start), or
+dropped when too little of it would show. A word that is not one of these, or one listed twice, is
+refused by name.
 
 ```toml
 [display]

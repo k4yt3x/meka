@@ -214,7 +214,7 @@ impl Ui {
     }
 
     /// What a command says in Meka's voice: a refusal, a failure, an empty list. In a panel until
-    /// Esc, or on the status row while a question is open, and nothing on the transcript; a line
+    /// Esc, or as a hint above a question while one is open, and nothing on the transcript; a line
     /// that ends in a period loses it, as every line on the screen does.
     pub(crate) fn reply(&self, message: impl Into<String>) {
         self.send(UiEvent::Reply(message.into()));

@@ -47,7 +47,7 @@ const LOG_RING_LINES: usize = 500;
 
 /// How often the screen redraws while something is changing.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
-/// How long a hint stays in the status row.
+/// How long a hint stands on the row above the composer.
 const HINT_LIFETIME: Duration = Duration::from_secs(6);
 /// The composer grows up to this share of the screen before it scrolls inside.
 const COMPOSER_SHARE: u16 = 3;
@@ -75,10 +75,9 @@ impl Selection {
         }
     }
 }
-/// What the status row says when a question is taken off the screen unanswered.
+/// The hint when a question is taken off the screen unanswered.
 const QUESTION_WITHDRAWN_HINT: &str = "The question was withdrawn";
-/// What the status row says while Enter waits on an image being read; it goes when the image
-/// lands.
+/// The hint while Enter waits on an image being read; it goes when the image lands.
 const IMAGE_READING_HINT: &str = "An image is still being read";
 /// How often the status row's count of running work is read back from the store.
 const WORK_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -386,6 +385,7 @@ struct Screen {
     /// The images an invocation took from the composer, until its turn starts: a host that refuses
     /// the invocation first hands them back to the composer.
     invoked_with: Vec<super::input::Attachment>,
+    /// The hint on the row above the composer, and when it was given.
     hint: Option<(String, Instant)>,
     /// When the open question was asked, for the grace it takes no answer in.
     question_opened: Option<Instant>,
@@ -732,7 +732,7 @@ impl Screen {
 
     /// An answer a command gives: a panel until Esc, and nothing on the transcript. A question on
     /// the screen is never taken away by it, since closing an approval prompt or a form answers
-    /// it: what is said then goes to the status row.
+    /// it: what is said then is a hint above the question.
     fn answer(&mut self, text: String) {
         if self.overlay_is_question() {
             self.show_hint(text.lines().next().unwrap_or_default().to_string());
@@ -3007,6 +3007,14 @@ impl Screen {
                 pill
             }
         });
+        // On the same row, clear of the status row's readings, and of whatever panel or question
+        // stands in the composer's place.
+        if let Some((hint, _)) = self.hint.as_ref().filter(|_| gap > 0) {
+            let taken = self.pill.map_or(taken, |pill| {
+                taken.max((pill.x + pill.width).saturating_sub(pill_row.x))
+            });
+            view::draw_hint(frame, pill_row, hint, taken);
+        }
 
         match &mut self.overlay {
             Some(Overlay::Panel { panel, .. }) => {
@@ -3043,7 +3051,6 @@ impl Screen {
                     model: self.model_fact(),
                     context: self.context_gauge(),
                     work: self.work,
-                    hint: self.hint.as_ref().map(|(hint, _)| hint.as_str()),
                     shell_mode: self.composer.is_shell_mode(),
                 };
                 // The block is the composer's gray across the row, padded as a sent prompt is; the

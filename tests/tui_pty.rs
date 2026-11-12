@@ -2288,9 +2288,18 @@ fn a_drag_over_the_transcript_copies_what_it_covers() {
         run.screens
     );
     let lit = &run.screens[2];
+    let composer = lit
+        .iter()
+        .rposition(|row| *row == half_row_above())
+        .unwrap_or_else(|| panic!("the composer's top row: {lit:#?}"));
     assert!(
-        lit.last().is_some_and(|row| row.contains("Copied 1 row")),
-        "the status row says what was copied: {lit:#?}"
+        lit[composer - 1].ends_with("Copied 1 row"),
+        "the row above the composer says what was copied: {lit:#?}"
+    );
+    assert!(
+        lit.last()
+            .is_some_and(|row| !row.contains("Copied") && row.contains("1.0M")),
+        "the status row keeps its gauge: {lit:#?}"
     );
 }
 

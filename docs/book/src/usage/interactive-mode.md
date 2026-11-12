@@ -35,6 +35,8 @@ always keeps the conversation off it: a spinner in column 0, then what the agent
 (`Working`, `Thinking`, `Answering` or `Using a tool`), how many seconds the turn has run, and
 `Esc to stop`. The spinner stands still as `•` while the turn waits on you, for an approval or a
 question, and the row goes when the turn ends. A `!command` has the same row, as `Running command`.
+A hint the screen gives, such as `Copied 3 rows` or what a second Ctrl+C would do, stands for a
+few seconds at the right end of the row above the composer, on the working row while there is one.
 
 Everything on the transcript shares one left edge. Column 0 holds a glyph that says what a row is:
 `▎` a bar down what you sent, in the color of the permission level it ran under (red for a
@@ -219,8 +221,8 @@ on the clipboard. Meka reads that from the operating system, since a terminal pa
 it needs a display on the machine Meka runs on and does not work over SSH; a path does. Each
 attachment is a chip above the text, in the order attached, marked `reading` while the image is
 read beside the screen; **Backspace** on an empty composer drops the last one. **Enter** sends them
-with the words once every one is read; pressed before then, it sends nothing and the status row
-says an image is still being read. A photo is drawn the way up it was taken, and so is a copy Meka
+with the words once every one is read; pressed before then, it sends nothing and the row above the
+composer says an image is still being read. A photo is drawn the way up it was taken, and so is a copy Meka
 makes of it for the model, shrunk or converted; one sent as it is keeps the orientation it records,
 for the provider to read. A skill or an MCP prompt typed with them takes them, and gives
 them back when it cannot run; any other command is refused while they are attached. The profile has
@@ -258,7 +260,7 @@ the turns a [rewind](#rewind) dropped are left out, and one row in their place s
 The screen captures the mouse so that the wheel, a click and a drag reach it. Dragging over the
 transcript selects the text it covers, and releasing copies it: to the terminal's own clipboard
 through the OSC 52 sequence, which works over SSH and inside tmux where they allow it, and to the
-system clipboard where Meka can reach one. The status row says how many rows went. What is copied
+system clipboard where Meka can reach one. The row above the composer says how many rows went. What is copied
 is the text, not the screen: each row from the text edge, without the gutter's marks, and a code
 block's code as it was written, a line folded at the edge coming back as one line, its indentation
 its own, and the block's shading adding nothing. The terminal's own selection still works with its modifier held (**Shift**; **Option** in iTerm2, **Fn** in

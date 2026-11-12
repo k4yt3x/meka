@@ -1905,7 +1905,6 @@ pub(crate) struct StatusFacts<'a> {
     pub(crate) context: Option<String>,
     /// Background tasks and sub-agents, shown while any run.
     pub(crate) work: RunningWork,
-    pub(crate) hint: Option<&'a str>,
     /// Whether the composer is in its shell mode, which the row says in red in place of the level
     /// and every fact on the left, so what Enter will do is never a surprise; the readings stay.
     pub(crate) shell_mode: bool,
@@ -1936,12 +1935,15 @@ pub(crate) fn composer_bar_color(facts: &StatusFacts<'_>) -> Color {
     }
 }
 
+/// The fewest columns a cut text on a row keeps, its ellipsis included, below which it is left
+/// out.
+const LEAST_CUT_COLUMNS: usize = 4;
+
 /// The status row under the composer, on the terminal's background in its own colors. Against the
 /// left, after a dot each, what the next prompt goes under: the permission level in its color, the
 /// profile, and the model dimmed, then where the session works, the path and the project, dimmed;
 /// in the shell mode, what Enter does instead, in red. Against the right edge, the session's live
-/// readings, the context gauge and the work running, or a hint while one stands. Each fact as the
-/// config lists it.
+/// readings, the context gauge and the work running. Each fact as the config lists it.
 ///
 /// Where the row is narrow, the level stays whole and the readings give way to it; the facts after
 /// the level give way from the last, the one that no longer fits cut to what is left (a path from
@@ -1951,8 +1953,6 @@ pub(crate) fn status_line(facts: &StatusFacts<'_>, width: usize) -> Line<'static
     use crate::config::StatusFact;
     /// The dot each fact after the level stands behind.
     const DOT: &str = " · ";
-    /// The fewest columns a cut fact keeps, its ellipsis included, below which it is dropped.
-    const LEAST_CUT_COLUMNS: usize = 4;
     let level = if facts.shell_mode {
         Span::styled(
             SHELL_MODE_LABEL.to_string(),
@@ -2014,31 +2014,21 @@ pub(crate) fn status_line(facts: &StatusFacts<'_>, width: usize) -> Line<'static
         }
     }
     // A column clear at the right edge, and two between the sides. The right side has what the
-    // level leaves: a hint cut to it, unless it would show no more than its ellipsis, or the
-    // readings that fit whole, in order, up to the first that does not, since a reading cut
-    // short reads as another number.
+    // level leaves: the readings that fit whole, in order, up to the first that does not, since a
+    // reading cut short reads as another number.
     let level_width = TEXT_EDGE + display_width(&level.content);
     let room = width.saturating_sub(level_width + 2 + draw::RIGHT_MARGIN);
-    let right = match facts.hint {
-        Some(hint) if display_width(hint) <= room || room >= LEAST_CUT_COLUMNS => Span::styled(
-            draw::cut_text(hint, room),
-            Style::default().fg(Color::Yellow),
-        ),
-        Some(_) => Span::raw(String::new()),
-        None => {
-            let mut shown = String::new();
-            for reading in &readings {
-                let dot = if shown.is_empty() { "" } else { DOT };
-                let left = room.saturating_sub(display_width(&shown) + display_width(dot));
-                if display_width(reading) > left {
-                    break;
-                }
-                shown.push_str(dot);
-                shown.push_str(reading);
-            }
-            Span::styled(shown, gray())
+    let mut shown = String::new();
+    for reading in &readings {
+        let dot = if shown.is_empty() { "" } else { DOT };
+        let left = room.saturating_sub(display_width(&shown) + display_width(dot));
+        if display_width(reading) > left {
+            break;
         }
-    };
+        shown.push_str(dot);
+        shown.push_str(reading);
+    }
+    let right = Span::styled(shown, gray());
     let right_width = display_width(&right.content);
     // The gap between the sides only when there is a right side to keep apart.
     let reserved = if right_width == 0 {
@@ -2194,6 +2184,38 @@ pub(crate) fn draw_working_row(
     let width = line.width() as u16;
     frame.render_widget(Paragraph::new(line), area);
     width
+}
+
+/// A hint on the row above the composer, against its right edge a column clear of it, past the
+/// first `taken` columns, which the working row's words and the pill cover: cut to the room left
+/// when enough of it is left to read, and left out otherwise.
+pub(crate) fn draw_hint(frame: &mut Frame<'_>, area: Rect, hint: &str, taken: u16) {
+    let start = if taken == 0 {
+        0
+    } else {
+        usize::from(taken) + 2
+    };
+    let room = usize::from(area.width).saturating_sub(start + draw::RIGHT_MARGIN);
+    if display_width(hint) > room && room < LEAST_CUT_COLUMNS {
+        return;
+    }
+    let shown = draw::cut_text(hint, room);
+    let width = u16::try_from(display_width(&shown)).unwrap_or(u16::MAX);
+    let x = area
+        .width
+        .saturating_sub(width.saturating_add(draw::RIGHT_MARGIN as u16));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            shown,
+            Style::default().fg(Color::Yellow),
+        ))),
+        Rect {
+            x: area.x + x,
+            width,
+            height: 1.min(area.height),
+            ..area
+        },
+    );
 }
 
 /// The pill while the view is scrolled up: the words on the composer's gray, as a pill the
@@ -4677,6 +4699,31 @@ mod tests {
         );
     }
 
+    /// A hint stands against the right edge of the row above the composer, a column clear of it;
+    /// past what the row's start holds it is cut to the room left, and left out where too little
+    /// of it would show.
+    #[test]
+    fn a_hint_stands_at_the_right_end_of_the_row_above_the_composer() {
+        let backend = ratatui::backend::TestBackend::new(30, 1);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        let mut row = |taken: u16| -> String {
+            terminal
+                .draw(|frame| draw_hint(frame, frame.area(), "Copied 12 rows", taken))
+                .expect("a frame");
+            let buffer = terminal.backend().buffer();
+            (0..30)
+                .map(|x| buffer[(x, 0)].symbol().to_string())
+                .collect()
+        };
+        assert_eq!(row(0), format!("{}Copied 12 rows ", " ".repeat(15)));
+        assert_eq!(
+            row(20),
+            format!("{}Copied… ", " ".repeat(22)),
+            "cut past the row's start"
+        );
+        assert_eq!(row(26), " ".repeat(30), "left out with too little room");
+    }
+
     /// Under the pointer, the pill swaps its gray and its words, and the pointer is on it exactly
     /// over the cells it covers.
     #[test]
@@ -4800,8 +4847,8 @@ mod tests {
     /// The status row has what the next prompt goes under and where the session works against
     /// the left, each after a dot, the level in its color, the profile in white and the model
     /// dimmed, then the path and the project, and its live readings against the right edge, one
-    /// column clear of it; a hint takes the right side while it stands, and where the row is narrow
-    /// the left side gives way from its end, the level last.
+    /// column clear of it; where the row is narrow the left side gives way from its end, the level
+    /// last.
     #[test]
     fn the_status_row_has_the_next_send_and_the_place_left_and_the_readings_right() {
         let text = |line: &Line<'static>| -> String {
@@ -4810,7 +4857,7 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect()
         };
-        let facts = |work: RunningWork, hint: Option<&'static str>| StatusFacts {
+        let facts = |work: RunningWork| StatusFacts {
             shown: &[
                 crate::config::StatusFact::Profile,
                 crate::config::StatusFact::Model,
@@ -4827,10 +4874,9 @@ mod tests {
             model: Some("claude-opus-4-8".into()),
             context: Some("34%".into()),
             work,
-            hint,
             shell_mode: false,
         };
-        let idle = status_line(&facts(RunningWork::default(), None), 80);
+        let idle = status_line(&facts(RunningWork::default()), 80);
         assert_eq!(
             text(&idle),
             format!(
@@ -4860,19 +4906,12 @@ mod tests {
             tasks: 2,
             subagents: 1,
         };
-        let busy = text(&status_line(&facts(running, None), 120));
+        let busy = text(&status_line(&facts(running), 120));
         assert!(
             busy.ends_with("34% · 2 background tasks · 1 sub-agent") && display_width(&busy) == 119,
             "the work running beside the turn is counted after the gauge: {busy:?}"
         );
-        let hinted = text(&status_line(&facts(running, Some("Copied 2 rows")), 120));
-        assert!(
-            hinted.starts_with("  workspace · work ")
-                && hinted.ends_with(" Copied 2 rows")
-                && display_width(&hinted) == 119,
-            "a hint takes the right side: {hinted:?}"
-        );
-        let at = |width| text(&status_line(&facts(RunningWork::default(), None), width));
+        let at = |width| text(&status_line(&facts(RunningWork::default()), width));
         assert_eq!(
             at(50),
             format!(
@@ -4893,13 +4932,10 @@ mod tests {
         );
         let running = |width| {
             text(&status_line(
-                &facts(
-                    RunningWork {
-                        tasks: 2,
-                        subagents: 1,
-                    },
-                    None,
-                ),
+                &facts(RunningWork {
+                    tasks: 2,
+                    subagents: 1,
+                }),
                 width,
             ))
         };
@@ -4918,7 +4954,7 @@ mod tests {
             text(&status_line(
                 &StatusFacts {
                     context: Some("0 / 200.0k (0%)".into()),
-                    ..facts(RunningWork::default(), None)
+                    ..facts(RunningWork::default())
                 },
                 width,
             ))
@@ -4938,7 +4974,7 @@ mod tests {
                         crate::config::StatusFact::Path,
                     ],
                     path: Some(path.into()),
-                    ..facts(RunningWork::default(), None)
+                    ..facts(RunningWork::default())
                 },
                 width,
             ))
@@ -4966,7 +5002,7 @@ mod tests {
             let row = text(&status_line(
                 &StatusFacts {
                     profile: Some(hearts.clone()),
-                    ..facts(RunningWork::default(), None)
+                    ..facts(RunningWork::default())
                 },
                 width,
             ));
@@ -5012,7 +5048,6 @@ mod tests {
             model: Some("claude-opus-4-8".into()),
             context: None,
             work: RunningWork::default(),
-            hint: None,
             shell_mode,
         };
         assert_eq!(
