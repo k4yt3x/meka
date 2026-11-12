@@ -23,12 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `web_fetch` sends the headers Chrome sends for a page opened in a tab, not its user agent alone.
 - `web_fetch` refuses `Host` and `Accept-Encoding` in a call's `headers`, since Meka sets both.
 - `chatgpt-subscription` sends Codex CLI's `originator` and user agent where it sent Meka's.
+- A line whose `/` no command name follows, such as a pasted path, goes to the agent.
+- A line that opens with a space goes to the agent as words, whatever follows the space.
 - Session archives are `format_version` 28; older archives are brought forward on import.
 
 ### Fixed
 
 - A hint given while a panel or a question is open shows above it, where it was hidden.
 - A request rejected over the profile's `max_output_tokens` fails naming it instead of compacting.
+- A `!` line pasted into the composer goes to the agent; only the shell mode runs a command.
 
 ## [0.93.0] - 2026-11-11
 

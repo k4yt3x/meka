@@ -303,7 +303,11 @@ lists and clears it.
 
 ## Slash commands
 
-Commands start with `/`. `/help` shows this table, with the `/mcp` subcommands beneath `/mcp` and
+Commands start with `/` and a command's name: a word of letters, digits, `-` and `_`, or `?`. A
+name Meka does not know is refused, so a mistyped command costs no turn. Anything else after the
+`/`, such as a pasted path or a compiler's `/home/…/crypto.cpp:417: error`, goes to the agent as
+words, and so does any line that opens with a space: ` /etc is full` sends `/etc is full`, and
+` exit` sends `exit`. `/help` shows this table, with the `/mcp` subcommands beneath `/mcp` and
 the shortcuts below it. A command is not echoed on the transcript. What a command has to *show*
 (`/help`, `/status`, a listing) opens in a **panel** in place of the composer: Up, Down, PgUp,
 PgDn and the wheel scroll it, **Esc** or **Enter** closes it, and nothing of it stays on the
@@ -477,7 +481,8 @@ here.) See [Forking a session](./sessions.md#forking-a-session) for exactly what
 Type `!` into the empty composer and it enters **shell mode**: the composer's bar turns red, the
 status row reads `Run command in shell` in red in place of the level and the facts after it, and what you type runs as a shell
 command on **Enter**, bypassing the model entirely. **Backspace** on the empty composer leaves the mode, and a recalled
-`!cmd` comes back in it. On the transcript the command keeps its `!`:
+`!cmd` comes back in it. Only the mode runs a command: a `!` pasted into the composer, or typed after
+a space, goes to the agent with the rest of the line. On the transcript the command keeps its `!`:
 
 ```text
 ▎

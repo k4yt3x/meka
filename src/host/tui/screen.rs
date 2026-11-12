@@ -1840,14 +1840,23 @@ impl Screen {
         if trimmed.is_empty() && !self.composer.has_attachments() {
             return;
         }
+        // A shell command is what the shell mode shows, never a `!` pasted or typed after a space;
+        // a line opening with a space is words, whatever follows it.
+        let shell_mode = self.composer.is_shell_mode();
+        let literal = !shell_mode && text.starts_with(char::is_whitespace);
         // The shell mode with nothing typed yet: Enter runs nothing and leaves the mode on.
-        if trimmed == "!" {
+        if shell_mode && trimmed == "!" {
             return;
         }
         // Leaving and a shell command take no image: the one leaves, and the other runs with the
         // images left for the next prompt.
-        let leaves = trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit");
-        let shell = trimmed.strip_prefix('!').map(str::to_string);
+        let leaves = !shell_mode
+            && !literal
+            && (trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit"));
+        let shell = shell_mode
+            .then(|| trimmed.strip_prefix('!').map(str::to_string))
+            .flatten();
+        let command_line = !shell_mode && super::commands::opens_command(&text);
         // An image rides on a prompt that opens a turn; the inbox a busy turn reads carries
         // words alone.
         if self.is_busy() && self.composer.has_attachments() && !leaves && shell.is_none() {
@@ -1856,7 +1865,7 @@ impl Screen {
         }
         // Asked ahead of taking anything, so a command that takes no image leaves the line and the
         // image where they were.
-        let routed = if self.composer.has_attachments() && trimmed.starts_with('/') {
+        let routed = if self.composer.has_attachments() && command_line {
             let images: Vec<crate::image::ImageSource> = self
                 .composer
                 .attachments()
@@ -1882,7 +1891,17 @@ impl Screen {
         };
         let attachments = self.composer.take_attachments();
         if !trimmed.is_empty() {
-            self.composer.remember(&trimmed);
+            // Words that would read, recalled bare, as the shell mode, a command or the exit are
+            // recalled behind the space that keeps them words.
+            let words = !leaves && shell.is_none() && !command_line;
+            let reads_as_more = trimmed.starts_with(['!', '/'])
+                || trimmed.eq_ignore_ascii_case("exit")
+                || trimmed.eq_ignore_ascii_case("quit");
+            if words && reads_as_more {
+                self.composer.remember(&format!(" {trimmed}"));
+            } else {
+                self.composer.remember(&trimmed);
+            }
         }
         self.composer.clear();
         self.back_to_bottom();
@@ -1933,7 +1952,7 @@ impl Screen {
             return;
         }
 
-        if trimmed.starts_with('/') {
+        if command_line {
             self.run_command_line(trimmed).await;
             return;
         }

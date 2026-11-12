@@ -1514,6 +1514,66 @@ fn a_reconnect_with_no_mcp_server_leaves_the_screen_ready() {
     );
 }
 
+/// A line whose `/` no command name follows, such as a pasted compiler error, goes to the agent,
+/// and so does a line that opens with a space; a mistyped command is still refused.
+#[test]
+fn a_slash_line_that_names_no_command_goes_to_the_agent() {
+    let install = screen_install("read", "", "");
+    let screens = run_screen(&install, TWO_TURNS, &[
+        "/home/u/src/crypto.cpp:417:50: error: deprecated",
+        " /etc is full",
+        "/stauts",
+        "\x1b",
+        "/exit",
+    ]);
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter()
+            .any(|row| row == "▎ /home/u/src/crypto.cpp:417:50: error: deprecated")
+            && rows.iter().any(|row| row == "  First answer."),
+        "the pasted error went to the agent: {rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| row == "▎ /etc is full")
+            && rows.iter().any(|row| row == "  Second answer."),
+        "the line behind a space went to the agent: {rows:#?}"
+    );
+    assert!(
+        screens[3]
+            .iter()
+            .any(|row| row.contains("Unknown command: /stauts;")),
+        "a mistyped command is refused: {:#?}",
+        screens[3]
+    );
+}
+
+/// Only the shell mode runs a command: a `!` line pasted into the composer goes to the agent as
+/// words, and recalled it goes there again rather than coming back in the shell mode.
+#[test]
+fn a_pasted_bang_line_is_words_and_recalled_as_words() {
+    let install = screen_install("read", "", "");
+    let screens = run_screen(&install, TWO_TURNS, &[
+        "\x1b[200~!echo pasted-bang\x1b[201~",
+        "\r",
+        "\x1b[A",
+        "/exit",
+    ]);
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter()
+            .filter(|row| *row == "▎ !echo pasted-bang")
+            .count()
+            == 2
+            && rows.iter().any(|row| row == "  First answer.")
+            && rows.iter().any(|row| row == "  Second answer."),
+        "the line went to the agent twice: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row == "  pasted-bang"),
+        "no shell ran it: {rows:#?}"
+    );
+}
+
 /// `!` into the empty composer is the shell mode: the status row says so in place of the level,
 /// and what is typed next runs as a command.
 #[test]

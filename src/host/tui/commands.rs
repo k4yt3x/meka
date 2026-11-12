@@ -1165,6 +1165,18 @@ fn parse_mcp_slash(rest: &str) -> SlashCommand {
     }
 }
 
+/// Whether `line`, as typed, opens a command: a `/` first, then a word a command could be named, or
+/// no word at all, which is refused as no command. A line whose `/` is followed by anything else,
+/// such as a pasted path (`/home/…/crypto.cpp:417: error`) or `/v1.2`, is words for the agent, and
+/// so is a line that opens with a space.
+pub(crate) fn opens_command(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split(char::is_whitespace).next().unwrap_or_default();
+    name.is_empty() || name == "?" || crate::skills::looks_like_skill_invocation(name)
+}
+
 /// The line for a slash command Meka does not know. It names the command and only the command:
 /// `/frob a b` is refused as `/frob`, because the argument was never read.
 pub(crate) fn unknown_command_message(line: &str) -> String {
@@ -1299,6 +1311,33 @@ async fn log_in_and_serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line opens a command when a name could follow its `/`, a known one or a typo, or
+    /// nothing does; a path, a version and a line that opens with a space are words.
+    #[test]
+    fn only_a_line_a_command_name_could_follow_opens_a_command() {
+        for line in [
+            "/help",
+            "/?",
+            "/stauts",
+            "/skill review it",
+            "/etc is full",
+            "/",
+            "/ x",
+        ] {
+            assert!(opens_command(line), "{line}");
+        }
+        for line in [
+            "/home/u/src/crypto.cpp:417:50: error: deprecated",
+            "/tmp: no space left",
+            "/v1.2 of the API",
+            " /help",
+            "\n/help",
+            "help",
+        ] {
+            assert!(!opens_command(line), "{line}");
+        }
+    }
 
     /// A skill or an MCP prompt invoked with an image attached takes the image; another command
     /// takes none, and a line that names no command is unknown, as it is without an image.
