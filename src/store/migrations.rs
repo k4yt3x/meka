@@ -637,6 +637,13 @@ const MIGRATIONS: &[Migration] = &[
         name: "compact_boundaries_count_a_lone_prompt_as_no_recent_turn",
         step: Step::Rust(compact_boundaries_count_a_lone_prompt_as_no_recent_turn),
     },
+    // 0.94 records a turn that failed over the output cap its profile states under an error type
+    // of its own, which a build before it cannot read and drops. Nothing to convert: a turn that
+    // failed that way before recorded a context overflow.
+    Migration {
+        name: "turns_record_an_output_cap_too_large",
+        step: Step::Sql(""),
+    },
 ];
 
 /// See the ledger entry. Safe to replay: a `user` row and a thinking block's text exist only
@@ -5129,6 +5136,9 @@ const ARCHIVE_FORMAT_0_92_DEVELOPMENT_2: u64 = 25;
 /// asked for a tail, as a boundary the store held then does after its ledger step, and count an
 /// unanswered prompt kept alone as recent turns kept.
 const ARCHIVE_FORMAT_0_92: u64 = 26;
+/// The archive `format_version` 0.93 wrote, whose turns record no output cap too large; nothing
+/// converts.
+const ARCHIVE_FORMAT_0_93: u64 = 27;
 
 /// How the text Meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -5718,7 +5728,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_91)
         | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT_2)
-        | Some(ARCHIVE_FORMAT_0_92) => {}
+        | Some(ARCHIVE_FORMAT_0_92)
+        | Some(ARCHIVE_FORMAT_0_93) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -7337,6 +7348,10 @@ mod tests {
             (
                 "compact_boundaries_count_a_lone_prompt_as_no_recent_turn",
                 7542107224716512193_u64,
+            ),
+            (
+                "turns_record_an_output_cap_too_large",
+                9469365220726110664_u64,
             ),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or

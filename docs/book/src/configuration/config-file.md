@@ -320,6 +320,8 @@ Override the per-request output (completion) token cap. When unset, each backend
 
 The Claude figures are Meka's own defaults for the two Anthropic backends. The adaptive one is what Claude Code 2.1.322 sends for Opus 5.5, the model `meka profile add` suggests, and the most any model that takes adaptive thinking accepts; Claude Code's per-model catalog says the same for Sonnet 5.5, Haiku 5.5, Fable 5.2 and Mythos 5.2 and 64000 for the rest of the line-up, and stating a figure here replaces the default. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
 
+Some endpoints hold the cap back from the context window on every request and reject one whose input and cap together exceed it: OpenRouter does, and so do Claude models before 4.5. A cap near the window's size leaves the conversation little room there, so a model catalog's maximum output, which is the most such an endpoint accepts beside an empty prompt, does not belong here; leave the key unset unless replies are cut short. When an endpoint rejects a request as too long while the conversation is under [`context_ceiling_percent`](#sessioncontext_ceiling_percent) and the cap is what takes it past `context_window`, the turn fails naming this key instead of compacting.
+
 Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget`](#thinkingbudget), else 16000). `meka profile add` and `meka profile set` both refuse a profile that fails this, and it is validated again at startup.
 
 ```toml
@@ -1228,7 +1230,7 @@ auto_compact = false
 
 The share of the context window Meka lets the conversation fill on its own. Two things happen at the line: with `auto_compact` on, the conversation is compacted once past it; and a whole `scratchpad_read` that would carry the context past it is cut there and says where to continue, whether or not compaction is on. Refused outside 1 through 100.
 
-What is left above the line has to hold the reply and one round's growth past it, so keep at least your output budget plus a round free: the API rejects a request whose input and output cap together exceed the window. The default leaves 150k tokens on a 1M window against a Claude reply budget of 128000; on a small window it needs lowering, or `max_output_tokens` does.
+What is left above the line has to hold the reply and one round's growth past it. An endpoint that holds the output cap back from the window (OpenRouter, Claude before 4.5) rejects a request whose input and cap together exceed it, so there keep at least the cap plus a round free; Claude 4.5 and newer accept such a request and stop the reply at the window. The default leaves 150k tokens on a 1M window against a Claude reply budget of 128000; on a small window it needs lowering, or [`max_output_tokens`](#max_output_tokens) does.
 
 Default: `85`
 

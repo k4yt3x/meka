@@ -3324,6 +3324,7 @@ mod tests {
             profile: profile.to_string(),
             context_window: 200_000,
             vision: true,
+            max_output_tokens: None,
         })
     }
 

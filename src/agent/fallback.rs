@@ -218,7 +218,7 @@ impl Agent {
                             rebuilt = rebuild.map(|rebuild| rebuild());
                             continue;
                         }
-                        return Err(error);
+                        return Err(self.attribute_overflow(error, request.messages));
                     };
                     let ceiling = crate::provider::retry::MAX_PROVIDER_RETRIES;
                     tracing::warn!(
@@ -277,6 +277,15 @@ mod tests {
     }
 
     async fn family_over(main: MockProvider, backup: MockProvider) -> Family {
+        family_over_with(main, backup, crate::config::ProfileConfig::default()).await
+    }
+
+    /// [`family_over`] with `backup` stating the window and the output cap `stated` does.
+    async fn family_over_with(
+        main: MockProvider,
+        backup: MockProvider,
+        stated: crate::config::ProfileConfig,
+    ) -> Family {
         let store = Store::for_test().await;
         let account = |name: &str| {
             (name.to_string(), crate::config::AccountConfig {
@@ -292,9 +301,15 @@ mod tests {
                 ..Default::default()
             })
         };
+        let (name, backup_profile) = profile("backup", vec![]);
+        let backup_profile = (name, crate::config::ProfileConfig {
+            context_window: stated.context_window,
+            max_output_tokens: stated.max_output_tokens,
+            ..backup_profile
+        });
         let providers = Arc::new(ProviderRegistry::for_test_over(
             [account("main"), account("backup")].into_iter().collect(),
-            [profile("main", vec!["backup"]), profile("backup", vec![])]
+            [profile("main", vec!["backup"]), backup_profile]
                 .into_iter()
                 .collect(),
             store.token_store(),
@@ -428,6 +443,38 @@ mod tests {
                 .any(|text| text == "Profile 'main' is unavailable; this turn runs on 'backup'."),
             "{:?}",
             notices(&family)
+        );
+    }
+
+    /// A rejection for length on a fallback is judged against the fallback's own window and cap,
+    /// since its endpoint is what rejected the request, and names the fallback.
+    #[tokio::test]
+    async fn a_fallback_s_output_cap_is_judged_against_its_own_window() {
+        let family = family_over_with(
+            MockProvider::from_rounds(vec![exhausted()]),
+            MockProvider::from_rounds(vec![vec![MockEvent::FailContextOverflow {
+                message: "maximum context length is 200000 tokens".to_string(),
+            }]]),
+            crate::config::ProfileConfig {
+                context_window: Some(200_000),
+                max_output_tokens: Some(200_000),
+                ..Default::default()
+            },
+        )
+        .await;
+        let error = run(&family)
+            .await
+            .expect_err("the fallback rejects the request");
+        assert!(
+            matches!(
+                &error,
+                MekaError::OutputCapTooLarge {
+                    profile,
+                    context_window: 200_000,
+                    ..
+                } if profile == "backup"
+            ),
+            "{error:?}"
         );
     }
 

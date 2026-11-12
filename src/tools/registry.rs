@@ -2512,6 +2512,7 @@ mod tests {
                     profile: "test".to_string(),
                     context_window: 1_000,
                     vision: true,
+                    max_output_tokens: None,
                 });
         };
         let names = |definitions: &[ToolDefinition]| -> Vec<String> {
@@ -2585,6 +2586,7 @@ mod tests {
                 profile: "test".to_string(),
                 context_window: 1_000,
                 vision: true,
+                max_output_tokens: None,
             });
         registry.publish_profile(&published);
         let alone = registry.active_tools(&[]);
@@ -2622,6 +2624,7 @@ mod tests {
             profile: "test".to_string(),
             context_window: 1_000,
             vision: true,
+            max_output_tokens: None,
         });
         let appended = registry.active_tools(&[]);
         assert_eq!(
@@ -2640,6 +2643,7 @@ mod tests {
             profile: "test".to_string(),
             context_window: 1_000,
             vision: true,
+            max_output_tokens: None,
         });
 
         registry.register_load_tool_for_test();
@@ -2679,6 +2683,7 @@ mod tests {
                     profile: "test".to_string(),
                     context_window: 1_000,
                     vision: true,
+                    max_output_tokens: None,
                 });
         };
         let names = |definitions: &[ToolDefinition]| -> Vec<String> {
@@ -2762,6 +2767,7 @@ mod tests {
                 profile: "test".to_string(),
                 context_window: 1_000,
                 vision: true,
+                max_output_tokens: None,
             });
         let active = registry.definitions_active(&[]);
         assert!(
@@ -2794,6 +2800,7 @@ mod tests {
                     profile: "test".to_string(),
                     context_window: 1_000,
                     vision: true,
+                    max_output_tokens: None,
                 });
         };
         let loaded = vec!["mcp__kv__fetch".to_string()];

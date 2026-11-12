@@ -12,7 +12,10 @@ and `-shm` companions with the file.
 
 ## 0.93 to 0.94
 
-Nothing in the store changes shape.
+The store moves forward on its first open, behind the automatic backup, so that a turn that fails
+over its profile's `max_output_tokens` records why; nothing converts. 0.93 refuses a store 0.94 has
+opened; downgrading means restoring the backup the upgrade took. Session archives are
+`format_version` 28; a 0.93 archive (27) imports as it is, and 0.93 refuses a 28.
 
 **`[display].prompt_padding` takes a word.** It is `"none"`, `"half"` or `"full"`, and Meka refuses
 a `config.toml` that still sets `true` or `false`, naming the key's line. Replace `true` with

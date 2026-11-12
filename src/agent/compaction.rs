@@ -5453,6 +5453,7 @@ mod tests {
                 profile: "test-profile".into(),
                 context_window: 40_000,
                 vision: false,
+                max_output_tokens: None,
             });
             // The write fails after context collection, so advancing the snapshot before
             // persistence would claim the model received the new constraint even though

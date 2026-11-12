@@ -997,6 +997,7 @@ mod tests {
             profile: "alpha".to_string(),
             context_window: 32_000,
             vision: true,
+            max_output_tokens: None,
         });
         let published = agent.cells.profile.clone();
         let gauge = published.window();
@@ -1010,6 +1011,7 @@ mod tests {
             profile: "beta".to_string(),
             context_window: 500_000,
             vision: false,
+            max_output_tokens: None,
         });
 
         assert_eq!(published.current().profile, "beta");
@@ -1268,6 +1270,7 @@ mod tests {
                 profile: "test-profile".to_string(),
                 context_window: 0,
                 vision: true,
+                max_output_tokens: None,
             },
             Arc::new(crate::frontend::SilentFrontend),
             registry,

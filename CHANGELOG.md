@@ -7,19 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.94.0] - 2026-11-12
+
 ### Added
 
 - Thinking shows open on the screen as it streams, then folds; `display.expand_streaming_thinking`.
+- The HTTP API reports a turn the profile's output cap left no room for as `output-cap-too-large`.
 
 ### Changed
 
 - **Breaking:** `[display].prompt_padding` takes `none`, `half` or `full`; see the upgrade guide.
 - The composer and sent prompts have half a row of gray above and below their words by default.
 - Hints such as `Copied 3 rows` show above the composer, no longer over the context gauge.
+- Session archives are `format_version` 28; older archives are brought forward on import.
 
 ### Fixed
 
 - A hint given while a panel or a question is open shows above it, where it was hidden.
+- A request rejected over the profile's `max_output_tokens` fails naming it instead of compacting.
 
 ## [0.93.0] - 2026-11-11
 
@@ -3291,7 +3296,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.93.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.94.0...HEAD
+[0.94.0]: https://github.com/k4yt3x/meka/compare/0.93.0...0.94.0
 [0.93.0]: https://github.com/k4yt3x/meka/compare/0.92.0...0.93.0
 [0.92.0]: https://github.com/k4yt3x/meka/compare/0.91.0...0.92.0
 [0.91.0]: https://github.com/k4yt3x/meka/compare/0.90.0...0.91.0

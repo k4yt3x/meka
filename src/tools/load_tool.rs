@@ -896,6 +896,7 @@ mod tests {
                 profile: "test".to_string(),
                 context_window: 1_000,
                 vision: true,
+                max_output_tokens: None,
             });
         let _already_set = fixture.tool_load.profile.set(published);
     }
@@ -910,6 +911,7 @@ mod tests {
                 profile: "test".to_string(),
                 context_window: 1_000,
                 vision: true,
+                max_output_tokens: None,
             });
         let _already_set = fixture.tool_load.profile.set(published);
     }

@@ -283,6 +283,9 @@ fn log_failure(error: &MekaError) {
             tracing::warn!("provider error: {message}");
         }
         MekaError::ContextOverflow(message) => tracing::warn!("context overflow: {message}"),
+        MekaError::OutputCapTooLarge { message, .. } => {
+            tracing::warn!("context overflow over the output cap: {message}");
+        }
         MekaError::McpTurnGated { .. } => tracing::warn!("mcp gate declined a turn: {error}"),
         MekaError::Installation(message) => tracing::error!("installation error: {message}"),
         other if kind == ErrorKind::Internal => {
@@ -322,7 +325,8 @@ pub(crate) fn status_of(kind: ErrorKind) -> StatusCode {
         ErrorKind::Provider
         | ErrorKind::ProviderUnavailable
         | ErrorKind::ProviderExhausted
-        | ErrorKind::ContextOverflow => StatusCode::BAD_GATEWAY,
+        | ErrorKind::ContextOverflow
+        | ErrorKind::OutputCapTooLarge => StatusCode::BAD_GATEWAY,
         ErrorKind::McpUnavailable | ErrorKind::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
         ErrorKind::StreamDetached | ErrorKind::SseLag | ErrorKind::Internal => {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -362,7 +366,7 @@ impl ProblemDetail {
     /// propagate agent-layer errors back to the client. Variants without a dedicated HTTP shape
     /// land on `internal` (500). Refine on demand as new error paths surface.
     ///
-    /// `relay_provider_errors` is `[serve] relay_provider_errors`, and it decides whether the four
+    /// `relay_provider_errors` is `[serve] relay_provider_errors`, and it decides whether the five
     /// upstream arms attach the provider's own response as a `provider_response` extension member.
     /// It does not touch `detail`, which is Meka's own sentence and identical in both states. A
     /// parameter rather than a `From` impl precisely so it cannot be forgotten: a `.into()` that

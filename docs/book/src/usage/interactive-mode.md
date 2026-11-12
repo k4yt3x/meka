@@ -222,9 +222,9 @@ it needs a display on the machine Meka runs on and does not work over SSH; a pat
 attachment is a chip above the text, in the order attached, marked `reading` while the image is
 read beside the screen; **Backspace** on an empty composer drops the last one. **Enter** sends them
 with the words once every one is read; pressed before then, it sends nothing and the row above the
-composer says an image is still being read. A photo is drawn the way up it was taken, and so is a copy Meka
-makes of it for the model, shrunk or converted; one sent as it is keeps the orientation it records,
-for the provider to read. A skill or an MCP prompt typed with them takes them, and gives
+composer says an image is still being read. A photo is drawn the way up it was taken, and so is a
+copy Meka makes of it for the model, shrunk or converted; one sent as it is keeps the orientation it
+records, for the provider to read. A skill or an MCP prompt typed with them takes them, and gives
 them back when it cannot run; any other command is refused while they are attached. The profile has
 to accept images (`[profiles.<name>].vision`), the limits are the HTTP API's, and an image waits for
 the turn to end rather than riding on a steer.
@@ -260,8 +260,8 @@ the turns a [rewind](#rewind) dropped are left out, and one row in their place s
 The screen captures the mouse so that the wheel, a click and a drag reach it. Dragging over the
 transcript selects the text it covers, and releasing copies it: to the terminal's own clipboard
 through the OSC 52 sequence, which works over SSH and inside tmux where they allow it, and to the
-system clipboard where Meka can reach one. The row above the composer says how many rows went. What is copied
-is the text, not the screen: each row from the text edge, without the gutter's marks, and a code
+system clipboard where Meka can reach one. The row above the composer says how many rows went. What
+is copied is the text, not the screen: each row from the text edge, without the gutter's marks, and a code
 block's code as it was written, a line folded at the edge coming back as one line, its indentation
 its own, and the block's shading adding nothing. The terminal's own selection still works with its modifier held (**Shift**; **Option** in iTerm2, **Fn** in
 Terminal.app). Set [`display.mouse = false`](../configuration/config-file.md#displaymouse) to

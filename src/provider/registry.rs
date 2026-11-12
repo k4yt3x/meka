@@ -888,6 +888,9 @@ pub(crate) struct ResolvedProfile {
     /// Whether this profile accepts image input. Hosts check it before accepting attachments; the
     /// agent reports it in each turn's context so image-producing tools have the same guidance.
     pub(crate) vision: bool,
+    /// The output cap the profile states, which its provider sends; `None` where it states none,
+    /// and the backend sends its own default or nothing.
+    pub(crate) max_output_tokens: Option<u64>,
 }
 /// The profile a session runs on.
 ///
@@ -994,6 +997,7 @@ pub(crate) async fn resolved_profile(
             .context_window
             .unwrap_or(crate::config::DEFAULT_CONTEXT_WINDOW),
         vision: settings.vision,
+        max_output_tokens: settings.max_output_tokens,
         profile,
     })
 }
@@ -1196,6 +1200,7 @@ impl PublishedProfile {
             profile: String::new(),
             context_window: 0,
             vision: false,
+            max_output_tokens: None,
         })
     }
 }
@@ -1229,6 +1234,7 @@ mod tests {
             profile: name.to_string(),
             context_window: window,
             vision: true,
+            max_output_tokens: None,
         };
         let cell = super::PublishedProfile::detached(&profile("main", 1_000));
         cell.serve(&profile("backup", 5_000));
@@ -1249,6 +1255,7 @@ mod tests {
             profile: name.to_string(),
             context_window: 1_000,
             vision: true,
+            max_output_tokens: None,
         };
         let cell = super::PublishedProfile::detached(&profile("main"));
         let provider = std::sync::Arc::clone(&cell.named().provider);

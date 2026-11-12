@@ -33,6 +33,26 @@ pub(crate) enum MekaError {
     #[error("context window exceeded: {0}")]
     ContextOverflow(String),
 
+    /// The provider rejected the request as too long, and the output cap the profile states
+    /// explains it: the request is under the compaction ceiling, but beside the cap it runs
+    /// past the context window, which an endpoint that holds the cap back from the window refuses.
+    /// Distinct from [`Self::ContextOverflow`] because compacting is no remedy: the cap is the
+    /// person's choice, and lowering it is. `message` is the provider's own text, for the log and
+    /// a relay.
+    #[error(
+        "profile '{profile}' cannot fit the conversation ({conversation_tokens} tokens) plus \
+         `max_output_tokens` ({max_output_tokens}) in `context_window` ({context_window}); lower \
+         `max_output_tokens`"
+    )]
+    OutputCapTooLarge {
+        profile: String,
+        /// The request's size as Meka counts it, which the provider's own count need not match.
+        conversation_tokens: u64,
+        max_output_tokens: u64,
+        context_window: u64,
+        message: String,
+    },
+
     /// A session exists, but this door may not drive it. Carries the whole refusal, which names
     /// both why and the door that can, so every surface can relay it verbatim.
     ///
@@ -660,6 +680,13 @@ pub(crate) enum ErrorKind {
     /// has nothing to do with the model's window; a request well under one limit routinely exceeds
     /// the other.
     ContextOverflow,
+    /// The upstream rejected the turn as too long over the output cap the profile states rather
+    /// than the conversation: [`MekaError::OutputCapTooLarge`].
+    ///
+    /// A 502 like [`Self::ContextOverflow`], because the upstream is what rejected the turn, and a
+    /// distinct `type` because the remedies differ: compacting does not help, and lowering the
+    /// profile's `max_output_tokens` does.
+    OutputCapTooLarge,
     /// A server marked `[mcp.servers.<name>] required` was not connected when a turn asked for it,
     /// so the turn was refused before anything reached the provider.
     ///
@@ -673,7 +700,7 @@ pub(crate) enum ErrorKind {
 
 impl ErrorKind {
     /// Every entry of the catalog, for a reader that holds a `type` and wants the kind back.
-    pub(crate) const ALL: [Self; 32] = [
+    pub(crate) const ALL: [Self; 33] = [
         Self::Auth,
         Self::AuthScope,
         Self::SessionNotFound,
@@ -704,6 +731,7 @@ impl ErrorKind {
         Self::ProviderUnavailable,
         Self::ProviderExhausted,
         Self::ContextOverflow,
+        Self::OutputCapTooLarge,
         Self::McpUnavailable,
         Self::Internal,
     ];
@@ -747,6 +775,7 @@ impl ErrorKind {
             Self::ProviderUnavailable => "provider-unavailable",
             Self::ProviderExhausted => "provider-exhausted",
             Self::ContextOverflow => "context-overflow",
+            Self::OutputCapTooLarge => "output-cap-too-large",
             Self::McpUnavailable => "mcp-unavailable",
             Self::Internal => "internal",
         }
@@ -785,6 +814,7 @@ impl ErrorKind {
             Self::ProviderUnavailable => "https://meka.bot/errors/provider-unavailable",
             Self::ProviderExhausted => "https://meka.bot/errors/provider-exhausted",
             Self::ContextOverflow => "https://meka.bot/errors/context-overflow",
+            Self::OutputCapTooLarge => "https://meka.bot/errors/output-cap-too-large",
             Self::McpUnavailable => "https://meka.bot/errors/mcp-unavailable",
             Self::Internal => "https://meka.bot/errors/internal",
         }
@@ -823,6 +853,9 @@ impl ErrorKind {
             Self::ProviderUnavailable => "Provider temporarily unavailable",
             Self::ProviderExhausted => "Provider quota exhausted",
             Self::ContextOverflow => "Conversation exceeds the model's context window",
+            Self::OutputCapTooLarge => {
+                "Profile reserves too much of the context window for the reply"
+            }
             Self::McpUnavailable => "Required MCP server is not ready",
             Self::Internal => "Internal server error",
         }
@@ -887,6 +920,7 @@ impl MekaError {
             Self::StreamError(_) | Self::RetryableProvider { .. } => ErrorKind::ProviderUnavailable,
             Self::ProviderExhausted { .. } => ErrorKind::ProviderExhausted,
             Self::ContextOverflow(_) => ErrorKind::ContextOverflow,
+            Self::OutputCapTooLarge { .. } => ErrorKind::OutputCapTooLarge,
             // A fully classified pre-flight refusal: answering "internal server error" would send
             // an operator looking for a bug in Meka instead of at the subprocess that did not
             // start.
@@ -943,6 +977,7 @@ impl MekaError {
             | Self::McpCredentialInTheWay { .. }
             | Self::McpLoginRequired { .. }
             | Self::McpSecretForAnotherUrl { .. }
+            | Self::OutputCapTooLarge { .. }
             | Self::SessionNotFound(_)
             | Self::TurnInFlight { .. } => self.to_string(),
             Self::Provider(_) | Self::InvalidRequest(_) => {
@@ -1036,6 +1071,7 @@ impl MekaError {
             | Self::StreamError(message)
             | Self::RetryableProvider { message, .. }
             | Self::ProviderExhausted { message, .. }
+            | Self::OutputCapTooLarge { message, .. }
             | Self::ContextOverflow(message) => Some(message),
             _ => None,
         }

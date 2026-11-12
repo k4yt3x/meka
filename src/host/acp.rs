@@ -148,7 +148,8 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
         crate::error::ErrorKind::Provider
         | crate::error::ErrorKind::ProviderUnavailable
         | crate::error::ErrorKind::ProviderExhausted
-        | crate::error::ErrorKind::ContextOverflow => {
+        | crate::error::ErrorKind::ContextOverflow
+        | crate::error::ErrorKind::OutputCapTooLarge => {
             withhold_or_relay(&error.sentence(), error.upstream_body().unwrap_or_default())
         }
         // The names travel and the reasons do not: a connector's reason has carried a spawn

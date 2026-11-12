@@ -1005,6 +1005,47 @@ pub(super) fn rejection_may_blame_content(error: &MekaError, content_started: bo
         _ => false,
     }
 }
+impl Agent {
+    /// A rejection for length, as the output cap's where the profile states one that explains it:
+    /// the request is under the compaction ceiling, so by the session's own settings it is not too
+    /// long, but beside the cap it runs past the context window, which an endpoint that holds the
+    /// cap back from the window refuses. Compacting is no remedy then, so the turn is not
+    /// compacted for it. Every other error comes back as it was. Both provider calls, a streamed
+    /// round and a completion, end their failures here with the messages they sent.
+    ///
+    /// The cap and the window are those of the profile the request was sent on, a fallback's
+    /// included, as its provider was built with them. The request is sized by the larger of the
+    /// last measurement and an estimate of `sent`: the measurement predates what the request added
+    /// since (a prompt, tool results), and a session opened from an archive has no measurement at
+    /// all.
+    pub(super) fn attribute_overflow(&self, error: MekaError, sent: &[Message]) -> MekaError {
+        let MekaError::ContextOverflow(message) = error else {
+            return error;
+        };
+        let serving = self.cells.profile.current();
+        let profile = serving.profile;
+        let window = serving.context_window;
+        let cap = serving.max_output_tokens;
+        let size = self
+            .cells
+            .context_occupancy()
+            .max(self.cells.estimate_context_tokens(sent));
+        let ceiling = crate::session::context_ceiling(window, self.options.context_ceiling_percent);
+        match cap {
+            Some(cap) if window > 0 && size <= ceiling && size.saturating_add(cap) > window => {
+                MekaError::OutputCapTooLarge {
+                    profile,
+                    conversation_tokens: size,
+                    max_output_tokens: cap,
+                    context_window: window,
+                    message,
+                }
+            }
+            _ => MekaError::ContextOverflow(message),
+        }
+    }
+}
+
 /// Whether a failed provider call should be retried, and if so, after how long. Pure and
 /// sleep-free so it's unit-testable in isolation from the async retry loops in `run_streaming` and
 /// `run_turn`'s non-streaming branch, which both call this with their current `retries` count

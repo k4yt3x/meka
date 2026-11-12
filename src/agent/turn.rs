@@ -3320,7 +3320,7 @@ impl Agent {
                             deferred_tools = Arc::from(active.deferred_definitions);
                             continue;
                         }
-                        return Err(error);
+                        return Err(self.attribute_overflow(error, &messages));
                     }
                 },
             }
@@ -4361,6 +4361,7 @@ mod tests {
                 profile: "test".to_string(),
                 context_window: 200_000,
                 vision: true,
+                max_output_tokens: None,
             },
         ));
         let (agent, store) =
@@ -5957,6 +5958,7 @@ mod tests {
             profile: "text-only".to_string(),
             context_window: 200_000,
             vision: false,
+            max_output_tokens: None,
         });
         let claimed = claimed_outcome(&store, session_id).await;
         agent
@@ -6405,6 +6407,7 @@ mod tests {
             profile: "text-only".to_string(),
             context_window: 200_000,
             vision,
+            max_output_tokens: None,
         };
         agent.set_provider(text_only(false));
         let refused = agent
@@ -9113,6 +9116,244 @@ mod tests {
         );
     }
 
+    /// An agent on profile 'capped', whose window is 1,000,000 tokens and whose output cap is
+    /// `cap`, over `provider`, compacting at 85 percent of the window when `auto_compact` holds.
+    async fn agent_on_a_capped_profile(
+        provider: Arc<dyn Provider>,
+        cap: Option<u64>,
+        auto_compact: bool,
+    ) -> (Agent, Store) {
+        let store = Store::for_test().await;
+        let providers = Arc::new(crate::provider::ProviderRegistry::for_test_over(
+            [("work".to_string(), crate::config::AccountConfig {
+                backend: "openai-responses".to_string(),
+                ..Default::default()
+            })]
+            .into_iter()
+            .collect(),
+            [("capped".to_string(), crate::config::ProfileConfig {
+                account: "work".to_string(),
+                model: Some("m".to_string()),
+                context_window: Some(1_000_000),
+                max_output_tokens: cap,
+                ..Default::default()
+            })]
+            .into_iter()
+            .collect(),
+            store.token_store(),
+        ));
+        providers.install_scripted_for("capped", provider);
+        let resolved = crate::provider::resolved_profile(&providers, "capped".to_string())
+            .await
+            .expect("the profile resolves");
+        let mut agent = crate::agent::tests::build_test_agent_on(
+            crate::session::SessionMaterials {
+                providers,
+                ..crate::session::SessionMaterials::for_test(store.clone())
+            },
+            resolved,
+            Arc::new(crate::frontend::SilentFrontend),
+            crate::tools::ToolRegistry::new(),
+        );
+        agent.options.auto_compact = auto_compact;
+        agent.options.context_ceiling_percent = 85;
+        (agent, store)
+    }
+
+    /// A round that measures `input_tokens` in context and calls a tool, so the turn asks again.
+    fn a_round_measuring(input_tokens: u64) -> Vec<crate::provider::mock::MockEvent> {
+        use crate::provider::mock::{MockEvent, MockStopReason};
+        vec![
+            MockEvent::Usage { input_tokens },
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: "does_not_exist".to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({}),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::ToolUse,
+            },
+        ]
+    }
+
+    /// A provider's rejection for length, as OpenRouter words one over the output cap.
+    fn a_rejection_for_length() -> crate::provider::mock::MockEvent {
+        crate::provider::mock::MockEvent::FailContextOverflow {
+            message: "This endpoint's maximum context length is 1000000 tokens. However, you \
+                      requested about 1100000 tokens (200000 of text input, 900000 in the output)."
+                .to_string(),
+        }
+    }
+
+    /// A rejection for length that the profile's output cap explains fails the turn naming the
+    /// cap, and nothing is compacted for it: the conversation is under the ceiling, so a summary
+    /// would destroy detail and the next stretch would be rejected the same way.
+    #[tokio::test]
+    async fn a_rejection_the_profile_s_output_cap_explains_fails_the_turn_without_compacting() {
+        use crate::provider::mock::MockProvider;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            a_round_measuring(200_000),
+            vec![a_rejection_for_length()],
+            text_round("the summary"),
+            text_round("done"),
+        ]));
+        let (agent, _store) = agent_on_a_capped_profile(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            Some(900_000),
+            true,
+        )
+        .await;
+        let mut messages = Conversation::new();
+        let error = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("read the log".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("the cap leaves the conversation no room");
+        assert!(
+            matches!(
+                &error,
+                MekaError::OutputCapTooLarge {
+                    profile,
+                    max_output_tokens: 900_000,
+                    context_window: 1_000_000,
+                    ..
+                } if profile == "capped"
+            ),
+            "{error:?}"
+        );
+        assert!(provider.completions().is_empty(), "nothing was summarized");
+        assert!(
+            !messages
+                .events()
+                .iter()
+                .any(|event| matches!(event, crate::conversation::Event::CompactBoundary { .. })),
+            "the conversation was not compacted"
+        );
+    }
+
+    /// Only a cap that explains the rejection takes the blame: none stated, one the conversation
+    /// still fits beside, or a conversation past the ceiling leave it the conversation's.
+    #[tokio::test]
+    async fn a_rejection_for_length_is_the_cap_s_only_where_the_cap_explains_it() {
+        use crate::provider::mock::MockProvider;
+
+        for (cap, measured, blamed) in [
+            (Some(900_000), 200_000, true),
+            (None, 200_000, false),
+            (Some(700_000), 200_000, false),
+            (Some(900_000), 870_000, false),
+        ] {
+            let provider = Arc::new(MockProvider::from_rounds(vec![
+                a_round_measuring(measured),
+                vec![a_rejection_for_length()],
+            ]));
+            let (agent, _store) =
+                agent_on_a_capped_profile(Arc::clone(&provider) as Arc<dyn Provider>, cap, false)
+                    .await;
+            let error = agent
+                .run_turn(
+                    &mut Conversation::new(),
+                    crate::agent::TurnInput::from_parts("read the log".to_string(), Vec::new())
+                        .expect("a prompt"),
+                    crate::agent::TurnCancellation::new(),
+                )
+                .await
+                .expect_err("the rejection ends the turn");
+            assert_eq!(
+                matches!(error, MekaError::OutputCapTooLarge { .. }),
+                blamed,
+                "cap {cap:?} beside {measured} measured: {error:?}"
+            );
+            assert_eq!(
+                matches!(error, MekaError::ContextOverflow(_)),
+                !blamed,
+                "{error:?}"
+            );
+        }
+    }
+
+    /// A session with no measurement yet, such as one opened from an archive, is sized by what its
+    /// request sent: the cap explains a rejection there too.
+    #[tokio::test]
+    async fn a_request_with_nothing_measured_is_sized_by_what_it_sent() {
+        use crate::provider::mock::MockProvider;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            a_rejection_for_length(),
+        ]]));
+        let (agent, _store) = agent_on_a_capped_profile(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            Some(900_000),
+            false,
+        )
+        .await;
+        let mut messages = Conversation::new();
+        messages.append(Message::user("x".repeat(600_000)));
+        messages.append(Message::assistant_text("read"));
+        let error = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go on".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("the cap leaves the conversation no room");
+        assert!(
+            matches!(error, MekaError::OutputCapTooLarge { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// A compaction whose summary request is rejected for length the cap explains fails naming the
+    /// cap too, whatever asked for it.
+    #[tokio::test]
+    async fn a_compaction_rejected_over_the_output_cap_names_the_cap() {
+        use crate::provider::mock::MockProvider;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            a_rejection_for_length(),
+        ]]));
+        let (mut agent, store) = agent_on_a_capped_profile(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            Some(900_000),
+            true,
+        )
+        .await;
+        agent.options.compact_checkpoint = false;
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "capped".to_string())
+                .await
+                .expect("create session"),
+        );
+        agent.cells().record_context_tokens(200_000);
+        let mut messages = Conversation::new();
+        for round in 0..4 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message::assistant_text(format!("answer {round}")));
+        }
+        let error = agent
+            .compact_session(
+                &mut messages,
+                crate::session::CompactRequest::new(crate::conversation::CompactionTrigger::Manual),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the summary request is rejected");
+        assert!(
+            matches!(error, MekaError::OutputCapTooLarge { .. }),
+            "{error:?}"
+        );
+    }
+
     /// A notice is not model output, so it must not disable the turn's retry.
     ///
     /// `content_started` exists to stop a retry double-emitting what the user already saw. The
@@ -10102,6 +10343,7 @@ mod tests {
                     profile: "other".to_string(),
                     context_window: 200_000,
                     vision: true,
+                    max_output_tokens: None,
                 });
             }
             let outcome = ask(&agent, &mut messages, "look", vec![image_source()]).await;
@@ -10153,6 +10395,7 @@ mod tests {
             profile: "other".to_string(),
             context_window: 200_000,
             vision: true,
+            max_output_tokens: None,
         });
         ask(&agent, &mut messages, "look", vec![image_source()])
             .await
@@ -10196,6 +10439,7 @@ mod tests {
             profile: "test-profile".to_string(),
             context_window: 200_000,
             vision: true,
+            max_output_tokens: None,
         });
         ask(&agent, &mut messages, "look", vec![image_source()])
             .await
@@ -10227,6 +10471,7 @@ mod tests {
             profile: "other".to_string(),
             context_window: 200_000,
             vision: true,
+            max_output_tokens: None,
         });
         ask(&agent, &mut messages, "look", vec![image_source()])
             .await
@@ -10271,6 +10516,7 @@ mod tests {
             profile: "other".to_string(),
             context_window: 200_000,
             vision: true,
+            max_output_tokens: None,
         });
         ask(&agent, &mut messages, "look", vec![image_source()])
             .await
@@ -10314,6 +10560,7 @@ mod tests {
                 profile: "renamed".to_string(),
                 context_window: 200_000,
                 vision: true,
+                max_output_tokens: None,
             },
             frontend.clone(),
             crate::tools::ToolRegistry::new(),
@@ -10360,6 +10607,7 @@ mod tests {
                 profile: "other".to_string(),
                 context_window: 200_000,
                 vision: true,
+                max_output_tokens: None,
             },
             frontend.clone(),
             crate::tools::ToolRegistry::new(),
@@ -11326,6 +11574,7 @@ mod tests {
                 profile: "test".to_string(),
                 context_window: 200_000,
                 vision: true,
+                max_output_tokens: None,
             },
         ));
         let (agent, _store) = agent_with_registry_for_test(provider, registry).await;
@@ -13216,6 +13465,7 @@ mod tests {
                 profile: "test-profile".into(),
                 context_window: 200_000,
                 vision,
+                max_output_tokens: None,
             });
             agent
                 .run_turn(

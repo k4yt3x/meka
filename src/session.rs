@@ -743,6 +743,7 @@ mod tests {
             profile: "work".to_string(),
             context_window: 0,
             vision: true,
+            max_output_tokens: None,
         };
         let running = crate::provider::PublishedProfile::detached(&resolved);
         let ended = crate::provider::PublishedProfile::detached(&resolved);
