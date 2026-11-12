@@ -12,14 +12,14 @@ Fetch a web page and return its content as markdown text.
 |------|------|----------|-------------|
 | `url` | string | yes | The URL to fetch |
 | `limit` | integer | no | Maximum characters to return (default: 30000, 0 for no limit) |
-| `headers` | object | no | Custom HTTP headers (overrides defaults like User-Agent) |
+| `headers` | object | no | HTTP headers, each replacing the default header of its name; `Host` and `Accept-Encoding` are refused |
 | `regex` | string | no | If provided, return only matching content (matches joined by newlines) |
 | `raw` | boolean | no | Return raw HTML instead of converting to markdown (default: false) |
 | `scratchpad` | string | no | Save output to the scratchpad under this name |
 
 ### Behavior
 
-- Fetches the page via HTTP GET.
+- Fetches the page via HTTP GET, with Chrome's headers unless [`[web].headers`](../configuration/config-file.md#webheaders) states others.
 - Converts HTML to Markdown using `fast_html2md` (unless `raw` is true). `<nav>` and `<footer>` containers are preserved (rewritten to `<div>` before conversion) so their links survive; `fast_html2md` would otherwise drop those subtrees as boilerplate. `<script>` / `<style>` / `<head>` are still stripped.
 - Resolves root-relative links against the page's final (post-redirect) URL, so a `/docs` href renders as the absolute `https://host/docs` the model can follow directly.
 - Truncates the output to `limit` characters (default: 30,000). When `regex` is given, the pattern runs against the whole document *before* this cap, so `limit` never decides which matches exist; the cap then applies to the joined match list.

@@ -1222,6 +1222,7 @@ impl ToolRegistry {
                 refuse_private_destinations: web_client_config.refuse_private_destinations,
                 refuse_own_addresses,
                 client: web_client,
+                headers: web_client_config.headers.clone(),
             }));
         }
         self.register_builtin(Arc::new(shell::ExecuteCommandTool {

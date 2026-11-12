@@ -36,9 +36,44 @@ use crate::{
 /// Default OAuth token endpoint. Refresh requests POST here as JSON.
 const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-/// `originator` request header value. Mirrors Codex's `codex_cli_rs` slot, flagged as the calling
-/// tool so OpenAI can attribute traffic.
-const ORIGINATOR: &str = "meka_cli";
+/// The `originator` Codex CLI sends, on its requests and in its login URL, which Meka sends as the
+/// official client's.
+pub(crate) const ORIGINATOR: &str = "codex_cli_rs";
+
+/// The Codex CLI release whose user agent Meka's requests carry, moved to the current release at
+/// each parity check against the reference client.
+const CODEX_VERSION: &str = "0.167.0";
+
+/// Codex CLI's user agent for this machine, worked out once as Codex works it out, since reading
+/// the operating system can start a process.
+static CODEX_USER_AGENT: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| codex_user_agent(&os_info::get()));
+
+/// Codex's `get_codex_user_agent`: the originator and release, the operating system's type,
+/// version and architecture as `os_info` names them, and the terminal as `unknown`, the token
+/// Codex sends when it finds none, so nothing of the user's terminal is sent. A character a header
+/// value cannot carry is made `_`.
+fn codex_user_agent(os: &os_info::Info) -> String {
+    let candidate = format!(
+        "{ORIGINATOR}/{CODEX_VERSION} ({} {}; {}) unknown",
+        os.os_type(),
+        os.version(),
+        os.architecture().unwrap_or("unknown")
+    );
+    if reqwest::header::HeaderValue::from_str(&candidate).is_ok() {
+        return candidate;
+    }
+    candidate
+        .chars()
+        .map(|character| {
+            if matches!(character, ' '..='~') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
 
 /// The `chatgpt-subscription` backend: one profile's model and the OAuth credential it bills.
 pub(crate) struct ChatGptSubscriptionProvider {
@@ -65,7 +100,6 @@ pub(crate) struct ChatGptSubscriptionProvider {
     deferred_tools: crate::config::DeferredTools,
     /// See `ProfileConfig::cyber_access_program`; `None` sends no `access_programs`.
     cyber_access_program: Option<String>,
-    user_agent: String,
 }
 
 impl ChatGptSubscriptionProvider {
@@ -120,12 +154,6 @@ impl ChatGptSubscriptionProvider {
             max_request_bytes,
             deferred_tools,
             cyber_access_program,
-            user_agent: format!(
-                "meka/{} ({}; {})",
-                env!("CARGO_PKG_VERSION"),
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            ),
         })
     }
 
@@ -270,7 +298,7 @@ impl ChatGptSubscriptionProvider {
                     .get(&url)
                     .header("Authorization", crate::text::bearer(&access_token))
                     .header("originator", ORIGINATOR)
-                    .header("User-Agent", &self.user_agent)
+                    .header("User-Agent", CODEX_USER_AGENT.as_str())
                     .header("Accept", "application/json");
                 if let Some(account_id) = account_id.as_deref() {
                     request = request.header("ChatGPT-Account-ID", account_id);
@@ -380,7 +408,7 @@ impl ChatGptSubscriptionProvider {
         let mut request = request
             .header("Authorization", crate::text::bearer(access_token))
             .header("originator", ORIGINATOR)
-            .header("User-Agent", &self.user_agent)
+            .header("User-Agent", CODEX_USER_AGENT.as_str())
             .header("Accept", "text/event-stream");
         // No `Content-Type` here: the shared send in `responses_wire` sets it when it attaches the
         // serialized body, and `reqwest` appends a second header rather than replacing the first,
@@ -771,6 +799,16 @@ mod tests {
 
     use super::*;
     use crate::provider::{StopReason, aggregate_stream};
+
+    /// Codex's user agent: its originator and release, the operating system as `os_info` names
+    /// it, and the terminal as Codex names none.
+    #[test]
+    fn the_user_agent_is_codex_s() {
+        assert_eq!(
+            codex_user_agent(&os_info::Info::with_type(os_info::Type::Arch)),
+            format!("codex_cli_rs/{CODEX_VERSION} (Arch Linux Unknown; unknown) unknown")
+        );
+    }
 
     fn credential_for_test() -> AuthCredential {
         AuthCredential::OAuthToken {

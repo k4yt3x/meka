@@ -820,7 +820,9 @@ pub(crate) fn streaming_enabled(no_stream_flag: bool, configured: Option<bool>) 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WebConfig {
-    pub(crate) user_agent: Option<String>,
+    /// The headers `web_fetch` sends, in the order written, in place of Meka's own set as a
+    /// whole. Unset sends Chrome's; see [`default_web_headers`].
+    pub(crate) headers: Option<WebHeaders>,
     /// Total request budget: connect, TLS and read. Default `"30s"`; `"0s"` is refused at
     /// startup.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
@@ -888,7 +890,8 @@ impl MinTlsVersion {
 /// by `crate::tools::web::build_web_client` at registry-build time.
 #[derive(Debug, Clone)]
 pub(crate) struct WebClientConfig {
-    pub(crate) user_agent: String,
+    /// The headers every fetch starts from, in order: `[web].headers`, else Chrome's.
+    pub(crate) headers: reqwest::header::HeaderMap,
     pub(crate) request_timeout: std::time::Duration,
     pub(crate) connect_timeout: Option<std::time::Duration>,
     pub(crate) read_timeout: Option<std::time::Duration>,
@@ -907,7 +910,7 @@ pub(crate) struct WebClientConfig {
 impl Default for WebClientConfig {
     fn default() -> Self {
         Self {
-            user_agent: DEFAULT_WEB_USER_AGENT.to_string(),
+            headers: default_web_headers(),
             request_timeout: DEFAULT_WEB_REQUEST_TIMEOUT,
             connect_timeout: None,
             read_timeout: None,
@@ -927,11 +930,6 @@ impl WebClientConfig {
     /// Build a resolved config from the TOML section. Invalid `min_tls_version` strings log a warn
     /// and fall through to reqwest's default rather than aborting startup.
     pub(crate) fn from_file(file: &WebConfig) -> Self {
-        let user_agent = file
-            .user_agent
-            .clone()
-            .unwrap_or_else(|| DEFAULT_WEB_USER_AGENT.to_string());
-
         let min_tls_version =
             file.min_tls_version
                 .as_deref()
@@ -946,7 +944,10 @@ impl WebClientConfig {
                 });
 
         Self {
-            user_agent,
+            headers: file
+                .headers
+                .as_ref()
+                .map_or_else(default_web_headers, |headers| headers.0.clone()),
             // A zero is carried through rather than filtered: `ResolvedConfig::validate` refuses
             // it, and filtering here is what let a `0` silently mean "the default".
             request_timeout: file.request_timeout.unwrap_or(DEFAULT_WEB_REQUEST_TIMEOUT),
@@ -972,9 +973,128 @@ impl WebClientConfig {
     }
 }
 
-/// Default UA for the web tools when `[web].user_agent` is unset. Kept in sync with what real
-/// Chrome emits so anti-bot filters don't single out Meka by default.
-pub(crate) const DEFAULT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+/// `[web].headers`: header names to values, in the order the file writes them, every name a
+/// header's and once only, and neither of the two [`is_reserved_web_header`] names.
+#[derive(Debug, Clone)]
+pub(crate) struct WebHeaders(reqwest::header::HeaderMap);
+
+impl<'de> Deserialize<'de> for WebHeaders {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Headers;
+        impl<'de> serde::de::Visitor<'de> for Headers {
+            type Value = WebHeaders;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a table of header names and their values")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut entries: A,
+            ) -> std::result::Result<WebHeaders, A::Error> {
+                use serde::de::Error;
+                let mut headers = reqwest::header::HeaderMap::new();
+                while let Some((name, value)) = entries.next_entry::<String, String>()? {
+                    let Ok(header) = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    else {
+                        return Err(A::Error::custom(format!("'{name}' is not a header name")));
+                    };
+                    if is_reserved_web_header(&header) {
+                        return Err(A::Error::custom(format!(
+                            "`{name}` is set by Meka on every request; remove it"
+                        )));
+                    }
+                    if headers.contains_key(&header) {
+                        return Err(A::Error::custom(format!("`{name}` is given twice")));
+                    }
+                    let Ok(value) = reqwest::header::HeaderValue::from_str(&value) else {
+                        return Err(A::Error::custom(format!(
+                            "the value of `{name}` is not a header value"
+                        )));
+                    };
+                    headers.insert(header, value);
+                }
+                Ok(WebHeaders(headers))
+            }
+        }
+        deserializer.deserialize_map(Headers)
+    }
+}
+
+/// Whether `name` is a header Meka sets on every `web_fetch` request, so neither `[web].headers`
+/// nor a call may: `Host` comes from the URL, and one given is sent to every site and every
+/// redirect alike; `Accept-Encoding` names the encodings Meka decodes, and a response in another
+/// would reach the model still compressed.
+pub(crate) fn is_reserved_web_header(name: &reqwest::header::HeaderName) -> bool {
+    name == reqwest::header::HOST || name == reqwest::header::ACCEPT_ENCODING
+}
+
+/// The Chrome major version [`DEFAULT_WEB_HEADERS`] claims. A macro, so `User-Agent` and
+/// `Sec-Ch-Ua` are written from one literal and cannot disagree; an outdated Chrome is a mark of a
+/// bot, so it is moved to the current stable release before each Meka release.
+macro_rules! chrome_major {
+    () => {
+        "157"
+    };
+}
+
+/// The headers `web_fetch` sends when `[web].headers` is unset: Chrome's for a top-level navigation
+/// on Windows, in the order Chrome sends them over HTTPS, named in lowercase as a header map holds
+/// them. Sites that turn away a client claiming to be a browser without a browser's headers serve
+/// this set. Two things differ from Chrome's, for the same reason: `Accept-Encoding` is left to the
+/// client, which sends the encodings it decodes, and `Accept` leaves out AVIF and JPEG XL, which
+/// Meka cannot read and an image server choosing a format from `Accept` would otherwise send.
+pub(crate) const DEFAULT_WEB_HEADERS: [(&str, &str); 12] = [
+    (
+        "sec-ch-ua",
+        concat!(
+            "\"Not-A.Brand\";v=\"99\", \"Google Chrome\";v=\"",
+            chrome_major!(),
+            "\", \"Chromium\";v=\"",
+            chrome_major!(),
+            "\""
+        ),
+    ),
+    ("sec-ch-ua-mobile", "?0"),
+    ("sec-ch-ua-platform", "\"Windows\""),
+    ("upgrade-insecure-requests", "1"),
+    (
+        "user-agent",
+        concat!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/",
+            chrome_major!(),
+            ".0.0.0 Safari/537.36"
+        ),
+    ),
+    (
+        "accept",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,\
+         application/signed-exchange;v=b3;q=0.7",
+    ),
+    ("sec-fetch-site", "none"),
+    ("sec-fetch-mode", "navigate"),
+    ("sec-fetch-user", "?1"),
+    ("sec-fetch-dest", "document"),
+    ("accept-language", "en-US,en;q=0.9"),
+    ("priority", "u=0, i"),
+];
+
+/// [`DEFAULT_WEB_HEADERS`] as a header map, in its order.
+pub(crate) fn default_web_headers() -> reqwest::header::HeaderMap {
+    DEFAULT_WEB_HEADERS
+        .iter()
+        .map(|(name, value)| {
+            (
+                reqwest::header::HeaderName::from_static(name),
+                reqwest::header::HeaderValue::from_static(value),
+            )
+        })
+        .collect()
+}
+
 /// `[web].request_timeout` when unset.
 pub(crate) const DEFAULT_WEB_REQUEST_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
@@ -4062,7 +4182,6 @@ mod tests {
     fn web_config_all_fields_parse() {
         let toml_str = r#"
 [web]
-user_agent = "meka-test"
 request_timeout = "60s"
 connect_timeout = "5s"
 read_timeout = "10s"
@@ -4076,7 +4195,6 @@ danger_accept_invalid_hostnames = true
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("parse toml");
         let web = config.web.expect("web present");
-        assert_eq!(web.user_agent.as_deref(), Some("meka-test"));
         assert_eq!(
             web.request_timeout,
             Some(std::time::Duration::from_secs(60))
@@ -4097,7 +4215,10 @@ danger_accept_invalid_hostnames = true
         // Empty [web] → sensible defaults; no user-surprising failures.
         let file = WebConfig::default();
         let config = WebClientConfig::from_file(&file);
-        assert_eq!(config.user_agent, DEFAULT_WEB_USER_AGENT);
+        assert_eq!(
+            config.headers.get("user-agent"),
+            default_web_headers().get("user-agent")
+        );
         assert_eq!(config.request_timeout, std::time::Duration::from_secs(30));
         assert!(config.connect_timeout.is_none());
         assert!(config.read_timeout.is_none());
@@ -4113,7 +4234,14 @@ danger_accept_invalid_hostnames = true
     #[test]
     fn web_client_config_resolves_full_file() {
         let file = WebConfig {
-            user_agent: Some("ua".to_string()),
+            headers: Some(WebHeaders(
+                [(
+                    reqwest::header::USER_AGENT,
+                    reqwest::header::HeaderValue::from_static("ua"),
+                )]
+                .into_iter()
+                .collect(),
+            )),
             request_timeout: Some(std::time::Duration::from_secs(60)),
             connect_timeout: Some(std::time::Duration::from_secs(5)),
             read_timeout: Some(std::time::Duration::from_secs(10)),
@@ -4127,7 +4255,15 @@ danger_accept_invalid_hostnames = true
             refuse_private_destinations: None,
         };
         let config = WebClientConfig::from_file(&file);
-        assert_eq!(config.user_agent, "ua");
+        assert_eq!(
+            config
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes()))
+                .collect::<Vec<_>>(),
+            [("user-agent", b"ua".as_slice())],
+            "a stated set replaces Meka's whole"
+        );
         assert_eq!(config.request_timeout, std::time::Duration::from_secs(60));
         assert_eq!(
             config.connect_timeout,
@@ -4147,6 +4283,73 @@ danger_accept_invalid_hostnames = true
         assert_eq!(config.min_tls_version, Some(MinTlsVersion::V1_3));
         assert!(config.danger_accept_invalid_certs);
         assert!(config.danger_accept_invalid_hostnames);
+    }
+
+    /// `[web].headers` keeps the order the file writes; an empty table is a set of none, and unset
+    /// is Chrome's. A name given twice in any case, a name or a value a header cannot carry, a
+    /// value that is not a string and a header Meka sets itself are refused naming the key.
+    #[test]
+    fn web_headers_keep_their_order_and_refuse_what_a_request_cannot_carry() {
+        let headers = |text: &str| -> Option<reqwest::header::HeaderMap> {
+            let config: ConfigFile = toml::from_str(text).expect("parse");
+            config
+                .web
+                .and_then(|web| web.headers)
+                .map(|headers| headers.0)
+        };
+        let names = |map: reqwest::header::HeaderMap| -> Vec<String> {
+            map.keys().map(ToString::to_string).collect()
+        };
+        assert_eq!(
+            headers("[web.headers]\nZ-Last = \"1\"\nA-First = \"2\"\nM-Middle = \"3\"\n")
+                .map(names),
+            Some(vec![
+                "z-last".to_string(),
+                "a-first".to_string(),
+                "m-middle".to_string()
+            ])
+        );
+        assert_eq!(
+            headers("[web]\nheaders = {}\n").map(|map| map.len()),
+            Some(0)
+        );
+        assert!(
+            default_web_headers()
+                .keys()
+                .all(|name| !is_reserved_web_header(name)),
+            "Meka's own set leaves the reserved headers to the client"
+        );
+        // A server that picks an image's format from `Accept` picks one Meka reads; an APNG is
+        // no format a server converts to, only one it serves as it is.
+        let accept = default_web_headers()
+            .get(reqwest::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .expect("an Accept");
+        for media_type in accept
+            .split(',')
+            .filter_map(|item| item.split(';').next())
+            .filter(|media_type| media_type.starts_with("image/") && *media_type != "image/apng")
+        {
+            assert!(
+                crate::image::is_raster_media_type(media_type),
+                "{media_type} is advertised but cannot be read"
+            );
+        }
+        for (text, key) in [
+            ("[web.headers]\nHost = \"example.org\"\n", "Host"),
+            (
+                "[web.headers]\naccept-encoding = \"zstd\"\n",
+                "accept-encoding",
+            ),
+            ("[web.headers]\nX-A = \"1\"\nx-a = \"2\"\n", "x-a"),
+            ("[web.headers]\n\"Bad Name\" = \"1\"\n", "Bad Name"),
+            ("[web.headers]\nX-Bad = \"line\\nbreak\"\n", "X-Bad"),
+            ("[web.headers]\nX-Number = 1\n", "integer"),
+        ] {
+            let error = toml::from_str::<ConfigFile>(text).expect_err("refused");
+            assert!(error.to_string().contains(key), "{text}: {error}");
+        }
     }
 
     #[test]

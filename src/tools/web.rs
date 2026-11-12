@@ -242,8 +242,10 @@ pub(crate) fn build_web_client(
     config: &WebClientConfig,
     refuse_own_addresses: bool,
 ) -> Result<reqwest::Client> {
+    // Title case on HTTP/1.1, as browsers and curl write header names; HTTP/2 lowercases every
+    // name by its spec. The headers themselves are each request's, from the tool's own set.
     let mut builder = reqwest::Client::builder()
-        .user_agent(&config.user_agent)
+        .http1_title_case_headers()
         .timeout(config.request_timeout);
     // The guard has two doors here, since hyper resolves a name through the client's resolver and
     // connects to a literal address without asking it: the resolver below judges every name, and
@@ -401,25 +403,46 @@ fn html_to_markdown(html: &str, base_url: &Option<url::Url>) -> String {
 /// parameter unwrap and the description shown to the agent. Pass `0` to disable the cap.
 const DEFAULT_LIMIT_CHARS: usize = 30_000;
 
-/// `builder` with the call's `headers`, refused naming the field when they are not an object of
-/// strings: a header dropped would send the request without what it asked for.
-fn apply_headers(
-    mut builder: reqwest::RequestBuilder,
+/// The headers a call sends: `defaults` in their order, with each one the call's `headers` names
+/// replaced where it stands, then the call's other headers. Refused naming the field when they are
+/// not an object of strings, or name a header that is not one or that Meka sets itself: a header
+/// dropped would send the request without what it asked for.
+fn request_headers(
+    defaults: &reqwest::header::HeaderMap,
     input: &serde_json::Value,
-) -> Result<reqwest::RequestBuilder> {
-    let Some(headers) = optional_object(input, "headers", "web_fetch")? else {
-        return Ok(builder);
+) -> Result<reqwest::header::HeaderMap> {
+    let mut headers = defaults.clone();
+    let Some(given) = optional_object(input, "headers", "web_fetch")? else {
+        return Ok(headers);
     };
-    for (name, value) in headers {
+    let refused = |message: String| MekaError::ToolExecution {
+        tool_name: "web_fetch".to_string(),
+        message,
+    };
+    for (name, value) in given {
         let Some(value) = value.as_str() else {
-            return Err(MekaError::ToolExecution {
-                tool_name: "web_fetch".to_string(),
-                message: "every value in 'headers' must be a string".to_string(),
-            });
+            return Err(refused(
+                "every value in 'headers' must be a string".to_string(),
+            ));
         };
-        builder = builder.header(name.as_str(), value);
+        let Ok(header) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            return Err(refused(format!(
+                "'{name}' in 'headers' is not a header name"
+            )));
+        };
+        if crate::config::is_reserved_web_header(&header) {
+            return Err(refused(format!(
+                "`{name}` is set by Meka on every request; leave it out of 'headers'"
+            )));
+        }
+        let Ok(value) = reqwest::header::HeaderValue::from_str(value) else {
+            return Err(refused(format!(
+                "the value of '{name}' in 'headers' is not a header value"
+            )));
+        };
+        headers.insert(header, value);
     }
-    Ok(builder)
+    Ok(headers)
 }
 
 pub(super) struct FetchUrlTool {
@@ -430,6 +453,8 @@ pub(super) struct FetchUrlTool {
     /// how the tool holds `[permissions].network = "remote"`.
     pub(super) refuse_own_addresses: bool,
     pub(crate) client: reqwest::Client,
+    /// The headers every fetch starts from: `[web].headers`, else Chrome's.
+    pub(super) headers: reqwest::header::HeaderMap,
 }
 
 #[async_trait]
@@ -455,7 +480,7 @@ impl Tool for FetchUrlTool {
                     },
                     "headers": {
                         "type": "object",
-                        "description": "Optional HTTP headers. Overrides defaults (e.g., User-Agent).",
+                        "description": "HTTP headers, each replacing the default header of its name.",
                         "additionalProperties": { "type": "string" }
                     },
                     "regex": {
@@ -529,9 +554,12 @@ impl crate::tools::Detachable for FetchUrlTool {
         let pattern = optional_str(&input, "regex", "web_fetch")?
             .map(|pattern| compile_user_regex(pattern, "web_fetch"))
             .transpose()?;
-        // Built here, since the builder holds a malformed URL or header until it is asked for the
-        // request, and the run would only find out when it sent it.
-        let request = apply_headers(self.client.get(&url), &input)?
+        // Built here, since the builder holds a malformed URL until it is asked for the request,
+        // and the run would only find out when it sent it.
+        let request = self
+            .client
+            .get(&url)
+            .headers(request_headers(&self.headers, &input)?)
             .build()
             .map_err(|error| fetch_failure(&url, &error))?;
         let client = self.client.clone();
@@ -1007,65 +1035,139 @@ mod tests {
         assert!(build_web_client(&config, false).is_ok());
     }
 
+    /// A header map of `pairs`, in their order.
+    fn header_map(pairs: &[(&'static str, &'static str)]) -> reqwest::header::HeaderMap {
+        pairs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    reqwest::header::HeaderName::from_static(name),
+                    reqwest::header::HeaderValue::from_static(value),
+                )
+            })
+            .collect()
+    }
+
+    /// The names and values of `headers`, in their order.
+    fn pairs_of(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string(),
+                    value.to_str().expect("visible ASCII").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// A call's header replaces the default of its name where it stands, whatever its case, and
+    /// one the defaults lack goes after them; with none given the defaults go as they are.
     #[test]
-    fn apply_headers_adds_headers() {
-        let client = reqwest::Client::new();
+    fn a_call_s_headers_replace_the_defaults_of_their_names_in_place() {
+        let defaults = header_map(&[
+            ("user-agent", "browser"),
+            ("accept", "text/html"),
+            ("accept-language", "en"),
+        ]);
         let input = serde_json::json!({
-            "url": "https://example.com",
-            "headers": {
-                "X-Custom": "test-value",
-                "Accept-Language": "en-US"
-            }
+            "headers": { "Accept": "application/json", "Authorization": "Bearer x" }
         });
-        let request = apply_headers(client.get("https://example.com"), &input)
-            .unwrap()
-            .build()
-            .unwrap();
-        assert_eq!(request.headers().get("X-Custom").unwrap(), "test-value");
-        assert_eq!(request.headers().get("Accept-Language").unwrap(), "en-US");
+        assert_eq!(
+            pairs_of(&request_headers(&defaults, &input).expect("headers")),
+            [
+                ("user-agent", "browser"),
+                ("accept", "application/json"),
+                ("accept-language", "en"),
+                ("authorization", "Bearer x"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+        );
+        assert_eq!(
+            pairs_of(&request_headers(&defaults, &serde_json::json!({})).expect("headers")),
+            pairs_of(&defaults)
+        );
     }
 
+    /// Headers of another shape, a value that is not a string or not a header value, a name that
+    /// is not a header's, and a header Meka sets itself are refused rather than left off the
+    /// request.
     #[test]
-    fn apply_headers_overrides_user_agent() {
-        let client = reqwest::Client::builder()
-            .user_agent("default-agent")
-            .build()
-            .unwrap();
-        let input = serde_json::json!({
-            "headers": { "User-Agent": "custom-agent" }
-        });
-        let request = apply_headers(client.get("https://example.com"), &input)
-            .unwrap()
-            .build()
-            .unwrap();
-        assert_eq!(request.headers().get("User-Agent").unwrap(), "custom-agent");
-    }
-
-    #[test]
-    fn apply_headers_no_headers() {
-        let client = reqwest::Client::new();
-        let input = serde_json::json!({"url": "https://example.com"});
-        let request = apply_headers(client.get("https://example.com"), &input)
-            .unwrap()
-            .build()
-            .unwrap();
-        assert!(request.headers().get("X-Custom").is_none());
-    }
-
-    /// Headers of another shape, or a value that is not a string, are refused rather than left
-    /// off the request.
-    #[test]
-    fn headers_that_are_not_an_object_of_strings_are_refused() {
-        let client = reqwest::Client::new();
+    fn headers_a_request_cannot_carry_are_refused() {
         for headers in [
             serde_json::json!({ "X-Valid": "good", "X-Invalid": 123 }),
             serde_json::json!("{\"Authorization\": \"Bearer x\"}"),
+            serde_json::json!({ "X-Bad": "line\nbreak" }),
+            serde_json::json!({ "Bad Name": "value" }),
+            serde_json::json!({ "Host": "example.org" }),
+            serde_json::json!({ "accept-encoding": "zstd" }),
         ] {
             let input = serde_json::json!({ "headers": headers });
             let refused =
-                apply_headers(client.get("https://example.com"), &input).expect_err("refused");
+                request_headers(&reqwest::header::HeaderMap::new(), &input).expect_err("refused");
             assert!(refused.to_string().contains("headers"), "{refused}");
         }
+    }
+
+    /// A fetch sends its headers in their order, title-cased on HTTP/1.1, with the encodings the
+    /// client decodes added by the client.
+    #[tokio::test]
+    async fn a_fetch_sends_its_headers_in_order_and_title_cased() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+                )
+                .await
+                .expect("answer");
+            String::from_utf8(request).expect("an ASCII request")
+        });
+        let tool = FetchUrlTool {
+            refuse_private_destinations: false,
+            refuse_own_addresses: false,
+            client: build_web_client(&WebClientConfig::default(), false).expect("client"),
+            headers: header_map(&[("sec-ch-ua-mobile", "?0"), ("user-agent", "browser")]),
+        };
+        tool.execute(
+            serde_json::json!({ "url": format!("http://{address}/"), "headers": { "X-Last": "1" } }),
+            crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new()),
+        )
+        .await
+        .expect("the fetch answers");
+        let request = peer.await.expect("the peer read the request");
+        let names: Vec<&str> = request
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+            .filter(|name| *name != "Host")
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Sec-Ch-Ua-Mobile",
+                "User-Agent",
+                "X-Last",
+                "Accept",
+                "Accept-Encoding"
+            ],
+            "{request}"
+        );
     }
 
     #[test]
@@ -1100,6 +1202,7 @@ mod tests {
 
             refuse_own_addresses: false,
             client: reqwest::Client::new(),
+            headers: reqwest::header::HeaderMap::new(),
         };
         let def = tool.definition();
         let props = &def.parameters["properties"];
@@ -1118,13 +1221,20 @@ mod tests {
             refuse_private_destinations: false,
             refuse_own_addresses: false,
             client: build_web_client(&WebClientConfig::default(), false).expect("client"),
+            headers: crate::config::default_web_headers(),
         };
-        for input in [
-            serde_json::json!({ "url": "example.com/page" }),
-            serde_json::json!({
-                "url": "https://example.com/",
-                "headers": { "X-Bad": "line\nbreak" },
-            }),
+        for (input, says) in [
+            (
+                serde_json::json!({ "url": "example.com/page" }),
+                "failed to fetch",
+            ),
+            (
+                serde_json::json!({
+                    "url": "https://example.com/",
+                    "headers": { "X-Bad": "line\nbreak" },
+                }),
+                "not a header value",
+            ),
         ] {
             let refused = tool
                 .start(
@@ -1135,7 +1245,7 @@ mod tests {
                 )
                 .await;
             assert!(
-                matches!(&refused, Err(error) if error.to_string().contains("failed to fetch")),
+                matches!(&refused, Err(error) if error.to_string().contains(says)),
                 "{input}"
             );
         }
@@ -1159,6 +1269,7 @@ mod tests {
 
             refuse_own_addresses: false,
             client: build_web_client(&WebClientConfig::default(), false).expect("client"),
+            headers: crate::config::default_web_headers(),
         };
         let cancellation = tokio_util::sync::CancellationToken::new();
         let stop = tokio::spawn({
@@ -1441,6 +1552,7 @@ mod tests {
                 refuse_private_destinations: refuse_private,
                 refuse_own_addresses: refuse_own,
                 client: build_web_client(&config, refuse_own).expect("client"),
+                headers: config.headers.clone(),
             };
             let error = tool
                 .execute(

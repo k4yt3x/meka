@@ -17,6 +17,14 @@ over its profile's `max_output_tokens` records why; nothing converts. 0.93 refus
 opened; downgrading means restoring the backup the upgrade took. Session archives are
 `format_version` 28; a 0.93 archive (27) imports as it is, and 0.93 refuses a 28.
 
+**`[web].user_agent` is `[web].headers`.** Meka refuses a `config.toml` that still sets
+`user_agent`, naming the key's line. `web_fetch` now sends Chrome's whole set of headers by
+default, not its user agent alone, so a file that only restated the default can drop the line. To
+send another user agent, write a `[web.headers]` table: it replaces Meka's set whole, so copy the
+set from [`web.headers`](../configuration/config-file.md#webheaders) and change `user-agent` in it,
+or write the few headers you want sent. A `web_fetch` call that names `Host` or `Accept-Encoding`
+in its `headers` is refused, since Meka sets both.
+
 **`[display].prompt_padding` takes a word.** It is `"none"`, `"half"` or `"full"`, and Meka refuses
 a `config.toml` that still sets `true` or `false`, naming the key's line. Replace `true` with
 `"full"` to keep a whole row of gray above and below the words, or remove the line for the new

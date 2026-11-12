@@ -17,8 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** `[display].prompt_padding` takes `none`, `half` or `full`; see the upgrade guide.
+- **Breaking:** `[web].user_agent` is `[web].headers`, a table of headers; see the upgrade guide.
 - The composer and sent prompts have half a row of gray above and below their words by default.
 - Hints such as `Copied 3 rows` show above the composer, no longer over the context gauge.
+- `web_fetch` sends the headers Chrome sends for a page opened in a tab, not its user agent alone.
+- `web_fetch` refuses `Host` and `Accept-Encoding` in a call's `headers`, since Meka sets both.
+- `chatgpt-subscription` sends Codex CLI's `originator` and user agent where it sent Meka's.
 - Session archives are `format_version` 28; older archives are brought forward on import.
 
 ### Fixed

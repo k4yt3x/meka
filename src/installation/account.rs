@@ -1215,7 +1215,10 @@ fn build_codex_authorize_url(
         .append_pair("id_token_add_organizations", "true")
         .append_pair("codex_cli_simplified_flow", "true")
         .append_pair("state", state)
-        .append_pair("originator", "meka_cli");
+        .append_pair(
+            "originator",
+            crate::provider::openai::subscription::ORIGINATOR,
+        );
     Ok(url.to_string())
 }
 
@@ -2278,7 +2281,7 @@ mod tests {
         assert!(url.contains("client_id=app_test"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("id_token_add_organizations=true"));
-        assert!(url.contains("originator=meka_cli"));
+        assert!(url.contains("originator=codex_cli_rs"));
     }
 
     #[test]

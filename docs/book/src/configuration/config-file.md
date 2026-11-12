@@ -1287,7 +1287,7 @@ Settings for the HTTP client `web_fetch` uses. All keys are optional; unset fiel
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
-| `user_agent` | string | Real Chrome UA | Some sites block non-browser UAs. Override if you need a specific identifier. |
+| `headers` | table | Chrome's | The headers every fetch sends, in the order written. Set, it replaces Meka's set whole; `{}` sends none. `Host` and `Accept-Encoding` are Meka's and refused. See below. |
 | `request_timeout` | duration | `"30s"` | Total request budget (connect + TLS + read). `"0s"` is refused at startup. |
 | `connect_timeout` | duration | unset | Separate cap on TCP + TLS handshake. Fail fast on unreachable hosts without shortening the whole request budget. `"0s"` is refused at startup. |
 | `read_timeout` | duration | unset | Per-chunk idle timeout. Catches bodies that stall mid-stream. `"0s"` is refused at startup. |
@@ -1299,6 +1299,44 @@ Settings for the HTTP client `web_fetch` uses. All keys are optional; unset fiel
 | `danger_accept_invalid_certs` | bool | `false` | **DANGEROUS.** Disable TLS certificate validation entirely. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
 | `danger_accept_invalid_hostnames` | bool | `false` | **DANGEROUS.** Accept certificates whose hostname doesn't match. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
 | `refuse_private_destinations` | bool | `false` | Refuse a fetch whose destination is a loopback, private, link-local, carrier-grade NAT or unspecified address, judged on every connection: the URL as given, every redirect hop, and every address a host name resolves to, so a name that answers differently twice cannot slip past. Off by default, since a local service is often exactly what a fetch is for. With `proxy` set, the proxy resolves the target and the guard sees only the proxy's own name, which it judges too: a proxy on this machine is named by its address, `127.0.0.1`, not `localhost`. |
+
+### `web.headers`
+
+Unset, `web_fetch` sends the headers Chrome sends for a page opened in a tab, in Chrome's order:
+
+```toml
+[web.headers]
+sec-ch-ua = '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"'
+sec-ch-ua-mobile = "?0"
+sec-ch-ua-platform = '"Windows"'
+upgrade-insecure-requests = "1"
+user-agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+sec-fetch-site = "none"
+sec-fetch-mode = "navigate"
+sec-fetch-user = "?1"
+sec-fetch-dest = "document"
+accept-language = "en-US,en;q=0.9"
+priority = "u=0, i"
+```
+
+Many sites turn away a client that claims to be a browser without sending a browser's headers. The
+Chrome version moves with Meka's releases. `accept` leaves out the AVIF and JPEG XL that Chrome
+names, since an image server that picks a format from it would send one `web_fetch` cannot read. A
+table you set replaces this one whole rather than changing one header in it, since a mix of two
+clients' headers is easy to tell apart from either; copy the set above to change part of it. Every
+request also carries `Host`, from the URL, and `Accept-Encoding`, naming the encodings Meka decodes,
+and `Accept: */*` when the table names no `Accept`. Names go out title-cased on HTTP/1.1 and
+lowercase on HTTP/2, as its spec requires. A `web_fetch` call's own `headers` replace the ones of
+the same name for that request.
+
+### Example: identify as curl
+
+```toml
+[web.headers]
+User-Agent = "curl/8.18.0"
+Accept = "*/*"
+```
 
 ### Example: corporate proxy with a private CA
 
