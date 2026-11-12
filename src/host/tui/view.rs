@@ -10,7 +10,7 @@ use std::{
 
 use ratatui::{
     Frame,
-    buffer::{Buffer, CellDiffOption},
+    buffer::{Buffer, Cell, CellDiffOption},
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -22,6 +22,7 @@ use super::{
     model::{Entry, Item, RanUnder, ToolState, Transcript},
 };
 use crate::{
+    config::PromptPadding,
     frontend::FrontendEvent,
     render::tui::{self as draw, ACT_GLYPH, ERROR_GLYPH, TEXT_EDGE, WARNING_GLYPH, gray},
     store::inbox::InboxClass,
@@ -99,7 +100,11 @@ fn text_rows(text: &str, streaming: bool, width: usize, reasoning: bool) -> Vec<
 /// an opened thinking block and a compaction's summary, drawn as markdown, a prompt, whose
 /// padding copies as nothing, and a picture, whose half blocks are no text. `None` for any other
 /// item, whose rows all copy as text. `prompt_padding` is `[display].prompt_padding`.
-fn copied_rows_of(entry: &Entry, width: usize, prompt_padding: bool) -> Option<Vec<draw::Row>> {
+fn copied_rows_of(
+    entry: &Entry,
+    width: usize,
+    prompt_padding: PromptPadding,
+) -> Option<Vec<draw::Row>> {
     let inner = width.max(1).saturating_sub(TEXT_EDGE).max(1);
     match &entry.item {
         Item::Prompt {
@@ -158,22 +163,65 @@ fn ran_under_color(ran_under: RanUnder) -> Color {
     }
 }
 
+/// A sent prompt's block: the composer's gray, the words in white rather than the terminal's
+/// foreground so they stand out of it.
+const PROMPT_BLOCK: Style = Style::new().fg(draw::WHITE).bg(COMPOSER_BACKGROUND);
+/// The glyph of a half padding row above the words: the cell's lower half, next to them.
+const HALF_PADDING_ABOVE: &str = "▄";
+/// The glyph of a half padding row below the words: the cell's upper half.
+const HALF_PADDING_BELOW: &str = "▀";
+/// A half padding row's cells: the glyph's half in the composer's gray, the other half the
+/// terminal's own background.
+const HALF_PADDING: Style = Style::new().fg(COMPOSER_BACKGROUND).bg(Color::Reset);
+
+/// Which side of the words a padding row is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaddingSide {
+    Above,
+    Below,
+}
+
+/// A padding row of `PromptPadding::Half` at `width`: the half of each cell next to the words in
+/// the composer's gray, the other half left to the terminal, so the block seems to start half a
+/// row from the words.
+pub(crate) fn half_padding_row(side: PaddingSide, width: usize) -> Line<'static> {
+    let glyph = match side {
+        PaddingSide::Above => HALF_PADDING_ABOVE,
+        PaddingSide::Below => HALF_PADDING_BELOW,
+    };
+    Line::from(Span::styled(glyph.repeat(width), HALF_PADDING))
+}
+
+/// Light `cell` as part of a selection, its colors swapped. A cell of a half padding row is lit as
+/// a cell of a whole one: swapped as drawn, its gray would move to the half away from the words and
+/// leave a dark line across the selection.
+pub(crate) fn light_selected(cell: &mut Cell) {
+    if matches!(cell.symbol(), HALF_PADDING_ABOVE | HALF_PADDING_BELOW)
+        && Some(cell.fg) == HALF_PADDING.fg
+        && Some(cell.bg) == HALF_PADDING.bg
+    {
+        cell.set_symbol(" ");
+        cell.set_style(PROMPT_BLOCK);
+    }
+    cell.modifier |= Modifier::REVERSED;
+}
+
 /// A prompt as the block the composer is, kept once sent: the composer's bar down its left edge
-/// in the color of what it ran under, and the words, with a row of its gray above and below them
-/// when `padded`, which copies as nothing.
+/// in the color of what it ran under, and the words, with padding above and below them as
+/// `padding` draws it, which copies as nothing. A half row carries no bar, since a cell that is
+/// half the terminal's and half gray has no third color for it.
 fn prompt_rows(
     text: &str,
     class: Option<InboxClass>,
     delivered: bool,
     ran_under: RanUnder,
     width: usize,
-    padded: bool,
+    padding: PromptPadding,
 ) -> Vec<draw::Row> {
     let inner = width.saturating_sub(TEXT_EDGE + draw::RIGHT_MARGIN).max(1);
     // The same gray across the whole row, so a prompt is told from the answer under it at a
-    // glance, the words in white rather than the terminal's foreground so they stand out of
-    // the gray.
-    let block = Style::default().fg(draw::WHITE).bg(COMPOSER_BACKGROUND);
+    // glance.
+    let block = PROMPT_BLOCK;
     let bar = Span::styled(
         format!("{:<TEXT_EDGE$}", draw::COMPOSER_BAR),
         block.fg(ran_under_color(ran_under)),
@@ -218,13 +266,20 @@ fn prompt_rows(
             draw::RowCopy::Padding,
         ));
     }
-    if !padded {
-        return lines;
-    }
-    let pad = block_row(String::new(), block);
-    std::iter::once((pad.clone(), draw::RowCopy::Padding))
+    let (above, below) = match padding {
+        PromptPadding::None => return lines,
+        PromptPadding::Half => (
+            half_padding_row(PaddingSide::Above, width),
+            half_padding_row(PaddingSide::Below, width),
+        ),
+        PromptPadding::Full => {
+            let pad = block_row(String::new(), block);
+            (pad.clone(), pad)
+        }
+    };
+    std::iter::once((above, draw::RowCopy::Padding))
         .chain(lines)
-        .chain(std::iter::once((pad, draw::RowCopy::Padding)))
+        .chain(std::iter::once((below, draw::RowCopy::Padding)))
         .collect()
 }
 
@@ -235,7 +290,7 @@ pub(crate) fn entry_rows(
     entry: &Entry,
     width: usize,
     working_directory: &Path,
-    prompt_padding: bool,
+    prompt_padding: PromptPadding,
 ) -> (Vec<Line<'static>>, Vec<draw::RowCopy>) {
     let (lines, copies): (Vec<Line<'static>>, Vec<draw::RowCopy>) =
         match copied_rows_of(entry, width, prompt_padding) {
@@ -505,7 +560,7 @@ pub(crate) fn entry_lines(
     entry: &Entry,
     width: usize,
     working_directory: &Path,
-    prompt_padding: bool,
+    prompt_padding: PromptPadding,
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     let inner = width.saturating_sub(TEXT_EDGE).max(1);
@@ -1200,7 +1255,7 @@ impl Viewport {
 
     /// Lay `entry` out on a transcript `width` wide unless the cache already has it, and say how
     /// many rows it is. `prompt_padding` is the transcript's, which never changes under the cache.
-    fn lay_out(&mut self, entry: &Entry, width: usize, prompt_padding: bool) -> usize {
+    fn lay_out(&mut self, entry: &Entry, width: usize, prompt_padding: PromptPadding) -> usize {
         let width = item_width(entry, width);
         let stale = self
             .cache
@@ -2348,13 +2403,13 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: crate::config::TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
-            prompt_padding: true,
+            prompt_padding: PromptPadding::Full,
         }
     }
 
     /// An item's lines at `width`, its paths shown against `/w`.
     fn lines_at(entry: &Entry, width: usize) -> Vec<Line<'static>> {
-        entry_lines(entry, width, Path::new("/w"), true)
+        entry_lines(entry, width, Path::new("/w"), PromptPadding::Full)
     }
 
     fn entry(item: Item, expanded: bool) -> Entry {
@@ -2681,8 +2736,13 @@ mod tests {
         for width in [1, 2, 5, 10, 16, 24, 40, 80, 200] {
             for (index, item) in items.iter().enumerate() {
                 for expanded in [false, true] {
-                    let lines =
-                        entry_rows(&entry(item.clone(), expanded), width, Path::new("/w"), true).0;
+                    let lines = entry_rows(
+                        &entry(item.clone(), expanded),
+                        width,
+                        Path::new("/w"),
+                        PromptPadding::Full,
+                    )
+                    .0;
                     for line in &lines {
                         let text: String = line
                             .spans
@@ -2856,7 +2916,7 @@ mod tests {
                 &entry(item, false),
                 80,
                 working_directory,
-                true,
+                PromptPadding::Full,
             ))
             .remove(0)
         };
@@ -4298,7 +4358,7 @@ mod tests {
                     .all(|span| span.style.bg == Some(COMPOSER_BACKGROUND))),
             "every row is the composer's block across the whole width: {lines:?}"
         );
-        let (_, copies) = entry_rows(&waiting, 60, Path::new("/w"), true);
+        let (_, copies) = entry_rows(&waiting, 60, Path::new("/w"), PromptPadding::Full);
         assert_eq!(
             copies,
             vec![
@@ -4332,7 +4392,7 @@ mod tests {
             },
             false,
         );
-        let (lines, copies) = entry_rows(&waiting, 60, Path::new("/w"), false);
+        let (lines, copies) = entry_rows(&waiting, 60, Path::new("/w"), PromptPadding::None);
         assert_eq!(plain(&lines), vec![
             "▎ also check the logs",
             "▎ (steer, waiting)"
@@ -4345,6 +4405,89 @@ mod tests {
                     .iter()
                     .all(|span| span.style.bg == Some(COMPOSER_BACKGROUND))),
             "every row is the composer's block across the whole width: {lines:?}"
+        );
+    }
+
+    /// A half row is the composer's gray in the half of each cell next to the words and the
+    /// terminal's own background in the other, across the whole width, with no bar; it copies as
+    /// nothing, and the words between keep their bar and their gray.
+    #[test]
+    fn a_half_padded_prompt_is_gray_only_in_the_half_next_to_its_words() {
+        let sent = entry(
+            Item::Prompt {
+                text: "also check the logs".into(),
+                class: None,
+                inbox_id: None,
+                delivered: true,
+                ran_under: RanUnder::Level(crate::permission::Permission::Read),
+            },
+            false,
+        );
+        let (lines, copies) = entry_rows(&sent, 60, Path::new("/w"), PromptPadding::Half);
+        assert_eq!(plain(&lines), vec![
+            "▄".repeat(60),
+            "▎ also check the logs".to_string(),
+            "▀".repeat(60)
+        ]);
+        assert_eq!(copies, vec![
+            draw::RowCopy::Padding,
+            draw::RowCopy::Text,
+            draw::RowCopy::Padding
+        ]);
+        for padding in [&lines[0], &lines[2]] {
+            assert!(
+                padding
+                    .spans
+                    .iter()
+                    .all(|span| span.style.fg == Some(COMPOSER_BACKGROUND)
+                        && span.style.bg == Some(Color::Reset)),
+                "the gray is the glyph, the rest the terminal's: {padding:?}"
+            );
+        }
+        assert!(
+            lines[1].width() == 60
+                && lines[1]
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg == Some(COMPOSER_BACKGROUND)),
+            "the words' row is the block across the whole width: {lines:?}"
+        );
+    }
+
+    /// A selection lights a half padding row as it lights a whole one, so the light stays one band
+    /// across a prompt rather than moving the gray to the half away from the words.
+    #[test]
+    fn a_selected_half_padding_row_lights_as_a_whole_one() {
+        let sent = entry(
+            Item::Prompt {
+                text: "ls".into(),
+                class: None,
+                inbox_id: None,
+                delivered: true,
+                ran_under: RanUnder::Level(crate::permission::Permission::Read),
+            },
+            false,
+        );
+        let lit = |padding| {
+            let (lines, _) = entry_rows(&sent, 8, Path::new("/w"), padding);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 3));
+            for (y, line) in (0..).zip(&lines) {
+                buffer.set_line(0, y, line, 8);
+            }
+            for cell in &mut buffer.content {
+                light_selected(cell);
+            }
+            buffer
+        };
+        let (half, full) = (lit(PromptPadding::Half), lit(PromptPadding::Full));
+        // Past the bar, which a half row does not carry.
+        for (x, y) in (TEXT_EDGE as u16..8).flat_map(|x| [(x, 0), (x, 2)]) {
+            assert_eq!(half[(x, y)], full[(x, y)], "the cell at {x}, {y}");
+        }
+        assert_eq!(
+            half[(3, 1)],
+            full[(3, 1)],
+            "the words' row lights as before"
         );
     }
 

@@ -36,6 +36,17 @@ fn screen_size(cells: u16) -> std::num::NonZeroU16 {
     std::num::NonZeroU16::new(cells).expect("a screen is at least one cell")
 }
 
+/// The padding row above the words of a sent prompt or of the composer, as the default half row
+/// draws it across the screen.
+fn half_row_above() -> String {
+    "▄".repeat(usize::from(COLUMNS))
+}
+
+/// The padding row below the words, as the default half row draws it across the screen.
+fn half_row_below() -> String {
+    "▀".repeat(usize::from(COLUMNS))
+}
+
 fn screen_install(permission: &str, extra_display: &str, extra_tables: &str) -> Install {
     let install = Install::new();
     install.write_config(&format!(
@@ -513,11 +524,12 @@ fn a_turn_draws_the_prompt_and_its_answer_above_the_composer() {
     assert_eq!(recorded, 1, "the row carries the switch");
 }
 
-/// `[display].prompt_padding = false` drops the row of gray above and below the words, on the
-/// composer and on a sent prompt alike; the default keeps both.
+/// `[display].prompt_padding` pads the composer and a sent prompt alike: by default with a half
+/// row of gray on each side, the bar beside the words alone; `full` with a whole row the bar runs
+/// down; `none` with nothing.
 #[test]
-fn prompt_padding_off_leaves_the_composer_and_a_sent_prompt_their_words_alone() {
-    // The rows of the bar alone around the prompt, and the composer's rows over the status row.
+fn prompt_padding_pads_the_composer_and_a_sent_prompt_alike() {
+    // The rows above and below the prompt, and the composer's three rows over the status row.
     let shape = |extra_display: &str| {
         let install = screen_install("read", extra_display, "");
         let screens = run_screen(&install, TWO_TURNS, &["hi", "/exit"]);
@@ -526,29 +538,66 @@ fn prompt_padding_off_leaves_the_composer_and_a_sent_prompt_their_words_alone() 
             .iter()
             .position(|row| row == "▎ hi")
             .unwrap_or_else(|| panic!("the prompt in its block: {rows:#?}"));
-        let around = [rows.get(prompt.wrapping_sub(1)), rows.get(prompt + 1)]
-            .into_iter()
-            .filter(|row| row.is_some_and(|row| row == "▎"))
-            .count();
-        let composer = rows
-            .iter()
-            .rev()
-            .skip(1)
-            .take_while(|row| row.as_str() == "▎")
-            .count();
+        let around = [prompt.wrapping_sub(1), prompt + 1].map(|at| rows.get(at).cloned());
+        let composer: Vec<String> = rows.iter().rev().skip(1).take(3).rev().cloned().collect();
         (around, composer, rows)
     };
     let (around, composer, rows) = shape("");
     assert_eq!(
-        (around, composer),
-        (2, 3),
-        "by default a row of the block above and below the words: {rows:#?}"
+        around,
+        [Some(half_row_above()), Some(half_row_below())],
+        "by default a half row of the block above and below the words: {rows:#?}"
     );
-    let (around, composer, rows) = shape("prompt_padding = false");
     assert_eq!(
-        (around, composer),
-        (0, 1),
-        "off, the words alone, the composer one row: {rows:#?}"
+        composer,
+        [half_row_above(), "▎".to_string(), half_row_below()],
+        "the composer the same, the bar beside its words alone: {rows:#?}"
+    );
+    let (around, composer, rows) = shape("prompt_padding = \"full\"");
+    assert_eq!(
+        around,
+        [Some("▎".to_string()), Some("▎".to_string())],
+        "full, a whole row the bar runs down: {rows:#?}"
+    );
+    assert_eq!(
+        composer,
+        ["▎", "▎", "▎"],
+        "the composer the same: {rows:#?}"
+    );
+    let (around, composer, rows) = shape("prompt_padding = \"none\"");
+    assert!(
+        around.iter().all(|row| row.as_deref() != Some("▎")
+            && !row
+                .as_deref()
+                .is_some_and(|row| row.starts_with(['▄', '▀']))),
+        "none, the words alone: {rows:#?}"
+    );
+    assert_eq!(composer[2], "▎", "the composer one row: {rows:#?}");
+    assert!(
+        !composer[1].starts_with(['▎', '▄', '▀']),
+        "nothing of the block above the composer's words: {rows:#?}"
+    );
+}
+
+/// The completion list sits on the composer's top edge, so while it is open the composer's top
+/// padding row is whole, the bar running up it, rather than leaving the terminal's half between
+/// the list and the block.
+#[test]
+fn the_completion_list_sits_on_a_whole_padding_row() {
+    let install = screen_install("read", "", "");
+    let screens = run_screen(&install, TWO_TURNS, &[
+        "\x1b[200~/pro\x1b[201~",
+        "\x15",
+        "/exit",
+    ]);
+    let listing = &screens[1];
+    let composer = listing.len().saturating_sub(4);
+    assert!(
+        listing[composer - 1].starts_with("  /pro")
+            && listing[composer] == "▎"
+            && listing[composer + 1] == "▎ /pro"
+            && listing[composer + 2] == half_row_below(),
+        "the list on a whole top row, the bottom row still half: {listing:#?}"
     );
 }
 
@@ -1770,7 +1819,7 @@ fn the_row_above_the_composer_says_what_the_agent_is_doing() {
         .unwrap_or_else(|| panic!("the row says what runs and for how long: {words:?}"));
     assert!(seconds.parse::<u64>().is_ok(), "{words:?}");
     assert!(
-        working[at + 1] == "▎"
+        working[at + 1] == half_row_above()
             && working[at + 2].starts_with('▎')
             && working[at + 2].contains("Steer the agent"),
         "the row stands right above the composer, whose padding row comes first: {working:#?}"
@@ -2079,7 +2128,7 @@ fn the_prompt_that_scrolled_off_sticks_at_the_top_and_a_click_brings_it_back() {
     let jumped = &screens[2];
     assert_eq!(
         jumped[..2],
-        ["▎", "▎ hi"],
+        [half_row_above().as_str(), "▎ hi"],
         "the prompt itself is at the top now, its padding row first: {jumped:#?}"
     );
     assert_eq!(
@@ -2117,13 +2166,13 @@ fn clicking_the_bar_walks_back_one_prompt_at_a_time() {
     );
     assert_eq!(
         first_jump[1..3],
-        ["▎", "▎ two"],
+        [half_row_above().as_str(), "▎ two"],
         "with the last prompt under it: {first_jump:#?}"
     );
     let second_jump = &screens[6];
     assert_eq!(
         second_jump[..2],
-        ["▎", "▎ one"],
+        [half_row_above().as_str(), "▎ one"],
         "the first prompt is at the top, with nothing left to stick: {second_jump:#?}"
     );
     assert_eq!(second_jump[4], "  line 1", "{second_jump:#?}");
@@ -2398,7 +2447,7 @@ fn scrolling_up_shows_the_pill_and_esc_returns_to_the_bottom() {
         .position(|row| row.contains("↓ back to bottom"))
         .unwrap_or_else(|| panic!("the pill is shown while scrolled up: {scrolled:#?}"));
     assert!(
-        scrolled[pill + 1] == "▎" && scrolled[pill + 2].starts_with('▎'),
+        scrolled[pill + 1] == half_row_above() && scrolled[pill + 2].starts_with('▎'),
         "it sits in the gap right above the composer and its padding row: {scrolled:#?}"
     );
     assert!(
@@ -2482,7 +2531,7 @@ fn history_loads_as_the_view_scrolls_up() {
     let older = &resumed[2];
     assert_eq!(
         older.get(..2),
-        Some(&["▎".to_string(), "▎ first".to_string()][..]),
+        Some(&[half_row_above(), "▎ first".to_string()][..]),
         "Ctrl+Home again reaches the first turn, its padding row first: {older:#?}"
     );
     let rows = final_screen(&resumed);

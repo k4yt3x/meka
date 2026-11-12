@@ -785,9 +785,9 @@ pub(crate) struct DisplayConfig {
     /// Whether the interactive screen folds a run of thinking and tool calls into one row once
     /// the agent says something after it or its turn ends. Default `true`.
     pub(crate) fold_steps: Option<bool>,
-    /// Whether the interactive screen draws a row of the composer's gray above and below the words
-    /// of the composer and of every sent prompt. Default `true`.
-    pub(crate) prompt_padding: Option<bool>,
+    /// How much of the composer's gray the interactive screen draws above and below the words of
+    /// the composer and of every sent prompt: `none`, `half` (default) or `full`.
+    pub(crate) prompt_padding: Option<PromptPadding>,
     pub(crate) show_session_id_on_create: Option<bool>,
     pub(crate) show_session_id_on_resume: Option<bool>,
     pub(crate) show_session_id_on_exit: Option<bool>,
@@ -1772,6 +1772,75 @@ impl From<SendClass> for String {
     }
 }
 
+/// How much of the composer's gray the interactive screen draws above and below the words of the
+/// composer and of every sent prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum PromptPadding {
+    /// No padding row.
+    None,
+    /// A row whose gray covers the half next to the words, drawn with half-block characters.
+    #[default]
+    Half,
+    /// A whole row of gray.
+    Full,
+}
+
+impl PromptPadding {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [PromptPadding; 3] = [Self::None, Self::Half, Self::Full];
+
+    /// The value's one spelling.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Half => "half",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl std::fmt::Display for PromptPadding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for PromptPadding {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|padding| padding.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a prompt padding. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|padding| padding.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for PromptPadding {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, String> {
+        value.parse()
+    }
+}
+
+impl From<PromptPadding> for String {
+    fn from(padding: PromptPadding) -> Self {
+        padding.name().to_string()
+    }
+}
+
 /// Which session a run should pick up, resolved from the mutually exclusive `--continue` and
 /// `--resume` flags.
 ///
@@ -2019,7 +2088,7 @@ pub(crate) struct ResolvedConfig {
     /// Resolved `[display].fold_steps`.
     pub(crate) fold_steps: bool,
     /// Resolved `[display].prompt_padding`.
-    pub(crate) prompt_padding: bool,
+    pub(crate) prompt_padding: PromptPadding,
     pub(crate) web_client: WebClientConfig,
     pub(crate) sandbox: bool,
     /// Resolved `[shell].additional_readable_directories`, as written: canonicalized where they
@@ -3129,7 +3198,7 @@ impl ResolvedConfig {
                 .turn_end_summary
                 .unwrap_or_else(|| TurnEndFact::DEFAULT_SUMMARY.to_vec()),
             fold_steps: file_display.fold_steps.unwrap_or(true),
-            prompt_padding: file_display.prompt_padding.unwrap_or(true),
+            prompt_padding: file_display.prompt_padding.unwrap_or_default(),
             status_row: file_display
                 .status_row
                 .unwrap_or_else(|| StatusFact::DEFAULT_ROW.to_vec()),
@@ -5191,6 +5260,27 @@ command = "ida-mcp"
             config.display.and_then(|display| display.send_class),
             Some(SendClass::Followup)
         );
+    }
+
+    /// `[display].prompt_padding` reads its three words; a boolean is refused, naming the key,
+    /// rather than read as one of them.
+    #[test]
+    fn prompt_padding_reads_its_words_and_refuses_a_boolean() {
+        for padding in PromptPadding::ALL {
+            let config: ConfigFile =
+                toml::from_str(&format!("[display]\nprompt_padding = \"{padding}\"\n"))
+                    .expect("each word parses");
+            assert_eq!(
+                config.display.and_then(|display| display.prompt_padding),
+                Some(padding)
+            );
+        }
+        for value in ["true", "false", "\"wide\""] {
+            let error =
+                toml::from_str::<ConfigFile>(&format!("[display]\nprompt_padding = {value}\n"))
+                    .expect_err("only the three words parse");
+            assert!(error.to_string().contains("prompt_padding"), "{error}");
+        }
     }
 
     /// The percent is the user's and reaches the agent beside the switch; the two keys are checked

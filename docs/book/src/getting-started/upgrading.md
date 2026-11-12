@@ -10,6 +10,15 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 Meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.93 to 0.94
+
+Nothing in the store changes shape.
+
+**`[display].prompt_padding` takes a word.** It is `"none"`, `"half"` or `"full"`, and Meka refuses
+a `config.toml` that still sets `true` or `false`, naming the key's line. Replace `true` with
+`"full"` to keep a whole row of gray above and below the words, or remove the line for the new
+default, `"half"`; replace `false` with `"none"`.
+
 ## 0.92 to 0.93
 
 Nothing in `config.toml` changes shape. The store moves forward on its first open, behind the

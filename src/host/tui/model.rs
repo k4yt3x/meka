@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     checklist::ChecklistItem,
-    config::TurnEndFact,
+    config::{PromptPadding, TurnEndFact},
     conversation::{Change, ContentBlock, ResultDisplay, Role, ToolResultContent},
     frontend::{FrontendEvent, NoticeLevel},
     store::{
@@ -36,9 +36,9 @@ pub(crate) struct Settings {
     pub(crate) turn_end_summary: Vec<TurnEndFact>,
     /// `[display].fold_steps`: whether a finished run of steps folds into one row.
     pub(crate) fold_steps: bool,
-    /// `[display].prompt_padding`: whether the composer and every sent prompt have a row of
-    /// their gray above and below the words.
-    pub(crate) prompt_padding: bool,
+    /// `[display].prompt_padding`: how much of their gray the composer and every sent prompt
+    /// have above and below the words.
+    pub(crate) prompt_padding: PromptPadding,
 }
 
 /// Where a tool call is in its life.
@@ -418,9 +418,8 @@ impl Transcript {
         self.settings.fold_steps && !self.tools_expanded
     }
 
-    /// Whether the composer and every sent prompt have a row of their gray above and below the
-    /// words.
-    pub(crate) fn prompt_padding(&self) -> bool {
+    /// How much of their gray the composer and every sent prompt have above and below the words.
+    pub(crate) fn prompt_padding(&self) -> PromptPadding {
         self.settings.prompt_padding
     }
 
@@ -2637,7 +2636,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
-            prompt_padding: true,
+            prompt_padding: PromptPadding::Full,
         })
     }
 
@@ -3294,7 +3293,12 @@ mod tests {
             transcript
                 .drawn()
                 .flat_map(|entry| {
-                    super::super::view::entry_lines(entry, 80, std::path::Path::new("/w"), true)
+                    super::super::view::entry_lines(
+                        entry,
+                        80,
+                        std::path::Path::new("/w"),
+                        PromptPadding::Full,
+                    )
                 })
                 .map(|line| {
                     line.spans
@@ -3783,7 +3787,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
-            prompt_padding: true,
+            prompt_padding: PromptPadding::Full,
         });
         older.load_page_above(page(
             vec![Event::CompactBoundary {
@@ -3866,7 +3870,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: facts,
             fold_steps: true,
-            prompt_padding: true,
+            prompt_padding: PromptPadding::Full,
         })
     }
 

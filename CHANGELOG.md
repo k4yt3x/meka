@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `[display].prompt_padding` takes `none`, `half` or `full`; see the upgrade guide.
+- The composer and sent prompts have half a row of gray above and below their words by default.
+
 ## [0.93.0] - 2026-11-11
 
 ### Added

@@ -1415,15 +1415,22 @@ fold_steps = false
 
 ### `display.prompt_padding`
 
-Whether the interactive screen draws a row of gray above and below the words of the composer and
-of every prompt you sent. With `false`, the block keeps no blank rows; the bar down its left edge
-stays.
+How much gray the interactive screen draws above and below the words of the composer and of every
+prompt you sent:
 
-Default: `true`
+- `half`: half a row on each side, drawn with the `▄` and `▀` block characters; the bar down the
+  block's left edge runs beside the words alone. Set `full` if your terminal shows gaps between
+  those characters.
+- `full`: a whole row on each side, the bar running down it.
+- `none`: no padding; the bar down the block's left edge stays.
+
+Either padding takes a whole row of the screen on each side, so the layout is the same with both.
+
+Default: `half`
 
 ```toml
 [display]
-prompt_padding = false
+prompt_padding = "full"
 ```
 
 ### `display.show_session_id_on_create`

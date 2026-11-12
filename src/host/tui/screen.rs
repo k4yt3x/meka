@@ -33,6 +33,7 @@ use super::{
     view::{self, StatusFacts, Viewport},
 };
 use crate::{
+    config::PromptPadding,
     frontend::{ElicitationKind, ElicitationPrompt, ElicitationResponse},
     host::terminal::{Escalation, INTERRUPT_RELAY, escalation_for},
     permission::SharedPermission,
@@ -2666,7 +2667,7 @@ impl Screen {
             let last = if y == to.1 { to.0.min(right) } else { right };
             for x in first..=last {
                 if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-                    cell.modifier |= ratatui::style::Modifier::REVERSED;
+                    view::light_selected(cell);
                 }
             }
         }
@@ -2912,7 +2913,8 @@ impl Screen {
             1 + gap + least_composer + 2 * padding + status_height <= area.height
         };
         let gap = 1 + u16::from(working.is_some());
-        let padding = if self.launch.transcript.prompt_padding() && fits(gap, COMPOSER_PADDING) {
+        let prompt_padding = self.launch.transcript.prompt_padding();
+        let padding = if prompt_padding != PromptPadding::None && fits(gap, COMPOSER_PADDING) {
             COMPOSER_PADDING
         } else {
             0
@@ -3049,6 +3051,33 @@ impl Screen {
                 // color runs down its left edge.
                 let block = Style::default().bg(super::input::COMPOSER_BACKGROUND);
                 frame.render_widget(ratatui::widgets::Block::new().style(block), composer_area);
+                // The bar runs down the rows the gray covers whole.
+                let mut barred = composer_area;
+                if prompt_padding == PromptPadding::Half && padding > 0 {
+                    let width = composer_area.width as usize;
+                    let mut half_row = |side, y| {
+                        frame.render_widget(
+                            Paragraph::new(view::half_padding_row(side, width)),
+                            Rect {
+                                y,
+                                height: 1,
+                                ..composer_area
+                            },
+                        );
+                    };
+                    half_row(
+                        view::PaddingSide::Below,
+                        (composer_area.y + composer_area.height).saturating_sub(1),
+                    );
+                    barred.height = barred.height.saturating_sub(padding);
+                    // The completion list sits on the block's top edge, so the row under it stays
+                    // whole rather than leaving the terminal's half between the two.
+                    if self.composer.focus() != Focus::Completion {
+                        half_row(view::PaddingSide::Above, composer_area.y);
+                        barred.y += padding;
+                        barred.height = barred.height.saturating_sub(padding);
+                    }
+                }
                 let field = Rect {
                     x: composer_area.x + lead,
                     y: composer_area.y + padding,
@@ -3094,7 +3123,7 @@ impl Screen {
                     }
                 }
                 // Last, so nothing drawn in the block covers it.
-                let bar: Vec<Line<'static>> = (0..composer_area.height)
+                let bar: Vec<Line<'static>> = (0..barred.height)
                     .map(|_| {
                         Line::from(Span::styled(
                             draw::COMPOSER_BAR.to_string(),
@@ -3103,8 +3132,8 @@ impl Screen {
                     })
                     .collect();
                 frame.render_widget(Paragraph::new(Text::from(bar)), Rect {
-                    width: 1.min(composer_area.width),
-                    ..composer_area
+                    width: 1.min(barred.width),
+                    ..barred
                 });
                 frame.render_widget(
                     Paragraph::new(Text::from(view::status_line(
