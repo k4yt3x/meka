@@ -1267,11 +1267,11 @@ context_window = 200000
 
 ## `[thinking]`
 
-Presentation and budget settings for extended thinking (`anthropic-messages` and `claude-subscription` backends). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key, not a setting here.
+The budget for extended thinking (`anthropic-messages` and `claude-subscription` backends). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key, not a setting here.
 
 While the model is thinking, the screen draws a live `• Thinking` row so a long pause reads as work rather than as a hang. On `claude-subscription` it carries the server's own running estimate (`• Thinking · 150 tokens`), redrawn in place as the count climbs; `anthropic-messages` does not report one, so the row stays bare. The count is coarse: a progress signal, not an accounting figure.
 
-When the block ends the line stays on screen as a record that the phase happened; if the model returned readable reasoning, that text replaces the line instead.
+Readable reasoning shows open while it streams, unless [`display.expand_streaming_thinking`](#displayexpand_streaming_thinking) is `false`. When the block ends its row stays, showing the first words of the reasoning; a row with no reasoning to show goes, as a resumed session draws none.
 
 ### `thinking.budget`
 
@@ -1329,9 +1329,9 @@ max_redirects = 0
 
 ## `[display]`
 
-Settings for the interactive screen: the two rows it composes, whether finished steps fold, the
-session id lines, what Enter does while a turn runs, the mouse, and `stream`, which also decides how
-a one-shot run asks the provider.
+Settings for the interactive screen: the two rows it composes, whether finished steps fold and
+streaming thinking shows open, the session id lines, what Enter does while a turn runs, the mouse,
+and `stream`, which also decides how a one-shot run asks the provider.
 
 ### `display.status_row`
 
@@ -1411,6 +1411,21 @@ Default: `true`
 ```toml
 [display]
 fold_steps = false
+```
+
+### `display.expand_streaming_thinking`
+
+Whether the interactive screen shows a thinking block open while it streams, so you can read the
+model's reasoning as it arrives, and folds it to its `• Thinking · …` row once the model moves on.
+A block that ends while you are scrolled up stays open until you are back at the bottom, and one you
+toggle while it streams stays as you leave it. With `false`, a streaming block is its row alone,
+showing its latest line. See [Expanding and collapsing](../usage/interactive-mode.md#expanding-and-collapsing).
+
+Default: `true`
+
+```toml
+[display]
+expand_streaming_thinking = false
 ```
 
 ### `display.prompt_padding`

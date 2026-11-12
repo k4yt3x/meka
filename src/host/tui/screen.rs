@@ -3597,6 +3597,11 @@ static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 /// the whole redraw at once rather than tearing between the rows.
 fn draw_screen(screen: &mut Screen, terminal: &mut DefaultTerminal) {
     screen.dirty = false;
+    // Ahead of the layout, so the frame in which a thinking block ends draws it folded; and only
+    // while the view follows the bottom, so a block a reader scrolled up to stays under them.
+    if screen.viewport.is_following() {
+        screen.launch.transcript.fold_streamed_thinking();
+    }
     // The frame's slow part, laying the transcript out at the width it is drawn at, is done before
     // the update opens. At a new size ratatui clears the terminal ahead of the frame, inside the
     // update, and a terminal holds an update only so long before it shows what it has, which

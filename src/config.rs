@@ -785,6 +785,9 @@ pub(crate) struct DisplayConfig {
     /// Whether the interactive screen folds a run of thinking and tool calls into one row once
     /// the agent says something after it or its turn ends. Default `true`.
     pub(crate) fold_steps: Option<bool>,
+    /// Whether the interactive screen shows a thinking block open while it streams and folds it
+    /// once the model moves on. Default `true`.
+    pub(crate) expand_streaming_thinking: Option<bool>,
     /// How much of the composer's gray the interactive screen draws above and below the words of
     /// the composer and of every sent prompt: `none`, `half` (default) or `full`.
     pub(crate) prompt_padding: Option<PromptPadding>,
@@ -2087,6 +2090,8 @@ pub(crate) struct ResolvedConfig {
     pub(crate) turn_end_summary: Vec<TurnEndFact>,
     /// Resolved `[display].fold_steps`.
     pub(crate) fold_steps: bool,
+    /// Resolved `[display].expand_streaming_thinking`.
+    pub(crate) expand_streaming_thinking: bool,
     /// Resolved `[display].prompt_padding`.
     pub(crate) prompt_padding: PromptPadding,
     pub(crate) web_client: WebClientConfig,
@@ -3198,6 +3203,7 @@ impl ResolvedConfig {
                 .turn_end_summary
                 .unwrap_or_else(|| TurnEndFact::DEFAULT_SUMMARY.to_vec()),
             fold_steps: file_display.fold_steps.unwrap_or(true),
+            expand_streaming_thinking: file_display.expand_streaming_thinking.unwrap_or(true),
             prompt_padding: file_display.prompt_padding.unwrap_or_default(),
             status_row: file_display
                 .status_row

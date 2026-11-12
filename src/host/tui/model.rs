@@ -36,6 +36,9 @@ pub(crate) struct Settings {
     pub(crate) turn_end_summary: Vec<TurnEndFact>,
     /// `[display].fold_steps`: whether a finished run of steps folds into one row.
     pub(crate) fold_steps: bool,
+    /// `[display].expand_streaming_thinking`: whether a thinking block shows open while it
+    /// streams, to fold once it ends.
+    pub(crate) expand_streaming_thinking: bool,
     /// `[display].prompt_padding`: how much of their gray the composer and every sent prompt
     /// have above and below the words.
     pub(crate) prompt_padding: PromptPadding,
@@ -336,6 +339,9 @@ pub(crate) struct Transcript {
     pending_turn_end: Option<Item>,
     /// What the thinking toggle last set, and what a new thinking item starts as.
     thinking_shown: bool,
+    /// The thinking items opened for their stream, by id, each to fold once it ends unless a hand
+    /// or the thinking toggle takes it over first.
+    streamed_open: Vec<u64>,
     /// What the tool toggle last set, and what a new tool call starts as.
     tools_expanded: bool,
     /// The tail item the answer is streaming into, if one is open.
@@ -378,6 +384,7 @@ impl Transcript {
             turn_started: None,
             pending_turn_end: None,
             thinking_shown: false,
+            streamed_open: Vec::new(),
             tools_expanded: false,
             open_text: None,
             open_thinking: None,
@@ -747,6 +754,7 @@ impl Transcript {
         });
         self.open_text = None;
         self.open_thinking = None;
+        self.streamed_open.clear();
         self.nudged = false;
         self.opening_at = None;
         self.appended_inbox.clear();
@@ -986,6 +994,8 @@ impl Transcript {
     /// Flip one collapsible item, by its id, which holds wherever the item has moved since the
     /// frame it was picked in; whether there was one to flip.
     pub(crate) fn toggle_item(&mut self, id: u64) -> bool {
+        // Flipped by hand, a thinking item opened for its stream is the user's now.
+        self.streamed_open.retain(|&held| held != id);
         self.revision += 1;
         let revision = self.revision;
         let attached = self.attached;
@@ -1018,6 +1028,7 @@ impl Transcript {
     /// Show or hide every thinking block, and start new ones that way.
     pub(crate) fn set_thinking_shown(&mut self, shown: bool) {
         self.thinking_shown = shown;
+        self.streamed_open.clear();
         self.revision += 1;
         let revision = self.revision;
         for entry in self.window.iter_mut().chain(self.tail.iter_mut()) {
@@ -1025,6 +1036,46 @@ impl Transcript {
                 entry.expanded = shown;
                 entry.revision = revision;
             }
+        }
+    }
+
+    /// Fold the thinking items opened for their stream that have ended. The screen asks while the
+    /// view follows the bottom, so an item a reader scrolled up to stays open under them; one no
+    /// longer held is let go.
+    pub(crate) fn fold_streamed_thinking(&mut self) {
+        if self.streamed_open.is_empty() {
+            return;
+        }
+        let revision = self.revision + 1;
+        let mut folded = false;
+        let mut streaming = Vec::new();
+        for entry in self.window.iter_mut().chain(self.tail.iter_mut()) {
+            if !self.streamed_open.contains(&entry.id) {
+                continue;
+            }
+            if matches!(entry.item, Item::Thinking { ended: true, .. }) {
+                entry.expanded = false;
+                entry.revision = revision;
+                folded = true;
+            } else {
+                streaming.push(entry.id);
+            }
+        }
+        if folded {
+            self.revision = revision;
+        }
+        self.streamed_open = streaming;
+    }
+
+    /// Show the thinking item at `index` open while it streams, when the screen is set to and the
+    /// thinking toggle does not show every item already.
+    fn open_for_stream(&mut self, index: usize) {
+        if !self.settings.expand_streaming_thinking || self.thinking_shown {
+            return;
+        }
+        if let Some(entry) = self.tail.get_mut(index) {
+            entry.expanded = true;
+            self.streamed_open.push(entry.id);
         }
     }
 
@@ -1303,6 +1354,7 @@ impl Transcript {
                     ended: false,
                 });
                 self.open_thinking = Some(index);
+                self.open_for_stream(index);
                 index
             }
         };
@@ -2636,6 +2688,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
+            expand_streaming_thinking: false,
             prompt_padding: PromptPadding::Full,
         })
     }
@@ -3787,6 +3840,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
+            expand_streaming_thinking: false,
             prompt_padding: PromptPadding::Full,
         });
         older.load_page_above(page(
@@ -3870,6 +3924,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: facts,
             fold_steps: true,
+            expand_streaming_thinking: false,
             prompt_padding: PromptPadding::Full,
         })
     }
@@ -5769,6 +5824,97 @@ mod tests {
             "{:?}",
             items(&transcript)
         );
+    }
+
+    /// A transcript whose screen shows thinking open while it streams.
+    fn streaming_open() -> Transcript {
+        let mut transcript = transcript();
+        transcript.settings.expand_streaming_thinking = true;
+        transcript
+    }
+
+    /// Whether each thinking item on screen is open, in order.
+    fn thoughts_open(transcript: &Transcript) -> Vec<bool> {
+        transcript
+            .drawn()
+            .filter(|entry| matches!(entry.item, Item::Thinking { .. }))
+            .map(|entry| entry.expanded)
+            .collect()
+    }
+
+    /// A thought shows open while it streams and folds once it has ended and the screen asks,
+    /// which it does only while the view follows the bottom; ended by the answer or by its own
+    /// end, each thought of a turn does the same.
+    #[test]
+    fn a_streaming_thought_shows_open_and_folds_once_it_has_ended() {
+        let mut transcript = streaming_open();
+        transcript.apply(FrontendEvent::ThinkingDelta("weighing the header".into()));
+        assert_eq!(thoughts_open(&transcript), [true], "open as it streams");
+        transcript.fold_streamed_thinking();
+        assert_eq!(thoughts_open(&transcript), [true], "still streaming");
+        transcript.apply(FrontendEvent::AssistantTextDelta("The header.".into()));
+        assert_eq!(
+            thoughts_open(&transcript),
+            [true],
+            "ended, it waits for the screen to ask"
+        );
+        transcript.fold_streamed_thinking();
+        assert_eq!(thoughts_open(&transcript), [false], "folded once asked");
+        transcript.apply(FrontendEvent::ThinkingDelta("and the footer".into()));
+        assert_eq!(thoughts_open(&transcript), [false, true]);
+        transcript.apply(FrontendEvent::ThinkingBlock {
+            content: "and the footer".into(),
+        });
+        transcript.fold_streamed_thinking();
+        assert_eq!(thoughts_open(&transcript), [false, false]);
+    }
+
+    /// A thought flipped by hand, or shown by the thinking toggle, is left as it was set when it
+    /// ends; once the toggle hides every thought again, the next one shows open as it streams.
+    #[test]
+    fn a_streaming_thought_taken_over_is_left_as_it_was_set() {
+        let mut transcript = streaming_open();
+        transcript.apply(FrontendEvent::ThinkingDelta("first".into()));
+        let id = transcript
+            .drawn()
+            .find(|entry| matches!(entry.item, Item::Thinking { .. }))
+            .map(|entry| entry.id)
+            .expect("the thought");
+        assert!(transcript.toggle_item(id));
+        assert!(transcript.toggle_item(id));
+        transcript.apply(FrontendEvent::ThinkingEnded);
+        transcript.fold_streamed_thinking();
+        assert_eq!(thoughts_open(&transcript), [true], "opened again by hand");
+
+        transcript.apply(FrontendEvent::AssistantTextDelta("words".into()));
+        transcript.apply(FrontendEvent::ThinkingDelta("second".into()));
+        transcript.set_thinking_shown(true);
+        transcript.apply(FrontendEvent::ThinkingEnded);
+        transcript.fold_streamed_thinking();
+        assert_eq!(
+            thoughts_open(&transcript),
+            [true, true],
+            "shown by the toggle"
+        );
+
+        transcript.set_thinking_shown(false);
+        transcript.apply(FrontendEvent::AssistantTextDelta("more words".into()));
+        transcript.apply(FrontendEvent::ThinkingDelta("third".into()));
+        assert_eq!(thoughts_open(&transcript), [false, false, true]);
+    }
+
+    /// Only a thought that streams opens: one that arrives whole, and every thought with the
+    /// setting off, starts as the thinking toggle says.
+    #[test]
+    fn only_a_streaming_thought_opens_and_only_with_the_setting_on() {
+        let mut whole = streaming_open();
+        whole.apply(FrontendEvent::ThinkingBlock {
+            content: "arrived whole".into(),
+        });
+        assert_eq!(thoughts_open(&whole), [false]);
+        let mut off = transcript();
+        off.apply(FrontendEvent::ThinkingDelta("streaming".into()));
+        assert_eq!(thoughts_open(&off), [false]);
     }
 
     /// An item is flipped by its id, wherever a page loaded above has moved it since the frame

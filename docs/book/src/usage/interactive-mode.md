@@ -128,8 +128,12 @@ calls run and the turn goes on.
 ## Expanding and collapsing
 
 Reasoning shows as one dimmed `• Thinking · …` row: the first words of the block once it has
-ended, its latest line while it still streams, or the token count when the provider reports only
-that.
+ended, or the token count when the provider reports only that. While a block streams it shows open,
+so you can read the model's reasoning as it arrives, and it folds to its row once the model moves on
+to its answer or a tool call. A block that ends while you are scrolled up stays open until you are
+back at the bottom, and one you toggle while it streams stays as you leave it. With
+[`display.expand_streaming_thinking`](../configuration/config-file.md#displayexpand_streaming_thinking)
+`= false`, a streaming block is its row alone, showing its latest line.
 
 A tool call is its name and the one argument that identifies it, `• file_read notes.txt`. A path
 is shown as the status row shows the directory: relative to the working directory under it, with
@@ -169,8 +173,9 @@ and the checklist are recorded with each result.
 
 - **Click** a block to toggle it. A block lights up under the mouse, which is the hint that it
   opens.
-- **Ctrl+T** shows or hides every thinking block at once; **Ctrl+O** expands or collapses every
-  tool call, and opens or folds every run of steps with them.
+- **Ctrl+T** shows or hides every thinking block at once, the one streaming included; while they
+  are shown, a new block stays open after it ends. **Ctrl+O** expands or collapses every tool call,
+  and opens or folds every run of steps with them.
 - **Alt+Up** and **Alt+Down** pick a block out from the keyboard, newest first; **Enter** or
   **Space** toggles the picked one, and **Esc** lets go of it.
 

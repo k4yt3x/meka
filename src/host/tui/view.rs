@@ -2403,6 +2403,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: crate::config::TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
+            expand_streaming_thinking: false,
             prompt_padding: PromptPadding::Full,
         }
     }
@@ -3616,6 +3617,7 @@ mod tests {
     fn the_cursor_stays_on_a_step_a_run_forms_around() {
         let mut transcript = Transcript::new(Settings {
             fold_steps: false,
+            expand_streaming_thinking: false,
             ..settings()
         });
         transcript.apply(FrontendEvent::TurnStarted {

@@ -14696,6 +14696,7 @@ mod tests {
             show_session_id_on_create: false,
             turn_end_summary: crate::config::TurnEndFact::DEFAULT_SUMMARY.to_vec(),
             fold_steps: true,
+            expand_streaming_thinking: false,
             prompt_padding: crate::config::PromptPadding::Full,
         }
     }

@@ -870,6 +870,98 @@ fn a_failed_turn_shows_its_partial_answer_in_its_own_turn() {
     );
 }
 
+/// A thought shows open while it streams and folds to its row once the answer starts; with
+/// `[display].expand_streaming_thinking = false` it streams as its row alone.
+#[test]
+fn a_streaming_thought_shows_open_until_the_answer_starts() {
+    const THOUGHT: &str = r#"[
+ [{"type":"thinking_delta","text":"Reading the stylesheet first.\n\nThen the footer."},
+  {"type":"sleep","ms":4000},
+  {"type":"thinking_delta","text":"\n\nBoth use margin-top."},
+  {"type":"thinking_complete"},
+  {"type":"text","text":"Fixed both."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = screen_install("read", "", "");
+    let screens = run_screen(&install, THOUGHT, &[
+        "fix the spacing",
+        "\x0c",
+        "\x0c",
+        "\x0c",
+        "/exit",
+    ]);
+    let streaming = &screens[1];
+    assert!(
+        streaming.iter().any(|row| row == "• Thinking")
+            && streaming
+                .iter()
+                .any(|row| row == "  Reading the stylesheet first.")
+            && streaming.iter().any(|row| row == "  Then the footer."),
+        "open while it streams: {streaming:#?}"
+    );
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("• Thinking · Reading the stylesheet first."))
+            && !rows.iter().any(|row| row == "  Then the footer."),
+        "folded to its row once the answer started: {rows:#?}"
+    );
+    assert!(rows.iter().any(|row| row == "  Fixed both."), "{rows:#?}");
+
+    let install = screen_install("read", "expand_streaming_thinking = false", "");
+    let screens = run_screen(&install, THOUGHT, &[
+        "fix the spacing",
+        "\x0c",
+        "\x0c",
+        "\x0c",
+        "/exit",
+    ]);
+    let streaming = &screens[1];
+    assert!(
+        streaming
+            .iter()
+            .any(|row| row == "• Thinking · Then the footer.")
+            && !streaming.iter().any(|row| row == "  Then the footer."),
+        "off, it streams as its row: {streaming:#?}"
+    );
+}
+
+/// A thought that ends while the view is scrolled up stays open under the reader, and folds once
+/// the view is back at the bottom.
+#[test]
+fn a_streaming_thought_waits_to_fold_while_the_view_is_scrolled_up() {
+    let thought: String = (1..=30)
+        .map(|n| format!("line {n} of the reasoning\\n\\n"))
+        .collect();
+    let script = format!(
+        r#"[[{{"type":"thinking_delta","text":"{thought}"}},{{"type":"sleep","ms":4000}},
+            {{"type":"thinking_complete"}},{{"type":"text","text":"The answer."}},
+            {{"type":"message_end","stop_reason":"end_turn"}}]]"#
+    );
+    let install = screen_install("read", "", "");
+    let wheel_up = "\x1b[<64;10;10M";
+    let screens = run_screen(&install, &script, &[
+        "think", wheel_up, "\x0c", "\x0c", "\x0c", "\x1b", "/exit",
+    ]);
+    let held = &screens[5];
+    assert!(
+        !held.iter().any(|row| row.contains("Esc to stop"))
+            && held.iter().any(|row| row.contains("↓ back to bottom")),
+        "the turn has ended with the view scrolled up: {held:#?}"
+    );
+    assert!(
+        held.iter().any(|row| row == "  line 20 of the reasoning"),
+        "the thought stays open under the reader: {held:#?}"
+    );
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("• Thinking · line 1 of the reasoning"))
+            && !rows.iter().any(|row| row == "  line 20 of the reasoning"),
+        "back at the bottom, it folds: {rows:#?}"
+    );
+}
+
 /// A session that recorded reasoning shows it again on resume, rendered rather than as source,
 /// when the config asks for the whole block.
 #[test]

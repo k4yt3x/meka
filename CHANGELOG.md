@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Thinking shows open on the screen as it streams, then folds; `display.expand_streaming_thinking`.
+
 ### Changed
 
 - **Breaking:** `[display].prompt_padding` takes `none`, `half` or `full`; see the upgrade guide.
