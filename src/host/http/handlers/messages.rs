@@ -265,7 +265,10 @@ pub(crate) fn history_item(entry: crate::store::HistoryEntry) -> HistoryItem {
                 memories_written: failure.memories_written.clone(),
                 checkpoint: failure.checkpoint.iter().map(message_item).collect(),
                 summarizer: failure.summarizer.iter().map(message_item).collect(),
-                error: failure.error.clone(),
+                error: failure
+                    .error
+                    .as_ref()
+                    .map(|error| error.sentence(crate::host::http::errors::api_wording)),
             })
         }
         HistoryKind::Rewind { rows, turns } => HistoryItemKind::Rewind(RewindItem {

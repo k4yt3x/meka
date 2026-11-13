@@ -74,6 +74,10 @@ pub(crate) struct Agent {
     /// A worker never consults it: see [`Self::mcp_manager`].
     mcp_manager: Option<std::sync::Weak<crate::mcp::McpClientManager>>,
     tool_registry: ToolRegistry,
+    /// What keeps the registry following the MCP manager's tool changes, held for as long as this
+    /// agent lives, since the manager holds it only weakly. `None` for a worker, whose registry
+    /// takes the tools once at its spawn, and where the process has no manager.
+    mcp_subscription: Option<crate::tools::mcp_adapter::McpSubscription>,
     store: Store,
     options: AgentOptions,
     /// Last checklist state pushed to the frontend, so a `checklist_*` call that changes nothing
@@ -264,6 +268,7 @@ impl Agent {
             mcp_manager: materials.mcp_manager.clone(),
             options,
             tool_registry,
+            mcp_subscription: None,
             store: materials.store.clone(),
             last_rendered_checklist: tokio::sync::RwLock::new(None),
             last_rendered_world: tokio::sync::RwLock::new(None),
@@ -297,6 +302,14 @@ impl Agent {
     /// The cells this agent drives, for a host that reads them without going through a turn.
     pub(crate) fn cells(&self) -> &SessionCells {
         &self.cells
+    }
+
+    /// Keep the registry following the MCP manager for as long as this agent lives.
+    pub(crate) fn hold_mcp_subscription(
+        &mut self,
+        subscription: crate::tools::mcp_adapter::McpSubscription,
+    ) {
+        self.mcp_subscription = Some(subscription);
     }
 
     /// What the session's own profile sends to: its name and the model its provider names. A

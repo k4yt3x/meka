@@ -147,6 +147,10 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
         crate::host::apply_recorded_bindings(&self.state.shared, &entry.agent, entry.id).await
     }
 
+    fn shutting_down(&self) -> bool {
+        self.state.leaving.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// An out-of-band turn has no `session/prompt` response to carry its outcome, so a failure
     /// would otherwise leave the editor with a prompt and nothing under it. Said as the notice the
     /// screen prints and the webhook `meka serve` posts; a clean finish needs no announcement,

@@ -185,6 +185,9 @@ pub(crate) async fn run_serve(
                 > 0
         });
         let (join_result, ()) = tokio::join!(serve_handle, turns_unwound);
+        // After the accept loop, which no longer waits for a write whose client hung up: once it
+        // has returned no connection is left to start another.
+        state.writes.wait_until_none().await;
         join_result
     })
     .await;
@@ -421,6 +424,13 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             "/v1/mcp/{name}/reconnect",
             post(handlers::info::mcp_reconnect),
         )
+        // Inside authentication, so a write runs with the principal it attached, and inside the
+        // body limit and the trace, whose body and span travel onto the write's task with the
+        // request.
+        .layer(middleware::from_fn_with_state(
+            state.writes.clone(),
+            run_writes_to_completion,
+        ))
         .layer(middleware::from_fn_with_state(
             auth,
             crate::host::http::auth::bearer_auth,
@@ -462,6 +472,46 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         None => router,
     };
     router.layer(TraceLayer::new_for_http()).with_state(state)
+}
+
+/// The routes whose method writes that run on their request's own future, each because its
+/// connection is part of what it does.
+const HELD_ON_THE_CONNECTION: &[(&str, &str)] = &[
+    // A held turn reads its client's hang-up as the end of the client's presence, and runs its
+    // turn on a task it spawns itself.
+    ("POST", "/v1/sessions/{id}/turns"),
+];
+
+/// Whether a request to the route `path` runs on a task of its own: every method that is not safe
+/// (RFC 9110, section 9.2.1), on every route [`HELD_ON_THE_CONNECTION`] does not name.
+fn outlives_its_client(method: &axum::http::Method, path: &str) -> bool {
+    !method.is_safe()
+        && !HELD_ON_THE_CONNECTION
+            .iter()
+            .any(|&(held_method, held_path)| method.as_str() == held_method && path == held_path)
+}
+
+/// Run a write on a task of its own and answer when it ends, so a client that hangs up drops the
+/// wait and never the write: hyper drops the handler of a connection whose client went away at
+/// whatever await it had reached, which would leave a write of several steps half done.
+async fn run_writes_to_completion(
+    axum::extract::State(writes): axum::extract::State<state::Writes>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let outlives = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .is_some_and(|path| outlives_its_client(request.method(), path.as_str()));
+    if !outlives {
+        return next.run(request).await;
+    }
+    match writes.begin().run(next.run(request)).await {
+        Ok(response) => response,
+        Err(error) => {
+            ProblemDetail::internal_sanitized("a write ended abnormally", error).into_response()
+        }
+    }
 }
 
 /// The CORS policy `[serve].cors_allowed_origins` asks for, or none when the key is unset, so a
@@ -642,4 +692,107 @@ async fn inject_problem_instance(
         }
     };
     axum::response::Response::from_parts(parts, rewritten)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each `.route(...)` call in `source`: where it starts, the path it registers, and the
+    /// methods its method router names.
+    fn registered_routes(source: &str) -> Vec<(usize, String, Vec<&'static str>)> {
+        const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
+        let mut routes = Vec::new();
+        for (at, _) in source.match_indices(".route(") {
+            let mut depth = 0usize;
+            let mut end = source.len();
+            for (offset, character) in source[at + ".route".len()..].char_indices() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = at + ".route".len() + offset;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let call = &source[at..end];
+            let path = call
+                .split('"')
+                .nth(1)
+                .expect("a route names its path first")
+                .to_string();
+            let methods = METHODS
+                .into_iter()
+                .filter(|method| {
+                    call.match_indices(&format!("{method}(")).any(|(found, _)| {
+                        call[..found].chars().next_back().is_some_and(|before| {
+                            !before.is_alphanumeric() && before != '_' && before != ':'
+                        })
+                    })
+                })
+                .collect();
+            routes.push((at, path, methods));
+        }
+        routes
+    }
+
+    /// Every route whose method writes is registered under the layer that runs it to completion,
+    /// or is named in [`HELD_ON_THE_CONNECTION`], and every route named there is one that writes. A
+    /// route registered after the layer, or on a router it does not wrap, runs on its connection,
+    /// and the next client that hangs up on it cuts it wherever it stands.
+    #[test]
+    fn every_write_route_runs_under_the_write_layer_or_is_held_by_name() {
+        let source = include_str!("http.rs").replace("\r\n", "\n");
+        let router = source
+            .split("fn build_router(")
+            .nth(1)
+            .expect("the router this assertion is about")
+            .split("\n}\n")
+            .next()
+            .expect("splitting always yields a first part");
+        let layer = router
+            .find("run_writes_to_completion")
+            .expect("the router applies the write layer");
+        let authentication = router
+            .find("bearer_auth")
+            .expect("the router applies authentication");
+        assert!(
+            layer < authentication,
+            "the write layer must sit inside authentication, so a write runs with its principal"
+        );
+
+        let routes = registered_routes(router);
+        assert!(
+            routes.len() > 40,
+            "the scan no longer finds the router's routes, so this assertion proves nothing"
+        );
+        let writes = |methods: &[&str]| {
+            methods
+                .iter()
+                .any(|method| matches!(*method, "post" | "put" | "patch" | "delete"))
+        };
+        let mut problems = Vec::new();
+        for (at, path, methods) in &routes {
+            if writes(methods) && *at > layer {
+                problems.push(format!(
+                    "{methods:?} {path} is registered outside the write layer"
+                ));
+            }
+        }
+        for (held_method, held_path) in HELD_ON_THE_CONNECTION {
+            let method = held_method.to_ascii_lowercase();
+            let named = writes(&[method.as_str()])
+                && routes.iter().any(|(_, path, methods)| {
+                    path == held_path && methods.contains(&method.as_str())
+                });
+            if !named {
+                problems.push(format!("{held_method} {held_path} names no write route"));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
 }

@@ -419,8 +419,8 @@ pub(crate) async fn create_session(
             approvals,
             capabilities_json,
             Some(principal.token_id.clone()),
-            profile.clone(),
-            project.clone(),
+            profile,
+            project,
         )
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to create session", error))?;
@@ -473,14 +473,19 @@ pub(crate) async fn create_session(
         capabilities,
         frontend: http_frontend,
     };
+    // Read before the session is anybody's to find, so a read that fails takes the row with it
+    // through the rollback; once the session is in the map the caller would be told of a failure
+    // about a session that exists.
+    let record = resident_record(&state, &entry, session_uuid).await?;
     entry
         .frontend
         .install_feed(session_uuid, &state.feed_wiring());
 
-    state.sessions.write().await.insert(session_uuid, entry);
-
-    // Just-created session has zero messages, so title is always empty. Skip the DB round-trip.
-    let title = String::new();
+    state
+        .sessions
+        .write()
+        .await
+        .insert(session_uuid, entry.clone());
 
     tracing::info!(
         "session created: id={session_uuid} cwd={cwd_path:?} permission={permission} \
@@ -490,34 +495,6 @@ pub(crate) async fn create_session(
 
     // Past the point of no return: disarm so the rollback Drop doesn't fire.
     rollback.disarm();
-    // Use the canonical `created_at` from the DB insert so all three surfaces agree.
-    let timestamp = created.created_at;
-    let record = SessionResponse {
-        session: SessionView {
-            id: session_uuid,
-            created_at: timestamp.clone(),
-            updated_at: timestamp,
-            working_directory: Some(cwd_path),
-            permission: Some(permission),
-            approvals,
-            profile,
-            project,
-            title,
-            // A root by construction: `POST /v1/sessions` has no way to name a parent, and
-            // a sub-agent session is only ever minted by `agent_spawn` inside a turn.
-            parent_id: None,
-            pinned_at: None,
-            last_turn: None,
-            turn_count: 0,
-            usage: Default::default(),
-        },
-        capabilities,
-        turn_in_flight: false,
-        inbox_pending: None,
-        // Just made: nothing can be parked on it yet.
-        requests_pending: Some(0),
-        checklist: Some(Vec::new()),
-    };
     announce_session(
         &state,
         crate::host::http::sse::SseEventType::SessionCreated,
@@ -755,15 +732,11 @@ pub(crate) async fn fork_session(
         None => Ok(()),
     };
     let forked_info = match branched {
-        Ok(()) => match state.shared.store.session_info(forked.id).await {
-            Ok(Some(info)) => Ok(info),
-            Ok(None) => Err(crate::error::MekaError::SessionNotFound(forked.id)),
-            Err(error) => Err(error),
-        },
+        Ok(()) => stored_record_parts(&state, forked.id).await,
         Err(error) => Err(error),
     };
-    let forked_info = match forked_info {
-        Ok(info) => info,
+    let (forked_info, inbox_pending) = match forked_info {
+        Ok(stored) => stored,
         Err(error) => {
             drop(copy_lock);
             roll_back_fork(&state, forked.id).await;
@@ -797,32 +770,7 @@ pub(crate) async fn fork_session(
         token = principal.token_id,
     );
 
-    let record = SessionResponse {
-        session: SessionView {
-            id: forked.id,
-            created_at: forked.created_at.clone(),
-            updated_at: forked.created_at,
-            working_directory: Some(entry.cells().cwd.get()),
-            permission: Some(entry.cells().permission.get()),
-            approvals: entry.cells().permission.approvals(),
-            profile: forked_info.profile,
-            project: forked_info.project,
-            title: forked_info.title,
-            // Read back rather than assumed: forking a sub-agent session keeps it under the
-            // same parent, so the copy is a sibling of the original, not a new root, and a
-            // response that said otherwise would disagree with the store.
-            parent_id: forked_info.parent_id,
-            pinned_at: forked_info.pinned_at,
-            last_turn: forked_info.last_turn,
-            turn_count: forked_info.turn_count,
-            usage: forked_info.usage,
-        },
-        capabilities: entry.capabilities,
-        turn_in_flight: false,
-        inbox_pending: None,
-        requests_pending: Some(entry.frontend.requests_pending()),
-        checklist: Some(entry.agent.cells().checklist.get().items),
-    };
+    let record = resident_record_from(&entry, forked_info, inbox_pending);
     announce_session(
         &state,
         crate::host::http::sse::SseEventType::SessionCreated,
@@ -1094,7 +1042,7 @@ pub(crate) fn listed_session(
     live: Option<&SessionEntry>,
     running_as_subagent: bool,
 ) -> SessionResponse {
-    let mut session = SessionView::from(row);
+    let mut session = SessionView::new(row, crate::host::http::errors::api_wording);
     if let Some(entry) = live {
         session.permission = Some(entry.cells().permission.get());
         session.approvals = entry.cells().permission.approvals();
@@ -1143,24 +1091,7 @@ pub(crate) async fn get_session(
     if let Some(entry) = state.sessions.read().await.get(&id).cloned() {
         return Ok(Json(resident_record(&state, &entry, id).await?));
     }
-    let summary = state
-        .shared
-        .store
-        .session_info(id)
-        .await
-        .map_err(|error| ProblemDetail::internal_sanitized("failed to look up session", error))?
-        .ok_or_else(|| session_not_found(id))?;
-    // Evicted-but-persisted row: fall back to DB columns for permission/capabilities.
-    let capabilities = capabilities_from_row(summary.capabilities_json.as_deref());
-    Ok(Json(SessionResponse {
-        session: SessionView::from(&summary),
-        capabilities,
-        // A sub-agent is never resident; its parent's run is what makes it busy.
-        turn_in_flight: state.shared.running_subagents.is_running(id),
-        inbox_pending: None,
-        requests_pending: None,
-        checklist: None,
-    }))
+    Ok(Json(dormant_record(&state, id).await?))
 }
 
 /// Move a session that is not resident onto another profile, or title or pin it, without building
@@ -1327,41 +1258,55 @@ async fn requested_project_move(
 
 /// A resident session as `GET /v1/sessions/{id}` answers for it: the row under what this process
 /// knows, the cells, the turn in flight, the parked prompts and the inbox.
-async fn resident_record(
+pub(crate) async fn resident_record(
     state: &ServerState,
     entry: &SessionEntry,
     id: Uuid,
 ) -> Result<SessionResponse, ProblemDetail> {
+    // The row, read rather than tolerated. `profile` is the billing record and `""` is not a
+    // profile, so a read that fails is a 500 rather than a 200 nobody can act on; a resident
+    // entry whose row is gone is a session that is not there.
+    match stored_record_parts(state, id).await {
+        Ok((info, inbox_pending)) => Ok(resident_record_from(entry, info, inbox_pending)),
+        Err(crate::error::MekaError::SessionNotFound(_)) => Err(session_not_found(id)),
+        Err(error) => Err(ProblemDetail::internal_sanitized(
+            "failed to read the session's record",
+            error,
+        )
+        .with("session_id", id.to_string())),
+    }
+}
+
+/// What a resident session's record takes from the store: its row, and how many inbox items wait.
+/// Read apart from [`resident_record_from`] for the door that makes a session and reads these
+/// while a failure can still take the row with it.
+async fn stored_record_parts(
+    state: &ServerState,
+    id: Uuid,
+) -> crate::error::Result<(crate::store::SessionSummary, u64)> {
+    let info = state
+        .shared
+        .store
+        .session_info(id)
+        .await?
+        .ok_or(crate::error::MekaError::SessionNotFound(id))?;
+    let inbox_pending = state.shared.store.inbox_store().pending_count(id).await?;
+    Ok((info, inbox_pending))
+}
+
+/// [`resident_record`] from what the store holds of the session, already read.
+fn resident_record_from(
+    entry: &SessionEntry,
+    info: crate::store::SessionSummary,
+    inbox_pending: u64,
+) -> SessionResponse {
     let updated_at = entry
         .updated_at
         .read()
         .ok()
         .map(|guard| guard.to_rfc3339())
         .unwrap_or_default();
-    // The row, read rather than tolerated. `profile` is the billing record and `""` is not a
-    // profile, so a read that fails is a 500 rather than a 200 nobody can act on; a resident
-    // entry whose row is gone is a session that is not there.
-    let info = state
-        .shared
-        .store
-        .session_info(id)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to look up session", error)
-                .with("session_id", id.to_string())
-        })?
-        .ok_or_else(|| session_not_found(id))?;
-    let inbox_pending = state
-        .shared
-        .store
-        .inbox_store()
-        .pending_count(id)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to count inbox items", error)
-                .with("session_id", id.to_string())
-        })?;
-    Ok(SessionResponse {
+    SessionResponse {
         session: SessionView {
             id: entry.id,
             created_at: entry.created_at.to_rfc3339(),
@@ -1374,7 +1319,9 @@ async fn resident_record(
             title: info.title,
             parent_id: info.parent_id,
             pinned_at: info.pinned_at,
-            last_turn: info.last_turn,
+            last_turn: info.last_turn.as_ref().map(|turn| {
+                crate::view::TurnView::new(turn, crate::host::http::errors::api_wording)
+            }),
             turn_count: info.turn_count,
             usage: info.usage,
         },
@@ -1383,7 +1330,7 @@ async fn resident_record(
         inbox_pending: Some(inbox_pending),
         requests_pending: Some(entry.frontend.requests_pending()),
         checklist: Some(entry.agent.cells().checklist.get().items),
-    })
+    }
 }
 
 /// Put each session a rename moved on the feeds, as `GET /v1/sessions/{id}` now answers for it: a
@@ -1415,9 +1362,12 @@ pub(crate) async fn announce_sessions_moved(state: &ServerState, ids: &[Uuid]) {
     }
 }
 
-/// A session's record as its row states it, for a session this process does not hold: not
-/// resident, and nothing can make it so while the reconstruction lock is held.
-async fn dormant_record(state: &ServerState, id: Uuid) -> Result<SessionResponse, ProblemDetail> {
+/// A session's record as its row states it, for a session this process does not hold: busy only
+/// while this process runs it as a sub-agent, which is never resident.
+pub(crate) async fn dormant_record(
+    state: &ServerState,
+    id: Uuid,
+) -> Result<SessionResponse, ProblemDetail> {
     let summary = state
         .shared
         .store
@@ -1426,9 +1376,9 @@ async fn dormant_record(state: &ServerState, id: Uuid) -> Result<SessionResponse
         .map_err(|error| ProblemDetail::internal_sanitized("failed to look up session", error))?
         .ok_or_else(|| session_not_found(id))?;
     Ok(SessionResponse {
-        session: SessionView::from(&summary),
+        session: SessionView::new(&summary, crate::host::http::errors::api_wording),
         capabilities: capabilities_from_row(summary.capabilities_json.as_deref()),
-        turn_in_flight: false,
+        turn_in_flight: state.shared.running_subagents.is_running(id),
         inbox_pending: None,
         requests_pending: None,
         checklist: None,
@@ -1516,51 +1466,10 @@ pub(crate) async fn patch_session(
         return Ok(response);
     }
 
-    // The level and the approvals switch apply during a turn: tool dispatch reads both cells live,
-    // which is what makes the level a brake, and the screen's Shift+Tab and ACP's
-    // `session/set_mode` move them mid-turn for that reason. The working directory and the
-    // profile are different. The file tools resolve every path against the live cwd cell, so a
-    // directory moved under a running turn moves its write fence, the profile is a turn's wire,
-    // and the project is the tier a turn's memories file into and the view its catalog is read
-    // through. A body naming any of the three claims the session the way compact and rewind do:
-    // `claim_idle`
-    // under the sessions read-lock, so DELETE's re-check sees it, then the conversation mutex,
-    // both held to the end of the handler across the row write, the cell writes and the agent
-    // swap. A turn arriving meanwhile finds the mutex held and answers 409, and so does a
-    // second PATCH naming these fields, which is accepted. A body naming only the level or the
-    // approvals switch claims nothing.
-    //
-    // A claim and not a read of `in_flight`: three awaits separate this point from the cell write,
-    // and a turn admitted inside them ran in the new directory.
-    //
-    // An entry missing from the map under the lock was evicted or deleted since it was loaded;
-    // `ensure_session_loaded` answers 404 for a row that is gone and re-attaches the other, and the
-    // next pass finds it.
-    const DOING: &str = "change the session's working directory, profile or project";
-    let (entry, turn_exclusive) = loop {
-        let entry = ensure_session_loaded(&state, id).await?;
-        if body.working_directory.is_none() && body.profile.is_none() && body.project.is_none() {
-            break (entry, None);
-        }
-        let map = state.sessions.read().await;
-        let entry = match map.get(&id).cloned() {
-            Some(entry) => entry,
-            None => {
-                drop(map);
-                continue;
-            }
-        };
-        let idle = entry
-            .claim_idle()
-            .ok_or_else(|| turn_in_flight_conflict(id, DOING))?;
-        let conversation = std::sync::Arc::clone(&entry.conversation)
-            .try_lock_owned()
-            .map_err(|_| turn_in_flight_conflict(id, DOING))?;
-        break (entry, Some((idle, conversation)));
-    };
-
     // Validate all fields up-front before any DB write so a mixed valid/invalid request
-    // (e.g. valid permission + invalid cwd) doesn't leave a half-applied state.
+    // (e.g. valid permission + invalid cwd) doesn't leave a half-applied state, and before the
+    // session is loaded, so a refused body leaves a session this server does not hold unloaded and
+    // its lock free.
     let new_permission = match body.permission.as_deref() {
         Some(level) => {
             let parsed: Permission = level.parse().map_err(|error| {
@@ -1622,6 +1531,49 @@ pub(crate) async fn patch_session(
     let new_project: Option<Option<String>> = match body.project.as_deref() {
         Some(project) => Some(requested_project_move(&state, project).await?),
         None => None,
+    };
+
+    // The level and the approvals switch apply during a turn: tool dispatch reads both cells live,
+    // which is what makes the level a brake, and the screen's Shift+Tab and ACP's
+    // `session/set_mode` move them mid-turn for that reason. The working directory and the
+    // profile are different. The file tools resolve every path against the live cwd cell, so a
+    // directory moved under a running turn moves its write fence, the profile is a turn's wire,
+    // and the project is the tier a turn's memories file into and the view its catalog is read
+    // through. A body naming any of the three claims the session the way compact and rewind do:
+    // `claim_idle`
+    // under the sessions read-lock, so DELETE's re-check sees it, then the conversation mutex,
+    // both held to the end of the handler across the row write, the cell writes and the agent
+    // swap. A turn arriving meanwhile finds the mutex held and answers 409, and so does a
+    // second PATCH naming these fields, which is accepted. A body naming only the level or the
+    // approvals switch claims nothing.
+    //
+    // A claim and not a read of `in_flight`: three awaits separate this point from the cell write,
+    // and a turn admitted inside them ran in the new directory.
+    //
+    // An entry missing from the map under the lock was evicted or deleted since it was loaded;
+    // `ensure_session_loaded` answers 404 for a row that is gone and re-attaches the other, and the
+    // next pass finds it.
+    const DOING: &str = "change the session's working directory, profile or project";
+    let (entry, turn_exclusive) = loop {
+        let entry = ensure_session_loaded(&state, id).await?;
+        if body.working_directory.is_none() && body.profile.is_none() && body.project.is_none() {
+            break (entry, None);
+        }
+        let map = state.sessions.read().await;
+        let entry = match map.get(&id).cloned() {
+            Some(entry) => entry,
+            None => {
+                drop(map);
+                continue;
+            }
+        };
+        let idle = entry
+            .claim_idle()
+            .ok_or_else(|| turn_in_flight_conflict(id, DOING))?;
+        let conversation = std::sync::Arc::clone(&entry.conversation)
+            .try_lock_owned()
+            .map_err(|_| turn_in_flight_conflict(id, DOING))?;
+        break (entry, Some((idle, conversation)));
     };
 
     // Filter out no-op fields so a PATCH that doesn't change anything skips the DB write
@@ -1745,51 +1697,14 @@ pub(crate) async fn patch_session(
     if moves_updated_at && let Ok(mut guard) = entry.updated_at.write() {
         *guard = chrono::Utc::now();
     }
-    let cwd_snapshot = entry.cells().cwd.get();
-    let updated_at = entry
-        .updated_at
-        .read()
-        .ok()
-        .map(|guard| guard.to_rfc3339())
-        .unwrap_or_default();
-    // Read, not tolerated, for the reason `get_session` gives: `""` is not a profile.
-    let info = state
-        .shared
-        .store
-        .session_info(id)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to look up session", error)
-                .with("session_id", id.to_string())
-        })?
-        .ok_or_else(|| session_not_found(id))?;
-    let record = SessionResponse {
-        session: SessionView {
-            id: entry.id,
-            created_at: entry.created_at.to_rfc3339(),
-            updated_at,
-            working_directory: Some(cwd_snapshot),
-            permission: Some(entry.cells().permission.get()),
-            approvals: entry.cells().permission.approvals(),
-            profile: info.profile,
-            project: info.project,
-            title: info.title,
-            parent_id: info.parent_id,
-            pinned_at: info.pinned_at,
-            last_turn: info.last_turn,
-            turn_count: info.turn_count,
-            usage: info.usage,
-        },
-        capabilities: entry.capabilities,
-        // The claim this handler holds is the counter's one increment and no turn, and nothing
-        // runs under it; a body that claimed nothing reads the counter, since a turn may be
-        // running under a change of level, approvals, title or pin.
-        turn_in_flight: turn_exclusive.is_none()
-            && entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
-        inbox_pending: None,
-        requests_pending: Some(entry.frontend.requests_pending()),
-        checklist: Some(entry.agent.cells().checklist.get().items),
-    };
+    let mut record = resident_record(&state, &entry, id).await?;
+    // Read and announced under the claim, so a `DELETE` cannot land between the change and its
+    // announcement. The claim this handler holds is the counter's one increment and no turn, and
+    // nothing runs under it; a body that claimed nothing reads the counter, since a turn may be
+    // running under a change of level, approvals, title or pin.
+    if turn_exclusive.is_some() {
+        record.turn_in_flight = false;
+    }
     // A `PATCH` that moved nothing is not a change anyone needs to hear of.
     if mutated {
         announce_session(
@@ -1962,10 +1877,10 @@ pub(crate) async fn delete_session(
         None => state.shared.store.delete_session_unless_attached(id).await,
     };
     if let Err(error) = deleted {
-        // The entry is out of the map and about to drop, so its registry has to leave the MCP
-        // manager here or it stays attached for the life of the process. Only the detach: the
-        // session's background work is still the session's, and it re-attaches from the row this
-        // delete failed to remove.
+        // The entry is out of the map and about to drop, so its registry leaves the MCP manager's
+        // list here rather than at the manager's next fan-out. Only the detach: the session's
+        // background work is still the session's, and it re-attaches from the row this delete
+        // failed to remove.
         if let (Some(entry), Some(manager)) = (removed.as_ref(), state.shared.mcp_manager.as_ref())
         {
             crate::tools::mcp_adapter::detach_session_registry(

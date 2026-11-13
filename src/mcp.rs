@@ -336,10 +336,11 @@ pub(crate) struct McpClientManager {
     /// here as each server reaches `Connected`, and `on_tool_list_changed` writes here on dynamic
     /// updates. A new subscriber is replayed this snapshot at [`Self::subscribe`] time.
     tools_snapshot: tokio::sync::RwLock<HashMap<String, ServerTools>>,
-    /// Who is told when a server's tool list changes. A session's registry subscribes when the
-    /// session opens and unsubscribes when it closes; updates from the connector or notification
-    /// handler reach every entry.
-    observers: tokio::sync::RwLock<Vec<Arc<dyn ServerToolsObserver>>>,
+    /// Who is told when a server's tool list changes, held weakly: a session's registry subscribes
+    /// when the session opens and leaves when it closes, or once nothing else holds it, so a
+    /// session dropped without closing takes its registry, and everything the registry holds, with
+    /// it.
+    observers: tokio::sync::RwLock<Vec<std::sync::Weak<dyn ServerToolsObserver>>>,
     /// `[mcp].connect_timeout`, kept so the request paths that run *after* the connector
     /// (a `tools/list_changed` refresh, `meka mcp tools`) can bound themselves by the same value
     /// the connect did. Set by [`Self::start_connector`]; a manager that never started one
@@ -1451,10 +1452,21 @@ impl McpClientManager {
             .write()
             .await
             .insert(server_name.to_string(), tools.clone());
-        let observers = self.observers.read().await;
-        for observer in observers.iter() {
-            observer.server_tools_changed(server_name, &tools);
-        }
+        self.tell_observers(server_name, &tools).await;
+    }
+
+    /// Hand `tools` to every observer still alive, dropping the ones gone.
+    async fn tell_observers(&self, server_name: &str, tools: &ServerTools) {
+        self.observers
+            .write()
+            .await
+            .retain(|observer| match observer.upgrade() {
+                Some(observer) => {
+                    observer.server_tools_changed(server_name, tools);
+                    true
+                }
+                None => false,
+            });
     }
 
     /// [`Self::update_server_tools`] for a caller holding the tools themselves.
@@ -1506,9 +1518,9 @@ impl McpClientManager {
     /// both paths fire is harmless.
     ///
     /// Sessions subscribe their registry at `session/new` and pair it with [`Self::unsubscribe`] at
-    /// `session/close`.
-    pub(crate) async fn subscribe(&self, observer: Arc<dyn ServerToolsObserver>) {
-        self.observers.write().await.push(Arc::clone(&observer));
+    /// `session/close`. Held weakly: `observer` is told for as long as the caller keeps it alive.
+    pub(crate) async fn subscribe(&self, observer: &Arc<dyn ServerToolsObserver>) {
+        self.observers.write().await.push(Arc::downgrade(observer));
         let snapshot = self.tools_snapshot.read().await;
         for (server_name, tools) in snapshot.iter() {
             observer.server_tools_changed(server_name, tools);
@@ -1519,7 +1531,11 @@ impl McpClientManager {
     /// subscribed.
     pub(crate) async fn unsubscribe(&self, identity: usize) {
         let mut observers = self.observers.write().await;
-        observers.retain(|observer| observer.identity() != identity);
+        observers.retain(|observer| {
+            observer
+                .upgrade()
+                .is_some_and(|observer| observer.identity() != identity)
+        });
     }
 
     /// What every entry is settled under, or the built-in defaults on a manager made without a
@@ -1817,9 +1833,7 @@ impl McpClientManager {
             tools: Vec::new(),
             deferred: Vec::new(),
         };
-        for observer in self.observers.read().await.iter() {
-            observer.server_tools_changed(name, &gone);
-        }
+        self.tell_observers(name, &gone).await;
         tracing::info!("removed MCP server '{name}' from the running manager");
         Ok(())
     }
@@ -2176,11 +2190,10 @@ impl McpClientManager {
     /// Close every connected server, in place.
     ///
     /// Takes `&self` deliberately. Consuming `self` would make callers `try_unwrap` an `Arc<Self>`
-    /// first, which never succeeds: the manager holds the tool registries it serves (the
-    /// observers) and those registries hold the six `mcp_resource_*` / `mcp_prompt_*` tools, each
-    /// of which holds an `Arc` back to the manager. With sole ownership unreachable,
-    /// `close_with_timeout` never runs and stdio children are left to rmcp's drop guard, which
-    /// spawns onto a runtime already tearing down.
+    /// first, which never succeeds while a session lives: its registry holds the six
+    /// `mcp_resource_*` / `mcp_prompt_*` tools, each of which holds an `Arc` back to the manager.
+    /// With sole ownership unreachable, `close_with_timeout` never runs and stdio children are left
+    /// to rmcp's drop guard, which spawns onto a runtime already tearing down.
     ///
     /// The service is taken out from under each entry's `state` lock rather than by owning the
     /// entry, so a `ServerEntry` clone held by an in-flight call doesn't block teardown either. The
@@ -3234,7 +3247,8 @@ mod tests {
         .await;
 
         let registry = crate::tools::ToolRegistry::new();
-        crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
+        let _subscription =
+            crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
 
         assert!(
             registry.get("mcp__notion__search").is_some()
@@ -3298,7 +3312,9 @@ mod tests {
             )
             .await;
             let registry = crate::tools::ToolRegistry::new();
-            crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
+            let _subscription =
+                crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone())
+                    .await;
             assert!(
                 registry.get("mcp__notion__search").is_some()
                     && !registry.is_deferred("mcp__notion__search"),
@@ -4188,7 +4204,8 @@ mod tests {
         .expect("prepare");
         context.set_manager(Arc::downgrade(&manager));
         let registry = crate::tools::ToolRegistry::new();
-        crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
+        let _subscription =
+            crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
         let entry = manager.entry("stub").expect("the configured entry");
 
         connector::connect_one(
@@ -4263,15 +4280,14 @@ mod tests {
 
     /// Shutdown must run while the manager is still shared.
     ///
-    /// Consuming `self` would make the caller win an `Arc::try_unwrap` first, which it never can:
-    /// the manager holds the registries it serves, and each of those holds six `mcp_resource_*` /
-    /// `mcp_prompt_*` tools that hold the manager back. Sole ownership was unreachable by
-    /// construction, so the close handshake never ran on any launch that had an MCP server to
-    /// close, and every exit warned about it instead.
+    /// Consuming `self` would make the caller win an `Arc::try_unwrap` first, which it never can
+    /// while a session lives: the session's registry holds six `mcp_resource_*` / `mcp_prompt_*`
+    /// tools that hold the manager. Sole ownership is unreachable, so a shutdown that consumed the
+    /// manager would never run the close handshake on a launch with an MCP server to close.
     ///
-    /// The cycle is built here rather than described, so a future change that reintroduces it is
-    /// caught: attaching a session's registry puts the registry inside the manager and tools
-    /// holding the manager inside that registry, and shutdown still has to reach the entries.
+    /// The sharing is built here rather than described, so a future change that drops `&self` is
+    /// caught: attaching a session's registry puts tools holding the manager inside that registry,
+    /// and shutdown still has to reach the entries.
     #[tokio::test]
     async fn shutdown_runs_while_the_manager_is_still_shared() {
         let manager = McpClientManager::prepare(
@@ -4284,9 +4300,10 @@ mod tests {
         .await
         .expect("prepare");
         let registry = crate::tools::ToolRegistry::new();
-        crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
+        let _subscription =
+            crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
 
-        // The cycle a `try_unwrap` would lose to.
+        // The sharing a `try_unwrap` would lose to.
         assert!(
             Arc::strong_count(&manager) > 1,
             "the manager must be shared for this test to mean anything"
@@ -4408,7 +4425,8 @@ mod tests {
 
         let registry = ToolRegistry::new();
         registry.register_load_tool_for_test();
-        crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
+        let _subscription =
+            crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
 
         let tool_load = registry.get("tool_load").expect("tool_load registered");
         let output = tool_load
@@ -4943,7 +4961,8 @@ mod tests {
 
         // Attached only now, which is the ordering both long-lived hosts actually use.
         let registry = crate::tools::ToolRegistry::new();
-        crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
+        let _subscription =
+            crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
 
         assert!(
             registry.get("mcp__notion__create_page").is_some(),
@@ -5010,15 +5029,16 @@ mod tests {
             let manager = Arc::clone(&manager);
             let registry = registry.clone();
             attach_handles.push(tokio::spawn(async move {
-                crate::tools::mcp_adapter::attach_session_registry(&manager, registry).await;
+                crate::tools::mcp_adapter::attach_session_registry(&manager, registry).await
             }));
         }
 
         for handle in update_handles {
             handle.await.expect("update task");
         }
+        let mut subscriptions = Vec::new();
         for handle in attach_handles {
-            handle.await.expect("attach task");
+            subscriptions.push(handle.await.expect("attach task"));
         }
 
         // The snapshot is the source of truth for "what got published".  Every server's
@@ -5111,6 +5131,7 @@ mod tests {
         manager: Arc<McpClientManager>,
         entry: Arc<ServerEntry>,
         registry: crate::tools::ToolRegistry,
+        _subscription: crate::tools::mcp_adapter::McpSubscription,
         _temp: tempfile::TempDir,
     }
 
@@ -5151,7 +5172,9 @@ mod tests {
             .expect("prepare");
             context.set_manager(Arc::downgrade(&manager));
             let registry = crate::tools::ToolRegistry::new();
-            crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
+            let subscription =
+                crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone())
+                    .await;
             let entry = manager.entry("stub").expect("the configured entry");
             let stub = Self {
                 state: path,
@@ -5160,6 +5183,7 @@ mod tests {
                 manager,
                 entry,
                 registry,
+                _subscription: subscription,
                 _temp: temp,
             };
             stub.write_state(state);

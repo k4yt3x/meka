@@ -127,7 +127,7 @@ pub(crate) struct TurnOptions {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct TurnResponse {
     #[serde(flatten)]
-    pub(crate) record: crate::store::turns::TurnRecord,
+    pub(crate) record: crate::view::TurnView,
     /// The model's words when `stop_reason` is `refusal` and it wrote any: its refusal, else the
     /// text it wrote before the stop; omitted otherwise. Mirrors the `refusal_text` field on the
     /// streaming `turn.finished` event, so blocking and streaming clients share the same shape.
@@ -159,7 +159,7 @@ pub(crate) struct UsageView {
     request_body = TurnRequest,
     responses(
         (status = 200, description = "A held turn's response: the assembled turn (stream=false) or its live SSE stream (stream=true). The application/json schema applies only to the former.", body = TurnResponse),
-        (status = 202, description = "A detached request's turn was admitted (detach=true, stream=false): the body is the turn record and `Location` names it under `/turns/{turn_id}`", body = crate::store::turns::TurnRecord),
+        (status = 202, description = "A detached request's turn was admitted (detach=true, stream=false): the body is the turn record and `Location` names it under `/turns/{turn_id}`", body = crate::view::TurnView),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
@@ -369,28 +369,9 @@ pub(crate) async fn submit_turn(
 
     // Asked again of the entry admitted, not only of the one the decode was judged against: the
     // session may have been evicted and moved onto a text-only profile in between, and the
-    // images would otherwise reach a model the row says cannot take them. Ahead of the outcome
-    // claim below, which is the first thing here a refusal could not undo.
+    // images would otherwise reach a model the row says cannot take them. Ahead of the turn's
+    // task, whose outcome claim is the first thing a refusal could not undo.
     refuse_images_without_vision(image_count, entry.accepts_images())?;
-
-    // An outcome that did not warrant a turn of its own rides on this one, ahead of the caller's
-    // message rather than as a message of its own: see `background::render_outcomes_riding`. Both
-    // arms below take the joined prompt, so neither surface can be the one that forgets.
-    let outcomes = if state.shared.config.background.enabled {
-        crate::host::claim_undelivered_outcomes(&entry.agent, &state.shared.store, session_id).await
-    } else {
-        Vec::new()
-    };
-    // A claim leaves the pool the poller announces from, so subscribers are told by whoever claims:
-    // the session's frontend tells them of what a turn claims once it is in the conversation, and
-    // this claim is told here, ahead of a turn that may be refused before its opening is appended.
-    // Best-effort here, unlike the poller: this claim is already stamped, and refusing the user's
-    // turn over a webhook bookkeeping failure would be the wrong trade. It is logged.
-    let _announced = state
-        .webhooks
-        .announce_finished_tasks(&state.shared.store.background_store(), &outcomes)
-        .await;
-    let input = input.riding(outcomes);
 
     let opener = Opener {
         holds: !body.detach,
@@ -429,6 +410,34 @@ pub(crate) async fn submit_turn(
         )
         .await
     }
+}
+
+/// `input` with the outcomes that did not warrant a turn of their own riding on it, ahead of the
+/// caller's message rather than as a message of its own: see `background::render_outcomes_riding`.
+/// Called first thing by the task that runs the turn, in both encodings: the claim is a one-way
+/// stamp, and a request dropped between it and the spawn would leave the outcomes delivered to
+/// nobody.
+async fn with_outcomes_riding(
+    shared: &crate::host::SharedDeps,
+    webhooks: &crate::host::http::webhook::WebhookDispatcher,
+    agent: &crate::agent::Agent,
+    session_id: Uuid,
+    input: crate::agent::TurnInput,
+) -> crate::agent::TurnInput {
+    let outcomes = if shared.config.background.enabled {
+        crate::host::claim_undelivered_outcomes(agent, &shared.store, session_id).await
+    } else {
+        Vec::new()
+    };
+    // A claim leaves the pool the poller announces from, so subscribers are told by whoever claims:
+    // the session's frontend tells them of what a turn claims once it is in the conversation, and
+    // this claim is told here, ahead of a turn that may be refused before its opening is appended.
+    // Best-effort here, unlike the poller: this claim is already stamped, and refusing the user's
+    // turn over a webhook bookkeeping failure would be the wrong trade. It is logged.
+    let _announced = webhooks
+        .announce_finished_tasks(&shared.store.background_store(), &outcomes)
+        .await;
+    input.riding(outcomes)
 }
 
 /// The refusal for attachments on a session whose profile does not accept them. Asked twice of a
@@ -537,17 +546,23 @@ fn lag_terminal_parts(
 /// 24h TTL, defeating the point of an idempotent retry; `TurnInFlight` means the turn was never
 /// attempted at all; and `TurnCanceled` means it was interrupted, which is a fact about one
 /// attempt rather than about the request. Caching that one pinned "canceled" as the answer for the
-/// next 24 hours, so the retry the cancellation invites could never run. In all three cases the
-/// ticket's `Drop` clears the `Pending` entry so a retry re-executes.
+/// next 24 hours, so the retry the cancellation invites could never run. A spent login, which
+/// `failure` names, is a fact about the account that the login its 422 asks for changes, so the
+/// retry after that login has to run. In all four cases the ticket's `Drop` clears the `Pending`
+/// entry so a retry re-executes.
 async fn commit_idempotency(
     ticket: Option<crate::host::http::idempotency::IdempotencyTicket>,
     session_id: Uuid,
     response: &Result<Json<TurnResponse>, ProblemDetail>,
+    failure: Option<&crate::error::MekaError>,
 ) {
     let Some(ticket) = ticket else {
         return;
     };
     let skip_cache = matches!(
+        failure,
+        Some(crate::error::MekaError::AccountLoginSpent { .. })
+    ) || matches!(
         response,
         Err(problem) if problem.status >= 500
             || problem.is(ErrorKind::TurnInFlight)
@@ -788,7 +803,10 @@ fn accepted_response(session_id: Uuid, record: &crate::store::turns::TurnRecord)
     (
         StatusCode::ACCEPTED,
         [(axum::http::header::LOCATION, location)],
-        Json(record),
+        Json(crate::view::TurnView::new(
+            record,
+            crate::host::http::errors::api_wording,
+        )),
     )
         .into_response()
 }
@@ -804,7 +822,10 @@ async fn commit_accepted(
     let Some(ticket) = ticket else {
         return;
     };
-    match serde_json::to_vec(record) {
+    match serde_json::to_vec(&crate::view::TurnView::new(
+        record,
+        crate::host::http::errors::api_wording,
+    )) {
         Ok(bytes) => ticket.commit(StatusCode::ACCEPTED.as_u16(), bytes).await,
         // Dropped uncommitted, so the `Pending` entry goes and a retry re-executes rather than
         // meeting a permanent 409.
@@ -896,6 +917,14 @@ async fn run_json_turn(
         let _turn_guard = turn_guard;
         let _published = published;
         let _stream_guard = StreamGuard::new(Arc::clone(&entry.frontend));
+        let input = with_outcomes_riding(
+            &state.shared,
+            &state.webhooks,
+            &entry.agent,
+            session_id,
+            input,
+        )
+        .await;
         let outcome = entry
             .agent
             .run_turn(&mut conversation, input, cancellation.clone())
@@ -921,7 +950,7 @@ async fn run_json_turn(
         // The requester has its answer in the response body, but it is not necessarily the only
         // party interested in the session, and a webhook subscriber should not have to care which
         // transport a turn happened to use.
-        let response = match outcome {
+        let response = match &outcome {
             Ok(turn_outcome) => {
                 notify_turn_end(
                     &state.webhooks,
@@ -934,7 +963,7 @@ async fn run_json_turn(
                     session_id,
                     turn_id,
                     opened,
-                    &turn_outcome,
+                    turn_outcome,
                     &recorder,
                 )
                 .await
@@ -951,7 +980,7 @@ async fn run_json_turn(
                 notify_turn_end(&state.webhooks, event_type, turn_id, session_id);
                 // The turn's terminal, recorded above, logged the failure.
                 let problem =
-                    ProblemDetail::for_logged_error(&error, state.config.relay_provider_errors);
+                    ProblemDetail::for_logged_error(error, state.config.relay_provider_errors);
                 Err(match message_withdrawn(&recorder) {
                     Some(withdrawn) => problem.with("message_withdrawn", withdrawn),
                     None => problem,
@@ -959,7 +988,13 @@ async fn run_json_turn(
             }
         };
         // Inside the task, so a client that hung up still records its outcome against the key.
-        commit_idempotency(ticket_for_task, session_id, &response).await;
+        commit_idempotency(
+            ticket_for_task,
+            session_id,
+            &response,
+            outcome.as_ref().err(),
+        )
+        .await;
         response
     });
 
@@ -1049,6 +1084,7 @@ async fn run_streaming_turn(
     let cancel_for_task = cancellation.clone();
     let relay_for_task = state.config.relay_provider_errors;
     let store_for_task = state.shared.store.clone();
+    let shared_for_task = Arc::clone(&state.shared);
     let webhooks_for_task = state.webhooks;
 
     // Spawn the turn so the SSE response can return immediately.
@@ -1062,6 +1098,14 @@ async fn run_streaming_turn(
         let _published = published;
         let mut conversation = owned_conversation;
         let _stream_guard = StreamGuard::new(Arc::clone(&entry_for_task.frontend));
+        let input = with_outcomes_riding(
+            &shared_for_task,
+            &webhooks_for_task,
+            &entry_for_task.agent,
+            session_id,
+            input,
+        )
+        .await;
         let outcome = entry_for_task
             .agent
             .run_turn(&mut conversation, input, cancel_for_task.clone())
@@ -1575,7 +1619,7 @@ async fn turn_response(
         .collect();
     let (refusal_text, notices) = reply_parts(outcome, recorder);
     Ok(TurnResponse {
-        record,
+        record: crate::view::TurnView::new(&record, crate::host::http::errors::api_wording),
         refusal_text,
         messages,
         notices,

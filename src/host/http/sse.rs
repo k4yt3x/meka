@@ -481,7 +481,7 @@ pub(crate) fn translate(
             serde_json::json!({
                 "compaction_id": id,
                 "trigger": trigger.name(),
-                "error": error,
+                "error": error.sentence(crate::host::http::errors::api_wording),
                 "interrupted": interrupted,
             }),
         ),
@@ -677,7 +677,7 @@ mod tests {
             FrontendEvent::CompactionFailed {
                 id: "c1".to_string(),
                 trigger: CompactionTrigger::Proactive,
-                error: "Interrupted".to_string(),
+                error: crate::error::RecordedFailure::Sentence("Interrupted".to_string()),
                 interrupted: true,
             },
             SessionCapabilities::default(),

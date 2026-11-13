@@ -242,9 +242,10 @@ one schema change; it is empty of anything worth reading.
 
 You may also find one `meka.db.v<version>.bak`. Meka copies the store aside before it changes the
 schema, and keeps exactly one such copy: the next schema-changing upgrade takes a fresh one and
-removes the one before it, so the copies do not accumulate. Expect the data directory to settle at
-roughly twice the size of the store, and to peak higher than that during an upgrade, since the new
-copy is written before the old one goes.
+removes the one before it, so the copies do not accumulate. An upgrade that is refused leaves the
+store as it was and removes the copy it took, so a retry adds none. Expect the data directory to
+settle at roughly twice the size of the store, and to peak higher than that during an upgrade, since
+the new copy is written before the old one goes.
 
 To restore one, stop every Meka process and copy it over `meka.db`. It records the schema version it
 was taken at, so the next start brings it forward again rather than mistaking it for a current store.
@@ -665,7 +666,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 27`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 26), which is brought forward as it is read. A reply's event carries its record as `reply`. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 29`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 28), which is brought forward as it is read. A reply's event carries its record as `reply`. An event that is a copy a compaction kept names the position of the event it copies (`copy_of`). Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 

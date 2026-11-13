@@ -2610,11 +2610,11 @@ impl Store {
                             "INSERT INTO turns (id, session_id, source, started_at, ended_at, \
                              status, stop_reason, error_type, detail, input_tokens, \
                              output_tokens, cache_creation_input_tokens, \
-                             cache_read_input_tokens, cancel_reason, profile, permission)
+                             cache_read_input_tokens, cancel_reason, profile, permission, refusal)
                              SELECT ?1, ?2, source, started_at, ended_at, status, stop_reason, \
                              error_type, detail, input_tokens, output_tokens, \
                              cache_creation_input_tokens, cache_read_input_tokens, cancel_reason, \
-                             profile, permission
+                             profile, permission, refusal
                              FROM turns WHERE id = ?3",
                             rusqlite::params![new, new_id_string, old],
                         )?;
@@ -5889,10 +5889,10 @@ mod tests {
         assert_eq!(ids, vec![second, first], "newest first");
         let error = turns[0].error.as_ref().expect("a failure names its error");
         assert_eq!(error.kind.type_uri(), "https://meka.bot/errors/provider");
+        let detail = error.failure.sentence(MekaError::sentence);
         assert!(
-            !error.detail.contains("acct-0f3c"),
-            "the provider's text never reaches the row: {}",
-            error.detail
+            !detail.contains("acct-0f3c"),
+            "the provider's text never reaches the row: {detail}"
         );
         let (page, next) = store
             .turn_store()
@@ -6165,6 +6165,80 @@ mod tests {
         );
     }
 
+    /// A turn that failed on a spent login keeps its refusal through every door that copies a
+    /// turn: its row, a fork, an archive's JSON and an import.
+    #[tokio::test]
+    async fn a_failed_turn_s_refusal_travels_through_its_row_a_fork_an_export_and_an_import() {
+        use crate::error::{RecordedFailure, RecordedRefusal};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let turn = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(
+                id,
+                turn,
+                crate::store::turns::TurnSource::Client,
+                Permission::Read,
+                "2026-11-13T10:00:00+00:00",
+            )
+            .await
+            .expect("open");
+        let spent = MekaError::AccountLoginSpent {
+            account: "sub".to_string(),
+            message: "refresh token expired".to_string(),
+        };
+        store
+            .turn_store()
+            .close_turn(turn, &TurnEnding::failed(&spent, TurnUsage::default()))
+            .await
+            .expect("close");
+        let failures = async |session| -> Vec<Option<RecordedFailure>> {
+            store
+                .turn_store()
+                .load_turns(session)
+                .await
+                .expect("turns")
+                .into_iter()
+                .map(|turn| turn.error.map(|error| error.failure))
+                .collect()
+        };
+        let recorded = [Some(RecordedFailure::Refusal(
+            RecordedRefusal::AccountLoginSpent {
+                account: "sub".to_string(),
+            },
+        ))];
+        assert_eq!(failures(id).await, recorded);
+        let (forked, _lock) = store
+            .fork_session_locked(id, ForkOverrides::default(), SourceLock::Probe)
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        assert_eq!(failures(forked.id).await, recorded);
+        let archive = crate::store::export::build_session_export(&store, id)
+            .await
+            .expect("export");
+        let archive = crate::store::export::parse_session_export(
+            &serde_json::to_vec(&archive).expect("serializes"),
+        )
+        .expect("parses");
+        let plan =
+            crate::store::export::plan_import(archive, crate::store::export::ImportInstallation {
+                selected: None,
+                default: None,
+                configured: None,
+                projects: Vec::new(),
+                ..crate::store::export::ImportInstallation::for_test()
+            })
+            .expect("plans");
+        let imported = plan.root_new_id;
+        store
+            .import_sessions(plan.records, plan.blobs)
+            .await
+            .expect("import");
+        assert_eq!(failures(imported).await, recorded);
+    }
+
     /// A turn a fallback served says so on its row, in its archive form, and on a fork's copy;
     /// one the session's own profile served says nothing.
     #[tokio::test]
@@ -6225,7 +6299,8 @@ mod tests {
             .expect("get")
             .expect("the row");
         assert_eq!(record.profile.as_deref(), Some("backup"));
-        let json = serde_json::to_value(&record).expect("json");
+        let view = |record| crate::view::TurnView::new(record, MekaError::sentence);
+        let json = serde_json::to_value(view(&record)).expect("json");
         assert_eq!(json["profile"], "backup");
         let own_record = store
             .turn_store()
@@ -6235,7 +6310,7 @@ mod tests {
             .expect("the row");
         assert_eq!(own_record.profile, None);
         assert!(
-            serde_json::to_value(&own_record)
+            serde_json::to_value(view(&own_record))
                 .expect("json")
                 .get("profile")
                 .is_none(),

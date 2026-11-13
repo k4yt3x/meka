@@ -129,10 +129,19 @@ impl ServerToolsObserver for ToolRegistry {
     }
 }
 
+/// A session registry's subscription to the manager, which holds it only weakly: the registry
+/// follows the servers' tool changes for as long as this lives, and a session dropped without
+/// detaching lets go of its registry with it.
+#[must_use = "the registry follows the manager only while its subscription lives"]
+pub(crate) struct McpSubscription {
+    _observer: Arc<dyn ServerToolsObserver>,
+}
+
 /// Wire a session's registry to the manager: it learns everything discovered so far, follows every
-/// change until [`detach_session_registry`], and carries the resource and prompt meta-tools, which
-/// delegate through `ServerEntry::require_connected` themselves and so tolerate servers that are
-/// still Pending or have Failed until a specific one is called.
+/// change until [`detach_session_registry`] or until the subscription is dropped, and carries the
+/// resource and prompt meta-tools, which delegate through `ServerEntry::require_connected`
+/// themselves and so tolerate servers that are still Pending or have Failed until a specific one is
+/// called.
 ///
 /// Takes the manager by `Arc` so the registry can hold a `Weak` back to it. `tool_load` needs that
 /// to explain that a name it cannot find belongs to a server that is not connected, rather than
@@ -140,10 +149,14 @@ impl ServerToolsObserver for ToolRegistry {
 pub(crate) async fn attach_session_registry(
     manager: &Arc<McpClientManager>,
     registry: ToolRegistry,
-) {
+) -> McpSubscription {
     registry.set_mcp_manager(Arc::downgrade(manager));
     mcp_resources::register_all(&registry, Arc::clone(manager));
-    manager.subscribe(Arc::new(registry)).await;
+    let observer: Arc<dyn ServerToolsObserver> = Arc::new(registry);
+    manager.subscribe(&observer).await;
+    McpSubscription {
+        _observer: observer,
+    }
 }
 
 /// Undo [`attach_session_registry`]. Identity is the registry's inner allocation, so any clone of

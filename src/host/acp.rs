@@ -100,7 +100,8 @@ fn invalid_params_error(message: impl ToString) -> agent_client_protocol::Error 
 /// holding it, a level or profile this configuration does not have, an empty prompt, a sub-agent's
 /// id, a session another process holds, a request over the profile's own size ceiling, and the
 /// configuration and usage refusals that name their remedy. Their `Display` is the `data`, so no
-/// handler rewrites the sentence.
+/// handler rewrites the sentence, except a login that must be redone, whose `Display` quotes the
+/// upstream: its `data` is its sentence, and the quote travels as an upstream's text does.
 ///
 /// **Everything else is withheld on the same terms `ProblemDetail::for_error` withholds it**, which
 /// is why this takes `relay_provider_errors` rather than reading it: a `.into()` that silently
@@ -125,16 +126,19 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
     // identical either way, so a client reading only the message is unaffected by the switch.
     let withhold_or_relay = |sentence: &str, upstream: &str| {
         tracing::warn!("{sentence}: {upstream}");
-        let data = if relay_provider_errors {
+        if relay_provider_errors {
             format!(
                 "{sentence}: {}",
                 crate::error::bounded_upstream_body(upstream)
             )
         } else {
             sentence.to_string()
-        };
-        internal_error(data)
+        }
     };
+    // Ahead of the kind match, whose refusal arm sends the `Display`, upstream quote and all.
+    if let MekaError::AccountLoginSpent { message, .. } = error {
+        return invalid_params_error(withhold_or_relay(&error.sentence(), message));
+    }
     // Classified by the kind every surface reads, so a refusal added to `MekaError` lands where
     // its kind says rather than in a catch-all here.
     match error.kind() {
@@ -149,9 +153,10 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
         | crate::error::ErrorKind::ProviderUnavailable
         | crate::error::ErrorKind::ProviderExhausted
         | crate::error::ErrorKind::ContextOverflow
-        | crate::error::ErrorKind::OutputCapTooLarge => {
-            withhold_or_relay(&error.sentence(), error.upstream_body().unwrap_or_default())
-        }
+        | crate::error::ErrorKind::OutputCapTooLarge => internal_error(withhold_or_relay(
+            &error.sentence(),
+            error.upstream_body().unwrap_or_default(),
+        )),
         // The names travel and the reasons do not: a connector's reason has carried a spawn
         // failure complete with the command line and its path.
         crate::error::ErrorKind::McpUnavailable => {
@@ -803,6 +808,10 @@ mod tests {
                 resets_after: None,
             },
             MekaError::ContextOverflow(leaky.to_string()),
+            MekaError::AccountLoginSpent {
+                account: "work".to_string(),
+                message: leaky.to_string(),
+            },
         ] {
             let withheld = acp_error_for(&error, false);
             let data = serde_json::to_string(&withheld.data).unwrap_or_default();
@@ -830,6 +839,25 @@ mod tests {
             "an unbounded upstream body reached the client: {} bytes",
             data.len()
         );
+    }
+
+    /// A login that is spent reaches the client as a refusal it can act on, not as an internal
+    /// error: the code says the remedy is the caller's, and the sentence names it.
+    #[test]
+    fn a_spent_login_reaches_the_client_as_a_refusal_naming_its_remedy() {
+        let reported = acp_error_for(
+            &MekaError::AccountLoginSpent {
+                account: "work".to_string(),
+                message: "API returned status 401".to_string(),
+            },
+            false,
+        );
+        assert_eq!(
+            reported.code,
+            agent_client_protocol::ErrorCode::INVALID_PARAMS
+        );
+        let data = serde_json::to_string(&reported.data).unwrap_or_default();
+        assert!(data.contains("meka account login work"), "{data}");
     }
 
     /// Meka's own request ceiling is the caller's to act on, so it keeps its sentence and its code.

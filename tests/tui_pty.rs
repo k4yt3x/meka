@@ -953,6 +953,108 @@ fn a_scheduled_fire_is_announced_as_a_stage_direction_above_its_reply() {
     assert_set_off_by_one_blank(rows, announced, announced, "the fire's direction");
 }
 
+/// A termination that lands while the screen is serving a sweep ends the sweep there: the fire it
+/// cuts short is handed back, and the next job due is not fired as a turn nothing would stop.
+#[test]
+fn a_termination_mid_sweep_fires_no_further_job() {
+    const TWO_JOBS: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"schedule_create"},
+  {"type":"tool_use_end","input":{"prompt":"FIRST_JOB","at":"1s"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"tool_use_start","id":"t2","name":"schedule_create"},
+  {"type":"tool_use_end","input":{"prompt":"SECOND_JOB","at":"1s"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"scheduled"},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"FIRST_FIRE_RUNNING"},
+  {"type":"sleep","ms":60000},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"SECOND_FIRE_RAN"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = screen_install("read", "", "\n[schedule]\npoll_interval = \"200ms\"\n");
+    install.write_script(TWO_JOBS);
+    let mut master: RawFd = -1;
+    let size = libc::winsize {
+        ws_row: ROWS,
+        ws_col: COLUMNS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let prepared = PreparedExec::meka(&install, &["-c"]);
+    // SAFETY: as in `drive_run`.
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &size as *const libc::winsize as *mut libc::winsize,
+        )
+    };
+    assert!(pid >= 0, "forkpty failed");
+    if pid == 0 {
+        // SAFETY: the child of a threaded process, so only what `PreparedExec::exec` promises.
+        unsafe { prepared.exec() }
+    }
+    keep_master_here(master);
+    // The second input sends nothing: it holds the driver until the first fire is on the screen,
+    // where the fire then waits out its minute.
+    let until_the_fire_runs = format!("{AWAITED}FIRST_FIRE_RUNNING{AWAITED}{KEYS_ONLY}");
+    let (.., rows) = pump(
+        master,
+        &["schedule two", &until_the_fire_runs],
+        false,
+        COLUMNS,
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("FIRST_FIRE_RUNNING")),
+        "the first fire is running when the signal lands: {rows:#?}"
+    );
+    // SAFETY: `pid` is the child forked above, signaled and reaped here and nowhere else, and
+    // `master` is still open.
+    let exit = unsafe {
+        libc::kill(pid, libc::SIGTERM);
+        let mut status = 0;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let exit = loop {
+            if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
+                break Some(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                });
+            }
+            if Instant::now() > deadline {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        libc::close(master);
+        exit
+    };
+    assert_eq!(exit, Some(130), "the screen leaves on the signal");
+
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let fires: Vec<Option<String>> = connection
+        .prepare("SELECT cancel_reason FROM turns WHERE source = 'schedule' ORDER BY rowid")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("the fires' turns");
+    assert_eq!(
+        fires,
+        [Some("server_shutdown".to_string())],
+        "one fire, stopped by the leaving, and none begun after it"
+    );
+    let jobs: i64 = connection
+        .query_row("SELECT count(*) FROM scheduled_jobs", [], |row| row.get(0))
+        .expect("count the jobs");
+    assert_eq!(jobs, 2, "both occurrences are there for the next start");
+}
+
 /// A rewind takes its turn off the screen as well as out of the conversation: the turn before it
 /// stays, and one row says how many turns went, then and when the session is resumed.
 #[test]

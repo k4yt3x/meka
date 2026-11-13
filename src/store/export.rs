@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 28;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 29;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -224,6 +224,8 @@ pub(crate) struct ExportedTurn {
     pub(crate) stop_reason: Option<String>,
     pub(crate) error_type: Option<String>,
     pub(crate) detail: Option<String>,
+    /// What a turn that failed on a refusal records in place of `detail`.
+    pub(crate) refusal: Option<crate::error::RecordedRefusal>,
     pub(crate) cancel_reason: Option<String>,
     /// The profile that served the turn when it was not the session's own.
     pub(crate) profile: Option<String>,
@@ -233,9 +235,17 @@ pub(crate) struct ExportedTurn {
 }
 impl From<crate::store::turns::TurnRecord> for ExportedTurn {
     fn from(turn: crate::store::turns::TurnRecord) -> Self {
-        let (error_type, detail) = match turn.error {
-            Some(error) => (Some(error.kind.name().to_string()), Some(error.detail)),
-            None => (None, None),
+        let (error_type, detail, refusal) = match turn.error {
+            Some(error) => {
+                let kind = Some(error.kind.name().to_string());
+                match error.failure {
+                    crate::error::RecordedFailure::Sentence(sentence) => {
+                        (kind, Some(sentence), None)
+                    }
+                    crate::error::RecordedFailure::Refusal(refusal) => (kind, None, Some(refusal)),
+                }
+            }
+            None => (None, None, None),
         };
         Self {
             id: turn.id.to_string(),
@@ -248,6 +258,7 @@ impl From<crate::store::turns::TurnRecord> for ExportedTurn {
                 .map(|stop_reason| stop_reason.name().to_string()),
             error_type,
             detail,
+            refusal,
             cancel_reason: turn.reason.map(|reason| reason.name().to_string()),
             profile: turn.profile,
             permission: turn.permission.name().to_string(),
@@ -1403,6 +1414,7 @@ mod tests {
             stop_reason: None,
             error_type: None,
             detail: None,
+            refusal: None,
             cancel_reason: None,
             profile: None,
             permission: "workspace".to_string(),
@@ -1473,6 +1485,7 @@ mod tests {
             stop_reason: None,
             error_type: None,
             detail: None,
+            refusal: None,
             cancel_reason: None,
             profile: None,
             permission: "read".to_string(),

@@ -792,7 +792,13 @@ impl Frontend for AcpFrontend {
                 trigger,
                 error,
                 interrupted,
-            } => compaction_failed_update(&self.client_state, id, trigger, error, interrupted),
+            } => compaction_failed_update(
+                &self.client_state,
+                id,
+                trigger,
+                error.sentence(crate::error::MekaError::sentence),
+                interrupted,
+            ),
             // Told as it finishes, since what it wrote stays written however the compaction ends.
             // A call put to the client has the card its prompt opened.
             FrontendEvent::CheckpointCallCompleted {
@@ -2081,7 +2087,11 @@ pub(super) fn replay_session_updates(
                         client_state,
                         id.clone(),
                         failure.trigger,
-                        failure.error.clone().unwrap_or_default(),
+                        failure
+                            .error
+                            .as_ref()
+                            .map(|error| error.sentence(crate::error::MekaError::sentence))
+                            .unwrap_or_default(),
                         failure.error.is_none(),
                     ),
                 );

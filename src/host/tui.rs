@@ -307,6 +307,15 @@ pub(crate) async fn run_interactive(
                 }
             }
         },
+        // A hangup or a termination leaves through the loop too.
+        {
+            let host = host_sender.clone();
+            move || {
+                if host.send(HostEvent::Exit { interrupted: true }).is_err() {
+                    tracing::debug!("the host loop has already ended");
+                }
+            }
+        },
     );
     let mut resident = session_id.map(|id| {
         crate::host::ResidentSession::from_parts(
@@ -542,11 +551,14 @@ pub(crate) async fn run_interactive(
                             .write()
                             .await
                             .insert(entry.id, SessionEntry(entry.clone()));
+                        // The host is leaving, which here only a hangup or a termination says:
+                        // its listener sends the `Exit` that ends the loop as interrupted, once
+                        // the background tasks it stopped have had their moment.
                         if crate::host::scheduler::deliver_ready_outcomes(&hooks, &sessions)
                             .await
                             .is_break()
                         {
-                            break;
+                            continue;
                         }
                     }
                 }
@@ -810,6 +822,14 @@ impl crate::host::scheduler::HostHooks for TuiHooks {
 
     fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// From the hangup or the termination on, while its listener waits on the background tasks
+    /// before it sends the exit. A sweep in flight or served meanwhile would fire the occurrence
+    /// that stop handed back, the next job due, or the outcome of a task it stopped, each as a
+    /// turn nothing stops.
+    fn shutting_down(&self) -> bool {
+        crate::host::terminal::INTERRUPT_RELAY.is_told_to_leave()
     }
 }
 

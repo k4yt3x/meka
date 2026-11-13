@@ -217,7 +217,7 @@ meka --oneshot --permission read --profile work -p "summarize today's alerts"
 ### Claiming an occurrence
 
 A due job is *leased* before it runs: the host records itself and an expiry on the row, delivers the
-turn, and then advances the schedule (or retires a one-shot). Three consequences worth knowing:
+turn, and then advances the schedule (or retires a one-shot). Four consequences worth knowing:
 
 - **A crash costs a retry, not the job.** The row is untouched until the turn is delivered, so a
   host that dies mid-delivery leaves a lease that expires and the next host takes the occurrence.
@@ -235,7 +235,16 @@ turn, and then advances the schedule (or retires a one-shot). Three consequences
   job is not deleted: it stays listed, cancelable, and marked as held with the reason, because a
   prompt that crashes Meka is something to look at rather than something to throw away. Recreate it,
   or cancel it. A host that simply declines a job it cannot take (`meka serve` finding the session
-  locked by a screen) does not count, since that says nothing about the job.
+  locked by a screen) does not count, since that says nothing about the job. Nor does a fire the
+  host owns and cannot run (its session cannot be opened, or the profile or project it records no
+  longer resolves): that is a fact about the installation, so the claim is kept until its lease
+  expires, the attempt is not counted, and the job runs again on the first retry after the cause is
+  fixed. While it lasts, the job is marked as held with that cause.
+- **A host leaving hands back the fire it cuts short.** A fire whose turn was stopped because its
+  host was leaving (`meka serve` or `meka acp` shutting down, a screen sent SIGTERM or SIGHUP) is
+  handed back rather than spent, and runs again on the next host that can take it. A fire someone
+  stopped (from the screen, `POST /v1/sessions/{id}/cancel`, `session/cancel`) is spent, as a stop
+  that was asked for.
 
 `[schedule] claim_lease` (default `"1h"`) is how long a lease is good for, and therefore how long a
 crashed host's occurrence waits before another host takes it. It should exceed a gate probe plus a
@@ -376,6 +385,11 @@ break. This one is tracked in memory rather than on the row, so it is known to t
 the job: a restart re-establishes it within two poll intervals, and `meka schedule list`, which is a
 separate process, does not see it.
 
+So is a job whose last fire its host could not run, with the cause, from the
+[failed fire](#claiming-an-occurrence) until a turn is delivered or that occurrence closes without
+one, as when its gate declines on the retry. It is tracked in memory the same way, so it is known
+to the process that tried.
+
 Four surfaces report it, and each says only what it can establish:
 
 - **`[Scheduled]` and `schedule_list`** carry the full sentence, since the agent is the one that can
@@ -438,6 +452,9 @@ Normally, because uniqueness is computed over the rows being printed while `show
 every job there is. `list --session <id>` narrows the table, so it can print a prefix that another
 session's job makes ambiguous. It fails closed (the command refuses and names the ids that
 collided), and an unfiltered `meka schedule list` always prints a prefix that resolves.
+
+A job this build cannot read (a row a newer Meka wrote, or one edited by hand) is left out of every
+listing, with a warning naming its id; `cancel` takes that id, or a unique prefix of it.
 
 `show` is the one that answers what a job actually does: the whole prompt, the whole command or tool
 a gate runs, the session's full id, when it last fired, and whether it is withheld. Nothing there is

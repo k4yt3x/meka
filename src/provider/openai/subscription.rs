@@ -1570,7 +1570,9 @@ mod tests {
         )
         .expect("provider");
         let result = provider.ensure_valid_credential().await;
-        assert!(matches!(result, Err(MekaError::Provider(ref m)) if m.contains("expired")));
+        assert!(
+            matches!(result, Err(MekaError::AccountLoginSpent { ref message, .. }) if message.contains("expired"))
+        );
     }
 
     /// The Codex refresh path classifies by what the token endpoint answered, like its Claude twin.
@@ -1656,14 +1658,14 @@ mod tests {
                     message.starts_with("Codex OAuth token refresh failed ("),
                     "{status_line}: {message}"
                 ),
-                MekaError::Provider(message) if !retryable => {
+                MekaError::AccountLoginSpent { account, message } if !retryable => {
                     assert!(
                         message.starts_with("Codex OAuth token refresh"),
                         "{status_line}: {message}"
                     );
-                    assert!(
-                        message.contains("meka account login work"),
-                        "{status_line} should name the profile to log in to: {message}"
+                    assert_eq!(
+                        account, "work",
+                        "{status_line} should name the account to log in to"
                     );
                 }
                 other => panic!("{status_line} was classified wrongly: {other}"),

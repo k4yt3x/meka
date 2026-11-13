@@ -153,14 +153,16 @@ where
 
 /// The error for a credential the backend rejected *after* the one refresh a rejection buys.
 ///
-/// Names the remedy, because at this point the token was minted moments ago and rejected anyway:
-/// the grant behind it is gone, and only signing in again produces one the backend will take. The
-/// same words `oauth_refresh_error` uses, so a user greps for one phrase.
+/// [`MekaError::AccountLoginSpent`], which names the remedy, because at this point the token was
+/// minted moments ago and rejected anyway: the grant behind it is gone, and only signing in again
+/// produces one the backend will take. The variant `oauth_refresh_error` answers a refused grant
+/// with, so every surface words the two alike.
 pub(crate) fn with_login_remedy(error: MekaError, account: &str) -> MekaError {
     match error {
-        MekaError::Provider(message) => MekaError::Provider(format!(
-            "{message}; run `meka account login {account}` to sign in again"
-        )),
+        MekaError::Provider(message) => MekaError::AccountLoginSpent {
+            account: account.to_string(),
+            message,
+        },
         other => other,
     }
 }
@@ -842,12 +844,10 @@ impl SubscriptionCredential {
         // With nothing to refresh with, a rejected or expired token has one remedy, which every
         // exit from the refresh path names.
         let Some(refresh_token) = refresh_token else {
-            return Err(with_login_remedy(
-                MekaError::Provider(
-                    "OAuth access token expired and no refresh token available".to_string(),
-                ),
-                &self.account,
-            ));
+            return Err(MekaError::AccountLoginSpent {
+                account: self.account.clone(),
+                message: "OAuth access token expired and no refresh token available".to_string(),
+            });
         };
 
         let refreshed = match refresh(refresh_token, prior_account_id).await {
@@ -965,6 +965,35 @@ pub(crate) trait LoginPrompt: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A credential rejected after its one refresh is a login to redo, which every surface can
+    /// tell from an anonymous upstream failure: it has the kind of a refusal the caller acts on,
+    /// its sentence names the account and the remedy without the upstream's words, and it is not
+    /// the unavailability a fallback profile stands in for, since no other profile can sign in.
+    #[test]
+    fn a_credential_rejected_after_its_refresh_is_a_login_to_redo() {
+        let rejection = crate::error::provider_http_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"type":"authentication_error","account_uuid":"acct-0f3c"}}"#,
+            None,
+            ProviderRequest::Completion,
+            None,
+        );
+        let error = with_login_remedy(rejection, "work");
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::InvalidBody);
+        assert!(!error.is_profile_unavailable());
+        assert_eq!(
+            error.sentence(),
+            "account 'work' must sign in again; run `meka account login work`"
+        );
+        assert!(
+            error
+                .upstream_body()
+                .is_some_and(|body| body.contains("acct-0f3c")),
+            "the upstream's words stay with the error, for the log and a relay"
+        );
+    }
 
     /// A stop must reach a request the provider is still answering. The wait for a response is
     /// the one place a whole reply spends its time and nothing else on this side may end it, so

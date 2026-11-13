@@ -161,6 +161,10 @@ fn api_sentence(error: &MekaError) -> Option<String> {
             "account '{account}' has no stored credential; log in with \
              `POST /v1/accounts/{account}/login`"
         ),
+        MekaError::AccountLoginSpent { account, .. } => format!(
+            "account '{account}' must sign in again; log in with \
+             `POST /v1/accounts/{account}/login`"
+        ),
         MekaError::ImportNamesUnknownProfile { name, known } => format!(
             "{}; the archive names it, so add it with `POST /v1/profiles` first",
             crate::text::unknown_name("profile", name, known)
@@ -282,6 +286,7 @@ fn log_failure(error: &MekaError) {
         | MekaError::ProviderExhausted { message, .. } => {
             tracing::warn!("provider error: {message}");
         }
+        MekaError::AccountLoginSpent { .. } => tracing::warn!("{error}"),
         MekaError::ContextOverflow(message) => tracing::warn!("context overflow: {message}"),
         MekaError::OutputCapTooLarge { message, .. } => {
             tracing::warn!("context overflow over the output cap: {message}");
@@ -851,6 +856,30 @@ mod tests {
         let detail = login.detail.unwrap_or_default();
         assert!(detail.contains("POST /v1/accounts/work/login"), "{detail}");
         assert!(!detail.contains("meka account"), "{detail}");
+        let spent = MekaError::AccountLoginSpent {
+            account: "work".to_string(),
+            message: "API returned status 401: {\"account_uuid\":\"acct-0f3c\"}".to_string(),
+        };
+        let withheld = ProblemDetail::for_error(&spent, false);
+        assert_eq!(
+            withheld.status, 422,
+            "a login to redo is the caller's to act on"
+        );
+        let body = serde_json::to_string(&withheld).expect("serialize");
+        assert!(
+            body.contains("POST /v1/accounts/work/login")
+                && !body.contains("meka account")
+                && !body.contains("acct-0f3c"),
+            "{body}"
+        );
+        assert!(
+            ProblemDetail::for_error(&spent, true)
+                .extensions
+                .get("provider_response")
+                .and_then(Value::as_str)
+                .is_some_and(|relayed| relayed.contains("acct-0f3c")),
+            "the upstream's words travel when the operator asked for them"
+        );
         let project = ProblemDetail::for_error(
             &MekaError::ImportNamesUnknownProject {
                 name: "movie".to_string(),

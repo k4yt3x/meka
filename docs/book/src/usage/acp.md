@@ -90,7 +90,7 @@ A client advertising `fs.readTextFile` but not `fs.writeTextFile` leaves the wri
 
 Meka holds an in-memory map of `sessionId → SessionEntry`. Any number of sessions can coexist in one `meka acp` process, each with its own cwd, permission level, conversation, cancellation token, and per-session runtime mutex. Prompts on different sessions run in parallel; a second `session/prompt` for a session that already has one in flight is refused with `InvalidParams`. The session row is also locked on disk (the same lock the screen uses), so two `meka` processes can't simultaneously write events for the same session id.
 
-An unknown `sessionId`, a session another Meka process holds, a sub-agent's id, a turn over the profile's `max_request_bytes` and a profile `config.toml` no longer has are all refused with `InvalidParams`; `InternalError` is reserved for faults in Meka or below it.
+An unknown `sessionId`, a session another Meka process holds, a sub-agent's id, a turn over the profile's `max_request_bytes`, a profile `config.toml` no longer has and a subscription account that must sign in again are all refused with `InvalidParams`, the last carrying the provider's text on the terms below; `InternalError` is reserved for faults in Meka or below it.
 
 What an `InternalError`'s `data` carries follows the same policy the HTTP API applies to a failed turn, so a deployment cannot have one surface withhold what the other publishes:
 
@@ -120,10 +120,9 @@ handling; `session/load` reopens it with its history, as it does one from a prev
 approval answers go with the entry, so they reset here as they do on `session/close`.
 
 `session/close` is optional in the protocol and several editors never send one, which is what this
-answers. Each open session holds an `Agent`, a tool registry the MCP manager keeps a clone of, and
-an open file lock, none of them reachable from anywhere else meanwhile. Neither the window nor the
-scan interval is configurable; both match [`[serve]`](../configuration/config-file.md#serve)'s
-defaults for the same mechanism.
+answers. Each open session holds an `Agent`, its tool registry, and an open file lock, none of them
+reachable from anywhere else meanwhile. Neither the window nor the scan interval is configurable;
+both match [`[serve]`](../configuration/config-file.md#serve)'s defaults for the same mechanism.
 
 ## Prompt turn
 

@@ -2997,7 +2997,7 @@ mod tests {
         live.apply(FrontendEvent::CompactionFailed {
             id: "c0".to_string(),
             trigger: record.trigger,
-            error: "the summarizer failed".to_string(),
+            error: crate::error::RecordedFailure::Sentence("the summarizer failed".to_string()),
             interrupted: false,
         });
         live.apply(FrontendEvent::CompactionStarted {

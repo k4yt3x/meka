@@ -281,7 +281,9 @@ pub(crate) async fn search_sessions(
     if format == cli::OutputFormat::Json {
         let views: Vec<crate::view::SessionMatchView> = found
             .iter()
-            .map(crate::view::SessionMatchView::from)
+            .map(|found| {
+                crate::view::SessionMatchView::new(found, crate::error::MekaError::sentence)
+            })
             .collect();
         cli::write_json_listing("sessions", &views)?;
         return Ok(());
@@ -343,7 +345,10 @@ async fn show_session(
         .await?
         .ok_or(crate::error::MekaError::SessionNotFound(session_id))?;
     if format == cli::OutputFormat::Json {
-        cli::write_json(&SessionView::from(&session))?;
+        cli::write_json(&SessionView::new(
+            &session,
+            crate::error::MekaError::sentence,
+        ))?;
         return Ok(());
     }
 
@@ -453,7 +458,10 @@ pub(crate) async fn list_sessions(
         .await?;
 
     if format == cli::OutputFormat::Json {
-        let views: Vec<SessionView> = sessions.iter().map(SessionView::from).collect();
+        let views: Vec<SessionView> = sessions
+            .iter()
+            .map(|session| SessionView::new(session, crate::error::MekaError::sentence))
+            .collect();
         cli::write_json_listing("sessions", &views)?;
         return Ok(());
     }

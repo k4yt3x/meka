@@ -1417,7 +1417,7 @@ pub(crate) fn subagent_terminal(
                         "type": error.kind.type_uri(),
                         "title": error.kind.title(),
                         "status": super::errors::status_of(error.kind).as_u16(),
-                        "detail": error.detail,
+                        "detail": error.failure.sentence(super::errors::api_wording),
                     }),
                 );
             }
@@ -1972,6 +1972,30 @@ mod tests {
             "a reader attached at the time still gets the terminal: {seen:?}"
         );
         drop(child_frontend);
+    }
+
+    /// A sub-agent's turn that failed on a spent login ends its feed with the route that signs the
+    /// account in, as every route of this API words it.
+    #[test]
+    fn a_sub_agent_s_failed_terminal_words_a_spent_login_with_the_login_route() {
+        let spent = crate::error::MekaError::AccountLoginSpent {
+            account: "sub".to_string(),
+            message: "refresh token expired".to_string(),
+        };
+        let (event_type, data) = subagent_terminal(
+            uuid::Uuid::from_u128(0x20),
+            uuid::Uuid::from_u128(0x2),
+            &crate::store::turns::TurnEnding::failed(
+                &spent,
+                crate::store::turns::TurnUsage::default(),
+            ),
+        );
+        assert_eq!(event_type, SseEventType::TurnFailed);
+        let detail = data["error"]["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("POST /v1/accounts/sub/login") && !detail.contains("meka account"),
+            "{data}"
+        );
     }
 
     /// The opening is re-issued to a reader that has not had it and to no other: one joining or

@@ -14,97 +14,47 @@ pub(crate) struct TurnStore {
     connection: Arc<super::connection::Connection>,
 }
 
-/// One turn as its row records it: when it began and, once it has, how it ended.
+/// One turn as its row records it: when it began and, once it has, how it ended. A surface shows
+/// it as a [`crate::view::TurnView`], which words its failure.
 ///
 /// `ended_at` and `status` are absent together on a turn that began and has not ended: the one
 /// in flight, or one the process died under. Whether it is the former is `turn_in_flight` on
 /// the session, a live fact no row stores.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnRecord {
     pub(crate) id: Uuid,
     /// Who opened it: `client`, `inbox`, `schedule`, `background`, `compaction` for a compaction
     /// run between turns, or `parent` for a sub-agent's.
-    #[cfg_attr(feature = "serve", schema(value_type = String))]
     pub(crate) source: TurnSource,
     /// RFC 3339, when the turn began.
     pub(crate) started_at: String,
     /// The permission level the turn ran under, as its opening told the model.
-    #[cfg_attr(feature = "serve", schema(value_type = String))]
     pub(crate) permission: crate::permission::Permission,
     /// RFC 3339, when the turn ended.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ended_at: Option<String>,
-    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<TurnStatus>,
     /// The class of the stop the turn's last reply ended on, on a turn that succeeded.
-    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stop_reason: Option<crate::conversation::StopReason>,
     /// What a turn that failed failed on, in the words a Problem Detail uses.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<TurnError>,
     /// Who or what stopped a turn that was canceled, in the word its `turn.canceled` carries.
-    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<CancelReason>,
     /// The profile that served the turn when it was not the session's own: one of its
     /// `fallbacks`, after the session's profile could not. Absent on a turn the session's profile
     /// served.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) profile: Option<String>,
     /// What the turn spent, every round of it.
     pub(crate) usage: TurnUsage,
 }
 
-/// The failure a turn ended on: its `type`, as every Problem Detail names it, and Meka's own
-/// sentence about it. Never the provider's text, which `[serve] relay_provider_errors` decides
-/// about per deployment and a stored copy would hand to every reader.
+/// The failure a turn ended on: its `type`, as every Problem Detail names it, and what Meka says
+/// about it. Never the provider's text, which `[serve] relay_provider_errors` decides about per
+/// deployment and a stored copy would hand to every reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnError {
     pub(crate) kind: crate::error::ErrorKind,
-    pub(crate) detail: String,
+    pub(crate) failure: crate::error::RecordedFailure,
 }
-
-impl serde::Serialize for TurnError {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut error = serializer.serialize_struct("TurnError", 2)?;
-        error.serialize_field("type", self.kind.type_uri())?;
-        error.serialize_field("detail", &self.detail)?;
-        error.end()
-    }
-}
-
-#[cfg(feature = "serve")]
-impl utoipa::PartialSchema for TurnError {
-    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
-        use utoipa::openapi::schema::{ObjectBuilder, Type};
-        ObjectBuilder::new()
-            .property(
-                "type",
-                ObjectBuilder::new()
-                    .schema_type(Type::String)
-                    .description(Some("The error's `type`, as a Problem Detail names it")),
-            )
-            .required("type")
-            .property(
-                "detail",
-                ObjectBuilder::new()
-                    .schema_type(Type::String)
-                    .description(Some("Meka's own sentence about the failure")),
-            )
-            .required("detail")
-            .into()
-    }
-}
-
-#[cfg(feature = "serve")]
-impl utoipa::ToSchema for TurnError {}
 
 /// The tokens a turn spent, as the provider reported them round by round.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -379,7 +329,7 @@ impl TurnEnding {
             stop_reason: None,
             error: Some(TurnError {
                 kind: error.kind(),
-                detail: error.sentence(),
+                failure: crate::error::RecordedFailure::of(error),
             }),
             reason: None,
             profile: None,
@@ -404,7 +354,7 @@ impl TurnEnding {
 pub(super) const TURN_COLUMNS: &str = "t.id, t.source, t.started_at, t.ended_at, t.status, \
      t.stop_reason, t.error_type, t.detail, t.input_tokens, t.output_tokens, \
      t.cache_creation_input_tokens, t.cache_read_input_tokens, t.cancel_reason, t.profile, \
-     t.permission";
+     t.permission, t.refusal";
 
 /// The join that puts a session's latest turn beside its row as `t`, every column NULL for a
 /// session no turn has begun on. The latest by when it began, whatever its state: a turn the
@@ -435,12 +385,23 @@ pub(super) fn turn_from_row(
         },
         None => None,
     };
-    let error = match (
-        row.get::<_, Option<String>>(offset + 6)?,
+    let failure = match (
         row.get::<_, Option<String>>(offset + 7)?,
+        row.get::<_, Option<String>>(offset + 15)?,
     ) {
-        (Some(name), Some(detail)) => match crate::error::ErrorKind::from_name(&name) {
-            Some(kind) => Some(TurnError { kind, detail }),
+        (_, Some(refusal)) => match serde_json::from_str(&refusal) {
+            Ok(refusal) => Some(crate::error::RecordedFailure::Refusal(refusal)),
+            Err(error) => {
+                tracing::warn!("turn {id} records a refusal Meka cannot read: {error}");
+                None
+            }
+        },
+        (Some(detail), None) => Some(crate::error::RecordedFailure::Sentence(detail)),
+        (None, None) => None,
+    };
+    let error = match (row.get::<_, Option<String>>(offset + 6)?, failure) {
+        (Some(name), Some(failure)) => match crate::error::ErrorKind::from_name(&name) {
+            Some(kind) => Some(TurnError { kind, failure }),
             None => {
                 tracing::warn!("turn {id} records an error type Meka cannot read: {name}");
                 None
@@ -569,6 +530,8 @@ impl TurnStore {
         let ended_at = chrono::Utc::now().to_rfc3339();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
+                let (detail, refusal) =
+                    failure_columns(ending.error.as_ref().map(|error| &error.failure))?;
                 connection.execute(
                     "UPDATE turns SET
                          ended_at = ?2,
@@ -581,7 +544,8 @@ impl TurnStore {
                          cache_creation_input_tokens = ?9,
                          cache_read_input_tokens = ?10,
                          cancel_reason = ?11,
-                         profile = ?12
+                         profile = ?12,
+                         refusal = ?13
                      WHERE id = ?1",
                     rusqlite::params![
                         turn_id.to_string(),
@@ -591,13 +555,14 @@ impl TurnStore {
                             .stop_reason
                             .map(crate::conversation::StopReason::name),
                         ending.error.as_ref().map(|error| error.kind.name()),
-                        ending.error.as_ref().map(|error| error.detail.clone()),
+                        detail,
                         ending.usage.input_tokens as i64,
                         ending.usage.output_tokens as i64,
                         ending.usage.cache_creation_input_tokens as i64,
                         ending.usage.cache_read_input_tokens as i64,
                         ending.reason.map(CancelReason::name),
                         ending.profile,
+                        refusal,
                     ],
                 )?;
                 Ok(())
@@ -683,11 +648,12 @@ pub(super) fn insert_turn_row(
     session_id: &str,
     turn: &super::export::ExportedTurn,
 ) -> rusqlite::Result<()> {
+    let refusal = turn.refusal.as_ref().map(refusal_column).transpose()?;
     transaction.execute(
         "INSERT INTO turns (id, session_id, source, started_at, ended_at, status, stop_reason, \
          error_type, detail, input_tokens, output_tokens, cache_creation_input_tokens, \
-         cache_read_input_tokens, cancel_reason, profile, permission)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         cache_read_input_tokens, cancel_reason, profile, permission, refusal)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         rusqlite::params![
             turn.id,
             session_id,
@@ -705,7 +671,27 @@ pub(super) fn insert_turn_row(
             turn.cancel_reason,
             turn.profile,
             turn.permission,
+            refusal,
         ],
     )?;
     Ok(())
+}
+
+/// What a failure writes into `detail` and `refusal`: one of the two, the other NULL.
+fn failure_columns(
+    failure: Option<&crate::error::RecordedFailure>,
+) -> rusqlite::Result<(Option<String>, Option<String>)> {
+    Ok(match failure {
+        None => (None, None),
+        Some(crate::error::RecordedFailure::Sentence(sentence)) => (Some(sentence.clone()), None),
+        Some(crate::error::RecordedFailure::Refusal(refusal)) => {
+            (None, Some(refusal_column(refusal)?))
+        }
+    })
+}
+
+/// A refusal as `turns.refusal` holds it, as JSON.
+fn refusal_column(refusal: &crate::error::RecordedRefusal) -> rusqlite::Result<String> {
+    serde_json::to_string(refusal)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }

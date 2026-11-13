@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An MCP image in a format providers do not take, such as BMP or TIFF, arrives converted to PNG.
 - On Unix a `!command` has no terminal, so one that asks for a password fails at once.
 - A shell gate whose command exits while something it started holds its output answers 2 s later.
+- A `PATCH /v1/sessions/{id}` naming a level, approvals or directory refuses a bad body first.
+- Session archives are `format_version` 29; older archives are brought forward on import.
 
 ### Fixed
 
@@ -49,6 +51,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `file_find` answers at its 60-second budget with what it found, even when few paths match.
 - A schedule gate that times out or prints past its limit stops every process it started.
 - The screen's `!command` shows what it printed when something it started keeps its output open.
+- A one-shot run sent SIGTERM or SIGHUP stops its command, saves its turn and prints its answer.
+- A write over HTTP runs to its end when its client hangs up; `POST /turns` keeps its own rule.
+- A background outcome is no longer lost when the client of the turn it rides hangs up.
+- `meka serve` waits on shutdown for a write whose client hung up before it ended.
+- A session whose load was cut short no longer answers `session-locked` until a restart.
+- A refused `PATCH /v1/sessions/{id}` no longer loads the session and holds its lock.
+- `session.created` and `session.updated` carry the record `GET /v1/sessions/{id}` answers.
+- A rename that moves a running sub-agent no longer announces it as idle.
+- Building or moving a session over HTTP answers each refusal with its own status, not a 500.
+- An account with no stored credential answers 422 naming `POST /v1/accounts/{name}/login`.
+- A subscription login that must be redone answers HTTP 422 naming its login route, not a 502.
+- Over ACP, a subscription login that must be redone is an `InvalidParams` naming the command.
+- A turn or compaction that failed on a login to redo names the login wherever it is read back.
+- A scheduled job whose session or profile cannot be loaded is retried each lease, never parked.
+- A job whose last fire could not run says why in `[Scheduled]`, `schedule_list`, `GET /v1/jobs`.
+- A scheduled fire cut short by `meka acp` exiting, or by SIGTERM or SIGHUP on the screen, reruns.
+- The screen sent SIGTERM or SIGHUP starts no further scheduled or background-outcome turn.
+- `meka schedule cancel` cancels a job this build cannot read, as the warning about it says.
+- A refused store upgrade no longer leaves a new copy of the store on every retry.
 
 ## [0.94.0] - 2026-11-12
 

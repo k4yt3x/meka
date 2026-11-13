@@ -32,14 +32,24 @@ pub(crate) struct InterruptRelay {
     /// collection between them. Waiters listen to this instead, so the ladder stays the only
     /// reader of the signal.
     pub(crate) pressed: tokio::sync::Notify,
+    /// Set when a hangup or a termination arrives, ahead of the turn being stopped. The host
+    /// leaves only once the stopped background tasks have had their moment, and the screen
+    /// starts no fire and no outcome turn in between.
+    told_to_leave: std::sync::atomic::AtomicBool,
 }
 pub(crate) static INTERRUPT_RELAY: std::sync::LazyLock<InterruptRelay> =
     std::sync::LazyLock::new(|| InterruptRelay {
         presses: std::sync::atomic::AtomicUsize::new(0),
         ladder_had_turn: std::sync::atomic::AtomicBool::new(false),
         pressed: tokio::sync::Notify::new(),
+        told_to_leave: std::sync::atomic::AtomicBool::new(false),
     });
 impl InterruptRelay {
+    /// Whether a hangup or a termination has arrived.
+    pub(crate) fn is_told_to_leave(&self) -> bool {
+        self.told_to_leave.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Fire the live turn's token, if any, and count the press on the ladder.
     ///
     /// A ladder climbed during a turn ends with the turn. Carrying its count into the wait after
@@ -69,6 +79,14 @@ impl InterruptRelay {
 /// row to be written, short enough that a user who has pressed Ctrl+C three times is not made to
 /// wait: `exit` on the spot orphans the process group and leaves the row reading `running`.
 pub(crate) const INTERRUPT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a one-shot run that a hangup or a termination told to leave has to go out through its
+/// own exit path before it exits where it stands. It covers the turn's unwind (five seconds for the
+/// stopped command's tree to die, its output to drain and the reply to be saved), then
+/// [`BACKGROUND_EXIT_GRACE`] for the background tasks and [`crate::mcp::SHUTDOWN_BUDGET`] for the
+/// MCP servers, which bound their own parts of the way out.
+pub(crate) const SIGNALED_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(5)
+    .saturating_add(BACKGROUND_EXIT_GRACE)
+    .saturating_add(crate::mcp::SHUTDOWN_BUDGET);
 /// What the nth Ctrl+C means.
 ///
 /// Split from the handler because the handler cannot be tested: it is a `tokio::spawn` around
@@ -111,26 +129,35 @@ pub(crate) fn background_cancellation_notice(signaled: usize) -> Option<String> 
 /// it. Idempotent; every turn path calls it, and only the first call spawns. `announce` says what a
 /// press did where the host shows such things, and `leave` is how the host leaves on the ladder's
 /// last press, once the canceled work has had its moment: the one-shot exits on the spot, while the
-/// screen has a terminal to give back first and goes through its own exit.
+/// screen has a terminal to give back first and goes through its own exit. `leave_on_signal` is how
+/// the host leaves on a hangup or a termination, once the turn and the background tasks have been
+/// stopped: the screen as on the last press, the one-shot through its run's own exit path, which
+/// waits for the stopped turn to be saved.
 pub(crate) fn install_interrupt_handler(
     cancel: crate::host::CancelCell,
     agent: &Agent,
     announce: impl Fn(&str) + Send + Sync + 'static,
     leave: impl Fn() + Send + Sync + 'static,
+    #[cfg_attr(
+        not(unix),
+        allow(
+            unused_variables,
+            reason = "only Unix listens for a hangup or a termination"
+        )
+    )]
+    leave_on_signal: impl Fn() + Send + Sync + 'static,
 ) {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if INSTALLED.set(()).is_err() {
         return;
     }
 
-    let leave: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(leave);
     // A hangup or a termination has no ladder: the terminal is going or gone, so the turn is
     // stopped, and the background tasks with it, whose process groups would otherwise outlive the
-    // exit untracked; then the host leaves through its own exit, which kills a `!command` still
-    // running and gives the terminal back where there is one.
+    // exit untracked; then the host leaves through its own exit path, which lets the stopped turn
+    // unwind, kills a `!command` still running and gives the terminal back where there is one.
     #[cfg(unix)]
     tokio::spawn({
-        let leave = std::sync::Arc::clone(&leave);
         let cancel = cancel.clone();
         let tasks = agent.background_tasks();
         let store = agent.store();
@@ -147,6 +174,9 @@ pub(crate) fn install_interrupt_handler(
                 _ = hangup.recv() => {}
                 _ = terminate.recv() => {}
             }
+            INTERRUPT_RELAY
+                .told_to_leave
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             cancel.cancel(crate::store::turns::CancelReason::ServerShutdown);
             // The process is going away under them, which is what `interrupted` says.
             tasks
@@ -160,10 +190,10 @@ pub(crate) fn install_interrupt_handler(
                 .is_err()
             {
                 tracing::warn!(
-                    "background tasks did not unwind within {INTERRUPT_DRAIN_GRACE:?}; exiting anyway"
+                    "background tasks did not unwind within {INTERRUPT_DRAIN_GRACE:?} of the signal"
                 );
             }
-            leave();
+            leave_on_signal();
         }
     });
     let tasks = agent.background_tasks();
@@ -318,6 +348,7 @@ mod tests {
             presses: std::sync::atomic::AtomicUsize::new(0),
             ladder_had_turn: std::sync::atomic::AtomicBool::new(false),
             pressed: tokio::sync::Notify::new(),
+            told_to_leave: std::sync::atomic::AtomicBool::new(false),
         };
         let cancel = crate::host::CancelCell::default();
 

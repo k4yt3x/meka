@@ -1212,6 +1212,51 @@ fn a_dormant_session_is_titled_and_pinned_without_being_revived() {
     assert!(listed["sessions"][0]["pinned_at"].is_string());
 }
 
+/// A `PATCH` refused for its body leaves a session this server has not loaded as it found it: not
+/// loaded, and its lock free for another process to take, where loading it first would hold the
+/// lock for the idle timeout to answer a request that changed nothing.
+#[test]
+fn a_refused_patch_leaves_a_dormant_session_dormant_and_unlocked() {
+    let harness = ServeTestHarness::spawn(
+        "idle_timeout = \"2s\"\ngc_scan_interval = \"1s\"\n",
+        mock_simple_turn(),
+    );
+    let id = session_with_one_turn(&harness);
+    harness.wait_until_evicted(&id);
+
+    let missing = harness.root().join("no-such-directory");
+    // `approvals` beside a profile or a project keeps the body off the path that never loads.
+    for body in [
+        serde_json::json!({"permission": "sideways"}),
+        serde_json::json!({"working_directory": missing.to_string_lossy()}),
+        serde_json::json!({"profile": "nowhere", "approvals": true}),
+        serde_json::json!({"project": "nowhere", "approvals": true}),
+    ] {
+        let refused = harness
+            .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+            .json(&body)
+            .send()
+            .expect("send");
+        assert_eq!(refused.status(), 422, "{body}");
+        assert!(
+            !harness.is_resident(&id),
+            "the refused {body} loaded the session"
+        );
+    }
+    let lock_path = harness
+        .install
+        .data_dir()
+        .join("locks")
+        .join(format!("{id}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", lock_path.display()));
+    lock.try_lock()
+        .expect("the session's lock is free for another process to take");
+}
+
 /// The words of a turn find its session, with the line they were found on; an unrelated word
 /// finds nothing.
 #[test]
@@ -2348,6 +2393,155 @@ fn idempotency_does_not_cache_server_errors() {
         200,
         "retried turn should succeed against the second mock script entry",
     );
+}
+
+/// A turn that failed because its account must sign in again is not kept against its key: the
+/// login its answer names changes what failed it, so the retry after that login runs the turn.
+#[test]
+fn a_spent_login_is_not_cached_against_its_idempotency_key() {
+    let script = serde_json::json!([
+        [{ "type": "fail_login_spent", "account": "mock", "message": "refresh token expired" }],
+        [{ "type": "text", "text": "signed in again" }]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let body = serde_json::json!({"message": "go", "stream": false});
+    let turn = || {
+        harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turns"))
+            .header("Idempotency-Key", "spent-login-key")
+            .json(&body)
+            .send()
+            .expect("send")
+    };
+    let first = turn();
+    assert_eq!(first.status().as_u16(), 422);
+    let problem: serde_json::Value = first.json().expect("problem");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("POST /v1/accounts/mock/login"),
+        "{problem}"
+    );
+
+    let second = turn();
+    assert_eq!(
+        second.status().as_u16(),
+        200,
+        "the retry runs the turn, which the script's second round answers"
+    );
+}
+
+/// Whether `detail` names the route that signs the mock account in again, and not the shell's
+/// command for it.
+fn names_the_login_route(detail: &serde_json::Value) -> bool {
+    detail.as_str().is_some_and(|detail| {
+        detail.contains("POST /v1/accounts/mock/login") && !detail.contains("meka account")
+    })
+}
+
+/// A turn that failed because its account must sign in again reads back from its row with the
+/// route that signs it in, as its live answer said: in `/turns`, and as the `last_turn` of the
+/// session's record and of the listing.
+#[test]
+fn a_turn_failed_on_a_spent_login_reads_back_with_the_login_route() {
+    let script = serde_json::json!([[
+        { "type": "fail_login_spent", "account": "mock", "message": "refresh token expired" }
+    ]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = create_session_id(&harness);
+    let failed = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turns"))
+        .json(&serde_json::json!({"message": "go", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(failed.status().as_u16(), 422);
+    let read = |path: &str| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, path)
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    let turns = read(&format!("/v1/sessions/{id}/turns"));
+    assert!(
+        names_the_login_route(&turns["turns"][0]["error"]["detail"]),
+        "{turns}"
+    );
+    let record = read(&format!("/v1/sessions/{id}"));
+    assert!(
+        names_the_login_route(&record["last_turn"]["error"]["detail"]),
+        "{record}"
+    );
+    let listing = read("/v1/sessions");
+    let listed = listing["sessions"]
+        .as_array()
+        .and_then(|sessions| sessions.iter().find(|session| session["id"] == id))
+        .unwrap_or_else(|| panic!("the session is listed: {listing}"));
+    assert!(
+        names_the_login_route(&listed["last_turn"]["error"]["detail"]),
+        "{listed}"
+    );
+}
+
+/// A compaction that failed because its account must sign in again names the route that signs it
+/// in, on the feed as it fails and in the history after.
+#[test]
+fn a_compaction_failed_on_a_spent_login_names_the_login_route() {
+    let script = serde_json::json!([
+        [
+            { "type": "text", "text": "reply 0" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [{ "type": "fail_login_spent", "account": "mock", "message": "refresh token expired" }]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", script);
+    let id = session_with_one_turn(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let compact = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
+        .send()
+        .expect("send");
+    assert_eq!(
+        compact.status().as_u16(),
+        422,
+        "{}",
+        compact.text().unwrap_or_default()
+    );
+    let body = read_feed_until(feed, |text| {
+        text.split("event: context.compaction_failed")
+            .nth(1)
+            .is_some_and(|rest| rest.contains("\n\n"))
+    });
+    let failed = sse_event_data(&body, "context.compaction_failed")
+        .unwrap_or_else(|| panic!("the failure is on the feed: {body}"));
+    assert!(names_the_login_route(&failed["error"]), "{failed}");
+    let history: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/history"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let item = history["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["type"] == "compaction_failed")
+        })
+        .unwrap_or_else(|| panic!("the history holds the failure: {history}"));
+    assert!(names_the_login_route(&item["error"]), "{item}");
 }
 
 /// `POST /cancel` against an in-flight streaming turn produces a `turn.canceled` SSE event
@@ -7522,6 +7716,245 @@ fn a_compaction_finishes_and_closes_its_turn_after_the_client_hangs_up() {
     );
 }
 
+/// Send `method path` by hand on a connection of its own, for a test that hangs up on it partway.
+///
+/// A `body` goes with `Expect: 100-continue`, and only once the server asks for it, which a
+/// handler does as it reads the body: the request is being served by then. One hung up on as it
+/// arrives can be dropped before any handler is called, since hyper may read the request and the
+/// end of the connection in one pass, and its client is then never served at all. Without a body
+/// the head alone is sent, and the caller hangs up on an event the request causes.
+fn send_by_hand(
+    harness: &ServeTestHarness,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> std::net::TcpStream {
+    use std::io::{BufRead, Write};
+    let address = harness
+        .base_url
+        .strip_prefix("http://")
+        .expect("the harness serves plain http");
+    let mut stream = std::net::TcpStream::connect(address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("read timeout");
+    let body = body.map(serde_json::Value::to_string);
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n",
+        token = harness.token
+    );
+    if let Some(body) = &body {
+        head.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {length}\r\nExpect: \
+             100-continue\r\n",
+            length = body.len()
+        ));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).expect("write the head");
+    if let Some(body) = body {
+        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone the stream"));
+        let mut status = String::new();
+        reader
+            .read_line(&mut status)
+            .expect("read the interim answer");
+        assert!(
+            status.starts_with("HTTP/1.1 100"),
+            "the server asks for the body: {status}"
+        );
+        let mut blank = String::new();
+        reader
+            .read_line(&mut blank)
+            .expect("read the end of the interim answer");
+        stream.write_all(body.as_bytes()).expect("write the body");
+    }
+    stream
+}
+
+/// Hang up on `stream` as a client whose timeout fires does, and return once the server has closed
+/// its side.
+fn hang_up(mut stream: std::net::TcpStream) {
+    use std::io::Read;
+    stream.shutdown(std::net::Shutdown::Write).expect("hang up");
+    let mut answer = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut answer) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset,
+            "the server ends the connection: {error}"
+        );
+    }
+}
+
+/// Take the server's store write lock, so a write the server issues waits until
+/// [`release_the_store`]: a request hung up on meanwhile is cut before its first write lands.
+fn hold_the_store(harness: &ServeTestHarness) -> rusqlite::Connection {
+    let store =
+        rusqlite::Connection::open(harness.install.database()).expect("open the server's store");
+    store
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold the store's write lock");
+    store
+}
+
+/// Let go of the lock [`hold_the_store`] took.
+fn release_the_store(store: &rusqlite::Connection) {
+    store
+        .execute_batch("ROLLBACK")
+        .expect("release the write lock");
+}
+
+/// A rewind outlives the request that asked for it: hung up on while its write waits for the
+/// store, the server still cuts the conversation and tells the session's feed what the cut took.
+#[test]
+fn a_rewind_finishes_and_is_announced_after_the_client_hangs_up() {
+    let harness = ServeTestHarness::spawn("", mock_turns(1));
+    let id = session_with_one_turn(&harness);
+    let turn = harness.newest_turn(&id, 1);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(20));
+
+    let store = hold_the_store(&harness);
+    hang_up(send_by_hand(
+        &harness,
+        "POST",
+        &format!("/v1/sessions/{id}/rewind"),
+        Some(&serde_json::json!({ "turn_id": turn })),
+    ));
+    release_the_store(&store);
+
+    let body = read_feed_until(feed, |text| text.contains("event: conversation.rewound"));
+    assert!(
+        sse_event_data(&body, "conversation.rewound").is_some(),
+        "the rewind ran to its end after the client left: {body}"
+    );
+    let messages: serde_json::Value = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{id}/context/messages"),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        messages["messages"].as_array().map(Vec::len),
+        Some(0),
+        "{messages}"
+    );
+}
+
+/// A delete outlives the request that asked for it: hung up on while the row's delete waits for the
+/// store, the session is still removed, let go of and announced, where a delete dropped there would
+/// never release the session or tell the listing. Its request has no body to pace the hang-up on,
+/// so the session's own feed ending, as the session leaves the map ahead of the row, says the
+/// handler has begun.
+#[test]
+fn a_delete_finishes_and_is_announced_after_the_client_hangs_up() {
+    let harness = ServeTestHarness::spawn("", mock_turns(1));
+    let id = session_with_one_turn(&harness);
+    let own = open_feed(&harness, &id, None, Duration::from_secs(20));
+    let feed = open_server_feed(&harness, None);
+
+    let store = hold_the_store(&harness);
+    let request = send_by_hand(&harness, "DELETE", &format!("/v1/sessions/{id}"), None);
+    read_feed_until(own, |_| false);
+    hang_up(request);
+    release_the_store(&store);
+
+    let body = read_feed_until(feed, |text| text.contains("event: session.deleted"));
+    let deleted = sse_event_data(&body, "session.deleted")
+        .unwrap_or_else(|| panic!("the delete ran to its end after the client left: {body}"));
+    assert_eq!(deleted["id"], id.as_str(), "{body}");
+    let gone = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send");
+    assert_eq!(gone.status(), 404);
+}
+
+/// A fork outlives the request that asked for it: hung up on while its copy waits for the store,
+/// the copy is still made, opened and announced, rather than left listed under an id nobody was
+/// told.
+#[test]
+fn a_fork_finishes_and_is_announced_after_the_client_hangs_up() {
+    let harness = ServeTestHarness::spawn("", mock_turns(1));
+    let id = session_with_one_turn(&harness);
+    let feed = open_server_feed(&harness, None);
+
+    let store = hold_the_store(&harness);
+    hang_up(send_by_hand(
+        &harness,
+        "POST",
+        &format!("/v1/sessions/{id}/fork"),
+        Some(&serde_json::json!({})),
+    ));
+    release_the_store(&store);
+
+    // The feed replays the source's own creation first.
+    let copy_created = |text: &str| {
+        sse_events(text)
+            .into_iter()
+            .find(|(name, data)| name == "session.created" && data["id"] != id.as_str())
+            .map(|(_, data)| data)
+    };
+    let body = read_feed_until(feed, |text| copy_created(text).is_some());
+    let created = copy_created(&body)
+        .unwrap_or_else(|| panic!("the fork ran to its end after the client left: {body}"));
+    let fork = created["id"].as_str().expect("the copy's id");
+    let copy: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{fork}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(copy["turn_count"], 1, "{copy}");
+}
+
+/// A write to the installation outlives the request that asked for it: an account renamed by a
+/// client that hangs up while the credential's move waits for the store is renamed in the file and
+/// in the store, where a rename dropped between the two would leave the credential under a name the
+/// file does not have.
+#[test]
+fn an_account_rename_finishes_after_the_client_hangs_up() {
+    let harness = ServeTestHarness::spawn_bare("", "", mock_simple_turn(), "sk_test_token", &[
+        "config:r", "config:w",
+    ]);
+    let created = harness
+        .request(reqwest::Method::POST, "/v1/accounts")
+        .json(&serde_json::json!({
+            "name": "work",
+            "backend": "anthropic-messages",
+            "api_key": "sk-ant-test"
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(created.status(), 201);
+
+    let store = hold_the_store(&harness);
+    hang_up(send_by_hand(
+        &harness,
+        "PATCH",
+        "/v1/accounts/work",
+        Some(&serde_json::json!({ "name": "corp" })),
+    ));
+    release_the_store(&store);
+
+    let account = |name: &str| {
+        let response = harness
+            .request(reqwest::Method::GET, &format!("/v1/accounts/{name}"))
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        (status, response.json::<serde_json::Value>().expect("parse"))
+    };
+    support::wait_until("the rename to be served", Duration::from_secs(20), || {
+        account("corp").0 == 200
+    });
+    let (_, renamed) = account("corp");
+    assert_eq!(renamed["authenticated"], "yes", "{renamed}");
+    assert_eq!(account("work").0, 404);
+}
+
 /// An empty body means "compact with no guidance". Requiring `{}` would make every client send a
 /// payload to say nothing.
 #[test]
@@ -10704,6 +11137,27 @@ fn an_inbox_turn_that_fails_for_good_gives_the_item_up_at_once() {
     );
 }
 
+/// An item given up because its account must sign in again says why with the route that signs it
+/// in, as the rest of this API words it.
+#[test]
+fn an_inbox_item_given_up_on_a_spent_login_names_the_login_route() {
+    let script = serde_json::json!([[
+        { "type": "fail_login_spent", "account": "mock", "message": "refresh token expired" }
+    ]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    enqueue_inbox_item(&harness, &id, "are you there?");
+
+    let body = read_feed_until(feed, |text| {
+        text.split("event: inbox.failed")
+            .nth(1)
+            .is_some_and(|rest| rest.contains("\n\n"))
+    });
+    let failed = sse_event_data(&body, "inbox.failed").expect("inbox.failed on the feed");
+    assert!(names_the_login_route(&failed["reason"]), "{failed}");
+}
+
 /// A quota rejection is a failure waiting can change: the item waits for the next attempt at the
 /// backoff, not the hour the upstream stated, the feed says until when and why, and the item
 /// record shows both while it waits.
@@ -12883,6 +13337,107 @@ fn a_canceled_task_rides_on_the_next_turn_instead_of_causing_one() {
             .windows(2)
             .any(|pair| pair[0]["role"] == "user" && pair[1]["role"] == "user"),
         "two consecutive user turns must never reach the provider: {after:#?}"
+    );
+}
+
+/// An outcome waiting to ride is claimed by the task that runs the turn, so a client that hangs up
+/// while its turn waits on the store still has the outcome carried by that turn, where a claim made
+/// on the request would stamp it delivered and leave it in no conversation.
+#[test]
+fn an_outcome_rides_its_turn_after_the_client_hangs_up() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "answered the question" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[background]\nenabled = true\n", script);
+    let id = start_streaming_session(&harness);
+    let first = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turns"))
+        .json(&serde_json::json!({"message": "run it"}))
+        .send()
+        .expect("send");
+    assert_eq!(first.status(), 200, "{}", first.text().unwrap_or_default());
+    let tasks: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/tasks?session={id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let task_id = tasks["tasks"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no background task started: {tasks}"))
+        .to_string();
+    let cancel = harness
+        .request(reqwest::Method::DELETE, &format!("/v1/tasks/{task_id}"))
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204, "the task must cancel");
+    support::wait_until("the first turn to end", Duration::from_secs(30), || {
+        let session: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        session["turn_in_flight"] == false
+    });
+
+    // The feeds replay the first turn, so what is waited for is another turn's.
+    let first_turn = harness.newest_turn(&id, 1);
+    let another_turn = |text: &str, events: &[&str]| {
+        sse_events(text)
+            .into_iter()
+            .any(|(name, data)| events.contains(&name.as_str()) && data["turn_id"] != first_turn)
+    };
+    // The client hangs up once its turn has started, which nothing on the request waits on the
+    // held store for. A claim made on the request would wait there instead, and fail at the
+    // store's busy timeout with the outcome carried by no turn.
+    let started = open_feed(&harness, &id, None, Duration::from_secs(20));
+    let ended = open_feed(&harness, &id, None, Duration::from_secs(20));
+    let store = hold_the_store(&harness);
+    let request = send_by_hand(
+        &harness,
+        "POST",
+        &format!("/v1/sessions/{id}/turns"),
+        Some(&serde_json::json!({ "message": "what is in this CSV?" })),
+    );
+    read_feed_until(started, |text| another_turn(text, &["turn.started"]));
+    hang_up(request);
+    release_the_store(&store);
+
+    let body = read_feed_until(ended, |text| {
+        another_turn(text, &["turn.finished", "turn.failed", "turn.canceled"])
+    });
+    let messages: serde_json::Value = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{id}/context/messages"),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let carried = messages["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .map(message_text)
+        .any(|text| text.contains("was canceled") && text.contains("what is in this CSV?"));
+    assert!(
+        carried,
+        "the outcome rides the turn its client left: {messages}\nthe feed: {body}"
     );
 }
 
@@ -18860,6 +19415,73 @@ fn a_rename_puts_each_moved_session_on_the_server_feed() {
     assert_eq!(record["project"], "film", "{record}");
 }
 
+/// A rename that moves a sub-agent while its parent runs it announces it busy, as `GET` answers for
+/// it: a sub-agent is never resident, so its parent's run is what makes it busy.
+#[test]
+fn a_rename_announces_a_running_sub_agent_as_busy() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+            { "type": "tool_use_end", "input": {"prompt": "count the files"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            // Long past the rename below, which follows the worker's announcement at once.
+            { "type": "sleep", "ms": 30000 },
+            { "type": "text", "text": "worker done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "dispatched" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with("", "", script, "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "config:w",
+    ]);
+    let feed = open_server_feed(&harness, None);
+    let parent = create_session_id(&harness);
+    let turn = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{parent}/turns"),
+        )
+        .json(&serde_json::json!({"message": "dispatch", "detach": true}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 202, "{}", turn.text().unwrap_or_default());
+    let spawned = |text: &str| {
+        sse_events(text)
+            .into_iter()
+            .find(|(name, data)| name == "session.created" && data["parent_id"] == parent.as_str())
+            .map(|(_, data)| data)
+    };
+    let body = read_feed_until(feed, |text| spawned(text).is_some());
+    let worker = spawned(&body).unwrap_or_else(|| panic!("the worker is announced: {body}"))["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let feed = open_server_feed(&harness, None);
+    let renamed = harness
+        .request(reqwest::Method::PATCH, "/v1/profiles/mock")
+        .json(&serde_json::json!({"name": "renamed"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        renamed.status(),
+        200,
+        "{}",
+        renamed.text().unwrap_or_default()
+    );
+    let moved = announced_record(feed, "session.updated", &worker, |record| {
+        record["profile"] == "renamed"
+    });
+    assert_eq!(moved["turn_in_flight"], true, "{moved}");
+}
+
 /// A `PATCH` naming a profile or a project claims the session while it writes, as a rewind does,
 /// and neither is a turn: the reply, the record each puts on the server feed and a `GET` after
 /// them all say `turn_in_flight: false`.
@@ -19038,6 +19660,86 @@ fn the_server_feed_carries_every_change_to_a_session_record() {
     let resumed_body = read_feed_until(resumed, |text| text.contains("event: session.deleted"));
     let resumed_ids = sse_event_ids(&resumed_body);
     assert_eq!(resumed_ids.first(), Some(&(first + 1)), "{resumed_ids:?}");
+}
+
+/// The record a door puts on the server feed for `id`: read until an event of `name` naming `id`
+/// whose record `matches`, from a feed opened before the door was asked.
+fn announced_record(
+    feed: reqwest::blocking::Response,
+    name: &str,
+    id: &str,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let found = |text: &str| {
+        sse_events(text)
+            .into_iter()
+            .find(|(event, data)| event == name && data["id"] == id && matches(data))
+            .map(|(_, data)| data)
+    };
+    let body = read_feed_until(feed, |text| found(text).is_some());
+    found(&body).unwrap_or_else(|| panic!("no {name} for {id}: {body}"))
+}
+
+/// Every door that announces a session's record announces the record `GET /v1/sessions/{id}`
+/// answers at that moment, so a client that replaces its row with the event loses nothing: a
+/// create, a rewind, a `PATCH` and a fork, on a session this server holds.
+#[test]
+fn an_announced_record_is_the_record_get_answers() {
+    let harness = ServeTestHarness::spawn("", mock_turns(1));
+    let get = |id: &str| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+
+    let feed = open_server_feed(&harness, None);
+    let id = create_session_id(&harness);
+    let created = announced_record(feed, "session.created", &id, |_| true);
+    assert_eq!(created, get(&id), "create");
+
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turns"))
+        .json(&serde_json::json!({"message": "hi"}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200, "{}", turn.text().unwrap_or_default());
+    let feed = open_server_feed(&harness, None);
+    let rewound = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
+        .json(&serde_json::json!({"turn_id": harness.newest_turn(&id, 1)}))
+        .send()
+        .expect("send");
+    assert_eq!(rewound.status(), 200);
+    let updated = announced_record(feed, "session.updated", &id, |_| true);
+    assert_eq!(updated, get(&id), "rewind");
+
+    let feed = open_server_feed(&harness, None);
+    let patched = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"title": "Kept", "permission": "workspace"}))
+        .send()
+        .expect("send");
+    assert_eq!(patched.status(), 200);
+    let updated = announced_record(feed, "session.updated", &id, |record| {
+        record["title"] == "Kept"
+    });
+    assert_eq!(updated, get(&id), "patch");
+
+    let feed = open_server_feed(&harness, None);
+    let forked = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
+        .send()
+        .expect("send");
+    assert_eq!(forked.status(), 201);
+    let fork = forked.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let created = announced_record(feed, "session.created", &fork, |_| true);
+    assert_eq!(created, get(&fork), "fork");
 }
 
 /// A sub-agent is run by a tool, not by a request, so the registry that answers its

@@ -240,13 +240,22 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         crate::host::apply_recorded_bindings(&self.state.shared, &entry.agent, entry.id).await
     }
 
+    fn refusal_sentence(&self, refusal: &crate::error::MekaError) -> String {
+        crate::host::http::errors::api_wording(refusal)
+    }
+
     async fn resident(&self, session_id: uuid::Uuid) -> anyhow::Result<Option<Self::Entry>> {
         match reattach::ensure_session_loaded(&self.state, session_id).await {
             Ok(entry) => Ok(Some(entry)),
             Err(problem) if problem.is(crate::host::http::errors::ErrorKind::SessionLocked) => {
                 Ok(None)
             }
-            Err(problem) => Err(anyhow::anyhow!("session unavailable: {}", problem.title)),
+            // The detail, where the problem has one, is Meka's sentence naming what is wrong; the
+            // title only names the problem's class.
+            Err(problem) => Err(anyhow::anyhow!(
+                "session unavailable: {}",
+                problem.detail.as_deref().unwrap_or(&problem.title)
+            )),
         }
     }
 
@@ -444,7 +453,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
     fn failed_before_running(&self, job: &crate::schedule::ScheduledJob, _error: &anyhow::Error) {
         // Not `failed`: that is a turn that ran, and a subscriber sent looking for a fault in one
         // would find no turn. The session could not be opened, and the lease expires and is
-        // claimed again, so this may repeat until the attempts run out.
+        // claimed again, so this repeats once a lease until it can be.
         self.notify(job, "not_run");
     }
 

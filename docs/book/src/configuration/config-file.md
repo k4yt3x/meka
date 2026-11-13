@@ -1625,8 +1625,8 @@ Maximum request body size in bytes. Requests exceeding this limit are refused wi
 
 ### `serve.relay_provider_errors`
 
-Whether a 502's payload carries the provider's own response text, as a `provider_response` member
-alongside `detail`.
+Whether a 502's payload, and the 422 of an account that must sign in again, carries the provider's
+own response text, as a `provider_response` member alongside `detail`.
 
 On by default. The upstream's error type is the actionable part of a failed turn, and "consult the
 server log" is no answer to anyone driving a Meka they do not operate. `meka acp` honors this key too: the same policy decides what a failed turn's `error.data` carries.
@@ -1743,7 +1743,7 @@ When `true`, idle-evicted sessions also have their SQLite row deleted, unless a 
 
 ### `serve.shutdown_drain_timeout`
 
-Maximum time to wait for in-flight turns and tasks to finish during graceful shutdown (`SIGTERM` / `SIGINT`). After this timeout, remaining tasks are aborted and the process exits.
+Maximum time to wait for in-flight turns, tasks and writes to finish during graceful shutdown (`SIGTERM` / `SIGINT`). After this timeout, remaining tasks are aborted and the process exits.
 
 | Type | Default |
 |------|---------|

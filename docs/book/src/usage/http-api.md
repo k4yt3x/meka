@@ -281,7 +281,8 @@ If you run more than one `meka` on the same store, send the `PATCH` to whichever
 session. A body naming only a profile is the one `PATCH` that works on a session this server has
 not loaded, and it takes the session lock to do it, so a session another process is running answers
 `409` `session-locked` rather than moving a row that process would go on ignoring. Only the host
-holding a session may change what it runs on.
+holding a session may change what it runs on. A `PATCH` whose body is refused leaves a session this
+server has not loaded as it was: nothing is loaded, and its lock stays free.
 
 A body naming **only** `profile` is also the rescue for a session whose profile has left
 `config.toml`: it moves the row without building an agent, so it works on a session that cannot
@@ -1090,7 +1091,7 @@ Every delivery carries `delivery_id`, `event`, `timestamp`, and event-specific i
 }
 ```
 
-A `schedule.fired` `status` is `completed`, `failed`, `canceled` when the turn was stopped before it finished, as happens when the server drains during it, or `not_run` when the job's session could not be opened for it (its profile left `config.toml`, or the session is gone); a `not_run` fire is tried again when its lease expires, so the status may repeat until the attempts run out.
+A `schedule.fired` `status` is `completed`, `failed`, `canceled` when someone stopped the turn before it finished, or `not_run` when the job's session could not be opened for it (its profile left `config.toml`, or the session is gone); a `not_run` fire is tried again when its lease expires, so the status repeats once a lease for as long as the cause lasts, and it never counts toward parking the job. A fire the server's own shutdown cuts short posts nothing: it is handed back and runs again.
 
 **Payloads never carry message content.** A webhook URL is a string in a config file: it can be mistyped, it can outlive whatever owned it, and anything that learns it can reach it. So a delivery tells you *what happened to which session*, and you fetch the conversation with your own bearer token over the API you already authenticate against. A compromised endpoint learns that a session was active, not what was said in it.
 
@@ -1258,7 +1259,7 @@ If the same key is replayed, the server returns the cached response. If the same
 
 Keys are scoped per-token **and per-session**, and expire after 24 hours. The session is part of the scope because an `Idempotency-Key` names *your* unit of work: sending the same key to two sessions is a reasonable thing to do, and it now runs both turns instead of answering the second with the first's transcript.
 
-A held turn that was canceled is not cached, so the retry the cancellation invites can actually run. Neither is a 5xx, for the same reason. Either retry re-executes the turn, and unless the turn was sent with `options.unanswered_message` set to `withdraw` it runs above the message the failed one left behind; see [Resending a failed turn](#resending-a-failed-turn).
+A held turn that was canceled is not cached, so the retry the cancellation invites can actually run. Neither is a 5xx, nor the 422 of an account that must sign in again, for the same reason. The retry re-executes the turn, and unless the turn was sent with `options.unanswered_message` set to `withdraw` it runs above the message the failed one left behind; see [Resending a failed turn](#resending-a-failed-turn).
 
 A detached request commits its key at admission, with the `202` it was answered. A replay answers that same record for the key's lifetime whatever became of the turn, canceled included, and starts nothing: the client chose not to wait, so the outcome is the turn resource's to report. A detached stream's replay is answered the record too, not a stream.
 
@@ -1268,7 +1269,7 @@ Idempotency keys are **ignored for a held stream**; such a client reconnects thr
 
 ### Which endpoints are safe to retry
 
-`Idempotency-Key` covers held JSON turns and detached requests. For everything else, know what a blind retry does before you configure one:
+`Idempotency-Key` covers held JSON turns and detached requests. For everything else, know what a blind retry does before you configure one. Every write but `POST /turns` runs to its end once the server is serving it, whether or not its client is still there, so a retry after a timeout finds what the first attempt did rather than half of it:
 
 | Endpoint | Retry-safe | On a duplicate |
 |---|---|---|
@@ -1339,14 +1340,14 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation, which only its parent drives. Reading it is unaffected; the message names the parent and what to do there: `agent_followup` for a turn or a fork, `POST /v1/sessions/{parent}/responses/{request_id}` for an approval, the parent itself for a scheduled job, and the parent's feed for a sub-agent's `attend`. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
 | `/errors/idempotency` | 409/429 | Key conflict (body mismatch: 409; cache cap: 429) |
-| `/errors/invalid-body` | 400/422 | Request body validation failed (422), or a path/query parameter the router rejected (400) |
+| `/errors/invalid-body` | 400/422 | Request body validation failed (422), or a path/query parameter the router rejected (400). Also a session built or moved onto a profile whose account has no stored credential (create, re-attach, a turn, a compaction, a `PATCH` of the profile), and a turn that ended because its subscription account must sign in again; both name `POST /v1/accounts/{name}/login` in `detail`, and the second carries `provider_response` as the 502s below do |
 | `/errors/precondition-failed` | 412 | `If-Match` on a rewind or a fork names a conversation that has since changed; `position` carries the current one. Read `GET /history` or `GET /context/messages` again and decide again |
 | `/errors/request-too-large` | 422 | Meka refused to send the turn: the conversation is still over the profile's `max_request_bytes` after redacting older tool-result images. Meka's own ceiling, so no provider judged it and no `provider_response` rides along; `detail` names the size, the limit and the remedy, `/compact`. **Do not retry unchanged**: `POST /compact` first |
 | `/errors/payload-too-large` | 413 | Body exceeds `max_body_bytes`, Meka's limit on the HTTP request itself. Unrelated to `request-too-large`, which is about what Meka may send onward |
 | `/errors/concurrency-limit` | 429 | Process-wide turn limit reached (`Retry-After` header included) |
 | `/errors/sse-lag` | 500 | SSE consumer fell behind; stream terminated (see [Falling behind](#falling-behind)) |
 | `/errors/stream-detached` | 500 | SSE-only. A re-attached stream ended with no recorded outcome because the turn's task died; read `GET /history` for what completed |
-| `/errors/provider` | 502 | An upstream call failed for a reason Meka could not classify as transient. Usually permanent (a revoked credential, a `base_url` that is not the API), but it is a catch-all, so treat it as "no reason to expect a retry to help" rather than "a retry cannot help" |
+| `/errors/provider` | 502 | An upstream call failed for a reason Meka could not classify as transient. Usually permanent (a revoked API key, a `base_url` that is not the API), but it is a catch-all, so treat it as "no reason to expect a retry to help" rather than "a retry cannot help" |
 | `/errors/provider-unavailable` | 502 | The upstream failed in a way Meka's classifier had already labeled transient. **Worth one backed-off resend.** Carries a `Retry-After` when the upstream gave one, which most of the time it did not |
 | `/errors/provider-exhausted` | 502 | The upstream rejected the request for quota or billing, by a signal it documents: a 402, a quota code on a 429, or the Claude subscription's exhausted usage window. **Nothing changes until the reset**, which rides as `Retry-After` when the upstream stated one. A profile with [`fallbacks`](../configuration/config-file.md#fallbacks) hands the turn to the next one instead of answering this |
 | `/errors/context-overflow` | 502 | The conversation exceeds the model's context window, and auto-compaction was off, already spent, or could not shorten it enough. **Do not retry unchanged**; `POST /compact` or send less first. Carries `provider_response` like the two above, since the upstream is what rejected it |
@@ -1359,7 +1360,7 @@ Streaming turns that fail mid-stream emit a `turn.failed` SSE event with the sam
 
 > The three 502s are the ones worth branching on. `/errors/provider-unavailable` is the positive signal: Meka's classifier recognized the failure as transient, which covers an overload, a 5xx, a dropped connection and a stalled stream. Resend it after a pause; [Resending a failed turn](#resending-a-failed-turn) says what the failed turn leaves behind. `/errors/context-overflow` is the flat refusal: the request no longer fits and will not fit next time either, so retrying it unchanged loops until your client gives up; shorten the conversation with `POST /v1/sessions/{id}/compact` or send less.
 >
-> **`/errors/provider` is the absence of the first signal, not the opposite of it.** It is a catch-all covering everything Meka could not place, so a revoked credential lands there and so does a 408, a truncated response body, and any mid-stream error type Meka does not yet recognize. Most of the time it is permanent and worth surfacing to a human rather than retrying, but do not build a client that will *never* retry it: one unhurried resend is reasonable, an unbounded loop is not.
+> **`/errors/provider` is the absence of the first signal, not the opposite of it.** It is a catch-all covering everything Meka could not place, so a revoked API key lands there and so does a 408, a truncated response body, and any mid-stream error type Meka does not yet recognize. Most of the time it is permanent and worth surfacing to a human rather than retrying, but do not build a client that will *never* retry it: one unhurried resend is reasonable, an unbounded loop is not.
 >
 > **Branch on `type`, not on `Retry-After`.** A `Retry-After` is present only when the upstream volunteered one in delta-seconds form, which most transient failures do not: a dropped connection never produced a response to carry a header, a mid-stream `overloaded_error` has no headers at all, and an upstream answering with an HTTP date sends none Meka can read. Treating its absence as "permanent" discards turns a second attempt would have completed, which is the reason these two types exist separately.
 >
@@ -1456,7 +1457,8 @@ A session is never evicted while a turn is in flight, while a scheduled fire or 
 2. Cancel all in-flight turns (same mechanism as `POST /cancel`).
 3. Emit `turn.canceled` with `reason: "server_shutdown"` on open SSE streams.
 4. Wait up to `shutdown_drain_timeout` for every turn to finish unwinding, including scheduled
-   fires, background-outcome deliveries, and turns whose client has already disconnected.
+   fires, background-outcome deliveries, and turns whose client has already disconnected, and for
+   every write whose client hung up before it ended.
    Canceling a turn is not the same as waiting for one: what follows the cancellation is the
    commit of the partial reply and of whatever the round already produced.
 5. Exit `0`. A drain that hits the timeout instead logs a warning, abandons what is still
@@ -1771,7 +1773,7 @@ A **tool** gate (`"check": {"tool": "…", "arguments": {…}}`) is not held to 
 
 `shell_execute` is one such tool wherever a sandbox backend is usable, so a `read` session can plant an arbitrary command on a timer through the tool form. That is deliberate and it is not the same grant as the shell form: a gate dispatches at `read`, the level Meka sandboxes, so the command runs read-only-confined rather than as a bare `sh -c`, and where no sandbox is available the tool resolves above `read` and the gate is refused instead. The confinement blocks writes, not the network. See [Scheduled jobs](./scheduling.md) for the longer version.
 
-No job of any kind can be created on a session at `none`, gated or not: no tool runs there, so the turn could neither act on the job nor cancel it, and `POST /v1/jobs` answers 403 `session-permission` rather than creating a row that can never run. A job whose session drops to `none` afterwards keeps its row and reports itself: every job view carries a `withheld` field, present only when something is holding the job back. With `sessions:r` it is the same sentence the agent is given; a `schedule:r`-only token gets a fixed sentence saying the reason needs `sessions:r`, because the reason can name the session's level, a gate's tool, or the first line of a check's output. It is computed per request from the session's current level, so it tracks a `PATCH /v1/sessions/{id}` without the job being rewritten.
+No job of any kind can be created on a session at `none`, gated or not: no tool runs there, so the turn could neither act on the job nor cancel it, and `POST /v1/jobs` answers 403 `session-permission` rather than creating a row that can never run. A job whose session drops to `none` afterwards keeps its row and reports itself: every job view carries a `withheld` field, present only when something is holding the job back. With `sessions:r` it is the same sentence the agent is given; a `schedule:r`-only token gets a fixed sentence saying the reason needs `sessions:r`, because the reason can name the session's level, a gate's tool, or the first line of a check's output. It is computed per request from the session's current level, so it tracks a `PATCH /v1/sessions/{id}` without the job being rewritten. A job whose last fire the server could not run (its session could not be opened, or the profile or project it records no longer resolves) carries that cause, and that it is retried every `[schedule].claim_lease`, until a turn is delivered or that occurrence closes without one; only the server process that tried knows it.
 
 A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a gate at all. Scope a bridge accordingly, and note that `GET /v1/jobs` is server-wide, so `schedule:r` alone lists every session id in the store.
 

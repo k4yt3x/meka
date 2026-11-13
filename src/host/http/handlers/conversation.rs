@@ -81,7 +81,7 @@ pub(crate) struct CompactRequestBody {
 )]
 #[allow(
     clippy::significant_drop_tightening,
-    reason = "the conversation guard is the compaction's exclusivity and moves into its task whole"
+    reason = "the conversation guard is the compaction's exclusivity and is held to its end"
 )]
 pub(crate) async fn compact(
     State(state): State<ServerState>,
@@ -192,92 +192,68 @@ pub(crate) async fn compact(
         state.config.stream_reattach_grace,
         state.config.stream_replay_events,
     );
-    // Spawned for the reason a client's turn is (see `run_blocking_turn`): axum drops the
-    // handler's future when the client hangs up, and a checkpoint runs for minutes against
-    // client timeouts of seconds. Dropped after `begin_turn`, the compaction would leave the
-    // feed's turn open with no terminal: `GET /feed` would announce a resumed turn that never
-    // ends and withhold the previous turn's terminal until another turn started. The terminal is
-    // recorded and the turn closed before the conversation is released, so a turn winning the
-    // lock next finds nothing of this one in the recorder or on the feed.
-    let join = tokio::spawn({
-        let state = state.clone();
-        let entry = entry.clone();
-        async move {
-            let _in_flight = in_flight;
-            let _published = published;
-            // Closes the feed's turn on a panic too, as it does for a client's turn.
-            let stream_guard = crate::host::http::handlers::turn::StreamGuard::new(
-                std::sync::Arc::clone(&entry.frontend),
-            );
-            let outcome = entry
-                .agent
-                .compact_session_under(&mut conversation, request, &cancellation, turn_id)
-                .await;
-            // The checkpoint turn emits provider notices and the `Compacted` event into the
-            // session's recorder; its usage rides the terminal, and the rest is dropped, as every
-            // other path that runs a turn outside a request drops it: left alone the events
-            // accumulate across repeated compactions and surface in whichever turn drains next.
-            let recorder = entry.frontend.drain();
-            {
-                use crate::host::http::handlers::turn::{terminal_event_parts, usage_from};
-                let compacted = outcome
-                    .as_ref()
-                    .map(|record| crate::agent::TurnOutcome::of(record.last_stop()));
-                let (event_type, data) = terminal_event_parts(
-                    Ok(compacted.as_ref().map_err(|error| *error)),
-                    cancellation
-                        .reason()
-                        .unwrap_or(crate::store::turns::CancelReason::Client),
-                    usage_from(&recorder),
-                    turn_id,
+    // The terminal is recorded and the turn closed before the conversation is released, so a turn
+    // winning the lock next finds nothing of this one in the recorder or on the feed.
+    let answered = {
+        let _in_flight = in_flight;
+        let _published = published;
+        // Closes the feed's turn on a panic too, as it does for a client's turn.
+        let stream_guard = crate::host::http::handlers::turn::StreamGuard::new(
+            std::sync::Arc::clone(&entry.frontend),
+        );
+        let outcome = entry
+            .agent
+            .compact_session_under(&mut conversation, request, &cancellation, turn_id)
+            .await;
+        // The checkpoint turn emits provider notices and the `Compacted` event into the
+        // session's recorder; its usage rides the terminal, and the rest is dropped, as every
+        // other path that runs a turn outside a request drops it: left alone the events
+        // accumulate across repeated compactions and surface in whichever turn drains next.
+        let recorder = entry.frontend.drain();
+        {
+            use crate::host::http::handlers::turn::{terminal_event_parts, usage_from};
+            let compacted = outcome
+                .as_ref()
+                .map(|record| crate::agent::TurnOutcome::of(record.last_stop()));
+            let (event_type, data) = terminal_event_parts(
+                Ok(compacted.as_ref().map_err(|error| *error)),
+                cancellation
+                    .reason()
+                    .unwrap_or(crate::store::turns::CancelReason::Client),
+                usage_from(&recorder),
+                turn_id,
+                id,
+                state.config.relay_provider_errors,
+                None,
+                crate::host::http::handlers::turn::position_for_terminal(&state.shared.store, id)
+                    .await,
+                crate::host::http::handlers::turn::served_by_for_terminal(
+                    &state.shared.store,
                     id,
-                    state.config.relay_provider_errors,
-                    None,
-                    crate::host::http::handlers::turn::position_for_terminal(
-                        &state.shared.store,
-                        id,
-                    )
-                    .await,
-                    crate::host::http::handlers::turn::served_by_for_terminal(
-                        &state.shared.store,
-                        id,
-                        turn_id,
-                    )
-                    .await,
-                );
-                entry.frontend.record_terminal(event_type, data);
-            }
-            // Read while the session is still this compaction's, so the answer and its tag are
-            // the conversation it left, never one a turn queued behind it has since added to.
-            let answered = match outcome {
-                Ok(_) => Ok((
-                    latest_compaction(&state, id).await,
-                    conversation_position(&state.shared.store, id).await,
-                )),
-                Err(error) => Err(error),
-            };
-            drop(stream_guard);
-            drop(conversation);
-            // Same reason every turn path touches: this both advances the `updated_at` clients
-            // poll for change detection, which the boundary write already moved on the DB row,
-            // and resets the GC idle timer. Without it a session compacted just shy of
-            // `idle_timeout` is evicted on the next scan, throwing away the context gauge
-            // `compact_session` has just re-seeded.
-            entry.touch();
-            answered
+                    turn_id,
+                )
+                .await,
+            );
+            entry.frontend.record_terminal(event_type, data);
         }
-    });
-    let answered = match join.await {
-        Ok(result) => result,
-        Err(panic) => {
-            tracing::error!("compaction task panicked: {panic:?}");
-            return Err(ProblemDetail::new(
-                crate::host::http::errors::ErrorKind::Internal,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "compaction task panicked",
-            )
-            .with("session_id", id.to_string()));
-        }
+        // Read while the session is still this compaction's, so the answer and its tag are
+        // the conversation it left, never one a turn queued behind it has since added to.
+        let answered = match outcome {
+            Ok(_) => Ok((
+                latest_compaction(&state, id).await,
+                conversation_position(&state.shared.store, id).await,
+            )),
+            Err(error) => Err(error),
+        };
+        drop(stream_guard);
+        drop(conversation);
+        // Same reason every turn path touches: this both advances the `updated_at` clients
+        // poll for change detection, which the boundary write already moved on the DB row,
+        // and resets the GC idle timer. Without it a session compacted just shy of
+        // `idle_timeout` is evicted on the next scan, throwing away the context gauge
+        // `compact_session` has just re-seeded.
+        entry.touch();
+        answered
     };
     // The compaction turn's terminal logged the failure.
     let (compaction, position) = answered.map_err(|error| {
@@ -583,12 +559,14 @@ pub(crate) async fn rewind(
     entry
         .frontend
         .push_sse(SseEventType::ConversationRewound, announced);
-    drop(conversation);
     // See the note in `compact`. `save_event` has already moved `updated_at` on the row, so
     // without this the resident entry reports an older timestamp than `meka session list` does for
     // the same session, and only agrees again once the GC evicts it.
     entry.touch();
     announce_rewound(&state, id, Some(&entry)).await;
+    // Held through the announcement: a turn is admitted on this lock alone, and one admitted
+    // ahead of the record's read would be announced as no turn.
+    drop(conversation);
     tracing::info!(
         "rewound session {id} via HTTP to before turn {turn}: {count} message(s) dropped",
         turn = body.turn_id,
@@ -652,25 +630,27 @@ async fn announce_rewound(
     id: Uuid,
     resident: Option<&crate::host::http::state::SessionEntry>,
 ) {
-    let summary = match state.shared.store.session_info(id).await {
-        Ok(Some(summary)) => summary,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!("failed to read session {id} for the feed after a rewind: {error}");
-            return;
-        }
+    use crate::host::http::handlers::sessions::{
+        announce_session, dormant_record, resident_record,
     };
-    let mut record =
-        crate::host::http::handlers::sessions::listed_session(&summary, resident, false);
-    // A resident rewind announces under the idle claim it holds, which is the counter's one
-    // increment and no turn; a dormant one has no entry to count. Neither is a turn in flight.
-    record.turn_in_flight = false;
-    crate::host::http::handlers::sessions::announce_session(
-        state,
-        SseEventType::SessionUpdated,
-        &record,
-        resident,
-    );
+    let record = match resident {
+        // A resident rewind announces under the idle claim and the conversation lock it holds,
+        // so neither a `DELETE` nor a turn can land between the rewind and its announcement; the
+        // claim is the counter's one increment and no turn.
+        Some(entry) => resident_record(state, entry, id).await.map(|mut record| {
+            record.turn_in_flight = false;
+            record
+        }),
+        None => dormant_record(state, id).await,
+    };
+    match record {
+        Ok(record) => announce_session(state, SseEventType::SessionUpdated, &record, resident),
+        Err(problem) if problem.status == StatusCode::NOT_FOUND.as_u16() => {}
+        Err(problem) => tracing::warn!(
+            "failed to read session {id} for the feed after a rewind: {detail}",
+            detail = problem.detail.as_deref().unwrap_or(&problem.title)
+        ),
+    }
 }
 
 /// The answer to a rewind: what it took, under the conversation's new tag.
@@ -777,7 +757,7 @@ pub(crate) struct TurnsQuery {
 pub(crate) struct TurnsResponse {
     pub(crate) session_id: Uuid,
     /// Newest first.
-    pub(crate) turns: Vec<crate::store::turns::TurnRecord>,
+    pub(crate) turns: Vec<crate::view::TurnView>,
     /// The id to pass back as `before` for the next page, when turns remain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) next_before: Option<Uuid>,
@@ -823,7 +803,10 @@ pub(crate) async fn turns(
         })?;
     Ok(Json(TurnsResponse {
         session_id: id,
-        turns,
+        turns: turns
+            .iter()
+            .map(|turn| crate::view::TurnView::new(turn, crate::host::http::errors::api_wording))
+            .collect(),
         next_before,
     }))
 }
@@ -839,7 +822,7 @@ pub(crate) async fn turns(
         ("turn_id" = Uuid, Path, description = "Turn UUID, as `turn.started` and the 202 of a detached request name it"),
     ),
     responses(
-        (status = 200, description = "The turn, with its ending once it has one", body = crate::store::turns::TurnRecord),
+        (status = 200, description = "The turn, with its ending once it has one", body = crate::view::TurnView),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found (`/errors/session-not-found`), or no turn of it has this id (`/errors/not-found`)", body = ProblemDetail),
@@ -851,7 +834,7 @@ pub(crate) async fn turn(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::SessionsRead>,
     Path((id, turn_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<crate::store::turns::TurnRecord>, ProblemDetail> {
+) -> Result<Json<crate::view::TurnView>, ProblemDetail> {
     // Read-only, like the listing: never revives a session.
     require_session_exists(&state, id).await?;
     let stored = state
@@ -864,8 +847,14 @@ pub(crate) async fn turn(
             ProblemDetail::internal_sanitized("failed to load the turn", error)
                 .with("session_id", id.to_string())
         })?;
+    let view = |turn: crate::store::turns::TurnRecord| {
+        Json(crate::view::TurnView::new(
+            &turn,
+            crate::host::http::errors::api_wording,
+        ))
+    };
     if let Some(turn) = stored {
-        return Ok(Json(turn));
+        return Ok(view(turn));
     }
     // The turn writes its own row a moment after it is admitted, and a detached request's 202
     // names it before then: until the row exists, the feed answers for the turn it is running.
@@ -880,7 +869,7 @@ pub(crate) async fn turn(
                 .in_flight_turn(entry.agent.cells().permission.get())
         })
         .filter(|turn| turn.id == turn_id);
-    live.map(Json).ok_or_else(|| {
+    live.map(view).ok_or_else(|| {
         ProblemDetail::new(
             ErrorKind::NotFound,
             StatusCode::NOT_FOUND,

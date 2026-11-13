@@ -12,7 +12,12 @@ and `-shm` companions with the file.
 
 ## 0.94 to 0.95
 
-Nothing in `config.toml` changes shape, and the store stays as it is.
+Nothing in `config.toml` changes shape. The store moves forward on its first open, behind the
+automatic backup, so that a turn or a compaction that fails because a login must be redone records
+the refusal itself, which each surface then says with its own remedy; nothing 0.94 wrote converts.
+0.94 refuses a store 0.95 has opened; downgrading means restoring the backup the upgrade took.
+Session archives are `format_version` 29; a 0.94 archive (28) is brought forward as it is read,
+and 0.94 refuses a 29.
 
 **An import takes its level and approvals switch from this installation.**
 `meka session import` and `POST /v1/sessions/import` used to write the permission level and the

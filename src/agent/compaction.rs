@@ -646,6 +646,7 @@ impl Agent {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
                 let interrupted = matches!(error, MekaError::Interrupted);
+                let recorded = crate::error::RecordedFailure::of(&error);
                 // On record whatever it did: its rounds ran and the memories they wrote stay
                 // written. Not in the view, which it leaves as it was.
                 let failure = crate::conversation::FailedCompaction {
@@ -653,7 +654,7 @@ impl Agent {
                     memories_written: progress.memories_written,
                     checkpoint: progress.checkpoint,
                     summarizer: progress.summarizer,
-                    error: (!interrupted).then(|| error.sentence()),
+                    error: (!interrupted).then(|| recorded.clone()),
                 };
                 if let Err(save_error) = self
                     .save_event(
@@ -669,7 +670,7 @@ impl Agent {
                     .emit(FrontendEvent::CompactionFailed {
                         id,
                         trigger,
-                        error: error.sentence(),
+                        error: recorded,
                         interrupted,
                     })
                     .await;

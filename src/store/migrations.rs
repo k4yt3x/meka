@@ -644,7 +644,106 @@ const MIGRATIONS: &[Migration] = &[
         name: "turns_record_an_output_cap_too_large",
         step: Step::Sql(""),
     },
+    // 0.95 records a turn or a compaction that failed because a login must be redone as the
+    // refusal's fields, which each surface words with its own remedy, a turn's in a column a build
+    // before it does not know. Its development builds recorded the shell's sentence, which takes
+    // the refusal it names; 0.94 recorded such a failure as the provider's, which stays as it is.
+    Migration {
+        name: "failures_keep_their_refusal_typed",
+        step: Step::Rust(failures_keep_their_refusal_typed),
+    },
 ];
+
+/// `turns.refusal`, nullable: the refusal a turn that failed on one ended on, as JSON, in place of
+/// `detail`. A turn's `detail` and a failed compaction's `error` holding
+/// [`SPENT_LOGIN_SENTENCE_0_95_DEVELOPMENT`] take the refusal it names instead. The column is
+/// guarded on the column set for the reason the module docs give, and a replay finds no sentence
+/// left to convert.
+fn failures_keep_their_refusal_typed(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "turns", "refusal")? {
+        transaction.execute_batch("ALTER TABLE turns ADD COLUMN refusal TEXT")?;
+    }
+    let encode = |value: &serde_json::Value| {
+        serde_json::to_string(value)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    };
+    let (opening, ..) = SPENT_LOGIN_SENTENCE_0_95_DEVELOPMENT;
+    let turns: Vec<(String, String)> = transaction
+        .prepare("SELECT id, detail FROM turns WHERE instr(detail, ?1) = 1")?
+        .query_map([opening], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, detail) in turns {
+        if let Some(account) = spent_login_account_0_95(&detail) {
+            transaction.execute(
+                "UPDATE turns SET detail = NULL, refusal = ?1 WHERE id = ?2",
+                rusqlite::params![encode(&spent_login_refusal_0_95(account))?, id],
+            )?;
+        }
+    }
+    let failures: Vec<(i64, String)> = transaction
+        .prepare("SELECT id, content FROM messages WHERE kind = 'compaction_failed'")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, content) in failures {
+        let Ok(mut event) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if type_spent_login_0_95(&mut event) {
+            transaction.execute(
+                "UPDATE messages SET content = ?1 WHERE id = ?2",
+                rusqlite::params![encode(&event)?, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// How 0.95's development builds recorded a login that must be redone where a turn or a
+/// compaction failed on one: the shell's sentence, around the account's name, which it gives
+/// twice.
+const SPENT_LOGIN_SENTENCE_0_95_DEVELOPMENT: (&str, &str, &str) = (
+    "account '",
+    "' must sign in again; run `meka account login ",
+    "`",
+);
+
+/// The account `sentence` names, when it is [`SPENT_LOGIN_SENTENCE_0_95_DEVELOPMENT`]. The name is
+/// read by its length, so one holding a quote, a backtick or the sentence's own words is read
+/// whole.
+fn spent_login_account_0_95(sentence: &str) -> Option<&str> {
+    let (opening, middle, closing) = SPENT_LOGIN_SENTENCE_0_95_DEVELOPMENT;
+    let named = sentence.strip_prefix(opening)?.strip_suffix(closing)?;
+    let account = named.get(..named.len().checked_sub(middle.len())? / 2)?;
+    (named.strip_prefix(account)?.strip_prefix(middle)? == account).then_some(account)
+}
+
+/// The refusal a spent login on `account` is recorded as, as `turns.refusal` and a failed
+/// compaction's `error` hold it.
+fn spent_login_refusal_0_95(account: &str) -> serde_json::Value {
+    serde_json::json!({"refusal": "account_login_spent", "account": account})
+}
+
+/// A `CompactionFailed` event's `error` takes the refusal it names when it is
+/// [`SPENT_LOGIN_SENTENCE_0_95_DEVELOPMENT`]. Reports whether it changed.
+fn type_spent_login_0_95(event: &mut serde_json::Value) -> bool {
+    let Some(error) = event
+        .get_mut("CompactionFailed")
+        .and_then(|failure| failure.get_mut("error"))
+    else {
+        return false;
+    };
+    let Some(refusal) = error
+        .as_str()
+        .and_then(spent_login_account_0_95)
+        .map(spent_login_refusal_0_95)
+    else {
+        return false;
+    };
+    *error = refusal;
+    true
+}
 
 /// See the ledger entry. Safe to replay: a `user` row and a thinking block's text exist only
 /// before their conversion, a reply's sentence is taken out of a reply of no other words, and a
@@ -2504,7 +2603,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 9_037_510_241_726_614_513;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 6_436_781_571_352_451_012;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2600,7 +2699,7 @@ pub(crate) fn apply(
     connection: &mut rusqlite::Connection,
     plan: Plan,
     context: &Context,
-) -> Result<()> {
+) -> std::result::Result<(), ApplyError> {
     if !plan.has_work() {
         return Ok(());
     }
@@ -2612,6 +2711,32 @@ pub(crate) fn apply(
         tracing::info!("applied schema migration '{name}'");
     }
     Ok(())
+}
+
+/// Why [`apply`] failed, with what it left of the store: the copy taken before it is a second copy
+/// of an unchanged store in one case and the only way back in the other.
+#[derive(Debug)]
+pub(crate) enum ApplyError {
+    /// Nothing the migration did stayed: its transaction rolled back, or never began.
+    RolledBack(MekaError),
+    /// The migration committed, then the connection failed to be put back as it was.
+    Committed(MekaError),
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RolledBack(error) | Self::Committed(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl From<ApplyError> for MekaError {
+    fn from(failure: ApplyError) -> Self {
+        match failure {
+            ApplyError::RolledBack(error) | ApplyError::Committed(error) => error,
+        }
+    }
 }
 
 /// Run `work` with foreign-key enforcement off, and restore it whichever way that goes.
@@ -2629,17 +2754,20 @@ pub(crate) fn apply(
 /// A panic inside a step is the one path that skips the restore. No shipped step can panic (none
 /// indexes, slices or unwraps), and a future one must not either; that is part of what "a migration
 /// is frozen and self-contained" buys.
+///
+/// `work` failing is a migration that rolled back, which [`apply_steps`] makes so by owning its
+/// transaction; only the restore can fail after a commit.
 fn with_foreign_keys_suspended<T>(
     connection: &mut rusqlite::Connection,
     work: impl FnOnce(&mut rusqlite::Connection) -> Result<T>,
-) -> Result<T> {
+) -> std::result::Result<T, ApplyError> {
     connection
         .execute_batch("PRAGMA foreign_keys = OFF;")
         .map_err(|error| {
-            MekaError::Database(format!(
+            ApplyError::RolledBack(MekaError::Database(format!(
                 "failed to suspend foreign keys for the schema migration: {error}. Nothing has been \
                  changed"
-            ))
+            )))
         })?;
     let outcome = work(connection);
     let restored = connection.execute_batch("PRAGMA foreign_keys = ON;");
@@ -2651,12 +2779,12 @@ fn with_foreign_keys_suspended<T>(
             "failed to re-enable foreign keys after the schema migration: {error}; restart Meka"
         );
     }
-    let outcome = outcome?;
+    let outcome = outcome.map_err(ApplyError::RolledBack)?;
     restored.map_err(|error| {
-        MekaError::Database(format!(
+        ApplyError::Committed(MekaError::Database(format!(
             "the schema migration committed but failed to re-enable foreign keys on this \
              connection: {error}; restart Meka"
-        ))
+        )))
     })?;
     Ok(outcome)
 }
@@ -5139,6 +5267,9 @@ const ARCHIVE_FORMAT_0_92: u64 = 26;
 /// The archive `format_version` 0.93 wrote, whose turns record no output cap too large; nothing
 /// converts.
 const ARCHIVE_FORMAT_0_93: u64 = 27;
+/// The archive `format_version` 0.94 wrote, and 0.95's development builds before their turns
+/// carried a refusal, which recorded a login that must be redone in the shell's sentence.
+const ARCHIVE_FORMAT_0_94: u64 = 28;
 
 /// How the text Meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -5729,7 +5860,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_92_DEVELOPMENT_2)
         | Some(ARCHIVE_FORMAT_0_92)
-        | Some(ARCHIVE_FORMAT_0_93) => {}
+        | Some(ARCHIVE_FORMAT_0_93)
+        | Some(ARCHIVE_FORMAT_0_94) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -5787,8 +5919,55 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     if from <= ARCHIVE_FORMAT_0_92 {
         count_lone_prompts_in_archive_0_93(document);
     }
+    if from <= ARCHIVE_FORMAT_0_94 {
+        type_spent_logins_in_archive_0_95(document);
+    }
     document["format_version"] = current.into();
     true
+}
+
+/// Each turn and failed compaction in an archive from before 0.95 that holds
+/// [`SPENT_LOGIN_SENTENCE_0_95_DEVELOPMENT`] takes the refusal it names, as a row the store held
+/// then does after its ledger step.
+fn type_spent_logins_in_archive_0_95(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(turns) = session
+            .get_mut("turns")
+            .and_then(|turns| turns.as_array_mut())
+        {
+            for turn in turns
+                .iter_mut()
+                .filter_map(serde_json::Value::as_object_mut)
+            {
+                let Some(refusal) = turn
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(spent_login_account_0_95)
+                    .map(spent_login_refusal_0_95)
+                else {
+                    continue;
+                };
+                turn.insert("detail".to_string(), serde_json::Value::Null);
+                turn.insert("refusal".to_string(), refusal);
+            }
+        }
+        if let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        {
+            for event in events {
+                if let Some(inner) = event.get_mut("event") {
+                    type_spent_login_0_95(inner);
+                }
+            }
+        }
+    }
 }
 
 /// Each boundary in an archive from before 0.93 whose compaction kept an unanswered prompt alone
@@ -6749,7 +6928,7 @@ fn predicate_for(fire: &str) -> Option<&'static str> {
 #[cfg(test)]
 pub(crate) fn create_for_test(connection: &mut rusqlite::Connection) -> Result<()> {
     let plan = plan(connection)?;
-    apply(connection, plan, &Context::default())
+    Ok(apply(connection, plan, &Context::default())?)
 }
 
 /// The baseline DDL, for a test that needs to plant a store shaped the way an older Meka left one.
@@ -7352,6 +7531,10 @@ mod tests {
             (
                 "turns_record_an_output_cap_too_large",
                 9469365220726110664_u64,
+            ),
+            (
+                "failures_keep_their_refusal_typed",
+                10595463980612986822_u64,
             ),
         ];
         /// Every column-zero item of `production` that a step can name, by a call, as a value or
@@ -12994,6 +13177,207 @@ mod tests {
         );
         let converted = document.clone();
         count_lone_prompts_in_archive_0_93(&mut document);
+        assert_eq!(document, converted, "a replay changes nothing");
+    }
+
+    /// A turn and a failed compaction from before 0.95 that recorded a spent login in the shell's
+    /// words take the refusal it names, for an account whose name holds a quote and a backtick
+    /// too, and read back as that refusal. A sentence naming two accounts, and any other, stays as
+    /// it was. A replay rewrites nothing.
+    #[tokio::test]
+    async fn a_failure_from_before_0_95_on_a_spent_login_records_its_refusal() {
+        use crate::error::{RecordedFailure, RecordedRefusal};
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4();
+        let spent = |account: &str| {
+            format!("account '{account}' must sign in again; run `meka account login {account}`")
+        };
+        let odd = "it's `odd`";
+        let mismatched = "account 'sub' must sign in again; run `meka account login other`";
+        let provider = "the provider rejected or failed this turn";
+        let details = [
+            spent("sub"),
+            spent(odd),
+            mismatched.to_string(),
+            provider.to_string(),
+        ];
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "failures_keep_their_refusal_typed");
+            plant_session(&connection, &session.to_string());
+            for (at, detail) in details.iter().enumerate() {
+                connection
+                    .execute(
+                        "INSERT INTO turns (id, session_id, source, started_at, ended_at, status, \
+                         error_type, detail, permission) \
+                         VALUES (?1, ?2, 'client', ?3, ?3, 'failed', 'invalid-body', ?4, 'read')",
+                        rusqlite::params![
+                            uuid::Uuid::new_v4().to_string(),
+                            session.to_string(),
+                            format!("2020-01-01T00:00:0{at}Z"),
+                            detail,
+                        ],
+                    )
+                    .expect("a turn to carry forward");
+            }
+            for error in [spent("sub").as_str(), provider] {
+                let event = serde_json::json!({"CompactionFailed": {
+                    "trigger": "manual",
+                    "memories_written": [],
+                    "error": error,
+                }});
+                connection
+                    .execute(
+                        "INSERT INTO messages (session_id, kind, content, created_at) \
+                         VALUES (?1, 'compaction_failed', ?2, 'then')",
+                        rusqlite::params![session.to_string(), event.to_string()],
+                    )
+                    .expect("a failed compaction to carry forward");
+            }
+        }
+
+        let store = crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+        let refusal = |account: &str| {
+            RecordedFailure::Refusal(RecordedRefusal::AccountLoginSpent {
+                account: account.to_string(),
+            })
+        };
+        let failures: Vec<Option<RecordedFailure>> = store
+            .turn_store()
+            .load_turns(session)
+            .await
+            .expect("turns")
+            .into_iter()
+            .map(|turn| turn.error.map(|error| error.failure))
+            .collect();
+        assert_eq!(failures, [
+            Some(refusal("sub")),
+            Some(refusal(odd)),
+            Some(RecordedFailure::Sentence(mismatched.to_string())),
+            Some(RecordedFailure::Sentence(provider.to_string())),
+        ]);
+        let compactions: Vec<Option<RecordedFailure>> = store
+            .load_events(session)
+            .await
+            .expect("events")
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::conversation::Event::CompactionFailed(failure) => Some(failure.error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compactions, [
+            Some(refusal("sub")),
+            Some(RecordedFailure::Sentence(provider.to_string())),
+        ]);
+        drop(store);
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let columns = |connection: &rusqlite::Connection| -> Vec<(Option<String>, Option<String>)> {
+            connection
+                .prepare("SELECT detail, refusal FROM turns ORDER BY started_at")
+                .expect("prepare")
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        assert_eq!(
+            columns(&connection)[0],
+            (
+                None,
+                Some(r#"{"refusal":"account_login_spent","account":"sub"}"#.to_string())
+            ),
+            "the sentence goes where the refusal comes"
+        );
+        let after = (columns(&connection), stored_messages(&connection));
+        let transaction = connection.transaction().expect("transaction");
+        failures_keep_their_refusal_typed(&transaction).expect("replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            (columns(&connection), stored_messages(&connection)),
+            after,
+            "a replay rewrites nothing"
+        );
+    }
+
+    /// A format 28 archive's turn and failed compaction that recorded a spent login in the shell's
+    /// words take the refusal it names, in the shape an import reads; another sentence stays as it
+    /// was, and a replay changes nothing.
+    #[test]
+    fn a_format_28_archive_records_a_spent_login_as_its_refusal() {
+        use crate::error::{RecordedFailure, RecordedRefusal};
+        let spent = "account 'sub' must sign in again; run `meka account login sub`";
+        let provider = "the provider rejected or failed this turn";
+        let turn = |id: &str, detail: &str| {
+            serde_json::json!({
+                "id": id, "source": "client", "started_at": "2020-01-01T00:00:00Z",
+                "ended_at": "2020-01-01T00:00:01Z", "status": "failed", "stop_reason": null,
+                "error_type": "invalid-body", "detail": detail, "cancel_reason": null,
+                "profile": null, "permission": "read",
+                "usage": {"input_tokens": 0, "output_tokens": 0,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+            })
+        };
+        let failed = |error: &str| {
+            serde_json::json!({
+                "at": "2020-01-01T00:00:01Z", "turn_id": null, "copy_of": null,
+                "event": {"CompactionFailed": {
+                    "trigger": "manual", "memories_written": [], "error": error,
+                }},
+            })
+        };
+        let mut document = serde_json::json!({
+            "format_version": 28,
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "permission": "read",
+                "turns": [
+                    turn("22222222-2222-4222-8222-222222222222", spent),
+                    turn("33333333-3333-4333-8333-333333333333", provider),
+                ],
+                "events": [failed(spent), failed(provider)],
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let session = &document["sessions"][0];
+        let refusal = RecordedRefusal::AccountLoginSpent {
+            account: "sub".to_string(),
+        };
+        let turns: Vec<crate::store::export::ExportedTurn> =
+            serde_json::from_value(session["turns"].clone()).expect("the turns an import reads");
+        let recorded: Vec<(Option<String>, Option<RecordedRefusal>)> = turns
+            .into_iter()
+            .map(|turn| (turn.detail, turn.refusal))
+            .collect();
+        assert_eq!(recorded, [
+            (None, Some(refusal.clone())),
+            (Some(provider.to_string()), None),
+        ]);
+        let compactions: Vec<Option<RecordedFailure>> = session["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .map(
+                |event| match serde_json::from_value(event["event"].clone()).expect("an event") {
+                    crate::conversation::Event::CompactionFailed(failure) => failure.error,
+                    other => panic!("every event is a failed compaction: {other:?}"),
+                },
+            )
+            .collect();
+        assert_eq!(compactions, [
+            Some(RecordedFailure::Refusal(refusal)),
+            Some(RecordedFailure::Sentence(provider.to_string())),
+        ]);
+        let converted = document.clone();
+        type_spent_logins_in_archive_0_95(&mut document);
         assert_eq!(document, converted, "a replay changes nothing");
     }
 

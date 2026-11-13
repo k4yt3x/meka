@@ -4530,14 +4530,14 @@ mod tests {
                     message.starts_with("OAuth token refresh failed ("),
                     "{status_line}: {message}"
                 ),
-                MekaError::Provider(message) if !retryable => {
+                MekaError::AccountLoginSpent { account, message } if !retryable => {
                     assert!(
                         message.starts_with("OAuth token refresh"),
                         "{status_line}: {message}"
                     );
-                    assert!(
-                        message.contains("meka account login work"),
-                        "{status_line} should name the profile to log in to: {message}"
+                    assert_eq!(
+                        account, "work",
+                        "{status_line} should name the account to log in to"
                     );
                 }
                 other => panic!("{status_line} was classified wrongly: {other}"),
@@ -4902,13 +4902,10 @@ mod tests {
             )
             .await
             .expect_err("a token rejected after its refresh is a failure");
-        match error {
-            MekaError::Provider(message) => assert!(
-                message.contains("meka account login work"),
-                "the remedy names the profile: {message}"
-            ),
-            other => panic!("expected a provider error naming the remedy, got {other:?}"),
-        }
+        assert!(
+            matches!(&error, MekaError::AccountLoginSpent { account, .. } if account == "work"),
+            "expected the login to be named as spent, got {error:?}"
+        );
         assert_eq!(
             api.messages_hits.load(std::sync::atomic::Ordering::SeqCst),
             2,

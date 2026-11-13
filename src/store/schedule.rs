@@ -118,7 +118,7 @@ impl ScheduleStore {
     }
 
     /// Every job in the database, soonest first. Backs `meka schedule list` and `meka schedule
-    /// cancel`, which work from a job id and so cannot ask the caller which session to look in.
+    /// show`, which work from a job id and so cannot ask the caller which session to look in.
     pub(crate) async fn list_all_scheduled_jobs(&self) -> crate::error::Result<Vec<ScheduledJob>> {
         self.query_scheduled_jobs(
             format!("SELECT {JOB_COLUMNS} FROM scheduled_jobs ORDER BY next_fire_at ASC"),
@@ -208,6 +208,41 @@ impl ScheduleStore {
             .collect())
     }
 
+    /// The full ids `id_prefix` names: in one session's jobs when `session` names one (the tool and
+    /// the screen, which answer inside one conversation), in every session's when it does not
+    /// (`meka schedule cancel`, where the operator has an id and no session). An unusable prefix
+    /// names nothing, so a blank one cannot reach every job.
+    ///
+    /// Read from the column rather than the decoded listing: a row this build cannot decode is
+    /// skipped by every listing, and a job nobody can list must still be a job somebody can
+    /// cancel, or it warns on every poll and keeps its session out of retention for good.
+    pub(crate) async fn job_ids_matching(
+        &self,
+        id_prefix: &str,
+        session: Option<uuid::Uuid>,
+    ) -> crate::error::Result<Vec<String>> {
+        if !crate::text::is_usable_id_prefix(id_prefix) {
+            return Ok(Vec::new());
+        }
+        let wanted = crate::text::id_prefix_for_matching(id_prefix);
+        let session = session.map(|session| session.to_string());
+        let mut ids: Vec<String> = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(
+                    "SELECT id FROM scheduled_jobs WHERE ?1 IS NULL OR session_id = ?1 ORDER BY id",
+                )?;
+                let ids = statement
+                    .query_map([session], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(ids)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to list job ids: {error}")))?;
+        ids.retain(|id| id.starts_with(&wanted));
+        Ok(ids)
+    }
+
     /// Delete a job by full or unique-prefix id. Returns the id actually removed, or `None` when
     /// nothing matched *or* when the row was gone by the time the delete ran.
     ///
@@ -223,30 +258,10 @@ impl ScheduleStore {
         session_id: uuid::Uuid,
         id_prefix: &str,
     ) -> crate::error::Result<Option<String>> {
-        if !crate::text::is_usable_id_prefix(id_prefix) {
-            return Ok(None);
-        }
-        let wanted = crate::text::id_prefix_for_matching(id_prefix);
-        // Resolved over the raw ids, not the decoded listing: a row this build cannot decode is
-        // skipped by every listing, and a job nobody can list must still be a job somebody can
-        // cancel, or it warns on every poll and keeps its session out of retention for good.
-        let session = session_id.to_string();
-        let ids: Vec<String> = self
-            .connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement =
-                    connection.prepare("SELECT id FROM scheduled_jobs WHERE session_id = ?1")?;
-                let ids = statement
-                    .query_map([session], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()?;
-                Ok(ids)
-            })
-            .await
-            .map_err(|error| MekaError::Database(format!("failed to list job ids: {error}")))?;
-        let matches: Vec<&String> = ids.iter().filter(|id| id.starts_with(&wanted)).collect();
+        let matches = self.job_ids_matching(id_prefix, Some(session_id)).await?;
         let id = match matches.as_slice() {
             [] => return Ok(None),
-            [id] => (*id).clone(),
+            [id] => id.clone(),
             several => {
                 return Err(MekaError::Usage(format!(
                     "'{}' matches {} jobs; use a longer id",
@@ -384,6 +399,32 @@ impl ScheduleStore {
             .await
             .map_err(|error| {
                 MekaError::Database(format!("failed to release a scheduled job: {error}"))
+            })
+    }
+
+    /// Forgive the attempt this host's claim counted, keeping the lease to expire: the host owned
+    /// the occurrence and could not run it, which is a fact about the installation rather than the
+    /// job, so it must not count toward [`MAX_CLAIM_ATTEMPTS`].
+    ///
+    /// Scoped to `owner`, so a claim another host has since taken keeps the attempt it counted,
+    /// and one less rather than none, so the claims a host abandoned by dying still count.
+    pub(crate) async fn forgive_attempt(&self, id: &str, owner: &str) -> crate::error::Result<()> {
+        let id = id.to_string();
+        let owner = owner.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE scheduled_jobs SET attempts = max(attempts - 1, 0) \
+                     WHERE id = ?1 AND claimed_by = ?2",
+                    rusqlite::params![id, owner],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to forgive a scheduled job's attempt: {error}"
+                ))
             })
     }
 

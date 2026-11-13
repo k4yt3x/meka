@@ -94,6 +94,10 @@ pub(super) fn back_up_before_migrating(
     if let Some(directory) = target.parent()
         && let Err(error) = sync_directory(directory)
     {
+        // Not known to be on disk under its name, so no backup to keep, and the store is
+        // unchanged: left in place, a directory that keeps refusing the sync would gain one more
+        // whole copy on every start.
+        remove_partial_backup(&target);
         return Err(MekaError::Database(format!(
             "failed to sync the directory of the pre-migration backup '{}': {error}. Nothing has \
              been changed",
@@ -125,6 +129,26 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
         Ok(())
     }
 }
+
+/// What becomes of the copy [`back_up_before_migrating`] took for a migration that then failed.
+///
+/// Removed when the migration rolled back: the store is still what the copy holds, so the copy is a
+/// second one of every conversation and credential, and each retry of a refusing step would leave
+/// another beside it. Kept when the migration committed before failing, since it is then the only
+/// way back. Either way the copies older than it stay, as a failed migration supersedes nothing.
+pub(super) fn settle_copy_of_failed_migration(failure: &migrations::ApplyError, copy: &Path) {
+    if let migrations::ApplyError::Committed(_) = failure {
+        return;
+    }
+    if let Err(error) = std::fs::remove_file(copy) {
+        tracing::warn!(
+            "failed to remove the pre-migration backup '{copy}' of a migration that changed \
+             nothing: {error}",
+            copy = copy.display()
+        );
+    }
+}
+
 /// Remove the copies an earlier migration left, now that a fresher one is in place.
 ///
 /// **Production reaches this only with a path [`back_up_before_migrating`] returned**, after the
@@ -863,6 +887,123 @@ mod tests {
             "a prune that ran before the migration committed would have destroyed the copy the \
              failed upgrade tells the user to fall back on"
         );
+    }
+
+    /// A migration that rolls back leaves no copy of its own, since the store is still what that
+    /// copy holds, and the older copy stays: a step that refuses on every start would otherwise
+    /// leave a store-sized copy per start.
+    #[tokio::test]
+    async fn a_migration_that_rolls_back_leaves_no_copy_of_its_own() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        {
+            let connection = rusqlite::Connection::open(&database_path).expect("open");
+            connection
+                .execute_batch(crate::store::migrations::baseline_for_test())
+                .expect("a store with work pending");
+            connection
+                .execute(
+                    "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'now', 'now')",
+                    [],
+                )
+                .expect("a session that has to be given a profile");
+        }
+        let planted = temp_dir.path().join("meka.db.v1.bak");
+        std::fs::write(&planted, b"the earlier copy").expect("plant");
+
+        for _ in 0..3 {
+            let error = Store::open(
+                Some(&database_path),
+                &crate::store::migrations::Context::on_unreadable_config(),
+            )
+            .await
+            .err()
+            .expect("a session that cannot be given a profile refuses the migration");
+            assert!(error.to_string().contains("carried-forward"), "{error}");
+        }
+
+        let mut copies: Vec<String> = std::fs::read_dir(temp_dir.path())
+            .expect("readable")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.contains(".bak"))
+            .collect();
+        copies.sort();
+        assert_eq!(copies, ["meka.db.v1.bak"]);
+        assert_eq!(
+            std::fs::read(&planted).expect("still there"),
+            b"the earlier copy"
+        );
+    }
+
+    /// A copy whose directory entry cannot be made durable is no backup, and the store is
+    /// unchanged, so the refusal takes the copy with it.
+    ///
+    /// The directory may be written and searched but not read, so the copy, its sync and its
+    /// rename all succeed and only opening the directory to sync it is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_whose_directory_sync_fails_goes_with_the_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let directory = temp_dir.path().join("data");
+        std::fs::create_dir(&directory).expect("create");
+        let database_path = directory.join("meka.db");
+        let connection = rusqlite::Connection::open(&database_path).expect("open");
+        connection
+            .execute_batch("CREATE TABLE kept (value TEXT); INSERT INTO kept VALUES ('row');")
+            .expect("a store with something to copy");
+
+        let original = std::fs::metadata(&directory).expect("stat").permissions();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o300))
+            .expect("make it unreadable");
+        let outcome = back_up_before_migrating(&connection, &database_path, 1);
+        std::fs::set_permissions(&directory, original).expect("restore so the tempdir can go");
+
+        let error = outcome.expect_err("a directory that cannot be opened cannot be synced");
+        assert!(
+            error.to_string().contains("failed to sync the directory"),
+            "the refusal should be the one this test aims at, not some other: {error}"
+        );
+        let copies: Vec<String> = std::fs::read_dir(&directory)
+            .expect("list")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.contains(".bak"))
+            .collect();
+        assert!(copies.is_empty(), "{copies:?}");
+    }
+
+    /// The copy taken before a migration that committed and then failed stays, as the only way
+    /// back to the store it changed; the copy of a store a migration left unchanged goes.
+    #[test]
+    fn only_the_copy_of_an_unchanged_store_goes_with_its_failed_migration() {
+        use crate::store::migrations::ApplyError;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let copy = temp_dir.path().join("meka.db.v1.bak");
+        std::fs::write(&copy, b"before").expect("plant");
+        settle_copy_of_failed_migration(
+            &ApplyError::Committed(MekaError::Database("committed".to_string())),
+            &copy,
+        );
+        assert!(copy.exists(), "the copy of a changed store stays");
+        settle_copy_of_failed_migration(
+            &ApplyError::RolledBack(MekaError::Database("rolled back".to_string())),
+            &copy,
+        );
+        assert!(!copy.exists(), "the copy of an unchanged store goes");
     }
 
     /// A directory that is not there at all is not an error, for the same reason.

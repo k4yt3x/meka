@@ -62,13 +62,20 @@ pub(crate) fn job_withheld(
              act on this nor cancel it"
         ));
     }
+    // Asked last: every other verdict stops the fire door before a host is offered the job, so
+    // while one holds, what the host's last fire found is not why the job is not firing.
+    let unrunnable = || {
+        memory
+            .unrunnable_reason(job)
+            .map_or(Withheld::No, Withheld::Yes)
+    };
     let Some(gate) = job.gate.as_ref() else {
-        return Withheld::No;
+        return unrunnable();
     };
     let Some((refusal, level)) = gate_withheld_reason(gate, live, tools) else {
         return match memory.standing_probe_failure(job) {
             Some(reason) => Withheld::Yes(reason),
-            None => Withheld::No,
+            None => unrunnable(),
         };
     };
     // `ToolUnavailable` is the one refusal that can mean "I cannot tell" rather than "it is
@@ -82,6 +89,40 @@ pub(crate) fn job_withheld(
         return Withheld::Undetermined;
     }
     Withheld::Yes(refusal.explain(&gate.probe, level))
+}
+/// Why a host that owns a job could not run its fire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unrunnable {
+    /// The session could not be reached; the error.
+    SessionUnreachable(String),
+    /// The session's recorded profile or project did not resolve; the error.
+    BindingsUnresolved(String),
+    /// The job's prompt is empty.
+    EmptyPrompt,
+}
+impl Unrunnable {
+    /// What the reporting surfaces say while the cause stands, or `None` when the cause is the
+    /// job's own.
+    ///
+    /// A session that cannot be reached and bindings that do not resolve are facts about the
+    /// installation, so the claim does not count toward parking and the job is retried once a
+    /// lease until they are fixed. An empty prompt is the job's: no retry fixes it, so its claim
+    /// counts as a crashing turn's does.
+    pub(crate) fn standing_reason(&self) -> Option<String> {
+        match self {
+            Self::SessionUnreachable(error) => Some(format!(
+                "its last fire did not run because its session could not be reached ({}); it is \
+                 retried every `[schedule].claim_lease`",
+                elide_for_message(error)
+            )),
+            Self::BindingsUnresolved(error) => Some(format!(
+                "its last fire did not run because its session's profile or project did not \
+                 resolve ({}); it is retried every `[schedule].claim_lease`",
+                elide_for_message(error)
+            )),
+            Self::EmptyPrompt => None,
+        }
+    }
 }
 /// What a job's row said when a probe failure was counted against it.
 ///
@@ -98,6 +139,10 @@ pub(crate) fn probe_witness(job: &ScheduledJob) -> ProbeWitness {
 }
 /// How many consecutive failures, the last one's reason, and the row they were counted against.
 pub(crate) type ProbeFailures = std::collections::HashMap<String, (u32, String, ProbeWitness)>;
+/// Why a fire could not run, and the row it was recorded against: its `last_fired_at` and the
+/// occurrence, its `next_fire_at`.
+type UnrunnableFires =
+    std::collections::HashMap<String, (String, (Option<DateTime<Utc>>, DateTime<Utc>))>;
 /// How many consecutive failures before a broken probe is reported as a standing condition.
 ///
 /// Two, not one: a single failure is as often a blip (a server restarting, a command losing a
@@ -131,6 +176,14 @@ pub(crate) struct SchedulerMemory {
     /// only the host that wins `claim_occurrence` evaluates, so a host that recorded two failures
     /// and then stopped winning would otherwise report the job dead forever.
     probe_failures: std::sync::Mutex<ProbeFailures>,
+    /// Why this host could not run each job's last fire, with the job's `last_fired_at` and
+    /// `next_fire_at` then.
+    ///
+    /// In memory for the reason the probe failures are, and witnessed the same way: a turn
+    /// delivered since, by this host or another, moves `last_fired_at`, and an occurrence closed
+    /// without one (a gate that declines on the retry) moves `next_fire_at`; an unrunnable fire
+    /// writes neither.
+    unrunnable: std::sync::Mutex<UnrunnableFires>,
     /// A token identifying this process to the claim column, for the life of the process.
     ///
     /// Per store handle rather than per sweep: the point is to tell *my* lease from someone
@@ -145,6 +198,7 @@ impl Default for SchedulerMemory {
         Self {
             permission_declined: std::sync::Mutex::default(),
             probe_failures: std::sync::Mutex::default(),
+            unrunnable: std::sync::Mutex::default(),
             owner: uuid::Uuid::new_v4().to_string(),
         }
     }
@@ -270,16 +324,83 @@ impl SchedulerMemory {
         crate::sync::lock(&self.permission_declined).remove(job_id);
     }
 
+    /// Record why this host could not run `job`'s fire, against the row as it stands.
+    pub(crate) fn record_unrunnable(&self, job: &ScheduledJob, reason: String) {
+        crate::sync::lock(&self.unrunnable).insert(
+            job.id.clone(),
+            (reason, (job.last_fired_at, job.next_fire_at)),
+        );
+    }
+
+    /// Why this host could not run `job`'s last fire, while that occurrence is still the one due
+    /// and no turn has been delivered since.
+    pub(crate) fn unrunnable_reason(&self, job: &ScheduledJob) -> Option<String> {
+        let (reason, witness) = crate::sync::lock(&self.unrunnable).get(&job.id).cloned()?;
+        if witness != (job.last_fired_at, job.next_fire_at) {
+            self.clear_unrunnable(&job.id);
+            return None;
+        }
+        Some(reason)
+    }
+
+    /// Forget why a job's fire could not run, on a fire that did or on the job going away.
+    pub(crate) fn clear_unrunnable(&self, job_id: &str) {
+        crate::sync::lock(&self.unrunnable).remove(job_id);
+    }
+
     /// Everything recorded against a job, on the job going away.
     pub(crate) fn forget(&self, job_id: &str) {
         self.clear_probe_failure(job_id);
         self.clear_permission_decline(job_id);
+        self.clear_unrunnable(job_id);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that could not run a job's last fire stops saying so once a turn has been delivered,
+    /// by this host or by another one, either of which moves `last_fired_at`.
+    #[test]
+    fn an_unrunnable_fire_stands_down_once_a_turn_is_delivered() {
+        let memory = SchedulerMemory::default();
+        let job = ScheduledJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: uuid::Uuid::nil(),
+            schedule: Schedule::parse_every("1h").expect("parses"),
+            prompt: "watch the thing".to_string(),
+            gate: None,
+            created_at: Utc::now(),
+            last_fired_at: None,
+            next_fire_at: Utc::now(),
+            attempts: 0,
+        };
+        let cause = Unrunnable::BindingsUnresolved(
+            "no profile named 'work' (configured: home)".to_string(),
+        );
+        memory.record_unrunnable(&job, cause.standing_reason().expect("the installation's"));
+        assert!(memory.unrunnable_reason(&job).is_some());
+
+        let mut delivered = job.clone();
+        delivered.last_fired_at = Some(Utc::now());
+        assert_eq!(
+            memory.unrunnable_reason(&delivered),
+            None,
+            "a turn delivered since is proof the session can run it"
+        );
+
+        // The occurrence closed without a turn, as a gate that declines on the retry closes it:
+        // the cause was that occurrence's, and the job is waiting for its next one.
+        memory.record_unrunnable(&job, cause.standing_reason().expect("the installation's"));
+        let mut advanced = job.clone();
+        advanced.next_fire_at = job.next_fire_at + chrono::Duration::hours(1);
+        assert_eq!(
+            memory.unrunnable_reason(&advanced),
+            None,
+            "a cause recorded for an occurrence does not outlive it"
+        );
+    }
 
     /// The held-back explanation is a fact about a standing state, so it is said once: an
     /// `every = "1m"` job would otherwise write it every minute. Restoring the authority arms it

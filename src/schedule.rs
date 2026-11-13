@@ -417,7 +417,9 @@ pub(crate) struct ScheduledJob {
     ///
     /// A deferral does *not* raise it. That is a host saying "not me", which is a fact about the
     /// host rather than the job, so [`crate::store::schedule::ScheduleStore::release_claim`]
-    /// resets the count.
+    /// resets the count. Nor does a fire the host owned and could not run for a cause of the
+    /// installation's (see [`Unrunnable::standing_reason`]):
+    /// [`crate::store::schedule::ScheduleStore::forgive_attempt`] forgives its claim's count.
     pub(crate) attempts: u32,
 }
 
@@ -3432,6 +3434,179 @@ mod tests {
         // The ceiling is reached, so the fourth sweep does not hand it to another turn to kill.
         harness.tick().await;
         assert!(harness.fired().is_empty(), "and the job is parked");
+    }
+
+    /// A fire the host could not run is held for its lease and does not count: three of them leave
+    /// `attempts` where it was, every surface says why while it lasts, and the job fires once its
+    /// session can run it again. An empty prompt is the job's own and still counts beside it.
+    ///
+    /// The cause is the installation's (a profile renamed under a running `meka serve`), so parking
+    /// would outlast the fix, and the parked reason would blame the job's prompt for it.
+    #[tokio::test]
+    async fn an_unrunnable_fire_is_retried_each_lease_without_counting_toward_parking() {
+        let harness = SchedulerHarness::new().await;
+        let hourly = || Schedule::parse_every("1h").expect("parses");
+        let job = harness
+            .overdue_job(hourly(), None, chrono::Duration::minutes(5))
+            .await;
+        let empty = harness
+            .overdue_job(hourly(), None, chrono::Duration::minutes(5))
+            .await;
+        let expire_the_leases = || {
+            let past = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+            let connection = harness.manager.schedule_store().connection.clone();
+            async move {
+                connection
+                    .call(move |connection| {
+                        connection.execute(
+                            "UPDATE scheduled_jobs SET claim_expires_at = ?1",
+                            rusqlite::params![past],
+                        )
+                    })
+                    .await
+                    .expect("the rows are there");
+            }
+        };
+        let unrunnable = |wakeup: Wakeup| {
+            std::future::ready(FireOutcome::Unrunnable(if wakeup.job.id == empty.id {
+                Unrunnable::EmptyPrompt
+            } else {
+                Unrunnable::BindingsUnresolved(
+                    "no profile named 'work' (configured: home)".to_string(),
+                )
+            }))
+        };
+        let row = |rows: &[ScheduledJob], id: &str| {
+            rows.iter()
+                .find(|row| row.id == id)
+                .cloned()
+                .expect("the job is kept")
+        };
+
+        let mut held = job.clone();
+        for attempt in 1..=MAX_CLAIM_ATTEMPTS {
+            run_due(
+                &harness.manager,
+                &harness.config,
+                None,
+                &NoResidents,
+                &SchedulerScope::every_job(),
+                &unrunnable,
+            )
+            .await
+            .expect("the sweep runs");
+            let after = harness.jobs().await;
+            held = row(&after, &job.id);
+            assert_eq!(
+                held.attempts, 0,
+                "attempt {attempt}: a fire the host could not run is not counted"
+            );
+            assert_eq!(
+                row(&after, &empty.id).attempts,
+                attempt,
+                "attempt {attempt}: an empty prompt is the job's own, and counts"
+            );
+            let reported = job_withheld_reason(
+                harness.manager.scheduler_memory(),
+                &held,
+                crate::permission::Permission::Unrestricted,
+                None,
+            )
+            .unwrap_or_default();
+            assert!(
+                reported.contains("did not resolve")
+                    && reported.contains("no profile named 'work'"),
+                "attempt {attempt}: and it is reported for what it is: {reported}"
+            );
+
+            harness.tick().await;
+            assert!(
+                harness.fired().is_empty(),
+                "attempt {attempt}: the claims are held for their lease, so the retry waits it out"
+            );
+            expire_the_leases().await;
+        }
+
+        harness.tick().await;
+        let fired: Vec<String> = harness
+            .fired()
+            .into_iter()
+            .map(|fired| fired.job_id)
+            .collect();
+        assert_eq!(
+            fired,
+            [job.id.as_str()],
+            "the job fires once its session can run it, and the empty prompt is parked"
+        );
+        // Asked of the row as it stood before the turn first: a reader holding the row as it is now
+        // clears the record on its own, by the witness.
+        assert_eq!(
+            harness.manager.scheduler_memory().unrunnable_reason(&held),
+            None,
+            "the record goes with the fire that ran, not only with the row the fire moved"
+        );
+        assert_eq!(
+            job_withheld_reason(
+                harness.manager.scheduler_memory(),
+                &row(&harness.jobs().await, &job.id),
+                crate::permission::Permission::Unrestricted,
+                None,
+            ),
+            None,
+            "and nothing says it cannot fire any more"
+        );
+    }
+
+    /// What the attempt counter exists for still counts beside an unrunnable fire: a claim a host
+    /// abandoned by dying.
+    #[tokio::test]
+    async fn a_claim_abandoned_by_a_dead_owner_still_counts_beside_an_unrunnable_fire() {
+        let harness = SchedulerHarness::new().await;
+        let job = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::minutes(5),
+            )
+            .await;
+        let died_at = Utc::now() - chrono::Duration::hours(2);
+        assert!(
+            harness
+                .manager
+                .schedule_store()
+                .claim_occurrence(
+                    &job.id,
+                    job.next_fire_at,
+                    "host-that-died",
+                    died_at,
+                    died_at + chrono::Duration::hours(1),
+                )
+                .await
+                .expect("claim"),
+            "a host takes the occurrence and dies holding it"
+        );
+
+        run_due(
+            &harness.manager,
+            &harness.config,
+            None,
+            &NoResidents,
+            &SchedulerScope::every_job(),
+            &|_wakeup: Wakeup| {
+                std::future::ready(FireOutcome::Unrunnable(Unrunnable::SessionUnreachable(
+                    "database is locked".to_string(),
+                )))
+            },
+        )
+        .await
+        .expect("the sweep runs");
+
+        let after = harness.jobs().await;
+        assert_eq!(
+            after.first().expect("the job is kept").attempts,
+            1,
+            "the dead host's claim counts, and the unrunnable fire after it forgives only its own"
+        );
     }
 
     /// The other half of the reorder: a *recurring* job refused for authority still spends the

@@ -20,12 +20,13 @@ use uuid::Uuid;
 
 use crate::{
     config::{AccountConfig, McpServerConfig, ProfileConfig},
+    error::MekaError,
     mcp::AdvertisedTool,
     memory::Memory,
     permission::Permission,
     schedule::ScheduledJob,
     skills::{self, Skill},
-    store::{SessionMatch, SessionSummary},
+    store::{SessionMatch, SessionSummary, turns::TurnRecord},
 };
 
 /// A session's row: what `meka session list` prints and what `GET /v1/sessions/{id}` answers with,
@@ -75,7 +76,7 @@ pub(crate) struct SessionView {
     /// because a list of sessions is rendered from it, one row per session; the whole history of
     /// turns is `GET /v1/sessions/{id}/turns`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) last_turn: Option<crate::store::turns::TurnRecord>,
+    pub(crate) last_turn: Option<TurnView>,
     /// How many turns the session has on record, every host's: the turns
     /// `GET /v1/sessions/{id}/turns` lists, which `[session].turn_retention` thins.
     pub(crate) turn_count: u64,
@@ -83,8 +84,9 @@ pub(crate) struct SessionView {
     pub(crate) usage: crate::store::turns::TurnUsage,
 }
 
-impl From<&SessionSummary> for SessionView {
-    fn from(session: &SessionSummary) -> Self {
+impl SessionView {
+    /// The view of `session`, its last turn's failure worded by `wording`.
+    pub(crate) fn new(session: &SessionSummary, wording: impl Fn(&MekaError) -> String) -> Self {
         Self {
             id: session.id,
             created_at: session.created_at.clone(),
@@ -97,10 +99,131 @@ impl From<&SessionSummary> for SessionView {
             title: session.title.clone(),
             parent_id: session.parent_id,
             pinned_at: session.pinned_at.clone(),
-            last_turn: session.last_turn.clone(),
+            last_turn: session
+                .last_turn
+                .as_ref()
+                .map(|turn| TurnView::new(turn, wording)),
             turn_count: session.turn_count,
             usage: session.usage,
         }
+    }
+}
+
+/// One turn as its row records it: when it began and, once it has, how it ended.
+///
+/// `ended_at` and `status` are absent together on a turn that began and has not ended: the one
+/// in flight, or one the process died under. Whether it is the former is `turn_in_flight` on
+/// the session, a live fact no row stores.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema), schema(as = TurnRecord))]
+pub(crate) struct TurnView {
+    pub(crate) id: Uuid,
+    /// Who opened it: `client`, `inbox`, `schedule`, `background`, `compaction` for a compaction
+    /// run between turns, or `parent` for a sub-agent's.
+    #[cfg_attr(feature = "serve", schema(value_type = String))]
+    pub(crate) source: crate::store::turns::TurnSource,
+    /// RFC 3339, when the turn began.
+    pub(crate) started_at: String,
+    /// The permission level the turn ran under, as its opening told the model.
+    #[cfg_attr(feature = "serve", schema(value_type = String))]
+    pub(crate) permission: Permission,
+    /// RFC 3339, when the turn ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ended_at: Option<String>,
+    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) status: Option<crate::store::turns::TurnStatus>,
+    /// The class of the stop the turn's last reply ended on, on a turn that succeeded.
+    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stop_reason: Option<crate::conversation::StopReason>,
+    /// What a turn that failed failed on, in the words a Problem Detail uses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<TurnErrorView>,
+    /// Who or what stopped a turn that was canceled, in the word its `turn.canceled` carries.
+    #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<crate::store::turns::CancelReason>,
+    /// The profile that served the turn when it was not the session's own: one of its
+    /// `fallbacks`, after the session's profile could not. Absent on a turn the session's profile
+    /// served.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
+    /// What the turn spent, every round of it.
+    pub(crate) usage: crate::store::turns::TurnUsage,
+}
+
+impl TurnView {
+    /// The view of `turn`, what it failed on worded by `wording`.
+    pub(crate) fn new(turn: &TurnRecord, wording: impl Fn(&MekaError) -> String) -> Self {
+        Self {
+            id: turn.id,
+            source: turn.source,
+            started_at: turn.started_at.clone(),
+            permission: turn.permission,
+            ended_at: turn.ended_at.clone(),
+            status: turn.status,
+            stop_reason: turn.stop_reason,
+            error: turn.error.as_ref().map(|error| TurnErrorView {
+                kind: error.kind,
+                detail: error.failure.sentence(wording),
+            }),
+            reason: turn.reason,
+            profile: turn.profile.clone(),
+            usage: turn.usage,
+        }
+    }
+}
+
+/// The failure a turn ended on, as a surface says it: its `type`, as every Problem Detail names it,
+/// and what Meka says about it in that surface's words.
+#[derive(Debug, Clone)]
+pub(crate) struct TurnErrorView {
+    pub(crate) kind: crate::error::ErrorKind,
+    pub(crate) detail: String,
+}
+
+impl Serialize for TurnErrorView {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut error = serializer.serialize_struct("TurnError", 2)?;
+        error.serialize_field("type", self.kind.type_uri())?;
+        error.serialize_field("detail", &self.detail)?;
+        error.end()
+    }
+}
+
+#[cfg(feature = "serve")]
+impl utoipa::PartialSchema for TurnErrorView {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ObjectBuilder, Type};
+        ObjectBuilder::new()
+            .property(
+                "type",
+                ObjectBuilder::new()
+                    .schema_type(Type::String)
+                    .description(Some("The error's `type`, as a Problem Detail names it")),
+            )
+            .required("type")
+            .property(
+                "detail",
+                ObjectBuilder::new()
+                    .schema_type(Type::String)
+                    .description(Some("Meka's own sentence about the failure")),
+            )
+            .required("detail")
+            .into()
+    }
+}
+
+/// The name the OpenAPI document gives the object, which generated clients are built against.
+#[cfg(feature = "serve")]
+impl utoipa::ToSchema for TurnErrorView {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("TurnError")
     }
 }
 
@@ -120,10 +243,11 @@ pub(crate) struct SessionMatchView {
     pub(crate) excerpt_position: Option<i64>,
 }
 
-impl From<&SessionMatch> for SessionMatchView {
-    fn from(found: &SessionMatch) -> Self {
+impl SessionMatchView {
+    /// The view of `found`, its last turn's failure worded by `wording`.
+    pub(crate) fn new(found: &SessionMatch, wording: impl Fn(&MekaError) -> String) -> Self {
         Self {
-            session: SessionView::from(&found.session),
+            session: SessionView::new(&found.session, wording),
             excerpt: found.excerpt.clone(),
             excerpt_position: found.excerpt_position,
         }
@@ -988,7 +1112,10 @@ mod tests {
     #[test]
     fn a_session_view_carries_the_row_under_the_documented_names() {
         let parent = Uuid::new_v4();
-        let view = SessionView::from(&summary(Some(PathBuf::from("/work")), Some(parent)));
+        let view = SessionView::new(
+            &summary(Some(PathBuf::from("/work")), Some(parent)),
+            MekaError::sentence,
+        );
         let document = serde_json::to_value(&view).expect("serializes");
         let keys: Vec<&str> = document
             .as_object()
@@ -1020,7 +1147,7 @@ mod tests {
     /// An optional the row does not carry is left out of the document, never written as `null`.
     #[test]
     fn a_session_view_omits_what_the_row_does_not_record() {
-        let mut view = SessionView::from(&summary(None, None));
+        let mut view = SessionView::new(&summary(None, None), MekaError::sentence);
         view.permission = None;
         let document = serde_json::to_value(&view).expect("serializes");
         let object = document.as_object().expect("an object");

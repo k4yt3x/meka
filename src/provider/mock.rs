@@ -134,6 +134,13 @@ pub(crate) enum MockEvent {
         message: String,
         resets_after_secs: Option<u64>,
     },
+    /// A login that must be redone. The stream returns
+    /// `Err(MekaError::AccountLoginSpent { .. })` at once, as a subscription driver does when its
+    /// token is rejected after a refresh or its refresh is refused.
+    FailLoginSpent {
+        account: String,
+        message: String,
+    },
     /// Synthetic *malformed-request* failure. The stream returns
     /// `Err(MekaError::InvalidRequest(message))` immediately, exercising `Agent::run_turn`'s
     /// degrade-and-retry path. Each attempt consumes one round, so
@@ -487,6 +494,9 @@ impl Provider for MockProvider {
                         resets_after: resets_after_secs.map(std::time::Duration::from_secs),
                     });
                 }
+                MockEvent::FailLoginSpent { account, message } => {
+                    return Err(crate::error::MekaError::AccountLoginSpent { account, message });
+                }
                 MockEvent::FailInvalidRequest { message } => {
                     return Err(crate::error::MekaError::InvalidRequest(message));
                 }
@@ -737,6 +747,10 @@ impl Provider for MockProvider {
                         resets_after: resets_after_secs.map(std::time::Duration::from_secs),
                     });
                 }
+                MockEvent::FailLoginSpent { account, message } => {
+                    send_stream_error(&event_sender, &message).await;
+                    return Err(crate::error::MekaError::AccountLoginSpent { account, message });
+                }
                 MockEvent::FailInvalidRequest { message } => {
                     send_stream_error(&event_sender, &message).await;
                     return Err(crate::error::MekaError::InvalidRequest(message));
@@ -851,6 +865,7 @@ impl ScriptedStream {
             | MockEvent::FailStreamHolding { .. }
             | MockEvent::FailRetryable { .. }
             | MockEvent::FailExhausted { .. }
+            | MockEvent::FailLoginSpent { .. }
             | MockEvent::FailInvalidRequest { .. }
             | MockEvent::FailContextOverflow { .. } => return None,
         })

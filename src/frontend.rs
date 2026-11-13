@@ -639,7 +639,7 @@ pub(crate) enum FrontendEvent {
     CompactionFailed {
         id: String,
         trigger: crate::conversation::CompactionTrigger,
-        error: String,
+        error: crate::error::RecordedFailure,
         interrupted: bool,
     },
     /// A call of a compaction's checkpoint finished, under the id [`checkpoint_call_id`] gives

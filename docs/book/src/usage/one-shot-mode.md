@@ -8,7 +8,7 @@ meka --oneshot -p "your prompt here"
 git diff | meka --oneshot -p -      # `-p -` reads the prompt from stdin
 ```
 
-The agent works through the prompt, tool calls included, and when the turn ends prints its answer: the last text block the model wrote, as markdown source, terminal or pipe alike, since the output is for the next tool rather than for reading. Nothing else is printed. The thinking, the tool calls and the rest of the process are logged, so `-v` shows them. A run interrupted with Ctrl+C exits 130, whatever it had printed by then.
+The agent works through the prompt, tool calls included, and when the turn ends prints its answer: the last text block the model wrote, as markdown source, terminal or pipe alike, since the output is for the next tool rather than for reading. Nothing else is printed. The thinking, the tool calls and the rest of the process are logged, so `-v` shows them. A run interrupted with Ctrl+C exits 130, whatever it had printed by then. A run sent SIGHUP or SIGTERM leaves the same way: its turn is stopped with the command it was running, what it had written is kept and printed, its background tasks are stopped, and it exits 130; one whose way out takes longer than 20 seconds is ended where it stands. A signal that arrives while the run is still starting, reading its prompt from standard input or opening the store, ends it at once, as it would any process.
 
 A prompt **without** `--oneshot` is not a one-shot run: it seeds the first turn and then leaves you on the screen, which is the right default when you are working interactively and the first thing you want is already in your shell history.
 
@@ -56,9 +56,9 @@ meka --oneshot -r 550e8400 -p "summarize what we decided"
 
 `--format json` keeps stdout empty during the turn and prints one object when it ends, so a script
 reads the whole turn at once rather than parsing a stream. Errors still go to stderr and the exit
-code; no object is printed for a turn that failed. A turn interrupted with Ctrl+C is reported, not
-failed: its object is printed with `stop_reason` set to `interrupted`, and the run exits 130 as it
-does without `--format json`.
+code; no object is printed for a turn that failed. A turn interrupted with Ctrl+C, SIGHUP or
+SIGTERM is reported, not failed: its object is printed with `stop_reason` set to `interrupted`, and
+the run exits 130 as it does without `--format json`.
 
 ```bash
 meka --oneshot -p "how many files are here?" --format json

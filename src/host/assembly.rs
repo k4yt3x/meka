@@ -780,22 +780,30 @@ pub(crate) async fn assemble_agent(
     agent_options: AgentOptions,
 ) -> anyhow::Result<Agent> {
     let tool_registry = ToolRegistry::build_default(&materials, &cells, &agent_options)?;
-    if let Some(manager) = materials
+    // Attached so the MCP connector and tools/list_changed handler propagate updates into this
+    // session's registry, and so it picks up whatever has already been discovered.
+    let subscription = match materials
         .mcp_manager
         .as_ref()
         .and_then(std::sync::Weak::upgrade)
     {
-        // Attach this session's registry so the MCP connector and tools/list_changed handler
-        // propagate updates into it, and so it picks up whatever has already been discovered.
-        crate::tools::mcp_adapter::attach_session_registry(&manager, tool_registry.clone()).await;
-    }
-    Ok(Agent::new(
+        Some(manager) => Some(
+            crate::tools::mcp_adapter::attach_session_registry(&manager, tool_registry.clone())
+                .await,
+        ),
+        None => None,
+    };
+    let mut agent = Agent::new(
         &materials,
         cells,
         tool_registry,
         agent_options,
         crate::agent::AgentRole::Root,
-    ))
+    );
+    if let Some(subscription) = subscription {
+        agent.hold_mcp_subscription(subscription);
+    }
+    Ok(agent)
 }
 /// What one session is built around: its row, if it exists yet, and the handles the host holds
 /// before the agent exists. The gauges are the host's because a frontend built before the agent
@@ -1131,9 +1139,9 @@ pub(crate) async fn collect_background_outcomes(
 /// Close the MCP servers on the way out.
 ///
 /// [`crate::mcp::McpClientManager::shutdown`] takes `&self`, so this runs regardless of how many
-/// owners the `Arc` still has. A `try_unwrap` here always fails: the manager holds the registries
-/// it serves, and those registries hold six tools that each hold the manager back, so the graceful
-/// path is unreachable and every run ends by leaving its stdio children to rmcp's drop guard.
+/// owners the `Arc` still has. A `try_unwrap` here fails while a session lives, since its registry
+/// holds six tools that each hold the manager, so the graceful path would be unreachable and every
+/// run would end by leaving its stdio children to rmcp's drop guard.
 pub(crate) async fn shutdown_mcp_manager(manager: Arc<crate::mcp::McpClientManager>) {
     manager.shutdown_within(crate::mcp::SHUTDOWN_BUDGET).await;
 }

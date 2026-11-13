@@ -92,7 +92,7 @@ pub(crate) fn format_late(late_by: chrono::Duration) -> String {
 ///
 /// Crash protection is [`MAX_CLAIM_ATTEMPTS`]'s job, not this variant's, so this means only what it
 /// says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FireOutcome {
     /// The turn ran, or failed in a way that re-running would not fix.
     Ran,
@@ -101,20 +101,21 @@ pub(crate) enum FireOutcome {
     /// its own watcher and will run the job itself, and a process at its concurrent-turn cap,
     /// which takes the job on a later sweep.
     Deferred,
-    /// This host owns the job and could not run it, and trying again immediately would not help.
+    /// This host owns the job and could not run it, for the cause it carries, and trying again
+    /// immediately would not help.
     ///
     /// The claim is left to expire rather than released or completed, which is the treatment a
     /// panicking turn already gets and for the same reason: releasing puts `next_fire_at` back in
     /// the past, so the occurrence comes due on the very next sweep and a gated job re-runs its
     /// probe every `poll_interval`; completing spends the occurrence, which for a one-shot deletes
     /// the row and loses the job outright. Waiting out `claim_lease` retries at a cadence a blip
-    /// survives and a persistent fault does not, and `MAX_CLAIM_ATTEMPTS` still parks it in the
-    /// end.
+    /// survives. A cause that is the installation's takes back the attempt the claim counted, so
+    /// it never parks the job, which would outlast the fix; see [`Unrunnable::standing_reason`].
     ///
     /// The concrete case is a session whose recorded profile no longer resolves: running
     /// the turn would bill an account the row does not name, and the cause may be a configuration
     /// error the user has yet to fix or a transient `SQLITE_BUSY` from another Meka process.
-    Unrunnable,
+    Unrunnable(Unrunnable),
 }
 /// What this process knows about a session's level that its row may not.
 ///
@@ -366,13 +367,28 @@ where
                     continue;
                 }
             };
-            if outcome == FireOutcome::Unrunnable {
+            if let FireOutcome::Unrunnable(cause) = &outcome {
                 // Neither released nor completed; see the variant. Same handling as the panicking
                 // turn above, and for the same reason.
                 tracing::warn!(
                     "this host failed to run job {short_id}; it is retried after \
                      `[schedule].claim_lease`"
                 );
+                // Unlike a panic, a cause that is the installation's is forgiven, and said on
+                // every surface that reports the job until a turn is delivered or that occurrence
+                // closes. A failed write leaves the claim counted, which only brings a park
+                // closer.
+                if let Some(reason) = cause.standing_reason() {
+                    if let Err(error) = schedule_store
+                        .forgive_attempt(&original.id, &claim.owner)
+                        .await
+                    {
+                        tracing::warn!("failed to forgive job {short_id}'s attempt: {error}");
+                    }
+                    store
+                        .scheduler_memory()
+                        .record_unrunnable(&original, reason);
+                }
                 continue;
             }
             if outcome == FireOutcome::Deferred {
@@ -423,6 +439,9 @@ where
                          delivered again"
                     ),
                 }
+                // Here rather than left to the witness: a one-shot just retired has no row left to
+                // compare against, and its entry would outlive it.
+                store.scheduler_memory().clear_unrunnable(&original.id);
                 // Counted only once a turn has actually been spent. A job `prepare` retired (a
                 // declining gate, a one-shot past its grace period) and a job the host handed back
                 // both cost the conversation nothing, so neither may consume a session's budget,

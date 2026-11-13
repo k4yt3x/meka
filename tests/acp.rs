@@ -6971,6 +6971,67 @@ fn a_failed_compaction_still_shows_what_its_checkpoint_wrote() {
     assert_eq!(updates[call]["status"], "completed");
 }
 
+/// A compaction that failed because its account must sign in again says so in the shell's words,
+/// which name the command that signs it in, live and on a load alike.
+#[test]
+fn a_compaction_failed_on_a_spent_login_names_the_login_command_live_and_on_a_load() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [{ "type": "fail_login_spent", "account": "mock", "message": "refresh token expired" }],
+        [
+            { "type": "text", "text": "the reply" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let config = format!("{ACP_INVALID_PARAMS_CONFIG}\n[session]\ncompact_checkpoint = false\n");
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        &config,
+        Some(script),
+        serde_json::json!({"session": {"compaction": {}}}),
+    );
+    let cwd = harness.work_dir();
+    let session_id = harness.new_session();
+    let failure = |updates: &[serde_json::Value]| -> String {
+        updates
+            .iter()
+            .map(|value| &value["params"]["update"])
+            .find(|update| {
+                update["sessionUpdate"] == "compaction_update" && update["status"] == "failed"
+            })
+            .and_then(|update| update["error"].as_str())
+            .unwrap_or_else(|| panic!("the compaction must fail with an error: {updates:?}"))
+            .to_string()
+    };
+    let id = harness.prompt(&session_id, "compact yourself");
+    let (updates, _) = harness.collect_updates(&session_id, id);
+    let live = failure(&updates);
+    assert!(live.contains("run `meka account login mock`"), "{live}");
+
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
+    );
+    assert!(closed["result"].is_object(), "close must succeed: {closed}");
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(
+        response["result"].is_object(),
+        "load must succeed: {response}"
+    );
+    assert_eq!(
+        failure(&updates),
+        live,
+        "the load says what the live run said"
+    );
+}
+
 /// A provider that reuses its call ids from round to round still gets a card per call: the
 /// protocol wants a call's id unique within the session, and an editor fills in the newest card it
 /// holds under an id, so the second call is sent under an id of its own, live and on a load.
@@ -8175,6 +8236,180 @@ poll_interval = "200ms"
     assert_eq!(
         reached, 0,
         "session/cancel must stop a scheduled turn; it ran on to the end of its script",
+    );
+}
+
+/// The configuration the two one-shot fire tests below share: a sweep every 200 ms.
+const ACP_FAST_SCHEDULE_CONFIG: &str = r#"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+
+[schedule]
+poll_interval = "200ms"
+"#;
+
+/// A fire's turn that says it has started and then waits for longer than either test runs.
+fn a_fire_that_waits() -> serde_json::Value {
+    serde_json::json!([[
+        { "type": "text", "text": "job turn running" },
+        { "type": "sleep", "ms": 60000 },
+        { "type": "text", "text": "PAST_THE_STOP" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]])
+}
+
+/// Seed a one-shot job on `session_id`, due a minute ago so the next sweep fires it, and wait
+/// until its turn is streaming. Returns the job's id.
+fn fire_a_one_shot_job(harness: &mut AcpTestHarness, session_id: &str) -> String {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now();
+    let due = (now - chrono::Duration::seconds(60)).to_rfc3339();
+    rusqlite::Connection::open(harness.database())
+        .expect("open the store")
+        .execute(
+            "INSERT INTO scheduled_jobs \
+             (id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, gate_last_output, \
+              gate_permission, created_at, last_fired_at, next_fire_at) \
+             VALUES (?1, ?2, 'at', ?3, 'PROBE_ONE_SHOT', NULL, NULL, NULL, NULL, ?4, NULL, ?3)",
+            rusqlite::params![&job_id, session_id, &due, now.to_rfc3339()],
+        )
+        .expect("seed the due job");
+    let started = read_until(&mut harness.reader, window(20), |line| {
+        line.contains("job turn running")
+    });
+    assert!(
+        started.iter().any(|line| line.contains("job turn running")),
+        "the scheduled job never started a turn",
+    );
+    job_id
+}
+
+/// How many rows the store holds for job `job_id`.
+fn job_rows(harness: &AcpTestHarness, job_id: &str) -> i64 {
+    rusqlite::Connection::open(harness.database())
+        .expect("open the store")
+        .query_row(
+            "SELECT count(*) FROM scheduled_jobs WHERE id = ?1",
+            rusqlite::params![job_id],
+            |row| row.get(0),
+        )
+        .expect("count the job's rows")
+}
+
+/// A one-shot fire the host leaving cuts short is handed back rather than spent: the job is still
+/// there for the next start to fire, and its turn says the host stopped it.
+#[cfg(unix)]
+#[test]
+fn a_one_shot_fire_cut_short_by_the_host_leaving_is_not_spent() {
+    let mut harness = AcpTestHarness::spawn(ACP_FAST_SCHEDULE_CONFIG, Some(a_fire_that_waits()));
+    let session_id = harness.new_session();
+    let job_id = fire_a_one_shot_job(&mut harness, &session_id);
+
+    // SAFETY: `child.id()` is a live process this test spawned and still owns.
+    unsafe {
+        libc::kill(harness.child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    assert!(
+        wait_for_exit(&mut harness.child, Duration::from_secs(30)).is_some(),
+        "meka acp did not leave on SIGTERM"
+    );
+    assert_eq!(job_rows(&harness, &job_id), 1, "the occurrence was spent");
+    let reason: Option<String> = rusqlite::Connection::open(harness.database())
+        .expect("open the store")
+        .query_row(
+            "SELECT cancel_reason FROM turns WHERE session_id = ?1 AND source = 'schedule'",
+            rusqlite::params![&session_id],
+            |row| row.get(0),
+        )
+        .expect("the fire's turn row");
+    assert_eq!(reason.as_deref(), Some("server_shutdown"));
+}
+
+/// A fire the leaving host hands back stays handed back: the host that is on its way out does not
+/// claim the occurrence again and run it as a new turn nobody stopped. The signal lands once the
+/// fire has run past a poll interval, which is when the next sweep is already due.
+#[cfg(unix)]
+#[test]
+fn a_fire_handed_back_by_a_leaving_host_is_not_fired_again_before_it_exits() {
+    // The fire says so itself once it has outlasted three of the 200 ms sweeps.
+    let script = serde_json::json!([
+        [
+            { "type": "text", "text": "job turn running" },
+            { "type": "sleep", "ms": 600 },
+            { "type": "text", "text": "PAST_A_SWEEP" },
+            { "type": "sleep", "ms": 60000 },
+            { "type": "text", "text": "PAST_THE_STOP" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "fired again" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn(ACP_FAST_SCHEDULE_CONFIG, Some(script));
+    let session_id = harness.new_session();
+    let job_id = fire_a_one_shot_job(&mut harness, &session_id);
+    let past = read_until(&mut harness.reader, window(20), |line| {
+        line.contains("PAST_A_SWEEP")
+    });
+    assert!(
+        past.iter().any(|line| line.contains("PAST_A_SWEEP")),
+        "the fire never outlasted a sweep",
+    );
+
+    // SAFETY: `child.id()` is a live process this test spawned and still owns.
+    unsafe {
+        libc::kill(harness.child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    assert!(
+        wait_for_exit(&mut harness.child, Duration::from_secs(30)).is_some(),
+        "meka acp did not leave on SIGTERM"
+    );
+    assert_eq!(job_rows(&harness, &job_id), 1, "the occurrence was spent");
+    let fires: i64 = rusqlite::Connection::open(harness.database())
+        .expect("open the store")
+        .query_row(
+            "SELECT count(*) FROM turns WHERE session_id = ?1 AND source = 'schedule'",
+            rusqlite::params![&session_id],
+            |row| row.get(0),
+        )
+        .expect("count the fires' turns");
+    assert_eq!(fires, 1, "the leaving host fired the occurrence again");
+}
+
+/// A one-shot fire the editor stops is spent, since stopping it was asked for: the job is gone
+/// once its turn has ended, and it never fires again.
+#[test]
+fn a_one_shot_fire_the_editor_stops_is_spent() {
+    let mut harness = AcpTestHarness::spawn(ACP_FAST_SCHEDULE_CONFIG, Some(a_fire_that_waits()));
+    let session_id = harness.new_session();
+    let job_id = fire_a_one_shot_job(&mut harness, &session_id);
+
+    harness.cancel(&session_id);
+    support::wait_until("the job's row to go", Duration::from_secs(20), || {
+        job_rows(&harness, &job_id) == 0
+    });
+    let reasons: Vec<Option<String>> = {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let mut statement = connection
+            .prepare(
+                "SELECT cancel_reason FROM turns WHERE session_id = ?1 AND source = 'schedule'",
+            )
+            .expect("prepare");
+        statement
+            .query_map(rusqlite::params![&session_id], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("read the fires' turns")
+    };
+    assert_eq!(
+        reasons,
+        [Some("client".to_string())],
+        "one fire, stopped by the editor"
     );
 }
 

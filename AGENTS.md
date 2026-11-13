@@ -440,7 +440,11 @@ One word per concept, everywhere it is written or read:
 - **Refusals.** An unknown name is reported through `text::unknown_name`, never a per-door sentence.
   A refusal whose remedy is a command is a typed `MekaError` variant (`ProfileDefaultStillNeeded`,
   `McpCredentialInTheWay`): its `Display` is the shell's sentence, and `ProblemDetail::for_error`,
-  the one place every HTTP route takes it from, words the route from its fields.
+  the one place every HTTP route takes it from, words the route from its fields. One that can end
+  a turn or a compaction is also a `RecordedRefusal` variant: its record keeps the fields, and each
+  reader words it through `RecordedFailure::sentence` with its surface's wording, so the sentence
+  a turn or a compaction records never names a command or a route. An inbox item's failure is
+  `meka serve`'s own record, read only over HTTP, and is worded with its routes.
 - **Listings.** A listing is a `text::format_table` over a column declaration, never hand-rolled
   widths: an identifier the reader retypes is shown in full, text shown for information is capped (a
   name at `NAME_WIDTH`), and one prose column takes what is left of `TABLE_WIDTH`, never below its

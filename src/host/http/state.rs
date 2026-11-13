@@ -30,6 +30,8 @@ pub(crate) struct ServerState {
     /// Process-wide count of in-flight turns. Inspected by `submit_turn` for the
     /// `max_concurrent_turns` cap; incremented + decremented via [`crate::host::TurnGuard`].
     pub(crate) concurrent_turns: Arc<AtomicUsize>,
+    /// The writes running on tasks of their own, which the shutdown drain waits for.
+    pub(crate) writes: Writes,
     /// Cancellation token fired when the process receives SIGTERM / SIGINT.
     ///
     /// What actually stops an in-flight turn is `host::http::drain_active_sessions`, which fires
@@ -98,6 +100,7 @@ impl ServerState {
             config,
             idempotency,
             concurrent_turns: Arc::new(AtomicUsize::new(0)),
+            writes: Writes::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             webhooks: super::webhook::WebhookDispatcher::new(config_webhooks),
             reconstruction_locks: super::reattach::ReconstructionLocks::default(),
@@ -122,6 +125,75 @@ impl ServerState {
             background: Some(self.shared.store.background_store()),
             server: Some(Arc::clone(&self.server_feed)),
             children: Some(Arc::clone(&self.child_feeds)),
+        }
+    }
+}
+
+/// The writes running on tasks of their own, counted so the shutdown drain can wait for each to
+/// end: one whose client hung up has no connection left for the accept loop to wait on.
+#[derive(Clone, Default)]
+pub(crate) struct Writes(Arc<WriteCount>);
+
+#[derive(Default)]
+struct WriteCount {
+    running: AtomicUsize,
+    /// Woken when the count reaches zero.
+    ended: tokio::sync::Notify,
+}
+
+/// One write [`Writes`] counts for as long as this lives.
+#[must_use = "the write is counted only while this lives"]
+pub(crate) struct RunningWrite(Arc<WriteCount>);
+
+impl Writes {
+    /// Count a write from now, ahead of whatever decides whether it may run.
+    pub(crate) fn begin(&self) -> RunningWrite {
+        self.0
+            .running
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        RunningWrite(Arc::clone(&self.0))
+    }
+
+    /// Resolve once no write is running.
+    pub(crate) async fn wait_until_none(&self) {
+        loop {
+            let ended = self.0.ended.notified();
+            tokio::pin!(ended);
+            // Registered before the count is read: `notify_waiters` wakes only a waiter already
+            // registered, and the last write can end between the read and the wait.
+            ended.as_mut().enable();
+            if self.0.running.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            ended.await;
+        }
+    }
+}
+
+impl RunningWrite {
+    /// Run `write` on a task of its own under the current span, counted until it ends, and answer
+    /// with what it returned, or with how its task ended without returning: a panic.
+    pub(crate) async fn run<T: Send + 'static>(
+        self,
+        write: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> Result<T, tokio::task::JoinError> {
+        tokio::spawn(tracing::Instrument::in_current_span(async move {
+            let _running = self;
+            write.await
+        }))
+        .await
+    }
+}
+
+impl Drop for RunningWrite {
+    fn drop(&mut self) {
+        if self
+            .0
+            .running
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.ended.notify_waiters();
         }
     }
 }

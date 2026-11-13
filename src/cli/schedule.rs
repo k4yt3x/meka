@@ -480,26 +480,20 @@ fn sanitize_untruncated(text: &str) -> String {
     crate::text::sanitize_to_line(text, usize::MAX)
 }
 
-/// Find the one job whose id starts with `id_prefix`, or say why not.
+/// Find the one job whose id starts with `id_prefix`, for `show`, or say why not.
 ///
 /// `scope` is `None` for the CLI, which scans every session because the operator has an id, not a
 /// session, and requiring them to find the session first would make the id useless on its own. It
 /// is `Some` for `/schedule show`, which answers inside one conversation like everything else on
-/// that surface. `show` and `cancel` share this rather than each filtering the listing themselves:
-/// a resolver that only one of them guards is a destructive command resolving ids the other
-/// refuses.
+/// that surface. [`cancel`] resolves over the stored ids instead, through the store's resolver,
+/// so it reaches a row this build cannot decode, which has nothing to show.
 async fn resolve_job(
     store: &Store,
     id_prefix: &str,
     scope: Option<uuid::Uuid>,
 ) -> Result<crate::schedule::ScheduledJob> {
-    let no_match = || {
-        Err(MekaError::Usage(format!(
-            "no scheduled job matching '{id_prefix}'"
-        )))
-    };
     if !crate::text::is_usable_id_prefix(id_prefix) {
-        return no_match();
+        return Err(no_job_matching(id_prefix));
     }
     let jobs = match scope {
         // `/schedule` on the screen is one conversation's view, and its `cancel` resolves against
@@ -511,30 +505,46 @@ async fn resolve_job(
     let wanted = crate::text::id_prefix_for_matching(id_prefix);
     let mut matches = jobs.into_iter().filter(|job| job.id.starts_with(&wanted));
     match (matches.next(), matches.next()) {
-        (None, _) => no_match(),
+        (None, _) => Err(no_job_matching(id_prefix)),
         (Some(job), None) => Ok(job),
-        // Full ids, as `resolve_session_id` reports: every match shares the prefix, so echoing it
-        // back twice names nothing the caller could retype.
-        (Some(first), Some(second)) => Err(MekaError::Usage(format!(
-            "ambiguous job id '{}' matches at least: {}, {}",
-            id_prefix, first.id, second.id
-        ))),
+        (Some(first), Some(second)) => Err(ambiguous_job_id(id_prefix, &first.id, &second.id)),
     }
 }
 
+fn no_job_matching(id_prefix: &str) -> MekaError {
+    MekaError::Usage(format!("no scheduled job matching '{id_prefix}'"))
+}
+
+/// Full ids, as `resolve_session_id` reports: every match shares the prefix, so echoing it back
+/// twice names nothing the caller could retype.
+fn ambiguous_job_id(id_prefix: &str, first: &str, second: &str) -> MekaError {
+    MekaError::Usage(format!(
+        "ambiguous job id '{id_prefix}' matches at least: {first}, {second}"
+    ))
+}
+
 async fn cancel(store: &Store, id_prefix: &str) -> Result<()> {
-    let job = resolve_job(store, id_prefix, None).await?;
-    // Reported from the delete's own row count, not from the listing that found the job: a
+    let id = match store
+        .schedule_store()
+        .job_ids_matching(id_prefix, None)
+        .await?
+        .as_slice()
+    {
+        [] => return Err(no_job_matching(id_prefix)),
+        [id] => id.clone(),
+        [first, second, ..] => return Err(ambiguous_job_id(id_prefix, first, second)),
+    };
+    // Reported from the delete's own row count, not from the resolution that found the job: a
     // scheduler sweep can retire it in between, and `ok: canceled` about a job this command did
     // not cancel is indistinguishable from the real thing.
-    match store.schedule_store().delete_scheduled_job(&job.id).await? {
+    match store.schedule_store().delete_scheduled_job(&id).await? {
         true => {
-            tracing::info!("canceled scheduled job {id}", id = job.id);
+            tracing::info!("canceled scheduled job {id}");
             Ok(())
         }
         false => Err(MekaError::Usage(format!(
             "scheduled job '{}' was already gone",
-            job.short_id()
+            id.get(..crate::text::ID_PREFIX).unwrap_or(&id)
         ))),
     }
 }
@@ -599,6 +609,45 @@ mod tests {
                 .id,
             job.id
         );
+    }
+
+    /// `meka schedule cancel` reaches a row this build cannot decode: every listing skips it, and
+    /// the store's warning about it names this command as the way to cancel it.
+    #[tokio::test]
+    async fn the_cli_cancels_a_job_this_build_cannot_decode() {
+        let manager = crate::store::Store::for_test().await;
+        let session = manager
+            .create_session(None, "p".to_string())
+            .await
+            .expect("session");
+        let id = uuid::Uuid::new_v4().to_string();
+        let (row_id, row_session) = (id.clone(), session.to_string());
+        let connection = manager.schedule_store().connection.clone();
+        connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, created_at, \
+                     next_fire_at) VALUES (?1, ?2, 'bogus', 'nothing this build reads', 'p', ?3, ?3)",
+                    rusqlite::params![row_id, row_session, chrono::Utc::now().to_rfc3339()],
+                )
+            })
+            .await
+            .expect("a row no build decodes");
+
+        cancel(&manager, &id[..8])
+            .await
+            .expect("cancel resolves the stored id");
+        let left: i64 = connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT count(*) FROM scheduled_jobs WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("count");
+        assert_eq!(left, 0, "the row is gone");
     }
 
     fn job_with(gate: Option<Gate>) -> ScheduledJob {

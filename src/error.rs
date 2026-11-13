@@ -243,6 +243,14 @@ pub(crate) enum MekaError {
     #[error("account '{account}' has no stored credential; run `meka account login {account}`")]
     AccountLoginRequired { account: String },
 
+    /// An account whose login is spent: the backend rejected a token the one refresh a rejection
+    /// buys had just minted, the issuer refused the refresh itself, or there is nothing to refresh
+    /// with, so only signing in again produces a credential the backend takes. `message` says what
+    /// failed, in the upstream's own words where it answered, for the log and a relay. The display
+    /// is the shell's sentence; a surface with a login of its own words it from the field.
+    #[error("provider error: {message}; run `meka account login {account}` to sign in again")]
+    AccountLoginSpent { account: String, message: String },
+
     /// An archive's session names a profile this installation does not configure. The display is
     /// the shell's sentence; a surface that cannot pick another profile for the import words it
     /// from the fields.
@@ -886,6 +894,7 @@ impl MekaError {
             | Self::UnknownProject { .. }
             | Self::ProfileDefaultStillNeeded { .. }
             | Self::AccountLoginRequired { .. }
+            | Self::AccountLoginSpent { .. }
             | Self::ImportNamesUnknownProfile { .. }
             | Self::ImportNamesNoProfile
             | Self::ImportNamesUnknownProject { .. }
@@ -980,6 +989,9 @@ impl MekaError {
             | Self::OutputCapTooLarge { .. }
             | Self::SessionNotFound(_)
             | Self::TurnInFlight { .. } => self.to_string(),
+            Self::AccountLoginSpent { account, .. } => format!(
+                "account '{account}' must sign in again; run `meka account login {account}`"
+            ),
             Self::Provider(_) | Self::InvalidRequest(_) => {
                 "the provider rejected or failed this turn".to_string()
             }
@@ -1072,9 +1084,105 @@ impl MekaError {
             | Self::RetryableProvider { message, .. }
             | Self::ProviderExhausted { message, .. }
             | Self::OutputCapTooLarge { message, .. }
-            | Self::ContextOverflow(message) => Some(message),
+            | Self::ContextOverflow(message)
+            | Self::AccountLoginSpent { message, .. } => Some(message),
             _ => None,
         }
+    }
+}
+
+/// A refusal a record keeps by its fields rather than its sentence, since each surface words its
+/// remedy with a command of its own: the ones a turn or a compaction can end on.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "refusal", rename_all = "snake_case")]
+pub(crate) enum RecordedRefusal {
+    /// See [`MekaError::AccountLoginSpent`].
+    AccountLoginSpent { account: String },
+}
+
+impl RecordedRefusal {
+    /// The refusal `error` is, when a record keeps it as one.
+    pub(crate) fn of(error: &MekaError) -> Option<Self> {
+        match error {
+            MekaError::AccountLoginSpent { account, .. } => Some(Self::AccountLoginSpent {
+                account: account.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The refusal this records, for a surface to word with its remedy. A spent login comes back
+    /// with an empty `message`: that is the upstream's own text, which no record keeps and no
+    /// surface's sentence reads.
+    pub(crate) fn refusal(&self) -> MekaError {
+        match self {
+            Self::AccountLoginSpent { account } => MekaError::AccountLoginSpent {
+                account: account.clone(),
+                message: String::new(),
+            },
+        }
+    }
+}
+
+/// What a turn or a compaction failed on, as its record keeps it and its live event carries it: a
+/// JSON string, or the refusal's object.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum RecordedFailure {
+    /// Meka's sentence, which reads the same on every surface.
+    Sentence(String),
+    /// A refusal each surface words with its own remedy.
+    Refusal(RecordedRefusal),
+}
+
+impl RecordedFailure {
+    /// How a record keeps `error`.
+    pub(crate) fn of(error: &MekaError) -> Self {
+        match RecordedRefusal::of(error) {
+            Some(refusal) => Self::Refusal(refusal),
+            None => Self::Sentence(error.sentence()),
+        }
+    }
+
+    /// The failure in a surface's words, a refusal through that surface's `wording`.
+    pub(crate) fn sentence(&self, wording: impl Fn(&MekaError) -> String) -> String {
+        match self {
+            Self::Sentence(sentence) => sentence.clone(),
+            Self::Refusal(refusal) => wording(&refusal.refusal()),
+        }
+    }
+}
+
+/// By hand rather than `untagged`, so an object that is no refusal Meka knows is refused naming
+/// what it holds, where `untagged` says only that nothing matched.
+impl<'de> serde::Deserialize<'de> for RecordedFailure {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Failure;
+        impl<'de> serde::de::Visitor<'de> for Failure {
+            type Value = RecordedFailure;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sentence or a recorded refusal")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                sentence: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(RecordedFailure::Sentence(sentence.to_string()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(RecordedFailure::Refusal)
+            }
+        }
+        deserializer.deserialize_any(Failure)
     }
 }
 
@@ -1598,8 +1706,9 @@ pub(crate) fn provider_stream_error_object(
 /// implies about the token, not by whether one arrived: a 429 was rejected before the grant was
 /// read and a 5xx usually means the server is unwell rather than that the grant is bad, so both
 /// retry in the ordinary way; that accepts the issuer that rotates and *then* fails. Everything
-/// else is terminal and names the login that recovers it. A success whose body cannot be decoded
-/// is terminal too: the server accepted the token, so it is certainly spent.
+/// else is terminal, as [`MekaError::AccountLoginSpent`], which names the login that recovers it.
+/// A success whose body cannot be decoded is terminal too: the server accepted the token, so it
+/// is certainly spent.
 ///
 /// A transport failure stays with [`provider_transport_error`]: the token's fate is unknown, and a
 /// token spent without Meka seeing the replacement is already dead, so retrying is right when the
@@ -1622,9 +1731,10 @@ pub(crate) fn oauth_refresh_error(
             server_error_on_completion: false,
         }
     } else {
-        MekaError::Provider(format!(
-            "{message}; run `meka account login {account}` to sign in again"
-        ))
+        MekaError::AccountLoginSpent {
+            account: account.to_string(),
+            message,
+        }
     }
 }
 
@@ -1732,6 +1842,59 @@ mod tests {
     }
 
     use super::*;
+
+    /// A spent login is recorded as its refusal, without the upstream's words, and reads from the
+    /// one value as the shell's sentence or as the API's; another failure is recorded as its
+    /// sentence. Both come back from JSON as they went.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn a_spent_login_is_recorded_as_its_refusal_for_each_surface_to_word() {
+        let api_wording = crate::host::http::errors::api_wording;
+        let spent = MekaError::AccountLoginSpent {
+            account: "sub".to_string(),
+            message: "refresh token expired for acct-0f3c".to_string(),
+        };
+        let recorded = RecordedFailure::of(&spent);
+        let stored = serde_json::to_string(&recorded).expect("serializes");
+        assert_eq!(
+            stored,
+            r#"{"refusal":"account_login_spent","account":"sub"}"#
+        );
+        let shell = recorded.sentence(MekaError::sentence);
+        assert_eq!(shell, spent.sentence());
+        assert!(shell.contains("meka account login sub"), "{shell}");
+        let api = recorded.sentence(api_wording);
+        assert_eq!(api, api_wording(&spent));
+        assert!(api.contains("POST /v1/accounts/sub/login"), "{api}");
+        let provider = MekaError::Provider("rejected for acct-0f3c".to_string());
+        let failed = RecordedFailure::of(&provider);
+        assert_eq!(failed, RecordedFailure::Sentence(provider.sentence()));
+        for failure in [recorded, failed] {
+            let encoded = serde_json::to_string(&failure).expect("serializes");
+            assert!(!encoded.contains("acct-0f3c"), "{encoded}");
+            let read: RecordedFailure = serde_json::from_str(&encoded).expect("reads");
+            assert_eq!(read, failure);
+        }
+    }
+
+    /// A string is a sentence whatever it holds, and an object is a refusal Meka knows or is
+    /// refused naming what it holds.
+    #[test]
+    fn a_recorded_failure_is_a_sentence_or_a_refusal_meka_knows() {
+        let looks_like_a_refusal = r#"{"refusal":"account_login_spent","account":"sub"}"#;
+        let read: RecordedFailure =
+            serde_json::from_value(serde_json::Value::from(looks_like_a_refusal)).expect("reads");
+        assert_eq!(
+            read,
+            RecordedFailure::Sentence(looks_like_a_refusal.to_string())
+        );
+        let error = serde_json::from_str::<RecordedFailure>(
+            r#"{"refusal":"mcp_login_required","server_name":"exa"}"#,
+        )
+        .expect_err("no refusal Meka records")
+        .to_string();
+        assert!(error.contains("mcp_login_required"), "{error}");
+    }
 
     /// Each of Claude's rejections over a thinking block's signature is recognized from the 400 it
     /// answers: one bound to a different conversation, one it cannot verify at all, and a redacted
@@ -2538,11 +2701,15 @@ mod tests {
             None,
             "work",
         );
-        let MekaError::Provider(message) = error else {
+        let MekaError::AccountLoginSpent { account, message } = &error else {
             panic!("a refused grant must not be retried, got: {error:?}");
         };
         assert!(message.contains("invalid_grant"), "{message}");
-        assert!(message.contains("meka account login work"), "{message}");
+        assert_eq!(account, "work");
+        assert!(
+            error.to_string().contains("meka account login work"),
+            "{error}"
+        );
     }
 
     /// A token endpoint that is merely unwell is retried, hint and all.
@@ -2592,10 +2759,10 @@ mod tests {
             None,
             "personal",
         );
-        let MekaError::Provider(message) = error else {
-            panic!("the grant was accepted, so nothing is left to retry: {error:?}");
-        };
-        assert!(message.contains("meka account login personal"), "{message}");
+        assert!(
+            matches!(&error, MekaError::AccountLoginSpent { account, .. } if account == "personal"),
+            "the grant was accepted, so nothing is left to retry: {error:?}"
+        );
     }
 
     /// A reply over the bound ends with an error rather than growing memory: by its declared length

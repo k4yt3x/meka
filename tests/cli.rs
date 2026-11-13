@@ -1451,6 +1451,191 @@ fn an_interrupted_wait_stops_the_background_task_it_was_waiting_for() {
     );
 }
 
+/// A one-shot run told to terminate leaves the way an interrupted one does: the turn stops its
+/// command and everything the command started, keeps what it had, closes its row as stopped by
+/// the run leaving, prints its report, and the process exits 130. The signal is sent once the
+/// command has written its pid, so it lands on a turn inside the call.
+#[cfg(unix)]
+#[test]
+fn a_terminated_oneshot_run_stops_its_command_and_closes_its_turn() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"anthropic-messages\"\n\n\
+         [profiles.mock]\naccount = \"mock\"\nmodel = \"claude-sonnet-4-5\"\n\n[permissions]\n\
+         default = \"unrestricted\"\nenabled = [\"read\", \"unrestricted\"]\n",
+    );
+    let pid_file = install.root().join("command.pid");
+    let command = format!("echo $$ > '{}'; exec sleep 301", pid_file.display());
+    install.write_script(serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "call-1", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": { "command": command } },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "never reached" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]));
+    let child = install
+        .meka(&["--oneshot", "--format", "json", "-p", "run it"])
+        .current_dir(install.work_dir())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn Meka");
+    let mut command_pid: Option<libc::pid_t> = None;
+    support::wait_until(
+        "the command's pid",
+        std::time::Duration::from_secs(20),
+        || {
+            command_pid = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok());
+            command_pid.is_some()
+        },
+    );
+    let command_pid = command_pid.expect("waited for above");
+    // SAFETY: `child.id()` is a live process this test spawned and still owns.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let output = child.wait_with_output().expect("wait for Meka");
+    // SAFETY: signal 0 checks that the pid exists and sends nothing.
+    let command_alive = || unsafe { libc::kill(command_pid, 0) } == 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while command_alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let survived = command_alive();
+    if survived {
+        // SAFETY: the pid is the command this test's run started.
+        unsafe {
+            libc::kill(command_pid, libc::SIGKILL);
+        }
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!survived, "the command outlived the run: {stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "the run exits as an interrupted one: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("one object on stdout ({error}): {stdout:?}"));
+    assert_eq!(report["stop_reason"], "interrupted");
+    let (status, reason, ended): (Option<String>, Option<String>, Option<String>) = store(&install)
+        .query_row(
+            "SELECT status, cancel_reason, ended_at FROM turns",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the one turn row");
+    assert_eq!(status.as_deref(), Some("canceled"), "{stderr}");
+    assert_eq!(reason.as_deref(), Some("server_shutdown"));
+    assert!(ended.is_some(), "the turn's row is closed");
+    let calls: i64 = store(&install)
+        .query_row(
+            "SELECT count(*) FROM messages WHERE kind = 'assistant' \
+             AND content LIKE '%shell_execute%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count the assistant's messages");
+    assert_eq!(calls, 1, "the call the turn made is kept: {stderr}");
+}
+
+/// A termination that lands after the turn, while the run waits for the background task the turn
+/// started, still leaves as an interrupted run: the task is stopped and recorded so, its command
+/// goes with it, and the process exits 130 rather than 0 over a turn that ended well. The signal
+/// is sent once the report is on stdout, which the run writes after the turn and ahead of the wait.
+#[cfg(unix)]
+#[test]
+fn a_termination_during_the_wait_for_background_work_exits_130() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"anthropic-messages\"\n\n\
+         [profiles.mock]\naccount = \"mock\"\nmodel = \"claude-sonnet-4-5\"\n\n[permissions]\n\
+         default = \"unrestricted\"\nenabled = [\"read\", \"unrestricted\"]\n\n[background]\n\
+         enabled = true\n",
+    );
+    let pid_file = install.root().join("command.pid");
+    let command = format!("echo $$ > '{}'; exec sleep 302", pid_file.display());
+    install.write_script(serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "call-1", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": { "command": command, "background": true } },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]));
+    let mut child = install
+        .meka(&["--oneshot", "--format", "json", "-p", "run it"])
+        .current_dir(install.work_dir())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn Meka");
+    let mut report = String::new();
+    {
+        use std::io::BufRead;
+        std::io::BufReader::new(child.stdout.take().expect("stdout is piped"))
+            .read_line(&mut report)
+            .expect("the report line");
+    }
+    assert!(
+        report.contains("\"stop_reason\":\"end_turn\""),
+        "the turn ended before the wait: {report}"
+    );
+    let mut command_pid: Option<libc::pid_t> = None;
+    support::wait_until(
+        "the command's pid",
+        std::time::Duration::from_secs(20),
+        || {
+            command_pid = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok());
+            command_pid.is_some()
+        },
+    );
+    let command_pid = command_pid.expect("waited for above");
+    // SAFETY: `child.id()` is a live process this test spawned and still owns.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let output = child.wait_with_output().expect("wait for Meka");
+    // SAFETY: signal 0 checks that the pid exists and sends nothing.
+    let command_alive = || unsafe { libc::kill(command_pid, 0) } == 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while command_alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let survived = command_alive();
+    if survived {
+        // SAFETY: the pid is the command this test's run started.
+        unsafe {
+            libc::kill(command_pid, libc::SIGKILL);
+        }
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!survived, "the command outlived the run: {stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "the run exits as an interrupted one: {stderr}"
+    );
+    let status: String = store(&install)
+        .query_row("SELECT status FROM background_tasks", [], |row| row.get(0))
+        .expect("the one task row");
+    assert_eq!(status, "interrupted", "{stderr}");
+}
+
 /// A script whose answer starts at once, says so on stderr, and then holds for longer than any
 /// test waits.
 #[cfg(unix)]
@@ -2946,6 +3131,31 @@ fn a_skill_run_is_titled_by_what_was_asked() {
             serde_json::from_slice(&listed.stdout).expect("the listing is JSON");
         assert_eq!(sessions["sessions"][0]["title"], title, "{sessions}");
     }
+}
+
+/// A run that failed because its account must sign in again is listed with the shell's command
+/// that signs it in.
+#[test]
+fn a_run_failed_on_a_spent_login_is_listed_with_the_login_command() {
+    let install = Install::new();
+    write_provider_config(&install, "alpha", &["alpha"]);
+    install.write_script(
+        r#"[[{"type":"fail_login_spent","account":"alpha","message":"refresh token expired"}]]"#,
+    );
+    let failed = install
+        .meka(&["--oneshot", "-p", "hello"])
+        .output()
+        .expect("run Meka");
+    assert!(!failed.status.success(), "the turn fails");
+    let listed = run_isolated(&install, &["session", "list", "--format", "json"]);
+    let sessions: serde_json::Value =
+        serde_json::from_slice(&listed.stdout).expect("the listing is JSON");
+    assert!(
+        sessions["sessions"][0]["last_turn"]["error"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("run `meka account login alpha`")),
+        "{sessions}"
+    );
 }
 
 /// Every command that prints survives a reader that hangs up, and none of them calls that failure.

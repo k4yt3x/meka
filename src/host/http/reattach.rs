@@ -29,25 +29,23 @@ use crate::{
 
 /// How a failed [`crate::host::build_session_agent`] reaches the caller.
 ///
-/// Something the caller can fix is the caller's to fix, not a server fault, and its message is
-/// Meka's own rather than an upstream provider's, so it goes back verbatim. Three cases: a session
-/// pinned to a profile that has since left `config.toml`, a profile that is configured but has no
-/// stored credential, and a session another one spawned, which only its parent can drive. All three
-/// name what to do about it, and sanitizing them to "internal server error; consult server logs"
-/// left the one actionable sentence in a file the caller cannot read.
+/// A [`crate::error::MekaError`] inside answers as its own kind says, through
+/// [`ProblemDetail::for_error`], the one mapping every refusal takes. A builder's refusal is the
+/// caller's to act on and names what to do about it: a session pinned to a profile that has since
+/// left `config.toml`, a profile whose account has no stored credential, a session another one
+/// spawned, which only its parent can drive. `relay_provider_errors` is `false` because a builder
+/// sends no request, so no upstream has spoken.
 ///
-/// **Caller-remediable, which is narrower than "Meka's own words".**
-/// [`crate::error::MekaError::Installation`] is Meka's own sentence too and is deliberately absent
-/// from the list: it names the operator's `ca_cert_file`, proxy or `base_url`, which no caller can
-/// act on and none should read. It falls to the sanitized arm below, as every other server fault
-/// does.
+/// A `MekaError` of the [`ErrorKind::Internal`] kind, or an error that is no `MekaError`, is a
+/// server fault: it answers "internal server error; consult server logs", with `context` and the
+/// error in the log. [`crate::error::MekaError::Installation`] is one, Meka's own sentence but
+/// naming the operator's `ca_cert_file`, proxy or `base_url`, which no caller can act on and none
+/// should read.
 ///
 /// Shared by re-attach and by session creation, so both answer a builder refusal the same way.
 /// Creation is the half a fresh `meka serve` hits first, since a profile's credential is checked
-/// when a session first asks for it rather than at startup.
-///
-/// Which status and `type` each refusal gets is [`ProblemDetail::for_error`]'s to say; this only
-/// decides which variants are refusals a builder can raise, and sanitizes the rest.
+/// when a session first asks for it rather than at startup. The twin of ACP's
+/// `build_failure_error`.
 pub(crate) fn agent_build_problem(
     id: Uuid,
     context: &str,
@@ -58,14 +56,9 @@ pub(crate) fn agent_build_problem(
     // way once wrapped, so one discriminator serves every door.
     let error: anyhow::Error = error.into();
     let problem = match error.downcast_ref::<MekaError>() {
-        Some(
-            refusal @ (MekaError::Config(_)
-            | MekaError::SessionNotDrivable(_)
-            | MekaError::ProfileNotConfigured { .. }
-            | MekaError::UnknownProject { .. }
-            | MekaError::SessionNotFound(_)
-            | MekaError::SessionLocked(_)),
-        ) => ProblemDetail::for_error(refusal, false),
+        Some(refusal) if refusal.kind() != ErrorKind::Internal => {
+            ProblemDetail::for_error(refusal, false)
+        }
         _ => ProblemDetail::internal_sanitized(context, error),
     };
     problem.with("session_id", id.to_string())
@@ -460,9 +453,8 @@ pub(crate) async fn ensure_session_loaded_holding(
             .with("session_id", id.to_string())
         })?;
     if !still_exists {
-        // Released like an evicted entry: `open_session` attached its registry to the MCP manager,
-        // and dropping the entry without detaching left a registry `tools/list_changed` fanned out
-        // to for the rest of the process.
+        // Released like an evicted entry, so its registry leaves the MCP manager's list now rather
+        // than at the manager's next fan-out.
         new_entry.release(state.shared.mcp_manager.as_ref()).await;
         return Err(session_not_found(id));
     }
@@ -520,9 +512,9 @@ mod tests {
     /// verbatim.
     ///
     /// It arrives here the same way a `Config` refusal does -- from a builder, in Meka's own words
-    /// -- which is exactly why the list has to be by variant rather than by "is this Meka's own
-    /// sentence". A `[web]` client that cannot be built named the operator's `ca_cert_file` in a
-    /// 422 `invalid-body`, telling a client to correct a payload that was never wrong.
+    /// -- which is exactly why the rule is by kind rather than by "is this Meka's own sentence". A
+    /// `[web]` client that cannot be built named the operator's `ca_cert_file` in a 422
+    /// `invalid-body`, telling a client to correct a payload that was never wrong.
     #[test]
     fn an_installation_fault_is_sanitized_rather_than_answered_as_a_refusal() {
         let problem = agent_build_problem(
@@ -535,6 +527,49 @@ mod tests {
         assert_eq!(problem.status, StatusCode::INTERNAL_SERVER_ERROR);
         let detail = problem.detail.unwrap_or_default();
         assert!(!detail.contains("10.0.0.1"), "{detail}");
+    }
+
+    /// A profile whose account has no stored credential is refused with the route that logs it in:
+    /// the refusal a fresh `meka serve` meets on its first `POST /v1/sessions`.
+    #[test]
+    fn a_missing_credential_answers_with_the_login_route() {
+        let id = Uuid::new_v4();
+        let problem = agent_build_problem(
+            id,
+            "failed to build session agent",
+            anyhow::Error::new(crate::error::MekaError::AccountLoginRequired {
+                account: "work".to_string(),
+            }),
+        );
+        assert_eq!(problem.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(problem.is(ErrorKind::InvalidBody), "{}", problem.type_uri);
+        let detail = problem.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("`POST /v1/accounts/work/login`"),
+            "the refusal must name the login: {detail}"
+        );
+        assert_eq!(problem.extensions["session_id"], id.to_string());
+    }
+
+    /// A refusal a builder raises answers as its own type says, whether or not anyone thought of
+    /// this door when the type was written: a profile naming no model is one the registry raises
+    /// on the way to a session.
+    #[test]
+    fn a_typed_refusal_answers_as_its_own_type_says() {
+        let problem = agent_build_problem(
+            Uuid::new_v4(),
+            "failed to build session agent",
+            anyhow::Error::new(crate::error::MekaError::ProfileNamesNoModel {
+                profile: "work".to_string(),
+            }),
+        );
+        assert_eq!(problem.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(problem.is(ErrorKind::InvalidBody), "{}", problem.type_uri);
+        let detail = problem.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("'work'"),
+            "the refusal names the profile: {detail}"
+        );
     }
 
     /// Two requests for the same unloaded session must not reconstruct it concurrently.

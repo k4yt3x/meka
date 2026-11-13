@@ -261,9 +261,9 @@ pub(crate) struct FailedCompaction {
     /// See [`CompactionRecord::summarizer`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) summarizer: Vec<RecordedMessage>,
-    /// What it failed on, in the words the live failure said; absent when it was stopped.
+    /// What it failed on, as the live failure said it; absent when it was stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<String>,
+    pub(crate) error: Option<crate::error::RecordedFailure>,
 }
 
 impl CompactionRecord {
@@ -3421,7 +3421,12 @@ pub(crate) fn format_session_as_markdown<'a>(
             }
             Event::CompactionFailed(failure) => {
                 match &failure.error {
-                    Some(error) => writeln!(output, "*Compaction failed: {error}*\n").ok(),
+                    Some(error) => writeln!(
+                        output,
+                        "*Compaction failed: {}*\n",
+                        error.sentence(crate::error::MekaError::sentence)
+                    )
+                    .ok(),
                     None => writeln!(output, "*Compaction stopped.*\n").ok(),
                 };
                 if !failure.memories_written.is_empty() {
@@ -3945,6 +3950,35 @@ mod tests {
         );
         assert!(!markdown.contains("the skill's body"), "{markdown}");
         assert!(!markdown.contains("fn a() {}"), "{markdown}");
+    }
+
+    /// The Markdown export says a compaction that failed on a spent login in the shell's words,
+    /// which name the command that signs in again.
+    #[test]
+    fn the_export_words_a_failed_compaction_s_refusal_as_the_shell_does() {
+        let event = Event::CompactionFailed(FailedCompaction {
+            trigger: CompactionTrigger::Manual,
+            memories_written: Vec::new(),
+            checkpoint: Vec::new(),
+            summarizer: Vec::new(),
+            error: Some(crate::error::RecordedFailure::of(
+                &crate::error::MekaError::AccountLoginSpent {
+                    account: "sub".to_string(),
+                    message: "refresh token expired".to_string(),
+                },
+            )),
+        });
+        let markdown = format_session_as_markdown(
+            uuid::Uuid::nil(),
+            [(&event, None)],
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            markdown.contains(
+                "*Compaction failed: account 'sub' must sign in again; run `meka account login sub`*"
+            ),
+            "{markdown}"
+        );
     }
 
     /// A session opened on an inbox item is named by the message, not by the header Meka wrote

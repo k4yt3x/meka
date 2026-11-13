@@ -314,6 +314,9 @@ pub(crate) async fn run_oneshot(
     // After the agent, so a start the builder refused leaves the row at the level it had.
     record_resume_permission(&store, session_id, permission_to_record).await;
     let cancel = crate::host::CancelCell::default();
+    // Whether a hangup or a termination told the run to leave, which it does through the exit path
+    // below like an interrupted run, whenever the signal came.
+    let signaled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     install_interrupt_handler(
         cancel.clone(),
         &agent,
@@ -324,6 +327,25 @@ pub(crate) async fn run_oneshot(
             // and has to release the grants itself.
             crate::sandbox::release_process_grants();
             std::process::exit(130);
+        },
+        {
+            let signaled = Arc::clone(&signaled);
+            move || {
+                signaled.store(true, std::sync::atomic::Ordering::SeqCst);
+                // The bound on the exit path below, which a call that ignores its stop would
+                // otherwise hold past every budget on it.
+                tokio::spawn(async {
+                    tokio::time::sleep(SIGNALED_EXIT_BOUND).await;
+                    tracing::warn!(
+                        "the run did not leave within {bound} of the signal; exiting",
+                        bound = crate::text::format_duration_words(SIGNALED_EXIT_BOUND)
+                    );
+                    // Exits from inside a task, so it never reaches the funnel in `main` and has
+                    // to release the grants itself.
+                    crate::sandbox::release_process_grants();
+                    std::process::exit(130);
+                });
+            }
         },
     );
     // Admitted before the outcome claim below, which can wait on the MCP servers: a Ctrl+C in
@@ -517,6 +539,11 @@ pub(crate) async fn run_oneshot(
     }
     if let Some(error) = write_error {
         return Err(error);
+    }
+    // A signal after the turn ended, during the wait for its background tasks or the way out,
+    // still told the run to leave, and the status says so.
+    if signaled.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(crate::error::MekaError::Interrupted.into());
     }
 
     Ok(())

@@ -52,6 +52,9 @@ pub(super) struct ServerState {
     /// naming one reopens it rather than failing, since an editor keeps a thread and sends to it,
     /// and has no reason to load what it never closed.
     pub(super) released: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Set once the editor has disconnected or a signal has arrived, ahead of the turns being
+    /// stopped, so nothing starts an out-of-band turn in the drain that follows.
+    pub(super) leaving: std::sync::atomic::AtomicBool,
 }
 
 impl ServerState {
@@ -67,6 +70,7 @@ impl ServerState {
             sessions: crate::host::Sessions::new(),
             transport_dead,
             released: std::sync::Mutex::default(),
+            leaving: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -178,6 +182,9 @@ pub(super) async fn acp_run_until_disconnect(
             tracing::info!("shutting down the ACP server");
         }
     }
+    state
+        .leaving
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     state.sessions.cancel_every_turn().await;
     if tokio::time::timeout(
         ACP_DRAIN_TIMEOUT,
@@ -192,10 +199,10 @@ pub(super) async fn acp_run_until_disconnect(
     // Reclaim every session the client never closed.
     //
     // `session/close` is an *optional* capability, so a client that simply exits leaves each entry
-    // resident: an `Agent`, a `ToolRegistry` the MCP manager holds a strong clone of, and an open
-    // file lock. Releasing them here lets the flock go -- which is what lets the same session be
-    // reopened by the next `meka` without a `SessionLocked` error -- and the registry, so
-    // `tools/list_changed` stops fanning out to sessions that no longer exist.
+    // resident: an `Agent`, a `ToolRegistry` subscribed to the MCP manager, and an open file lock.
+    // Releasing them here lets the flock go -- which is what lets the same session be reopened by
+    // the next `meka` without a `SessionLocked` error -- and the registry, so `tools/list_changed`
+    // stops fanning out to sessions that no longer exist.
     let released = state
         .sessions
         .release_every(state.shared.mcp_manager.as_ref())
@@ -219,10 +226,10 @@ pub(super) const ACP_IDLE_SCAN_INTERVAL: std::time::Duration =
 /// Release sessions the editor opened and stopped using.
 ///
 /// `session/close` is an *optional* ACP capability, so an editor is entitled never to send one, and
-/// several do not. Each session it opens holds an `Agent`, a `ToolRegistry` the MCP manager keeps a
-/// strong clone of, and an open file lock; over a long editing session that is a descriptor per
-/// file the user glanced at, none of them released, and the session cannot be reopened from
-/// anywhere else meanwhile.
+/// several do not. Each session it opens holds an `Agent`, a `ToolRegistry` subscribed to the MCP
+/// manager, and an open file lock; over a long editing session that is a descriptor per file the
+/// user glanced at, none of them released, and the session cannot be reopened from anywhere else
+/// meanwhile.
 ///
 /// Only the in-memory entry goes. The row stays, so `session/load` brings the conversation back
 /// exactly as it does for a session from a previous run -- which is the same trade `meka serve`
@@ -238,8 +245,8 @@ pub(super) fn spawn_idle_session_sweep(state: Arc<ServerState>) -> tokio::task::
                 .sweep_idle(ACP_SESSION_IDLE_TIMEOUT, |_| false)
                 .await
             {
-                // Same teardown `session/close` does, and for the same reason: without it the
-                // manager keeps fanning `tools/list_changed` out to a registry nobody reads.
+                // Same teardown `session/close` does: the background work the session left is
+                // stopped and recorded, and its registry leaves the manager's list.
                 entry.release(state.shared.mcp_manager.as_ref()).await;
                 crate::sync::lock(&state.released).insert(id.clone());
                 tracing::info!(

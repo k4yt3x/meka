@@ -392,7 +392,12 @@ impl Store {
                 } else {
                     None
                 };
-                migrations::apply(connection, plan, &context)?;
+                if let Err(failure) = migrations::apply(connection, plan, &context) {
+                    if let Some(copy) = &backup {
+                        settle_copy_of_failed_migration(&failure, copy);
+                    }
+                    return Err(failure.into());
+                }
                 // After `apply`, never before. Two orderings have to hold at once and only this one
                 // gives both: a copy must exist before an older one is removed, which the `?` on
                 // `back_up_before_migrating` above guarantees, *and* the older copy must survive a

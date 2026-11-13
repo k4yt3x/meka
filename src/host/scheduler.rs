@@ -210,6 +210,12 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
         Ok(())
     }
 
+    /// A refusal as this host words it for whoever reads a job's report or the reason an inbox
+    /// item was given up: the shell's sentence, or `serve`'s own where the remedy is a route.
+    fn refusal_sentence(&self, refusal: &MekaError) -> String {
+        refusal.sentence()
+    }
+
     /// Announce finished tasks where the host announces them, and say whether they may be
     /// delivered into a turn. `serve` posts webhooks and lets a delivery webhook veto; the others
     /// have nothing to announce to.
@@ -277,6 +283,9 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     /// feed, as it does for a withdrawal a client asked for.
     async fn inbox_withdrawn(&self, _entry: &Self::Entry, _item_id: uuid::Uuid) {}
 
+    /// Whether the host is leaving, after which no fire and no outcome delivery starts. Where
+    /// turns are stopped one by one (`meka acp`, the screen), a turn begun then is one nothing
+    /// stops.
     fn shutting_down(&self) -> bool {
         false
     }
@@ -304,8 +313,8 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
 ///
 /// A gated job waits for the runtime: its probe has just said "now", and the wait is what makes a
 /// gate on a busy session mean anything. An ungated one does not queue behind a turn; it defers to
-/// the next tick, so a long turn cannot pile fires up behind it. A fire the process is shutting
-/// down during is deferred whatever it did, so the occurrence runs again on the next start.
+/// the next tick, so a long turn cannot pile fires up behind it. A fire the host's leaving cut
+/// short is deferred, so the occurrence runs again on the next start.
 #[allow(
     clippy::significant_drop_tightening,
     reason = "the conversation guard is the fire's exclusivity and lives to the end on purpose"
@@ -313,6 +322,12 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
 pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireOutcome {
     let job = &wakeup.job;
     let job_id = job.short_id().to_string();
+    // Ahead of everything: an occurrence handed back by a fire the leaving cut short is due again
+    // at once, and the sweep that follows would otherwise run it as a new turn.
+    if hooks.shutting_down() {
+        tracing::debug!("scheduled job {job_id} came due while the host is leaving; deferring");
+        return FireOutcome::Deferred;
+    }
     let entry = match hooks.resident(job.session_id).await {
         Ok(Some(entry)) => entry,
         Ok(None) => {
@@ -328,7 +343,9 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
                 "scheduled job {job_id} did not run: failed to reach its session: {error}"
             );
             hooks.failed_before_running(job, &error);
-            return FireOutcome::Unrunnable;
+            return FireOutcome::Unrunnable(crate::schedule::Unrunnable::SessionUnreachable(
+                error.to_string(),
+            ));
         }
     };
     entry.touch();
@@ -366,7 +383,9 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
              ({error}); restore the profile in config.toml or move the session onto another"
         );
         hooks.failed_before_running(job, &error);
-        return FireOutcome::Unrunnable;
+        return FireOutcome::Unrunnable(crate::schedule::Unrunnable::BindingsUnresolved(
+            reportable_cause(&error, |refusal| hooks.refusal_sentence(refusal)),
+        ));
     }
     let cancellation = hooks.cancellation();
     let turn_id = uuid::Uuid::new_v4();
@@ -388,7 +407,7 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
             .identified(turn_id),
         Err(empty) => {
             tracing::warn!("scheduled job {job_id} rendered no prompt: {empty}");
-            return FireOutcome::Unrunnable;
+            return FireOutcome::Unrunnable(crate::schedule::Unrunnable::EmptyPrompt);
         }
     };
 
@@ -427,7 +446,7 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     let outcome = outcome.map(|_| ());
     // Before `finished`, not after: a fire the drain cut short is deferred and fires again on the
     // next start, so telling a webhook it failed announced one occurrence twice.
-    if deferred_by_the_drain(hooks.shutting_down(), &outcome) {
+    if deferred_by_the_drain(&cancellation, &outcome) {
         tracing::info!(
             "scheduled job {job_id} was cut short by the shutdown; deferring the occurrence"
         );
@@ -480,11 +499,28 @@ where
     })
 }
 
+/// Why a session's bindings did not resolve, as a job's reporting surfaces may say it: the model
+/// reads it in `[Scheduled]` and an API client in `GET /v1/jobs`. A refusal is Meka's own sentence
+/// about the configuration, in the host's `wording`; a fault's text names the operator's files or
+/// the store, so it stays in the log line beside this.
+fn reportable_cause(error: &anyhow::Error, wording: impl Fn(&MekaError) -> String) -> String {
+    match error.downcast_ref::<MekaError>() {
+        Some(refusal) if refusal.kind() != crate::error::ErrorKind::Internal => wording(refusal),
+        _ => "the cause is in the Meka log".to_string(),
+    }
+}
+
 /// Whether a fire's occurrence is handed back for the next start rather than completed: only when
-/// the drain cut the turn short. A turn that finished, or failed on its own, while the drain began
-/// is complete, its messages persisted; deferring it too makes a one-shot reminder deliver twice.
-fn deferred_by_the_drain(shutting_down: bool, outcome: &Result<(), MekaError>) -> bool {
-    shutting_down && matches!(outcome, Err(MekaError::Interrupted))
+/// the host's leaving cut the turn short, as the reason the turn was stopped for says on every
+/// host. A fire someone stopped is spent as stopped. A turn that finished, or failed on its own,
+/// while the drain began is complete, its messages persisted; deferring it too makes a one-shot
+/// reminder deliver twice.
+fn deferred_by_the_drain(
+    cancellation: &crate::agent::TurnCancellation,
+    outcome: &Result<(), MekaError>,
+) -> bool {
+    cancellation.reason() == Some(crate::store::turns::CancelReason::ServerShutdown)
+        && matches!(outcome, Err(MekaError::Interrupted))
 }
 
 /// Deliver finished background work to every resident session that can take a turn for it.
@@ -860,7 +896,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                 if !inbox_retry_can_help(&error) {
                     let reason = format!(
                         "the turn opened on it failed, and waiting would not change that: {}",
-                        error.sentence()
+                        hooks.refusal_sentence(&error)
                     );
                     tracing::warn!("inbox turn on session {session_id} failed: {error}");
                     for item in &offered {
@@ -1127,24 +1163,72 @@ mod tests {
         assert!(admitted < stamped, "and ahead of the one-way stamp");
     }
     /// A fire that completed before the drain reached it is complete: its reply is in the store,
-    /// and a deferred occurrence would deliver it again on the next start. Only the drain's own
-    /// interruption hands the occurrence back.
+    /// and a deferred occurrence would deliver it again on the next start. Only the host's leaving
+    /// hands the occurrence back, on every host, and a fire someone stopped first is spent.
     #[test]
     fn only_a_fire_the_drain_cut_short_is_deferred() {
         use super::deferred_by_the_drain;
-        assert!(deferred_by_the_drain(
-            true,
-            &Err(crate::error::MekaError::Interrupted)
-        ));
-        assert!(!deferred_by_the_drain(true, &Ok(())));
-        assert!(!deferred_by_the_drain(
-            true,
-            &Err(crate::error::MekaError::Provider("down".to_string()))
-        ));
-        assert!(!deferred_by_the_drain(
-            false,
-            &Err(crate::error::MekaError::Interrupted)
-        ));
+        use crate::{agent::TurnCancellation, error::MekaError, store::turns::CancelReason};
+        // `meka serve`'s fires stop with its shutdown token; `meka acp` and the screen stop theirs
+        // through the session's cell.
+        let shutdown = CancellationToken::new();
+        let served = TurnCancellation::child_of(&shutdown, CancelReason::ServerShutdown);
+        shutdown.cancel();
+        let held = TurnCancellation::new();
+        held.cancel(CancelReason::ServerShutdown);
+        for left in [served, held] {
+            assert!(deferred_by_the_drain(&left, &Err(MekaError::Interrupted)));
+            assert!(!deferred_by_the_drain(&left, &Ok(())));
+            assert!(!deferred_by_the_drain(
+                &left,
+                &Err(MekaError::Provider("down".to_string()))
+            ));
+        }
+
+        let shutdown = CancellationToken::new();
+        let stopped = TurnCancellation::child_of(&shutdown, CancelReason::ServerShutdown);
+        stopped.cancel(CancelReason::Client);
+        shutdown.cancel();
+        assert!(
+            !deferred_by_the_drain(&stopped, &Err(MekaError::Interrupted)),
+            "a fire someone stopped before the host left is spent"
+        );
+    }
+
+    /// The cause a job is reported held with is what a caller may read: a refusal's own sentence,
+    /// and for a fault only where to look, since its text names the operator's files.
+    #[test]
+    fn a_reported_cause_names_a_refusal_and_withholds_a_fault() {
+        use super::reportable_cause;
+        use crate::error::MekaError;
+        let refusal = anyhow::Error::new(MekaError::ProfileNotConfigured {
+            name: "work".to_string(),
+            known: vec!["home".to_string()],
+        });
+        let reported = reportable_cause(&refusal, MekaError::sentence);
+        assert!(reported.contains("'work'"), "{reported}");
+        // The remedy is the host's to word: `serve` names its route where the shell names a
+        // command.
+        let login = anyhow::Error::new(MekaError::AccountLoginRequired {
+            account: "work".to_string(),
+        });
+        let served = reportable_cause(&login, crate::host::http::errors::api_wording);
+        assert!(
+            served.contains("POST /v1/accounts/work/login") && !served.contains("meka account"),
+            "{served}"
+        );
+        for fault in [
+            anyhow::Error::new(MekaError::Installation(
+                "failed to read ca_cert_file '/etc/ssl/corp.pem'".to_string(),
+            )),
+            anyhow::anyhow!("failed to open '/var/lib/meka/meka.db'"),
+        ] {
+            let reported = reportable_cause(&fault, MekaError::sentence);
+            assert!(
+                !reported.contains('/') && reported.contains("log"),
+                "a fault's text stays in the log: {reported}"
+            );
+        }
     }
 
     /// Asserted against the source, and weaker than a behavioral test: nothing in the suite drives

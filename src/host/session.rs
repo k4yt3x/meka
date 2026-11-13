@@ -194,6 +194,82 @@ mod tests {
         ));
     }
 
+    /// Session `id` built through the assembly every host uses and holding its lock, on a manager
+    /// holding `servers`, with `agent_spawn` registered as `meka serve` registers it.
+    async fn session_for_test(
+        store: &Store,
+        id: uuid::Uuid,
+        servers: &[crate::config::McpServerConfig],
+    ) -> (ResidentSession, Arc<crate::mcp::McpClientManager>) {
+        let context = crate::mcp::McpClientContext::new();
+        let manager = crate::mcp::McpClientManager::prepare(
+            servers,
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        let materials = crate::session::SessionMaterials {
+            mcp_manager: Some(Arc::downgrade(&manager)),
+            subagents: crate::config::ResolvedSubagentsConfig {
+                max_depth: 1,
+                ..Default::default()
+            },
+            ..crate::session::SessionMaterials::for_test(store.clone())
+        };
+        let cells = crate::session::SessionCells::for_test(
+            crate::permission::SharedPermission::new(
+                crate::permission::Permission::Read,
+                crate::permission::EnabledPermissions::ALL,
+            ),
+            crate::workspace::SharedCwd::new(std::env::temp_dir()),
+            crate::workspace::SharedRoots::default(),
+            Arc::new(crate::frontend::SilentFrontend),
+        );
+        let agent = assemble_agent(materials, cells, crate::session::AgentOptions::for_test())
+            .await
+            .expect("the agent builds");
+        assert!(
+            agent.tool_registry().get("agent_spawn").is_some(),
+            "the tool holding the session's cells is registered, or this proves nothing"
+        );
+        let lock = store.lock_session(id).expect("the session's lock");
+        let session = ResidentSession::new(
+            id,
+            agent,
+            crate::conversation::Conversation::new(),
+            CancelCell::default(),
+            lock,
+        );
+        (session, manager)
+    }
+
+    /// A session dropped without being released, as a request cut between its build and its
+    /// insertion drops one, lets go of its lock: the next open takes it rather than answering
+    /// `session-locked` until the process restarts. With no server configured, as `meka serve`
+    /// always holds a manager, and with one.
+    #[tokio::test]
+    async fn a_session_dropped_unreleased_lets_go_of_its_lock() {
+        for servers in [Vec::new(), vec![crate::config::McpServerConfig::for_test(
+            "stub",
+        )]] {
+            let store = Store::for_test().await;
+            let id = uuid::Uuid::new_v4();
+            let (session, _manager) = session_for_test(&store, id, &servers).await;
+            assert!(
+                store.lock_session(id).is_err(),
+                "the open session holds its lock"
+            );
+            drop(session);
+            store
+                .lock_session(id)
+                .unwrap_or_else(|error| panic!("with {} server(s): {error}", servers.len()));
+        }
+    }
+
     #[test]
     fn a_cancel_during_admission_still_stops_the_turn() {
         let cell = CancelCell::default();
