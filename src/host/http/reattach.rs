@@ -380,9 +380,9 @@ pub(crate) async fn ensure_session_loaded_holding(
         None => SessionCapabilities::default(),
     };
 
-    // A row can carry no `cwd`: `meka session import` stores the archive's value verbatim, and an
-    // archive may omit it. Default to the server's process working directory, and propagate
-    // `current_dir()` failure as 500 so the operator can fix it.
+    // A row can carry no `cwd`: an import records none where the archive's is not a directory
+    // here, and an archive may omit it. Default to the server's process working directory, and
+    // propagate `current_dir()` failure as 500 so the operator can fix it.
     let cwd_path = match summary.cwd.clone() {
         Some(path) => path,
         None => std::env::current_dir().map_err(|error| {

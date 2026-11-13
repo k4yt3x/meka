@@ -7762,6 +7762,98 @@ fn import_rejects_a_malformed_envelope() {
     );
 }
 
+/// The archive of a session just created on `harness`, as the export route answers it.
+fn exported_archive(harness: &ServeTestHarness) -> serde_json::Value {
+    let source = create_session_id(harness);
+    harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{source}/export"),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse")
+}
+
+/// An import over HTTP settles what a session may do as the CLI's does: the server's level and
+/// approvals switch whatever the archive says, and no directory the server would refuse from a
+/// client.
+#[test]
+fn an_imported_session_takes_the_server_s_level_and_approvals() {
+    let harness = ServeTestHarness::spawn_configured_with_flags(
+        MOCK_PROFILE,
+        "",
+        "",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+        |_| Vec::new(),
+        &["--permission", "read"],
+    );
+    let mut envelope = exported_archive(&harness);
+    let session = &mut envelope["sessions"][0];
+    session["permission"] = "unrestricted".into();
+    session["approvals"] = true.into();
+    session["working_directory"] = harness
+        .install
+        .root()
+        .join("gone")
+        .to_string_lossy()
+        .into_owned()
+        .into();
+
+    let response = harness
+        .request(reqwest::Method::POST, "/v1/sessions/import")
+        .json(&envelope)
+        .send()
+        .expect("send");
+    assert_eq!(
+        response.status(),
+        201,
+        "{}",
+        response.text().unwrap_or_default()
+    );
+    let imported: serde_json::Value = response.json().expect("parse");
+    let id = imported["session_id"].as_str().expect("session_id");
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(record["permission"], "read", "{record}");
+    assert_eq!(record["approvals"], false, "{record}");
+    assert!(record["working_directory"].is_null(), "{record}");
+}
+
+/// An import refused for a name this server lacks says which route supplies it, never a shell
+/// command a client of this API cannot run.
+#[test]
+fn an_import_refusal_names_this_api_s_remedy() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let envelope = exported_archive(&harness);
+    for (field, remedy) in [
+        ("profile", "`POST /v1/profiles`"),
+        ("project", "`POST /v1/projects`"),
+    ] {
+        let mut envelope = envelope.clone();
+        envelope["sessions"][0][field] = "ghost".into();
+        let response = harness
+            .request(reqwest::Method::POST, "/v1/sessions/import")
+            .json(&envelope)
+            .send()
+            .expect("send");
+        assert_eq!(response.status(), 422);
+        let problem: serde_json::Value = response.json().expect("parse");
+        let detail = problem["detail"].as_str().expect("detail");
+        assert!(
+            detail.contains("'ghost'") && detail.contains(remedy) && !detail.contains("`meka "),
+            "{detail}"
+        );
+    }
+}
+
 /// A job is canceled by its full id, which is what a client of this API holds. An id matching
 /// nothing must say so rather than answering 204 over a job that is still firing, and the short
 /// form a terminal prints is no id here: that ergonomic is the CLI's.

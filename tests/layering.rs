@@ -736,8 +736,8 @@ const PROCESS_STARTERS: &[(&str, &str)] = &[
     (
         "src/host/tui/screen.rs",
         "the screen's `!command`, through `process::spawn`; the browser it opens for a URL a \
-         server asks for (`open::that`) is the user's own and stays outside, since a job would \
-         close it with the call",
+         server asks for (`open::that_detached`) is the user's own and stays outside, since a job \
+         would close it with the call",
     ),
     (
         "src/scheduler.rs",
@@ -828,9 +828,9 @@ fn production_code_starts_a_process_only_where_the_ledger_says() {
 /// Whether `code` builds a command or creates a process: a `Command::new(` that is not the tail
 /// of a longer name (`AvailableCommand::new(` is ACP's), a `CreateProcess` call that is not the
 /// `CreateProcessSecurityEnvironment` export (an environment, not a process), or the `open`
-/// crate's `open::that(`, which starts the platform's opener.
+/// crate's `open::that` and its variants, which start the platform's opener.
 fn starts_a_process(code: &str) -> bool {
-    if code.contains("open::that(")
+    if code.contains("open::that")
         || code
             .match_indices("CreateProcess")
             .any(|(at, _)| !code[at..].starts_with("CreateProcessSecurityEnvironment"))
@@ -918,6 +918,7 @@ fn a_longer_name_ending_in_command_is_not_a_process_start() {
         "export(c\"CreateProcessSecurityEnvironment\")?"
     ));
     assert!(starts_a_process("open::that(&question.url)"));
+    assert!(starts_a_process("open::that_detached(&url)"));
     assert!(!starts_a_process(
         "AvailableCommand::new(command.name, command.help)"
     ));

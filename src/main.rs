@@ -219,10 +219,10 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
             // Two readers, and the difference matters. The ledger takes the one `default_profile`
             // picks, ignoring `--profile`: it stamps a profile onto every session that predates
             // Meka recording one, once and irreversibly, and that must not turn on a flag the first
-            // invocation after an upgrade happened to carry. `meka session import` takes the flag
-            // itself beside that default and the configured profiles, and settles per run in
-            // `plan_import`, where choosing per run is exactly what `--profile` is for. An
-            // unreadable `config.toml` is carried to the ledger as itself rather than collapsing
+            // invocation after an upgrade happened to carry. `meka session import` resolves the
+            // run's own flags instead, and settles per run in `plan_import`, where choosing per
+            // run is exactly what `--profile` and `--permission` are for. An unreadable
+            // `config.toml` is carried to the ledger as itself rather than collapsing
             // into "nothing resolved", because the two must not produce the same write: the adopt
             // step runs once and irreversibly, so a parse error read as "nothing resolved" strands
             // every existing session against no profile with nothing said. It is not turned into a
@@ -230,7 +230,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
             // the raw document through `toml_edit` and are how a user *repairs* such a file;
             // refusing every subcommand would close the only door out. The migration refuses
             // instead, and only when it actually has rows to stamp.
-            let (installation, default_permission, context, memory_inline_max_bytes) =
+            let (context, memory_inline_max_bytes) =
                 match config::default_profile_on_disk(None) {
                     Ok(adopted) => {
                         // The file is read again for its profile table and its memory table,
@@ -248,12 +248,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                                 &file.accounts,
                                 &file.profiles,
                             ));
-                        (
-                            Some((adopted, file.profiles)),
-                            Some(permission),
-                            context,
-                            memory_inline_max_bytes,
-                        )
+                        (context, memory_inline_max_bytes)
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -261,8 +256,6 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                              profile is adopted for older sessions: {error}"
                         );
                         (
-                            None,
-                            None,
                             store::migrations::Context::on_unreadable_config(),
                             config::MEMORY_INLINE_MAX_BYTES_DEFAULT,
                         )
@@ -280,21 +273,10 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     crate::cli::project::run(action, &store).await
                 }
                 cli::Command::Session { action } => {
-                    let (default, configured) = match &installation {
-                        Some((default, configured)) => (default.as_deref(), Some(configured)),
-                        None => (None, None),
-                    };
-                    let profiles = crate::store::export::ImportInstallation {
-                        selected: cli_ref.profile.as_deref(),
-                        default,
-                        configured,
-                        projects: store.project_names().await?,
-                    };
                     crate::cli::session::run_session_subcommand(
                         &store,
                         action,
-                        profiles,
-                        default_permission,
+                        cli_ref.overrides(),
                     )
                     .await
                 }

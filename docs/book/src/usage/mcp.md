@@ -102,6 +102,8 @@ authorized 'notion'
 
 The probe and the auto-login only run for HTTP servers, and only when the user didn't provide `--auth-token-stdin` (static bearer) or `--auth` (other than `oauth`). Stdio servers skip both.
 
+The authorization URL comes from the server's own metadata, and a login whose URL is not an `http` or `https` URL is refused before it is shown anywhere.
+
 Only `meka mcp login` runs the browser flow. A host that connects a server and finds no stored credential (the screen at startup, `meka serve`, `meka acp`, `/mcp reconnect`) marks it failed for want of OAuth credentials for its URL, which each surface words with its own login: `meka mcp login <name>` in a shell, `/mcp login <name>` on the screen, `POST /v1/mcp/{name}/login` over HTTP, rather than printing a URL to a terminal nobody may be watching.
 
 ### Remote hosts / SSH sessions
@@ -183,5 +185,5 @@ Both are tuning knobs: rarely needed, but useful if you're running ~30 stdio ser
 
 | Feature | Meka behavior |
 |---------|----------------|
-| `elicitation/create` | Routed to the calling session's frontend (screen / ACP form or URL prompt, or an HTTP session's `elicitation.requested` event when it declared `supports_elicitation`) with a 60s timeout, when the server's in-flight tool calls all come from one session. Declined, with a warning, when no tool call is in flight, when the user does not answer in time, or when two sessions have calls in flight on the same server: the protocol ties an elicitation to nothing that names the call that provoked it, so routing it would be a guess. |
+| `elicitation/create` | Routed to the calling session's frontend (screen / ACP form or URL prompt, or an HTTP session's `elicitation.requested` event when it declared `supports_elicitation`) with a 60s timeout, when the server's in-flight tool calls all come from one session. Declined, with a warning, when no tool call is in flight, when the user does not answer in time, or when two sessions have calls in flight on the same server: the protocol ties an elicitation to nothing that names the call that provoked it, so routing it would be a guess. A URL elicitation is declined the same way unless its URL is an `http` or `https` URL: the screen opens it with the system's opener and a client may do the same, and neither is handed a file, a share or another application's scheme. Every surface shows and opens the URL as parsed. |
 | `input_required` | How a 2026-07-28 server asks: inside the answer to `tools/call`, `resources/read` or `prompts/get`, instead of with a request of its own. An elicitation in a tool call's answer goes to the same prompt as above, and the call is sent again with the user's answer and the server's opaque state, up to ten rounds, all under the one tool-call timeout; an interrupt ends the wait for an answer as it ends the call. In a resource read or a prompt render there is no call to route it to, so it is declined. Sampling and roots are never asked for, because Meka declares neither. |

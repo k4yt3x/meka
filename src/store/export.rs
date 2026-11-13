@@ -93,6 +93,10 @@ pub(crate) struct ExportedBlob {
 /// and an import is a door that writes such a row, so it answers to the same rule as every other:
 /// each name is one this installation has, or the import is refused. `--profile` is the explicit
 /// act that moves a session onto another profile; a project the archive names is added first.
+///
+/// The level and the approvals switch are this installation's to say as well, as a new session's
+/// are, whatever the archive recorded. A directory the archive names is recorded where it is a
+/// directory here, as one a client names is.
 pub(crate) struct ImportInstallation<'a> {
     /// `--profile <name>`, when it was passed: every imported session takes it, whatever the
     /// archive recorded.
@@ -109,6 +113,35 @@ pub(crate) struct ImportInstallation<'a> {
     /// The projects this installation's store has, which a project the archive records has to be
     /// among.
     pub(crate) projects: Vec<String>,
+    /// The level a new session starts at on the importing run, which every root session the
+    /// archive carries takes whatever it recorded, and which a sub-agent's row is held within.
+    /// `--permission` is the explicit act for another level, as `--profile` is for the profile.
+    pub(crate) permission: crate::permission::Permission,
+    /// `[permissions].approvals`, which every imported session takes.
+    pub(crate) approvals: bool,
+    /// The rule every door that records a directory holds one to, answering its canonical
+    /// spelling, or why it is not a directory here in words that follow the path; a directory it
+    /// refuses is not recorded. Handed in because the module that defines it sits above the
+    /// store.
+    pub(crate) accept_directory:
+        fn(&std::path::Path) -> std::result::Result<std::path::PathBuf, String>,
+}
+#[cfg(test)]
+impl ImportInstallation<'static> {
+    /// The planner with no installation behind it, for a test to state over what it is about:
+    /// nothing selected, defaulted or configured, the `read` level with approvals off, and every
+    /// directory taken as spelled.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            selected: None,
+            default: None,
+            configured: None,
+            projects: Vec::new(),
+            permission: crate::permission::Permission::Read,
+            approvals: false,
+            accept_directory: |directory| Ok(directory.to_path_buf()),
+        }
+    }
 }
 /// What [`plan_import`] settled: the sessions to write, the image bytes they reference, and the
 /// id the archive's root was given.
@@ -339,14 +372,9 @@ fn utc_rfc3339(session: &str, what: &str, stamp: &mut String) -> crate::error::R
 /// session). Pure and I/O-free so the ID-remap and ordering are unit-testable.
 pub(crate) fn plan_import(
     mut export: SessionExport,
-    // How each session's profile is settled, here rather than at the reader because an import is
-    // where a session enters *this* installation.
+    // How each session's profile and authority are settled, here rather than at the reader
+    // because an import is where a session enters *this* installation.
     installation: ImportInstallation<'_>,
-    // What an archive session that records no level adopts, settled here for the same reason as
-    // the profile: a row with no level runs nothing under the scheduler, and this installation's
-    // default is what such a session would start at. `None` refuses the archive rather than
-    // guessing.
-    default_permission: Option<crate::permission::Permission>,
 ) -> crate::error::Result<ImportPlan> {
     check_format_version(export.format_version)?;
     if export.sessions.is_empty() {
@@ -674,16 +702,16 @@ pub(crate) fn plan_import(
                 reply: event.reply,
             });
         }
-        let permission = match (session.permission, default_permission) {
-            (Some(level), _) => level,
-            (None, Some(level)) => level,
-            (None, None) => {
-                return Err(crate::error::MekaError::Usage(format!(
-                    "session {} in the archive records no permission level, and no default could \
-                     be read from `config.toml`",
-                    session.id
-                )));
-            }
+        // A sub-agent's row by the rule `Store::spawn_terms` reads one by. Its level is the
+        // lower of what it recorded and this installation's, since a follow-up narrows a worker
+        // and never widens it; a root's is this installation's, as a new session's is.
+        let spawned = super::sessions::is_spawned(
+            new_parent_id.is_some(),
+            session.subagent_spec_json.is_some(),
+        );
+        let permission = match session.permission {
+            Some(recorded) if spawned => recorded.greatest_within_both(installation.permission),
+            _ => installation.permission,
         };
         let profile = match (
             installation.selected,
@@ -711,6 +739,23 @@ pub(crate) fn plan_import(
                 return Err(crate::error::MekaError::ImportNamesNoProfile);
             }
         };
+        // A directory this installation would refuse from a client is left out rather than
+        // recorded: a row without a working directory opens where its host does.
+        let accepted = |noun: &str, directory: &std::path::Path| match (installation
+            .accept_directory)(
+            directory
+        ) {
+            Ok(canonical) => Some(canonical),
+            Err(reason) => {
+                tracing::info!(
+                    "session {id} in the archive is imported without its {noun} '{path}', \
+                         which {reason}",
+                    id = session.id,
+                    path = directory.display()
+                );
+                None
+            }
+        };
         // Refused rather than written, as a profile is: a row naming a project this installation
         // lacks is a session every resume refuses by name.
         if !session.project.is_empty() && !installation.projects.contains(&session.project) {
@@ -723,11 +768,18 @@ pub(crate) fn plan_import(
             new_id,
             new_parent_id,
             created_at: session.created_at,
-            cwd: session.working_directory,
+            cwd: session
+                .working_directory
+                .as_deref()
+                .and_then(|directory| accepted("working directory", directory)),
             permission,
-            approvals: session.approvals,
+            approvals: installation.approvals,
             capabilities_json: session.capabilities_json,
-            additional_roots: session.additional_workspace_directories,
+            additional_roots: session
+                .additional_workspace_directories
+                .iter()
+                .filter_map(|root| accepted("workspace directory", root))
+                .collect(),
             subagent_spec_json: session.subagent_spec_json,
             profile,
             project: session.project,
@@ -1021,16 +1073,13 @@ mod tests {
             [None, None, None, Some(0), None],
             "the copy stands for its row, and the repair after it restates the view"
         );
-        let plan = plan_import(
-            archive,
-            ImportInstallation {
-                selected: None,
-                default: Some("test-profile"),
-                configured: None,
-                projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        )
+        let plan = plan_import(archive, ImportInstallation {
+            selected: None,
+            default: Some("test-profile"),
+            configured: None,
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        })
         .expect("imports");
         assert_eq!(plan.records[0].events[3].copy_of, Some(0));
     }
@@ -1124,8 +1173,8 @@ mod tests {
                     default: Some("work"),
                     configured: Some(&profiles),
                     projects: Vec::new(),
+                    ..ImportInstallation::for_test()
                 },
-                Some(crate::permission::Permission::Read),
             )
         };
         let said_at = |event: serde_json::Value, at: &str| {
@@ -1212,16 +1261,13 @@ mod tests {
     #[test]
     fn an_archive_naming_a_profile_this_installation_lacks_is_refused() {
         let profiles = configured(&["other"]);
-        let message = refusal(plan_import(
-            archive_on("work"),
-            ImportInstallation {
-                selected: None,
-                default: Some("other"),
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            None,
-        ));
+        let message = refusal(plan_import(archive_on("work"), ImportInstallation {
+            selected: None,
+            default: Some("other"),
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        }));
         assert!(
             message.contains("'work'") && message.contains("--profile <name> session import"),
             "{message}"
@@ -1235,16 +1281,13 @@ mod tests {
         let profiles = configured(&["work"]);
         let mut archive = archive_on("work");
         archive.sessions[0].created_at = "2020-01-01T05:00:00+05:00".to_string();
-        let plan = plan_import(
-            archive,
-            ImportInstallation {
-                selected: None,
-                default: Some("work"),
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        )
+        let plan = plan_import(archive, ImportInstallation {
+            selected: None,
+            default: Some("work"),
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        })
         .expect("plans");
         assert_eq!(plan.records[0].created_at, "2020-01-01T00:00:00+00:00");
     }
@@ -1259,16 +1302,13 @@ mod tests {
             let mut archive = archive_on("work");
             archive.sessions[0].events =
                 serde_json::from_value(events).expect("well-formed events");
-            plan_import(
-                archive,
-                ImportInstallation {
-                    selected: None,
-                    default: Some("work"),
-                    configured: Some(&profiles),
-                    projects: Vec::new(),
-                },
-                Some(crate::permission::Permission::Read),
-            )
+            plan_import(archive, ImportInstallation {
+                selected: None,
+                default: Some("work"),
+                configured: Some(&profiles),
+                projects: Vec::new(),
+                ..ImportInstallation::for_test()
+            })
         };
         let saying = |text: &str, copy_of: Option<usize>| {
             serde_json::json!({
@@ -1338,16 +1378,13 @@ mod tests {
             media_type: "text/html".to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
         });
-        let message = refusal(plan_import(
-            archive,
-            ImportInstallation {
-                selected: None,
-                default: Some("work"),
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        ));
+        let message = refusal(plan_import(archive, ImportInstallation {
+            selected: None,
+            default: Some("work"),
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        }));
         assert!(message.contains("'text/html'"), "{message}");
     }
 
@@ -1441,16 +1478,13 @@ mod tests {
             permission: "read".to_string(),
             usage: crate::store::turns::TurnUsage::default(),
         });
-        let message = refusal(plan_import(
-            archive,
-            ImportInstallation {
-                selected: None,
-                default: Some("work"),
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        ));
+        let message = refusal(plan_import(archive, ImportInstallation {
+            selected: None,
+            default: Some("work"),
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        }));
         assert!(message.contains("'screen'"), "{message}");
     }
 
@@ -1461,16 +1495,13 @@ mod tests {
         let profiles = configured(&["work"]);
         let mut archive = archive_on("work");
         archive.sessions[0].project = "movie".to_string();
-        let message = refusal(plan_import(
-            archive,
-            ImportInstallation {
-                selected: None,
-                default: Some("work"),
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        ));
+        let message = refusal(plan_import(archive, ImportInstallation {
+            selected: None,
+            default: Some("work"),
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        }));
         assert!(
             message.contains("no project named 'movie'")
                 && message.contains("`meka project add movie`"),
@@ -1478,16 +1509,13 @@ mod tests {
         );
         let mut archive = archive_on("work");
         archive.sessions[0].project = "movie".to_string();
-        plan_import(
-            archive,
-            ImportInstallation {
-                selected: None,
-                default: Some("work"),
-                configured: Some(&profiles),
-                projects: vec!["movie".to_string()],
-            },
-            Some(crate::permission::Permission::Read),
-        )
+        plan_import(archive, ImportInstallation {
+            selected: None,
+            default: Some("work"),
+            configured: Some(&profiles),
+            projects: vec!["movie".to_string()],
+            ..ImportInstallation::for_test()
+        })
         .expect("a project the store has is planned");
     }
 
@@ -1498,16 +1526,13 @@ mod tests {
         let profiles = configured(&["work"]);
         let mut archive = archive_on("work");
         archive.sessions[0].created_at = "yesterday".to_string();
-        let message = refusal(plan_import(
-            archive,
-            ImportInstallation {
-                selected: None,
-                default: Some("work"),
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        ));
+        let message = refusal(plan_import(archive, ImportInstallation {
+            selected: None,
+            default: Some("work"),
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        }));
         assert!(
             message.contains("RFC 3339") && message.contains("created_at"),
             "{message}"
@@ -1525,16 +1550,13 @@ mod tests {
             let mut archive = archive_on("work");
             archive.sessions[0].title = Some(title.to_string());
             archive.sessions[0].pinned_at = Some("2026-02-02T00:00:00+00:00".to_string());
-            plan_import(
-                archive,
-                ImportInstallation {
-                    selected: None,
-                    default: Some("work"),
-                    configured: Some(&profiles),
-                    projects: Vec::new(),
-                },
-                Some(crate::permission::Permission::Read),
-            )
+            plan_import(archive, ImportInstallation {
+                selected: None,
+                default: Some("work"),
+                configured: Some(&profiles),
+                projects: Vec::new(),
+                ..ImportInstallation::for_test()
+            })
         };
         let plan = import("  Research   notes ").expect("a plan");
         assert_eq!(plan.records[0].title.as_deref(), Some("Research notes"));
@@ -1549,32 +1571,26 @@ mod tests {
     #[test]
     fn a_profile_flag_moves_every_imported_session_onto_it() {
         let profiles = configured(&["other"]);
-        let plan = plan_import(
-            archive_on("work"),
-            ImportInstallation {
-                selected: Some("other"),
-                default: None,
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            None,
-        )
+        let plan = plan_import(archive_on("work"), ImportInstallation {
+            selected: Some("other"),
+            default: None,
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        })
         .expect("the flag names a configured profile");
         assert!(
             plan.records.iter().all(|record| record.profile == "other"),
             "every session moved onto the selected profile"
         );
 
-        let message = refusal(plan_import(
-            archive_on("work"),
-            ImportInstallation {
-                selected: Some("ghost"),
-                default: None,
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            None,
-        ));
+        let message = refusal(plan_import(archive_on("work"), ImportInstallation {
+            selected: Some("ghost"),
+            default: None,
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        }));
         assert!(message.contains("'ghost'"), "{message}");
     }
 
@@ -1583,30 +1599,129 @@ mod tests {
     #[test]
     fn an_archive_naming_no_profile_takes_the_default_or_is_refused() {
         let profiles = configured(&["other"]);
-        let plan = plan_import(
-            archive_on(""),
-            ImportInstallation {
-                selected: None,
-                default: Some("other"),
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            None,
-        )
+        let plan = plan_import(archive_on(""), ImportInstallation {
+            selected: None,
+            default: Some("other"),
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        })
         .expect("the default supplies one");
         assert_eq!(plan.records[0].profile, "other");
 
-        let message = refusal(plan_import(
-            archive_on(""),
-            ImportInstallation {
-                selected: None,
-                default: None,
-                configured: Some(&profiles),
-                projects: Vec::new(),
-            },
-            None,
-        ));
+        let message = refusal(plan_import(archive_on(""), ImportInstallation {
+            selected: None,
+            default: None,
+            configured: Some(&profiles),
+            projects: Vec::new(),
+            ..ImportInstallation::for_test()
+        }));
         assert!(message.contains("--profile"), "{message}");
+    }
+
+    /// `archive_on("work")` with `sessions` in place of its one session: each a session object
+    /// holding the fields a test states over those of the archive's own.
+    fn archive_of(sessions: &[serde_json::Value]) -> SessionExport {
+        let mut archive = serde_json::to_value(archive_on("work")).expect("serialize");
+        let template = archive["sessions"][0].clone();
+        archive["sessions"] = sessions
+            .iter()
+            .map(|stated| {
+                let mut session = template.clone();
+                for (field, value) in stated.as_object().expect("a session object") {
+                    session[field] = value.clone();
+                }
+                session
+            })
+            .collect();
+        serde_json::from_value(archive).expect("a well-formed archive")
+    }
+
+    const ROOT: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// An imported session's level and approvals switch are the importing installation's,
+    /// whatever the archive recorded: a root takes its level, a sub-agent keeps the lower of the
+    /// two, and every session takes its approvals switch. A directory it would not take from a
+    /// client is not recorded.
+    #[test]
+    fn an_import_takes_its_level_approvals_and_directories_from_the_installation() {
+        let archive = || {
+            archive_of(&[
+                serde_json::json!({
+                    "permission": "unrestricted",
+                    "approvals": false,
+                    "working_directory": "/refused/project",
+                    "additional_workspace_directories": ["/taken", "/refused/more"],
+                }),
+                // A worker whose parent the archive does not carry is a worker still.
+                serde_json::json!({
+                    "id": "orphan", "parent_id": "elsewhere", "permission": "workspace",
+                    "subagent_spec_json": "{\"permission\":\"unrestricted\"}",
+                }),
+                // A second root, which recorded less than this installation gives.
+                serde_json::json!({"id": "low", "permission": "none"}),
+                serde_json::json!({
+                    "id": "wide", "parent_id": ROOT, "permission": "workspace",
+                    "working_directory": "/taken",
+                }),
+                serde_json::json!({"id": "narrow", "parent_id": ROOT, "permission": "none"}),
+            ])
+        };
+        let installation = |permission| ImportInstallation {
+            default: Some("work"),
+            permission,
+            approvals: true,
+            accept_directory: |directory| {
+                if directory.starts_with("/refused") {
+                    return Err("is refused".to_string());
+                }
+                Ok(directory.to_path_buf())
+            },
+            ..ImportInstallation::for_test()
+        };
+        use crate::permission::Permission;
+        let levels = |permission| -> Vec<Permission> {
+            plan_import(archive(), installation(permission))
+                .expect("plans")
+                .records
+                .iter()
+                .map(|record| record.permission)
+                .collect()
+        };
+        assert_eq!(
+            levels(Permission::Read),
+            [
+                Permission::Read,
+                Permission::Read,
+                Permission::Read,
+                Permission::Read,
+                Permission::None
+            ],
+            "root, orphan, low, wide, narrow"
+        );
+        assert_eq!(
+            levels(Permission::Unrestricted),
+            [
+                Permission::Unrestricted,
+                Permission::Workspace,
+                Permission::Unrestricted,
+                Permission::Workspace,
+                Permission::None
+            ],
+            "root, orphan, low, wide, narrow"
+        );
+        let plan = plan_import(archive(), installation(Permission::Read)).expect("plans");
+        assert!(
+            plan.records.iter().all(|record| record.approvals),
+            "every session takes the installation's switch"
+        );
+        let root = &plan.records[0];
+        assert_eq!(root.cwd, None, "a refused directory is not recorded");
+        assert_eq!(root.additional_roots, [std::path::PathBuf::from("/taken")]);
+        assert_eq!(
+            plan.records[3].cwd,
+            Some(std::path::PathBuf::from("/taken"))
+        );
     }
 
     #[test]

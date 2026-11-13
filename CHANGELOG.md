@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** An import takes this installation's level and approvals; see the upgrade guide.
+- **Breaking:** An import leaves out an archive's directory that is not a directory here.
+- `meka --permission <level> session import` brings an archive's sessions in at that level.
+
+### Fixed
+
+- The approval prompt scrolls long arguments with PgUp, PgDn, Ctrl+Home, Ctrl+End and the wheel.
+- A panel's footer names the keys that scroll it and counts the rows above as well as below.
+- An approval prompt with tens of thousands of rows of arguments is drawn instead of left blank.
+- An MCP server's question keeps its name in view and scrolls a message longer than its rows.
+- A URL an MCP server asks to have opened shows ahead of its message, which can no longer hide it.
+- An MCP server's URL that is not `http` or `https` is refused, in a question and in a login.
+- A URL an MCP server asks to have opened is shown and opened in its parsed form.
+- Opening a server's URL in the browser no longer holds up the screen until the browser starts.
+- A sub-agent's approval prompt names the sub-agent on the screen and in ACP clients.
+- An MCP server's question reaches an ACP editor under the server's name.
+- A reply that nests thousands of quotes or lists no longer crashes the screen.
+- A command's live output goes on past a byte that is not UTF-8.
+- Command output with a code fence in it stays inside its block in an ACP editor.
+- An HTTP import refusing an unknown profile or project names the route that adds it.
+
 ## [0.94.0] - 2026-11-12
 
 ### Added

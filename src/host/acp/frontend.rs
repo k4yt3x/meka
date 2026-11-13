@@ -1042,8 +1042,13 @@ impl Frontend for AcpFrontend {
         // The title is the one line a client is sure to show, and it names the destination for
         // every write-shaped tool; `raw_input` and the content block carry every argument, so a
         // client that renders either shows what is being written and not only where. See
-        // `PermissionRequest::input`.
-        let title = tool_call_title(&request.tool_name, request.primary_param.as_deref());
+        // `PermissionRequest::input`. It names the sub-agent asking, an execute call's included:
+        // the card is the question's own, and who asks is what the answer turns on.
+        let title = format!(
+            "{}{}",
+            crate::frontend::approval_asker(request.subagent_id),
+            tool_call_title(&request.tool_name, request.primary_param.as_deref()),
+        );
         let content = vec![text_content_block(approval_arguments_block(&request.input))];
         if !announced {
             if !owned {
@@ -1591,7 +1596,8 @@ pub(super) fn recorded_change_block(change: &crate::conversation::Change) -> Too
 /// A code fence no line of `text` can close: one backtick longer than the longest run opening a
 /// line, and never shorter than the three a plain block uses. A memory or a skill holds fenced
 /// code of its own, and an unchanged line of it sits behind the one space a diff gives context,
-/// which is indentation a fence may carry, so a three-backtick block would end there.
+/// which is indentation a fence may carry, so a three-backtick block would end there; a command
+/// prints a Markdown file as it is.
 fn fence_for(text: &str) -> String {
     let longest = text
         .lines()
@@ -1649,7 +1655,9 @@ pub(super) fn command_signal(metadata: &Option<ToolOutputMetadata>) -> Option<St
 /// claude-agent-acp's no-terminal fallback). Shared by the live view a command streams while it
 /// runs and the final one emitted when it exits, so output doesn't reflow when the call completes.
 pub(super) fn console_content_block(output: &str) -> ToolCallContent {
-    text_content_block(format!("```console\n{}\n```", output.trim_end()))
+    let output = output.trim_end();
+    let fence = fence_for(output);
+    text_content_block(format!("{fence}console\n{output}\n{fence}"))
 }
 /// Build the `content` array of a `tool_call_update` from Meka's tool output. A change the tool
 /// reported wins: the words the tool wrote about it are the model's, and the change is what the

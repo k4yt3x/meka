@@ -1337,8 +1337,9 @@ pub(crate) async fn record_session_cwd(
 /// `meka serve` reads the column the same way (`crate::host::http::reattach`).
 ///
 /// The launch directory is the fallback for two cases, both of which have to keep the run going:
-/// a row that carries no directory (`meka session import` stores an archive's value verbatim, and
-/// an archive may omit it) and one naming a directory that has since been removed.
+/// a row that carries no directory (`meka session import` records none where the archive's is not
+/// a directory here, and an archive may omit it) and one naming a directory that has since been
+/// removed.
 pub(crate) fn resume_working_directory(
     recorded: Option<std::path::PathBuf>,
     launch_cwd: &std::path::Path,

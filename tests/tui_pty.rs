@@ -31,6 +31,20 @@ mod support;
 const ROWS: u16 = 40;
 const COLUMNS: u16 = 100;
 
+/// Ends an input that is keys pressed and no line, so no Enter follows it: for keys longer than
+/// one byte pressed where Enter is an answer.
+const KEYS_ONLY: char = '\0';
+
+/// Opens and closes the row text an input waits for: `"{AWAITED}row text{AWAITED}keys"` is sent
+/// only once a row of the screen holds `row text`, for what shows when another process is ready
+/// and not when the screen has gone quiet.
+const AWAITED: char = '\u{1}';
+
+/// The row text `line` waits for and the keys it then sends, for an input that names one.
+fn awaited(line: &str) -> Option<(&str, &str)> {
+    line.strip_prefix(AWAITED)?.split_once(AWAITED)
+}
+
 /// `cells` as the screen size the emulator takes, which is never zero.
 fn screen_size(cells: u16) -> std::num::NonZeroU16 {
     std::num::NonZeroU16::new(cells).expect("a screen is at least one cell")
@@ -348,13 +362,26 @@ fn pump(
         // Judged whether or not bytes arrived: the working row's spinner has the child writing
         // every frame of a turn, and a capture mid-turn is what some tests are for.
         if last_activity.elapsed() > quiet_needed {
+            if let Some((row_text, _)) = pending.last().and_then(|line| awaited(line))
+                && !rows_of(&parser).iter().any(|row| row.contains(row_text))
+            {
+                continue;
+            }
             match pending.pop() {
                 Some(line) => {
                     screens.push(rows_of(&parser));
+                    let line = awaited(line).map_or(line, |(_, keys)| keys);
+                    let (line, keys_only) = match line.strip_suffix(KEYS_ONLY) {
+                        Some(keys) => (keys, true),
+                        None => (line, false),
+                    };
                     write_all(master, line.as_bytes());
                     // A lone control byte is a keystroke, not a line, and a paste is no Enter.
                     let pasted = line.starts_with("\x1b[200~") && line.ends_with("\x1b[201~");
-                    if !pasted && (line.len() > 1 || !line.starts_with(|c: char| c.is_control())) {
+                    if !keys_only
+                        && !pasted
+                        && (line.len() > 1 || !line.starts_with(|c: char| c.is_control()))
+                    {
                         write_all(master, b"\r");
                     }
                     last_activity = Instant::now();
@@ -652,6 +679,193 @@ fn an_always_answer_at_the_approval_prompt_covers_the_next_call_to_the_tool() {
     assert!(
         work.join("b.txt").exists(),
         "the second write ran without a question: {rows:#?}"
+    );
+}
+
+/// An approval prompt whose arguments are longer than the panel is read in full before it is
+/// answered: PgDn scrolls the arguments under the call's row and over the answers, the footer
+/// says how much is out of view, and the arrows still move the pick, so the last line of a long
+/// write is on screen when the answer is given.
+#[test]
+fn a_long_approval_prompt_scrolls_to_its_last_argument() {
+    let content: String = (1..=60).map(|n| format!("line {n:02}\\n")).collect();
+    let script = format!(
+        r#"[[{{"type":"tool_use_start","id":"t1","name":"file_write"}},
+  {{"type":"tool_use_end","input":{{"path":"big.txt","content":"{content}"}}}},
+  {{"type":"message_end","stop_reason":"tool_use"}}],
+ [{{"type":"text","text":"not written"}},
+  {{"type":"message_end","stop_reason":"end_turn"}}]]"#
+    );
+    let install = screen_install("read", "", "");
+    let page_down = format!("{}{KEYS_ONLY}", "\x1b[6~".repeat(10));
+    let screens = run_screen(&install, &script, &[
+        "/approvals on",
+        "write it",
+        &page_down,
+        // Down twice and Enter: the third answer, which denies.
+        "\x1b[B\x1b[B",
+        "/exit",
+    ]);
+    let asked = &screens[2];
+    let footer = asked.last().expect("the panel's footer");
+    assert!(
+        asked.iter().any(|row| row.ends_with("line 01"))
+            && !asked.iter().any(|row| row.ends_with("line 60"))
+            && footer.contains("PgUp PgDn scroll")
+            && footer.ends_with(" below"),
+        "the prompt opens on the top of the arguments and says more is below: {asked:#?}"
+    );
+    let paged = &screens[3];
+    let footer = paged.last().expect("the panel's footer");
+    assert!(
+        paged.iter().any(|row| row.ends_with("line 60"))
+            && paged.iter().any(|row| row.starts_with("• file_write"))
+            && paged.iter().any(|row| row == "  Allow                  y")
+            && footer.contains(" above")
+            && !footer.contains(" below"),
+        "paging reaches the last line with the call and the answers still in view: {paged:#?}"
+    );
+    let rows = final_screen(&screens);
+    assert!(
+        rows.iter().any(|row| row == "• file_write denied"),
+        "the arrows moved the pick under the scrolled arguments: {rows:#?}"
+    );
+    assert!(
+        !install.root().join("work").join("big.txt").exists(),
+        "the denied write did not run"
+    );
+}
+
+/// A server that asks for a URL to be opened asks under its own name, with the URL in view
+/// however long the message it sends with it: the URL, as parsed, is what the answer opens, and
+/// it stands ahead of the message, which is the server's to make as long as it likes.
+#[test]
+fn a_url_question_keeps_its_asker_and_its_url_ahead_of_a_long_message() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mcp_stub_server.py"
+    );
+    let server = tempfile::tempdir().expect("a directory for the server's state");
+    let state = server.path().join("state.json");
+    let message: Vec<String> = (1..=40)
+        .map(|n| format!("Sentence {n} of a message the server made long."))
+        .collect();
+    let elicit = serde_json::json!({
+        "message": message.join(" "),
+        "url": "HTTPS://Example.test/authorize?state=abc",
+    });
+    std::fs::write(
+        &state,
+        serde_json::json!({"tools": ["search"], "elicit": elicit}).to_string(),
+    )
+    .expect("write the server's state");
+    let install = screen_install(
+        "unrestricted",
+        "",
+        &format!(
+            "\n[mcp]\ndeferral = \"eager\"\n\n[[mcp.servers]]\nname = \"forms\"\ntransport = \
+             \"stdio\"\ncommand = \"python3\"\nargs = [{fixture:?}, {:?}]\n",
+            state.to_string_lossy()
+        ),
+    );
+    let script = r#"[[{"type":"tool_use_start","id":"t1","name":"mcp__forms__search"},
+  {"type":"tool_use_end","input":{}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"done"},
+  {"type":"message_end","stop_reason":"end_turn"}]]"#;
+    // Esc declines, once the server has asked: it is a process of its own and may be slow to
+    // start.
+    let decline = format!("{AWAITED}• MCP server 'forms':{AWAITED}\x1b");
+    let screens = run_screen(&install, script, &["ask", &decline, "/exit"]);
+    let asked = &screens[1];
+    let heading = asked
+        .iter()
+        .position(|row| row == "• MCP server 'forms':")
+        .unwrap_or_else(|| panic!("the question names who asks: {asked:#?}"));
+    assert_eq!(
+        asked.get(heading + 1).map(String::as_str),
+        Some("  https://example.test/authorize?state=abc"),
+        "the URL, as it is opened, stands first: {asked:#?}"
+    );
+    assert!(
+        asked
+            .last()
+            .is_some_and(|footer| footer.ends_with(" below")),
+        "the message runs on past the panel: {asked:#?}"
+    );
+}
+
+/// A form whose message runs past its rows takes the page keys, which scroll the message under
+/// the server's name; one that shows all of its message leaves them to the transcript, so what
+/// led to the question can be read from the keyboard before it is answered.
+#[test]
+fn a_form_takes_the_page_keys_only_while_its_message_runs_past_its_rows() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mcp_stub_server.py"
+    );
+    let asked_by = "• MCP server 'forms':";
+    // The screen as the question opened, and after `key` was pressed under it.
+    let pressed = |message: &str, key: &str| {
+        let server = tempfile::tempdir().expect("a directory for the server's state");
+        let state = server.path().join("state.json");
+        let elicit = serde_json::json!({
+            "message": message,
+            "schema": {"type": "object", "properties": {"name": {"type": "string"}}},
+        });
+        std::fs::write(
+            &state,
+            serde_json::json!({"tools": ["search"], "elicit": elicit}).to_string(),
+        )
+        .expect("write the server's state");
+        let install = screen_install(
+            "unrestricted",
+            "",
+            &format!(
+                "\n[mcp]\ndeferral = \"eager\"\n\n[[mcp.servers]]\nname = \"forms\"\ntransport = \
+                 \"stdio\"\ncommand = \"python3\"\nargs = [{fixture:?}, {:?}]\n",
+                state.to_string_lossy()
+            ),
+        );
+        // Sixty rows of reply ahead of the call, so the transcript holds more than its rows.
+        let reply: String = (1..=60).map(|n| format!("- item {n:02}\\n")).collect();
+        let script = format!(
+            r#"[[{{"type":"text","text":"{reply}"}},
+  {{"type":"tool_use_start","id":"t1","name":"mcp__forms__search"}},
+  {{"type":"tool_use_end","input":{{}}}},
+  {{"type":"message_end","stop_reason":"tool_use"}}],
+ [{{"type":"text","text":"done"}},
+  {{"type":"message_end","stop_reason":"end_turn"}}]]"#
+        );
+        let key = format!("{AWAITED}{asked_by}{AWAITED}{key}{KEYS_ONLY}");
+        // Esc declines.
+        let mut screens = run_screen(&install, &script, &["ask", &key, "\x1b", "/exit"]);
+        let after = screens.swap_remove(2);
+        (screens.swap_remove(1), after)
+    };
+    let shows = |screen: &[String], text: &str| screen.iter().any(|row| row.contains(text));
+
+    let long: Vec<String> = (1..=40)
+        .map(|n| format!("Sentence {n} of a message the server made long."))
+        .collect();
+    let (asked, paged) = pressed(&long.join(" "), "\x1b[6~");
+    assert!(
+        shows(&asked, asked_by) && shows(&asked, "PgUp PgDn scroll") && !shows(&asked, " above"),
+        "a message longer than the question opens at its top and says how it scrolls: {asked:#?}"
+    );
+    assert!(
+        shows(&paged, asked_by) && shows(&paged, " above") && shows(&paged, "item 60"),
+        "PgDn scrolls the message under the server's name and leaves the transcript: {paged:#?}"
+    );
+
+    let (asked, paged) = pressed("Name?", "\x1b[5~");
+    assert!(
+        shows(&asked, asked_by) && shows(&asked, "item 60") && !shows(&asked, "PgUp PgDn scroll"),
+        "a message that fits names no key: {asked:#?}"
+    );
+    assert!(
+        shows(&paged, asked_by) && !shows(&paged, "item 60"),
+        "PgUp scrolls the transcript while the question stays: {paged:#?}"
     );
 }
 

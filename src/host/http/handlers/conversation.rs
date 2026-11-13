@@ -978,31 +978,27 @@ pub(crate) async fn import(
     // Version mismatch, an empty session list and a profile this server does not configure all
     // surface here, as 422 rather than 500: the envelope is the caller's, so a rejection is a
     // statement about their input. An archive that names no profile adopts this server's default,
-    // which is the same profile `POST /v1/sessions` gives a body that names none.
+    // a root session this server's level and every session its approvals switch, which are the
+    // ones `POST /v1/sessions` gives a body that names none.
     let catalog = state.shared.providers.catalog();
     let crate::store::export::ImportPlan {
         records,
         blobs,
         root_new_id,
-    } = crate::store::export::plan_import(
-        export,
-        crate::store::export::ImportInstallation {
+    } =
+        crate::store::export::plan_import(export, crate::store::export::ImportInstallation {
             selected: None,
             default: catalog.default_profile.as_deref().ok(),
             configured: Some(&catalog.profiles),
             projects: state.shared.store.project_names().await.map_err(|error| {
                 ProblemDetail::internal_sanitized("failed to list projects", error)
             })?,
-        },
-        Some(state.shared.config.permission),
-    )
-    .map_err(|error| {
-        ProblemDetail::new(
-            ErrorKind::InvalidBody,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            error.to_string(),
-        )
-    })?;
+            permission: state.shared.config.permission,
+            approvals: state.shared.config.approvals,
+            accept_directory: crate::workspace::judge_directory,
+        })
+        // A planner refusal carries no provider text, so the relay flag has nothing to decide.
+        .map_err(|error| ProblemDetail::for_error(&error, false))?;
     let count = records.len();
     let imported: Vec<Uuid> = records.iter().map(|record| record.new_id).collect();
     state

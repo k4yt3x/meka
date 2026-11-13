@@ -406,10 +406,9 @@ pub(crate) struct ProfileSettings {
 /// first would decide what their existing sessions record as their profile.
 ///
 /// *Selection* errors are dropped rather than reported: the caller is on its way to a command that
-/// works fine with no profile configured, and neither of the two things this feeds needs the
-/// reason. The migration context takes an absent name as "nothing resolved" and leaves those rows
-/// alone; `crate::store::export::plan_import` refuses the import rather than writing a session that
-/// cannot run. A config that could not be **read** is a different answer and is raised, via
+/// works fine with no profile configured, and the migration context this feeds does not need the
+/// reason: it takes an absent name as "nothing resolved" and leaves those rows alone. A config
+/// that could not be **read** is a different answer and is raised, via
 /// [`load_config_file_or_err`], for the reason that function already gives: "empty" and "your
 /// profiles are gone" are indistinguishable to a caller with no `validate()` behind it.
 ///

@@ -29,7 +29,7 @@ use super::{
         shorten_path_with_tilde,
     },
     model::{Item, Transcript},
-    panel::{Choice, Panel},
+    panel::{BodyScroll, Choice, Panel},
     view::{self, StatusFacts, Viewport},
 };
 use crate::{
@@ -195,6 +195,36 @@ struct UrlQuestion {
     responder: tokio::sync::oneshot::Sender<ElicitationResponse>,
 }
 
+impl UrlQuestion {
+    /// Answer the server with what was picked, and hand back the URL when the pick was to open
+    /// it. The answer goes first, since the server's call waits on it and a launcher can take as
+    /// long as the browser it starts; a question nobody waits on any more opens nothing.
+    fn answer(self, index: usize) -> Option<String> {
+        let (response, opens) = match index {
+            0 => (ElicitationResponse::Accept { content: None }, true),
+            1 => (ElicitationResponse::Cancel, false),
+            _ => (ElicitationResponse::Decline, false),
+        };
+        if self.responder.send(response).is_err() {
+            tracing::trace!("the turn that asked has already moved on");
+            return None;
+        }
+        opens.then_some(self.url)
+    }
+}
+
+/// Hand `url` to the system's opener, off the calling task and detached from this process: the
+/// screen neither waits for a launcher that runs the browser itself nor takes the browser down
+/// with its terminal.
+fn open_in_browser(url: String) {
+    tokio::task::spawn_blocking(move || {
+        // A launch failure on a headless host is expected noise.
+        if let Err(error) = open::that_detached(&url) {
+            tracing::debug!("failed to open the browser: {error}");
+        }
+    });
+}
+
 /// What the URL picker offers, in the order drawn, and what each answers the server with.
 const URL_CHOICES: [(&str, Option<char>); 3] = [
     ("Open in the browser", Some('y')),
@@ -286,8 +316,12 @@ struct Field {
 /// A server's form, asked one field at a time in the composer's place.
 struct Elicitation {
     responder: tokio::sync::oneshot::Sender<ElicitationResponse>,
+    /// Who asks, on a row of its own that stays whatever the length of what is asked.
+    attribution: Line<'static>,
     /// What the server asks, as it said it.
     body: Vec<Line<'static>>,
+    /// Where the body is read from when it is longer than its rows.
+    scroll: BodyScroll,
     fields: Vec<Field>,
     /// The field being asked.
     index: usize,
@@ -296,6 +330,13 @@ struct Elicitation {
 }
 
 impl Elicitation {
+    /// Rows the question wants, between two and `most`: who asks, what it asks, and the field.
+    fn height(&self, most: u16) -> u16 {
+        u16::try_from(self.body.len().saturating_add(2))
+            .unwrap_or(u16::MAX)
+            .clamp(2, most.max(2))
+    }
+
     fn question(&self) -> String {
         self.fields
             .get(self.index)
@@ -353,6 +394,24 @@ const APPROVAL_CHOICES: [(&str, Option<char>, ApprovalDecision); 4] = [
     ("Deny", Some('n'), ApprovalDecision::Deny),
     ("Deny for the session", None, ApprovalDecision::DenyAlways),
 ];
+
+/// The approval panel's heading, `width` columns wide: the call's row, behind the sub-agent that
+/// asks when one does. The asker leads and the tool's name has what is left of the width, so a
+/// narrow panel cuts the name before it.
+fn approval_title(request: &ApprovalRequest, width: usize) -> Line<'static> {
+    let asker = crate::frontend::approval_asker(request.subagent_id);
+    let mut title = draw::tool_row(
+        &request.tool_name,
+        Vec::new(),
+        Vec::new(),
+        width.saturating_sub(crate::text::display_width(&asker)),
+    );
+    if !asker.is_empty() {
+        // After the glyph, which is the row's first span.
+        title.spans.insert(1, Span::raw(asker));
+    }
+    title
+}
 
 /// The screen's state between frames.
 struct Screen {
@@ -1163,7 +1222,7 @@ impl Screen {
         // right edge, where the panel's body stops, so the panel draws the rows as they are.
         let width =
             (self.transcript_area.width.max(20) as usize).saturating_sub(draw::RIGHT_MARGIN);
-        let title = draw::tool_row(&request.tool_name, Vec::new(), Vec::new(), width);
+        let title = approval_title(&request, width);
         let body = draw::approval_rows(&request.tool_name, &request.input, width);
         let choices = APPROVAL_CHOICES
             .iter()
@@ -1184,33 +1243,48 @@ impl Screen {
         prompt: ElicitationPrompt,
         responder: tokio::sync::oneshot::Sender<ElicitationResponse>,
     ) {
-        // Server-controlled strings are flattened to one line before they wrap: a newline in the
-        // message could paint rows that look like Meka's own, enough to forge an approval block.
-        // Laid out a column short of the right edge, where the panel's body and the question's
-        // stop, so both draw the rows as they are.
+        // Who asks stands on a row of its own, which neither a panel nor a question scrolls
+        // away, so a message of any length is read under the name of the server that sent it.
+        // The message is flattened to one line before it wraps: a newline in it could paint rows
+        // that look like Meka's own, enough to forge an approval block. Laid out a column short
+        // of the right edge, where the panel's body and the question's stop, so both draw the
+        // rows as they are.
         let width =
             (self.transcript_area.width.max(20) as usize).saturating_sub(draw::RIGHT_MARGIN);
-        let mut body = draw::glyph_text_rows(
+        let attribution = draw::glyph_text_rows(
             draw::ACT_GLYPH,
             gray(),
-            &format!(
-                "{}: {}",
-                one_line(&prompt.server_name, 64),
-                crate::text::sanitize_to_line(&prompt.message, usize::MAX)
-            ),
+            &format!("{}:", prompt.attribution()),
             Style::default(),
-            width,
-        );
+            usize::MAX,
+        )
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+        let message = prompt.message_line();
+        let message_rows = if message.trim().is_empty() {
+            Vec::new()
+        } else {
+            draw::edge_rows(draw::plain_lines(
+                &message,
+                width.saturating_sub(TEXT_EDGE),
+                Style::default(),
+            ))
+        };
         let fields = match prompt.kind {
             // A URL is a pick, not a typed answer: the three things that can be done with it are
             // the choices, the way the approval prompt's are. The URL is wrapped whole, since what
-            // is cut from a URL is what the browser is about to open.
+            // is cut from a URL is what the browser is about to open, and laid out as it came,
+            // the one string that is then opened. It stands ahead of the message, which is the
+            // server's to make as long as it likes: the panel opens on the top of its body, so no
+            // message pushes the URL out of view.
             ElicitationKind::Url { url } => {
-                body.extend(draw::edge_rows(draw::plain_lines(
-                    &crate::text::sanitize_to_line(&url, usize::MAX),
+                let mut body = draw::edge_rows(draw::plain_lines(
+                    &url,
                     width.saturating_sub(TEXT_EDGE),
                     gray(),
-                )));
+                ));
+                body.extend(message_rows);
                 let choices = URL_CHOICES
                     .iter()
                     .map(|(label, key)| Choice {
@@ -1220,7 +1294,7 @@ impl Screen {
                     })
                     .collect();
                 self.open_panel(
-                    Panel::with_choices(body, choices, 0),
+                    Panel::with_choices(body, choices, 0).with_heading(attribution),
                     PanelKind::OpenUrl(UrlQuestion { url, responder }),
                 );
                 return;
@@ -1268,7 +1342,9 @@ impl Screen {
         };
         self.overlay = Some(Overlay::Elicitation(Elicitation {
             responder,
-            body,
+            attribution,
+            body: message_rows,
+            scroll: BodyScroll::default(),
             fields,
             index: 0,
             filled: serde_json::Map::new(),
@@ -1310,20 +1386,8 @@ impl Screen {
 
     /// What was picked for a URL a server wants opened.
     fn answer_url(question: UrlQuestion, index: usize) {
-        let response = match index {
-            0 => {
-                if let Err(error) = open::that(&question.url) {
-                    // The URL is on screen; a launch failure on a headless host is expected
-                    // noise.
-                    tracing::debug!("failed to open the browser: {error}");
-                }
-                ElicitationResponse::Accept { content: None }
-            }
-            1 => ElicitationResponse::Cancel,
-            _ => ElicitationResponse::Decline,
-        };
-        if question.responder.send(response).is_err() {
-            tracing::trace!("the turn that asked has already moved on");
+        if let Some(url) = question.answer(index) {
+            open_in_browser(url);
         }
     }
 
@@ -1648,9 +1712,17 @@ impl Screen {
                 Some(Overlay::Panel { panel, .. }) => panel.pick_next(),
                 _ => self.composer.pick_next(),
             },
+            // A panel takes the page keys, and so does a question whose message runs past its
+            // rows, since what is out of view there is what the answer is given to. A question
+            // that shows all of its message leaves them to the transcript.
             Action::ScrollUp => match self.overlay.as_mut() {
                 Some(Overlay::Panel { panel, .. }) => {
                     panel.page_previous(self.viewport.page().unsigned_abs());
+                }
+                Some(Overlay::Elicitation(elicitation)) if elicitation.scroll.is_scrollable() => {
+                    elicitation
+                        .scroll
+                        .page_up(self.viewport.page().unsigned_abs());
                 }
                 _ => self.viewport.scroll_by(-self.viewport.page()),
             },
@@ -1658,14 +1730,25 @@ impl Screen {
                 Some(Overlay::Panel { panel, .. }) => {
                     panel.page_next(self.viewport.page().unsigned_abs());
                 }
+                Some(Overlay::Elicitation(elicitation)) if elicitation.scroll.is_scrollable() => {
+                    elicitation
+                        .scroll
+                        .page_down(self.viewport.page().unsigned_abs());
+                }
                 _ => self.viewport.scroll_by(self.viewport.page()),
             },
             Action::ScrollTop => match self.overlay.as_mut() {
                 Some(Overlay::Panel { panel, .. }) => panel.pick_first(),
+                Some(Overlay::Elicitation(elicitation)) if elicitation.scroll.is_scrollable() => {
+                    elicitation.scroll.scroll_to_top();
+                }
                 _ => self.viewport.scroll_to_top(),
             },
             Action::ScrollBottom => match self.overlay.as_mut() {
                 Some(Overlay::Panel { panel, .. }) => panel.pick_last(),
+                Some(Overlay::Elicitation(elicitation)) if elicitation.scroll.is_scrollable() => {
+                    elicitation.scroll.scroll_to_end();
+                }
                 _ => self.back_to_bottom(),
             },
             Action::CursorPrevious => {
@@ -2561,10 +2644,20 @@ impl Screen {
         match mouse.kind {
             MouseEventKind::ScrollUp => match self.overlay.as_mut() {
                 Some(Overlay::Panel { panel, .. }) if over_overlay => panel.scroll_by(-wheel),
+                Some(Overlay::Elicitation(elicitation))
+                    if over_overlay && elicitation.scroll.is_scrollable() =>
+                {
+                    elicitation.scroll.scroll_by(-wheel);
+                }
                 _ => self.viewport.scroll_by(-wheel),
             },
             MouseEventKind::ScrollDown => match self.overlay.as_mut() {
                 Some(Overlay::Panel { panel, .. }) if over_overlay => panel.scroll_by(wheel),
+                Some(Overlay::Elicitation(elicitation))
+                    if over_overlay && elicitation.scroll.is_scrollable() =>
+                {
+                    elicitation.scroll.scroll_by(wheel);
+                }
                 _ => self.viewport.scroll_by(wheel),
             },
             // A press starts a selection; whether it was a click is known at the release.
@@ -2954,11 +3047,7 @@ impl Screen {
         let most_panel = (area.height / PANEL_SHARE).max(2);
         let bottom_height = match &mut self.overlay {
             Some(Overlay::Panel { panel, .. }) => panel.height(area.width as usize, most_panel),
-            Some(Overlay::Elicitation(elicitation)) => u16::try_from(elicitation.body.len())
-                .unwrap_or(u16::MAX)
-                .saturating_add(1)
-                .min(most_panel)
-                .max(2),
+            Some(Overlay::Elicitation(elicitation)) => elicitation.height(most_panel),
             None if self.composer.search.is_some() => 1 + chrome_rows + status_height,
             None => {
                 self.composer.height(
@@ -3041,11 +3130,14 @@ impl Screen {
                 self.overlay_area = Some(bottom_area);
             }
             Some(Overlay::Elicitation(elicitation)) => {
+                let question = elicitation.question();
                 view::draw_question(
                     frame,
                     bottom_area,
+                    &elicitation.attribution,
                     &elicitation.body,
-                    &elicitation.question(),
+                    &mut elicitation.scroll,
+                    &question,
                     &elicitation.answer,
                 );
                 self.overlay_area = Some(bottom_area);
@@ -3817,6 +3909,122 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A URL question answers the server before it hands the URL back to be opened, and hands
+    /// it back for the one pick that opens it; one nobody waits on any more opens nothing.
+    #[test]
+    fn a_url_question_is_answered_before_its_url_is_opened() {
+        let question = || {
+            let (responder, answer) = tokio::sync::oneshot::channel();
+            let question = UrlQuestion {
+                url: "https://example.test/login".to_string(),
+                responder,
+            };
+            (question, answer)
+        };
+        let (asked, mut answer) = question();
+        assert_eq!(
+            asked.answer(0).as_deref(),
+            Some("https://example.test/login")
+        );
+        assert!(
+            matches!(
+                answer.try_recv(),
+                Ok(ElicitationResponse::Accept { content: None })
+            ),
+            "the answer is in hand when the URL comes back"
+        );
+        for (index, declines) in [(1, false), (2, true)] {
+            let (asked, mut answer) = question();
+            assert_eq!(asked.answer(index), None, "only the first pick opens");
+            assert_eq!(
+                matches!(answer.try_recv(), Ok(ElicitationResponse::Decline)),
+                declines
+            );
+        }
+        let (asked, answer) = question();
+        drop(answer);
+        assert_eq!(asked.answer(0), None, "nobody waits on the answer");
+    }
+
+    /// A sub-agent's approval prompt reaches the screen with the sub-agent asking, and the
+    /// panel's heading names it ahead of the tool; the session's own prompt is headed by the
+    /// call's row alone.
+    #[tokio::test]
+    async fn an_approval_panel_names_the_sub_agent_asking() {
+        use crate::frontend::{Frontend, PermissionRequest};
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let frontend = std::sync::Arc::new(super::super::frontend::TuiFrontend::new(
+            super::super::frontend::Ui::new(sender),
+        ));
+        let worker = uuid::Uuid::parse_str("3e9b51d0-0000-4000-8000-000000000000").expect("id");
+        for (subagent_id, expected) in [
+            (Some(worker), "Sub-agent 3e9b51d0: file_write"),
+            (None, "file_write"),
+        ] {
+            let asking = tokio::spawn({
+                let frontend = std::sync::Arc::clone(&frontend);
+                async move {
+                    frontend
+                        .request_permission(PermissionRequest {
+                            tool_name: "file_write".to_string(),
+                            primary_param: None,
+                            input: serde_json::json!({ "path": "notes.txt" }),
+                            cancellation: tokio_util::sync::CancellationToken::new(),
+                            tool_call: None,
+                            subagent_id,
+                        })
+                        .await
+                }
+            });
+            let Some(UiEvent::Approval(request)) = receiver.recv().await else {
+                panic!("the screen is asked");
+            };
+            let heading: String = approval_title(&request, 80)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(
+                heading,
+                format!("{:<TEXT_EDGE$}{expected}", draw::ACT_GLYPH),
+                "the heading of a prompt asked by {subagent_id:?}"
+            );
+            asking.abort();
+        }
+    }
+
+    /// The asker stands ahead of the tool's name as a span of its own, so the name is drawn as on
+    /// the session's own prompt: an MCP tool's server prefix dimmed, its own name in the accent.
+    #[test]
+    fn a_sub_agent_s_heading_draws_the_tool_s_name_as_the_session_s_own_does() {
+        let title = |subagent_id| {
+            let (responder, _answer) = tokio::sync::oneshot::channel();
+            approval_title(
+                &ApprovalRequest {
+                    tool_name: "mcp__exa__web_search".to_string(),
+                    input: serde_json::Value::Null,
+                    subagent_id,
+                    cancellation: tokio_util::sync::CancellationToken::new(),
+                    responder,
+                },
+                80,
+            )
+        };
+        let own = title(None);
+        let worker = uuid::Uuid::parse_str("3e9b51d0-0000-4000-8000-000000000000").expect("id");
+        let asked = title(Some(worker));
+        assert_eq!(
+            asked.spans.get(1).map(|span| span.content.as_ref()),
+            Some("Sub-agent 3e9b51d0: ")
+        );
+        assert_eq!(asked.spans.get(2..), own.spans.get(1..), "{asked:?}");
+        assert_eq!(
+            own.spans.len(),
+            3,
+            "the glyph, the server's prefix, the name: {own:?}"
+        );
+    }
 
     /// Within the grace a question takes no answer, but a form's field takes its text: a key
     /// swallowed there is gone, while the Enter that would send it is the one that waits. A

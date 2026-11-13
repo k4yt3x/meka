@@ -149,7 +149,9 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    user through the session's `Frontend`. The screen, the one-shot run, ACP and HTTP each
    implement it once; a
    sub-agent's `PermissionForwardingFrontend` forwards its approval prompts and notices to its
-   parent's; `SilentFrontend` answers a call with nobody behind it.
+   parent's, stamped with the sub-agent asking, which `frontend::approval_asker` puts at the
+   head of the screen's panel and the ACP card; `SilentFrontend` answers a call with nobody
+   behind it.
 
 ## Where state lives
 
@@ -217,7 +219,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | The refusal for a level the set does not admit | `EnabledPermissions::disabled_level`, raising `MekaError::DisabledLevel` | `SharedPermission::try_set` behind `/permission`, ACP `session/set_mode` and its permission option; HTTP create and `PATCH` |
 | Whether a profile name is configured | `config::require_profile`, raising `MekaError::ProfileNotConfigured` | `--profile` and `default_profile` selection, `resolve_profile_switch` and the resume repin (`host/assembly.rs`), HTTP create and `PATCH`, the provider registry, `meka profile use` |
 | What a session's row may move to, and what a failed write costs | `Store::update_session` taking a `SessionPatch`; the policy is `host::record_session_change` | screen `/permission`, `/approvals`, `/cd`; ACP `session/set_mode` and `session/set_config_option`; HTTP `PATCH`; the profile switch and resume reconciliation. A patch that fails to write the level, switch, directory or roots is warned about and the command continues; one carrying a profile fails the request. The one writer below `host` is the sub-agent tool recording the profile a worker ran on, which warns. |
-| Whether a working directory is accepted, and how it is spelled | `workspace::accept_cwd`; `cwd_filter` for a listing filter | ACP `session/new`, `load`, `resume`, `fork`; screen `/cd`; HTTP create, `PATCH` and `?cwd=` |
+| Whether a working directory is accepted, and how it is spelled | `workspace::accept_cwd`, over `judge_directory`; `cwd_filter` for a listing filter | ACP `session/new`, `load`, `resume`, `fork`; screen `/cd`; HTTP create, `PATCH` and `?cwd=`; both import doors ask `judge_directory` of each directory an archive names, and leave out one it refuses |
 | Whether a session accepts an image | `ResidentSession::accepts_images`, off the published profile's `vision` | HTTP `POST /turns`, ACP `session/prompt` |
 | A session's title | `Conversation::title` (the first user `Append` in the log with a non-blank `Text` block or another block carrying a person's words, whitespace collapsed, `TITLE_CHARS` = 200; `TITLE_ROW_WHERE_SQL` is the same rule in SQL) | `SessionSummary`, the HTTP turn response, ACP's title update (from the resident log after a first prompt, from the row on a load, resume or fork, since a hydrated log begins at the last boundary) |
 | Making a persisted session resident | `Store::open_session_row`: lock first, then read | screen and one-shot resume, `serve` re-attach (`ensure_session_loaded`), ACP `session/load` and `session/resume` |
@@ -248,6 +250,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | How long a host waits for an approval answer | `APPROVAL_TIMEOUT` in `frontend.rs` (30 minutes) | the ACP and HTTP frontends; the screen has a human and no timeout |
 | How a notice serializes | `NoticeView` | SSE `notice`, the blocking response, the one-shot JSON report |
 | Whether an upstream's own words may reach a caller | `host::relay_provider_errors`, bounded by `error::bounded_upstream_body` | `ProblemDetail::for_error`'s `provider_response`, `acp_error_for`'s `data` |
+| Which URL a server may have a browser sent to | `mcp::handler::browser_url`: `http` or `https`, in its parsed form | `mcp::handler::elicit`, ahead of every host's elicitation prompt; `mcp::auth`, ahead of every `LoginPrompt::authorize_at` |
 | How much of a reply is read | `error::MAX_REPLY_BYTES`, through `error::read_whole_reply` for a whole reply and `provider::sse::drive` for one streamed event; a redirect is refused ahead of either by `provider::succeeded`, since `provider::build_http_client` follows none | every provider reply, the token exchange included |
 | Whether a skill's name resolves outside Meka's own store | `skills::refuse_foreign_write` / `refuse_foreign_delete`, both on `foreign_location` | `skill_write`, `skill_edit`, `skill_delete`, `meka skill add`/`remove`, `PUT`/`DELETE /v1/skills/{name}`; the `ForeignSkill` it hands back renders with the path for a local reader and without it on the wire |
 | Whether an older Meka wrote the store | `store/migrations.rs` alone | nothing else may know |

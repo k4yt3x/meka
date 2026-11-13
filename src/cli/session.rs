@@ -106,14 +106,11 @@ pub(crate) async fn fork_session_command(
 pub(crate) async fn run_session_subcommand(
     store: &Store,
     action: &cli::SessionAction,
-    // How `import` settles each archived session's profile: the `--profile` flag as passed, the
-    // installation's default and its configured profiles. The flag is carried unresolved so that
-    // `meka --profile work session import` moves the archive per run, while the migration context
-    // the caller also builds ignores it, because that stamps rows once and irreversibly. Unused by
-    // every other action here.
-    profiles: crate::store::export::ImportInstallation<'_>,
-    // The level such an archive's sessions adopt when they record none, for the same reason.
-    default_permission: Option<crate::permission::Permission>,
+    // The run's flags, which `import` settles each archived session against: `meka --profile work
+    // session import` moves the archive onto a profile and `--permission` names the level its
+    // sessions start at, per run, while the migration context the caller builds ignores both,
+    // because that stamps rows once and irreversibly. Unused by every other action here.
+    overrides: crate::config::CliOverrides,
 ) -> anyhow::Result<()> {
     match action {
         cli::SessionAction::List {
@@ -183,9 +180,7 @@ pub(crate) async fn run_session_subcommand(
                 unresolved.len() + resolved.len()
             )
         }
-        cli::SessionAction::Import { input } => {
-            import_session(store, input, profiles, default_permission).await
-        }
+        cli::SessionAction::Import { input } => import_session(store, input, overrides).await,
         cli::SessionAction::Show { session_id, format } => {
             let session_id = store.resolve_session_id(session_id).await?;
             show_session(store, session_id, *format).await
@@ -606,15 +601,14 @@ fn write_export(path: &std::path::Path, body: &str) -> std::io::Result<()> {
 pub(crate) async fn import_session(
     store: &Store,
     input: &str,
-    profiles: crate::store::export::ImportInstallation<'_>,
-    default_permission: Option<crate::permission::Permission>,
+    overrides: crate::config::CliOverrides,
 ) -> anyhow::Result<()> {
     // A `config.toml` that did not parse leaves nothing to check an archive's profile name
     // against, so the import is refused ahead of the first write rather than writing that name
     // unchecked. Here rather than in `main.rs`, whose unreadable-config arm serves every
     // subcommand and has to stay open for the ones that repair the file.
-    crate::config::ResolvedConfig::resolve(crate::config::CliOverrides::default())
-        .require_readable_config()?;
+    let config = crate::config::ResolvedConfig::resolve(overrides);
+    config.require_readable_config()?;
     let raw = if input == "-" {
         let mut buffer = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
@@ -634,7 +628,16 @@ pub(crate) async fn import_session(
         records,
         blobs,
         root_new_id,
-    } = crate::store::export::plan_import(export, profiles, default_permission)?;
+    } = crate::store::export::plan_import(export, crate::store::export::ImportInstallation {
+        // The flag as passed, and the default the file picks without it.
+        selected: config.request.requested_profile.as_deref(),
+        default: config.configured_default_profile.as_deref(),
+        configured: Some(&config.profiles),
+        projects: store.project_names().await?,
+        permission: config.permission,
+        approvals: config.approvals,
+        accept_directory: crate::workspace::judge_directory,
+    })?;
     let count = records.len();
     store.import_sessions(records, blobs).await?;
 
@@ -1056,14 +1059,6 @@ mod tests {
         )
         .expect("write archive");
         let store = Store::for_test().await;
-        // What `main.rs` hands this door when the file could not be read: nothing to check against.
-        let profiles = crate::store::export::ImportInstallation {
-            selected: None,
-            default: None,
-            configured: None,
-            projects: Vec::new(),
-        };
-
         // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serializes every test
         // that sets it.
         let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
@@ -1071,8 +1066,7 @@ mod tests {
         let result = import_session(
             &store,
             &archive.to_string_lossy(),
-            profiles,
-            Some(crate::permission::Permission::Read),
+            crate::config::CliOverrides::default(),
         )
         .await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };

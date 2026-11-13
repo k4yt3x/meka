@@ -6,6 +6,9 @@
 //! body with choices to pick from (`/permission`, `/profile`, the approval prompt). It wears the
 //! composer's background, since it stands where the composer stood and is a layer over the
 //! transcript, not part of it.
+//!
+//! A body longer than its rows is read through a [`BodyScroll`], here and in the question that
+//! takes a typed answer, so whatever cuts a body can scroll it and says how much is out of view.
 
 use ratatui::{
     Frame,
@@ -25,6 +28,89 @@ pub(crate) struct Choice {
     pub(crate) key: Option<char>,
     /// What it is, shown after the label in place of a key.
     pub(crate) description: Option<String>,
+}
+
+/// Where a body longer than its rows is read from.
+#[derive(Debug, Default)]
+pub(crate) struct BodyScroll {
+    /// The first body row on screen.
+    first: usize,
+    /// The body rows the last frame had room for: the most a page moves, so paging skips none.
+    room: usize,
+    /// The rows the body had on the last frame.
+    rows: usize,
+}
+
+impl BodyScroll {
+    /// `delta` rows down, or up when it is negative.
+    pub(crate) fn scroll_by(&mut self, delta: isize) {
+        self.first = if delta < 0 {
+            self.first.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.first.saturating_add(delta.unsigned_abs())
+        };
+    }
+
+    /// A page of `rows` up, or of the rows on screen where those are fewer.
+    pub(crate) fn page_up(&mut self, rows: usize) {
+        self.first = self.first.saturating_sub(self.page(rows));
+    }
+
+    /// A page of `rows` down, or of the rows on screen where those are fewer.
+    pub(crate) fn page_down(&mut self, rows: usize) {
+        self.first = self.first.saturating_add(self.page(rows));
+    }
+
+    fn page(&self, rows: usize) -> usize {
+        rows.min(self.room).max(1)
+    }
+
+    /// The top of the body.
+    pub(crate) fn scroll_to_top(&mut self) {
+        self.first = 0;
+    }
+
+    /// The end of the body, which the next frame clamps to.
+    pub(crate) fn scroll_to_end(&mut self) {
+        self.first = usize::MAX;
+    }
+
+    /// The rows a frame with `room` for a body of `rows` shows, the position held inside the
+    /// body.
+    pub(crate) fn window(&mut self, rows: usize, room: usize) -> std::ops::Range<usize> {
+        self.room = room;
+        self.rows = rows;
+        self.first = self.first.min(rows.saturating_sub(room));
+        self.first..self.first.saturating_add(room).min(rows)
+    }
+
+    /// Whether a key that scrolls the body has anything to bring into view: the last frame
+    /// showed some of it and not all.
+    pub(crate) fn is_scrollable(&self) -> bool {
+        self.room > 0 && self.rows > self.room
+    }
+}
+
+/// What a footer says of a body of `rows` with only `shown` on screen: the keys that bring the
+/// rest in, and how many rows there are each way. `None` for a body all in view, and for one
+/// with no row on screen, where no key brings one in.
+pub(crate) fn out_of_view_note(
+    keys: &str,
+    rows: usize,
+    shown: &std::ops::Range<usize>,
+) -> Option<String> {
+    let (above, below) = (shown.start, rows.saturating_sub(shown.end));
+    if shown.is_empty() || (above == 0 && below == 0) {
+        return None;
+    }
+    let mut note = format!("{keys} scroll");
+    if above > 0 {
+        note.push_str(&format!(" · {above} above"));
+    }
+    if below > 0 {
+        note.push_str(&format!(" · {below} below"));
+    }
+    Some(note)
 }
 
 /// The panel's state between frames.
@@ -50,8 +136,7 @@ pub(crate) struct Panel {
     wrapped: Option<(usize, Vec<Line<'static>>)>,
     choices: Vec<Choice>,
     picked: usize,
-    /// The first body row on screen.
-    scroll: usize,
+    scroll: BodyScroll,
 }
 
 impl Panel {
@@ -81,7 +166,7 @@ impl Panel {
             wrapped: None,
             choices: Vec::new(),
             picked: 0,
-            scroll: 0,
+            scroll: BodyScroll::default(),
         }
     }
 
@@ -102,13 +187,13 @@ impl Panel {
             wrapped: None,
             picked: picked.min(choices.len().saturating_sub(1)),
             choices,
-            scroll: 0,
+            scroll: BodyScroll::default(),
         }
     }
 
     /// The same panel opened at the end of its body, where the newest of a log is.
     pub(crate) fn scrolled_to_end(mut self) -> Self {
-        self.scroll = usize::MAX;
+        self.scroll.scroll_to_end();
         self
     }
 
@@ -202,55 +287,68 @@ impl Panel {
         self.shown().get(self.picked).copied()
     }
 
-    /// Up: the pick one back, or the body one row up.
+    /// Whether the page keys and the wheel move the pick: where choices are all there is. Under a
+    /// body they scroll it, with choices or without, since the arrows are what move a pick and a
+    /// body cut short with no key to scroll it is one answered unread.
+    fn pages_the_pick(&self) -> bool {
+        self.body.is_empty()
+    }
+
+    /// Up: the pick one back, or the body one row up where there is nothing to pick.
     pub(crate) fn pick_previous(&mut self) {
         if self.has_choices() {
             self.picked = self.picked.saturating_sub(1);
         } else {
-            self.scroll = self.scroll.saturating_sub(1);
+            self.scroll.scroll_by(-1);
         }
     }
 
-    /// Down: the pick one on, among what is shown, or the body one row down.
+    /// Down: the pick one on, among what is shown, or the body one row down where there is
+    /// nothing to pick.
     pub(crate) fn pick_next(&mut self) {
         if self.has_choices() {
             self.picked = (self.picked + 1).min(self.shown().len().saturating_sub(1));
         } else {
-            self.scroll = self.scroll.saturating_add(1);
+            self.scroll.scroll_by(1);
         }
     }
 
-    /// PgUp: the pick a page of choices up, or the body a page of `rows` up.
+    /// PgUp: the body a page of `rows` up, or the pick a page of choices up where there is no
+    /// body.
     pub(crate) fn page_previous(&mut self, rows: usize) {
-        if self.has_choices() {
+        if self.pages_the_pick() {
             self.picked = self.picked.saturating_sub(self.page_rows.max(1));
         } else {
-            self.scroll = self.scroll.saturating_sub(rows);
+            self.scroll.page_up(rows);
         }
     }
 
-    /// PgDn: the pick a page of choices down, or the body a page of `rows` down.
+    /// PgDn: the body a page of `rows` down, or the pick a page of choices down where there is
+    /// no body.
     pub(crate) fn page_next(&mut self, rows: usize) {
-        if self.has_choices() {
+        if self.pages_the_pick() {
             self.picked =
                 (self.picked + self.page_rows.max(1)).min(self.shown().len().saturating_sub(1));
         } else {
-            self.scroll = self.scroll.saturating_add(rows);
+            self.scroll.page_down(rows);
         }
     }
 
-    /// Ctrl+Home: the first choice, or the top of the body.
+    /// Ctrl+Home: the top of the body, or the first choice where there is no body.
     pub(crate) fn pick_first(&mut self) {
-        self.picked = 0;
-        self.scroll = 0;
+        if self.pages_the_pick() {
+            self.picked = 0;
+        } else {
+            self.scroll.scroll_to_top();
+        }
     }
 
-    /// Ctrl+End: the last choice, or the end of the body, which the next frame clamps to.
+    /// Ctrl+End: the end of the body, or the last choice where there is no body.
     pub(crate) fn pick_last(&mut self) {
-        if self.has_choices() {
+        if self.pages_the_pick() {
             self.picked = self.shown().len().saturating_sub(1);
         } else {
-            self.scroll = usize::MAX;
+            self.scroll.scroll_to_end();
         }
     }
 
@@ -270,20 +368,16 @@ impl Panel {
             .position(|choice| choice.key == Some(key.to_ascii_lowercase()))
     }
 
-    /// The wheel: the pick by `delta` rows where there are choices, else the body.
+    /// The wheel: the body by `delta` rows, or the pick where there is no body.
     pub(crate) fn scroll_by(&mut self, delta: isize) {
-        if self.has_choices() {
-            self.picked = if delta < 0 {
-                self.picked.saturating_sub(delta.unsigned_abs())
-            } else {
-                (self.picked + delta.unsigned_abs()).min(self.shown().len().saturating_sub(1))
-            };
+        if !self.pages_the_pick() {
+            self.scroll.scroll_by(delta);
             return;
         }
-        self.scroll = if delta < 0 {
-            self.scroll.saturating_sub(delta.unsigned_abs())
+        self.picked = if delta < 0 {
+            self.picked.saturating_sub(delta.unsigned_abs())
         } else {
-            self.scroll.saturating_add(delta as usize)
+            (self.picked + delta.unsigned_abs()).min(self.shown().len().saturating_sub(1))
         };
     }
 
@@ -338,8 +432,10 @@ impl Panel {
     /// Rows the panel wants at `width`, between two and `most`.
     pub(crate) fn height(&mut self, width: usize, most: u16) -> u16 {
         let body = self.wrapped_body(width).len();
-        let rows = self.fixed_rows() + body;
-        (rows.max(2) as u16).min(most.max(2))
+        let rows = self.fixed_rows().saturating_add(body);
+        u16::try_from(rows)
+            .unwrap_or(u16::MAX)
+            .clamp(2, most.max(2))
     }
 
     /// Draw the panel into `area`, on the composer's background: the heading when there is one,
@@ -355,24 +451,23 @@ impl Panel {
                 width.saturating_sub(draw::RIGHT_MARGIN),
             ));
         }
-        // The choices come first and scroll to keep the pick in view; the body takes the rest.
+        // The choices come first and scroll to keep the pick in view; the body takes the rest,
+        // and a row at the least where there are two to share, so paging can bring any of it
+        // into view however many choices there are.
         let frame_rows = usize::from(self.heading.is_some()) + 1;
         let offered = self.shown();
-        let choice_rows = offered
-            .len()
-            .min((area.height as usize).saturating_sub(frame_rows));
-        self.page_rows = choice_rows;
-        let room = (area.height as usize).saturating_sub(frame_rows + choice_rows);
+        let available = (area.height as usize).saturating_sub(frame_rows);
         let body_rows = self.wrapped_body(width).len();
-        let most = body_rows.saturating_sub(room);
-        self.scroll = self.scroll.min(most);
-        let scroll = self.scroll;
+        let kept_for_body = usize::from(body_rows > 0 && available > 1);
+        let choice_rows = offered.len().min(available - kept_for_body);
+        self.page_rows = choice_rows;
+        let in_view = self.scroll.window(body_rows, available - choice_rows);
         let at_edge = self.body_at_edge;
         let shown: Vec<Line<'static>> = self
             .wrapped_body(width)
+            .get(in_view.clone())
+            .unwrap_or_default()
             .iter()
-            .skip(scroll)
-            .take(room)
             .cloned()
             .map(|mut line| {
                 if at_edge {
@@ -381,7 +476,6 @@ impl Panel {
                 line
             })
             .collect();
-        let hidden_below = body_rows.saturating_sub(scroll + room);
         lines.extend(shown);
         let rows: Vec<super::view::ListRow> = offered
             .iter()
@@ -401,12 +495,19 @@ impl Panel {
                 .skip(first_choice)
                 .take(choice_rows),
         );
+        // The keys named are the ones that scroll what is cut: the arrows move the pick where
+        // there is one, and with it the choices, so under choices the body is the page keys'.
         let mut footer = self.footer();
-        if self.scroll > 0 || hidden_below > 0 || choice_rows < offered.len() {
+        let body_keys = if self.has_choices() {
+            "PgUp PgDn"
+        } else {
+            "↑↓"
+        };
+        if let Some(note) = out_of_view_note(body_keys, body_rows, &in_view) {
+            footer.push_str(" · ");
+            footer.push_str(&note);
+        } else if choice_rows < offered.len() {
             footer.push_str(" · ↑↓ scroll");
-            if hidden_below > 0 {
-                footer.push_str(&format!(" · {hidden_below} more below"));
-            }
         }
         let footer = draw::cut_text(
             &footer,
@@ -614,7 +715,7 @@ mod tests {
         let shown = rows(&terminal);
         assert_eq!(shown[0], "  row 1");
         assert_eq!(shown[4], "  row 5");
-        assert_eq!(shown[5], "  Esc to close · ↑↓ scroll · 5 more below");
+        assert_eq!(shown[5], "  Esc to close · ↑↓ scroll · 5 below");
         let buffer = terminal.backend().buffer();
         assert_eq!(
             buffer[(buffer.area.width - 1, 2)].style().bg,
@@ -630,7 +731,137 @@ mod tests {
             shown[4], "  row 10",
             "the scroll clamps at the end: {shown:?}"
         );
+        assert_eq!(shown[5], "  Esc to close · ↑↓ scroll · 5 above");
         assert_eq!(panel.height(50, 30), 11, "the footer and ten rows of body");
+    }
+
+    /// A body is scrollable where the last frame showed some of it and not all: not before a
+    /// frame, not where it all fits, and not where it has no row to show in.
+    #[test]
+    fn a_body_is_scrollable_only_where_some_of_it_shows_and_not_all() {
+        let mut scroll = BodyScroll::default();
+        assert!(!scroll.is_scrollable(), "before any frame");
+        let _shown = scroll.window(5, 5);
+        assert!(!scroll.is_scrollable(), "all in view");
+        let _shown = scroll.window(5, 0);
+        assert!(!scroll.is_scrollable(), "no row to show it in");
+        let _shown = scroll.window(5, 2);
+        assert!(scroll.is_scrollable());
+    }
+
+    /// The approval prompt's shape: a heading, a body longer than its rows, and answers under
+    /// it.
+    fn question(body_rows: usize) -> Panel {
+        let body = (1..=body_rows)
+            .map(|n| Line::from(format!("  row {n}")))
+            .collect();
+        let choices = [("Allow", 'y'), ("Deny", 'n')]
+            .into_iter()
+            .map(|(label, key)| Choice {
+                label: label.to_string(),
+                key: Some(key),
+                description: None,
+            })
+            .collect();
+        Panel::with_choices(body, choices, 0).with_heading("file_write notes.txt")
+    }
+
+    fn drawn(panel: &mut Panel, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(80, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        terminal
+            .draw(|frame| panel.draw(frame, frame.area()))
+            .expect("a frame");
+        rows(&terminal)
+    }
+
+    /// Under a body with answers below it, the page keys and the wheel scroll the body, a page
+    /// at a time at most so none of it is skipped, and the arrows go on moving the pick; the
+    /// footer names the keys that scroll and says how much is out of view each way. What the
+    /// body hides is what the answer is given to unread.
+    #[test]
+    fn a_body_over_choices_scrolls_while_the_arrows_keep_the_pick() {
+        let mut panel = question(30);
+        let shown = drawn(&mut panel, 10);
+        assert_eq!(shown[1], "  row 1", "{shown:#?}");
+        assert_eq!(shown[6], "  row 6", "{shown:#?}");
+        assert_eq!(shown[7], "  Allow  y", "{shown:#?}");
+        assert_eq!(
+            shown[9],
+            "  Enter to select · Esc to close · PgUp PgDn scroll · 24 below"
+        );
+
+        panel.pick_next();
+        assert_eq!(panel.picked(), Some(1), "Down moves the pick");
+        assert_eq!(drawn(&mut panel, 10)[1], "  row 1", "and leaves the body");
+
+        panel.page_next(100);
+        let shown = drawn(&mut panel, 10);
+        assert_eq!(
+            shown[1], "  row 7",
+            "a page is the rows on screen, so the next starts under the last: {shown:#?}"
+        );
+        assert_eq!(panel.picked(), Some(1), "PgDn leaves the pick");
+        assert_eq!(
+            shown[9],
+            "  Enter to select · Esc to close · PgUp PgDn scroll · 6 above · 18 below"
+        );
+
+        panel.scroll_by(2);
+        assert_eq!(
+            drawn(&mut panel, 10)[1],
+            "  row 9",
+            "the wheel scrolls it too"
+        );
+        panel.page_previous(3);
+        assert_eq!(drawn(&mut panel, 10)[1], "  row 6");
+
+        panel.pick_last();
+        let shown = drawn(&mut panel, 10);
+        assert_eq!(shown[6], "  row 30", "Ctrl+End reaches the end: {shown:#?}");
+        assert_eq!(
+            shown[9],
+            "  Enter to select · Esc to close · PgUp PgDn scroll · 24 above"
+        );
+        panel.pick_first();
+        assert_eq!(drawn(&mut panel, 10)[1], "  row 1");
+        assert_eq!(panel.picked(), Some(1), "neither end moves the pick");
+    }
+
+    /// A panel too short for its answers and its body gives the body a row all the same, so
+    /// paging still brings every row of it into view.
+    #[test]
+    fn a_short_panel_keeps_a_row_of_the_body_over_its_choices() {
+        let mut panel = question(30);
+        let shown = drawn(&mut panel, 4);
+        assert_eq!(
+            shown[..3],
+            ["file_write notes.txt", "  row 1", "  Allow  y"],
+            "{shown:#?}"
+        );
+        panel.page_next(100);
+        assert_eq!(drawn(&mut panel, 4)[1], "  row 2");
+    }
+
+    /// A panel with no row to spare for its body names no key that scrolls it: paging there
+    /// changes a count and brings nothing into view. The arrows still scroll the answers.
+    #[test]
+    fn a_panel_with_no_row_for_its_body_names_no_key_that_scrolls_it() {
+        let mut panel = question(30);
+        let shown = drawn(&mut panel, 3);
+        assert_eq!(shown, [
+            "file_write notes.txt",
+            "  Allow  y",
+            "  Enter to select · Esc to close · ↑↓ scroll"
+        ]);
+    }
+
+    /// A body of more rows than a `u16` counts asks for the most the panel may have: a height
+    /// wrapped to nothing would leave the answers undrawn and Enter still picking the first.
+    #[test]
+    fn a_panel_s_height_is_clamped_before_it_is_narrowed() {
+        let mut panel = question(usize::from(u16::MAX) + 1 - 4);
+        assert_eq!(panel.height(60, 20), 20);
     }
 
     /// A text panel's words stop a column short of the right edge, a listing's description

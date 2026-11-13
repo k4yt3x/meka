@@ -474,8 +474,7 @@ pub(crate) struct ImportSessionRecord {
     pub(crate) new_parent_id: Option<Uuid>,
     pub(crate) created_at: String,
     pub(crate) cwd: Option<PathBuf>,
-    /// The level the row starts at; an archive that recorded none is given the config default by
-    /// `plan_import` before it reaches here.
+    /// The level the row starts at, which `plan_import` settles from the importing installation.
     pub(crate) permission: Permission,
     /// Whether calls above the level are submitted for approval.
     pub(crate) approvals: bool,
@@ -658,6 +657,11 @@ pub(crate) fn spawned_session_sql(qualifier: &str) -> String {
         "({qualifier}parent_session_id IS NOT NULL OR {qualifier}subagent_spec_json IS NOT NULL)"
     )
 }
+/// Whether a row with these two columns is a sub-agent's: the rule [`Store::spawn_terms`] reads a
+/// row by, for a door that settles a session by it before its row exists.
+pub(super) fn is_spawned(has_parent: bool, has_spawn_terms: bool) -> bool {
+    has_parent || has_spawn_terms
+}
 /// How far a search over sessions reaches.
 ///
 /// A session's own tools read its tree below `unrestricted` and the store at it; the operator's
@@ -701,8 +705,8 @@ pub(crate) struct SessionSummary {
     /// message's words. One string, because every surface labels a session with it and none of
     /// them asks which it was.
     pub(crate) title: String,
-    /// Working directory captured at session creation. `None` when an archive omitted one and
-    /// [`Store::import_sessions`] stored that absence verbatim; ACP-facing code falls
+    /// Working directory captured at session creation. `None` when an archive omitted one or
+    /// named one that is not a directory on the installation importing it; ACP-facing code falls
     /// back to the process cwd for display.
     pub(crate) cwd: Option<std::path::PathBuf>,
     /// The level the session runs at: written by every door that creates a row and by every
@@ -2371,7 +2375,7 @@ impl Store {
             })
             .map(|row| {
                 let (parent, spec) = row?;
-                if parent.is_none() && spec.is_none() {
+                if !is_spawned(parent.is_some(), spec.is_some()) {
                     return None;
                 }
                 Some(SpawnTerms {
@@ -6135,17 +6139,15 @@ mod tests {
             .await
             .expect("export");
         assert_eq!(archive.sessions[0].turns[0].permission, "workspace");
-        let plan = crate::store::export::plan_import(
-            archive,
-            crate::store::export::ImportInstallation {
+        let plan =
+            crate::store::export::plan_import(archive, crate::store::export::ImportInstallation {
                 selected: None,
                 default: None,
                 configured: None,
                 projects: Vec::new(),
-            },
-            Some(Permission::Read),
-        )
-        .expect("plans");
+                ..crate::store::export::ImportInstallation::for_test()
+            })
+            .expect("plans");
         let imported = plan.root_new_id;
         store
             .import_sessions(plan.records, plan.blobs)
@@ -8086,17 +8088,15 @@ mod tests {
         let archive = crate::store::export::build_session_export(&store, source)
             .await
             .expect("export");
-        let plan = crate::store::export::plan_import(
-            archive,
-            crate::store::export::ImportInstallation {
+        let plan =
+            crate::store::export::plan_import(archive, crate::store::export::ImportInstallation {
                 selected: None,
                 default: None,
                 configured: None,
                 projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        )
-        .expect("plans");
+                ..crate::store::export::ImportInstallation::for_test()
+            })
+            .expect("plans");
         let imported = plan.root_new_id;
         store
             .import_sessions(plan.records, plan.blobs)
@@ -11714,17 +11714,15 @@ mod tests {
             Some(3),
             None
         ]);
-        let plan = crate::store::export::plan_import(
-            archive,
-            crate::store::export::ImportInstallation {
+        let plan =
+            crate::store::export::plan_import(archive, crate::store::export::ImportInstallation {
                 selected: None,
                 default: None,
                 configured: None,
                 projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        )
-        .expect("plans");
+                ..crate::store::export::ImportInstallation::for_test()
+            })
+            .expect("plans");
         let imported = plan.root_new_id;
         store
             .import_sessions(plan.records, plan.blobs)
@@ -11848,17 +11846,15 @@ mod tests {
             ),
             "{carried:?}"
         );
-        let plan = crate::store::export::plan_import(
-            archive,
-            crate::store::export::ImportInstallation {
+        let plan =
+            crate::store::export::plan_import(archive, crate::store::export::ImportInstallation {
                 selected: None,
                 default: None,
                 configured: None,
                 projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        )
-        .expect("plans");
+                ..crate::store::export::ImportInstallation::for_test()
+            })
+            .expect("plans");
         let imported = plan.root_new_id;
         store
             .import_sessions(plan.records, plan.blobs)
@@ -12034,17 +12030,15 @@ mod tests {
         let archive = crate::store::export::build_session_export(&store, id)
             .await
             .expect("export");
-        let plan = crate::store::export::plan_import(
-            archive,
-            crate::store::export::ImportInstallation {
+        let plan =
+            crate::store::export::plan_import(archive, crate::store::export::ImportInstallation {
                 selected: None,
                 default: None,
                 configured: None,
                 projects: Vec::new(),
-            },
-            Some(crate::permission::Permission::Read),
-        )
-        .expect("plans");
+                ..crate::store::export::ImportInstallation::for_test()
+            })
+            .expect("plans");
         let imported = plan.root_new_id;
         store
             .import_sessions(plan.records, plan.blobs)

@@ -1069,9 +1069,10 @@ pub(crate) fn accept_cwd(path: &Path) -> crate::error::Result<PathBuf> {
 /// Whether `path` names a directory that is there, and its canonical spelling when it does; the
 /// failure is the reason, worded to follow the path, so each door prefixes its own noun.
 ///
-/// What [`accept_cwd`] asks of a working directory and [`accept_worker_scope`] of every directory
-/// a sub-agent holds, so a list entry is refused in the words a working directory is.
-fn judge_directory(path: &Path) -> Result<PathBuf, String> {
+/// What [`accept_cwd`] asks of a working directory, [`accept_worker_scope`] of every directory a
+/// sub-agent holds and an import of every directory an archive names, so a list entry is judged
+/// in the words a working directory is.
+pub(crate) fn judge_directory(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err("is not an absolute path".to_string());
     }

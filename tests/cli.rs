@@ -3148,6 +3148,82 @@ fn an_export_file_is_owner_only() {
     assert_eq!(mode, 0o600, "an export is private data");
 }
 
+/// An archive says what its session was allowed where it was written, and an import does not take
+/// its word: the copy starts at the level and the approvals switch a new session here would,
+/// `--permission` names another level for the run, and a directory that is not here is not
+/// recorded.
+#[test]
+fn an_imported_session_takes_this_installation_s_level_and_approvals() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"anthropic-messages\"\n\n\
+         [profiles.mock]\naccount = \"mock\"\nmodel = \"claude-sonnet-4-5\"\n\n[permissions]\n\
+         default = \"read\"\napprovals = true\n",
+    );
+    let run = run_scripted(&install, &["-p", "hi", "--oneshot"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let source = only_session(&install);
+    let exported = run_isolated(&install, &[
+        "session", "export", &source, "--format", "json", "-o", "-",
+    ]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let mut archive: serde_json::Value = serde_json::from_slice(&exported.stdout).expect("json");
+    let kept = install.root().join("kept");
+    std::fs::create_dir_all(&kept).expect("a directory that is here");
+    let session = &mut archive["sessions"][0];
+    session["permission"] = "unrestricted".into();
+    session["approvals"] = false.into();
+    session["working_directory"] = kept.to_string_lossy().into_owned().into();
+    session["additional_workspace_directories"] =
+        serde_json::json!([install.root().join("gone").to_string_lossy()]);
+    let path = install.root().join("archive.json");
+    std::fs::write(&path, archive.to_string()).expect("write the archive");
+    let path = path.to_str().expect("path");
+
+    let import = |flags: &[&str]| -> (String, bool, Option<String>, Option<String>) {
+        let mut arguments = flags.to_vec();
+        arguments.extend(["session", "import", path]);
+        let imported = run_isolated(&install, &arguments);
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        let id = String::from_utf8_lossy(&imported.stdout).trim().to_string();
+        store(&install)
+            .query_row(
+                "SELECT permission, approvals, working_directory, \
+                 additional_workspace_directories_json FROM sessions WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("the imported row")
+    };
+    let (permission, approvals, directory, roots) = import(&[]);
+    assert_eq!(permission, "read", "the installation's default level");
+    assert!(approvals, "the installation's approvals switch");
+    assert_eq!(
+        directory.map(std::path::PathBuf::from),
+        Some(std::fs::canonicalize(&kept).expect("canonical")),
+        "a directory that is here is recorded as every door records one"
+    );
+    assert!(
+        roots.is_none_or(|roots| roots == "[]"),
+        "a directory that is not here is not recorded"
+    );
+
+    let (permission, ..) = import(&["--permission", "workspace"]);
+    assert_eq!(permission, "workspace", "the level the run named");
+}
+
 /// `[session].retention` must not take the session `-r` names. The sweep spares only a
 /// session some process holds, so it has to run after the resume has taken its lock; run first, it
 /// deleted the conversation the user had just listed and then failed on "no session matches".

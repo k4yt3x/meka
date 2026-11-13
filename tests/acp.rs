@@ -3467,7 +3467,8 @@ enabled = ["read", "unrestricted"]
 /// parent's ACP connection. The parent triggers `agent_spawn`; the sub-agent runs in `ask` mode
 /// (inherited) and attempts `file_write`, which fires a `session/request_permission` on the
 /// *parent's* connection. The editor is never shown the sub-agent's call, so the prompt opens a
-/// card of its own and closes it with the answer, leaving the `agent_spawn` card as it was.
+/// card of its own, titled with the sub-agent asking, and closes it with the answer, leaving the
+/// `agent_spawn` card as it was.
 #[test]
 fn acp_subagent_permission_forwards_to_parent_client() {
     let config_toml = r#"
@@ -3565,11 +3566,15 @@ enabled = ["read", "unrestricted"]
         panic!("the prompt's card is opened and closed: {updates:?}");
     };
     assert_eq!(opened["sessionUpdate"], "tool_call", "{opened}");
+    let asker = opened["title"]
+        .as_str()
+        .and_then(|title| title.strip_prefix("Sub-agent "))
+        .and_then(|rest| rest.split_once(": "));
     assert!(
-        opened["title"]
-            .as_str()
-            .is_some_and(|title| title.starts_with("file_write ")),
-        "{opened}"
+        asker.is_some_and(|(id, call)| id.len() == 8
+            && id.chars().all(|c| c.is_ascii_hexdigit())
+            && call.starts_with("file_write ")),
+        "the card names the sub-agent asking, by its id's prefix, ahead of the call: {opened}"
     );
     assert_eq!(closed["status"], "completed", "{closed}");
     assert_eq!(

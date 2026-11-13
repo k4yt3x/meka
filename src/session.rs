@@ -788,6 +788,7 @@ mod tests {
             default,
             configured: None,
             projects: Vec::new(),
+            ..ImportInstallation::for_test()
         }
     }
 
@@ -840,7 +841,6 @@ mod tests {
                 projects: vec!["webdev".to_string()],
                 ..planner_profiles(Some("test-profile"))
             },
-            Some(crate::permission::Permission::Read),
         )
         .expect("plan");
         manager
@@ -871,7 +871,6 @@ mod tests {
         } = plan_import(
             serde_json::from_value(older).expect("parse"),
             planner_profiles(Some("test-profile")),
-            Some(crate::permission::Permission::Read),
         )
         .expect("plan");
         manager
@@ -910,14 +909,7 @@ mod tests {
             sessions: Vec::new(),
             blobs: Vec::new(),
         };
-        assert!(
-            plan_import(
-                export,
-                planner_profiles(None),
-                Some(crate::permission::Permission::Read)
-            )
-            .is_err()
-        );
+        assert!(plan_import(export, planner_profiles(None)).is_err());
     }
 
     /// An import longer than a transaction arrives whole: every event, the image a row in a later
@@ -958,7 +950,6 @@ mod tests {
         } = plan_import(
             serde_json::from_str(&json).expect("deserialize"),
             planner_profiles(None),
-            Some(crate::permission::Permission::Read),
         )
         .expect("plan");
         target
@@ -1172,11 +1163,11 @@ mod tests {
             records,
             blobs,
             root_new_id,
-        } = plan_import(
-            reparsed,
-            planner_profiles(None),
-            Some(crate::permission::Permission::Read),
-        )
+        } = plan_import(reparsed, ImportInstallation {
+            // Above the worker's own level, so its row shows which of the two it keeps.
+            permission: crate::permission::Permission::Unrestricted,
+            ..planner_profiles(None)
+        })
         .expect("plan");
         assert_ne!(root_new_id, root, "import mints a new id");
         manager
@@ -1217,7 +1208,7 @@ mod tests {
         assert_eq!(
             child_new.permission,
             Some(crate::permission::Permission::Read),
-            "a worker's row records the level it was spawned at"
+            "a worker's row keeps its own level under an installation that gives more"
         );
 
         // The turn came back as a row of its own, and the rows that named it name the copy.
@@ -1427,12 +1418,7 @@ mod tests {
             records,
             blobs,
             root_new_id: new_id,
-        } = plan_import(
-            reparsed,
-            planner_profiles(None),
-            Some(crate::permission::Permission::Read),
-        )
-        .expect("plan");
+        } = plan_import(reparsed, planner_profiles(None)).expect("plan");
         manager
             .import_sessions(records, blobs)
             .await
@@ -1479,12 +1465,7 @@ mod tests {
             records,
             blobs: _,
             root_new_id: _,
-        } = plan_import(
-            export,
-            planner_profiles(Some("work")),
-            Some(crate::permission::Permission::Read),
-        )
-        .expect("plan");
+        } = plan_import(export, planner_profiles(Some("work"))).expect("plan");
         assert!(records[0].additional_roots.is_empty());
         assert_eq!(
             records[0].profile, "work",
@@ -1522,11 +1503,7 @@ mod tests {
             "blobs": [],
         });
         let export: SessionExport = serde_json::from_value(json).expect("deserialize");
-        let Err(error) = plan_import(
-            export,
-            planner_profiles(None),
-            Some(crate::permission::Permission::Read),
-        ) else {
+        let Err(error) = plan_import(export, planner_profiles(None)) else {
             panic!("no default and no recorded profile must refuse the import");
         };
         assert!(
@@ -1588,12 +1565,7 @@ mod tests {
             records,
             blobs: _,
             root_new_id: _,
-        } = plan_import(
-            hostile,
-            planner_profiles(None),
-            Some(crate::permission::Permission::Read),
-        )
-        .expect("plan");
+        } = plan_import(hostile, planner_profiles(None)).expect("plan");
         assert_eq!(
             records[0].profile, "work",
             "the session runs on its profile, and the endpoint comes from that profile alone"
@@ -1605,12 +1577,7 @@ mod tests {
             records,
             blobs: _,
             root_new_id: _,
-        } = plan_import(
-            plain,
-            planner_profiles(None),
-            Some(crate::permission::Permission::Read),
-        )
-        .expect("plan");
+        } = plan_import(plain, planner_profiles(None)).expect("plan");
         assert_eq!(records[0].profile, "work");
     }
 

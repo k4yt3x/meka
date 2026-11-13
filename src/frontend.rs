@@ -767,6 +767,22 @@ pub(crate) fn checkpoint_call_id(compaction_id: &str, place: usize) -> String {
     format!("{compaction_id}/{place}")
 }
 
+/// What an approval prompt's heading opens with when a sub-agent asks: the sub-agent, named by
+/// the id prefix the screen's rows name it by, and nothing for the session's own call. Without
+/// it a sub-agent's prompt reads as the session's own, and one from a background sub-agent can
+/// arrive after the turn that spawned it has ended. One wording for the screen's panel and the
+/// ACP card, each of which puts it ahead of its own words for the call.
+pub(crate) fn approval_asker(subagent_id: Option<Uuid>) -> String {
+    match subagent_id {
+        Some(id) => {
+            let id = id.to_string();
+            let short = id.get(..crate::text::ID_PREFIX).unwrap_or(&id);
+            format!("Sub-agent {short}: ")
+        }
+        None => String::new(),
+    }
+}
+
 /// What an answer to an approval prompt is said as: the tool, then what was decided.
 pub(crate) fn approval_answered(tool_name: &str, allowed: bool, for_the_session: bool) -> String {
     let word = match (allowed, for_the_session) {
@@ -1156,6 +1172,52 @@ pub(crate) struct ElicitationPrompt {
     /// way to the parent's, so a client can say whose tool it is; `None` for the root's own call.
     pub(crate) subagent_id: Option<Uuid>,
 }
+
+/// Columns of a server's name an elicitation's attribution shows.
+const ATTRIBUTION_NAME_COLUMNS: usize = 64;
+
+impl ElicitationPrompt {
+    /// Who is asking, in Meka's words: what follows it is the server's, and a server's words read
+    /// alone read as Meka's own.
+    pub(crate) fn attribution(&self) -> String {
+        format!(
+            "MCP server '{}'",
+            crate::text::sanitize_to_line(&self.server_name, ATTRIBUTION_NAME_COLUMNS)
+        )
+    }
+
+    /// What the server asks, on one line of the screen: a newline in a server's words starts a
+    /// row the attribution ahead of the first no longer covers.
+    pub(crate) fn message_line(&self) -> String {
+        crate::text::sanitize_to_line(&self.message, usize::MAX)
+    }
+
+    /// Who asks and what it asks as one line, for a surface with one field for both. That surface
+    /// is an editor, which draws what a terminal cannot measure, so the server's words keep the
+    /// combining marks and joiners [`Self::message_line`] drops for the screen, and lose only
+    /// what moves a cursor, reorders a line or starts a new one.
+    pub(crate) fn attributed_message(&self) -> String {
+        // Flattened ahead of the sanitizer, which drops a carriage return where this keeps the
+        // space between the words it stood between.
+        let flattened: String = self
+            .message
+            .chars()
+            .map(|character| {
+                if character.is_whitespace() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        format!(
+            "{}: {}",
+            self.attribution(),
+            crate::text::sanitize_stream_text(&flattened)
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ElicitationKind {
     /// Structured form: the server sent a JSON schema of fields to fill.

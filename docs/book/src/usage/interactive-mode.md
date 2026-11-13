@@ -283,7 +283,7 @@ Inside tmux, the wheel needs tmux's own mouse mode (`set -g mouse on`).
 | Ctrl+V | Attach the image on the clipboard to the next prompt |
 | Ctrl+T, Ctrl+O | Show or hide every thinking block; expand or collapse every tool call and run |
 | Alt+Up, Alt+Down | Pick a block; Enter or Space toggles it, Esc lets go |
-| PgUp, PgDn, Ctrl+Home, Ctrl+End | Scroll the transcript; older turns load as you reach the top |
+| PgUp, PgDn, Ctrl+Home, Ctrl+End | Scroll the transcript; older turns load as you reach the top. While a panel is open, or a question whose message is longer than its rows, they scroll what it shows |
 | Esc | Close the completion list or a panel (`q` closes a panel too); stop the turn, then the background tasks, then leave (see [Interrupting the agent](#interrupting-the-agent)); when nothing runs, back to the bottom, let go of a picked block |
 | Ctrl+C | The same ladder as Esc while the agent works; clear the composer when idle, or climb the ladder from an empty one |
 | Ctrl+D | Leave, when the composer is empty |
@@ -310,8 +310,9 @@ words, and so does any line that opens with a space: ` /etc is full` sends `/etc
 ` exit` sends `exit`. `/help` shows this table, with the `/mcp` subcommands beneath `/mcp` and
 the shortcuts below it. A command is not echoed on the transcript. What a command has to *show*
 (`/help`, `/status`, a listing) opens in a **panel** in place of the composer: Up, Down, PgUp,
-PgDn and the wheel scroll it, **Esc** or **Enter** closes it, and nothing of it stays on the
-transcript. What the screen holds the answer to works at any time, a turn running or not: the
+PgDn and the wheel scroll it, its footer says how many rows are above and below, **Esc** or
+**Enter** closes it, and nothing of it stays on the transcript. What the screen holds the answer to
+works at any time, a turn running or not: the
 listings and pickers (`/skill`, `/memory`, `/schedule`, `/task`, `/session`, `/help`, `/log`), the
 settings (`/permission`, `/approvals`, `/cd`), `/task cancel` and `/schedule cancel`, and `/exit`.
 A command that needs the agent's turn to be over (`/compact`, `/rewind`, `/fork`, `/export`,
@@ -530,11 +531,22 @@ ladder, and presses escalate:
 The count starts over with each new turn, so the first press of the next turn cancels that turn whatever happened during the last one, and it ends with the turn: a press during a wait that is not a turn (`/usage`, a stuck `/mcp reconnect`) starts a count of its own from the first step. When nothing is running, Esc goes back to the bottom of the transcript, and Ctrl+C clears a composer with text in it; on an empty one it counts on the ladder, so a second press stops the background tasks and a third leaves.
 
 A question the agent asks replaces the composer until it is answered. An approval prompt is a
-panel titled with the call, its arguments under it and four answers to pick from: **Allow** (`y`),
-**Allow for the session** (`a`), **Deny** (`n`), **Deny for the session**, each also reachable by
-its number; Esc denies. A server that asks for a URL to be opened asks the same way, with
-**Open in the browser** (`y`), **Skip** (`s`) and **Decline** (`n`) to pick from. An MCP form
-takes typed answers, one field at a time; Esc declines. While any of these is open, Esc answers
-it rather than stopping the turn; Ctrl+C stops the turn, which withdraws the question. Questions
-are put one at a time: when two tool calls dispatched together both ask, the second waits until
-the first is answered.
+panel titled with the call, behind the sub-agent asking when a sub-agent asks
+(`Sub-agent 3e9b51d0: file_write`), its arguments under it and four answers to pick from:
+**Allow** (`y`), **Allow for the session** (`a`), **Deny** (`n`), **Deny for the session**, each
+also reachable by its number; Esc denies. Every argument is there in full. When they are longer
+than the panel, **PgUp**, **PgDn**, **Ctrl+Home**, **Ctrl+End** and the wheel scroll them while
+Up and Down keep moving the pick, and the footer says how many rows are above and below, so a
+long write or command can be read to its last line before it is answered.
+
+A question from an MCP server opens under `MCP server '<name>':`, a row that stays in view
+whatever the length of what the server says. A server that asks for a URL to be opened asks as
+an approval prompt does, the URL first and whole, its message after, with
+**Open in the browser** (`y`), **Skip** (`s`) and **Decline** (`n`) to pick from; only an `http`
+or `https` URL is ever offered. An MCP form takes typed answers, one field at a time; Esc
+declines. A message longer than either question scrolls with the same keys. Under a form whose
+message fits, those keys scroll the transcript, as they do with no question open.
+
+While any of these is open, Esc answers it rather than stopping the turn; Ctrl+C stops the turn,
+which withdraws the question. Questions are put one at a time: when two tool calls dispatched
+together both ask, the second waits until the first is answered.

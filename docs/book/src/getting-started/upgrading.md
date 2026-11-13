@@ -10,6 +10,22 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 Meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.94 to 0.95
+
+Nothing in `config.toml` changes shape, and the store stays as it is.
+
+**An import takes its level and approvals switch from this installation.**
+`meka session import` and `POST /v1/sessions/import` used to write the permission level and the
+approvals switch an archive recorded, and the imported session then ran on them. Now a root
+session starts at the level a new session would, a sub-agent at the lower of that and the level it
+recorded, and every session takes this installation's approvals switch. A working directory or
+additional workspace directory the archive names is still kept when it is a directory here; one
+that is not is now left out, and the session works in the directory it is resumed from. To bring
+an archive in at another level,
+import it with `meka --permission <level> session import <file>`, or set the level afterwards
+with `/permission` on the screen, `meka -r <id> --permission <level>`, or
+`PATCH /v1/sessions/{id}`. The approvals switch moves with `/approvals` or the same `PATCH`.
+
 ## 0.93 to 0.94
 
 The store moves forward on its first open, behind the automatic backup, so that a turn that fails

@@ -2643,6 +2643,67 @@ mod tests {
         }
     }
 
+    /// Quotes and lists nest as deep as the tree allows and no deeper: past it a marker is text
+    /// in the deepest container kept, on the row the source wrote it on, and an ordered item
+    /// keeps its number, so what a model wrote is all there and none of it adds a level.
+    #[test]
+    fn a_container_past_the_depth_is_read_as_text() {
+        let depth = markdown::MAX_CONTAINER_DEPTH;
+        let bars = "▐ ".repeat(depth);
+        assert_eq!(
+            plain(&markdown_lines(
+                &format!("{} deep\n", ">".repeat(depth + 3)),
+                200
+            )),
+            vec![format!("{bars}> > > deep")]
+        );
+        // A list is two levels, the list and its item.
+        assert_eq!(
+            plain(&markdown_lines(
+                &format!("{}deep\n", "- ".repeat(depth / 2 + 2)),
+                200
+            )),
+            vec![format!("{}- - deep", "• ".repeat(depth / 2))]
+        );
+        let quotes = ">".repeat(depth);
+        let rows = plain(&markdown_lines(
+            &format!("{quotes} 3. three\n{quotes} 4. four\n"),
+            200,
+        ));
+        assert_eq!(rows.first(), Some(&format!("{bars}3. three")), "{rows:?}");
+        assert_eq!(rows.last(), Some(&format!("{bars}4. four")), "{rows:?}");
+    }
+
+    /// A list as deep as any document nests is a list at every level: a list and its item are a
+    /// container each, and the depth has room for thirty of both.
+    #[test]
+    fn a_list_thirty_levels_deep_nests_at_every_level() {
+        assert_eq!(
+            plain(&markdown_lines(&format!("{}deep\n", "- ".repeat(30)), 200)),
+            vec![format!("{}deep", "• ".repeat(30))]
+        );
+    }
+
+    /// Text nested deeper than any document is laid out on the stack a runtime worker has: one
+    /// line of `>` or of `- ` opens a container per marker, and a layout that went down a level
+    /// for each would run out of stack there, which ends the process.
+    #[test]
+    fn nesting_without_bound_is_laid_out_on_a_worker_s_stack() {
+        for marker in [">", "- "] {
+            let source = format!("{}deep\n", marker.repeat(50_000));
+            let rows = std::thread::Builder::new()
+                .stack_size(2 * crate::text::MIB)
+                .spawn(move || plain(&markdown_lines(&source, 80)))
+                .expect("a thread")
+                .join()
+                .expect("laid out");
+            assert!(
+                rows.last().is_some_and(|row| row.ends_with("deep")),
+                "{marker:?}: the text is all there"
+            );
+        }
+    }
+
     /// A fenced block is highlighted by its language rather than painted flat, and the fence lines
     /// themselves are not shown as text.
     /// A fenced row wider than the width folds inside its shade's margins with every character

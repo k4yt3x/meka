@@ -282,6 +282,20 @@ pub(super) fn record_resource_update(server_name: &str, context: &McpClientConte
     context.resource_updates.record(server_name, uri);
 }
 
+/// A URL a server names for a browser, as the one string every surface shows, relays and opens,
+/// or `None` for one that is not an `http` or `https` URL: a URL elicitation's and an OAuth
+/// authorization endpoint's.
+///
+/// `http` and `https` alone, because the system's opener takes any string: a `file:` URL, a UNC
+/// path or an application's own scheme would run a local handler on a consent that says
+/// "browser". The parsed form rather than the server's own string, because its serialization is
+/// ASCII: nothing in it is a character a display drops and an opener keeps, so what a person
+/// reads is what is opened.
+pub(super) fn browser_url(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.into())
+}
+
 /// Put a server's elicitation to `frontend` and answer with what the user said, or a decline when
 /// the user did not answer in time.
 ///
@@ -307,7 +321,18 @@ pub(super) async fn elicit(
             (ElicitationKind::Form { schema }, message.clone())
         }
         ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
-            (ElicitationKind::Url { url: url.clone() }, message.clone())
+            let Some(url) = browser_url(url) else {
+                frontend
+                    .emit(crate::frontend::FrontendEvent::Notice(
+                        crate::frontend::Notice::elicitation_declined(
+                            server,
+                            "its URL is not an http or https URL",
+                        ),
+                    ))
+                    .await;
+                return ElicitationResponse::Decline.into_result();
+            };
+            (ElicitationKind::Url { url }, message.clone())
         }
         // Forward-compat: an elicitation kind this build doesn't recognize falls back to a
         // generic form prompt rather than failing the request.
@@ -1344,6 +1369,105 @@ mod tests {
             "{:?}",
             prompt.kind
         );
+    }
+
+    /// A browser is sent to an `http` or `https` URL and nothing else: not a file, a share, an
+    /// application's scheme, a script or a string that is no URL at all. What comes back is the
+    /// parsed form, in which a character a screen would drop and an opener keep is spelled out.
+    #[test]
+    fn a_browser_is_sent_to_web_urls_alone() {
+        assert_eq!(
+            browser_url("https://example.test/login?state=s-1").as_deref(),
+            Some("https://example.test/login?state=s-1")
+        );
+        assert_eq!(
+            browser_url("HTTP://Example.test").as_deref(),
+            Some("http://example.test/")
+        );
+        for refused in [
+            "file:///etc/passwd",
+            "smb://host/share",
+            "vscode://extension/install",
+            "javascript:alert(1)",
+            r"\\host\share\run.exe",
+            r"C:\Windows\System32\calc.exe",
+            "calc.exe",
+            "",
+        ] {
+            assert_eq!(browser_url(refused), None, "{refused:?}");
+        }
+        let hidden = browser_url("https://example.test/a\u{202e}b\u{200b}c").expect("a web URL");
+        assert!(
+            hidden.is_ascii() && !hidden.chars().any(char::is_control),
+            "{hidden:?}"
+        );
+    }
+
+    /// A URL elicitation that names anything but a web URL is declined where it arrives, ahead
+    /// of every host: no frontend is asked, since each would show it, relay it or open it, and
+    /// a warning names the server.
+    #[tokio::test]
+    async fn a_url_elicitation_that_names_no_web_url_is_declined_unasked() {
+        #[derive(Default)]
+        struct Recording {
+            asked: std::sync::atomic::AtomicBool,
+            notices: std::sync::Mutex<Vec<crate::frontend::Notice>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Frontend for Recording {
+            async fn emit(&self, event: crate::frontend::FrontendEvent) {
+                if let crate::frontend::FrontendEvent::Notice(notice) = event {
+                    crate::sync::lock(&self.notices).push(notice);
+                }
+            }
+
+            async fn request_permission(
+                &self,
+                _request: crate::frontend::PermissionRequest,
+            ) -> crate::frontend::PermissionOutcome {
+                crate::frontend::PermissionOutcome::Allow
+            }
+
+            async fn handle_elicitation(
+                &self,
+                _prompt: crate::frontend::ElicitationPrompt,
+            ) -> ElicitationResponse {
+                self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
+                ElicitationResponse::Accept { content: None }
+            }
+        }
+
+        for url in [
+            "file:///etc/passwd",
+            "vscode://extension/install",
+            "calc.exe",
+        ] {
+            let frontend = Recording::default();
+            let request: ElicitRequestParams = serde_json::from_value(serde_json::json!({
+                "mode": "url", "message": "Sign in", "url": url, "elicitationId": "e1"
+            }))
+            .expect("a url request");
+            let result = elicit("srv", &frontend, request, None).await;
+            assert!(
+                matches!(result.action, ElicitationAction::Decline),
+                "{url}: {:?}",
+                result.action
+            );
+            assert!(
+                !frontend.asked.load(std::sync::atomic::Ordering::Relaxed),
+                "{url}: nothing is put to the person"
+            );
+            let notices = crate::sync::lock(&frontend.notices);
+            assert!(
+                matches!(
+                    notices.as_slice(),
+                    [notice] if notice.level == crate::frontend::NoticeLevel::Warn
+                        && notice.text.contains("'srv'")
+                ),
+                "{url}: {notices:?}"
+            );
+        }
     }
 
     /// A URL prompt's acceptance reaches the server with no content, whatever the frontend sent

@@ -110,6 +110,8 @@ pub(crate) fn action_for(key: &KeyEvent, focus: Focus, composer: ComposerState) 
             KeyCode::Char('l') if ctrl => Action::Redraw,
             KeyCode::PageUp => Action::ScrollUp,
             KeyCode::PageDown => Action::ScrollDown,
+            KeyCode::Home if ctrl => Action::ScrollTop,
+            KeyCode::End if ctrl => Action::ScrollBottom,
             _ => Action::Edit,
         },
         Focus::Filtering => match key.code {

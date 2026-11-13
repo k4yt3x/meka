@@ -2259,35 +2259,72 @@ pub(crate) fn is_on_pill(pill: Option<Rect>, column: u16, row: u16) -> bool {
     })
 }
 
-/// A question drawn where the composer was: its body, then the prompt line with the answer so
-/// far.
+/// A question drawn where the composer was: who asks, what it asks, then the prompt line with
+/// the answer so far. Who asks and the prompt line keep their rows whatever the length of what
+/// is asked; a body longer than the rows between them is read through `scroll`, and gives up a
+/// row to a footer saying how much of it is out of view, on the terminal's background as a
+/// panel's is.
 pub(crate) fn draw_question(
     frame: &mut Frame<'_>,
     area: Rect,
+    attribution: &Line<'static>,
     body: &[Line<'static>],
+    scroll: &mut super::panel::BodyScroll,
     prompt: &str,
     answer: &str,
 ) {
     frame.render_widget(Clear, area);
-    let mut lines = body.to_vec();
+    let width = area.width as usize;
+    let between = (area.height as usize).saturating_sub(2);
+    // The footer is drawn only where a row of the body still stands above it: a footer alone
+    // would name keys that bring nothing into view.
+    let footed = body.len() > between && between > 1;
+    let in_view = scroll.window(body.len(), between - usize::from(footed));
+    let mut lines = vec![draw::cut_line(
+        attribution.clone(),
+        width.saturating_sub(draw::RIGHT_MARGIN),
+    )];
+    lines.extend(
+        body.get(in_view.clone())
+            .unwrap_or_default()
+            .iter()
+            .cloned(),
+    );
+    let cursor_row = lines.len();
     lines.push(Line::from(vec![
         Span::raw(" ".repeat(TEXT_EDGE)),
         Span::styled(prompt.to_string(), Style::default().fg(Color::Yellow)),
         Span::raw(answer.to_string()),
     ]));
-    // The last rows are the ones that matter: the question and the answer under it.
-    let skip = lines.len().saturating_sub(area.height as usize);
-    let shown: Vec<Line<'static>> = lines.into_iter().skip(skip).map(draw::on_shade).collect();
-    let cursor_row = shown.len().saturating_sub(1);
+    let shown: Vec<Line<'static>> = lines.into_iter().map(draw::on_shade).collect();
     let cursor_column = TEXT_EDGE + display_width(prompt) + display_width(answer);
     // The composer's background, words a column short of its edge: the question stands where the
     // composer stood.
     let block = Style::default().bg(super::input::COMPOSER_BACKGROUND);
-    frame.render_widget(ratatui::widgets::Block::new().style(block), area);
+    let shaded = Rect {
+        height: area.height.saturating_sub(u16::from(footed)),
+        ..area
+    };
+    frame.render_widget(ratatui::widgets::Block::new().style(block), shaded);
     frame.render_widget(Paragraph::new(Text::from(shown)).style(block), Rect {
         width: area.width.saturating_sub(draw::RIGHT_MARGIN as u16),
-        ..area
+        ..shaded
     });
+    if footed && let Some(note) = super::panel::out_of_view_note("PgUp PgDn", body.len(), &in_view)
+    {
+        let note = draw::cut_text(&note, width.saturating_sub(TEXT_EDGE + draw::RIGHT_MARGIN));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" ".repeat(TEXT_EDGE)),
+                Span::styled(note, draw::gray()),
+            ])),
+            Rect {
+                y: area.y + area.height.saturating_sub(1),
+                height: 1,
+                ..area
+            },
+        );
+    }
     frame.set_cursor_position((
         area.x
             .saturating_add(cursor_column.min(area.width.saturating_sub(1) as usize) as u16),
@@ -4561,15 +4598,17 @@ mod tests {
                 draw_question(
                     frame,
                     frame.area(),
+                    &Line::from("• MCP server 'forms':"),
                     &[Line::from(format!("  {}", "b".repeat(40)))],
+                    &mut super::super::panel::BodyScroll::default(),
                     "name: ",
                     &"a".repeat(40),
                 );
             })
             .expect("a frame");
         let buffer = terminal.backend().buffer();
-        for y in 0..2 {
-            assert_eq!(buffer[(28, y)].symbol(), if y == 0 { "b" } else { "a" });
+        for y in 1..3 {
+            assert_eq!(buffer[(28, y)].symbol(), if y == 1 { "b" } else { "a" });
             assert_eq!(
                 buffer[(29, y)].symbol(),
                 " ",
@@ -4577,6 +4616,66 @@ mod tests {
             );
             assert_eq!(buffer[(29, y)].style().bg, Some(COMPOSER_BACKGROUND));
         }
+    }
+
+    /// Who asks keeps the first row of a question and the field its last whatever the length of
+    /// what is asked: a message longer than the rows between them scrolls there, under a footer
+    /// that says how much of it is out of view, so the server's name is never what is cut.
+    #[test]
+    fn a_long_question_scrolls_under_the_name_of_who_asks() {
+        let body: Vec<Line<'static>> = (1..=20)
+            .map(|n| Line::from(format!("  word {n}")))
+            .collect();
+        let mut scroll = super::super::panel::BodyScroll::default();
+        let draw = |scroll: &mut super::super::panel::BodyScroll| {
+            let backend = ratatui::backend::TestBackend::new(50, 6);
+            let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+            terminal
+                .draw(|frame| {
+                    draw_question(
+                        frame,
+                        frame.area(),
+                        &Line::from("• MCP server 'forms':"),
+                        &body,
+                        scroll,
+                        "name (string): ",
+                        "Ada",
+                    );
+                })
+                .expect("a frame");
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(draw(&mut scroll), [
+            "• MCP server 'forms':",
+            "  word 1",
+            "  word 2",
+            "  word 3",
+            "  name (string): Ada",
+            "  PgUp PgDn scroll · 17 below",
+        ]);
+        scroll.page_down(100);
+        assert_eq!(draw(&mut scroll), [
+            "• MCP server 'forms':",
+            "  word 4",
+            "  word 5",
+            "  word 6",
+            "  name (string): Ada",
+            "  PgUp PgDn scroll · 3 above · 14 below",
+        ]);
+        scroll.scroll_to_end();
+        let shown = draw(&mut scroll);
+        assert_eq!(shown[0], "• MCP server 'forms':");
+        assert_eq!(shown[3], "  word 20");
+        assert_eq!(shown[5], "  PgUp PgDn scroll · 17 above");
     }
 
     /// The list shows at most `COMPLETION_ROWS`, keeps the pick on screen, and lines the

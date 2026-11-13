@@ -5,7 +5,8 @@
 //! rules. The screen ([`super::tui`]) lays the tree out at a width, which is where nesting becomes
 //! indentation: an item's blocks are laid out narrower by its marker and a quote's by its bar, so
 //! a row that wraps stays under the text it continues. Markers never survive into a run's text,
-//! because a run carries the styles they stood for.
+//! because a run carries the styles they stood for; the one exception is a quote or a list nested
+//! past [`MAX_CONTAINER_DEPTH`], whose marker is all that is left of it.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -123,6 +124,20 @@ struct InlineStyle {
     strikeout: usize,
 }
 
+/// How deep quotes and lists nest in the tree, a list and its item being a container each, so a
+/// list nests half as deep as a quote. Laying the tree out recurses a level per container and so
+/// does dropping it, on a stack that text from a model must not be able to run out, and one line
+/// of `>` opens a quote per character. A container past this is read as text in the deepest one
+/// kept, its marker included; no document nests this deep.
+pub(super) const MAX_CONTAINER_DEPTH: usize = 64;
+
+/// A container open past [`MAX_CONTAINER_DEPTH`], which the tree does not hold.
+enum Beyond {
+    Quote,
+    /// The number its next item takes, when it is an ordered list.
+    List(Option<u64>),
+}
+
 /// A container whose events are still arriving.
 enum Open {
     Quote(Vec<Block>),
@@ -139,6 +154,11 @@ struct Builder {
     /// The document's own blocks, outside every container.
     blocks: Vec<Block>,
     open: Vec<Open>,
+    /// The containers open past [`MAX_CONTAINER_DEPTH`], innermost last.
+    beyond: Vec<Beyond>,
+    /// Whether the pending runs hold nothing but the markers of such containers, which the next
+    /// marker follows on the same row, as the source wrote them.
+    markers_pending: bool,
     /// Inline runs of the text block being read.
     runs: Vec<OwnedCompound>,
     /// The level of the heading being read, while one is.
@@ -209,7 +229,8 @@ impl Builder {
             // No flush: an item's task marker arrives ahead of the paragraph it belongs to. A
             // paragraph directly in an item is what makes its list loose.
             Tag::Paragraph => {
-                if matches!(self.open.last(), Some(Open::Item(_)))
+                if self.beyond.is_empty()
+                    && matches!(self.open.last(), Some(Open::Item(_)))
                     && let Some(Open::List { loose, .. }) = self.open.iter_mut().rev().nth(1)
                 {
                     *loose = true;
@@ -218,6 +239,10 @@ impl Builder {
             Tag::Heading { level, .. } => {
                 self.flush_text();
                 self.heading = Some(header_depth(level));
+            }
+            Tag::BlockQuote(_) if self.is_at_depth() => {
+                self.beyond.push(Beyond::Quote);
+                self.push_marker("> ");
             }
             Tag::BlockQuote(_) => {
                 self.flush_text();
@@ -237,6 +262,10 @@ impl Builder {
                 self.flush_text();
                 self.html = Some(String::new());
             }
+            Tag::List(start) if self.is_at_depth() => {
+                self.end_row_ahead_of_marker();
+                self.beyond.push(Beyond::List(start));
+            }
             // A nested list opens while its parent item's own text is still pending.
             Tag::List(start) => {
                 self.flush_text();
@@ -246,7 +275,18 @@ impl Builder {
                     items: Vec::new(),
                 });
             }
-            Tag::Item => self.open.push(Open::Item(Vec::new())),
+            Tag::Item if self.beyond.is_empty() => self.open.push(Open::Item(Vec::new())),
+            Tag::Item => {
+                let marker = match self.beyond.last_mut() {
+                    Some(Beyond::List(Some(number))) => {
+                        let marker = format!("{number}. ");
+                        *number = number.saturating_add(1);
+                        marker
+                    }
+                    _ => "- ".to_string(),
+                };
+                self.push_marker(&marker);
+            }
             Tag::Table(alignments) => {
                 self.flush_text();
                 self.table = Some(TableState {
@@ -295,10 +335,16 @@ impl Builder {
                     }
                 }
             }
+            // A container the tree holds ends after every one inside it, so while any is open
+            // past the depth, the end is one of theirs; an item's is its list's to count.
             TagEnd::BlockQuote(_) | TagEnd::List(_) | TagEnd::Item => {
                 self.flush_text();
-                if let Some(open) = self.open.pop() {
-                    self.close(open);
+                if self.beyond.is_empty() {
+                    if let Some(open) = self.open.pop() {
+                        self.close(open);
+                    }
+                } else if tag != TagEnd::Item {
+                    self.beyond.pop();
                 }
             }
             TagEnd::TableHead => {
@@ -389,10 +435,31 @@ impl Builder {
         }
     }
 
+    /// Whether a container starting now is past the depth the tree nests to.
+    fn is_at_depth(&self) -> bool {
+        !self.beyond.is_empty() || self.open.len() >= MAX_CONTAINER_DEPTH
+    }
+
+    /// End the row being read, unless it holds only markers: the text of the container around
+    /// a marker is a row of its own, and a marker's own markers are not.
+    fn end_row_ahead_of_marker(&mut self) {
+        if !self.markers_pending {
+            self.flush_text();
+        }
+    }
+
+    /// The marker of a container past the depth, as text where its blocks would have hung.
+    fn push_marker(&mut self, marker: &str) {
+        self.end_row_ahead_of_marker();
+        self.push_text(marker);
+        self.markers_pending = true;
+    }
+
     fn push_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
+        self.markers_pending = false;
         for link in &mut self.links {
             link.shown.push_str(text);
         }
@@ -402,6 +469,7 @@ impl Builder {
 
     /// The pending runs as the paragraph or heading they are.
     fn flush_text(&mut self) {
+        self.markers_pending = false;
         if self.runs.is_empty() {
             return;
         }

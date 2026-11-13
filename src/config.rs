@@ -2158,11 +2158,13 @@ pub(crate) struct ResolvedConfig {
     pub(crate) default_profile: Option<String>,
     /// The profile `default_profile` picks, ignoring `--profile`.
     ///
-    /// Only the migration ledger wants this. It stamps a profile onto sessions that predate Meka
+    /// The migration ledger wants this. It stamps a profile onto sessions that predate Meka
     /// recording one, which is a guess it makes once and cannot revisit, so the answer must not
     /// depend on a flag the first invocation after an upgrade happened to carry: `meka --profile
-    /// side -p "..."` would otherwise move a whole history onto `side` because of one run.
-    /// Everything else wants [`Self::default_profile`], where the flag is the point.
+    /// side -p "..."` would otherwise move a whole history onto `side` because of one run. An
+    /// import wants it for the sessions an archive names no profile for, and reads `--profile` on
+    /// its own, since the flag there moves every session. Everything else wants
+    /// [`Self::default_profile`], where the flag is the point.
     pub(crate) configured_default_profile: Option<String>,
     /// The accounts, the profiles and the default as one selection, which the hosts hand to the
     /// provider registry and replace there after a write of their own; [`Self::accounts`] and
@@ -2842,14 +2844,14 @@ pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
 /// The third element is the level the user asked for on this run and got, or `None` when the level
 /// came from the config file or the built-in default. Resuming needs the distinction: a session
 /// runs at the level it recorded, and only an explicit request overrides that. The level
-/// `config.toml` alone gives a new session, for what is written into rows and archives: the store's
-/// ledger and an import. Unlike [`ResolvedConfig::resolve`] it reads no CLI flag and no environment
-/// variable, because those belong to one run and the row outlives it.
+/// `config.toml` alone gives a new session, for what the store's ledger writes into rows. Unlike
+/// [`ResolvedConfig::resolve`] it reads no CLI flag and no environment variable, because those
+/// belong to one run and the row outlives it.
 pub(crate) fn default_permission_on_disk() -> crate::error::Result<Permission> {
     let config_file = load_config_file_or_err()?;
     let permissions = config_file.permissions.unwrap_or_default();
-    // No CLI or environment tier: what this answers is written into rows and archives that every
-    // later process reads, so only the file's own statement may decide it.
+    // No CLI or environment tier: what this answers is written into rows that every later
+    // process reads, so only the file's own statement may decide it.
     let (permission, _enabled, _requested) = resolve_permission(
         None,
         None,

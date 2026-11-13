@@ -1302,6 +1302,25 @@ mod tests {
         assert_eq!(text.text, "```console\nhello\nworld\n```");
     }
 
+    /// Output that holds a code fence of its own stays inside the block: a fence the output
+    /// could close would end the block there and leave the rest for the client to read as
+    /// Markdown, live and once the command has ended alike.
+    #[test]
+    fn a_console_block_outgrows_the_fences_its_output_holds() {
+        let output = "# Notes\n```sh\nls\n```\n## After\n";
+        let fenced = "````console\n# Notes\n```sh\nls\n```\n## After\n````";
+        let text_of = |block: &ToolCallContent| {
+            serde_json::to_value(block).expect("json")["content"]["text"].clone()
+        };
+        let content = vec![ToolResultContent::Text {
+            text: output.to_string(),
+        }];
+        let completed = build_completion_content("shell_execute", &content, None, None);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(text_of(&completed[0]), fenced);
+        assert_eq!(text_of(&console_content_block(output)), fenced);
+    }
+
     #[test]
     fn build_completion_content_execute_command_empty_output_no_block() {
         let content = vec![ToolResultContent::Text {

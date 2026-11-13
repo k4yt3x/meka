@@ -572,9 +572,10 @@ pub(super) async fn handle_list_sessions(
                 .respond_with_error(acp_error_for(&error, state.shared.relay_provider_errors()));
         }
     };
-    // Fallback for a row carrying no `cwd`, which `meka session import` produces when the archive
-    // omits it. The process cwd matches what the agent would use for relative-path resolution if
-    // the client picked one of these to load. That is better than refusing to surface them.
+    // Fallback for a row carrying no `cwd`, which an import produces when the archive omits it or
+    // names one that is not a directory here. The process cwd matches what the agent would use for
+    // relative-path resolution if the client picked one of these to load. That is better than
+    // refusing to surface them.
     let fallback_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let sessions = rows

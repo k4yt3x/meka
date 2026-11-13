@@ -35,6 +35,8 @@ pub(crate) struct ApprovalRequest {
     /// Every argument the call was made with, shown in full: a prompt that hides the write is not
     /// doing its job.
     pub(crate) input: serde_json::Value,
+    /// The sub-agent whose call this is, which the heading names; `None` for the session's own.
+    pub(crate) subagent_id: Option<uuid::Uuid>,
     /// Fires when the turn is stopped, which withdraws the question.
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
     pub(crate) responder: tokio::sync::oneshot::Sender<ApprovalDecision>,
@@ -307,6 +309,7 @@ impl Frontend for TuiFrontend {
             .send(UiEvent::Approval(ApprovalRequest {
                 tool_name: request.tool_name,
                 input: request.input,
+                subagent_id: request.subagent_id,
                 cancellation: cancellation.clone(),
                 responder,
             }))

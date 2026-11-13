@@ -397,7 +397,11 @@ line is whether the model runs: `/compact` is refused because compaction is a tu
 `POST /v1/sessions/import` recreates a session tree from a `meka session export` archive under fresh
 ids, on the same terms as the CLI's `meka session import`. An archive naming no profile takes the
 server's default, the same one `POST /v1/sessions` applies to a body with no `profile`; a
-long-lived host always has one, since it refuses to start without it.
+long-lived host always has one, since it refuses to start without it. Whatever the archive says,
+every session takes the server's approvals switch, a root session the level the server starts a
+new session at, and a sub-agent the lower of that and the level it recorded; a directory the
+archive names that `POST /v1/sessions` would refuse is left out. A profile or project the server
+lacks is refused with a `422` naming the route that adds it.
 
 One limit is the server's alone: an archive holding more than **1000** sessions is refused with a
 `422` whose detail names the count and the cap, and points at `meka session import`. The whole tree

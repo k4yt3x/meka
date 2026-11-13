@@ -367,7 +367,8 @@ workspace, or `shell_execute` below `unrestricted` when nothing can sandbox it.
 
 `none` with approvals on is the most cautious shape: every tool call is put to you, and nothing runs
 unattended. Sub-agents share their parent's switch, and their prompts are forwarded to the parent's
-frontend.
+frontend, headed on the screen and in an ACP client by the sub-agent asking, as
+`Sub-agent 3e9b51d0: file_write`, and carrying its `subagent_id` over HTTP.
 
 On the screen the prompt is a panel in place of the composer: the call as its title, every
 argument under it, and four answers. Move the cursor with Up and Down and press **Enter**, or press
@@ -383,6 +384,7 @@ command the agent runs afterwards, so use it for the tools you trust wholesale a
 session, so the answers stay with the one you branched from. The same two answers are ACP's
 **Always allow** / **Always deny** options and the HTTP API's `allow_always` / `deny_always`
 outcomes. The decision is one row on the transcript, `• shell_execute allowed for the session`.
+Either answer covers every sub-agent of the session too, whichever prompt it was given at.
 
 Where nobody can be asked at all (a `--oneshot` run, or `meka serve` answering a turn with no
 stream to put the prompt on), a call that needs approval is denied and a warning names the tool
@@ -417,10 +419,11 @@ A long value wraps rather than being cut, so the end of a shell pipeline cannot 
 line you are approving.
 
 **Nothing is left out.** A value too long for the panel wraps onto as many rows as it takes, and
-the panel scrolls: Up, Down, PgUp and PgDn move through it, and the footer says how many rows are
-below. A shell pipeline puts its consequence last, so a prompt that cut the value anywhere would
-hide the exact part you are being asked about; a call with two hundred arguments is two hundred
-arguments to scroll through, and that much to read is itself the signal to deny.
+the panel scrolls: PgUp, PgDn, Ctrl+Home, Ctrl+End and the wheel move through it while Up and Down
+move the pick, and the footer says how many rows are above and below. A shell pipeline puts its
+consequence last, so a prompt that cut the value anywhere would hide the exact part you are being
+asked about; a call with two hundred arguments is two hundred arguments to scroll through, and
+that much to read is itself the signal to deny.
 
 When a call is too much to read, **denying costs nothing**: say no, inspect the file or the
 session with `meka session export`, and let the agent retry.

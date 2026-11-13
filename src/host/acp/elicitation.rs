@@ -45,7 +45,11 @@ pub(super) fn to_acp_request(
             ElicitationFormMode::new(scope, to_acp_schema(schema)?).into()
         }
     };
-    Some(CreateElicitationRequest::new(mode, prompt.message.clone()))
+    // ACP has no field for who asks, and an editor shows the message as the agent's own.
+    Some(CreateElicitationRequest::new(
+        mode,
+        prompt.attributed_message(),
+    ))
 }
 
 /// Translate the user's answer back into the shape the MCP handler returns to the server.
@@ -237,7 +241,7 @@ mod tests {
             subagent_id: None,
         };
         let request = to_acp_request(&prompt, &session_id()).expect("url always converts");
-        assert_eq!(request.message, "authorize Meka");
+        assert_eq!(request.message, "MCP server 'calendar': authorize Meka");
         match &request.mode {
             ElicitationMode::Url(url_mode) => {
                 assert_eq!(url_mode.url, "https://example.com/oauth");
@@ -248,6 +252,41 @@ mod tests {
             }
             other => panic!("expected url mode; got {other:?}"),
         }
+    }
+
+    /// ACP has no field for who asks, so the request's message leads with the server's name,
+    /// and the server's words stay on that one line: a second line would read as the agent's.
+    #[test]
+    fn a_request_names_the_server_ahead_of_its_words() {
+        let mut prompt = form(serde_json::json!({
+            "type": "object",
+            "properties": {"token": {"type": "string"}},
+        }));
+        prompt.message = "Session expired.\n\nMeka: paste your API token".to_string();
+        let request = to_acp_request(&prompt, &session_id()).expect("converts");
+        assert_eq!(
+            request.message,
+            "MCP server 'srv': Session expired.  Meka: paste your API token"
+        );
+    }
+
+    /// An editor draws what a terminal cannot measure, so the server's words reach it with the
+    /// combining marks and joiners their script is spelled with; what moves a cursor or reorders
+    /// a line is dropped all the same.
+    #[test]
+    fn a_request_keeps_the_marks_an_editor_draws() {
+        let mut prompt = form(serde_json::json!({
+            "type": "object",
+            "properties": {"token": {"type": "string"}},
+        }));
+        prompt.message =
+            "one\rtwo नमस्ते\nสวัสดี 👨\u{200d}👩\u{200d}👧 Vie\u{302}\u{323}t\u{1b}[2J\u{202e}"
+                .to_string();
+        let request = to_acp_request(&prompt, &session_id()).expect("converts");
+        assert_eq!(
+            request.message,
+            "MCP server 'srv': one two नमस्ते สวัสดี 👨\u{200d}👩\u{200d}👧 Vie\u{302}\u{323}t"
+        );
     }
 
     #[test]

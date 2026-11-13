@@ -1111,7 +1111,8 @@ impl OutputBudget {
 /// Reads bytes rather than `read_to_string` because a chunk boundary can fall inside a multi-byte
 /// character: the trailing incomplete sequence is carried over to the next read instead of being
 /// relayed as replacement characters. What is relayed still covers the whole stream, so the live
-/// view is unaffected by how the reads happened to split.
+/// view is unaffected by how the reads happened to split, and bytes that are no character at all
+/// are relayed as the returned string spells them.
 ///
 /// Whichever way the read ends, the returned string is everything the drain took in. The spawn
 /// decides what to say about a stream that ended early; this function never drops a byte it read.
@@ -1145,20 +1146,9 @@ where
                 content.extend(buffer.iter().take(read));
 
                 if let Some(relay) = &relay {
-                    // Relay only the prefix that is complete UTF-8; whatever trails an incomplete
-                    // sequence stays behind for the next read to finish.
-                    let pending = content.get(relayed..).unwrap_or_default();
-                    let valid = match std::str::from_utf8(pending) {
-                        Ok(text) => text.len(),
-                        Err(error) => error.valid_up_to(),
-                    };
-                    if valid > 0
-                        && let Some(prefix) = pending.get(..valid)
-                    {
-                        // `valid` is the length of a verified-UTF-8 prefix, so the lossy decode
-                        // never actually substitutes anything; it is just the panic-free spelling.
-                        let text = String::from_utf8_lossy(prefix).into_owned();
-                        relayed += valid;
+                    let (text, taken) = relayable(content.get(relayed..).unwrap_or_default());
+                    relayed += taken;
+                    if !text.is_empty() {
                         relay.send(text).await;
                     }
                 }
@@ -1180,6 +1170,39 @@ where
     // in a foreign encoding, a binary blob on stderr) should still hand the model everything else
     // it printed.
     String::from_utf8_lossy(&content).into_owned()
+}
+
+/// The text of `pending` that can be relayed now and the bytes it covers: every complete
+/// character, and U+FFFD for each sequence that can never become one, as a lossy decode of the
+/// whole stream spells it. A sequence the next read may still complete is left behind; one that
+/// is invalid is stepped over, since waiting on it would hold back everything after it.
+fn relayable(pending: &[u8]) -> (String, usize) {
+    let mut text = String::new();
+    let mut taken = 0;
+    loop {
+        let rest = pending.get(taken..).unwrap_or_default();
+        let error = match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                text.push_str(valid);
+                return (text, taken + valid.len());
+            }
+            Err(error) => error,
+        };
+        let valid = error.valid_up_to();
+        // A verified-UTF-8 prefix, so the lossy decode substitutes nothing; it is the
+        // panic-free spelling.
+        text.push_str(&String::from_utf8_lossy(
+            rest.get(..valid).unwrap_or_default(),
+        ));
+        taken += valid;
+        match error.error_len() {
+            Some(invalid) => {
+                text.push(char::REPLACEMENT_CHARACTER);
+                taken += invalid;
+            }
+            None => return (text, taken),
+        }
+    }
 }
 
 /// What the two drains returned, and whether they were stopped before the pipes closed.
@@ -1689,6 +1712,30 @@ mod tests {
             !chunks.iter().any(|chunk| chunk.contains('\u{fffd}')),
             "no chunk may contain a replacement character; got {chunks:?}",
         );
+    }
+
+    /// Bytes that are no character do not stop the live view: each is relayed as the replacement
+    /// character the result holds in its place and the stream goes on after it, however the
+    /// reads split, where a relay that waited for it to become text would show nothing more of
+    /// the command.
+    #[tokio::test]
+    async fn the_relay_goes_on_past_bytes_that_are_no_character() {
+        let source: &[u8] = b"caf\xe9 au lait\n\xe2\x28\xa1 \xe2\x9c\x93 done\n";
+        let expected = String::from_utf8_lossy(source).into_owned();
+        assert!(
+            expected.ends_with("\u{fffd}(\u{fffd} ✓ done\n"),
+            "{expected:?}"
+        );
+
+        let whole = Arc::new(ChunkRecorder::default());
+        let collected = drain_for_test(std::io::Cursor::new(source), relay_into(&whole)).await;
+        assert_eq!(collected, expected);
+        assert_eq!(whole.relayed(), expected, "read at once");
+
+        let split = Arc::new(ChunkRecorder::default());
+        let reader = tokio::io::AsyncReadExt::take(source, u64::MAX);
+        drain_for_test(OneByteAtATime(reader), relay_into(&split)).await;
+        assert_eq!(split.relayed(), expected, "read a byte at a time");
     }
 
     /// The relay must reassemble to the source across a stream of many reads, each carrying a

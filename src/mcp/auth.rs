@@ -927,8 +927,7 @@ async fn authenticate_oauth_authorization_code(
                 server_name: server_name.to_string(),
                 message: format!("failed to get authorization URL: {error}"),
             })?;
-
-    login_prompt.authorize_at(&auth_url);
+    let auth_url = present_authorization_url(server_name, &auth_url, login_prompt.as_ref())?;
 
     let expected_state = state_in_authorization_url(&auth_url);
     let callback = await_oauth_callback(
@@ -958,6 +957,23 @@ async fn authenticate_oauth_authorization_code(
             server_name: server_name.to_string(),
             message: "unexpected OAuth state after authorization".to_string(),
         })
+}
+
+/// Put the authorization URL to the person who opens it, and answer the URL they were given.
+/// The authorization endpoint is the server's to name, and every prompt hands the URL to a
+/// person to open or to a client that opens it, so one no browser should be sent to is refused
+/// ahead of all of them.
+fn present_authorization_url(
+    server_name: &str,
+    auth_url: &str,
+    login_prompt: &dyn LoginPrompt,
+) -> Result<String> {
+    let auth_url = super::handler::browser_url(auth_url).ok_or_else(|| MekaError::McpAuth {
+        server_name: server_name.to_string(),
+        message: "the authorization URL is not an http or https URL".to_string(),
+    })?;
+    login_prompt.authorize_at(&auth_url);
+    Ok(auth_url)
 }
 
 /// What an authorization response carries back (RFC 6749 section 4.1.2, RFC 9207): the code, the
@@ -2476,6 +2492,46 @@ mod tests {
             "missing 'code' parameter in pasted URL",
             "OAuth state mismatch; refusing the callback",
         ]);
+    }
+
+    /// A server whose authorization endpoint is no web URL is refused before any prompt is
+    /// handed it: the terminal would print it to be opened, the screen would show it, and the
+    /// HTTP API would relay it to a client that opens it.
+    #[test]
+    fn an_authorization_url_that_is_no_web_url_reaches_no_prompt() {
+        #[derive(Default)]
+        struct Shown(std::sync::Mutex<Vec<String>>);
+
+        #[async_trait::async_trait]
+        impl LoginPrompt for Shown {
+            fn authorize_at(&self, url: &str) {
+                self.0.lock().unwrap().push(url.to_string());
+            }
+
+            fn awaiting(&self, _completion: Completion) {}
+
+            fn accepts_paste(&self) -> bool {
+                false
+            }
+
+            async fn read_pasted_line(&self) -> std::result::Result<Option<String>, String> {
+                Ok(None)
+            }
+
+            fn paste_refused(&self, _reason: &str) {}
+        }
+
+        let prompt = Shown::default();
+        for refused in ["file:///etc/passwd", "vscode://authorize?state=s"] {
+            let error = present_authorization_url("acme", refused, &prompt)
+                .expect_err("no browser is sent there");
+            assert!(error.to_string().contains("acme"), "{error}");
+        }
+        assert!(prompt.0.lock().unwrap().is_empty(), "nothing was shown");
+        let shown =
+            present_authorization_url("acme", "https://idp.test/authorize?state=s", &prompt)
+                .expect("a web URL");
+        assert_eq!(*prompt.0.lock().unwrap(), [shown]);
     }
 
     /// The `state` the authorization URL carries is the one a callback must bring back.
