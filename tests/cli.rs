@@ -3210,9 +3210,16 @@ fn an_imported_session_takes_this_installation_s_level_and_approvals() {
     let (permission, approvals, directory, roots) = import(&[]);
     assert_eq!(permission, "read", "the installation's default level");
     assert!(approvals, "the installation's approvals switch");
+    // Meka records the canonical path without Windows' verbatim `\\?\` prefix, which
+    // `std::fs::canonicalize` includes there.
+    let expected = std::fs::canonicalize(&kept).expect("canonical");
+    let expected = expected
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string();
     assert_eq!(
-        directory.map(std::path::PathBuf::from),
-        Some(std::fs::canonicalize(&kept).expect("canonical")),
+        directory,
+        Some(expected),
         "a directory that is here is recorded as every door records one"
     );
     assert!(
