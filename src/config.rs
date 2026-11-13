@@ -3577,8 +3577,9 @@ impl ResolvedConfig {
         // that expires while a host is still working lets a second host take the same occurrence,
         // which the session lock catches at the cost of a deferral and a re-run gate probe. Checked
         // against `gate_timeout` rather than against a fixed floor because that is the only bound
-        // on the work Meka knows; the turn after it is unbounded, which is why the documentation
-        // asks for headroom on top rather than this settling the question.
+        // on the work Meka knows; the turn after it is unbounded, and a probe stopped at its
+        // timeout takes a moment more to end its processes and hand over what they printed, which
+        // is why the documentation asks for headroom on top rather than this settling the question.
         if self.schedule.claim_lease <= self.schedule.gate_timeout {
             return Err(crate::error::MekaError::Config(format!(
                 "`[schedule].claim_lease` ({}) must outlast `[schedule].gate_timeout` ({}); remove \

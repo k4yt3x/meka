@@ -6,7 +6,10 @@
 //! `node_modules`, and the `ignore` crate is not a dependency. Only the matcher comes from the
 //! `grep-*` family.
 
+use std::io::Read;
+
 use async_trait::async_trait;
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 
 use super::{
     Tool, ToolOutput,
@@ -21,6 +24,13 @@ use crate::{
 /// Inline match cap when the agent isn't redirecting to the scratchpad, and the ceiling an explicit
 /// `limit` is clamped to. Single source of truth for the description and the runtime cap.
 const MAX_INLINE_MATCHES: usize = 100;
+
+/// The most the searcher holds of one file at a time, which makes it the longest line a search
+/// reads. A file with no line terminator is one line, and unbounded the searcher grows its buffer
+/// to the whole of it: a disk image or a multi-gigabyte export on one line would take the process
+/// down, and under `serve` every session with it. The ceiling is the one a whole `file_read` is
+/// held to, since a line past that is one no reader here returns either.
+const SEARCH_HEAP_BYTES: usize = super::file::MAX_READ_FILE_BYTES;
 
 pub(super) struct SearchContentsTool {
     pub(crate) site: crate::session::ToolSite,
@@ -176,7 +186,7 @@ fn search_with_grep(
     // busy cwd would otherwise starve every other root and report only "truncated", which reads as
     // "the other folders had nothing".
     let mut unsearched_roots = 0usize;
-    let mut unreadable = 0usize;
+    let mut skipped = Skipped::default();
 
     for search_path in search_paths {
         // Checked per root as well as inside `walk_directory`: a root that is a plain file, or that
@@ -216,7 +226,17 @@ fn search_with_grep(
 
         if path.is_file() {
             searched_any = true;
-            search_file(&matcher, path, &mut results, max_results, &mut unreadable)?;
+            if search_file(
+                &matcher,
+                path,
+                &mut results,
+                max_results,
+                budget,
+                &mut skipped,
+            )? {
+                timed_out = true;
+                break;
+            }
         } else if path.is_dir() {
             searched_any = true;
             if glob_pattern.is_none()
@@ -237,7 +257,7 @@ fn search_with_grep(
                 budget,
                 fence,
             };
-            if walk_directory(path, &scope, &mut results, &mut unreadable)? {
+            if walk_directory(path, &scope, &mut results, &mut skipped)? {
                 timed_out = true;
                 break;
             }
@@ -269,6 +289,11 @@ fn search_with_grep(
     if truncated {
         results.truncate(max_results);
     }
+    let Skipped {
+        unreadable,
+        binary,
+        oversized,
+    } = skipped;
 
     // A search that was cut short must say so even when it found nothing: a bare "No matches
     // found." on an unfinished search reads as a definitive answer.
@@ -295,6 +320,17 @@ fn search_with_grep(
              inside them would not appear here",
         ));
     }
+    if binary > 0 {
+        notes.push(format!(
+            "{binary} file(s) hold binary data and were skipped"
+        ));
+    }
+    if oversized > 0 {
+        notes.push(format!(
+            "{oversized} file(s) have a line longer than {} and were skipped",
+            crate::text::format_size(SEARCH_HEAP_BYTES)
+        ));
+    }
 
     let body = if results.is_empty() {
         "No matches found.".to_string()
@@ -308,41 +344,154 @@ fn search_with_grep(
     }
 }
 
+/// What a search left out, by why: each is a place a match could be, so each is said.
+#[derive(Default)]
+struct Skipped {
+    /// A directory that could not be opened, or a file that could not be opened or read or that
+    /// matched on a line that is not UTF-8.
+    unreadable: usize,
+    /// A file that holds a NUL byte.
+    binary: usize,
+    /// A file with a line longer than [`SEARCH_HEAP_BYTES`].
+    oversized: usize,
+}
+
 /// Search one file, stopping once `results` holds one entry more than `max_results`: a single file
 /// can hold millions of matching lines, so the cap has to bound collection here too, not only at
-/// the end of the walk.
+/// the end of the walk. Returns whether the time budget ran out inside the file; errors with
+/// [`MekaError::Interrupted`] when the turn was canceled.
+///
+/// A file that could not be searched whole is counted in `skipped` by why, since it may hold the
+/// match and a `debug!` alone would let "No matches found." read as definitive. A binary file and
+/// one with a line over the limit give up what they matched before that was known, so "skipped"
+/// is true of them.
 fn search_file(
     matcher: &grep_regex::RegexMatcher,
     path: &std::path::Path,
     results: &mut Vec<String>,
     max_results: usize,
-    // Counted like an unreadable directory: a file that cannot be opened or searched may hold the
-    // match, and a `debug!` alone would let "No matches found." read as definitive.
-    unreadable: &mut usize,
-) -> Result<()> {
-    use grep_searcher::{Searcher, sinks::UTF8};
-
-    let mut searcher = Searcher::new();
-    if let Err(error) = searcher.search_path(
-        matcher,
+    budget: &WalkBudget,
+    skipped: &mut Skipped,
+) -> Result<bool> {
+    let mut searcher = SearcherBuilder::new()
+        // A NUL is what tells a binary file from text, as ripgrep reads it: the lines of an image
+        // or a database are noise to the model, and the longest of them is unbounded.
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .heap_limit(Some(SEARCH_HEAP_BYTES))
+        .build();
+    let found_before = results.len();
+    let mut sink = Matches {
         path,
-        UTF8(|line_number, line| {
-            results.push(format!(
-                "{}:{}:{}",
-                path.display(),
-                line_number,
-                line.trim_end()
-            ));
-            Ok(results.len() <= max_results)
-        }),
-    ) {
-        let path = path.display();
-        tracing::debug!("failed to search {path}: {error}");
-        *unreadable += 1;
+        results,
+        max_results,
+        is_binary: false,
+        is_undecodable: false,
+    };
+    let searched = std::fs::File::open(path)
+        .and_then(|file| searcher.search_reader(matcher, Budgeted { file, budget }, &mut sink));
+    let (is_binary, is_undecodable) = (sink.is_binary, sink.is_undecodable);
+    match searched {
+        Ok(()) if is_binary => {
+            results.truncate(found_before);
+            skipped.binary += 1;
+        }
+        Ok(()) if is_undecodable => skipped.unreadable += 1,
+        Ok(()) => {}
+        Err(error) => match Halted::in_error(&error) {
+            Some(WalkStop::Canceled) => return Err(MekaError::Interrupted),
+            Some(WalkStop::TimedOut) => return Ok(true),
+            // The standard library never makes an error of this kind, so one that is not the
+            // reader's own is the searcher's, and the one it makes over a file it could open is
+            // its refusal to grow the buffer past the limit.
+            None if error.kind() == std::io::ErrorKind::Other => {
+                results.truncate(found_before);
+                skipped.oversized += 1;
+            }
+            None => {
+                let path = path.display();
+                tracing::debug!("failed to search {path}: {error}");
+                skipped.unreadable += 1;
+            }
+        },
+    }
+    Ok(false)
+}
+
+/// Where one file's matching lines go, as `path:line:text` rows.
+struct Matches<'a> {
+    path: &'a std::path::Path,
+    results: &'a mut Vec<String>,
+    max_results: usize,
+    /// Whether the searcher met a NUL and quit.
+    is_binary: bool,
+    /// Whether a matching line was not UTF-8, which ends the file's search.
+    is_undecodable: bool,
+}
+
+impl Sink for Matches<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, matched: &SinkMatch<'_>) -> std::io::Result<bool> {
+        let (Ok(line), Some(line_number)) =
+            (std::str::from_utf8(matched.bytes()), matched.line_number())
+        else {
+            self.is_undecodable = true;
+            return Ok(false);
+        };
+        self.results.push(format!(
+            "{}:{}:{}",
+            self.path.display(),
+            line_number,
+            line.trim_end()
+        ));
+        Ok(self.results.len() <= self.max_results)
     }
 
-    Ok(())
+    fn binary_data(&mut self, _searcher: &Searcher, _offset: u64) -> std::io::Result<bool> {
+        self.is_binary = true;
+        Ok(false)
+    }
 }
+
+/// A file as the searcher reads it, asking the budget at every read. The walk asks between
+/// files, and the searcher calls its sink only for a line that matches, so the reads are the one
+/// place inside a file that every search passes however little it finds: without this a single
+/// huge file outlasts the deadline and a canceled call.
+struct Budgeted<'a> {
+    file: std::fs::File,
+    budget: &'a WalkBudget,
+}
+
+impl Read for Budgeted<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self.budget.check() {
+            Some(stop) => Err(std::io::Error::other(Halted(stop))),
+            None => self.file.read(buffer),
+        }
+    }
+}
+
+/// The error a [`Budgeted`] read ends a file's search with.
+#[derive(Debug)]
+struct Halted(WalkStop);
+
+impl Halted {
+    /// The stop `error` carries, when it is a [`Budgeted`] read's.
+    fn in_error(error: &std::io::Error) -> Option<WalkStop> {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Self>())
+            .map(|halted| halted.0)
+    }
+}
+
+impl std::fmt::Display for Halted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the search was stopped")
+    }
+}
+
+impl std::error::Error for Halted {}
 
 /// What one search is judged against, the same for every root and every directory under it.
 struct SearchScope<'a> {
@@ -359,14 +508,14 @@ struct SearchScope<'a> {
 /// was stopped by the time budget; errors with [`MekaError::Interrupted`] when the turn was
 /// canceled.
 ///
-/// `unreadable` counts the directories the walk could not open and the files it could not search,
+/// `skipped` counts the directories the walk could not open and the files it could not search,
 /// so the caller can say so: a silent skip turns a tree with an unreadable subdirectory into a
 /// confident "No matches found.".
 fn walk_directory(
     directory: &std::path::Path,
     scope: &SearchScope<'_>,
     results: &mut Vec<String>,
-    unreadable: &mut usize,
+    skipped: &mut Skipped,
 ) -> Result<bool> {
     let SearchScope {
         matcher,
@@ -400,7 +549,7 @@ fn walk_directory(
             Err(error) => {
                 let directory = dir.display();
                 tracing::debug!("failed to read directory '{directory}': {error}");
-                *unreadable += 1;
+                skipped.unreadable += 1;
                 continue;
             }
         };
@@ -444,7 +593,9 @@ fn walk_directory(
                 if file_type.is_symlink() && fence.hides(&path) {
                     continue;
                 }
-                search_file(matcher, &path, results, max_results, unreadable)?;
+                if search_file(matcher, &path, results, max_results, budget, skipped)? {
+                    return Ok(true);
+                }
                 // Stop walking once the cap is exceeded. Reading every remaining file on the
                 // machine to fill a result set that is already being truncated is pure waste.
                 if results.len() > max_results {
@@ -464,8 +615,9 @@ mod tests {
     use super::*;
 
     /// `file_search` below `unrestricted` refuses a `path` inside Meka's own directories, and a
-    /// walk from a root above them neither enters them nor follows a symlink into them. The
-    /// database is searched as bytes, so a pattern for a key prefix pulled runs out of `meka.db`.
+    /// walk from a root above them neither enters them nor follows a symlink into them. `meka.db`
+    /// holds a NUL, so a search would skip it as binary, but not the text beside it: a pattern
+    /// for a key prefix would pull a value out of `config.toml`.
     #[tokio::test]
     async fn search_contents_steps_around_meka_s_own_directories_below_unrestricted() {
         use crate::permission::{EnabledPermissions, Permission, SharedPermission};
@@ -1031,12 +1183,206 @@ mod tests {
             .build("match")
             .expect("matcher");
         let mut results = Vec::new();
-        search_file(&matcher, &file_path, &mut results, 10, &mut 0).expect("search");
+        let budget = WalkBudget::new(CancellationToken::new());
+        search_file(
+            &matcher,
+            &file_path,
+            &mut results,
+            10,
+            &budget,
+            &mut Skipped::default(),
+        )
+        .expect("search");
 
         assert_eq!(
             results.len(),
             11,
             "expected the cap plus the one entry that proves more exist"
+        );
+    }
+
+    /// A file with a NUL in it is binary: its lines are noise and the longest of them has no
+    /// bound. It gives nothing to the results, including what matched ahead of the NUL, and the
+    /// answer says a file was left out and why, so "No matches found." is not read as the whole
+    /// truth.
+    #[tokio::test]
+    async fn a_binary_file_is_skipped_and_said() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp_dir.path().join("text.txt"), "needle in text\n").expect("write");
+        std::fs::write(temp_dir.path().join("image.bin"), b"needle\0needle\n").expect("write");
+        // Far enough in that the searcher has handed over the first line before it meets the NUL.
+        let mut late = b"needle on the first line\n".to_vec();
+        late.extend(std::iter::repeat_n(b"filler line\n".as_slice(), 20_000).flatten());
+        late.push(0);
+        std::fs::write(temp_dir.path().join("late.bin"), late).expect("write");
+
+        let tool = SearchContentsTool {
+            site: crate::session::ToolSite::for_test(),
+        };
+        let text = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": temp_dir.path().to_str().expect("path")
+                }),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
+            )
+            .await
+            .expect("the search completes")
+            .text_content();
+        assert!(text.contains("needle in text"), "{text}");
+        assert!(
+            !text.contains("image.bin") && !text.contains("late.bin"),
+            "a binary file gives no matches: {text}"
+        );
+        assert!(text.contains("2 file(s) hold binary data"), "{text}");
+
+        let single = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": temp_dir.path().join("image.bin").to_str().expect("path")
+                }),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
+            )
+            .await
+            .expect("the search completes")
+            .text_content();
+        assert!(
+            single.contains("No matches found.") && single.contains("1 file(s) hold binary data"),
+            "a binary file named as `path` says why it gave nothing: {single}"
+        );
+    }
+
+    /// The searcher holds a line whole, and a run with no line terminator is one line. Past the
+    /// limit the file is refused and said, where reading it would take as much memory as the run
+    /// is long; what matched ahead of the run goes with it, so the file is skipped whole.
+    #[tokio::test]
+    async fn a_line_longer_than_the_heap_limit_is_refused_and_said() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut content = b"needle on the first line\n".to_vec();
+        content.resize(SEARCH_HEAP_BYTES + 1024, b'x');
+        std::fs::write(temp_dir.path().join("export.json"), content).expect("write");
+
+        let tool = SearchContentsTool {
+            site: crate::session::ToolSite::for_test(),
+        };
+        let text = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": temp_dir.path().to_str().expect("path")
+                }),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
+            )
+            .await
+            .expect("the search completes")
+            .text_content();
+        assert!(text.contains("No matches found."), "{text:.300}");
+        assert!(
+            text.contains("1 file(s) have a line longer than"),
+            "{text:.300}"
+        );
+    }
+
+    /// The budget is asked inside a file as well as between files: one large file with nothing
+    /// to match is otherwise searched to its end however long that takes.
+    #[test]
+    fn the_budget_ends_a_search_inside_one_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut content = "nothing here\n".repeat(100_000);
+        content.push_str("needle at the end\n");
+        let file_path = temp_dir.path().join("large.log");
+        std::fs::write(&file_path, content).expect("write");
+
+        let matcher = grep_regex::RegexMatcherBuilder::new()
+            .build("needle")
+            .expect("matcher");
+        let budget =
+            WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
+        let mut results = Vec::new();
+        let timed_out = search_file(
+            &matcher,
+            &file_path,
+            &mut results,
+            MAX_INLINE_MATCHES,
+            &budget,
+            &mut Skipped::default(),
+        )
+        .expect("a spent budget is a stop, not an error");
+        assert!(timed_out, "the spent budget ends the file's search");
+        assert!(
+            results.is_empty(),
+            "the search stopped before the end of the file: {results:?}"
+        );
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let canceled = search_file(
+            &matcher,
+            &file_path,
+            &mut results,
+            MAX_INLINE_MATCHES,
+            &WalkBudget::new(cancellation),
+            &mut Skipped::default(),
+        );
+        assert!(
+            matches!(canceled, Err(MekaError::Interrupted)),
+            "a stop ends the file's search as the turn's interruption: {canceled:?}"
+        );
+    }
+
+    /// The budget is asked at every read, not once per file: a stop that arrives while a file is
+    /// being read ends its search there. The file is a FIFO the test feeds, so the stop is known
+    /// to land after the search has read from it and before the file ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_that_arrives_mid_file_ends_its_search() {
+        use std::io::Write as _;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let fifo = temp_dir.path().join("stream.log");
+        let named = std::ffi::CString::new(fifo.to_str().expect("path")).expect("no NUL");
+        // SAFETY: `mkfifo(3)` reads a NUL-terminated path, which `named` is.
+        assert_eq!(unsafe { libc::mkfifo(named.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let cancellation = CancellationToken::new();
+        let writer = std::thread::spawn({
+            let fifo = fifo.clone();
+            let cancellation = cancellation.clone();
+            move || {
+                let mut pipe = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open the FIFO");
+                // More than a pipe holds, so this returns only once the search has read from it.
+                pipe.write_all("nothing here\n".repeat(100_000).as_bytes())
+                    .expect("the search reads what is written");
+                cancellation.cancel();
+                // The search may be waiting in a read it began before the stop; this ends that
+                // read, so the one after it meets the stop. A search that has stopped already
+                // has closed its end.
+                if let Err(error) = pipe.write_all(b"needle\n") {
+                    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+                }
+            }
+        });
+
+        let matcher = grep_regex::RegexMatcherBuilder::new()
+            .build("needle")
+            .expect("matcher");
+        let stopped = search_file(
+            &matcher,
+            &fifo,
+            &mut Vec::new(),
+            MAX_INLINE_MATCHES,
+            &WalkBudget::new(cancellation),
+            &mut Skipped::default(),
+        );
+        writer.join().expect("the writer");
+        assert!(
+            matches!(stopped, Err(MekaError::Interrupted)),
+            "a read made after the stop ends the search: {stopped:?}"
         );
     }
 

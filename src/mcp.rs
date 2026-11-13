@@ -89,11 +89,6 @@ pub(crate) const DEFAULT_MCP_REQUEST_TIMEOUT: std::time::Duration =
 /// How long a connection whose renewal was tried waits before a rejection on it is renewed again.
 const RENEWAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Allow-list of image MIME types passed straight through to the provider. Anything else (notably
-/// `image/svg+xml`, which can embed script/link elements) is converted to a text placeholder.
-pub(crate) const ALLOWED_IMAGE_MIME_TYPES: &[&str] =
-    &["image/png", "image/jpeg", "image/gif", "image/webp"];
-
 pub(crate) type McpRunningService =
     rmcp::service::RunningService<RoleClient, handler::MekaClientHandler>;
 
@@ -793,6 +788,12 @@ impl ServerEntry {
         &self.server_name
     }
 
+    /// Whether a handshake has landed on this entry, whatever became of the connection since: a
+    /// server whose first tool listing failed has connected, and is `Failed`.
+    pub(crate) fn has_connected(&self) -> bool {
+        self.connection.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     /// `tools/list`, bounded in both time and count.
     ///
     /// `list_all_tools` follows the server's pagination cursor to exhaustion, so a server that
@@ -810,11 +811,20 @@ impl ServerEntry {
             .map_err(|_elapsed| MekaError::McpConnection {
                 server_name: self.server_name.clone(),
                 message: format!("tools/list timed out after {timeout:?}"),
-            })?
-            .map_err(|error| MekaError::McpConnection {
+            })?;
+        let listed = match listed {
+            // "Method not found" is how a server without tools, one of resources or prompts alone,
+            // answers: it has none to list, which is not a listing that failed.
+            Err(ServiceError::McpError(error))
+                if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
+            {
+                Vec::new()
+            }
+            listed => listed.map_err(|error| MekaError::McpConnection {
                 server_name: self.server_name.clone(),
                 message: format!("failed to list tools: {error}"),
-            })?;
+            })?,
+        };
         drop(connection);
 
         let advertised = listed.len();
@@ -1240,7 +1250,14 @@ impl ServerEntry {
             return Err(error);
         }
         let (cause, needs) = connector::failure_cause(&error);
-        connector::record_connect_failure(self, &self.server_name, cause, needs).await;
+        connector::record_connect_failure(
+            self,
+            &self.state().await,
+            &self.server_name,
+            cause,
+            needs,
+        )
+        .await;
         if let Some(retry) = self.background_retry.get() {
             tokio::spawn(connector::retry_until_connected(
                 Arc::clone(self),
@@ -3455,6 +3472,110 @@ mod tests {
         );
     }
 
+    /// A legacy Streamable HTTP server whose first answer to `tools/call` is a response stream
+    /// that ends before the result, as a proxy cutting an idle stream leaves it; it counts the
+    /// calls it receives and answers every later one.
+    #[cfg(all(unix, feature = "serve"))]
+    async fn cut_the_first_call_s_stream(
+        axum::extract::State(calls): axum::extract::State<Arc<std::sync::atomic::AtomicUsize>>,
+        axum::Json(message): axum::Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let Some(id) = message.get("id").cloned() else {
+            return axum::http::StatusCode::ACCEPTED.into_response();
+        };
+        let reply = match message["method"].as_str() {
+            Some("initialize") => serde_json::json!({
+                "protocolVersion": handler::LEGACY_PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "stub", "version": "1"},
+            }),
+            Some("tools/list") => serde_json::json!({"tools": [{
+                "name": "send",
+                "description": "stub send",
+                "inputSchema": {"type": "object", "properties": {}},
+            }]}),
+            Some("tools/call") => {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        ": the stream ends here\n\n",
+                    )
+                        .into_response();
+                }
+                serde_json::json!({"content": [{"type": "text", "text": "sent"}]})
+            }
+            _ => {
+                return axum::Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": "method not found"},
+                }))
+                .into_response();
+            }
+        };
+        axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": reply})).into_response()
+    }
+
+    /// Over HTTP a response stream can end while the connection stands, and the call it was
+    /// answering may still be running on the server: it is not sent again on that connection,
+    /// and the model is told it may have run.
+    #[cfg(all(unix, feature = "serve"))]
+    #[tokio::test]
+    async fn a_call_whose_response_stream_was_cut_is_not_sent_again() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(cut_the_first_call_s_stream))
+            .with_state(Arc::clone(&calls));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut config = McpServerConfig::for_test("cut");
+        config.url = Some(url);
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        let entry = manager.entry("cut").expect("the configured entry");
+        connector::connect_one(
+            Arc::clone(&entry),
+            Arc::clone(&manager),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        let tool = manager
+            .tool_by_name("mcp__cut__send")
+            .await
+            .expect("the stub's tool is registered");
+
+        let error = tool
+            .call(
+                None,
+                &call_context(Arc::new(AcceptingFrontend(serde_json::json!({})))),
+            )
+            .await
+            .expect_err("the stream ended without the call's result");
+        assert!(
+            error.to_string().contains("the call may have run"),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a call the server received is sent once"
+        );
+    }
+
     /// A legacy Streamable HTTP server that accepts one bearer token at a time and counts the
     /// handshakes it answers.
     #[cfg(all(unix, feature = "serve"))]
@@ -5254,6 +5375,71 @@ mod tests {
         assert_eq!(stub.sent("initialize"), 2);
     }
 
+    /// A first listing that fails is a failed connect: the entry is `Failed` with the listing's
+    /// cause, which the turn gates on for a `required` server, and the retry every failed connect
+    /// gets brings it up with its tools once the server lists them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_first_listing_fails_the_connect_until_a_retry_lists() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "fail_list": -32603
+        }))
+        .await;
+        let mut required = McpServerConfig::clone(&stub.entry.config());
+        required.required = Some(true);
+        crate::sync::write(&stub.entry.configs).settled = Arc::new(required);
+        stub.connect().await;
+        match stub.entry.state().await {
+            ServerState::Failed { error, .. } => {
+                assert!(error.contains("listing refused"), "{error}");
+            }
+            other => panic!("expected Failed, got {}", other.label()),
+        }
+        let not_ready = stub.manager.enabled_not_connected().await;
+        assert_eq!(not_ready.len(), 1);
+        assert!(not_ready[0].required, "the turn gates on a required server");
+        assert!(stub.registry.get("mcp__stub__search").is_none());
+
+        stub.write_state(serde_json::json!({"tools": ["search"]}));
+        connector::retry_until_connected(
+            Arc::clone(&stub.entry),
+            Arc::downgrade(&stub.manager),
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(
+            stub.entry.state().await,
+            ServerState::Connected { .. }
+        ));
+        assert!(stub.registry.get("mcp__stub__search").is_some());
+        assert!(stub.manager.enabled_not_connected().await.is_empty());
+    }
+
+    /// A server that answers `tools/list` with "method not found" has said it has no tools,
+    /// which is no failure: it is connected with none, and every listing finds none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_server_without_tools_is_connected_with_none() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "resources": ["file:///a"], "fail_list": -32601
+        }))
+        .await;
+        stub.connect().await;
+        assert!(
+            matches!(stub.entry.state().await, ServerState::Connected { .. }),
+            "{}",
+            stub.entry.state().await.label()
+        );
+        assert!(
+            stub.manager
+                .list_advertised_tools("stub")
+                .await
+                .expect("listed")
+                .is_empty()
+        );
+    }
+
     /// A connect still in flight when the manager shuts down ends with it, and the child it was
     /// spawning dies: the thread the connect runs on would otherwise be abandoned at exit with
     /// the child alive and nothing left to kill it.
@@ -5299,6 +5485,161 @@ mod tests {
             matches!(stub.entry.state().await, ServerState::Pending),
             "nothing is recorded against a server that was never given its chance"
         );
+    }
+
+    /// A server that exits under a call it has received may have run it, so the call is not
+    /// sent to the process spawned in its place: the model is told the call may have run, and
+    /// the connection is mended for the next call, which goes out once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_whose_answer_was_lost_is_not_sent_again() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["send"], "exit_on_call": true
+        }))
+        .await;
+        stub.connect().await;
+        let frontend: Arc<dyn crate::frontend::Frontend> =
+            Arc::new(AcceptingFrontend(serde_json::json!({})));
+
+        let error = stub
+            .tool("send")
+            .await
+            .call(None, &call_context(Arc::clone(&frontend)))
+            .await
+            .expect_err("the server exited without answering");
+        assert!(
+            error.to_string().contains("the call may have run"),
+            "{error}"
+        );
+        assert_eq!(
+            stub.sent("tools/call"),
+            1,
+            "a call the server received is sent once: {:?}",
+            stub.logged_methods()
+        );
+        assert!(
+            !stub.entry.needs_reconnect().await,
+            "the connection is mended before the call returns"
+        );
+
+        stub.write_state(serde_json::json!({"tools": ["send"]}));
+        let result = stub
+            .tool("send")
+            .await
+            .call(None, &call_context(frontend))
+            .await
+            .expect("the next call runs on the mended connection");
+        assert_eq!(text_of(&result), "send ran");
+        assert_eq!(stub.sent("tools/call"), 2, "{:?}", stub.logged_methods());
+        assert_eq!(
+            stub.sent("server/discover"),
+            2,
+            "the lost answer reopened the connection, and the next call found it open: {:?}",
+            stub.logged_methods()
+        );
+    }
+
+    /// Answers an elicitation only once the server's transport has closed, so the round that
+    /// carries the answer finds the connection gone before it is sent.
+    #[cfg(unix)]
+    struct AnswersOnceClosed(Arc<ServerEntry>);
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl crate::frontend::Frontend for AnswersOnceClosed {
+        async fn emit(&self, _event: crate::frontend::FrontendEvent) {}
+
+        async fn request_permission(
+            &self,
+            _request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            crate::frontend::PermissionOutcome::Allow
+        }
+
+        async fn handle_elicitation(
+            &self,
+            _prompt: crate::frontend::ElicitationPrompt,
+        ) -> crate::frontend::ElicitationResponse {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !self.0.needs_reconnect().await {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the stub was supposed to exit after asking"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            crate::frontend::ElicitationResponse::Accept {
+                content: Some(serde_json::json!({})),
+            }
+        }
+    }
+
+    /// A call whose first round the server answered by asking for input has been seen by the
+    /// server, so a later round that finds the connection closed does not start the call over
+    /// on a fresh one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_the_server_asked_about_is_not_started_over() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["send"],
+            "elicit": {"message": "Name?", "schema": {"type": "object", "properties": {}}},
+            "exit_after_asking": true,
+        }))
+        .await;
+        stub.connect().await;
+
+        let error = stub
+            .tool("send")
+            .await
+            .call(
+                None,
+                &call_context(Arc::new(AnswersOnceClosed(Arc::clone(&stub.entry)))),
+            )
+            .await
+            .expect_err("the server exited before the answer could be sent");
+        assert!(
+            error.to_string().contains("the call may have run"),
+            "{error}"
+        );
+        assert_eq!(
+            stub.sent("tools/call"),
+            1,
+            "a call the server asked about is not sent from the start again: {:?}",
+            stub.logged_methods()
+        );
+    }
+
+    /// A call that finds its connection closed before anything was sent is made on a fresh
+    /// one: nothing reached the server, so there is nothing it could have run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_that_was_never_sent_is_made_on_a_fresh_connection() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["send"], "exit_after": 1
+        }))
+        .await;
+        stub.connect().await;
+        assert!(
+            eventually(std::time::Duration::from_secs(10), async || stub
+                .entry
+                .needs_reconnect()
+                .await)
+            .await,
+            "the stub was supposed to exit after its first listing"
+        );
+        stub.write_state(serde_json::json!({"tools": ["send"]}));
+
+        let result = stub
+            .tool("send")
+            .await
+            .call(
+                None,
+                &call_context(Arc::new(AcceptingFrontend(serde_json::json!({})))),
+            )
+            .await
+            .expect("the call is made once the connection is reopened");
+        assert_eq!(text_of(&result), "send ran");
+        assert_eq!(stub.sent("tools/call"), 1, "{:?}", stub.logged_methods());
     }
 
     /// The manager holds the entry built under a name and not one taken out, whatever still runs
@@ -5387,6 +5728,51 @@ mod tests {
             matches!(stub.entry.state().await, ServerState::Disabled),
             "the entry is left as a removal leaves it"
         );
+    }
+
+    /// A listing that a removal or a shutdown leaves unanswered records nothing against the
+    /// server: the entry stays as the removal or the shutdown left it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listing_cut_short_by_a_removal_or_a_shutdown_records_nothing() {
+        for ending in ["removal", "shutdown"] {
+            let stub = StubServer::prepare(serde_json::json!({
+                "tools": ["search"], "list_delay_ms": 60_000
+            }))
+            .await;
+            let connecting = tokio::spawn({
+                let entry = Arc::clone(&stub.entry);
+                let manager = Arc::clone(&stub.manager);
+                async move {
+                    connector::connect_one(entry, manager, std::time::Duration::from_secs(60))
+                        .await;
+                }
+            });
+            assert!(
+                eventually(std::time::Duration::from_secs(10), async || stub
+                    .sent("tools/list")
+                    == 1)
+                .await,
+                "{ending}: the listing was never sent: {:?}",
+                stub.logged_methods()
+            );
+            if ending == "removal" {
+                stub.manager.remove_server("stub").await.expect("remove");
+                // A removal leaves the listing its connection; the server exiting ends it.
+                stub.write_state(serde_json::json!({"exit": true}));
+            } else {
+                stub.manager.shutdown_within(SHUTDOWN_BUDGET).await;
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), connecting)
+                .await
+                .expect("the listing ends with its connection")
+                .expect("the connect task");
+            assert!(
+                matches!(stub.entry.state().await, ServerState::Disabled),
+                "{ending}: {}",
+                stub.entry.state().await.label()
+            );
+        }
     }
 
     /// A reconnect still in flight when the manager shuts down ends with it too, child included:

@@ -107,11 +107,15 @@ evaluation and the job fires every interval. It earns its place on a *shell* gat
 code is a real signal. For a tool, reach for `at` instead.
 
 The gate's output is passed into the turn it triggers, so the model does not re-run the check the
-gate just ran. A pointer narrows what is *judged*, not what the model is told: the turn still sees
+gate just ran. It arrives under `[Gate output]` with terminal control characters removed and every
+line quoted with `> `, so nothing the check read can pass for the fire's own header or a second
+prompt. A pointer narrows what is *judged*, not what the model is told: the turn still sees
 the whole result, because the surrounding fields are usually what makes the fire worth reading. The
 turn sees at most 8 KiB of it, and `at` will read a document up to a megabyte; past that there is
-nothing for a pointer to point into and the gate reports that the probe did not return JSON. A gate
-should be reading a status, not a payload.
+nothing for a pointer to point into and the gate reports that the probe did not return JSON. A
+command that prints past that megabyte is cut off there, stopped with everything it started if it
+is still running, and does not count as `"succeeded"` whatever it exits with. A gate should be
+reading a status, not a payload.
 
 The two shapes that compare against the previous evaluation (`"changed"`, and `at` with
 `is: "changed"`) always fire the first time: with nothing to compare against, "changed" is the
@@ -238,8 +242,9 @@ crashed host's occurrence waits before another host takes it. It should exceed a
 turn: a lease that expires under a host still working lets a second host take the same occurrence,
 and although the session lock stops that becoming a second turn, the occurrence still makes a round
 trip and the gate probe runs again. A host refuses to start on a `claim_lease` at or under
-`gate_timeout`, since that half is checkable; the turn after the probe is unbounded, so leave real
-headroom on top rather than treating that check as the whole answer.
+`gate_timeout`, since that half is checkable; a probe stopped at its timeout takes up to two
+seconds or so more to end its processes and hand over its output, and the turn after the probe is
+unbounded, so leave real headroom on top rather than treating that check as the whole answer.
 
 Two hosts sharing a session do not fight over its jobs. A session is held by one process at a time,
 and `meka serve` leaves that session's jobs to whoever holds it rather than reaching for them and

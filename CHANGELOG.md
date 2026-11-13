@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** An import takes this installation's level and approvals; see the upgrade guide.
 - **Breaking:** An import leaves out an archive's directory that is not a directory here.
 - `meka --permission <level> session import` brings an archive's sessions in at that level.
+- **Breaking:** A gate on an MCP tool sees repeated structured content once; see the upgrade guide.
+- `file_search` skips a file it finds a NUL byte in, and says how many it skipped.
+- A scheduled fire's gate output and a background report's task output are quoted with `> `.
+- A scheduled job's gate output has terminal control characters removed.
+- An MCP image in a format providers do not take, such as BMP or TIFF, arrives converted to PNG.
+- On Unix a `!command` has no terminal, so one that asks for a password fails at once.
+- A shell gate whose command exits while something it started holds its output answers 2 s later.
 
 ### Fixed
 
@@ -29,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A command's live output goes on past a byte that is not UTF-8.
 - Command output with a code fence in it stays inside its block in an ACP editor.
 - An HTTP import refusing an unknown profile or project names the route that adds it.
+- An MCP tool call cut off before its answer fails saying it may have run; it is not sent again.
+- An MCP server whose tool listing fails on connect shows as failed until a retry lists its tools.
+- A required MCP server whose tools cannot be listed refuses turns until they can be.
+- An MCP server with no tools no longer warns that its tool listing failed.
+- The first MCP tool listing after a connect honors an `[mcp].connect_timeout` above 30 seconds.
+- MCP results that repeat their structured content as text reach the model once.
+- An MCP image that does not decode is replaced by a note instead of breaking later requests.
+- An MCP `headers_helper` that leaves a process holding its output no longer hangs the connect.
+- `file_search` skips a file with a line over 16 MiB instead of reading the line into memory.
+- `file_search` stops at its 60-second budget, or when interrupted, inside one large file too.
+- `file_find` answers at its 60-second budget with what it found, even when few paths match.
+- A schedule gate that times out or prints past its limit stops every process it started.
+- The screen's `!command` shows what it printed when something it started keeps its output open.
 
 ## [0.94.0] - 2026-11-12
 

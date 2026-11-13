@@ -470,16 +470,16 @@ pub(crate) fn prepare_image_source(
     })
 }
 
-/// Decode a base64 image attachment supplied by a *client* into an [`ImageSource`]: base64-decode
-/// the payload, classify it, then enforce the size cap and convert unsupported formats to PNG.
-/// Returns a human-readable message on failure, suitable for surfacing back to the caller as a
-/// validation error.
+/// Decode a base64 image supplied by a *client* or an MCP server into an [`ImageSource`]:
+/// base64-decode the payload, classify it, then enforce the size cap and convert unsupported
+/// formats to PNG. Returns a human-readable message on failure, suitable for surfacing back to the
+/// caller as a validation error.
 ///
 /// `declared_mime` is only a hint; [`prepare_image_source`] decides from the bytes. That matters
-/// here more than anywhere else, since a client's declared type is attacker-or-typo controlled.
+/// here more than anywhere else, since a declared type from outside is attacker-or-typo controlled.
 ///
-/// Shared by the ACP `session/prompt` handler and the HTTP `POST /turns` handler so both frontends
-/// enforce identical limits on client-supplied images.
+/// Shared by the ACP `session/prompt` handler, the HTTP `POST /turns` handler and an MCP tool's
+/// image result, so each enforces identical limits on the images it is handed.
 pub(crate) fn decode_base64_image(data: &str, declared_mime: &str) -> Result<ImageSource, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())

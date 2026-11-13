@@ -76,10 +76,16 @@ impl crate::tools::Detachable for McpToolAdapter {
             None,
             move |context| async move {
                 let result = tool.call(arguments, &call_context(context)).await?;
-                Ok(tool_output_from_result(
-                    &result,
-                    format!("mcp_{}_{}", tool.server_name(), tool.raw_name()),
-                ))
+                let hint = format!("mcp_{}_{}", tool.server_name(), tool.raw_name());
+                // Rendering a result decodes its images, which is tens of milliseconds of CPU on
+                // a large one and would hold every other task on this worker.
+                tokio::task::spawn_blocking(move || tool_output_from_result(&result, hint))
+                    .await
+                    .map_err(|error| crate::error::MekaError::McpToolExecution {
+                        server_name: tool.server_name().to_string(),
+                        tool_name: tool.raw_name().to_string(),
+                        message: format!("result rendering task failed: {error}"),
+                    })
             },
         ))
     }
@@ -205,10 +211,13 @@ fn tool_output_from_result(
 ) -> ToolOutput {
     let mut content = convert_tool_result_content(&result.content);
 
-    // Structured content is appended as a fenced JSON block for the model to read. Callers that
-    // compute on the result take the `structured` field below instead, so the wording and fencing
-    // here stay free to change without altering what a scheduled job's gate predicate decides.
-    if let Some(structured) = &result.structured_content {
+    // Structured content is appended as a fenced JSON block for the model to read, unless a text
+    // block already states it. A gate's `at` predicate computes on the `structured` field below;
+    // its `changed` and `matches` predicates read this text, so what is appended here is part of
+    // what such a gate judges.
+    if let Some(structured) = &result.structured_content
+        && !restated_as_text(structured, &result.content)
+    {
         let pretty = serde_json::to_string_pretty(structured).unwrap_or_default();
         if !pretty.is_empty() {
             let appended = format!("\n\n---\n**Structured content:**\n```json\n{pretty}\n```");
@@ -231,6 +240,19 @@ fn tool_output_from_result(
         frontend_metadata: None,
         structured: result.structured_content.clone(),
     }
+}
+
+/// Whether a text block of `content` is `structured` as JSON on its own: the specification asks a
+/// server that returns `structuredContent` to return the same JSON in a text block, and the model
+/// is sent it once.
+fn restated_as_text(structured: &serde_json::Value, content: &[rmcp::model::ContentBlock]) -> bool {
+    content.iter().any(|block| match block {
+        rmcp::model::ContentBlock::Text(text) => {
+            serde_json::from_str::<serde_json::Value>(&text.text)
+                .is_ok_and(|parsed| parsed == *structured)
+        }
+        _ => false,
+    })
 }
 
 /// The arguments an MCP call actually carries: everything the model sent, minus Meka's own.
@@ -327,6 +349,33 @@ mod tests {
             rendered.contains("**Structured content:**") && rendered.contains("\"chats\""),
             "the model still sees the fenced block: {rendered}"
         );
+    }
+
+    /// The specification asks a server that returns `structuredContent` to return the same JSON
+    /// in a text block, and the model is sent it once; a structure no text block states is still
+    /// rendered, as above.
+    #[test]
+    fn structured_content_a_text_block_states_is_not_rendered_again() {
+        let structured = serde_json::json!({ "chats": [{ "id": "a" }], "checked_at": "now" });
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                serde_json::to_string_pretty(&structured).expect("json"),
+            )]);
+        result.structured_content = Some(structured.clone());
+
+        let output = tool_output_from_result(&result, "mcp_bridge_unseen".to_string());
+
+        let rendered = output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                crate::conversation::ToolResultContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(!rendered.contains("Structured content"), "{rendered}");
+        assert_eq!(rendered.matches("checked_at").count(), 1, "{rendered}");
+        assert_eq!(output.structured.as_ref(), Some(&structured));
     }
 
     /// The common case: a server that sends only text leaves `structured` empty rather than

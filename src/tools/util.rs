@@ -64,6 +64,12 @@ impl WalkBudget {
         self.budget.as_secs()
     }
 
+    /// When the walk's time runs out, for a caller that answers by then whatever the walk is
+    /// doing.
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     /// Called once per directory entry, so it stays to one atomic load plus one clock read.
     pub(super) fn check(&self) -> Option<WalkStop> {
         if self.cancellation.is_cancelled() {

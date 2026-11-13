@@ -67,9 +67,15 @@ Search file contents using a regex pattern. Powered by the ripgrep library.
   searched, so pass `glob` or `path` to stay out of one.
 - Name a hidden file, skipped build directory, or symlinked directory explicitly with `path` to
   search it. Private Meka directories still require `unrestricted`.
+- **Binary files are skipped.** A file the search finds a NUL byte in gives no matches, and the
+  result says how many such files were left out. A search that ends inside a file before it
+  reaches the NUL, at the match cap, lists what it had found there.
+- **A file with a line longer than 16 MiB is skipped**, and the result says so. A file with no
+  line breaks is one line, and the search holds a line whole.
 - Results are limited to 100 matches; `limit` lowers the cap, and `scratchpad` lifts it unless
   `limit` is also set. The search stops once the cap is exceeded instead of reading the rest of
   the tree to fill a result set it will truncate anyway.
-- The search stops after 60 seconds, returning what it found with a note saying it is incomplete.
+- The search stops after 60 seconds, inside one large file as well as between files, returning
+  what it found with a note saying it is incomplete.
 - Interrupting the turn (Ctrl+C, or `session/cancel` from an editor) stops the search.
 - Each result includes the file path, line number, and matching line.

@@ -835,7 +835,7 @@ async fn run_json_turn(
     // admission check before anything is written.
     //
     // Dropped mid-`execute_tool_calls` the future would take the running command's future with
-    // it, orphaning its process group (nothing calls `kill_child_tree` on the drop path), leave
+    // it, killing its tree with no grace (a dropped `process::Tree` sends `SIGKILL`), leave
     // the in-memory conversation holding an assistant `tool_use` whose result was never appended,
     // and skip `notify_turn_end` so a webhook subscriber never hears the turn end at all. The DB
     // stays consistent, since `run_turn` commits each round trip as it completes, but the

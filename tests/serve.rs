@@ -22213,6 +22213,14 @@ fn mcp_credentials_are_managed_over_http() {
 /// rejects a request without the bearer `tok-1` with a challenge, `/register` registers a client,
 /// `/token` mints `tok-1`, and every request is recorded in `seen`.
 fn spawn_oauth_mcp_stub(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> u16 {
+    spawn_oauth_mcp_stub_listing(seen, true)
+}
+
+/// [`spawn_oauth_mcp_stub`], whose `tools/list` answers with an error unless `lists`.
+fn spawn_oauth_mcp_stub_listing(
+    seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    lists: bool,
+) -> u16 {
     support::spawn_http_listener({
         let seen = std::sync::Arc::clone(seen);
         move |request| {
@@ -22265,6 +22273,16 @@ fn spawn_oauth_mcp_stub(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) ->
                             "capabilities": {"tools": {}},
                             "serverInfo": {"name": "stub", "version": "0"},
                         }),
+                        "tools/list" if !lists => {
+                            return json(
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": {"code": -32603, "message": "listing broke"},
+                                })
+                                .to_string(),
+                            );
+                        }
                         "tools/list" => serde_json::json!({
                             "tools": [{
                                 "name": "echo",
@@ -22480,6 +22498,88 @@ fn an_mcp_oauth_login_over_http_ends_in_a_connected_server() {
             .as_array()
             .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "mcp__remote__echo"))
     });
+}
+
+/// A login is the handshake landing with what the flow minted. A server whose tool listing fails
+/// after it is failed for that, and the login stands: the bundle is stored, so nobody logs in a
+/// second time once the listing is mended.
+#[test]
+fn an_mcp_oauth_login_stands_when_the_server_s_tool_listing_fails() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let port = spawn_oauth_mcp_stub_listing(&seen, false);
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "mcp:r", "config:r", "config:w",
+    ]);
+    let send = |path: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let response = harness
+            .request(reqwest::Method::POST, path)
+            .json(&body)
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        (status, response.json().unwrap_or(serde_json::Value::Null))
+    };
+    let get = |path: &str| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, path)
+            .send()
+            .expect("send")
+            .json()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let wait_for = |what: &str, check: &mut dyn FnMut() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !check() {
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not happen in time; the stub saw:\n{}",
+                seen.lock().unwrap().join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let (status, body) = send(
+        "/v1/mcp",
+        serde_json::json!({"name": "remote", "transport": "http", "url": format!("http://127.0.0.1:{port}/mcp")}),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, started) = send("/v1/mcp/remote/login", serde_json::json!({}));
+    assert_eq!(status, 202, "{started}");
+    let url = started["authorization_url"].as_str().expect("a URL");
+    let redirect_uri = query_parameter(url, "redirect_uri");
+    let state = query_parameter(url, "state");
+    let login_id = started["login_id"].as_str().expect("login_id").to_string();
+    let landed = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client")
+        .get(format!("{redirect_uri}?code=cbcode&state={state}"))
+        .send()
+        .expect("the listener answers the browser");
+    assert_eq!(landed.status(), 200);
+
+    let mut login = serde_json::Value::Null;
+    wait_for("the login settling", &mut || {
+        login = get(&format!("/v1/mcp/remote/login/{login_id}"));
+        login["status"] != "pending"
+    });
+    assert_eq!(login["status"], "completed", "{login}");
+    wait_for("the server's listing failing", &mut || {
+        get("/v1/mcp/remote")["state"] == "failed"
+    });
+    let detail = get("/v1/mcp/remote");
+    assert_eq!(
+        detail["credentials"],
+        serde_json::json!(["OAuth tokens"]),
+        "the bundle the login minted is stored: {detail}"
+    );
+    assert!(
+        detail["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("listing broke")),
+        "the server says what failed: {detail}"
+    );
 }
 
 /// A pending MCP login is a write that has not landed yet: another write while it waits leaves

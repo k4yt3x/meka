@@ -37,12 +37,11 @@ pub(crate) fn build_stdio_command(command_str: &str, args: &[String]) -> Command
 
 /// Build the shared HTTP transport config (URL, bearer token, custom headers) used by both the auth
 /// and no-auth paths.
-pub(super) fn build_http_transport_config(
+pub(super) async fn build_http_transport_config(
     server_name: &str,
     config: &McpServerConfig,
     // The server's stored bearer, already read from `mcp_credentials`. Passed in rather than
-    // looked up here because this function is sync and the store is not, and because a
-    // transport has no business knowing where a secret lives.
+    // looked up here because a transport has no business knowing where a secret lives.
     bearer: Option<&str>,
 ) -> Result<rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig> {
     let url = config
@@ -65,7 +64,7 @@ pub(super) fn build_http_transport_config(
     let mut merged_headers: std::collections::HashMap<String, String> =
         config.headers.clone().unwrap_or_default();
     if let Some(script) = &config.headers_helper {
-        let dynamic = run_headers_helper(server_name, url, script)?;
+        let dynamic = run_headers_helper(server_name, url, script).await?;
         merged_headers.extend(dynamic);
     }
 
@@ -96,15 +95,19 @@ pub(super) fn build_http_transport_config(
 /// Execute `headers_helper` and parse its stdout as an `Name: Value\n` stream, returning a map
 /// merged into the HTTP transport's custom headers.
 ///
-/// The script is spawned synchronously (it's a startup-path helper, not called per-request) with a
-/// 15-second wall-clock timeout. `MEKA_MCP_SERVER_NAME` and `MEKA_MCP_SERVER_URL` are injected so
-/// one helper can serve multiple servers.
-fn run_headers_helper(
+/// The script runs on every connect (not per request) with a 15-second wall-clock timeout, as the
+/// root of a tree of its own, so a timeout or a connect that is dropped ends whatever it started.
+/// `MEKA_MCP_SERVER_NAME` and `MEKA_MCP_SERVER_URL` are injected so one helper can serve multiple
+/// servers.
+async fn run_headers_helper(
     server_name: &str,
     url: &str,
     script: &str,
 ) -> Result<std::collections::HashMap<String, String>> {
     use std::process::Stdio;
+
+    use crate::process::{Capture, Ended, Keep};
+
     let connection_error = |message: String| MekaError::McpConnection {
         server_name: server_name.to_string(),
         message,
@@ -133,14 +136,14 @@ fn run_headers_helper(
         )));
     }
 
-    let mut command = std::process::Command::new(&resolved);
+    let mut command = Command::new(&resolved);
     command
         .env("MEKA_MCP_SERVER_NAME", server_name)
         .env("MEKA_MCP_SERVER_URL", url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = crate::process::spawn(&mut command).map_err(|error| {
+    let child = crate::process::spawn_tree(&mut command).map_err(|error| {
         connection_error(format!(
             "failed to spawn `headers_helper` '{script}': {error}"
         ))
@@ -148,69 +151,52 @@ fn run_headers_helper(
 
     // stdout is the header list, rarely more than a few KiB; stderr is repeated verbatim in the
     // error message, so it is kept tight.
-    const MAX_HELPER_STDOUT_BYTES: u64 = 64 * crate::text::KIB as u64;
-    const MAX_HELPER_STDERR_BYTES: u64 = 4 * crate::text::KIB as u64;
+    const MAX_HELPER_STDOUT_BYTES: usize = 64 * crate::text::KIB;
+    const MAX_HELPER_STDERR_BYTES: usize = 4 * crate::text::KIB;
+    // How long the helper's output is waited for once it has exited: a process it started and
+    // left behind can hold the pipe open, and the connect is not held for it.
+    const HELPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     // Read while the helper runs, not after it exits: one that writes more than a pipe holds
     // blocks until it is read, and would otherwise sit out the timeout. What is past the cap is
     // read and dropped, for the same reason.
-    fn drain(
-        pipe: Option<impl std::io::Read + Send + 'static>,
-        max_bytes: u64,
-    ) -> Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>> {
-        pipe.map(|pipe| {
-            std::thread::spawn(move || {
-                use std::io::Read;
-                let mut kept = Vec::new();
-                let mut pipe = pipe;
-                (&mut pipe).take(max_bytes).read_to_end(&mut kept)?;
-                std::io::copy(&mut pipe, &mut std::io::sink())?;
-                Ok(kept)
-            })
-        })
-    }
-    let stdout_reader = drain(child.stdout.take(), MAX_HELPER_STDOUT_BYTES);
-    let stderr_reader = drain(child.stderr.take(), MAX_HELPER_STDERR_BYTES);
-    let collect = |reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>| match reader
-        .map(std::thread::JoinHandle::join)
-    {
-        None => Ok(Vec::new()),
-        Some(Ok(read)) => read,
-        Some(Err(_)) => Err(std::io::Error::other("the pipe reader panicked")),
+    let capture = Capture {
+        stdout: Keep::Head(MAX_HELPER_STDOUT_BYTES),
+        stderr: Keep::Head(MAX_HELPER_STDERR_BYTES),
+        sink: None,
     };
-
-    // `std::process::Child` has no `wait_timeout`, so the budget is a `try_wait` loop.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    if let Err(error) = child.kill() {
-                        tracing::debug!("failed to kill the headers helper: {error}");
-                    } else if let Err(error) = child.wait() {
-                        tracing::debug!("failed to reap the headers helper: {error}");
-                    }
-                    return Err(connection_error(format!(
-                        "`headers_helper` '{script}' timed out after 15s"
-                    )));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(error) => {
-                return Err(connection_error(format!(
-                    "failed to wait for `headers_helper` '{script}': {error}"
-                )));
-            }
+    let finished = crate::process::run(
+        child,
+        capture,
+        Some(std::time::Duration::from_secs(15)),
+        None,
+        HELPER_DRAIN_TIMEOUT,
+    )
+    .await
+    .map_err(|error| {
+        connection_error(format!(
+            "failed to wait for `headers_helper` '{script}': {error}"
+        ))
+    })?;
+    let status = match finished.ended {
+        Ended::Exited(status) => status,
+        // Nothing stops the helper and nothing spends a budget, so its timeout is the one way it
+        // is ended.
+        Ended::TimedOut | Ended::Stopped | Ended::OutputBound => {
+            return Err(connection_error(format!(
+                "`headers_helper` '{script}' timed out after 15s"
+            )));
         }
     };
+    if finished.drained.stopped_early {
+        tracing::debug!(
+            "`headers_helper` '{script}' left its output open past its exit; its headers are what \
+             it printed until then"
+        );
+    }
 
     if !status.success() {
-        let stderr_buffer = collect(stderr_reader).unwrap_or_else(|error| {
-            tracing::debug!("failed to read the headers helper's stderr: {error}");
-            Vec::new()
-        });
-        let stderr_text = String::from_utf8_lossy(&stderr_buffer);
+        let stderr_text = String::from_utf8_lossy(&finished.drained.stderr.bytes);
         return Err(connection_error(format!(
             "`headers_helper` '{}' exited with status {}: {}",
             script,
@@ -219,13 +205,7 @@ fn run_headers_helper(
         )));
     }
 
-    let stdout_buffer = collect(stdout_reader).map_err(|error| {
-        connection_error(format!(
-            "failed to read `headers_helper` '{script}' stdout: {error}"
-        ))
-    })?;
-    let stdout = String::from_utf8_lossy(&stdout_buffer);
-
+    let stdout = String::from_utf8_lossy(&finished.drained.stdout.bytes);
     parse_header_lines(&stdout).map_err(|message| {
         connection_error(format!("`headers_helper` '{script}' output: {message}"))
     })
@@ -265,13 +245,14 @@ mod tests {
 
     /// The one place a stored bearer becomes a request header. Everything upstream of here can be
     /// right and the server still sees no `Authorization` if this drops it.
-    #[test]
-    fn a_stored_bearer_becomes_the_authorization_header() {
+    #[tokio::test]
+    async fn a_stored_bearer_becomes_the_authorization_header() {
         let config = build_http_transport_config(
             "api",
             &http_server("api"),
             Some("bearer-not-a-real-token"),
         )
+        .await
         .expect("builds");
 
         assert_eq!(&*config.uri, "https://api.example.com/mcp");
@@ -283,15 +264,17 @@ mod tests {
 
     /// A server that authenticates through a flow has no stored bearer, and must send no
     /// `Authorization` of its own: rmcp's auth layer sets that header itself.
-    #[test]
-    fn no_bearer_means_no_authorization_header() {
-        let config = build_http_transport_config("api", &http_server("api"), None).expect("builds");
+    #[tokio::test]
+    async fn no_bearer_means_no_authorization_header() {
+        let config = build_http_transport_config("api", &http_server("api"), None)
+            .await
+            .expect("builds");
         assert!(config.auth_header.is_none());
     }
 
     /// The bearer and `headers` are separate inputs and both have to survive.
-    #[test]
-    fn a_bearer_and_custom_headers_coexist() {
+    #[tokio::test]
+    async fn a_bearer_and_custom_headers_coexist() {
         let mut server = http_server("api");
         server.headers = Some(
             [("X-Tenant-Id".to_string(), "acme".to_string())]
@@ -300,6 +283,7 @@ mod tests {
         );
 
         let config = build_http_transport_config("api", &server, Some("bearer-not-a-real-token"))
+            .await
             .expect("builds");
 
         assert_eq!(
@@ -352,20 +336,21 @@ mod tests {
     /// name is not searched on `PATH`: a helper that runs whatever the launch directory or the
     /// path holds under that name is a persistence primitive.
     #[cfg(unix)]
-    #[test]
-    fn the_headers_helper_is_found_beside_the_config_and_nowhere_else() {
+    #[tokio::test]
+    async fn the_headers_helper_is_found_beside_the_config_and_nowhere_else() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let script = dir.path().join("helper.sh");
         std::fs::write(&script, "#!/bin/sh\nprintf 'X-Test: found\\n'\n").expect("write");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         // SAFETY: guarded above.
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
-        let beside = run_headers_helper("s", "http://example.test", "helper.sh");
-        let absolute = run_headers_helper("s", "http://example.test", &script.to_string_lossy());
-        let bare = run_headers_helper("s", "http://example.test", "sh");
+        let beside = run_headers_helper("s", "http://example.test", "helper.sh").await;
+        let absolute =
+            run_headers_helper("s", "http://example.test", &script.to_string_lossy()).await;
+        let bare = run_headers_helper("s", "http://example.test", "sh").await;
         // SAFETY: guarded above.
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
@@ -385,8 +370,8 @@ mod tests {
     /// A helper that writes more than a pipe holds, to stderr here, is read while it runs rather
     /// than left blocked on the write until the timeout kills it.
     #[cfg(unix)]
-    #[test]
-    fn a_chatty_headers_helper_still_finishes() {
+    #[tokio::test]
+    async fn a_chatty_headers_helper_still_finishes() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -399,9 +384,52 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         let started = std::time::Instant::now();
         let headers = run_headers_helper("s", "http://example.test", &script.to_string_lossy())
+            .await
             .expect("the helper's headers");
         assert_eq!(headers.get("X-Test").map(String::as_str), Some("found"));
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// A helper that exits having started something that keeps its stdout open still answers
+    /// within its budget, with what it printed: the connect is not held until whatever it left
+    /// behind lets go of the pipe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_leaves_its_stdout_held_still_answers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("helper.sh");
+        let held_by = dir.path().join("held-by");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'X-Test: found\\n'\nsleep 30 &\necho $! > '{}'\n",
+                held_by.display()
+            ),
+        )
+        .expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_headers_helper("s", "http://example.test", &script.to_string_lossy()),
+        )
+        .await;
+        // The `sleep` outlives a helper that exited on its own, so it is ended here, by the pid it
+        // wrote, rather than left for its 30 seconds.
+        let pid: libc::pid_t = std::fs::read_to_string(&held_by)
+            .expect("the helper wrote the pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // SAFETY: `kill(2)` has no preconditions.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+
+        let headers = answered
+            .expect("the helper answers within its budget")
+            .expect("the helper's headers");
+        assert_eq!(headers.get("X-Test").map(String::as_str), Some("found"));
     }
 
     #[test]

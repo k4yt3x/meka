@@ -22,7 +22,7 @@ use rmcp::{
     service::{NotificationContext, PeerRequestOptions, RequestContext, ServiceError},
 };
 
-use super::{ALLOWED_IMAGE_MIME_TYPES, MAX_MCP_IMAGE_BYTES, McpClientContext, ServerEntry};
+use super::{MAX_MCP_IMAGE_BYTES, McpClientContext, ServerEntry};
 use crate::{
     error::{MekaError, Result},
     frontend::{ElicitationResponse, Frontend},
@@ -555,7 +555,9 @@ impl McpTool {
     }
 
     /// One attempt at the call on the connection as it stands: every round the server asks for,
-    /// under one deadline. A closed transport is the caller's to reopen.
+    /// under one deadline. A transport that was closed before the call's first request went out
+    /// is the caller's to reopen and call again on; one that closes once a request has gone is
+    /// [`Attempt::Unanswered`], since the server may have run the call.
     async fn call_tool_once(
         &self,
         peer: Peer<RoleClient>,
@@ -585,9 +587,16 @@ impl McpTool {
         loop {
             (params.input_responses, params.request_state) = rounds.carry();
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(params.clone()));
-            let answer = match self.send_bounded(&peer, request, context, deadline).await? {
-                Attempt::Answered(answer) => answer,
-                Attempt::Stopped(stopped) => return Ok(Attempt::Stopped(stopped)),
+            let answer = match self.send_bounded(&peer, request, context, deadline).await {
+                Ok(Attempt::Answered(answer)) => answer,
+                Ok(Attempt::Stopped(stopped)) => return Ok(Attempt::Stopped(stopped)),
+                Ok(Attempt::Unanswered) => return Ok(Attempt::Unanswered),
+                // Never sent, but an earlier round of this call was, and answered by asking for
+                // input: the server has seen the call, so it is not started over.
+                Err(ServiceError::TransportClosed) if rounds.sent > 1 => {
+                    return Ok(Attempt::Unanswered);
+                }
+                Err(error) => return Err(error),
             };
             match answer {
                 ServerResult::CallToolResult(result) => return Ok(Attempt::Answered(result)),
@@ -611,6 +620,12 @@ impl McpTool {
 
     /// Send one request and wait for its answer under the call's cancellation and `deadline`;
     /// whichever of the two fires first tells the server to stop before this returns.
+    ///
+    /// A closed transport is two different facts here, which rmcp reports as one error. From the
+    /// send it is the error: the request never left, and may be sent on another connection. From
+    /// the wait it is [`Attempt::Unanswered`]: the request went out and its answer did not come
+    /// back, whether the server exited under it or a proxy cut the response stream of a
+    /// connection that still stands.
     async fn send_bounded(
         &self,
         peer: &Peer<RoleClient>,
@@ -667,7 +682,10 @@ impl McpTool {
         };
 
         tokio::select! {
-            response = handle.await_response() => response.map(Attempt::Answered),
+            response = handle.await_response() => match response {
+                Err(ServiceError::TransportClosed) => Ok(Attempt::Unanswered),
+                answered => answered.map(Attempt::Answered),
+            },
             _ = context.cancellation.cancelled() => {
                 notify_cancel("user interrupt").await;
                 Ok(Attempt::Stopped(Stopped::Interrupted))
@@ -681,7 +699,10 @@ impl McpTool {
 }
 
 impl McpTool {
-    /// Make the call, reconnecting and retrying once if the transport has closed under it.
+    /// Make the call, on a fresh connection when the one it found had closed before the call
+    /// could be sent. A call that was sent is never sent again: a server may have run it, a
+    /// disconnection cancels nothing, and nothing in the protocol licenses a second send. One
+    /// whose answer was lost mends the connection for the next call and fails saying so.
     ///
     /// Cancellation and timeout both notify the server before returning, so it can stop work it
     /// would otherwise finish for nobody. An interrupt is [`MekaError::Interrupted`]; every other
@@ -723,6 +744,24 @@ impl McpTool {
                     self.entry.tool_call_timeout.as_secs()
                 )));
             }
+            Ok(Attempt::Unanswered) => {
+                // Reopened here rather than left to the next call, as a call that met a closed
+                // transport always has; a no-op for a connection that still stands. What the
+                // reopening comes to is the entry's own state to say, to the next call.
+                match self.entry.reconnect(&context.cancellation).await {
+                    Ok(()) => {}
+                    Err(MekaError::Interrupted) => return Err(MekaError::Interrupted),
+                    Err(error) => tracing::debug!(
+                        "MCP server '{server_name}' was not reconnected after it left a call \
+                         unanswered: {error}",
+                        server_name = self.entry.server_name()
+                    ),
+                }
+                return Err(failed(
+                    "the connection closed before the server answered; the call may have run"
+                        .to_string(),
+                ));
+            }
             Err(error) => {
                 if crate::mcp::rejected_as_unauthorized(&error) {
                     let server_name = self.entry.server_name();
@@ -753,11 +792,15 @@ enum Stopped {
     TimedOut,
 }
 
-/// What one attempt at a request came to: the server's answer, or Meka's own stop. A failure the
-/// server or the transport reported is the attempt's error, which a reconnect may answer.
+/// What one attempt at a request came to: the server's answer, Meka's own stop, or a request
+/// that went out and was never answered. A failure the server or the transport reported is the
+/// attempt's error, which a reconnect may answer.
 enum Attempt<T> {
     Answered(T),
     Stopped(Stopped),
+    /// The request was sent and the connection closed before its answer arrived, so whether the
+    /// server acted on it is unknown.
+    Unanswered,
 }
 
 /// Map MCP `CallToolResult.content` items to Meka's provider-layer `ToolResultContent` blocks. Text
@@ -766,7 +809,7 @@ enum Attempt<T> {
 pub(crate) fn convert_tool_result_content(
     items: &[rmcp::model::ContentBlock],
 ) -> Vec<crate::conversation::ToolResultContent> {
-    use crate::{conversation::ToolResultContent, image::ImageSource};
+    use crate::conversation::ToolResultContent;
 
     // The one unbounded thing a server controls in a tool result: every byte of text goes into
     // the session and back to the provider on every later turn. Generous enough that no real
@@ -820,29 +863,11 @@ pub(crate) fn convert_tool_result_content(
                 }
             }
             rmcp::model::ContentBlock::Image(image) => {
-                // The server's declared `mime_type` is a hint; what gets forwarded is decided by
-                // the bytes. Providers sniff and reject a mismatch with a 400, and that rejection
-                // lands inside a `tool_result` already committed to the session, where it fails
-                // every later request. Only the first few characters are decoded, so this costs
-                // nothing on a multi-megabyte payload.
-                let sniffed = match crate::image::classify_base64_prefix(&image.data) {
-                    crate::image::ImageHandling::PassThrough(format) => Some(format.to_mime_type()),
-                    // A format needing transcoding (TIFF, ICO, ...) would mean decoding and
-                    // re-encoding the whole payload, which is not worth it for a server that
-                    // mislabeled its own output.
-                    _ => None,
-                }
-                .filter(|mime| {
-                    ALLOWED_IMAGE_MIME_TYPES
-                        .iter()
-                        .any(|allowed| allowed.eq_ignore_ascii_case(mime))
-                });
-                // Two ceilings, and both matter. `MAX_MCP_IMAGE_BYTES` is Meka's own memory and
-                // quota guard. The second is the providers' limit, which every other image
-                // producer gets for free by going through `prepare_image_payload`; this path
-                // builds its `ImageSource` directly, so without it an MCP image between the two
-                // ceilings is forwarded only for the provider to answer 400. Base64 carries 3
-                // bytes per 4 characters, which is exact enough to compare against a cap.
+                // Two ceilings, and both matter, checked on the base64 so a payload past either
+                // costs no decode. `MAX_MCP_IMAGE_BYTES` is Meka's own memory and quota guard. The
+                // second is the providers' limit, past which an image is forwarded only for the
+                // provider to answer 400. Base64 carries 3 bytes per 4 characters, which is exact
+                // enough to compare against a cap.
                 let decoded_len = image.data.len() / 4 * 3;
                 let oversize = if image.data.len() > MAX_MCP_IMAGE_BYTES {
                     Some(format!(
@@ -859,28 +884,26 @@ pub(crate) fn convert_tool_result_content(
                 } else {
                     None
                 };
-                if let Some(reason) = oversize {
-                    if !text_buffer.is_empty() {
-                        text_buffer.push('\n');
+                // Through the check every other image door applies, since a broken image lands in
+                // a `tool_result` already committed to the session and fails every later request:
+                // the bytes decide the format whatever the server declared, one providers do not
+                // take is converted to PNG, and one that does not decode is refused.
+                let prepared = match oversize {
+                    Some(reason) => Err(reason),
+                    None => crate::image::decode_base64_image(&image.data, &image.mime_type)
+                        .map_err(|error| format!("declared '{}': {error}", image.mime_type)),
+                };
+                match prepared {
+                    Ok(source) => {
+                        flush_text(&mut text_buffer, &mut blocks);
+                        blocks.push(ToolResultContent::Image { source });
                     }
-                    text_buffer.push_str(&format!("[image suppressed: {reason}]"));
-                } else if let Some(media_type) = sniffed {
-                    flush_text(&mut text_buffer, &mut blocks);
-                    blocks.push(ToolResultContent::Image {
-                        source: ImageSource::Base64 {
-                            media_type: media_type.to_string(),
-                            data: image.data.clone(),
-                        },
-                    });
-                } else {
-                    if !text_buffer.is_empty() {
-                        text_buffer.push('\n');
+                    Err(reason) => {
+                        if !text_buffer.is_empty() {
+                            text_buffer.push('\n');
+                        }
+                        text_buffer.push_str(&format!("[image suppressed: {reason}]"));
                     }
-                    text_buffer.push_str(&format!(
-                        "[image suppressed: declared '{}', but the bytes are not an allowed image \
-                         format]",
-                        image.mime_type
-                    ));
                 }
             }
             rmcp::model::ContentBlock::Audio(audio) => {
@@ -1043,16 +1066,42 @@ mod tests {
         }
     }
 
-    /// The allow-list applies to what the bytes actually are. BMP decodes fine but isn't a format
-    /// we forward, so a real BMP is suppressed no matter what the server called it.
+    /// What the bytes are decides, whatever the server called them, and a format providers do not
+    /// take is converted: a real BMP labeled PNG arrives as a PNG.
     #[test]
-    fn convert_tool_result_content_image_rejects_disallowed_format() {
+    fn convert_tool_result_content_image_converts_a_format_providers_do_not_take() {
         use rmcp::model::ContentBlock;
         let items = vec![ContentBlock::image(
             base64_image(image::ImageFormat::Bmp),
             "image/png",
         )];
         let blocks = convert_tool_result_content(&items);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            crate::conversation::ToolResultContent::Image { source } => {
+                assert_eq!(source.media_type(), "image/png");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(source.base64_data().expect("base64"))
+                    .expect("decodes");
+                assert_eq!(
+                    image::guess_format(&bytes).expect("an image"),
+                    image::ImageFormat::Png
+                );
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    /// A good signature is not a good image: a payload cut short would be committed to the
+    /// session and fail every later request, so it is suppressed as at every other image door.
+    #[test]
+    fn convert_tool_result_content_image_that_does_not_decode_is_suppressed() {
+        use rmcp::model::ContentBlock;
+        let whole = base64::engine::general_purpose::STANDARD
+            .decode(base64_image(image::ImageFormat::Png))
+            .expect("decodes");
+        let cut = base64::engine::general_purpose::STANDARD.encode(&whole[..whole.len() / 2]);
+        let blocks = convert_tool_result_content(&[ContentBlock::image(cut, "image/png")]);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             crate::conversation::ToolResultContent::Text { text } => {

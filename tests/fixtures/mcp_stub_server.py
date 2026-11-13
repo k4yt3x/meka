@@ -15,6 +15,12 @@ request, so a test can change what the server does between two requests to it. T
       "exit_after": 1,                      tools/list calls to serve before exiting
       "list_delay_ms": 300,                 how long each tools/list takes to answer
       "call_delay_ms": 300,                 how long each tools/call takes to answer
+      "exit_on_call": true,                 exit on tools/call without answering it, as a
+                                            server that dies under a call it has received
+      "exit_after_asking": true,            exit once tools/call has asked `elicit` as
+                                            input_required, before the call is sent again
+      "fail_list": -32603,                  answer tools/list with this JSON-RPC error code
+      "exit": true,                         exit at once, whatever it is doing
       "fail_initialize": true,              answer initialize with an error, as a server that
                                             cannot start a session
       "resources": ["file:///a"],           resources advertised, and the ones a subscription
@@ -55,6 +61,7 @@ request, so a test can change what the server does between two requests to it. T
 """
 
 import json
+import os
 import sys
 import threading
 import time
@@ -202,6 +209,8 @@ class Server:
             if current.get("instructions") is not None:
                 result["instructions"] = current["instructions"]
             reply(message_id, result)
+        elif method == "tools/list" and current.get("fail_list") is not None:
+            fail(message_id, current["fail_list"], "listing refused")
         elif method == "tools/list":
             time.sleep(current.get("list_delay_ms", 0) / 1000)
             result = {
@@ -327,6 +336,8 @@ class Server:
             reply(request_id, self.result({"_meta": {META_SUBSCRIPTION_ID: request_id}}))
 
     def call_tool(self, message_id, params, meta, current):
+        if current.get("exit_on_call"):
+            sys.exit(0)
         name = params.get("name")
         time.sleep(current.get("call_delay_ms", 0) / 1000)
         if current.get("progress") and meta.get("progressToken") is not None:
@@ -361,6 +372,8 @@ class Server:
         answers = params.get("inputResponses")
         if elicit and (answers is None or elicit.get("repeat")):
             self.ask(message_id, elicit)
+            if current.get("exit_after_asking"):
+                sys.exit(0)
             return
         text = f"{name} ran"
         if answers is not None:
@@ -446,6 +459,8 @@ class Server:
         while True:
             time.sleep(0.05)
             try:
+                if state(self.path).get("exit"):
+                    os._exit(0)
                 self.emit_pending()
             except (OSError, ValueError):
                 # The state file is being rewritten; the next tick reads it whole.

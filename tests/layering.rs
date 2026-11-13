@@ -730,23 +730,23 @@ fn tool_arguments_are_read_through_the_shared_readers() {
 const PROCESS_STARTERS: &[(&str, &str)] = &[
     (
         "src/tools/shell.rs",
-        "`shell_execute`, through `process::spawn_with_pre_exec` on Unix and `process::spawn` on \
-         Windows",
+        "`shell_execute`, through `process::spawn_tree_with_pre_exec` on Unix and \
+         `process::spawn_tree` on Windows",
     ),
     (
         "src/host/tui/screen.rs",
-        "the screen's `!command`, through `process::spawn`; the browser it opens for a URL a \
+        "the screen's `!command`, through `process::spawn_tree`; the browser it opens for a URL a \
          server asks for (`open::that_detached`) is the user's own and stays outside, since a job \
          would close it with the call",
     ),
     (
         "src/scheduler.rs",
-        "a schedule's shell gate, through `process::spawn`",
+        "a schedule's shell gate, through `process::spawn_tree`",
     ),
     (
         "src/mcp/transport.rs",
         "a stdio MCP server, which rmcp spawns between `process::prepare` and `process::adopt` in \
-         the connector, and the `headers_helper`, through `process::spawn`",
+         the connector, and the `headers_helper`, through `process::spawn_tree`",
     ),
     (
         "src/sandbox/bubblewrap.rs",

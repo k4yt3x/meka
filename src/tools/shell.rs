@@ -679,13 +679,11 @@ impl ExecuteCommandTool {
             _ => None,
         };
 
-        // Unix: the child-side steps, run by the door after its own placement. `setsid` puts the
-        // child in its own session/process group so timeouts and cancellation can kill the whole
-        // tree (including backgrounded grandchildren such as `(sleep 3600 &)`) via
-        // `kill(-pgid, …)`. On Linux the Landlock setup runs here too, and only for the Landlock
-        // dialect: under Bubblewrap the ruleset is enacted inside the sandbox by `meka confine`,
-        // after bwrap's mounts, because a domain that handles any filesystem right refuses
-        // `mount(2)`.
+        // Unix: the child-side steps, run by the door after its own placement and the `setsid`
+        // that gives the command a tree of its own. On Linux the Landlock setup runs here, and
+        // only for the Landlock dialect: under Bubblewrap the ruleset is enacted inside the
+        // sandbox by `meka confine`, after bwrap's mounts, because a domain that handles any
+        // filesystem right refuses `mount(2)`.
         #[cfg(unix)]
         let in_child = {
             // Planned here, in the parent, because `pre_exec` runs after `fork` in a
@@ -711,12 +709,6 @@ impl ExecuteCommandTool {
                 crate::sandbox::held_network(&self.sandbox_capability, confinement.network());
 
             move || {
-                // SAFETY: `setsid(2)` is async-signal-safe and has no preconditions beyond "the
-                // caller isn't already a process group leader", which is guaranteed for a
-                // freshly forked child process.
-                if unsafe { libc::setsid() } == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
                 // The layer's executable rides into Bubblewrap on its descriptor, which stays
                 // close-on-exec until here so no other child of Meka inherits it. `fcntl(2)`
                 // is async-signal-safe.
@@ -768,85 +760,51 @@ impl ExecuteCommandTool {
         // and allocates nothing.
         #[cfg(unix)]
         let spawned =
-            unsafe { crate::process::spawn_with_pre_exec(&mut command_builder, in_child) };
+            unsafe { crate::process::spawn_tree_with_pre_exec(&mut command_builder, in_child) };
         #[cfg(windows)]
-        let spawned = crate::process::spawn(&mut command_builder);
-        let mut child = ChildGroup(spawned.map_err(|error| MekaError::ToolExecution {
+        let spawned = crate::process::spawn_tree(&mut command_builder);
+        let child = spawned.map_err(|error| MekaError::ToolExecution {
             tool_name: "shell_execute".to_string(),
             message: format!("failed to spawn command: {error}"),
-        })?);
+        })?;
 
-        // Drain stdout/stderr on dedicated tasks that start *before* the wait.
-        // `tokio::process::Child::wait()` does not read the pipes; a child writing past the OS pipe
-        // buffer (~64 KiB) would block in `write()`, `wait()` would never return, and the call
-        // would spuriously hit the timeout below. After the child's process group exits the pipe
-        // write ends close and the drains hit EOF.
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let relay = OutputRelay::for_call(&context);
-        let budget = Arc::new(OutputBudget::new(MAX_OUTPUT_BYTES));
-        let stop = tokio_util::sync::CancellationToken::new();
-        let stdout_task = tokio::spawn({
-            let relay = relay.clone();
-            let budget = Arc::clone(&budget);
-            let stop = stop.clone();
-            async move { drain_output(stdout, relay, budget, stop).await }
-        });
-        let stderr_task = tokio::spawn({
-            let relay = relay.clone();
-            let budget = Arc::clone(&budget);
-            let stop = stop.clone();
-            async move { drain_output(stderr, relay, budget, stop).await }
-        });
-
-        // wait_with_output() consumes the child, so use wait() + manual stdout/stderr reading
-        // instead to allow kill on cancellation. `biased`, so a bound reached in the same instant
-        // the child exits is reported as the bound: the random pick would otherwise call the
-        // command clean while its last reads were never taken.
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                kill_child_tree(&mut child).await;
-                stdout_task.abort();
-                stderr_task.abort();
-                Err(MekaError::Interrupted)
-            }
-            _ = budget.exhausted.cancelled() => {
-                kill_child_tree(&mut child).await;
-                let drained = collect_drains(stdout_task, stderr_task, &stop).await;
+        let budget = Arc::new(crate::process::OutputBudget::new(MAX_OUTPUT_BYTES));
+        let finished = crate::process::run(
+            child,
+            command_capture(&budget, OutputRelay::for_call(&context)),
+            Some(timeout),
+            Some(crate::process::Stop::Graceful(&cancellation)),
+            DRAIN_TIMEOUT,
+        )
+        .await
+        .map_err(wait_failed)?;
+        let drained = DrainedOutput::from(finished.drained);
+        match finished.ended {
+            crate::process::Ended::Stopped => Err(MekaError::Interrupted),
+            crate::process::Ended::OutputBound => {
                 Ok(killed_command_output(&drained, &output_bound_reason()))
             }
-            _ = tokio::time::sleep(timeout) => {
-                kill_child_tree(&mut child).await;
-                let drained = collect_drains(stdout_task, stderr_task, &stop).await;
-                Ok(killed_command_output(&drained, &timed_out_reason(timeout, &budget)))
-            }
-            status = child.wait() => {
-                finish_command(status, stdout_task, stderr_task, &stop, &budget).await
-            }
+            crate::process::Ended::TimedOut => Ok(killed_command_output(
+                &drained,
+                &timed_out_reason(timeout, &budget),
+            )),
+            crate::process::Ended::Exited(status) => Ok(finish_command(&status, &drained, &budget)),
         }
     }
 }
 
 /// The result of a command that ran to its end: its exit status with what the drains collected.
 ///
-/// The drains may still cross the bound here: a child exits once its last write fits in the pipe,
-/// so it can finish within a pipe's worth of the bound and leave the crossing to the collection
-/// below. That output is cut like a killed command's, and the result says so first, because a clean
-/// exit code over an incomplete transcript is the one shape the record must never take.
-async fn finish_command(
-    status: std::io::Result<std::process::ExitStatus>,
-    stdout_task: tokio::task::JoinHandle<String>,
-    stderr_task: tokio::task::JoinHandle<String>,
-    stop: &tokio_util::sync::CancellationToken,
-    budget: &OutputBudget,
-) -> Result<ToolOutput> {
-    let status = status.map_err(|error| MekaError::ToolExecution {
-        tool_name: "shell_execute".to_string(),
-        message: format!("failed to wait for command: {error}"),
-    })?;
-
-    let drained = collect_drains(stdout_task, stderr_task, stop).await;
+/// The drains may still cross the bound after the exit: a child exits once its last write fits in
+/// the pipe, so it can finish within a pipe's worth of the bound and leave the crossing to the
+/// drains' collection. That output is cut like a killed command's, and the result says so first,
+/// because a clean exit code over an incomplete transcript is the one shape the record must never
+/// take.
+fn finish_command(
+    status: &std::process::ExitStatus,
+    drained: &DrainedOutput,
+    budget: &crate::process::OutputBudget,
+) -> ToolOutput {
     if drained.stopped_early {
         tracing::warn!(
             "command output drain stopped after {DRAIN_TIMEOUT:?}; a background process may be \
@@ -854,9 +812,9 @@ async fn finish_command(
         );
     }
 
-    if budget.exhausted.is_cancelled() {
-        return Ok(led_by_reason(&drained, &output_cut_note())
-            .with_metadata(command_exit_metadata(&status)));
+    if budget.is_exhausted() {
+        return led_by_reason(drained, &output_cut_note())
+            .with_metadata(command_exit_metadata(status));
     }
 
     // No output-length truncation here: the agent layer's `persist_oversized_results`
@@ -867,7 +825,28 @@ async fn finish_command(
     if drained.stopped_early {
         append_drain_stopped_note(&mut output);
     }
-    Ok(output.with_metadata(command_exit_metadata(&status)))
+    output.with_metadata(command_exit_metadata(status))
+}
+
+/// What a command's drains keep: every byte of both streams, within `budget`, relayed to the
+/// call's live view when one is open.
+fn command_capture(
+    budget: &Arc<crate::process::OutputBudget>,
+    relay: Option<OutputRelay>,
+) -> crate::process::Capture {
+    crate::process::Capture {
+        stdout: crate::process::Keep::Budgeted(Arc::clone(budget)),
+        stderr: crate::process::Keep::Budgeted(Arc::clone(budget)),
+        sink: relay.map(|relay| Arc::new(relay) as Arc<dyn crate::process::Sink>),
+    }
+}
+
+/// The failure of waiting on a command that was started.
+fn wait_failed(error: std::io::Error) -> MekaError {
+    MekaError::ToolExecution {
+        tool_name: "shell_execute".to_string(),
+        message: format!("failed to wait for command: {error}"),
+    }
 }
 
 /// The result of a command Meka killed, at its timeout or at the output bound: the reason, then
@@ -899,9 +878,9 @@ fn led_by_reason(drained: &DrainedOutput, reason: &str) -> ToolOutput {
 /// Why a command was killed at its timeout, in the words the model and every test read. When the
 /// drains also reached the bound while the command died, the result says that too, since the
 /// transcript is then cut as well as ended.
-fn timed_out_reason(timeout: std::time::Duration, budget: &OutputBudget) -> String {
+fn timed_out_reason(timeout: std::time::Duration, budget: &crate::process::OutputBudget) -> String {
     let mut reason = format!("Command timed out after {}ms", timeout.as_millis());
-    if budget.exhausted.is_cancelled() {
+    if budget.is_exhausted() {
         reason.push('\n');
         reason.push_str(&output_cut_note());
     }
@@ -936,104 +915,26 @@ fn unconfinable_command() -> MekaError {
     }
 }
 
-/// The command's child, killed with its whole process group when the value is dropped; on
-/// Windows the job the door placed it in ends the tree when the value drops.
-///
-/// The `select!` arms below kill the group on a stop, a timeout and an exhausted bound, but a
-/// caller that drops the `execute` future never reaches them: a gate's `tokio::time::timeout`
-/// drops it and only then fires the token, and nothing else reaps the group, so without this
-/// every evaluation of a `shell_execute` gate would leave its command running. `Drop` is
-/// synchronous, so there is no grace signal here; a child the arms already killed and reaped has
-/// no id and is not signaled.
-struct ChildGroup(crate::process::Spawned<tokio::process::Child>);
-
-impl std::ops::Deref for ChildGroup {
-    type Target = crate::process::Spawned<tokio::process::Child>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for ChildGroup {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for ChildGroup {
-    fn drop(&mut self) {
-        let Some(pid) = self.0.id() else {
-            return;
-        };
-        #[cfg(unix)]
-        {
-            // SAFETY: `kill(2)` is always safe to call; `setsid` in `pre_exec` made the child's
-            // pid its group id, so `-pid` names the whole tree.
-            let killed = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
-            if killed != 0 {
-                let error = std::io::Error::last_os_error();
-                tracing::debug!("failed to kill process group {pid} on drop: {error}");
-            }
-        }
-        if let Err(error) = self.0.start_kill() {
-            tracing::debug!("failed to kill child {pid} on drop: {error}");
-        }
-    }
-}
-
-/// Terminate the child and everything it started. Called on timeout and on cancellation. On Unix
-/// the `setsid()` done in `pre_exec` makes the child's pid its pgid, so `kill(-pgid, …)` reaches
-/// every backgrounded descendant it spawned (`(sleep 3600 &)` survives a plain `child.kill()` but
-/// is caught here); on Windows the job the door placed the child in is terminated. The closing
-/// `child.kill().await` is a no-op once the tree is gone and reaps the child either way.
-async fn kill_child_tree(child: &mut crate::process::Spawned<tokio::process::Child>) {
-    #[cfg(windows)]
-    if let Err(error) = child.terminate_tree() {
-        tracing::debug!("failed to terminate the command's job: {error}");
-    }
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            let pgid = pid as libc::pid_t;
-            // SAFETY: `kill(2)` is always safe to call; it just returns an error if the target is
-            // gone. Sending to `-pgid` targets the whole process group. Errors here usually mean
-            // the group already exited; log at debug so an unkillable group still leaves a trail
-            // without spamming default verbosity.
-            let term_result = unsafe { libc::kill(-pgid, libc::SIGTERM) };
-            if term_result != 0 {
-                let error = std::io::Error::last_os_error();
-                tracing::debug!("failed to send SIGTERM to process group {pgid}: {error}");
-            }
-            // Brief grace period so well-behaved children can shut down cleanly before SIGKILL
-            // lands.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let kill_result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-            if kill_result != 0 {
-                let error = std::io::Error::last_os_error();
-                tracing::debug!("failed to send SIGKILL to process group {pgid}: {error}");
-            }
-        }
-    }
-    if let Err(error) = child.kill().await {
-        tracing::debug!("failed to kill child process: {error}");
-    }
-}
-
 /// Upper bound on draining a child's stdout/stderr after it has exited or been killed. A
 /// backgrounded grandchild that inherited the pipe write handle can keep the pipe open past the
 /// direct child's exit; rather than block the tool call, the drains are told to stop and return
 /// what they have, and the result says so.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Forwards a running command's output to the frontend as it is produced. Cloned into both drain
-/// tasks so stdout and stderr land in one stream in arrival order, which is what a terminal shows.
+/// Forwards a running command's output to the frontend as it is produced. The sink of both drains,
+/// so stdout and stderr land in one stream in arrival order, which is what a terminal shows.
+///
+/// A read can end inside a multi-byte character, so what each stream has read and not yet relayed
+/// waits here for the read that completes it rather than being relayed as replacement characters.
+/// What is relayed still covers the whole stream, so the live view is unaffected by how the reads
+/// happened to split, and bytes that are no character at all are relayed as the result spells them.
 ///
 /// `None` when no live view is open on the call, in which case the output is only collected.
-#[derive(Clone)]
 struct OutputRelay {
     frontend: Arc<dyn crate::frontend::Frontend>,
     tool_call_id: String,
+    stdout_pending: std::sync::Mutex<Vec<u8>>,
+    stderr_pending: std::sync::Mutex<Vec<u8>>,
 }
 
 impl OutputRelay {
@@ -1043,6 +944,8 @@ impl OutputRelay {
         context.live_call_id().map(|tool_call_id| Self {
             frontend: Arc::clone(&context.frontend),
             tool_call_id: tool_call_id.to_string(),
+            stdout_pending: std::sync::Mutex::default(),
+            stderr_pending: std::sync::Mutex::default(),
         })
     }
 
@@ -1053,6 +956,26 @@ impl OutputRelay {
                 chunk,
             })
             .await;
+    }
+}
+
+#[async_trait]
+impl crate::process::Sink for OutputRelay {
+    async fn receive(&self, stream: crate::process::Stream, chunk: &[u8]) {
+        let pending = match stream {
+            crate::process::Stream::Stdout => &self.stdout_pending,
+            crate::process::Stream::Stderr => &self.stderr_pending,
+        };
+        let text = {
+            let mut pending = crate::sync::lock(pending);
+            pending.extend_from_slice(chunk);
+            let (text, taken) = relayable(&pending);
+            pending.drain(..taken);
+            text
+        };
+        if !text.is_empty() {
+            self.send(text).await;
+        }
     }
 }
 
@@ -1068,109 +991,6 @@ impl OutputRelay {
 /// Above the largest legitimate outputs measured (a whole `git log -p`, an `ls -lR /usr`, both in
 /// the tens of MiB) and well below the runaway cases.
 const MAX_OUTPUT_BYTES: usize = 64 * crate::text::MIB;
-
-/// One command's share of [`MAX_OUTPUT_BYTES`], held by both of its drains.
-///
-/// Shared rather than split per stream, so a command that prints everything on one stream gets the
-/// whole bound, and one that splits its output cannot double it.
-struct OutputBudget {
-    remaining: std::sync::atomic::AtomicUsize,
-    /// Fires when a drain has spent the budget. The spawn waits on it beside the timeout.
-    exhausted: tokio_util::sync::CancellationToken,
-}
-
-impl OutputBudget {
-    fn new(bytes: usize) -> Self {
-        Self {
-            remaining: std::sync::atomic::AtomicUsize::new(bytes),
-            exhausted: tokio_util::sync::CancellationToken::new(),
-        }
-    }
-
-    /// Spend `bytes`. `false` when they did not fit, at which point the budget is exhausted and
-    /// stays so; the chunk that crossed the line is kept, so the record ends on a whole read.
-    fn spend(&self, bytes: usize) -> bool {
-        use std::sync::atomic::Ordering;
-        let before = self
-            .remaining
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                Some(remaining.saturating_sub(bytes))
-            })
-            .unwrap_or(0);
-        if before >= bytes {
-            return true;
-        }
-        self.exhausted.cancel();
-        false
-    }
-}
-
-/// Read a child pipe until EOF, the budget runs out, or `stop` fires, relaying each chunk as it
-/// arrives and returning everything read.
-///
-/// Reads bytes rather than `read_to_string` because a chunk boundary can fall inside a multi-byte
-/// character: the trailing incomplete sequence is carried over to the next read instead of being
-/// relayed as replacement characters. What is relayed still covers the whole stream, so the live
-/// view is unaffected by how the reads happened to split, and bytes that are no character at all
-/// are relayed as the returned string spells them.
-///
-/// Whichever way the read ends, the returned string is everything the drain took in. The spawn
-/// decides what to say about a stream that ended early; this function never drops a byte it read.
-async fn drain_output<R>(
-    reader: Option<R>,
-    relay: Option<OutputRelay>,
-    budget: Arc<OutputBudget>,
-    stop: tokio_util::sync::CancellationToken,
-) -> String
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    let Some(mut reader) = reader else {
-        return String::new();
-    };
-
-    let mut content: Vec<u8> = Vec::new();
-    let mut relayed = 0usize;
-    let mut buffer = [0u8; 8192];
-    loop {
-        // `read` is cancel-safe on a pipe: a read that has not completed has copied nothing, so
-        // stopping here loses nothing already produced.
-        let read = tokio::select! {
-            read = reader.read(&mut buffer) => read,
-            _ = stop.cancelled() => break,
-        };
-        match read {
-            Ok(0) => break,
-            Ok(read) => {
-                content.extend(buffer.iter().take(read));
-
-                if let Some(relay) = &relay {
-                    let (text, taken) = relayable(content.get(relayed..).unwrap_or_default());
-                    relayed += taken;
-                    if !text.is_empty() {
-                        relay.send(text).await;
-                    }
-                }
-
-                // After the chunk is kept, so the record ends on what was actually read; the spawn
-                // kills the command, and this drain has nothing more to take from it.
-                if !budget.spend(read) {
-                    break;
-                }
-            }
-            Err(error) => {
-                tracing::debug!("failed to read child output: {error}");
-                break;
-            }
-        }
-    }
-
-    // Lossy rather than a hard error: a command that emits a stray non-UTF-8 byte (a progress bar
-    // in a foreign encoding, a binary blob on stderr) should still hand the model everything else
-    // it printed.
-    String::from_utf8_lossy(&content).into_owned()
-}
 
 /// The text of `pending` that can be relayed now and the bytes it covers: every complete
 /// character, and U+FFFD for each sequence that can never become one, as a lossy decode of the
@@ -1214,47 +1034,17 @@ struct DrainedOutput {
     stopped_early: bool,
 }
 
-/// Join both drains, waiting at most [`DRAIN_TIMEOUT`] in total for the pipes to close.
-///
-/// A drain that has not reached EOF by then is told to stop and returns what it has, so a
-/// backgrounded grandchild holding the pipe delays the result by the timeout and costs the output
-/// it prints afterwards, never the output already read.
-async fn collect_drains(
-    mut stdout_task: tokio::task::JoinHandle<String>,
-    mut stderr_task: tokio::task::JoinHandle<String>,
-    stop: &tokio_util::sync::CancellationToken,
-) -> DrainedOutput {
-    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
-    let mut stopped_early = false;
-    let stdout = join_drain_by(&mut stdout_task, deadline, stop, &mut stopped_early).await;
-    let stderr = join_drain_by(&mut stderr_task, deadline, stop, &mut stopped_early).await;
-    DrainedOutput {
-        stdout,
-        stderr,
-        stopped_early,
-    }
-}
-
-/// One drain's result by `deadline`. Past it, `stop` is fired and the drain is joined for what it
-/// has, which it returns as soon as it sees the signal.
-async fn join_drain_by(
-    task: &mut tokio::task::JoinHandle<String>,
-    deadline: tokio::time::Instant,
-    stop: &tokio_util::sync::CancellationToken,
-    stopped_early: &mut bool,
-) -> String {
-    let joined = match tokio::time::timeout_at(deadline, &mut *task).await {
-        Ok(joined) => joined,
-        Err(_elapsed) => {
-            *stopped_early = true;
-            stop.cancel();
-            task.await
+impl From<crate::process::Drained> for DrainedOutput {
+    /// Lossy rather than a hard error: a command that emits a stray non-UTF-8 byte (a progress bar
+    /// in a foreign encoding, a binary blob on stderr) should still hand the model everything else
+    /// it printed.
+    fn from(drained: crate::process::Drained) -> Self {
+        Self {
+            stdout: String::from_utf8_lossy(&drained.stdout.bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&drained.stderr.bytes).into_owned(),
+            stopped_early: drained.stopped_early,
         }
-    };
-    joined.unwrap_or_else(|error| {
-        tracing::debug!("drain task failed: {error}");
-        String::new()
-    })
+    }
 }
 
 /// Structured exit status for frontends that render a terminal. `ExitStatus::code()` is `None`
@@ -1294,8 +1084,9 @@ fn signal_name(number: i32) -> String {
 
 /// Exit status for a command Meka killed, at its timeout or at the output bound. The child is torn
 /// down without its status being reaped, so there is nothing to read it from. On Unix the kill
-/// really is a signal ([`kill_child_tree`]); Windows has no signals, and claiming one there would
-/// put a name in the client's terminal that never existed on that platform.
+/// really is a signal (to the tree, by [`crate::process::run`]); Windows has no signals, and
+/// claiming one there would put a name in the client's terminal that never existed on that
+/// platform.
 fn killed_exit_metadata() -> crate::frontend::ToolOutputMetadata {
     crate::frontend::ToolOutputMetadata::CommandExit {
         exit_code: None,
@@ -1372,9 +1163,8 @@ async fn run_windows_sandboxed(
 ) -> Result<ToolOutput> {
     use std::{sync::Arc, time::Duration};
 
-    // Bound the post-kill cleanup wait so a stuck `TerminateProcess` or a drain task that somehow
-    // fails to reach EOF can't hang the tool indefinitely. Two seconds is generous for kernel-side
-    // teardown.
+    // Bound the post-kill cleanup wait so a stuck `TerminateProcess` can't hang the tool
+    // indefinitely. Two seconds is generous for kernel-side teardown.
     const POST_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
     let mut sandboxed =
@@ -1389,19 +1179,8 @@ async fn run_windows_sandboxed(
     let stderr = sandboxed.take_stderr().map(tokio::fs::File::from_std);
 
     let child = Arc::new(sandboxed);
-    let budget = Arc::new(OutputBudget::new(MAX_OUTPUT_BYTES));
-    let stop = tokio_util::sync::CancellationToken::new();
-    let stdout_task = tokio::spawn({
-        let relay = relay.clone();
-        let budget = Arc::clone(&budget);
-        let stop = stop.clone();
-        async move { drain_output(stdout, relay, budget, stop).await }
-    });
-    let stderr_task = tokio::spawn({
-        let budget = Arc::clone(&budget);
-        let stop = stop.clone();
-        async move { drain_output(stderr, relay, budget, stop).await }
-    });
+    let budget = Arc::new(crate::process::OutputBudget::new(MAX_OUTPUT_BYTES));
+    let drains = crate::process::Drains::start(stdout, stderr, command_capture(&budget, relay));
 
     let wait_child = Arc::clone(&child);
     // `tokio::select!` requires the future passed to the happy-path branch (`join = ...`) to be
@@ -1411,7 +1190,7 @@ async fn run_windows_sandboxed(
     // without committing the move until we know which branch wins.
     let mut wait_handle = tokio::task::spawn_blocking(move || wait_child.wait_blocking());
 
-    // `biased` for the reason the Unix spawn gives: a bound reached as the child exits is the
+    // `biased` for the reason `process::run` gives: a bound reached as the child exits is the
     // bound, not a clean exit.
     tokio::select! {
         biased;
@@ -1420,16 +1199,14 @@ async fn run_windows_sandboxed(
                 tracing::debug!("failed to kill sandboxed child: {error}");
             }
             abort_after_timeout(wait_handle, POST_KILL_TIMEOUT).await;
-            abort_after_timeout(stdout_task, POST_KILL_TIMEOUT).await;
-            abort_after_timeout(stderr_task, POST_KILL_TIMEOUT).await;
             Err(MekaError::Interrupted)
         }
-        _ = budget.exhausted.cancelled() => {
+        _ = drains.bound_reached() => {
             if let Err(error) = child.kill() {
                 tracing::debug!("failed to kill sandboxed child: {error}");
             }
             abort_after_timeout(wait_handle, POST_KILL_TIMEOUT).await;
-            let drained = collect_drains(stdout_task, stderr_task, &stop).await;
+            let drained = DrainedOutput::from(drains.collect(DRAIN_TIMEOUT).await);
             Ok(killed_command_output(&drained, &output_bound_reason()))
         }
         _ = tokio::time::sleep(timeout) => {
@@ -1437,7 +1214,7 @@ async fn run_windows_sandboxed(
                 tracing::debug!("failed to kill sandboxed child: {error}");
             }
             abort_after_timeout(wait_handle, POST_KILL_TIMEOUT).await;
-            let drained = collect_drains(stdout_task, stderr_task, &stop).await;
+            let drained = DrainedOutput::from(drains.collect(DRAIN_TIMEOUT).await);
             Ok(killed_command_output(&drained, &timed_out_reason(timeout, &budget)))
         }
         join = &mut wait_handle => {
@@ -1445,7 +1222,9 @@ async fn run_windows_sandboxed(
                 tool_name: "shell_execute".to_string(),
                 message: format!("wait task panicked: {error}"),
             })?;
-            finish_command(status, stdout_task, stderr_task, &stop, &budget).await
+            let status = status.map_err(wait_failed)?;
+            let drained = DrainedOutput::from(drains.collect(DRAIN_TIMEOUT).await);
+            Ok(finish_command(&status, &drained, &budget))
         }
     }
 }
@@ -1562,6 +1341,8 @@ mod tests {
         Some(OutputRelay {
             frontend,
             tool_call_id: "call_1".to_string(),
+            stdout_pending: std::sync::Mutex::default(),
+            stderr_pending: std::sync::Mutex::default(),
         })
     }
 
@@ -1569,15 +1350,17 @@ mod tests {
     /// that behaves gets.
     async fn drain_for_test<R>(reader: R, relay: Option<OutputRelay>) -> String
     where
-        R: tokio::io::AsyncRead + Unpin,
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
-        drain_output(
+        let budget = Arc::new(crate::process::OutputBudget::new(MAX_OUTPUT_BYTES));
+        let drained = crate::process::Drains::start(
             Some(reader),
-            relay,
-            Arc::new(OutputBudget::new(MAX_OUTPUT_BYTES)),
-            tokio_util::sync::CancellationToken::new(),
+            None::<tokio::io::Empty>,
+            command_capture(&budget, relay),
         )
-        .await
+        .collect(DRAIN_TIMEOUT)
+        .await;
+        DrainedOutput::from(drained).stdout
     }
 
     /// Construct an `ExecuteCommandTool` for tests with a backend probe matching whatever the host
@@ -1739,9 +1522,9 @@ mod tests {
     }
 
     /// The relay must reassemble to the source across a stream of many reads, each carrying a
-    /// partial character into the next: `relayed` is a cursor into the drain's buffer, and a cursor
-    /// that drifts by one byte loses a whole read from the live view while the result stays
-    /// complete, which no single-read test can show.
+    /// partial character into the next: what a read leaves unrelayed waits for the next, and a
+    /// carry-over that drifts by one byte loses a whole read from the live view while the result
+    /// stays complete, which no single-read test can show.
     #[tokio::test]
     async fn the_relay_loses_nothing_across_a_stream_of_many_reads() {
         // A 3-byte character repeated, so no power-of-two read size can land on a boundary and
@@ -1766,124 +1549,6 @@ mod tests {
             !chunks.iter().any(|chunk| chunk.contains('\u{fffd}')),
             "and no chunk may be cut mid-character",
         );
-    }
-
-    /// A drain stops reading once the budget is spent, keeps every byte it read including the
-    /// chunk that crossed the line, and raises the signal the spawn kills the command on. Nothing
-    /// is elided: what the model gets is a prefix of what the command printed.
-    #[tokio::test]
-    async fn a_drain_stops_at_the_output_bound_and_keeps_what_it_read() {
-        let bound = 100 * crate::text::KIB;
-        let mut source = Vec::with_capacity(3 * bound);
-        source.extend_from_slice(b"FIRST-LINE\n");
-        source.resize(3 * bound, b'x');
-        let budget = Arc::new(OutputBudget::new(bound));
-
-        let collected = drain_output(
-            Some(std::io::Cursor::new(source.clone())),
-            None,
-            Arc::clone(&budget),
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await;
-
-        assert!(
-            budget.exhausted.is_cancelled(),
-            "spending the budget must raise the signal"
-        );
-        assert!(
-            collected.len() >= bound && collected.len() < source.len(),
-            "the drain stops at the bound, not before and not at EOF: {} bytes",
-            collected.len()
-        );
-        assert_eq!(
-            collected.as_bytes(),
-            &source[..collected.len()],
-            "what was kept is a prefix of the stream"
-        );
-    }
-
-    /// Both of a command's drains draw on one budget, so output split across stdout and stderr is
-    /// bounded as a whole rather than at twice the bound.
-    #[tokio::test]
-    async fn two_drains_share_one_budget() {
-        let bound = 100 * crate::text::KIB;
-        let budget = Arc::new(OutputBudget::new(bound));
-        // Each stream alone fits; together they do not.
-        let each = vec![b'y'; bound * 3 / 4];
-
-        let (stdout, stderr) = tokio::join!(
-            drain_output(
-                Some(std::io::Cursor::new(each.clone())),
-                None,
-                Arc::clone(&budget),
-                tokio_util::sync::CancellationToken::new(),
-            ),
-            drain_output(
-                Some(std::io::Cursor::new(each.clone())),
-                None,
-                Arc::clone(&budget),
-                tokio_util::sync::CancellationToken::new(),
-            ),
-        );
-
-        assert!(budget.exhausted.is_cancelled(), "the pair spent the budget");
-        assert!(
-            stdout.len() + stderr.len() < 2 * each.len(),
-            "one of the drains stopped short: {} + {}",
-            stdout.len(),
-            stderr.len()
-        );
-        assert!(
-            stdout.len() + stderr.len() >= bound,
-            "and not before the bound was reached: {} + {}",
-            stdout.len(),
-            stderr.len()
-        );
-    }
-
-    /// A drain told to stop returns what it has read so far rather than waiting for a pipe that
-    /// something else is holding open; that is what makes a grandchild cost only its later output.
-    #[tokio::test]
-    async fn a_drain_told_to_stop_returns_what_it_has() {
-        use tokio::io::AsyncWriteExt;
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        let stop = tokio_util::sync::CancellationToken::new();
-        let recorder = Arc::new(ChunkRecorder::default());
-        let drain = tokio::spawn({
-            let stop = stop.clone();
-            let relay = relay_into(&recorder);
-            async move {
-                drain_output(
-                    Some(reader),
-                    relay,
-                    Arc::new(OutputBudget::new(MAX_OUTPUT_BYTES)),
-                    stop,
-                )
-                .await
-            }
-        });
-
-        writer.write_all(b"partial output\n").await.expect("write");
-        writer.flush().await.expect("flush");
-        // The writer stays open, so EOF never comes; only the signal ends the drain. Sent once the
-        // relay shows the drain has taken the bytes, so the test never races the read.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while recorder.relayed() != "partial output\n" {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the drain must read what was written"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        stop.cancel();
-
-        let collected = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
-            .await
-            .expect("the drain returns promptly once told to stop")
-            .expect("the drain task completes");
-        assert_eq!(collected, "partial output\n");
-        drop(writer);
     }
 
     /// The common case must be untouched: byte-for-byte what was printed.
@@ -2086,20 +1751,15 @@ mod tests {
     #[tokio::test]
     async fn a_command_whose_drains_reach_the_bound_after_it_exits_is_not_reported_clean() {
         use std::os::unix::process::ExitStatusExt;
-        let budget = OutputBudget::new(16);
+        let budget = crate::process::OutputBudget::new(16);
         assert!(!budget.spend(32), "the budget is spent past its bound");
-        let stdout_task = tokio::spawn(async { "printed before the cut\n".to_string() });
-        let stderr_task = tokio::spawn(async { String::new() });
+        let drained = DrainedOutput {
+            stdout: "printed before the cut\n".to_string(),
+            stderr: String::new(),
+            stopped_early: false,
+        };
 
-        let result = finish_command(
-            Ok(std::process::ExitStatus::from_raw(0)),
-            stdout_task,
-            stderr_task,
-            &tokio_util::sync::CancellationToken::new(),
-            &budget,
-        )
-        .await
-        .expect("a result");
+        let result = finish_command(&std::process::ExitStatus::from_raw(0), &drained, &budget);
 
         assert!(result.is_error, "a cut transcript is never a clean result");
         let text = result.text_content();
@@ -2172,7 +1832,7 @@ mod tests {
         let text = result.text_content();
         let reason = timed_out_reason(
             std::time::Duration::from_millis(300),
-            &OutputBudget::new(MAX_OUTPUT_BYTES),
+            &crate::process::OutputBudget::new(MAX_OUTPUT_BYTES),
         );
         assert!(
             text.starts_with(&format!("{reason}\nbefore-the-stall\n")),

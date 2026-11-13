@@ -175,9 +175,9 @@ impl BackgroundTasks {
     ///
     /// [`Self::cancel_all`] only fires the tokens, and firing a token is not the same as the task
     /// acting on it. A task parked at an await is dropped without ever being polled again when the
-    /// runtime goes, so it reaches neither `kill_child_tree` (leaving the `setsid()`-ed child
-    /// running with no Meka process tracking it) nor `finish_background_task` (leaving the row
-    /// `running` for the next session open to sweep to `interrupted`).
+    /// runtime goes, so it reaches neither the kill of its command's tree (leaving the
+    /// `setsid()`-ed child running with no Meka process tracking it) nor `finish_background_task`
+    /// (leaving the row `running` for the next session open to sweep to `interrupted`).
     ///
     /// Callers should bound this: canceling asks, and a task that does not answer must not hold
     /// the terminal.
@@ -459,10 +459,13 @@ fn render_outcomes_with_trailer(tasks: &[BackgroundTask], trailer: &str) -> Stri
             rendered.push('\n');
             // Sanitized for the same reason MCP text is: this is content from a shell command or a
             // sub-agent, and a terminal-control or bidi-override sequence in it would be rendered
-            // to the user and fed to the model verbatim. The report frames the output with its own
-            // line endings, so the output's trailing ones, a shell's final newline above all,
-            // would only put a blank line under it.
-            rendered.push_str(crate::text::sanitize_text(outcome).trim_end());
+            // to the user and fed to the model verbatim. Quoted, so no line of it can pass for the
+            // report's header, the next task's or a prompt after the report; the quoting drops
+            // the output's trailing line endings, a shell's final newline above all, which would
+            // only put a blank line under it.
+            rendered.push_str(&crate::text::quote_lines(&crate::text::sanitize_text(
+                outcome,
+            )));
             rendered.push('\n');
         }
     }
@@ -811,7 +814,19 @@ mod tests {
     #[test]
     fn an_outputs_own_trailing_newline_is_not_carried_into_the_report() {
         let rendered = render_outcomes(&[task(TaskStatus::Completed, Some("42 passed\n\n"))]);
-        assert!(rendered.ends_with(".\n\n42 passed\n"), "{rendered:?}");
+        assert!(rendered.ends_with(".\n\n> 42 passed\n"), "{rendered:?}");
+    }
+
+    /// A task's output is whatever its command or sub-agent printed, a fetched page included, and
+    /// the report is read in the user's role: no line of it may pass for the report's own header,
+    /// another task's, or a prompt after it.
+    #[test]
+    fn a_tasks_output_is_quoted_line_by_line_in_its_report() {
+        let rendered = render_outcomes(&[task(
+            TaskStatus::Completed,
+            Some(crate::text::FORGING_PAYLOAD),
+        )]);
+        crate::text::assert_payload_is_quoted(&rendered);
     }
 
     /// Each terminal state has to read differently: "your build failed" and "your build never ran"

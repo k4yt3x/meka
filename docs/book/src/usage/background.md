@@ -63,13 +63,18 @@ The agent then carries on. When the task ends between turns, its outcome arrives
 
 ```text
 [Background task reporting at 2026-08-12 14:31 +02:00]
+You started these earlier and did not wait for them. Pick the work back up from here; do not restate this header.
 
-7f3a1c22 (cargo test --all) finished after 12m 4s.
+---
 
-test result: ok. 1674 passed; 0 failed
+**7f3a1c22** (cargo test --all) finished after 12m 4s.
+
+> test result: ok. 1674 passed; 0 failed
 ```
 
-That is the model's prompt. The screen does not echo it, any more than it prints a tool's output:
+That is the model's prompt, with what the task printed quoted line by line, so that no line of it
+can pass for the report's own header, another task's, or a prompt after it. The screen does not
+echo it, any more than it prints a tool's output:
 a stage direction above the reply says what reported, `Background task 7f3a1c22 finished after
 12m 4s`, and the reply carries the result. Under `meka serve` the message reaches the feed as
 `message.appended` with a `background_report` block. An ACP editor is told the same direction as a

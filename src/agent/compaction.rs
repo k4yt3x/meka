@@ -10,6 +10,7 @@ use crate::{
         CompactRequest, SUMMARY_SHAPE, compaction_retained_budget, compaction_tail_budget,
         compaction_verbatim_budget,
     },
+    text::quote_lines,
 };
 
 /// The heading a compaction's message opens on, above the summary, so the model reads what
@@ -257,17 +258,6 @@ fn retained_messages(head: &[Message], request: Option<&str>, budget: u64) -> Ve
     }
     selected.reverse();
     selected
-}
-
-/// `text` with every line quoted, the shape an entry of the section takes: a message with
-/// headings or markers of its own cannot then be read as part of the summary.
-fn quote_lines(text: &str) -> String {
-    text.trim_start_matches(['\r', '\n'])
-        .trim_end()
-        .lines()
-        .map(|line| format!("> {line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// What a compaction keeps verbatim after its summary.

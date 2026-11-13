@@ -118,18 +118,17 @@ pub(crate) enum UiEvent {
         attached: Result<super::input::Attachment, String>,
     },
     /// A `!command` the screen ran has ended: what it printed and how it ended, or why it could
-    /// not be started. `stopped` marks one the user killed.
+    /// not be started.
     ShellFinished {
         run: u64,
         output: Result<ShellOutput, String>,
-        stopped: bool,
     },
 }
 
 /// What a `!command` printed, each stream cut to its tail, and how it ended.
 #[derive(Debug)]
 pub(crate) struct ShellOutput {
-    pub(crate) status: std::process::ExitStatus,
+    pub(crate) ended: crate::process::Ended,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
     /// Bytes let go ahead of what was kept, both streams together.

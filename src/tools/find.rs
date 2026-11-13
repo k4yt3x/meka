@@ -1,5 +1,7 @@
 //! `file_find` tool: glob-pattern file discovery.
 
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 
 use super::{
@@ -24,6 +26,37 @@ struct FindOutcome {
     unreadable: usize,
     timed_out: bool,
     budget_secs: u64,
+}
+
+/// What a walk has found so far. The walk's thread writes it as it goes, and `execute` reads it
+/// when the budget's deadline comes first, so the call answers on time with what was found while
+/// the thread is still inside one of `glob`'s directory reads.
+#[derive(Default)]
+struct Found {
+    matches: Vec<String>,
+    /// Continues past the storage cap so the truncation message can report the real number of
+    /// matches. The cap bounds only what is stored: a pattern that matches nothing never reaches
+    /// it, so the cap is not a bound on the walk. The budget is.
+    total: usize,
+    /// A pattern rooted high in the tree crosses directories the user cannot read, one
+    /// `GlobError` each; a `/`-rooted walk logging every one at `warn` would produce gigabytes of
+    /// log output, so they are counted here and reported once.
+    unreadable: usize,
+}
+
+impl Found {
+    /// The outcome of a walk that ended with what `self` holds. Copied rather than taken: the
+    /// walk's own end and the deadline can come together, and whichever answers must see all of
+    /// it.
+    fn outcome(&self, timed_out: bool, budget: &WalkBudget) -> FindOutcome {
+        FindOutcome {
+            matches: self.matches.clone(),
+            total: self.total,
+            unreadable: self.unreadable,
+            timed_out,
+            budget_secs: budget.budget_secs(),
+        }
+    }
 }
 
 pub(super) struct FindFilesTool {
@@ -143,24 +176,46 @@ impl Tool for FindFilesTool {
         // One budget for the whole call, not one per root: `WalkBudget::new` stamps its deadline at
         // construction, so a per-root budget would silently give a four-root workspace four times
         // the ceiling. `run_walk` walks the roots in order under this single deadline.
-        let budget = WalkBudget::new(cancellation.clone());
-        let walk =
-            tokio::task::spawn_blocking(move || run_walk(&full_patterns, cap, &budget, &fence));
-
-        // Race the walk against the token rather than just awaiting it. The walk checks the same
-        // token itself, but `glob`'s iterator does its directory reads inside `next()`, so a walk
-        // that finds neither a match nor an error for a long stretch sits between checks and would
-        // otherwise hold the turn open. Returning here detaches that thread; its own budget check
-        // stops it shortly after.
-        let outcome = tokio::select! {
-            joined = walk => joined.map_err(|error| MekaError::ToolExecution {
+        let budget = Arc::new(WalkBudget::new(cancellation.clone()));
+        let found = Arc::new(Mutex::new(Found::default()));
+        let walk = tokio::task::spawn_blocking({
+            let budget = budget.clone();
+            let found = found.clone();
+            move || run_walk(&full_patterns, cap, &budget, &fence, &found)
+        });
+        let walk = async {
+            walk.await.map_err(|error| MekaError::ToolExecution {
                 tool_name: "file_find".to_string(),
                 message: format!("task join error: {error}"),
-            })??,
-            _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+            })?
         };
 
+        // Race the walk against the token and the budget's deadline rather than just awaiting it.
+        // The walk checks both itself, but `glob`'s iterator does its directory reads inside
+        // `next()`, so a walk that finds neither a match nor an error for a long stretch sits
+        // between checks and would otherwise hold the turn open past either. Returning here
+        // detaches that thread, which runs on until the iterator next yields, where it checks the
+        // budget, or to the end of its tree.
+        let outcome = answer_by_the_deadline(walk, &found, &budget, &cancellation).await?;
+
         Ok(ToolOutput::text(render_outcome(&outcome, cap), false))
+    }
+}
+
+/// What the walk ends with, unless the call is canceled first or the budget's deadline comes
+/// first; at the deadline it is what the walk has put in `found` by then, marked incomplete.
+async fn answer_by_the_deadline(
+    walk: impl Future<Output = Result<FindOutcome>>,
+    found: &Mutex<Found>,
+    budget: &WalkBudget,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<FindOutcome> {
+    tokio::select! {
+        outcome = walk => outcome,
+        _ = cancellation.cancelled() => Err(MekaError::Interrupted),
+        _ = tokio::time::sleep_until(budget.deadline().into()) => {
+            Ok(crate::sync::lock(found).outcome(true, budget))
+        }
     }
 }
 
@@ -171,28 +226,21 @@ impl Tool for FindFilesTool {
 /// `full_patterns` holds one rooted glob per workspace root, walked in order under a single shared
 /// `budget`. Counts accumulate across roots so the caller's cap and truncation message describe the
 /// whole search rather than its last leg, and a timeout part-way through root two still reports the
-/// matches root one produced.
+/// matches root one produced. All of it is kept in `found`, which the call reads when the
+/// budget's deadline comes before the walk's end.
 fn run_walk(
     full_patterns: &[String],
     cap: usize,
     budget: &WalkBudget,
     fence: &crate::workspace::ReadFence,
+    found: &Mutex<Found>,
 ) -> Result<FindOutcome> {
-    let mut matches: Vec<String> = Vec::new();
     // Roots are kept even when one nests inside another (see `glob_roots`), so a pattern that
     // crosses directories can match the same file from two of them: with roots `/work` and
     // `/work/main`, `**/*.md` finds `/work/main/README.md` under both. Deduplicate here rather
     // than by pruning roots, which is what would lose files. Skipped for a single pattern, which
     // cannot repeat a path, so the common case allocates nothing.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Total continues past the storage cap so the truncation message can report the real number of
-    // matches. Note that the cap bounds only what is stored: a pattern that matches nothing never
-    // reaches it, so the cap is not a bound on the walk. `budget` is.
-    let mut total: usize = 0;
-    // A pattern rooted high in the tree crosses directories the user cannot read, one `GlobError`
-    // each; a `/`-rooted walk logging every one at `warn` would produce gigabytes of log output,
-    // so they are counted here and reported once.
-    let mut unreadable: usize = 0;
     let mut timed_out = false;
 
     'roots: for full_pattern in full_patterns {
@@ -236,26 +284,21 @@ fn run_walk(
                     if full_patterns.len() > 1 && !seen.insert(rendered.clone()) {
                         continue;
                     }
-                    total += 1;
-                    if matches.len() < cap {
-                        matches.push(rendered);
+                    let mut found = crate::sync::lock(found);
+                    found.total += 1;
+                    if found.matches.len() < cap {
+                        found.matches.push(rendered);
                     }
                 }
                 Err(error) => {
-                    unreadable += 1;
+                    crate::sync::lock(found).unreadable += 1;
                     tracing::debug!("glob error: {error}");
                 }
             }
         }
     }
 
-    Ok(FindOutcome {
-        matches,
-        total,
-        unreadable,
-        timed_out,
-        budget_secs: budget.budget_secs(),
-    })
+    Ok(crate::sync::lock(found).outcome(timed_out, budget))
 }
 
 /// Render the walk for the model. A truncated, timed-out, or error-riddled walk has to say so even
@@ -538,9 +581,38 @@ mod tests {
             500,
             &budget,
             &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+            &Mutex::default(),
         )
         .expect("walk should return, not error");
         assert!(outcome.timed_out, "expired budget must stop the walk");
+    }
+
+    /// The call answers at the budget's deadline with what the walk has found, while the walk sits
+    /// between two entries where it does not check the budget: `glob` reads directories inside
+    /// `next()`, and a walk that matches little spends nearly all its time there. Virtual time, so
+    /// a race that never answered fails here at once instead of hanging the test.
+    #[tokio::test(start_paused = true)]
+    async fn the_call_answers_at_the_deadline_with_what_the_walk_has_found() {
+        let found = Mutex::new(Found::default());
+        {
+            let mut found = crate::sync::lock(&found);
+            found.matches = vec!["/work/a.md".to_string(), "/work/b.md".to_string()];
+            found.total = 2;
+        }
+        let budget =
+            WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
+        let held_open = std::future::pending::<Result<FindOutcome>>();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            answer_by_the_deadline(held_open, &found, &budget, &CancellationToken::new()),
+        )
+        .await
+        .expect("the call answers by its deadline")
+        .expect("a deadline is an answer, not an error");
+        let rendered = render_outcome(&outcome, DEFAULT_INLINE_RESULTS);
+        assert!(rendered.contains("/work/a.md\n/work/b.md"), "{rendered}");
+        assert!(rendered.contains("incomplete"), "{rendered}");
     }
 
     /// A malformed `pattern` is the caller's mistake and must surface as an error. Returning
@@ -559,6 +631,7 @@ mod tests {
             500,
             &budget,
             &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+            &Mutex::default(),
         ) else {
             panic!("a malformed caller pattern must not be swallowed");
         };
@@ -595,6 +668,7 @@ mod tests {
             500,
             &budget,
             &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+            &Mutex::default(),
         )
         .expect("walk");
 
@@ -620,6 +694,7 @@ mod tests {
             500,
             &budget,
             &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+            &Mutex::default(),
         )
         .expect("walk should return, not error");
 
@@ -652,6 +727,7 @@ mod tests {
             500,
             &budget,
             &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+            &Mutex::default(),
         )
         .expect("walk should return, not error");
 
@@ -684,6 +760,7 @@ mod tests {
             500,
             &budget,
             &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+            &Mutex::default(),
         )
         .expect("walk should return, not error");
 
@@ -717,6 +794,7 @@ mod tests {
             500,
             &budget,
             &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+            &Mutex::default(),
         )
         .expect("walk should return, not error");
 

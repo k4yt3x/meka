@@ -26,6 +26,17 @@ import it with `meka --permission <level> session import <file>`, or set the lev
 with `/permission` on the screen, `meka -r <id> --permission <level>`, or
 `PATCH /v1/sessions/{id}`. The approvals switch moves with `/approvals` or the same `PATCH`.
 
+**A gate on an MCP tool reads repeated structured content once.** An MCP tool that returns
+`structuredContent` usually returns the same JSON as text too, as the MCP specification asks.
+Meka used to append the structured content to that text as a second, pretty-printed copy under a
+`**Structured content:**` heading, and a scheduled job's tool gate judged the whole. Now such a
+result carries it once, as the server's own text. A `"changed"` gate on such a tool fires once at
+its first check after the upgrade, because the text it compares has changed; a gate judges the
+first 8 KiB of a result, so one whose own text fills that is unaffected. A `matches` gate
+whose pattern was written against the appended copy (its heading, or its pretty-printed spacing)
+no longer matches: write the pattern against the server's own text, or use an `at` pointer, which
+reads the structured value and is unaffected.
+
 ## 0.93 to 0.94
 
 The store moves forward on its first open, behind the automatic backup, so that a turn that fails

@@ -281,12 +281,14 @@ struct ShellRun {
 
 impl ShellRun {
     /// Kill the command and what it started, now. The token goes first, so the task waiting on
-    /// the command reads the death that follows as a stop rather than an exit; the group is
-    /// then signaled from here as well, for the leave that may not poll the task again.
+    /// the command reads the death that follows as a stop rather than an exit; the tree is
+    /// then killed from here as well, for the leave that may not poll the task again.
     fn kill(&mut self) {
         self.ended = true;
         self.stop.cancel();
-        signal_shell_group(self.pid);
+        if let Some(pid) = self.pid {
+            crate::process::kill_tree_now(pid);
+        }
     }
 }
 
@@ -1100,11 +1102,7 @@ impl Screen {
             UiEvent::Elicitation { prompt, responder } => {
                 self.ask(Question::Elicitation { prompt, responder });
             }
-            UiEvent::ShellFinished {
-                run,
-                output,
-                stopped,
-            } => self.finish_shell(run, output, stopped),
+            UiEvent::ShellFinished { run, output } => self.finish_shell(run, output),
             UiEvent::Item(item) => self.push(item),
             // An image read for the composer takes its chip's place, unless the chip has gone.
             UiEvent::Attached { id, attached } => {
@@ -2554,23 +2552,14 @@ impl Screen {
         });
         let ui = self.launch.ui.clone();
         tokio::spawn(async move {
-            let (output, stopped) = wait_for_shell_command(child, stop).await;
-            ui.send(UiEvent::ShellFinished {
-                run,
-                output,
-                stopped,
-            });
+            let output = wait_for_shell_command(child, stop).await;
+            ui.send(UiEvent::ShellFinished { run, output });
         });
     }
 
     /// What a `!command` came to: its output on the transcript, and a row for how it ended when
     /// it did not succeed.
-    fn finish_shell(
-        &mut self,
-        run: u64,
-        output: Result<super::frontend::ShellOutput, String>,
-        stopped: bool,
-    ) {
+    fn finish_shell(&mut self, run: u64, output: Result<super::frontend::ShellOutput, String>) {
         if self.shell.as_ref().is_some_and(|running| running.id == run) {
             if let Some(running) = self.shell.as_mut() {
                 running.ended = true;
@@ -2599,12 +2588,19 @@ impl Screen {
                 if !printed.trim().is_empty() {
                     self.push(Item::ShellOutput(printed));
                 }
-                if stopped {
-                    self.push(Item::interrupted());
-                } else if !output.status.success()
-                    && let Some(code) = output.status.code()
-                {
-                    self.push(Item::note(format!("Command exited with status {code}")));
+                match output.ended {
+                    crate::process::Ended::Exited(status) => {
+                        if !status.success()
+                            && let Some(code) = status.code()
+                        {
+                            self.push(Item::note(format!("Command exited with status {code}")));
+                        }
+                    }
+                    // A `!command` has no timeout and no budget: the stop is the one way the
+                    // screen ends it.
+                    crate::process::Ended::Stopped
+                    | crate::process::Ended::TimedOut
+                    | crate::process::Ended::OutputBound => self.push(Item::interrupted()),
                 }
             }
             Err(error) => self.reply(format!("Failed to execute command: {error}")),
@@ -3550,10 +3546,7 @@ fn log_item(line: crate::relay::LogLine) -> Item {
 
 /// Start `command` through the shell in `working_dir`, its output captured and its input closed:
 /// the terminal is the screen's, so the command gets no stdin to read from it.
-fn spawn_shell_command(
-    command: &str,
-    working_dir: &Path,
-) -> std::io::Result<crate::process::Spawned<tokio::process::Child>> {
+fn spawn_shell_command(command: &str, working_dir: &Path) -> std::io::Result<crate::process::Tree> {
     #[cfg(windows)]
     let mut shell = {
         let mut shell = tokio::process::Command::new("powershell");
@@ -3572,50 +3565,41 @@ fn spawn_shell_command(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    // A group of its own, so a stop reaches what the command started and not only the shell.
-    #[cfg(unix)]
-    shell.process_group(0);
-    crate::process::spawn(&mut shell)
+    // A tree of its own, so a stop reaches what the command started and not only the shell.
+    crate::process::spawn_tree(&mut shell)
 }
 
 /// Wait for a started command to exit, or for `stop` to fire, which kills it with every process
-/// it started; then what it printed. The second value says whether it was stopped.
+/// it started; then what it printed, each stream cut to its tail.
 async fn wait_for_shell_command(
-    mut child: crate::process::Spawned<tokio::process::Child>,
+    child: crate::process::Tree,
     stop: tokio_util::sync::CancellationToken,
-) -> (Result<super::frontend::ShellOutput, String>, bool) {
-    let mut stdout = tokio::spawn(read_tail(child.stdout.take()));
-    let mut stderr = tokio::spawn(read_tail(child.stderr.take()));
-    let (status, stopped) = tokio::select! {
-        biased;
-        () = stop.cancelled() => {
-            signal_shell_group(child.id());
-            #[cfg(windows)]
-            if let Err(error) = child.terminate_tree() {
-                tracing::debug!("failed to terminate the command's job: {error}");
-            }
-            if let Err(error) = child.kill().await {
-                tracing::debug!("failed to kill the command: {error}");
-            }
-            (child.wait().await, true)
-        }
-        status = child.wait() => (status, false),
+) -> Result<super::frontend::ShellOutput, String> {
+    let capture = crate::process::Capture {
+        stdout: crate::process::Keep::Tail(SHELL_OUTPUT_KEEP_BYTES),
+        stderr: crate::process::Keep::Tail(SHELL_OUTPUT_KEEP_BYTES),
+        sink: None,
     };
-    let status = match status {
-        Ok(status) => status,
-        Err(error) => return (Err(error.to_string()), stopped),
-    };
-    let ((stdout, stdout_dropped), (stderr, stderr_dropped)) =
-        tokio::join!(drained_within(&mut stdout), drained_within(&mut stderr));
-    (
-        Ok(super::frontend::ShellOutput {
-            status,
-            stdout,
-            stderr,
-            dropped_bytes: stdout_dropped + stderr_dropped,
-        }),
-        stopped,
-    )
+    // Killed at once on a stop: the screen has signaled the tree itself by then, and a grace
+    // would only hold back the row that says so.
+    let stop = crate::process::Stop::AtOnce(&stop);
+    let finished = crate::process::run(child, capture, None, Some(stop), SHELL_DRAIN_GRACE)
+        .await
+        .map_err(|error| error.to_string())?;
+    if finished.drained.stopped_early {
+        tracing::debug!(
+            "gave up on the rest of the command's output after {seconds}s; something it \
+             started still holds the pipe",
+            seconds = SHELL_DRAIN_GRACE.as_secs()
+        );
+    }
+    let crate::process::Drained { stdout, stderr, .. } = finished.drained;
+    Ok(super::frontend::ShellOutput {
+        ended: finished.ended,
+        dropped_bytes: stdout.dropped + stderr.dropped,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
 }
 
 /// Cut `text` to its last `keep` lines; whether anything was cut.
@@ -3626,83 +3610,6 @@ fn keep_last_lines(text: &mut String, keep: usize) -> bool {
     };
     text.drain(..=at);
     true
-}
-
-/// The last [`SHELL_OUTPUT_KEEP_BYTES`] of what `pipe` has to give and how many bytes ahead of
-/// them were let go, or nothing for a pipe the child did not get.
-async fn read_tail(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> (Vec<u8>, u64) {
-    use tokio::io::AsyncReadExt as _;
-    let mut kept = Vec::new();
-    let mut dropped = 0u64;
-    let Some(mut pipe) = pipe else {
-        return (kept, dropped);
-    };
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        match pipe.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(read) => {
-                kept.extend(chunk.iter().take(read));
-                // Trimmed once the kept part has doubled, so a long output is moved a few
-                // times rather than once per read.
-                if kept.len() > 2 * SHELL_OUTPUT_KEEP_BYTES {
-                    let cut = kept.len() - SHELL_OUTPUT_KEEP_BYTES;
-                    kept.drain(..cut);
-                    dropped += cut as u64;
-                }
-            }
-            Err(error) => {
-                tracing::debug!("failed to read the command's output: {error}");
-                break;
-            }
-        }
-    }
-    if kept.len() > SHELL_OUTPUT_KEEP_BYTES {
-        let cut = kept.len() - SHELL_OUTPUT_KEEP_BYTES;
-        kept.drain(..cut);
-        dropped += cut as u64;
-    }
-    (kept, dropped)
-}
-
-/// What a drain has read once the command has ended, given [`SHELL_DRAIN_GRACE`] to finish: a
-/// process the command left behind can hold the pipe open, and the screen does not wait on it.
-async fn drained_within(drain: &mut tokio::task::JoinHandle<(Vec<u8>, u64)>) -> (Vec<u8>, u64) {
-    match tokio::time::timeout(SHELL_DRAIN_GRACE, &mut *drain).await {
-        Ok(Ok(read)) => read,
-        Ok(Err(error)) => {
-            tracing::debug!("the command's output drain ended early: {error}");
-            (Vec::new(), 0)
-        }
-        Err(_) => {
-            drain.abort();
-            tracing::debug!(
-                "gave up on the rest of the command's output after {seconds}s; something it \
-                 started still holds the pipe",
-                seconds = SHELL_DRAIN_GRACE.as_secs()
-            );
-            (Vec::new(), 0)
-        }
-    }
-}
-
-/// Kill everything a command started along with it: on Unix the process group it was given,
-/// named by its own pid. Elsewhere the job the child runs in is terminated by whoever holds it.
-fn signal_shell_group(pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        // SAFETY: `kill(2)` has no preconditions; the group is the child's own, so `-pid` names
-        // its tree and nothing else.
-        let killed = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
-        if killed != 0 {
-            let error = std::io::Error::last_os_error();
-            tracing::debug!("failed to kill the command's process group {pid}: {error}");
-        }
-    }
-    #[cfg(not(unix))]
-    tracing::trace!(
-        "no process group to signal for {pid:?}; the child's job is ended by its holder"
-    );
 }
 
 /// The modes the screen takes beyond raw mode and the alternate screen, which ratatui gives back
@@ -4276,25 +4183,37 @@ mod tests {
         ]);
     }
 
-    /// A command that prints without end cannot grow the screen with it: each stream keeps its
-    /// last bytes and counts what it let go.
+    /// A command that exits while something it started still holds its output shows what it
+    /// printed: the screen waits only so long for the rest, and keeps what it has read.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_command_s_output_keeps_its_tail() {
-        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
-        let writing = tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt as _;
-            for byte in *b"abc" {
-                writer
-                    .write_all(&vec![byte; SHELL_OUTPUT_KEEP_BYTES])
-                    .await
-                    .expect("write");
-            }
-        });
-        let (kept, dropped) = read_tail(Some(reader)).await;
-        writing.await.expect("the writer");
-        assert_eq!(kept.len(), SHELL_OUTPUT_KEEP_BYTES);
-        assert_eq!(dropped, 2 * SHELL_OUTPUT_KEEP_BYTES as u64);
-        assert!(kept.iter().all(|&byte| byte == b'c'));
+    async fn a_command_whose_output_outlives_it_keeps_what_it_printed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let held_by = dir.path().join("held-by");
+        let child = spawn_shell_command(
+            &format!("echo printed; sleep 30 & echo $! > '{}'", held_by.display()),
+            dir.path(),
+        )
+        .expect("the command starts");
+        let output =
+            wait_for_shell_command(child, tokio_util::sync::CancellationToken::new()).await;
+        // The `sleep` outlives a command that exited on its own, so it is ended here, by the pid it
+        // wrote, rather than left for its 30 seconds.
+        let pid: libc::pid_t = std::fs::read_to_string(&held_by)
+            .expect("the command wrote the pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // SAFETY: `kill(2)` has no preconditions.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+
+        let output = output.expect("the command ran");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "printed\n");
+        assert!(
+            matches!(output.ended, crate::process::Ended::Exited(status) if status.success()),
+            "{:?}",
+            output.ended
+        );
     }
 
     /// Lines past the cap go from the front, whole lines only, trailing newline or not.

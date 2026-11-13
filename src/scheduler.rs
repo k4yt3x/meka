@@ -65,8 +65,13 @@ impl Wakeup {
         rendered.push_str("\n\n");
         rendered.push_str(&self.job.prompt);
         if let Some(output) = &self.gate_output {
+            // What the gate's command or tool printed, a fetched page as readily as a status
+            // word: sanitized as a background report's output is, and quoted, so no line of it
+            // can pass for this block's header or for a prompt after it.
             rendered.push_str("\n\n[Gate output]\n");
-            rendered.push_str(output);
+            rendered.push_str(&crate::text::quote_lines(&crate::text::sanitize_text(
+                output,
+            )));
         }
         rendered
     }
@@ -1001,6 +1006,12 @@ pub(crate) async fn run_shell_probe(
     timeout: Duration,
     cwd: Option<&std::path::Path>,
 ) -> Result<ProbeOutcome, String> {
+    use crate::process::{Capture, Keep, OutputBudget};
+
+    /// How long a probe's output is waited for once its command has ended: a process it started
+    /// and left behind can hold the pipe open, and the probe is not held for it.
+    const GATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
     let mut builder = gate_command_builder(command);
     // The creating session's directory, not the host process's. A gate is almost always written by
     // the model right after verifying the same command through `shell_execute`, which runs in the
@@ -1020,80 +1031,56 @@ pub(crate) async fn run_shell_probe(
     builder
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // Dropping the future on timeout must not leave the command running until the next tick
-        // spawns another. On Unix this reaps the direct child only: a gate whose shell backgrounds
-        // something of its own can still orphan it, which is a reason to keep gates to simple
-        // checks. On Windows the job the door places the child in takes the tree with it.
-        .kill_on_drop(true);
-
-    let mut child = crate::process::spawn(&mut builder)
+        .stderr(std::process::Stdio::piped());
+    // A tree of its own, so a timeout, the parse limit or a dropped evaluation ends the whole
+    // pipeline (`gh … | jq …`) rather than the shell alone.
+    let child = crate::process::spawn_tree(&mut builder)
         .map_err(|error| format!("failed to start gate: {error}"))?;
 
-    // Read up to the parse limit and one byte more, never the whole pipe: `wait_with_output` would
-    // hold everything a runaway `yes` produced until the timeout. Past the limit the probe is cut
-    // off, since nothing after it can be parsed anyway.
-    use tokio::io::AsyncReadExt as _;
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let read_bounded = |pipe: Option<tokio::process::ChildStdout>, limit: usize| async move {
-        let mut buffer = Vec::new();
-        if let Some(pipe) = pipe {
-            tokio::io::AsyncReadExt::take(pipe, limit as u64 + 1)
-                .read_to_end(&mut buffer)
-                .await?;
-        }
-        Ok::<_, std::io::Error>(buffer)
+    // Stdout is spent from the parse limit, never held whole: `wait_with_output` would hold
+    // everything a runaway `yes` produced until the timeout. Past the limit the probe is stopped,
+    // since nothing after it can be parsed anyway. Stderr keeps its head and is read to its end: a
+    // read end closed at the cap would make the child's next write to stderr `SIGPIPE`, so a gate
+    // that logs more than the cap would die before it could print its answer.
+    let capture = Capture {
+        stdout: Keep::Budgeted(std::sync::Arc::new(OutputBudget::new(GATE_PARSE_BYTES))),
+        stderr: Keep::Head(GATE_OUTPUT_BYTES),
+        sink: None,
     };
-    // Drained to its end rather than `take`n: a `take` closes the read end once the cap is reached,
-    // and the child's next write to stderr is then `SIGPIPE`, so a gate that logs more than the cap
-    // would die before it could print its answer.
-    let read_stderr_bounded = |pipe: Option<tokio::process::ChildStderr>| async move {
-        let mut kept = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let mut chunk = [0u8; 8192];
-            loop {
-                let read = tokio::io::AsyncReadExt::read(&mut pipe, &mut chunk).await?;
-                if read == 0 {
-                    break;
-                }
-                let room = GATE_OUTPUT_BYTES.saturating_sub(kept.len());
-                kept.extend(chunk.iter().take(read.min(room)));
-            }
+    let finished = crate::process::run(child, capture, Some(timeout), None, GATE_DRAIN_TIMEOUT)
+        .await
+        .map_err(|error| format!("gate failed to run: {error}"))?;
+    shell_probe_outcome(finished, timeout)
+}
+/// What a shell probe's run came to, for a predicate to judge: its output up to the parse limit
+/// and whether it succeeded, or the refusal of a run that outlasted `timeout`.
+///
+/// Apart from the run, so what each ending means is testable without a process.
+pub(crate) fn shell_probe_outcome(
+    finished: crate::process::Finished,
+    timeout: Duration,
+) -> Result<ProbeOutcome, String> {
+    use crate::process::Ended;
+
+    let status = match finished.ended {
+        Ended::Exited(status) => Some(status),
+        Ended::OutputBound => None,
+        Ended::TimedOut | Ended::Stopped => {
+            return Err(format!(
+                "gate exceeded its {} budget",
+                humantime::format_duration(timeout)
+            ));
         }
-        Ok::<_, std::io::Error>(kept)
     };
-    let collected = async {
-        let (stdout, stderr) = tokio::join!(
-            read_bounded(stdout_pipe, GATE_PARSE_BYTES),
-            read_stderr_bounded(stderr_pipe)
-        );
-        let mut stdout = stdout?;
-        let stderr = stderr?;
-        let cut_off = stdout.len() > GATE_PARSE_BYTES;
-        if cut_off {
-            stdout.truncate(GATE_PARSE_BYTES);
-            // The producer is still running with nobody reading; waiting for it to finish on its
-            // own would be waiting for the timeout.
-            if let Err(error) = child.kill().await {
-                tracing::debug!("failed to stop a gate that exceeded its output limit: {error}");
-            }
-        }
-        let status = child.wait().await?;
-        Ok::<_, std::io::Error>((stdout, stderr, status, cut_off))
-    };
-    let (stdout_bytes, stderr_bytes, status, cut_off) =
-        match tokio::time::timeout(timeout, collected).await {
-            Ok(Ok(collected)) => collected,
-            Ok(Err(error)) => return Err(format!("gate failed to run: {error}")),
-            Err(_) => {
-                return Err(format!(
-                    "gate exceeded its {} budget",
-                    humantime::format_duration(timeout)
-                ));
-            }
-        };
+    let mut stdout_bytes = finished.drained.stdout.bytes;
+    let stderr_bytes = finished.drained.stderr.bytes;
+    // Past the limit the output is cut off and the probe has not succeeded, whichever the run saw
+    // first: a command that fits its last write in the pipe exits before the drain crosses the
+    // limit, and one that does not is stopped at it, and which of the two happened is a race the
+    // predicate must not be decided by.
+    let cut_off = stdout_bytes.len() > GATE_PARSE_BYTES;
     if cut_off {
+        stdout_bytes.truncate(GATE_PARSE_BYTES);
         tracing::debug!(
             "gate output exceeded {GATE_PARSE_BYTES} bytes and was cut off; the command was stopped"
         );
@@ -1109,7 +1096,10 @@ pub(crate) async fn run_shell_probe(
     // for a large class of correct gates a non-zero exit is the signal (`diff -q`, `git diff
     // --exit-code`, `grep ERROR log`, `curl -f`), and refusing to produce output would silence them
     // permanently. The `succeeded` flag carries the exit status to whichever predicate asked.
-    if !status.success() {
+    let succeeded = !cut_off && status.is_some_and(|status| status.success());
+    if let Some(status) = status
+        && !succeeded
+    {
         let stderr = truncate_gate_output(&String::from_utf8_lossy(&stderr_bytes));
         let detail = if stderr.is_empty() {
             String::new()
@@ -1119,7 +1109,7 @@ pub(crate) async fn run_shell_probe(
         tracing::debug!("gate command exited with {status}{detail}; its output still stands");
     }
 
-    Ok(ProbeOutcome::new(&stdout, None, status.success()))
+    Ok(ProbeOutcome::new(&stdout, None, succeeded))
 }
 /// Decide whether a probe's result means "fire".
 ///

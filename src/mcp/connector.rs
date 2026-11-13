@@ -220,9 +220,9 @@ pub(super) fn failure_cause(error: &MekaError) -> (String, Option<super::Credent
     }
 }
 
-/// Record a failed connect on `entry`, announcing it only when it tells the user something new.
-/// The one door a failure is recorded by: the connector's, and the give-up of
-/// `ServerEntry::reconnect`.
+/// Record a failed connect on `entry`, announcing it only when it tells the user something new:
+/// when `found`, the state the attempt started from, is not the same failure. The one door a
+/// failure is recorded by: the connector's, and the give-up of `ServerEntry::reconnect`.
 ///
 /// A server that is down stays down, and [`retry_until_connected`] keeps trying every five minutes
 /// for the life of the process. Logged at `warn!` on every attempt, a missing binary or an
@@ -230,6 +230,7 @@ pub(super) fn failure_cause(error: &MekaError) -> (String, Option<super::Credent
 /// *change* of cause, is worth saying; a repeat of the same one is not.
 pub(super) async fn record_connect_failure(
     entry: &Arc<ServerEntry>,
+    found: &ServerState,
     server_name: &str,
     cause: String,
     needs: Option<super::CredentialNeed>,
@@ -237,11 +238,7 @@ pub(super) async fn record_connect_failure(
     // The cause reaches the log at the default level, the model as the reason the server is
     // unavailable, and every session's history through the tool results that quote it.
     let cause = crate::text::redact_urls(&cause);
-    let repeat = {
-        let state = entry.state.read().await;
-        is_repeat_failure(&state, &cause)
-    };
-    if repeat {
+    if is_repeat_failure(found, &cause) {
         tracing::debug!("MCP server '{server_name}' still unavailable: {cause}");
     } else {
         tracing::warn!("failed to connect to MCP server '{server_name}': {cause}");
@@ -277,6 +274,9 @@ pub(crate) async fn connect_one(
         tracing::debug!("MCP server '{server_name}' is not connected: {reason}");
         return;
     }
+    // The state this attempt starts from, which a failure repeats when it fails the same way:
+    // once the connection is adopted, the state says `Connected` instead.
+    let found = entry.state().await;
 
     // `connect_server`'s future is `!Send` for an OAuth-authenticated server (rmcp's auth module
     // holds a `!Sync` closure slot across an await), so it is driven on a `spawn_blocking` thread
@@ -308,12 +308,12 @@ pub(crate) async fn connect_one(
         Ok(Some(Ok(Ok(service)))) => service,
         Ok(Some(Ok(Err(error)))) => {
             let (cause, needs) = failure_cause(&error);
-            record_connect_failure(&entry, &server_name, cause, needs).await;
+            record_connect_failure(&entry, &found, &server_name, cause, needs).await;
             return;
         }
         Ok(Some(Err(_elapsed))) => {
             let cause = format!("connect timed out after {connect_timeout:?}");
-            record_connect_failure(&entry, &server_name, cause, None).await;
+            record_connect_failure(&entry, &found, &server_name, cause, None).await;
             return;
         }
         // Ended by a shutdown or a removal: the entry is closed or out, and a failure recorded now
@@ -321,7 +321,7 @@ pub(crate) async fn connect_one(
         Ok(None) => return,
         Err(join_error) => {
             let cause = format!("connect task join error: {join_error}");
-            record_connect_failure(&entry, &server_name, cause, None).await;
+            record_connect_failure(&entry, &found, &server_name, cause, None).await;
             return;
         }
     };
@@ -348,38 +348,29 @@ pub(crate) async fn connect_one(
     drop(landing);
     tracing::info!("connected to MCP server '{server_name}' on MCP {version}");
 
-    // A failure here does not undo `Connected`: the server is reachable, only its tool list
-    // failed, so it is warned about and the tool set left empty.
+    // A listing that fails undoes `Connected`, recorded as a failed connect: a server whose tools
+    // are unknown is one a turn cannot count on, and as `Failed` a `required` one gates the turn,
+    // every surface says why, and the retry every failed connect gets asks again.
     //
-    // Bounded by the same `connect_timeout` as the connect itself: `tools/list` is a request to the
-    // server just made, and unbounded, a server that accepts the connection and then never answers
-    // holds this task open for the life of the process.
-    let discovery = tokio::time::timeout(
-        connect_timeout,
-        discover_and_register_tools(&entry, &manager),
-    )
-    .await
-    .unwrap_or_else(|_elapsed| {
-        Err(MekaError::McpConnection {
-            server_name: server_name.clone(),
-            message: format!("tool discovery timed out after {connect_timeout:?}"),
-        })
-    });
-    match discovery {
+    // Bounded by the same `connect_timeout` as the connect itself, so raising the key gives a slow
+    // listing its time as well: `tools/list` is a request to the server just made, and unbounded,
+    // a server that accepts the connection and then never answers holds this task open for the
+    // life of the process.
+    match discover_and_register_tools(&entry, &manager, connect_timeout).await {
         Ok(count) => {
             tracing::info!("MCP server '{server_name}' registered {count} tool(s)");
         }
-        // A removal closes the transport under a listing still in flight, which is the removal
-        // working and not the server failing.
-        Err(error) if !manager.holds(&entry) => {
+        // A listing that fails once its server is removed, or once a shutdown has ended the
+        // connection under it, is not the server failing, and the entry is not one to record on.
+        Err(error) if !manager.holds(&entry) || entry.connects.stopping().is_cancelled() => {
             tracing::debug!(
-                "MCP server '{server_name}' was removed while its tools were being listed: {error}"
+                "MCP server '{server_name}' was removed or shut down while its tools were being \
+                 listed: {error}"
             );
         }
         Err(error) => {
-            tracing::warn!(
-                "MCP server '{server_name}' connected but tool discovery failed: {error}"
-            );
+            let (cause, needs) = failure_cause(&error);
+            record_connect_failure(&entry, &found, &server_name, cause, needs).await;
         }
     }
 }
@@ -390,10 +381,9 @@ pub(crate) async fn connect_one(
 async fn discover_and_register_tools(
     entry: &Arc<ServerEntry>,
     manager: &Arc<McpClientManager>,
+    timeout: Duration,
 ) -> Result<usize> {
-    manager
-        .list_and_register(entry, super::DEFAULT_MCP_REQUEST_TIMEOUT)
-        .await
+    manager.list_and_register(entry, timeout).await
 }
 
 /// The raw name that already took `namespaced` on this server, or `None` after recording `raw`
@@ -792,7 +782,7 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
 
             let bearer = bearer_for_transport(server_name, bearer, config.auth.as_ref());
             let transport_config =
-                build_http_transport_config(server_name, config, bearer.as_deref())?;
+                build_http_transport_config(server_name, config, bearer.as_deref()).await?;
 
             if let Some(auth_config) = &config.auth {
                 super::auth::connect_http_with_oauth(
@@ -926,6 +916,7 @@ mod tests {
         let entry = bare_entry("api");
         record_connect_failure(
             &entry,
+            &ServerState::Pending,
             "api",
             "error sending request for url (https://api.example.test/mcp?apiKey=SECRET)"
                 .to_string(),
@@ -963,13 +954,28 @@ mod tests {
     #[tokio::test]
     async fn record_connect_failure_stores_the_bare_cause() {
         let entry = bare_entry("ida");
-        record_connect_failure(&entry, "ida", "'ida-mcp' not found".to_string(), None).await;
+        record_connect_failure(
+            &entry,
+            &ServerState::Pending,
+            "ida",
+            "'ida-mcp' not found".to_string(),
+            None,
+        )
+        .await;
         match &*entry.state.read().await {
             ServerState::Failed { error, .. } => assert_eq!(error, "'ida-mcp' not found"),
             other => panic!("expected Failed, got {}", other.label()),
         }
         // A second identical failure keeps the state and stays quiet.
-        record_connect_failure(&entry, "ida", "'ida-mcp' not found".to_string(), None).await;
+        let found = entry.state().await;
+        record_connect_failure(
+            &entry,
+            &found,
+            "ida",
+            "'ida-mcp' not found".to_string(),
+            None,
+        )
+        .await;
         assert!(matches!(
             &*entry.state.read().await,
             ServerState::Failed { .. }

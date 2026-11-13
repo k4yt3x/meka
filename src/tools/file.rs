@@ -298,7 +298,7 @@ pub(super) async fn resolve_write_target(
 /// and is kept whole, while a file is read in one call and the text ends up in the conversation,
 /// where the window is the real limit long before this is. Any file this large is one the model
 /// wants a slice of rather than the whole of, and the file stays on disk to be sliced.
-const MAX_READ_FILE_BYTES: usize = 16 * crate::text::MIB;
+pub(super) const MAX_READ_FILE_BYTES: usize = 16 * crate::text::MIB;
 
 /// Lines a `file_read` returns from `start` when the caller names no `end`. Single source of truth
 /// for the description and the runtime default.

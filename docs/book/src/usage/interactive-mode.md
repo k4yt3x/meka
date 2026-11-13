@@ -501,7 +501,8 @@ It runs beside the screen, which keeps drawing and counts the seconds on the wor
 **Ctrl+C** kills it, with everything it started, and marks it `! Interrupted`; so does leaving
 Meka, a hangup or SIGTERM included. (On Windows the shell alone is killed.) Its output keeps its
 last 1 MiB and 10,000 lines, and a row says when more was let go. It reads nothing from the keyboard, and a command that needs the terminal itself (an editor, a pager) belongs in a
-shell beside Meka.
+shell beside Meka. On Unix it runs without a controlling terminal, so a command that opens one (a
+password prompt) fails at once.
 
 ## Exiting
 

@@ -349,7 +349,7 @@ fn refuse_a_misplaced_secret(
 }
 
 /// Connect `config` once with a person at hand for the browser step, against `token_store`, and
-/// say why it ended short of `Connected`, or `None` for a connect that landed. The reason is the
+/// say why its handshake did not land, or `None` for one that did. The reason is the
 /// bare cause the connector recorded on the flow's own entry, URLs redacted: the connect's error
 /// is answered as a state there, and a login that fails on it would otherwise say only that it did
 /// not complete.
@@ -375,10 +375,15 @@ async fn login_flow(
         crate::mcp::auth::OAUTH_CALLBACK_TIMEOUT + PROBE_CONNECT_TIMEOUT,
     )
     .await?;
-    let reason = if connected {
+    let entry = manager.server_entry(&config.name);
+    // A login is the handshake landing with what the flow minted. A tool listing that fails after
+    // it leaves the server `Failed`, which is the server's to say at its next connect: failing the
+    // login on it would throw away a credential the server has just accepted.
+    let landed = connected || entry.as_ref().is_some_and(|entry| entry.has_connected());
+    let reason = if landed {
         None
     } else {
-        let recorded = match manager.server_entry(&config.name) {
+        let recorded = match entry {
             Some(entry) => match entry.state().await {
                 crate::mcp::ServerState::Failed { error, .. } => Some(error),
                 _ => None,

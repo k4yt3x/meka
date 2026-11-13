@@ -2673,6 +2673,85 @@ mod tests {
         assert!(!outcome.text.is_empty());
     }
 
+    /// A probe whose output passes the parse limit has not succeeded, whether its command was
+    /// stopped at the limit or had exited 0 before the read that crossed it: which of the two a
+    /// run sees first is a race, and a predicate is not decided by one.
+    #[test]
+    fn a_probe_whose_output_passes_the_parse_limit_has_not_succeeded() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        use crate::process::{Captured, Drained, Ended, Finished};
+
+        let judged = |ended: Ended, printed: usize| {
+            let finished = Finished {
+                ended,
+                drained: Drained {
+                    stdout: Captured {
+                        bytes: vec![b'x'; printed],
+                        dropped: 0,
+                    },
+                    stderr: Captured::default(),
+                    stopped_early: false,
+                },
+            };
+            crate::scheduler::shell_probe_outcome(finished, Duration::from_secs(30))
+                .expect("a run that ended in time is judged")
+        };
+        let exited_clean = || Ended::Exited(std::process::ExitStatus::from_raw(0));
+
+        assert!(
+            judged(exited_clean(), GATE_PARSE_BYTES).succeeded,
+            "output that fits the limit is whole, and the exit status stands"
+        );
+        assert!(
+            !judged(exited_clean(), GATE_PARSE_BYTES + 1).succeeded,
+            "a command that exited 0 before the crossing read is cut off all the same"
+        );
+        assert!(
+            !judged(Ended::OutputBound, GATE_PARSE_BYTES + 1).succeeded,
+            "and so is one stopped at the limit"
+        );
+    }
+
+    /// A gate that overruns its budget is stopped whole. The stages of its pipeline are children
+    /// of the shell, so a kill of the shell alone would leave them running, one set per evaluation
+    /// for as long as whatever they wait on stalls.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gate_that_overruns_its_budget_takes_its_pipeline_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stalled = dir.path().join("stalled");
+        // The first stage writes its own pid and then becomes the stall, so the test finds the
+        // process by the pid it wrote rather than by its command line.
+        let command = format!(
+            "sh -c 'echo $$ > \"{}\"; exec sleep 30' | cat",
+            stalled.display()
+        );
+        let outcome =
+            crate::scheduler::run_shell_probe(&command, Duration::from_secs(1), None).await;
+        assert!(outcome.is_err(), "an overrunning gate is an error");
+
+        let pid: libc::pid_t = std::fs::read_to_string(&stalled)
+            .expect("the first stage wrote its pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // Gone once whoever inherits it reaps it, which takes a moment after the kill.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // SAFETY: signal 0 only asks whether the process exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: `kill(2)` has no preconditions; this ends what the gate left behind.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("the pipeline's stalled stage outlived the gate");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_gate_whose_authority_was_withdrawn_is_not_executed() {
@@ -4795,10 +4874,37 @@ mod tests {
         let rendered = wakeup.render_prompt();
         assert!(rendered.starts_with("[Scheduled job "));
         assert!(rendered.contains("do the thing"));
-        assert!(rendered.contains("[Gate output]\nci-red"));
+        assert!(rendered.contains("[Gate output]\n> ci-red"));
         assert!(
             !rendered.contains("Late by"),
             "a second of tick latency is not worth reporting"
+        );
+    }
+
+    /// A gate's output is whatever its command or tool read, a fetched page included, and the
+    /// fire is read in the user's role on a turn nobody watches: no line of it may pass for the
+    /// block's own header or for a second prompt.
+    #[tokio::test]
+    async fn a_gates_output_is_quoted_line_by_line_under_its_label() {
+        let harness = SchedulerHarness::new().await;
+        let job = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::seconds(1),
+            )
+            .await;
+        let wakeup = Wakeup {
+            job,
+            gate_output: Some(format!("{}\n\u{1b}[2J", crate::text::FORGING_PAYLOAD)),
+            late_by: chrono::Duration::seconds(1),
+            coalesced: 0,
+        };
+        let rendered = wakeup.render_prompt();
+        crate::text::assert_payload_is_quoted(&rendered);
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "a gate's output is sanitized as a report's is: {rendered:?}"
         );
     }
 

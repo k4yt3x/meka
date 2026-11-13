@@ -20,13 +20,24 @@
 //!   handle, so dropping the child ends every process it started.
 //! - macOS: no lever exists for one process over another; the system takes the largest footprint
 //!   first, which is the runaway command.
+//!
+//! A command Meka runs and waits for (`shell_execute`, the screen's `!command`, a schedule gate's
+//! shell probe, an MCP server's `headers_helper`) is started as the root of a [`Tree`] of its own
+//! and run by [`run`]: its output read under a [`Keep`] rule per stream, and the tree killed on a
+//! stop, a timeout, an exhausted budget or a drop.
 
-#[cfg(windows)]
-use std::sync::atomic::AtomicBool;
 use std::{
     io,
     ops::{Deref, DerefMut},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
+
+use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 /// A command the door can start: tokio's and the standard library's.
 pub(crate) trait Spawnable {
@@ -121,7 +132,9 @@ impl<Child> Spawned<Child> {
     }
 }
 
-/// Start `command` with the door's placement applied.
+/// Start `command` with the door's placement applied. Windows only, where a tree's root needs no
+/// step in the child; on Unix every door goes through `spawn_with_pre_exec`.
+#[cfg(windows)]
 pub(crate) fn spawn<C: Spawnable>(command: &mut C) -> io::Result<Spawned<C::Child>> {
     prepare(command);
     finish(command)
@@ -155,7 +168,7 @@ where
 
 /// The half of the placement that is set on the command before it starts, for a door where
 /// another crate makes the spawn; [`adopt`] is the other half. A door this crate spawns for itself
-/// goes through [`spawn`] or `spawn_with_pre_exec`, which do both.
+/// goes through [`spawn_tree`] or `spawn_with_pre_exec`, which do both.
 pub(crate) fn prepare<C: Spawnable>(command: &mut C) {
     prepare_standard(command.standard());
 }
@@ -373,8 +386,6 @@ fn cap_by_process_id(process_id: u32) -> Option<std::os::windows::io::OwnedHandl
 /// not silence a different one.
 #[cfg(windows)]
 fn announce_once(announced: &AtomicBool, message: &str) {
-    use std::sync::atomic::Ordering;
-
     if announced.swap(true, Ordering::Relaxed) {
         tracing::debug!("{message}");
     } else {
@@ -382,9 +393,517 @@ fn announce_once(announced: &AtomicBool, message: &str) {
     }
 }
 
+/// How long a tree's processes are given to end on `SIGTERM` before `SIGKILL` lands.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_millis(200);
+
+/// A child that leads a tree of its own, which ends with it: everything the child starts, and
+/// everything they start. On Unix the child leads a session of its own (`setsid`), a process group
+/// with no controlling terminal, so `-pid` names the tree, backgrounded descendants such as
+/// `(sleep 3600 &)` included; on Windows the job the door placed it in ends the tree with its
+/// handle.
+///
+/// [`run`] kills the tree on a stop, a timeout and an exhausted budget, but a caller that drops the
+/// future never reaches those arms: a tool gate's `tokio::time::timeout` drops a `shell_execute`
+/// call and only then fires its token, so without the kill on drop every evaluation of such a gate
+/// would leave its command running. `Drop` is synchronous, so there is no grace signal there; a
+/// child already reaped has no id and is not signaled.
+pub(crate) struct Tree(Spawned<tokio::process::Child>);
+
+impl Tree {
+    /// The child's process id, `None` once it has been reaped.
+    pub(crate) fn id(&self) -> Option<u32> {
+        self.0.id()
+    }
+
+    /// End the tree: on Unix `SIGTERM` to the group, a moment for well-behaved processes to shut
+    /// down cleanly, then `SIGKILL`; on Windows the job is terminated.
+    async fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id() {
+            let pgid = pid as libc::pid_t;
+            // SAFETY: `kill(2)` is always safe to call; it just returns an error if the target is
+            // gone. Sending to `-pgid` targets the whole process group. Errors here usually mean
+            // the group already exited; log at debug so an unkillable group still leaves a trail
+            // without spamming default verbosity.
+            let term_result = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+            if term_result != 0 {
+                let error = io::Error::last_os_error();
+                tracing::debug!("failed to send SIGTERM to process group {pgid}: {error}");
+            }
+            tokio::time::sleep(KILL_GRACE).await;
+        }
+        self.kill_at_once().await;
+    }
+
+    /// End the tree with no grace: `SIGKILL` to the group on Unix, the job terminated on Windows.
+    /// The closing `kill` is a no-op once the tree is gone and reaps the child either way.
+    async fn kill_at_once(&mut self) {
+        #[cfg(windows)]
+        if let Err(error) = self.0.terminate_tree() {
+            tracing::debug!("failed to terminate the command's job: {error}");
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id() {
+            kill_tree_now(pid);
+        }
+        if let Err(error) = self.0.kill().await {
+            tracing::debug!("failed to kill child process: {error}");
+        }
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let Some(pid) = self.0.id() else {
+            return;
+        };
+        kill_tree_now(pid);
+        if let Err(error) = self.0.start_kill() {
+            tracing::debug!("failed to kill child {pid} on drop: {error}");
+        }
+    }
+}
+
+/// Kill the tree whose root has process id `process_id` with `SIGKILL`, at once: what a dropped
+/// [`Tree`] does, and what a holder that cannot wait on the task owning the `Tree` calls, such as a
+/// screen on its way out, which may not poll that task again.
+#[cfg(unix)]
+pub(crate) fn kill_tree_now(process_id: u32) {
+    // SAFETY: `kill(2)` has no preconditions; the root leads its own session, so `-pid` names its
+    // tree and nothing else.
+    let killed = unsafe { libc::kill(-(process_id as libc::pid_t), libc::SIGKILL) };
+    if killed != 0 {
+        let error = io::Error::last_os_error();
+        tracing::debug!("failed to kill process group {process_id}: {error}");
+    }
+}
+
+/// See the Unix definition: on Windows the job ends the tree when the [`Tree`] holding it drops,
+/// as it does when Meka's own process ends.
+#[cfg(windows)]
+pub(crate) fn kill_tree_now(_process_id: u32) {}
+
+/// Start `command` with the door's placement applied, as the root of a [`Tree`].
+pub(crate) fn spawn_tree(command: &mut tokio::process::Command) -> io::Result<Tree> {
+    // SAFETY: the caller's step does nothing, so the child makes the door's own calls alone.
+    #[cfg(unix)]
+    let spawned = unsafe { spawn_tree_with_pre_exec(command, || Ok(())) };
+    #[cfg(windows)]
+    let spawned = spawn(command).map(Tree);
+    spawned
+}
+
+/// [`spawn_tree`], with `pre_exec` run in the child once the door's own steps have: after the
+/// placement and the `setsid` that gives the child its tree, so a step that restricts the child (a
+/// Landlock domain) comes last.
+///
+/// # Safety
+///
+/// As for [`spawn_with_pre_exec`].
+#[cfg(unix)]
+pub(crate) unsafe fn spawn_tree_with_pre_exec<F>(
+    command: &mut tokio::process::Command,
+    mut pre_exec: F,
+) -> io::Result<Tree>
+where
+    F: FnMut() -> io::Result<()> + Send + Sync + 'static,
+{
+    // SAFETY: `setsid(2)` is async-signal-safe and has no precondition beyond the caller not
+    // leading a process group already, which a freshly forked child never does; `pre_exec` carries
+    // the caller's obligation.
+    let spawned = unsafe {
+        spawn_with_pre_exec(command, move || {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            pre_exec()
+        })
+    };
+    spawned.map(Tree)
+}
+
+/// Which of a command's two output streams a chunk was read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// Where a drain sends each chunk as soon as it has read it, beside what it keeps. The drain waits
+/// for the sink before reading on, so a slow sink slows the command rather than queueing its
+/// output.
+#[async_trait]
+pub(crate) trait Sink: Send + Sync {
+    /// Take `chunk`, the next bytes read from `stream`.
+    async fn receive(&self, stream: Stream, chunk: &[u8]);
+}
+
+/// How much a command may print before it is stopped, spent by the drains that draw on it.
+///
+/// Shared rather than split per stream when both streams draw on it, so a command that prints
+/// everything on one stream gets the whole bound, and one that splits its output cannot double it.
+pub(crate) struct OutputBudget {
+    remaining: AtomicUsize,
+    exhausted: AtomicBool,
+}
+
+impl OutputBudget {
+    /// A budget of `bytes`.
+    pub(crate) fn new(bytes: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(bytes),
+            exhausted: AtomicBool::new(false),
+        }
+    }
+
+    /// Spend `bytes`. `false` when they did not fit, at which point the budget is exhausted and
+    /// stays so; the chunk that crossed the line is kept, so the record ends on a whole read.
+    pub(crate) fn spend(&self, bytes: usize) -> bool {
+        let before = self
+            .remaining
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                Some(remaining.saturating_sub(bytes))
+            })
+            .unwrap_or(0);
+        if before >= bytes {
+            return true;
+        }
+        self.exhausted.store(true, Ordering::SeqCst);
+        false
+    }
+
+    /// Whether a spend did not fit.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
+    }
+}
+
+/// What a drain keeps of what it reads from its pipe.
+pub(crate) enum Keep {
+    /// Every byte, spent from a budget a command's streams may share. The read that crosses it is
+    /// kept, so the capture ends on a whole read, and ends the command: the drain stops reading
+    /// and [`run`] kills the tree.
+    Budgeted(Arc<OutputBudget>),
+    /// The first this many bytes. The rest is read to the pipe's end and let go, since closing the
+    /// pipe at the cap would have the child's next write take `SIGPIPE`.
+    Head(usize),
+    /// The last this many bytes, with a count of what was let go ahead of them.
+    Tail(usize),
+}
+
+/// What a drain kept of one stream.
+#[derive(Default)]
+pub(crate) struct Captured {
+    pub(crate) bytes: Vec<u8>,
+    /// Bytes read and let go: past a [`Keep::Head`], or ahead of a [`Keep::Tail`].
+    pub(crate) dropped: u64,
+}
+
+/// What [`run`] keeps of each of a command's streams, and where it sends each chunk as it reads it.
+pub(crate) struct Capture {
+    pub(crate) stdout: Keep,
+    pub(crate) stderr: Keep,
+    pub(crate) sink: Option<Arc<dyn Sink>>,
+}
+
+/// A command's two drains, reading from the moment they start.
+///
+/// Started before the wait, because waiting on a child does not read its pipes: a child writing
+/// past a pipe's buffer (about 64 KiB) blocks in `write`, never exits, and the wait sits out its
+/// timeout. Once every process holding a pipe's write end has exited, the drain reads to its end.
+pub(crate) struct Drains {
+    stdout: tokio::task::JoinHandle<Captured>,
+    stderr: tokio::task::JoinHandle<Captured>,
+    /// Tells a drain to stop reading and return what it has.
+    stop: CancellationToken,
+    /// Stops both drains when they are let go unjoined, so a run whose future is dropped leaves no
+    /// drain reading a pipe that something outside the tree still holds.
+    stop_on_drop: tokio_util::sync::DropGuard,
+    /// Fired by a drain whose budget ran out.
+    bound: CancellationToken,
+}
+
+impl Drains {
+    /// Start a drain on each pipe, keeping what `capture` says.
+    pub(crate) fn start<StdoutPipe, StderrPipe>(
+        stdout: Option<StdoutPipe>,
+        stderr: Option<StderrPipe>,
+        capture: Capture,
+    ) -> Self
+    where
+        StdoutPipe: tokio::io::AsyncRead + Unpin + Send + 'static,
+        StderrPipe: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let stop = CancellationToken::new();
+        let bound = CancellationToken::new();
+        let stdout = tokio::spawn(drain(
+            stdout,
+            Stream::Stdout,
+            capture.stdout,
+            capture.sink.clone(),
+            stop.clone(),
+            bound.clone(),
+        ));
+        let stderr = tokio::spawn(drain(
+            stderr,
+            Stream::Stderr,
+            capture.stderr,
+            capture.sink,
+            stop.clone(),
+            bound.clone(),
+        ));
+        Self {
+            stdout,
+            stderr,
+            stop_on_drop: stop.clone().drop_guard(),
+            stop,
+            bound,
+        }
+    }
+
+    /// Wait until a drain's budget has run out.
+    pub(crate) async fn bound_reached(&self) {
+        self.bound.cancelled().await;
+    }
+
+    /// Both drains' captures, waiting at most `drain_timeout` in all for the pipes to close.
+    ///
+    /// A drain that has not reached its pipe's end by then is told to stop and returns what it
+    /// has, so a process the command left behind holding the pipe delays the result by the timeout
+    /// and costs the output it prints afterwards, never the output already read.
+    pub(crate) async fn collect(self, drain_timeout: Duration) -> Drained {
+        let Self {
+            mut stdout,
+            mut stderr,
+            stop,
+            stop_on_drop,
+            bound: _,
+        } = self;
+        let deadline = tokio::time::Instant::now() + drain_timeout;
+        let mut stopped_early = false;
+        let stdout = join_drain_by(&mut stdout, deadline, &stop, &mut stopped_early).await;
+        let stderr = join_drain_by(&mut stderr, deadline, &stop, &mut stopped_early).await;
+        drop(stop_on_drop);
+        Drained {
+            stdout,
+            stderr,
+            stopped_early,
+        }
+    }
+}
+
+/// What a command's two drains kept.
+pub(crate) struct Drained {
+    pub(crate) stdout: Captured,
+    pub(crate) stderr: Captured,
+    /// Something kept a pipe open past the drain timeout, so the drains were told to stop and
+    /// anything printed after that is not in `stdout` or `stderr`.
+    pub(crate) stopped_early: bool,
+}
+
+/// One drain's capture by `deadline`. Past it, `stop` is fired and the drain is joined for what it
+/// has, which it returns as soon as it sees the signal.
+async fn join_drain_by(
+    task: &mut tokio::task::JoinHandle<Captured>,
+    deadline: tokio::time::Instant,
+    stop: &CancellationToken,
+    stopped_early: &mut bool,
+) -> Captured {
+    let joined = match tokio::time::timeout_at(deadline, &mut *task).await {
+        Ok(joined) => joined,
+        Err(_elapsed) => {
+            *stopped_early = true;
+            stop.cancel();
+            task.await
+        }
+    };
+    joined.unwrap_or_else(|error| {
+        tracing::debug!("drain task failed: {error}");
+        Captured::default()
+    })
+}
+
+/// Read `reader` until its end, `stop`, or its budget running out, sending each chunk to `sink` as
+/// it arrives and keeping what `keep` says. A budget that runs out fires `bound`.
+///
+/// Whichever way the read ends, what `keep` kept is returned: the caller decides what to say about
+/// a stream that ended early, and this function never drops a byte its rule keeps.
+async fn drain<R>(
+    reader: Option<R>,
+    stream: Stream,
+    keep: Keep,
+    sink: Option<Arc<dyn Sink>>,
+    stop: CancellationToken,
+    bound: CancellationToken,
+) -> Captured
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut captured = Captured::default();
+    let Some(mut reader) = reader else {
+        return captured;
+    };
+    let mut buffer = [0u8; 8192];
+    loop {
+        // `read` is cancel-safe on a pipe: a read that has not completed has copied nothing, so
+        // stopping here loses nothing already produced.
+        let read = tokio::select! {
+            read = reader.read(&mut buffer) => read,
+            () = stop.cancelled() => break,
+        };
+        let read = match read {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                tracing::debug!("failed to read child output: {error}");
+                break;
+            }
+        };
+        let chunk = buffer.get(..read).unwrap_or_default();
+        if let Some(sink) = &sink {
+            sink.receive(stream, chunk).await;
+        }
+        match &keep {
+            Keep::Budgeted(budget) => {
+                captured.bytes.extend_from_slice(chunk);
+                // After the chunk is kept, so the capture ends on what was actually read; the run
+                // kills the command, and this drain has nothing more to take from it.
+                if !budget.spend(read) {
+                    bound.cancel();
+                    break;
+                }
+            }
+            Keep::Head(limit) => {
+                let room = limit.saturating_sub(captured.bytes.len());
+                let kept = chunk.get(..room).unwrap_or(chunk);
+                captured.bytes.extend_from_slice(kept);
+                captured.dropped += (chunk.len() - kept.len()) as u64;
+            }
+            Keep::Tail(limit) => {
+                captured.bytes.extend_from_slice(chunk);
+                // Trimmed once the kept part has doubled, so a long output is moved a few times
+                // rather than once per read.
+                if captured.bytes.len() > limit.saturating_mul(2) {
+                    keep_tail(&mut captured, *limit);
+                }
+            }
+        }
+    }
+    if let Keep::Tail(limit) = keep {
+        keep_tail(&mut captured, limit);
+    }
+    captured
+}
+
+/// Cut `captured` to its last `limit` bytes, counting what goes.
+fn keep_tail(captured: &mut Captured, limit: usize) {
+    let cut = captured.bytes.len().saturating_sub(limit);
+    captured.bytes.drain(..cut);
+    captured.dropped += cut as u64;
+}
+
+/// How a command [`run`] waited on ended.
+#[derive(Debug)]
+pub(crate) enum Ended {
+    /// It exited on its own, with this status.
+    Exited(std::process::ExitStatus),
+    /// Its timeout passed first, and the tree was killed.
+    TimedOut,
+    /// The stop token fired first, and the tree was killed.
+    Stopped,
+    /// A stream's budget ran out first, and the tree was killed.
+    OutputBound,
+}
+
+/// How a command ended, and what its drains kept.
+pub(crate) struct Finished {
+    pub(crate) ended: Ended,
+    pub(crate) drained: Drained,
+}
+
+/// What ends a run from outside, and how its tree is ended then.
+pub(crate) enum Stop<'a> {
+    /// As a timeout ends it: `SIGTERM`, a grace, then `SIGKILL`, so a command interrupted under a
+    /// turn has its moment to clean up.
+    Graceful(&'a CancellationToken),
+    /// With `SIGKILL` and no grace: the holder has decided the command is over, as the screen
+    /// has when its user stops a `!command`, and waiting out a grace would only hold the answer.
+    AtOnce(&'a CancellationToken),
+}
+
+impl Stop<'_> {
+    fn token(&self) -> &CancellationToken {
+        match self {
+            Self::Graceful(token) | Self::AtOnce(token) => token,
+        }
+    }
+}
+
+/// Run `tree` to its end: drain its pipes as `capture` says, wait for the first of its exit,
+/// `stop`, `timeout` and a budget running out, kill the tree on any but the exit, and collect the
+/// drains within `drain_timeout`, or on a stop at once with what they have read, since an
+/// interrupt does not wait on a pipe something outside the tree still holds. `None` for `timeout`
+/// or `stop` is a run nothing ends but the command, a budget or a drop.
+///
+/// `Err` only when waiting on the child fails, and the tree is killed with the dropped value then.
+pub(crate) async fn run(
+    mut tree: Tree,
+    capture: Capture,
+    timeout: Option<Duration>,
+    stop: Option<Stop<'_>>,
+    drain_timeout: Duration,
+) -> io::Result<Finished> {
+    let drains = Drains::start(tree.0.stdout.take(), tree.0.stderr.take(), capture);
+    // `biased`, so a bound reached in the same instant the child exits is reported as the bound:
+    // the random pick would otherwise call the command clean while its last reads were never
+    // taken.
+    let ended = tokio::select! {
+        biased;
+        () = until_stopped(stop.as_ref()) => {
+            match stop {
+                Some(Stop::AtOnce(_)) => tree.kill_at_once().await,
+                _ => tree.kill().await,
+            }
+            drains.stop.cancel();
+            Ended::Stopped
+        }
+        () = drains.bound_reached() => {
+            tree.kill().await;
+            Ended::OutputBound
+        }
+        () = until_elapsed(timeout) => {
+            tree.kill().await;
+            Ended::TimedOut
+        }
+        status = tree.0.wait() => Ended::Exited(status?),
+    };
+    Ok(Finished {
+        ended,
+        drained: drains.collect(drain_timeout).await,
+    })
+}
+
+/// Until `stop` fires; never, when there is none.
+async fn until_stopped(stop: Option<&Stop<'_>>) {
+    match stop {
+        Some(stop) => stop.token().cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Until `timeout` has passed; never, when there is none.
+async fn until_elapsed(timeout: Option<Duration>) {
+    match timeout {
+        Some(timeout) => tokio::time::sleep(timeout).await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(any(target_os = "linux", windows))]
     use super::*;
 
     /// A quiet child that lives until it is killed, where a test spawns one.
@@ -416,11 +935,11 @@ mod tests {
     #[tokio::test]
     async fn a_child_runs_at_the_highest_oom_score() {
         let mut command = sleeping_command();
-        let mut child = spawn(&mut command).expect("spawn sleep");
-        let id = child.id().expect("a running child");
+        let mut tree = spawn_tree(&mut command).expect("spawn sleep");
+        let id = tree.id().expect("a running child");
         let score =
             std::fs::read_to_string(format!("/proc/{id}/oom_score_adj")).expect("read the score");
-        child.kill().await.expect("kill the child");
+        tree.kill().await;
         assert_eq!(score.trim(), "1000");
     }
 
@@ -558,5 +1077,276 @@ mod tests {
             "the child outlives the dropped handle"
         );
         child.kill().await.expect("kill the child");
+    }
+
+    /// A sink that hands every chunk it receives to a channel, so a test can wait for a drain to
+    /// have read something.
+    struct ChannelSink(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+
+    #[async_trait]
+    impl Sink for ChannelSink {
+        async fn receive(&self, _stream: Stream, chunk: &[u8]) {
+            self.0.send(chunk.to_vec()).expect("the test still listens");
+        }
+    }
+
+    /// A drain over `reader` keeping what `keep` says, with nothing telling it to stop; also
+    /// whether it reported its bound.
+    async fn drain_for_test<R>(reader: R, keep: Keep) -> (Captured, bool)
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let bound = CancellationToken::new();
+        let captured = drain(
+            Some(reader),
+            Stream::Stdout,
+            keep,
+            None,
+            CancellationToken::new(),
+            bound.clone(),
+        )
+        .await;
+        (captured, bound.is_cancelled())
+    }
+
+    /// A drain stops reading once the budget is spent, keeps every byte it read including the
+    /// chunk that crossed the line, and raises the signal the run kills the command on. Nothing
+    /// is elided: what the caller gets is a prefix of what the command printed.
+    #[tokio::test]
+    async fn a_drain_stops_at_the_output_bound_and_keeps_what_it_read() {
+        let bound = 100 * crate::text::KIB;
+        let mut source = Vec::with_capacity(3 * bound);
+        source.extend_from_slice(b"FIRST-LINE\n");
+        source.resize(3 * bound, b'x');
+        let budget = Arc::new(OutputBudget::new(bound));
+
+        let (collected, reported) = drain_for_test(
+            std::io::Cursor::new(source.clone()),
+            Keep::Budgeted(Arc::clone(&budget)),
+        )
+        .await;
+
+        assert!(
+            budget.is_exhausted() && reported,
+            "spending the budget must raise the signal"
+        );
+        let collected = collected.bytes;
+        assert!(
+            collected.len() >= bound && collected.len() < source.len(),
+            "the drain stops at the bound, not before and not at EOF: {} bytes",
+            collected.len()
+        );
+        assert_eq!(
+            collected.as_slice(),
+            &source[..collected.len()],
+            "what was kept is a prefix of the stream"
+        );
+    }
+
+    /// Both of a command's drains draw on one budget, so output split across stdout and stderr is
+    /// bounded as a whole rather than at twice the bound.
+    #[tokio::test]
+    async fn two_drains_share_one_budget() {
+        let bound = 100 * crate::text::KIB;
+        let budget = Arc::new(OutputBudget::new(bound));
+        // Each stream alone fits; together they do not.
+        let each = vec![b'y'; bound * 3 / 4];
+
+        let ((stdout, _), (stderr, _)) = tokio::join!(
+            drain_for_test(
+                std::io::Cursor::new(each.clone()),
+                Keep::Budgeted(Arc::clone(&budget))
+            ),
+            drain_for_test(
+                std::io::Cursor::new(each.clone()),
+                Keep::Budgeted(Arc::clone(&budget))
+            ),
+        );
+
+        assert!(budget.is_exhausted(), "the pair spent the budget");
+        let printed = stdout.bytes.len() + stderr.bytes.len();
+        assert!(
+            printed < 2 * each.len(),
+            "one of the drains stopped short: {printed}"
+        );
+        assert!(
+            printed >= bound,
+            "and not before the bound was reached: {printed}"
+        );
+    }
+
+    /// A drain told to stop returns what it has read so far rather than waiting for a pipe that
+    /// something else is holding open; that is what makes a grandchild cost only its later output.
+    #[tokio::test]
+    async fn a_drain_told_to_stop_returns_what_it_has() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let stop = CancellationToken::new();
+        let (sink, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let draining = tokio::spawn(drain(
+            Some(reader),
+            Stream::Stdout,
+            Keep::Budgeted(Arc::new(OutputBudget::new(usize::MAX))),
+            Some(Arc::new(ChannelSink(sink))),
+            stop.clone(),
+            CancellationToken::new(),
+        ));
+
+        writer.write_all(b"partial output\n").await.expect("write");
+        writer.flush().await.expect("flush");
+        // The writer stays open, so EOF never comes; only the signal ends the drain. Sent once the
+        // sink shows the drain has taken the bytes, so the test never races the read.
+        assert_eq!(
+            received
+                .recv()
+                .await
+                .expect("the drain reads what was written"),
+            b"partial output\n"
+        );
+        stop.cancel();
+
+        let collected = tokio::time::timeout(Duration::from_secs(2), draining)
+            .await
+            .expect("the drain returns promptly once told to stop")
+            .expect("the drain task completes");
+        assert_eq!(collected.bytes, b"partial output\n");
+        drop(writer);
+    }
+
+    /// A stop is answered at once, with what was read: the run does not wait out its drain timeout
+    /// for a pipe that something outside the tree still holds.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stop_does_not_wait_on_a_pipe_held_outside_the_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let escaped = dir.path().join("escaped");
+        // `setsid` takes its shell out of the tree, so the kill leaves it holding the pipes; it
+        // says so once it is out, which is what the stop waits for.
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "setsid sh -c 'echo $$ > \"{}\"; echo escaped; exec sleep 30' & exec sleep 30",
+                escaped.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let tree = spawn_tree(&mut command).expect("the command starts");
+        let (sink, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let capture = Capture {
+            stdout: Keep::Tail(crate::text::KIB),
+            stderr: Keep::Tail(crate::text::KIB),
+            sink: Some(Arc::new(ChannelSink(sink))),
+        };
+        let stop = CancellationToken::new();
+        let running = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                let stop = Stop::Graceful(&stop);
+                run(tree, capture, None, Some(stop), Duration::from_secs(3600)).await
+            }
+        });
+        assert_eq!(
+            received.recv().await.expect("the command prints"),
+            b"escaped\n"
+        );
+        stop.cancel();
+
+        let finished = tokio::time::timeout(Duration::from_secs(10), running).await;
+        // The escaped `sleep` is ended here, by the pid the command wrote, rather than left for
+        // its 30 seconds.
+        let pid: libc::pid_t = std::fs::read_to_string(&escaped)
+            .expect("the command wrote the pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // SAFETY: `kill(2)` has no preconditions.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+
+        let finished = finished
+            .expect("a stop does not wait for the pipe to close")
+            .expect("the run completes")
+            .expect("the command ran");
+        assert!(
+            matches!(finished.ended, Ended::Stopped),
+            "{:?}",
+            finished.ended
+        );
+        assert_eq!(finished.drained.stdout.bytes, b"escaped\n");
+    }
+
+    /// A stop that kills at once sends no `SIGTERM` first: the command gets no moment to clean
+    /// up, and the run does not wait one out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_at_once_gives_the_tree_no_grace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let termed = dir.path().join("termed");
+        // The trap is set before the command says it is ready, so a `SIGTERM` after that would
+        // leave the file behind.
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "trap 'echo termed > \"{}\"; exit 0' TERM; echo ready; sleep 30 & wait",
+                termed.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let tree = spawn_tree(&mut command).expect("the command starts");
+        let (sink, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let capture = Capture {
+            stdout: Keep::Tail(crate::text::KIB),
+            stderr: Keep::Tail(crate::text::KIB),
+            sink: Some(Arc::new(ChannelSink(sink))),
+        };
+        let stop = CancellationToken::new();
+        let running = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                let stop = Stop::AtOnce(&stop);
+                run(tree, capture, None, Some(stop), Duration::from_secs(10)).await
+            }
+        });
+        assert_eq!(
+            received.recv().await.expect("the command prints"),
+            b"ready\n"
+        );
+        stop.cancel();
+
+        let finished = running
+            .await
+            .expect("the run completes")
+            .expect("the command ran");
+        assert!(
+            matches!(finished.ended, Ended::Stopped),
+            "{:?}",
+            finished.ended
+        );
+        assert!(
+            !termed.exists(),
+            "the command was killed outright, with no signal it could answer"
+        );
+    }
+
+    /// A command that prints without end cannot grow its reader's memory with it: a tail keeps
+    /// the stream's last bytes and counts what it let go.
+    #[tokio::test]
+    async fn a_tail_keeps_the_last_bytes_and_counts_the_rest() {
+        let limit = 64 * crate::text::KIB;
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let writing = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            for byte in *b"abc" {
+                writer.write_all(&vec![byte; limit]).await.expect("write");
+            }
+        });
+        let (kept, _) = drain_for_test(reader, Keep::Tail(limit)).await;
+        writing.await.expect("the writer");
+        assert_eq!(kept.bytes.len(), limit);
+        assert_eq!(kept.dropped, 2 * limit as u64);
+        assert!(kept.bytes.iter().all(|&byte| byte == b'c'));
     }
 }

@@ -1445,7 +1445,8 @@ fn an_outcome_turn_is_held_by_the_item_deferred_on_its_task() {
     assert!(
         !body
             .iter()
-            .any(|row| row.contains("[Background task reporting") || row == "ok"),
+            .any(|row| row.contains("[Background task reporting")
+                || row.trim_start().trim_start_matches("> ") == "ok"),
         "the prompt and the output stay with the model: {body:#?}"
     );
     assert_set_off_by_one_blank(body, report, report, "the report's direction");
