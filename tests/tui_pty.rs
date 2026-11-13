@@ -759,12 +759,14 @@ fn a_url_question_keeps_its_asker_and_its_url_ahead_of_a_long_message() {
         serde_json::json!({"tools": ["search"], "elicit": elicit}).to_string(),
     )
     .expect("write the server's state");
+    // The grace is how long a turn waits for a server still connecting: the server is a process
+    // of its own, and on a loaded runner it is not up within the default three seconds.
     let install = screen_install(
         "unrestricted",
         "",
         &format!(
-            "\n[mcp]\ndeferral = \"eager\"\n\n[[mcp.servers]]\nname = \"forms\"\ntransport = \
-             \"stdio\"\ncommand = \"python3\"\nargs = [{fixture:?}, {:?}]\n",
+            "\n[mcp]\ndeferral = \"eager\"\ngrace = \"60s\"\n\n[[mcp.servers]]\nname = \
+             \"forms\"\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = [{fixture:?}, {:?}]\n",
             state.to_string_lossy()
         ),
     );
@@ -818,12 +820,16 @@ fn a_form_takes_the_page_keys_only_while_its_message_runs_past_its_rows() {
             serde_json::json!({"tools": ["search"], "elicit": elicit}).to_string(),
         )
         .expect("write the server's state");
+        // The grace is how long a turn waits for a server still connecting: the server is a
+        // process of its own, and on a loaded runner it is not up within the default three
+        // seconds.
         let install = screen_install(
             "unrestricted",
             "",
             &format!(
-                "\n[mcp]\ndeferral = \"eager\"\n\n[[mcp.servers]]\nname = \"forms\"\ntransport = \
-                 \"stdio\"\ncommand = \"python3\"\nargs = [{fixture:?}, {:?}]\n",
+                "\n[mcp]\ndeferral = \"eager\"\ngrace = \"60s\"\n\n[[mcp.servers]]\nname = \
+                 \"forms\"\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = [{fixture:?}, \
+                 {:?}]\n",
                 state.to_string_lossy()
             ),
         );
