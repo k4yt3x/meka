@@ -124,7 +124,7 @@ Meka forwards the model string verbatim and doesn't gate which strings are valid
 - `anthropic-beta: <comma-separated beta list>` (computed per request, see below)
 - `x-app: cli`
 - `User-Agent: claude-cli/<version> (external, cli)`
-- `X-Claude-Code-Session-Id: <uuid>` (per-process)
+- `X-Claude-Code-Session-Id: <uuid>`: the session's id, and on a sub-agent's request the id of the session at the root of its family, so a conversation and its sub-agents are one session to the endpoint; an account call (usage, profile), which belongs to no session, carries an id minted once per process
 - Stainless SDK identification headers (`x-stainless-*`)
 - `x-claude-code-request-class`: `main` for a turn of the conversation, `subagent` for a sub-agent's turn (with `x-claude-code-agent-type: general-purpose`, the built-in agent an `Agent` call without a custom definition runs), `compaction` for a compaction's requests
 - `x-claude-code-agent-id`: on every request a sub-agent makes, its compaction's included, an id in Claude Code's sub-agent shape (`a` and sixteen hex digits) derived from the sub-agent's session; `x-claude-code-parent-agent-id` on a nested sub-agent's, naming the sub-agent that spawned it
@@ -186,7 +186,7 @@ Nothing in Meka depends on that order. `patch_request_body` finds the `cch=00000
 
 ### Other body fields
 
-- `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "...", "session_id": "..."}` (`device_id` from the account's `device_id`; `account_uuid` from the OAuth token, empty until one is known; `session_id` is per-process).
+- `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "...", "session_id": "..."}` (`device_id` from the account's `device_id`; `account_uuid` from the OAuth token, empty until one is known; `session_id` is the id the `X-Claude-Code-Session-Id` header carries).
 - `context_management.edits = [{type: "clear_thinking_20251015", keep: "all"}]`: present when thinking is enabled on a context-management-capable model. Mirrors Claude Code's `apiMicrocompact`.
 - `output_config.effort`: see [Reasoning effort](#reasoning-effort).
 - `thinking.display`: see [`thinking_display`](#thinking_display); absent with thinking off and under `redacted`.

@@ -53,7 +53,7 @@ The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself,
 
 ### Omitting a field keeps what is there
 
-`memory_write`'s `body`, `tags`, `priority`, `load`, `references`, `source` and `expires` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update (a reworded description, say) a single call that cannot cost the note its contents, its labels, its rank, its dependencies or its deadline. To clear the body or the expiry, pass `""`; to clear a list, pass `[]`. A blank in any other field is the field omitted.
+`memory_write`'s `body`, `tags`, `priority`, `load`, `references`, `source` and `expires` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update (a reworded description, say) a single call that cannot cost the note its contents, its labels, its rank, its dependencies or its deadline. To clear the body, the source or the expiry, pass `""`; to clear a list, pass `[]`. A blank in any other field is the field omitted.
 
 `PUT /v1/memories/{name}` and `meka memory add <name> --force` follow the same rule.
 
@@ -301,7 +301,7 @@ The export directory is created at mode `0700` and each file at `0600`, and an e
 
 What lands on disk is byte-exact: bodies, tags, priorities and recorded dates are written exactly as stored, including zero-width joiners, CRLF line endings and leading or trailing blank lines. `read_count` rides along too, because it is the one value the rest of the file cannot reconstruct.
 
-Descriptions are the one field normalized rather than preserved: every write door collapses a description to a single line before storing it, so what comes back is what was stored. A description made only of characters YAML cannot carry has no such form, and `meka memory export` refuses the whole run and names it rather than writing a file whose frontmatter would not parse.
+Descriptions are the one field normalized rather than preserved: every write door collapses a description to a single line before storing it, so what comes back is what was stored. A description that says nothing once control and format characters are left out, which no write door accepts, is one the import would refuse, so `meka memory export` refuses the whole run and names it rather than writing a snapshot that would not read back.
 
 An export reads back with any tool that understands YAML frontmatter, and `meka memory import <dir>` reads it back into a store: every file of the snapshot in one transaction, so nothing lands unless everything does. The project of each memory is read from its frontmatter and must exist, so `meka project add <name>` comes first on the other installation; `created`, `verified` and `read_count` are restored as written, which is what makes the import a restore rather than a copy. A memory the store already holds in the same tier is refused by name until `--force`, which overwrites it with the file; a name a global memory and a project memory would then share is refused outright, since no tier may hold the other's name; and the inline budget holds over the whole import as it holds over a write. The manifest is read first: a snapshot an older Meka wrote at another `format_version` is brought forward in one place, the migration module, or refused by version.
 

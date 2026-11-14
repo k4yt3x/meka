@@ -165,6 +165,7 @@ impl CutRequest {
             tools: &self.tools,
             deferred_tools: &self.deferred_tools,
             attribution: original.attribution.clone(),
+            streaming: original.streaming,
         }
     }
 

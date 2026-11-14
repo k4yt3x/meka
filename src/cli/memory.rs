@@ -644,7 +644,7 @@ pub(crate) async fn run_export(
     }
 
     // Every memory checked before a single file is written, both for a name a filesystem cannot
-    // take and for a description the file cannot carry: this is the one place a name becomes a
+    // take and for a description the import would refuse: this is the one place a name becomes a
     // path, and a row can carry one Meka's own write doors would have refused, since anything
     // writing straight to the column can land a `nul.md` or a `-old.md`.
     let unusable: Vec<String> = memories
@@ -661,14 +661,14 @@ pub(crate) async fn run_export(
             {
                 return Some(format!("{} ({})", memory.name, reason));
             }
-            // A description of nothing but control characters survives the write door (they are
-            // not whitespace, so `trim().is_empty()` says it is a description) and leaves the file
-            // with `description: ""`, which reads back as having none. That is a memory lost
-            // through a backup, so the export refuses instead.
-            if !memory::description_survives_export(&memory.description) {
+            // The import holds a file's description to what a write door asks of one, so a stored
+            // description that fails it (a row no door wrote) would be a file the import refuses,
+            // and with it the whole snapshot. That is a backup that does not restore, so the
+            // export refuses instead.
+            if !memory::description_says_something(&memory.description) {
                 return Some(format!(
-                    "{} (its description has no character YAML can carry, so it would not read \
-                     back)",
+                    "{} (its description says nothing once control and format characters are \
+                     left out, so it would not read back)",
                     memory.name
                 ));
             }
@@ -1837,18 +1837,16 @@ mod tests {
         assert_eq!(file_mode, 0o600, "and so must every memory in it");
     }
 
-    /// A description the file cannot carry stops the export, rather than writing a file that
-    /// cannot be read back.
+    /// A description the import would refuse stops the export, rather than writing a snapshot
+    /// that cannot be read back.
     ///
-    /// `require_str` only refuses a description that is blank after `trim`, and a control character
-    /// is not whitespace, so `\u{1}` is a description at every write door and nothing at all once
-    /// `render_memory` has dropped what YAML cannot represent. The file then says `description:
-    /// ""`, and that reads back as having none: a note lost through the one path that exists to
-    /// preserve it.
+    /// A control character is not whitespace, so the store takes `\u{1}` as a description, and the
+    /// import refuses a file whose description says nothing once rendered: a snapshot holding one
+    /// would not restore.
     #[tokio::test]
-    async fn a_description_the_file_cannot_carry_stops_the_export() {
+    async fn a_description_the_import_would_refuse_stops_the_export() {
         let store = MemoryStore::for_test().await.expect("store");
-        for (name, description) in [("fine", "an ordinary note"), ("blank", "\u{1}\u{2}")] {
+        for (name, description) in [("fine", "an ordinary note"), ("blank", "\u{1}\u{200b}")] {
             store
                 .write(WriteRequest {
                     name: name.to_string(),

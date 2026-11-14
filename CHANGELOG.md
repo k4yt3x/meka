@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A shell gate whose command exits while something it started holds its output answers 2 s later.
 - A `PATCH /v1/sessions/{id}` naming a level, approvals or directory refuses a bad body first.
 - Session archives are `format_version` 29; older archives are brought forward on import.
+- A memory export lists tags and references one per line and quotes only what YAML requires.
+- `meka skill get --format json` and `show --format json` print the description as the file has it.
 
 ### Fixed
 
@@ -70,6 +72,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The screen sent SIGTERM or SIGHUP starts no further scheduled or background-outcome turn.
 - `meka schedule cancel` cancels a job this build cannot read, as the warning about it says.
 - A refused store upgrade no longer leaves a new copy of the store on every retry.
+- A compaction on `openai-chat-completions` streams when the session's turns do.
+- A Chat Completions reply that is not a completion is reported with what the endpoint sent.
+- An error inside a Chat Completions or Responses stream shows the whole error object sent.
+- Past 100 images, a Claude request redacts down to 80, so later rounds keep the cached prefix.
+- Claude subscription requests name their conversation's session; a sub-agent's names its root's.
+- A subscription's usage, profile and statistics reads are abandoned after 30 seconds.
+- A memory export whose values hold commas or brackets, or read as YAML numbers, imports back.
+- A memory export keeps a control character in a description or a source.
+- `memory_write` clears `source` when given `""`, as its schema says.
+- `GET /v1/skills/{name}` returns the description as the file has it, not a stripped copy.
 
 ## [0.94.0] - 2026-11-12
 

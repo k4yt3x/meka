@@ -942,8 +942,9 @@ pub(crate) struct ToolDefinitionView {
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct SkillView {
     pub(crate) name: String,
-    /// Rendered as an index for a client to draw, not the file's bytes: the body is the surface
-    /// that is returned verbatim.
+    /// In a listing, made safe to draw (one line, with no format or control characters), since a
+    /// listing is an index a client draws. `GET /v1/skills/{name}` and the answer of `PUT` carry
+    /// the file's own, which is what a client edits and writes back.
     pub(crate) description: String,
     /// Listing rank, 0..=9, lower first. Orders the `[Skills]` index the model sees and decides
     /// which entries that index's cap drops.
@@ -997,6 +998,9 @@ impl InstalledSkillView {
 
 /// One skill in full: what `GET /v1/skills/{name}` answers with, and the core of what `meka skill
 /// get` and `show` print.
+///
+/// The record a client edits and writes back with `PUT`, so its `description` is the one the file
+/// holds, verbatim: a listing's is made safe to draw, and sending that back would rewrite the file.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct SkillDetail {
@@ -1019,7 +1023,10 @@ impl SkillDetail {
     /// The view of one skill, with the body the caller chose to load, or none.
     pub(crate) fn new(skill: &Skill, body: Option<String>) -> Self {
         Self {
-            skill: SkillView::from(skill),
+            skill: SkillView {
+                description: skill.description.clone(),
+                ..SkillView::from(skill)
+            },
             license: skill.license.clone(),
             allowed_tools: skill.allowed_tools.clone(),
             body,

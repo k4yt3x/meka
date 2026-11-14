@@ -300,6 +300,8 @@ pub(crate) struct StreamRequest {
     /// The session the request named, for the same reason: a ChatGPT request sends it as its
     /// cache affinity, and a turn that reads it before the session exists sends none.
     pub(crate) session_id: Option<uuid::Uuid>,
+    /// The session at the root of the request's family, for the same reason.
+    pub(crate) root_session_id: Option<uuid::Uuid>,
     /// The response before a compaction the request named, for the same reason.
     pub(crate) response_before_compaction: Option<crate::provider::MainResponse>,
     /// The tools the session had called when the request was built, for the same reason.
@@ -646,6 +648,7 @@ impl Provider for MockProvider {
             turn_origin: attribution.turn_origin,
             turn_position: attribution.turn_position,
             session_id: attribution.session_id,
+            root_session_id: attribution.root_session_id,
             response_before_compaction: attribution.response_before_compaction(),
             tools_used: attribution.tools_used.clone(),
         });

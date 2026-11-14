@@ -163,9 +163,11 @@ impl Agent {
     /// Run [`crate::provider::Provider::complete`] under the same retry policy a streamed turn
     /// gets, so one transient 429 mid-compaction is not terminal, and with the same fallback when
     /// the retries are spent. The provider is read per attempt, so a fallback bound by one
-    /// attempt is what the next one sends to.
+    /// attempt is what the next one sends to. Each attempt asks as the session's turns do:
+    /// streamed when the session streams, whole when it does not (see
+    /// [`CompletionRequest::streaming`]).
     ///
-    /// `content_started` is `false` by construction: nothing streamed, so a retry cannot
+    /// `content_started` is `false` by construction: nothing is shown, so a retry cannot
     /// double-emit. `cancellation` gates the *waits*, as the loops in `run_streaming` and
     /// `run_turn` do, or a `Retry-After` could hold Ctrl+C for a minute; `attempt_cancellation`
     /// gates the request itself, and the two differ on purpose. The checkpoint hands its turn's
@@ -197,7 +199,8 @@ impl Agent {
                     ..request.clone()
                 },
                 None => request.clone(),
-            };
+            }
+            .streaming(self.options.streaming);
             match provider
                 .complete(attempt, attempt_cancellation.clone())
                 .await
@@ -893,8 +896,59 @@ mod tests {
         assert_eq!(family.agent.profile(), "main");
     }
 
-    /// The non-streaming door falls back too, and the end of the turn it served, a compaction run
-    /// between turns being one, puts the named profile back.
+    /// A provider that records whether each completion was asked to stream, and answers it empty.
+    #[derive(Default)]
+    struct StreamingRecorder(std::sync::Mutex<Vec<bool>>);
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for StreamingRecorder {
+        async fn complete(
+            &self,
+            request: CompletionRequest<'_>,
+            _cancellation: CancellationToken,
+        ) -> Result<crate::provider::Completion> {
+            crate::sync::lock(&self.0).push(request.streaming);
+            Ok(crate::provider::MessageAccumulator::new().finish())
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest<'_>,
+            _event_sender: tokio::sync::mpsc::Sender<crate::provider::StreamEvent>,
+            _cancellation: CancellationToken,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A completion asks as the session's turns do: streamed when the session streams, whole when
+    /// it does not.
+    #[tokio::test]
+    async fn a_completion_asks_as_the_session_s_turns_do() {
+        let recorder = Arc::new(StreamingRecorder::default());
+        let (mut agent, _store) = crate::agent::tests::agent_for_test(
+            Arc::clone(&recorder) as Arc<dyn crate::provider::Provider>
+        )
+        .await;
+        let token = CancellationToken::new();
+        for streaming in [true, false] {
+            agent.options.streaming = streaming;
+            agent
+                .complete_with_retry(
+                    "a test call",
+                    CompletionRequest::new("system", &[], &[]),
+                    None,
+                    &token,
+                    &token,
+                )
+                .await
+                .expect("the recorder answers");
+        }
+        assert_eq!(*crate::sync::lock(&recorder.0), [true, false]);
+    }
+
+    /// The door of a request nobody watches falls back too, and the end of the turn it served, a
+    /// compaction run between turns being one, puts the named profile back.
     #[tokio::test]
     async fn a_completion_falls_back_and_the_end_of_its_turn_restores() {
         let family = family(vec![exhausted()], vec![answer("from backup")]).await;

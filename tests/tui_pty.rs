@@ -1011,10 +1011,11 @@ fn a_termination_mid_sweep_fires_no_further_job() {
         "the first fire is running when the signal lands: {rows:#?}"
     );
     // SAFETY: `pid` is the child forked above, signaled and reaped here and nowhere else, and
-    // `master` is still open.
+    // `master` is open until the close below.
     let exit = unsafe {
         libc::kill(pid, libc::SIGTERM);
         let mut status = 0;
+        let mut written = [0u8; 65536];
         let deadline = Instant::now() + Duration::from_secs(30);
         let exit = loop {
             if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
@@ -1025,13 +1026,26 @@ fn a_termination_mid_sweep_fires_no_further_job() {
                 });
             }
             if Instant::now() > deadline {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, &mut status, 0);
                 break None;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            // The terminal is read while the screen leaves: on macOS a process cannot finish
+            // exiting while its terminal holds output nobody has read, a kill included.
+            let mut poll = libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if libc::poll(&mut poll, 1, 50) > 0 && poll.revents & libc::POLLIN != 0 {
+                libc::read(master, written.as_mut_ptr().cast(), written.len());
+            }
         };
+        // Closed ahead of the kill, for the same reason: the terminal gone, nothing is left to
+        // wait on.
         libc::close(master);
+        if exit.is_none() {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
         exit
     };
     assert_eq!(exit, Some(130), "the screen leaves on the signal");

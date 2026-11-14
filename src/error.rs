@@ -1667,16 +1667,18 @@ pub(crate) fn provider_stream_error(code: &str, message: String) -> MekaError {
 /// or 5xx is then retried as the same status arriving as a response would be. Read as a string
 /// only, every numeric code was "unknown" and a mid-stream rate limit ended the turn where the
 /// same limit on the headers would have backed off. `type` is the fallback when there is no string
-/// code, and `fallback_message` stands in for a missing `message`.
-pub(crate) fn provider_stream_error_object(
-    error: &serde_json::Value,
-    fallback_message: &str,
-) -> MekaError {
-    let message = error
-        .get("message")
-        .and_then(|value| value.as_str())
-        .unwrap_or(fallback_message)
-        .to_string();
+/// code.
+///
+/// The message is `what` happened, then the object as it arrived, cut by
+/// [`bounded_upstream_body`], as an error on a status shows its whole body: a gateway may put the
+/// cause in a field the spec does not define. A failure that states no error is `what` alone.
+pub(crate) fn provider_stream_error_object(error: &serde_json::Value, what: &str) -> MekaError {
+    // A failure that states no error has nothing to show beside what happened.
+    let message = if error.is_null() {
+        what.to_string()
+    } else {
+        format!("{what}: {}", bounded_upstream_body(&error.to_string()))
+    };
     if let Some(status) = error.get("code").and_then(|value| value.as_u64()) {
         return if status == 429 || (500..600).contains(&status) {
             MekaError::RetryableProvider {
@@ -2017,7 +2019,7 @@ mod tests {
                 "fallback",
             );
             assert!(
-                matches!(error, MekaError::RetryableProvider { ref message, .. } if message == "later"),
+                matches!(error, MekaError::RetryableProvider { .. }),
                 "{status}: {error:?}"
             );
         }
@@ -2027,15 +2029,14 @@ mod tests {
                 "fallback",
             );
             assert!(
-                matches!(error, MekaError::Provider(ref message) if message == "no"),
+                matches!(error, MekaError::Provider(_)),
                 "{status}: {error:?}"
             );
         }
-        // A string code goes through the documented list; `type` stands in when there is none, and
-        // the fallback message when the object names none.
+        // A string code goes through the documented list; `type` stands in when there is none.
         assert!(matches!(
             provider_stream_error_object(&serde_json::json!({"code": "server_error"}), "fallback"),
-            MekaError::RetryableProvider { ref message, .. } if message == "fallback"
+            MekaError::RetryableProvider { .. }
         ));
         assert!(matches!(
             provider_stream_error_object(&serde_json::json!({"type": "overloaded_error"}), "x"),
@@ -2048,6 +2049,41 @@ mod tests {
             ),
             MekaError::Provider(_)
         ));
+    }
+
+    /// An error inside a stream is shown as it arrived, after what happened, a field the spec does
+    /// not define included, and classed by its `code` alone; one past the bound is cut as a relayed
+    /// body is.
+    #[test]
+    fn a_stream_error_object_is_shown_as_it_arrived() {
+        let error = provider_stream_error_object(
+            &serde_json::json!({"message": "Provider returned error", "code": 429,
+                "metadata": {"raw": "the upstream is rate-limited"}}),
+            "the endpoint reported an error in the stream",
+        );
+        assert!(
+            matches!(&error, MekaError::RetryableProvider { message, .. } if message
+                == "the endpoint reported an error in the stream: {\"message\":\"Provider returned \
+                    error\",\"code\":429,\"metadata\":{\"raw\":\"the upstream is rate-limited\"}}"),
+            "{error:?}"
+        );
+
+        let long = serde_json::json!({"type": "invalid_request_error",
+            "message": "x".repeat(RELAYED_BODY_BYTES)});
+        let error = provider_stream_error_object(&long, "the response failed");
+        assert!(
+            matches!(&error, MekaError::Provider(message)
+                if message.starts_with("the response failed: {\"type\":\"invalid_request_error\"")
+                    && message.ends_with(TRUNCATION_MARKER)
+                    && message.len() <= "the response failed: ".len() + RELAYED_BODY_BYTES),
+            "{error:?}"
+        );
+
+        let error = provider_stream_error_object(&serde_json::Value::Null, "the response failed");
+        assert!(
+            matches!(&error, MekaError::Provider(message) if message == "the response failed"),
+            "{error:?}"
+        );
     }
 
     #[test]

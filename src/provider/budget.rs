@@ -17,9 +17,10 @@ use crate::{
     image::RedactedImage,
 };
 
-/// The most images the Messages API takes in one request. Fails toward sending less: a backend
-/// behind a `base_url` that takes more loses its oldest images early, and one that takes fewer
-/// refuses the request as it would without this.
+/// The most images the Messages API takes in one request on a model with a 200k-token context
+/// window, the lowest of its limits and so one no model refuses. Fails toward sending less: a model
+/// or a backend behind a `base_url` that takes more loses its oldest images early, and one that
+/// takes fewer refuses the request as it would without this.
 pub(super) const ANTHROPIC_MAX_REQUEST_IMAGES: usize = 100;
 
 /// The images `messages` carries, as attachments and in tool results.
@@ -49,6 +50,15 @@ pub(super) const REDACTION_HEADROOM_BYTES: usize = 6 * crate::text::MIB;
 pub(super) fn redaction_target(max_request_bytes: usize) -> usize {
     let headroom = REDACTION_HEADROOM_BYTES.min(max_request_bytes / 2);
     max_request_bytes - headroom
+}
+
+/// Where a redaction by count stops for a given cap: a fifth below it, the proportion
+/// [`REDACTION_HEADROOM_BYTES`] is of the Anthropic byte ceiling and for the same reason. A
+/// redaction is recorded on the conversation, so stopping at the cap itself would leave the context
+/// at the cap, and every later round that adds an image would redact one more early message and
+/// rewrite the cached prefix each time.
+pub(super) fn image_redaction_target(max_images: usize) -> usize {
+    max_images - max_images / 5
 }
 
 use crate::conversation::BUDGET_REDACTION_NOTE;
@@ -185,7 +195,14 @@ pub(super) fn fit_body_to_budget<F>(
 where
     F: FnMut(&[Message]) -> Result<String>,
 {
-    let images_to_drop = max_images.map_or(0, |max| image_count(messages).saturating_sub(max));
+    let images_to_drop = max_images.map_or(0, |max| {
+        let count = image_count(messages);
+        if count > max {
+            count - image_redaction_target(max)
+        } else {
+            0
+        }
+    });
     let (counted, mut stats) = redact_oldest_image_count(messages, images_to_drop);
     let body_json = build(counted.as_ref())?;
 
@@ -296,46 +313,84 @@ mod tests {
         assert!(notice.is_none(), "nothing was redacted");
     }
 
-    /// A request over the API's image count loses its oldest images until it is at the count,
-    /// however small its body, and says so; the message being answered keeps its own.
-    #[test]
-    fn a_request_over_the_image_count_loses_its_oldest_images() {
-        let image = || ContentBlock::Image {
-            source: crate::image::ImageSource::Base64 {
-                media_type: "image/png".to_string(),
-                data: "aGk=".to_string(),
-            },
-        };
-        let messages = vec![
-            Message {
-                role: Role::User,
-                content: vec![image(), image()],
-                provider_fields: None,
-            },
-            message("between"),
-            Message {
-                role: Role::User,
-                content: vec![image()],
-                provider_fields: None,
-            },
-        ];
+    fn image_message() -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                source: crate::image::ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "aGk=".to_string(),
+                },
+            }],
+            provider_fields: None,
+        }
+    }
+
+    /// What `fit_body_to_budget` sends for `messages` under an image cap, and its notice.
+    fn fit_to_image_count(
+        messages: &[Message],
+        max_images: usize,
+    ) -> (Vec<Message>, Option<crate::frontend::Notice>) {
         let mut sent = Vec::new();
-        let (_, notice) = fit_body_to_budget(&messages, 1 << 20, Some(2), |messages| {
+        let (_, notice) = fit_body_to_budget(messages, 1 << 20, Some(max_images), |messages| {
             sent = messages.to_vec();
             Ok("{}".to_string())
         })
         .expect("fits");
-        assert_eq!(image_count(&sent), 2, "{sent:?}");
+        (sent, notice)
+    }
+
+    /// A request over the API's image count loses its oldest images, however small its body, and
+    /// says so; the message being answered keeps its own, and a request at the count loses none.
+    #[test]
+    fn a_request_over_the_image_count_loses_its_oldest_images() {
+        let at_the_count: Vec<Message> = (0..10).map(|_| image_message()).collect();
+        let (sent, notice) = fit_to_image_count(&at_the_count, 10);
+        assert_eq!(
+            image_count(&sent),
+            10,
+            "a request at the count is sent whole"
+        );
+        assert!(notice.is_none(), "nothing was redacted");
+
+        let mut over = at_the_count;
+        over.push(image_message());
+        let (sent, notice) = fit_to_image_count(&over, 10);
+        assert!(image_count(&sent) < 10, "{sent:?}");
         assert!(
             matches!(sent[0].content[0], ContentBlock::HarnessNote { .. }),
             "the oldest image goes first: {sent:?}"
         );
-        assert!(matches!(sent[2].content[0], ContentBlock::Image { .. }));
+        assert!(
+            matches!(sent[10].content[0], ContentBlock::Image { .. }),
+            "the message being answered keeps its image: {sent:?}"
+        );
+        let redacted = 11 - image_count(&sent);
         let notice = notice.expect("a redaction is reported");
         assert!(
-            notice.text.starts_with("Redacted 1 old image "),
+            notice
+                .text
+                .starts_with(&format!("Redacted {redacted} old images ")),
             "{}",
             notice.text
+        );
+    }
+
+    /// A redaction by count stops below the count, so the rounds after it that each add an image
+    /// send the earlier messages as the redaction left them: redacting one more early image per
+    /// round would change the request's prefix on every one of them.
+    #[test]
+    fn a_redaction_by_count_leaves_room_for_the_next_images() {
+        let over: Vec<Message> = (0..11).map(|_| image_message()).collect();
+        let (mut view, notice) = fit_to_image_count(&over, 10);
+        assert!(notice.is_some(), "the first request over the count redacts");
+
+        view.push(image_message());
+        let (sent, notice) = fit_to_image_count(&view, 10);
+        assert!(
+            notice.is_none(),
+            "the next image must not redact another: {} images",
+            image_count(&sent)
         );
     }
 }

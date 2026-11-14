@@ -405,6 +405,12 @@ pub(crate) struct CompletionRequest<'a> {
     pub(crate) deferred_tools: &'a [ToolDefinition],
     /// Who the request is for; see [`crate::provider::Attribution`].
     pub(crate) attribution: crate::provider::Attribution,
+    /// Whether [`crate::provider::Provider::complete`] sends the request as a stream and folds
+    /// it, as a session that streams asks, rather than asking for a whole reply. Read by the
+    /// `complete` of `openai-chat-completions`, the one wire with a whole-reply request of its
+    /// own; a wire with one request shape ignores it, and [`crate::provider::Provider::stream`]
+    /// always streams. Off by default.
+    pub(crate) streaming: bool,
 }
 
 impl<'a> CompletionRequest<'a> {
@@ -419,6 +425,7 @@ impl<'a> CompletionRequest<'a> {
             tools,
             deferred_tools: &[],
             attribution: crate::provider::Attribution::default(),
+            streaming: false,
         }
     }
 
@@ -431,6 +438,12 @@ impl<'a> CompletionRequest<'a> {
     /// Say who the request is for.
     pub(crate) fn attributed(mut self, attribution: crate::provider::Attribution) -> Self {
         self.attribution = attribution;
+        self
+    }
+
+    /// Say whether `complete` sends the request as a stream; see [`Self::streaming`].
+    pub(crate) fn streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
         self
     }
 }

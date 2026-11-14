@@ -144,7 +144,7 @@ pub(super) fn optional_str<'a>(
 }
 
 /// [`optional_str`] for a field whose blank value is meaningful: the replacement an edit makes,
-/// a body or an entry's content to clear, an expiry to lift.
+/// a body, an entry's content or a source to clear, an expiry to lift.
 pub(super) fn optional_str_allowing_empty<'a>(
     input: &'a serde_json::Value,
     field: &str,

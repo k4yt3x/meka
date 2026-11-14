@@ -1586,6 +1586,7 @@ impl ToolRegistry {
                 tool_builder_params: super::subagent::ToolBuilderParams {
                     materials: materials.clone(),
                     cells: cells.clone(),
+                    root_session: cells.session_id.clone(),
                     // The root agent holds the whole store, so that is the ceiling on what it
                     // can grant a sub-agent. Whether a sub-agent gets anything is decided per
                     // `agent_spawn` call, and defaults to nothing.

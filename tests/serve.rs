@@ -9600,6 +9600,84 @@ fn skill_write_without_a_body_preserves_the_existing_one() {
     );
 }
 
+/// What `GET /v1/skills/{name}` answers is what a client edits and writes back, so its description
+/// is the one the file holds: read, given a new body and put back, a skill keeps the zero-width
+/// non-joiner its description spells a Persian word with, which the listing, made safe to draw,
+/// leaves out.
+#[test]
+fn a_skill_read_and_written_back_keeps_the_description_its_file_has() {
+    let harness =
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+    let description =
+        "Answer in \u{0645}\u{06cc}\u{200c}\u{062e}\u{0648}\u{0627}\u{0647}\u{0645} Persian";
+    let created = harness
+        .request(reqwest::Method::PUT, "/v1/skills/persian")
+        .json(&serde_json::json!({"description": description, "body": "The old procedure."}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        created.status(),
+        200,
+        "{}",
+        created.text().unwrap_or_default()
+    );
+
+    let read: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/skills/persian")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let written_back = harness
+        .request(reqwest::Method::PUT, "/v1/skills/persian")
+        .json(&serde_json::json!({
+            "description": read["description"],
+            "body": "The new procedure.",
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(
+        written_back.status(),
+        200,
+        "{}",
+        written_back.text().unwrap_or_default()
+    );
+    let file = std::fs::read_to_string(
+        harness
+            .root()
+            .join("meka")
+            .join("skills")
+            .join("persian")
+            .join("SKILL.md"),
+    )
+    .expect("read the skill file");
+    let (front, _) = file
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .unwrap_or_else(|| panic!("a frontmatter block: {file}"));
+    let front: yaml_serde::Value = yaml_serde::from_str(front).expect("yaml");
+    assert_eq!(front["description"].as_str(), Some(description), "{file}");
+    assert!(file.contains("The new procedure."), "{file}");
+
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/skills")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let entry = listed
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .find(|skill| skill["name"] == "persian")
+        .expect("the skill is listed");
+    let drawn = entry["description"].as_str().expect("a description");
+    assert!(
+        drawn.contains("Answer in") && !drawn.contains('\u{200c}'),
+        "{entry}"
+    );
+}
+
 /// The name reaches the filesystem, so it needs the same character-class guard the tools apply.
 /// A traversal must be refused before any path join, not sanitized after one.
 #[test]

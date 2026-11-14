@@ -294,6 +294,18 @@ async fn await_lock(
 /// seconds establishing. The two numbers being equal means a slow connect can consume the whole
 /// refresh budget, which is the correct precedence: the total is what bounds the user's wait.
 pub(crate) const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a subscription's account read (usage, profile, role, statistics) may take, from
+/// connecting to the end of its reply, before it is abandoned: the bound a refresh has, for the
+/// same kind of small request to a well-known endpoint.
+///
+/// No stop reaches one: it answers a command, not a turn, and the screen's `/usage` and an editor
+/// await it, so an endpoint that accepts the connection and then goes quiet would otherwise hold
+/// the command for as long as the process lives.
+///
+/// It cannot usefully go below `CONNECT_TIMEOUT`, for the reason [`REFRESH_TIMEOUT`] gives:
+/// reqwest's per-request `timeout` runs from the start of connecting, so a value under 30 seconds
+/// would abandon a connection the client is still willing to spend 30 seconds establishing.
+pub(crate) const ACCOUNT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Everything an OAuth refresh-token exchange needs, named rather than positional.
 ///
 /// A struct because the alternative is six parameters of which five are `&str`, where transposing
@@ -960,6 +972,121 @@ pub(crate) trait LoginPrompt: Send + Sync {
     /// A pasted line that did not carry what the login needs, with why, so the person can paste
     /// again.
     fn paste_refused(&self, reason: &str);
+}
+
+/// An endpoint that stops answering, for the tests of every request [`ACCOUNT_READ_TIMEOUT`]
+/// bounds.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A local endpoint that answers its first requests, then accepts one more and never answers
+    /// it, which is what a proxy that takes the connection and goes quiet looks like.
+    pub(crate) struct SilentEndpoint {
+        /// The endpoint's origin, `http://127.0.0.1:<port>`.
+        pub(crate) base_url: String,
+        unanswered: tokio::sync::oneshot::Receiver<()>,
+        peer: tokio::task::JoinHandle<()>,
+    }
+
+    impl SilentEndpoint {
+        /// An endpoint that answers one request with each of `answers`, a JSON body under a 200,
+        /// in the order the requests arrive, and holds the next one open in silence. An answered
+        /// request is one without a body.
+        pub(crate) async fn after(answers: &[&str]) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let base_url = format!("http://{}", listener.local_addr().expect("address"));
+            let answers: Arc<Vec<String>> = Arc::new(
+                answers
+                    .iter()
+                    .map(|body| {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
+                             {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                    })
+                    .collect(),
+            );
+            let (reached, unanswered) = tokio::sync::oneshot::channel();
+            let reached = Arc::new(Mutex::new(Some(reached)));
+            let seen = Arc::new(AtomicUsize::new(0));
+            let peer = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.expect("accept");
+                    tokio::spawn({
+                        let answers = answers.clone();
+                        let reached = reached.clone();
+                        let seen = seen.clone();
+                        async move {
+                            loop {
+                                let mut head = Vec::new();
+                                let mut chunk = [0u8; 1024];
+                                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    match socket.read(&mut chunk).await {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(read) => head.extend_from_slice(&chunk[..read]),
+                                    }
+                                }
+                                match answers.get(seen.fetch_add(1, Ordering::SeqCst)) {
+                                    Some(answer) => {
+                                        socket
+                                            .write_all(answer.as_bytes())
+                                            .await
+                                            .expect("answer the request");
+                                    }
+                                    None => {
+                                        if let Some(reached) = reached.lock().expect("lock").take()
+                                        {
+                                            reached.send(()).expect("the test is waiting");
+                                        }
+                                        std::future::pending::<()>().await;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                base_url,
+                unanswered,
+                peer,
+            }
+        }
+
+        /// What `call` comes to once its request sits unanswered.
+        ///
+        /// The clock is paused only then, so it runs to the next timer at once: a call that bounds
+        /// its request ends on that bound, and one that does not is still waiting when the hour
+        /// here runs out. Paused any earlier, the clock would run while the connection is still
+        /// being made and end the call on its connect timeout, whether it bounds the request or
+        /// not.
+        pub(crate) async fn outcome_of<T>(self, call: impl Future<Output = T>) -> T {
+            let Self {
+                unanswered, peer, ..
+            } = self;
+            tokio::pin!(call);
+            tokio::select! {
+                biased;
+                reached = unanswered => reached.expect("the endpoint is still up"),
+                _ = &mut call => panic!("the call ended before the endpoint went silent"),
+            }
+            tokio::time::pause();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(60 * 60), call)
+                .await
+                .expect("a request nobody answers must end on its own timeout");
+            peer.abort();
+            outcome
+        }
+    }
 }
 
 #[cfg(test)]

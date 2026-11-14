@@ -1223,6 +1223,7 @@ impl Agent {
             previous_request: Some(Arc::clone(&self.previous_request)),
             previous_message: Some(Arc::clone(&self.previous_message)),
             session_id: self.cells.session_id.get(),
+            root_session_id: self.root_session_id(),
             turn_origin: (!worker).then_some(origin),
             turn_position,
             main_thread: self.main_thread(),
@@ -9044,6 +9045,11 @@ mod tests {
             Some(created),
             "the first request must name the session the turn created"
         );
+        assert_eq!(
+            requests[0].root_session_id,
+            Some(created),
+            "and as the conversation it belongs to"
+        );
     }
 
     /// An overflow the agent cannot compact away has to surface once, not loop.
@@ -10506,6 +10512,7 @@ mod tests {
         agent.role = crate::agent::AgentRole::Worker(crate::agent::WorkerLineage {
             prompt_id: None,
             parent_agent_id: None,
+            root_session_id: None,
         });
         let mut messages = Conversation::new();
         ask(&agent, &mut messages, "first", Vec::new())

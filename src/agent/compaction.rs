@@ -1096,6 +1096,7 @@ impl Agent {
             previous_request: copy_of(&self.previous_request),
             previous_message: copy_of(&self.previous_message),
             session_id: self.cells.session_id.get(),
+            root_session_id: self.root_session_id(),
             compaction: Some(crate::provider::CompactionKind::from(request.trigger)),
             tools_used: self.session_stats.tools_used(),
             ..Default::default()
@@ -4115,6 +4116,23 @@ mod tests {
             Some("msg_01last"),
             "the conversation's message slot is untouched"
         );
+    }
+
+    /// A compaction's requests name the session of their conversation, as its turns' do, so the
+    /// Claude subscription sees them as part of that session.
+    #[tokio::test]
+    async fn a_compaction_s_requests_name_the_session_of_their_conversation() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![]));
+        let (agent, store) = agent_with_checkpoint(provider, true).await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session);
+
+        let attribution =
+            agent.compaction_attribution(&CompactRequest::new(CompactionTrigger::Manual));
+        assert_eq!(attribution.root_session_id, Some(session));
     }
 
     /// `context_replace` knows more than the caller did, because it ran after reading the

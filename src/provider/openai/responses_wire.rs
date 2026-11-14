@@ -1602,9 +1602,11 @@ pub(super) fn process_event(
                 .get("response")
                 .and_then(|response| response.get("error"))
                 .unwrap_or(&serde_json::Value::Null);
+            // The message carries the error cut to a bound, so the log keeps it whole.
+            tracing::debug!("Responses response.failed error: {error_object}");
             return Err(crate::error::provider_stream_error_object(
                 error_object,
-                "response.failed event",
+                "the response failed",
             ));
         }
 
@@ -1614,8 +1616,8 @@ pub(super) fn process_event(
         "error" => {
             state.finished = true;
             // The frame's fields sit at its top level on the public endpoint and under `error` on
-            // the ChatGPT backend; the fallback label says nothing about the cause, so the frame
-            // itself goes to the log.
+            // the ChatGPT backend; the message carries them cut to a bound, so the frame itself
+            // goes to the log.
             tracing::debug!("Responses error frame: {data}");
             let fields = data
                 .get("error")
@@ -1623,7 +1625,7 @@ pub(super) fn process_event(
                 .unwrap_or(data);
             return Err(crate::error::provider_stream_error_object(
                 fields,
-                "error event",
+                "the endpoint reported an error in the stream",
             ));
         }
 
@@ -4591,6 +4593,28 @@ mod tests {
         );
     }
 
+    /// A failed response's error past the bound is cut in the message, and goes to the log whole,
+    /// as the cut says.
+    #[test]
+    fn a_failed_response_s_error_goes_to_the_log_whole() {
+        let logs = crate::streams::capture::capture_logs(tracing::Level::DEBUG);
+        let cause = "c".repeat(crate::error::RELAYED_BODY_BYTES);
+        let result = process_event(
+            "response.failed",
+            &serde_json::json!({"response": {"error": {"message": cause}}}),
+            &mut SseState::default(),
+        );
+        assert!(
+            matches!(&result, Err(MekaError::Provider(message))
+                if message.ends_with(crate::error::TRUNCATION_MARKER)),
+            "{result:?}"
+        );
+        assert!(
+            logs.logged().contains(&cause),
+            "the log holds what the message cut"
+        );
+    }
+
     #[test]
     fn process_event_failed_with_server_error_code_is_retryable() {
         let mut state = SseState::default();
@@ -4616,7 +4640,7 @@ mod tests {
         );
         assert!(state.finished);
         assert!(
-            matches!(flat, Err(MekaError::Provider(ref message)) if message == "flat cause"),
+            matches!(flat, Err(MekaError::Provider(ref message)) if message.contains("flat cause")),
             "{flat:?}"
         );
         let mut state = SseState::default();
@@ -4630,7 +4654,7 @@ mod tests {
             &mut state,
         );
         assert!(
-            matches!(nested, Err(MekaError::RetryableProvider { ref message, .. }) if message.starts_with("Our servers")),
+            matches!(nested, Err(MekaError::RetryableProvider { ref message, .. }) if message.contains("Our servers")),
             "{nested:?}"
         );
     }

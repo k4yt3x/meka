@@ -100,13 +100,15 @@ your provider plan, not to the harness. What these bound is *silence*. A model t
 thinking is still sending, so a stream that goes quiet for five minutes has died, and waiting on it
 forever is not patience.
 
-A whole reply (`--no-stream`, and the summary a compaction asks for) is silent until it is finished,
+A whole reply (`--no-stream` on `openai-chat-completions`) is silent until it is finished,
 so it gets no clock at all: a reply may take as long as it takes. A connection whose peer has gone
 is found by TCP and HTTP/2 keepalives instead, which a busy server answers and a vanished one does
 not, so a dropped route still surfaces as an error within a minute or two. A peer that is up and
 never answers is not found this way: such a request waits until it is canceled, which is the trade
 a `base_url` behind a gateway with no timeout of its own makes. A cancel drops a pending reply at
-once, in either mode.
+once, in either mode. An account read (`/usage`, `meka account usage`, `whoami`, `stats`) is not a
+reply, and its bound is on the whole read: it is abandoned 30 seconds after it starts unless its
+whole answer has arrived.
 
 ## `default_profile`
 
@@ -341,8 +343,9 @@ cap states it here. Redaction removes tool-result images, oldest first; an image
 newest message is never removed, and a body that still does not fit is refused so the turn can
 degrade its own attachments instead. `openai-chat-completions` never sends tool-result images (that
 API's tool messages are text), so there the ceiling only refuses. The Anthropic backends also send
-at most 100 images in one request, the Messages API's own limit, redacting the oldest past it the
-same way.
+at most 100 images in one request, the Messages API's limit for a model with a 200k-token context
+window: a request past it has its oldest images redacted the same way, down to 80, so the rounds
+that follow do not each redact one more.
 
 ```toml
 [profiles.local]
@@ -1565,7 +1568,7 @@ wheel_rows = 3
 Whether the provider is asked to stream its reply or to return it whole. On the screen a streamed
 answer is drawn as it arrives and a whole one lands when the turn ends; a one-shot run prints its
 answer when the turn ends either way. The `--no-stream` flag turns streaming off for one run; this
-key is the standing preference, and it applies to sub-agents as well.
+key is the standing preference, and it applies to sub-agents and to compaction as well.
 
 Default: `true`
 

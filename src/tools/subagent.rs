@@ -43,6 +43,9 @@ pub(crate) struct ToolBuilderParams {
     /// running worker; the roots are shared, because nothing mutates them after construction. A
     /// worker whose spawn stated a scope takes neither: its directory and roots are its own.
     pub(crate) cells: crate::session::SessionCells,
+    /// The session at the root of the family: the root agent's own id, handed down unchanged, so
+    /// a worker at any depth names the conversation it belongs to.
+    pub(crate) root_session: crate::session::SharedSessionId,
     /// How much of the memory store the agent doing the spawning holds, which is the ceiling on
     /// what it can grant. `Write` for the root agent; for a worker, whatever its own spawn call
     /// granted. A grant is clamped against this, so authority only ever narrows going down the
@@ -2301,6 +2304,7 @@ async fn build_subagent(
                 },
                 ..sub_cells.clone()
             },
+            root_session: params.root_session.clone(),
             // The worker's own granted level, not its parent's. `params.memory_access` is what the
             // spawning agent holds, so letting the spread supply it would let a worker grant its
             // children up to its parent's level rather than its own, reaching through a child
@@ -2364,6 +2368,7 @@ async fn build_subagent(
         crate::agent::WorkerLineage {
             prompt_id: call.prompt_id,
             parent_agent_id,
+            root_session_id: params.root_session.get(),
         },
     ))
 }
@@ -3354,6 +3359,7 @@ mod tests {
         cells.session_id = parent_session;
         ToolBuilderParams {
             materials: crate::session::SessionMaterials::for_test(store),
+            root_session: cells.session_id.clone(),
             cells,
             // A root agent: holds the whole store, and has instructions it could pass on.
             memory_access: MemoryAccess::Write,
@@ -7946,6 +7952,66 @@ mod tests {
         assert_ne!(
             Some(identity.agent_id.as_str()),
             identity.parent_agent_id.as_deref()
+        );
+    }
+
+    /// A worker's requests name the conversation they belong to, which is the session at the root
+    /// of its family at any depth: the root's, not the worker's own, and not its spawner's when
+    /// the spawner is a worker itself.
+    #[tokio::test]
+    async fn a_workers_requests_name_the_session_at_the_root_of_its_family() {
+        use crate::provider::mock::{MockEvent, MockStopReason};
+
+        let store = store_for_test().await;
+        let root = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("root");
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(root)),
+        );
+        // Streamed, so the mock records what each request named.
+        params.parent_options.streaming = true;
+        // The worker spawns a worker of its own, which answers, and then answers itself.
+        let provider = mock(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "spawn-1".to_string(),
+                    name: "agent_spawn".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({ "prompt": "look closer", "permission": "read" }),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("looked"),
+            text_round("spawned"),
+        ]);
+        let spawn = AgentSpawnTool {
+            remaining_depth: 2,
+            ..spawn_tool_for(params, provider.clone())
+        };
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "permission": "read" }),
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        assert!(!output.is_error, "{}", output.text_content());
+
+        let named: Vec<_> = provider
+            .streams()
+            .iter()
+            .map(|request| request.root_session_id)
+            .collect();
+        assert_eq!(
+            named,
+            vec![Some(root); 3],
+            "the worker's two requests and its own worker's one"
         );
     }
 

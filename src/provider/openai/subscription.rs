@@ -277,9 +277,9 @@ impl ChatGptSubscriptionProvider {
     /// Not `apply_headers`: that sets `Accept: text/event-stream` for the SSE responses call, and
     /// these endpoints return plain JSON.
     async fn fetch_json_endpoint(&self, url: String, what: &str) -> Result<String> {
-        // A token with no signal source: these calls answer a command, not a turn, and the
-        // process that asked ends with the command. Held for the whole reply so the body is read
-        // through the same door as every other.
+        // A token nothing fires: these calls answer a command, not a turn, so no stop reaches
+        // them and the request's own timeout is their bound. Held for the whole reply so the body
+        // is read through the same door as every other.
         let cancellation = tokio_util::sync::CancellationToken::new();
         let response = crate::oauth::send_with_one_refresh(
             self,
@@ -296,6 +296,7 @@ impl ChatGptSubscriptionProvider {
                 let mut request = self
                     .client
                     .get(&url)
+                    .timeout(crate::oauth::ACCOUNT_READ_TIMEOUT)
                     .header("Authorization", crate::text::bearer(&access_token))
                     .header("originator", ORIGINATOR)
                     .header("User-Agent", CODEX_USER_AGENT.as_str())
@@ -1064,6 +1065,37 @@ mod tests {
                 "the turn request must carry `{header}`; head:\n{head}"
             );
         }
+    }
+
+    /// An account read that an endpoint accepts and never answers ends on its own timeout, as the
+    /// Claude sibling's does: no stop reaches one, and a screen or an editor awaits it.
+    #[tokio::test]
+    async fn an_account_read_nobody_answers_ends_on_its_own_timeout() {
+        let endpoint = crate::oauth::testing::SilentEndpoint::after(&[]).await;
+        let provider = ChatGptSubscriptionProvider::from_settings(
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ChatGptSubscription,
+                credential_for_test(),
+                "gpt-5".to_string(),
+            )
+            .base_url(Some(format!("{}/v1", endpoint.base_url)))
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .effort(Some("high".to_string()))
+            .max_output_tokens(None),
+        )
+        .expect("provider");
+
+        let error = endpoint
+            .outcome_of(provider.fetch_usage())
+            .await
+            .expect_err("an unanswered read is a failure");
+        assert!(
+            matches!(error, MekaError::RetryableProvider { .. }),
+            "{error}"
+        );
     }
 
     /// The stats probe classifies a dead endpoint the same way the turn path does.

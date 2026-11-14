@@ -213,7 +213,8 @@ impl Tool for MemoryWriteTool {
                         .map_err(|message| tool_error("memory_write", message))?,
                 ),
             };
-        let source = match optional_str(&input, "source", "memory_write")? {
+        // A blank is a value here, as it is in `body` and `expires`: `""` clears the source.
+        let source = match optional_str_allowing_empty(&input, "source", "memory_write")? {
             None => None,
             Some(text) => Some(
                 memory::normalize_source(text)
@@ -2188,6 +2189,48 @@ mod tests {
         // The freshness caveat must ride along; a recalled memory asserted as live state is the
         // failure this guards against.
         assert!(text.contains("not live state"), "{text}");
+    }
+
+    /// `source: ""` clears the source, as the schema says and as the CLI and HTTP doors do; an
+    /// omitted `source` keeps it.
+    #[tokio::test]
+    async fn an_empty_source_clears_it_and_an_omitted_one_keeps_it() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+            project: Default::default(),
+        };
+        let call = |input: serde_json::Value| {
+            write.execute(
+                input,
+                crate::tools::ToolContext::for_test(CancellationToken::new()),
+            )
+        };
+        let stored_source = || async {
+            memories
+                .get("freeze", &MemoryView::Global)
+                .await
+                .expect("read")
+                .expect("the memory exists")
+                .source
+        };
+        call(serde_json::json!({
+            "name": "freeze",
+            "description": "No deploys this week",
+            "source": "ops, in chat"
+        }))
+        .await
+        .expect("create");
+
+        call(serde_json::json!({"name": "freeze", "priority": 3}))
+            .await
+            .expect("an update that omits the source");
+        assert_eq!(stored_source().await, "ops, in chat");
+
+        call(serde_json::json!({"name": "freeze", "source": ""}))
+            .await
+            .expect("an update that clears the source");
+        assert_eq!(stored_source().await, "");
     }
 
     /// A priority must land on the same value whichever door it came through: `as_u64` would

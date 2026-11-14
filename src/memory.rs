@@ -31,11 +31,11 @@ use std::{
     time::SystemTime,
 };
 
+use crate::entry::validate_entry_name;
 // Re-exported rather than referenced through `crate::entry` at each use site: priority is part
 // of the memory store's public vocabulary (`meka memory add --priority`, the `memory_write`
 // schema), and its default lives there only so `skills` can share the same scale.
 pub(crate) use crate::entry::{DEFAULT_PRIORITY, normalize_description};
-use crate::entry::{validate_entry_name, yaml_scalar};
 
 /// A single durable note, as one row of the `memories` table.
 ///
@@ -450,10 +450,9 @@ pub(crate) const MAX_TAG_CHARS: usize = 32;
 
 /// Validate one tag: lowercase alphanumerics and hyphens, starting with an alphanumeric.
 ///
-/// Strict deliberately, and load-bearing rather than cosmetic in two places. Tags are stored
-/// space-joined in one column, so a tag containing a space would come back as two; and
-/// [`render_memory`] emits the list as a YAML flow sequence through [`yaml_scalar`], which is safe
-/// only for values already normalized to one line.
+/// Strict deliberately, and load-bearing rather than cosmetic: tags are stored space-joined in one
+/// column, so a tag containing a space would come back as two, and the tag histogram in the
+/// `[Memory]` index renders each one into text the model reads.
 pub(crate) fn validate_tag(tag: &str) -> Result<(), String> {
     if tag.is_empty() {
         return Err("a tag cannot be empty".to_string());
@@ -651,71 +650,82 @@ pub(crate) struct MemoryFrontmatter {
 /// [`DEFAULT_PRIORITY`], `load` only when it is not the default, `created` only when known,
 /// `verified` only when it differs from `created`, `expires`, `source`, `references` and `tags`
 /// only when set, so the common case stays a two-line header. The same text is what a write or a
-/// delete draws as a diff, so each field is its own line and a change to one shows as that line.
+/// delete draws as a diff, so each field, and each entry of a list, is its own line and a change to
+/// one shows as that line.
 pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> String {
-    let mut out = String::new();
-    out.push_str("---\n");
-    // Only the characters YAML genuinely cannot carry are dropped. A C0 or C1 control inside a
-    // double-quoted scalar is outside YAML's `c-printable` production, so an export holding one is
-    // a file no parser will read. `sanitize_stored_description` would go further than that
-    // argument: it also strips the whole `Cf` category, so a Persian description would come back
-    // a different word after a backup, a read that sanitizes written to a persistent store.
-    out.push_str(&format!(
-        "description: {}\n",
-        yaml_scalar(&normalize_description(&yaml_printable(
-            &frontmatter.description
-        )))
-    ));
+    use yaml_serde::{Mapping, Value};
+
+    let mut front = Mapping::new();
+    // As stored, on the one line every write door makes of it: the serializer escapes what YAML
+    // cannot hold raw, a control character among it, so nothing is dropped here. Sanitizing would
+    // be a read that rewrites a persistent store: a Persian description would come back a
+    // different word after a backup.
+    front.insert(
+        "description".into(),
+        normalize_description(&frontmatter.description).into(),
+    );
     if let Some(project) = &frontmatter.project {
-        out.push_str(&format!("project: {}\n", yaml_scalar(project)));
+        front.insert("project".into(), project.as_str().into());
     }
     if frontmatter.priority != DEFAULT_PRIORITY {
-        out.push_str(&format!("priority: {}\n", frontmatter.priority));
+        front.insert("priority".into(), u64::from(frontmatter.priority).into());
     }
     if frontmatter.load != Load::default() {
-        out.push_str(&format!("load: {}\n", frontmatter.load));
+        front.insert("load".into(), frontmatter.load.name().into());
     }
-    if let Some(created) = &frontmatter.created {
-        // Quoted by `yaml_scalar` on the strength of the colons in the time, which is what keeps
-        // the offset from parsing as a nested mapping.
-        out.push_str(&format!("created: {}\n", yaml_scalar(created)));
-    }
-    if let Some(verified) = &frontmatter.verified {
-        out.push_str(&format!("verified: {}\n", yaml_scalar(verified)));
-    }
-    if let Some(expires) = &frontmatter.expires {
-        out.push_str(&format!("expires: {}\n", yaml_scalar(expires)));
+    for (key, stamp) in [
+        ("created", &frontmatter.created),
+        ("verified", &frontmatter.verified),
+        ("expires", &frontmatter.expires),
+    ] {
+        if let Some(stamp) = stamp {
+            front.insert(key.into(), stamp.as_str().into());
+        }
     }
     if !frontmatter.source.is_empty() {
-        out.push_str(&format!(
-            "source: {}\n",
-            yaml_scalar(&normalize_description(&yaml_printable(&frontmatter.source)))
-        ));
+        front.insert(
+            "source".into(),
+            normalize_description(&frontmatter.source).into(),
+        );
     }
     if frontmatter.read_count > 0 {
-        out.push_str(&format!("read_count: {}\n", frontmatter.read_count));
+        front.insert(
+            "read_count".into(),
+            u64::from(frontmatter.read_count).into(),
+        );
     }
     if !frontmatter.references.is_empty() {
-        // Quoted one by one like the tags below: a reference has passed `validate_reference`,
-        // so it is one line, but a URL holds colons and a path may open with a YAML indicator.
-        let quoted: Vec<String> = frontmatter
-            .references
-            .iter()
-            .map(|reference| yaml_scalar(&yaml_printable(reference)))
-            .collect();
-        out.push_str(&format!("references: [{}]\n", quoted.join(", ")));
+        front.insert(
+            "references".into(),
+            Value::Sequence(
+                frontmatter
+                    .references
+                    .iter()
+                    .map(|reference| reference.as_str().into())
+                    .collect(),
+            ),
+        );
     }
     if !frontmatter.tags.is_empty() {
-        // Each element through `yaml_scalar` rather than a bare flow sequence. Every tag reaching
-        // here has passed `validate_tag`, so the bare form would be safe today; quoting costs
-        // nothing and means a later loosening of that character class cannot quietly produce a file
-        // a reader takes as something else.
-        let quoted: Vec<String> = frontmatter
-            .tags
-            .iter()
-            .map(|tag| yaml_scalar(tag))
-            .collect();
-        out.push_str(&format!("tags: [{}]\n", quoted.join(", ")));
+        front.insert(
+            "tags".into(),
+            Value::Sequence(
+                frontmatter
+                    .tags
+                    .iter()
+                    .map(|tag| tag.as_str().into())
+                    .collect(),
+            ),
+        );
+    }
+
+    let mut out = String::from("---\n");
+    // A map of strings, integers and lists of strings always serializes, so the failure arm is
+    // not expected to run; it is logged rather than dropped because the file it leaves has no
+    // header, which `meka memory import` refuses.
+    match yaml_serde::to_string(&Value::Mapping(front)) {
+        Ok(header) => out.push_str(&header),
+        Err(error) => tracing::error!("failed to serialize a memory's frontmatter: {error}"),
     }
     // The body verbatim between one separator newline and one terminator newline, both added
     // unconditionally. Trimming leading newlines and appending a terminator only when one is
@@ -728,22 +738,6 @@ pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> Stri
     out
 }
 
-/// Drop the characters YAML cannot represent in a scalar, and nothing else.
-///
-/// Deliberately narrower than [`render_for_model`]: this is the *export* path, so the only
-/// justification for touching the text is that the file would otherwise be unparseable. Format
-/// characters (ZWJ, ZWNJ, bidi marks) are `c-printable` and stay.
-fn yaml_printable(text: &str) -> String {
-    text.chars()
-        .filter(|character| {
-            let code = *character as u32;
-            *character == '\n'
-                || *character == '\t'
-                || (code >= 0x20 && code != 0x7F && !(0x80..=0x9F).contains(&code))
-        })
-        .collect()
-}
-
 /// Whether a description will still say something by the time the model reads it.
 ///
 /// `trim().is_empty()` is a question about whitespace. Format characters (zero-width spaces,
@@ -753,26 +747,11 @@ fn yaml_printable(text: &str) -> String {
 /// [`render_description_for_model`] strips exactly that class at the render boundary, so asking
 /// it is asking the question the store actually has.
 ///
-/// Distinct from [`description_survives_export`], which asks whether YAML can carry the text. A
-/// description can fail either check independently.
+/// Every write door asks it, and so do both ends of an export: [`memory_from_export`] refuses a
+/// file whose description fails it, so `meka memory export` refuses a stored one before it writes
+/// anything, rather than write a snapshot that would not read back.
 pub(crate) fn description_says_something(description: &str) -> bool {
     !render_description_for_model(description).trim().is_empty()
-}
-
-/// Whether a description would still say something once written to an export file.
-///
-/// [`render_memory`] drops what YAML cannot carry, and a description made only of such characters
-/// becomes `description: ""`, which reads back as no description at all, losing the memory through
-/// the one path that is supposed to preserve it. `meka memory export` asks this before it writes
-/// anything, and refuses the whole run rather than write a file that would come back empty.
-///
-/// Distinct from [`description_says_something`], which asks whether the *model* would see anything.
-/// A description can fail either check independently: YAML carries a zero-width space fine, and the
-/// render boundary strips it.
-pub(crate) fn description_survives_export(description: &str) -> bool {
-    !normalize_description(&yaml_printable(description))
-        .trim()
-        .is_empty()
 }
 
 /// Render one [`Memory`] as an export file, body included.
@@ -1036,7 +1015,7 @@ mod tests {
         assert_eq!(parse_priority(Some(99), "n"), crate::entry::MAX_PRIORITY);
     }
 
-    /// A tag is stored space-joined in one column and rendered into a YAML flow sequence, so
+    /// A tag is stored space-joined in one column and rendered into the index the model reads, so
     /// anything either of those would read as structure has to be refused at the door.
     #[test]
     fn tag_validation_refuses_anything_yaml_would_interpret() {
@@ -1182,6 +1161,180 @@ mod tests {
         assert!(!rendered.contains("tags:"), "{rendered}");
         assert!(!rendered.contains("read_count:"), "{rendered}");
         assert!(rendered.contains("created:"), "{rendered}");
+    }
+
+    /// One exported memory read back through the import's own path.
+    fn reimported(memory: &Memory) -> ImportedMemory {
+        let file = export_memory(memory);
+        let (frontmatter, body) = split_memory_file(&file).expect("framed as written");
+        let frontmatter: yaml_serde::Value = yaml_serde::from_str(frontmatter)
+            .unwrap_or_else(|error| panic!("the frontmatter is not YAML ({error}):\n{file}"));
+        memory_from_export(&memory.name, frontmatter, body)
+            .unwrap_or_else(|reason| panic!("the export does not import ({reason}):\n{file}"))
+    }
+
+    /// A memory holding nothing but the fields a test sets.
+    fn plain_memory() -> Memory {
+        Memory {
+            name: "note".to_string(),
+            project: String::new(),
+            description: "plain".to_string(),
+            priority: DEFAULT_PRIORITY,
+            load: Load::default(),
+            references: Vec::new(),
+            source: String::new(),
+            verified_at: SystemTime::UNIX_EPOCH,
+            expires_at: None,
+            tags: Vec::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            read_count: 0,
+            body: Some(String::new()),
+        }
+    }
+
+    /// Every header field comes back as the string it was stored as, whatever YAML would make of
+    /// the text unquoted: a number in any base, a keyword, an indicator, or a flow-sequence
+    /// delimiter inside a list element.
+    #[test]
+    fn an_export_reads_back_every_field_yaml_would_read_as_something_else() {
+        for literal in [
+            "Smith, 2020",
+            "app/[slug]/page.tsx",
+            "{braces}",
+            "[bracketed]",
+            "a, b",
+            "0x1f",
+            "0o17",
+            "0b1",
+            ".inf",
+            "-.INF",
+            ".nan",
+            "1e3",
+            "1_000",
+            "+1",
+            "007",
+            "2020",
+            "1.5",
+            "2020-01-01",
+            "null",
+            "~",
+            "true",
+            "yes",
+            "off",
+            "- item",
+            "key: value",
+            "trailing:",
+            "x # comment",
+            "# hash",
+            "? question",
+            "| pipe",
+            "> fold",
+            "&anchor",
+            "*alias",
+            "!tag",
+            "!!str x",
+            "%directive",
+            "@at",
+            "`tick",
+            "'single'",
+            "\"double\"",
+            "say \"hi\": now",
+            "back\\slash",
+            "<<",
+            "=",
+            "caf\u{e9} \u{200d} joined",
+        ] {
+            let memory = Memory {
+                description: literal.to_string(),
+                source: literal.to_string(),
+                references: vec![literal.to_string(), "second".to_string()],
+                ..plain_memory()
+            };
+            let imported = reimported(&memory);
+            assert_eq!(imported.description, literal, "description");
+            assert_eq!(imported.source, literal, "source");
+            assert_eq!(
+                imported.references,
+                [literal.to_string(), "second".to_string()],
+                "references"
+            );
+        }
+
+        // A control character is not whitespace, so a description or a source may hold one; a
+        // reference may not.
+        for literal in [
+            "bell\u{7}rung",
+            "red \u{1b}[31m",
+            "del\u{7f}",
+            "csi \u{9b}2J",
+        ] {
+            let memory = Memory {
+                description: literal.to_string(),
+                source: literal.to_string(),
+                ..plain_memory()
+            };
+            let imported = reimported(&memory);
+            assert_eq!(imported.description, literal, "description");
+            assert_eq!(imported.source, literal, "source");
+        }
+
+        let tags: Vec<String> = [
+            "007", "0b1", "0o17", "0x1f", "1e3", "2020", "false", "no", "null", "on",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let memory = Memory {
+            tags: tags.clone(),
+            ..plain_memory()
+        };
+        assert_eq!(reimported(&memory).tags, tags);
+    }
+
+    /// A file whose lists are flow sequences and whose scalars are quoted by hand imports as one
+    /// in the serializer's style does: the reader is YAML, so the writer's style is not part of
+    /// the format.
+    #[test]
+    fn an_export_in_the_flow_sequence_form_still_imports() {
+        let file = "---\n\
+                    description: \"Where deploys run: the short version\"\n\
+                    project: ops\n\
+                    priority: 2\n\
+                    load: inline\n\
+                    created: \"2026-01-02T03:04:05.123456789+00:00\"\n\
+                    verified: \"2026-03-04T05:06:07+00:00\"\n\
+                    expires: \"2027-01-01T00:00:00+00:00\"\n\
+                    source: \"k4yt3x, in chat: on the 3rd\"\n\
+                    read_count: 4\n\
+                    references: [runbook, \"https://example.com/x\", \"[bracketed]\"]\n\
+                    tags: [infra, \"007\"]\n\
+                    ---\n\
+                    \n\
+                    Body text.\n\
+                    \n";
+        let (frontmatter, body) = split_memory_file(file).expect("framed as written");
+        let frontmatter: yaml_serde::Value = yaml_serde::from_str(frontmatter).expect("yaml");
+        let imported = memory_from_export("deploy-host", frontmatter, body).expect("imports");
+        let stamp = |raw: &str| parse_stamp(raw).expect("a stamp");
+        assert_eq!(imported, ImportedMemory {
+            name: "deploy-host".to_string(),
+            project: "ops".to_string(),
+            description: "Where deploys run: the short version".to_string(),
+            priority: 2,
+            load: Load::Inline,
+            created_at: stamp("2026-01-02T03:04:05.123456789+00:00"),
+            verified_at: stamp("2026-03-04T05:06:07+00:00"),
+            expires_at: Some(stamp("2027-01-01T00:00:00+00:00")),
+            source: "k4yt3x, in chat: on the 3rd".to_string(),
+            references: vec![
+                "runbook".to_string(),
+                "https://example.com/x".to_string(),
+                "[bracketed]".to_string(),
+            ],
+            tags: vec!["007".to_string(), "infra".to_string()],
+            read_count: 4,
+            body: "Body text.\n".to_string(),
+        });
     }
 
     /// One spelling per policy, and the default is the listed tier.

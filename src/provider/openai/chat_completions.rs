@@ -360,7 +360,7 @@ impl OpenAiChatCompletionsProvider {
         let choice = response
             .get("choices")
             .and_then(|choices| choices.get(0))
-            .ok_or_else(|| MekaError::Provider("no choices in response".to_string()))?;
+            .ok_or_else(|| not_a_completion("no choices in response", &response.to_string()))?;
 
         let stated_stop = choice
             .get("finish_reason")
@@ -369,7 +369,7 @@ impl OpenAiChatCompletionsProvider {
 
         let assistant_message = choice
             .get("message")
-            .ok_or_else(|| MekaError::Provider("no 'message' in choice".to_string()))?;
+            .ok_or_else(|| not_a_completion("no 'message' in choice", &response.to_string()))?;
         let mut content_blocks = Vec::new();
 
         let reasoning = reasoning_of(assistant_message);
@@ -489,6 +489,18 @@ impl OpenAiChatCompletionsProvider {
     }
 }
 
+/// The failure of a whole reply that is not a completion: what is wrong with it, then the body the
+/// endpoint sent, cut as a relayed body is. The body is not read for an `error`: the spec defines
+/// none under a 200, and its reference client reads none there.
+fn not_a_completion(what: &str, body: &str) -> MekaError {
+    // The message carries the body cut to a bound, so the log keeps it whole.
+    tracing::debug!("Chat Completions reply that is not a completion: {body}");
+    MekaError::Provider(format!(
+        "{what}: {}",
+        crate::error::bounded_upstream_body(crate::error::render_error_body(body))
+    ))
+}
+
 // An API key has nothing to refresh; the impl exists so every send goes through the one site that
 // races a stop, `crate::oauth::send_with_one_refresh`.
 impl crate::oauth::RefreshesCredential for OpenAiChatCompletionsProvider {}
@@ -504,6 +516,16 @@ impl Provider for OpenAiChatCompletionsProvider {
         request: CompletionRequest<'_>,
         cancellation: CancellationToken,
     ) -> Result<crate::provider::Completion> {
+        // An endpoint may answer only a stream, so a session whose turns stream asks this way too.
+        if request.streaming {
+            let (event_sender, event_receiver) = mpsc::channel::<StreamEvent>(1024);
+            let (streamed, folded) = tokio::join!(
+                self.stream(request, event_sender, cancellation),
+                crate::provider::aggregate_stream(event_receiver),
+            );
+            streamed?;
+            return Ok(folded);
+        }
         let CompletionRequest {
             system_prompt,
             messages,
@@ -540,8 +562,10 @@ impl Provider for OpenAiChatCompletionsProvider {
         let response_text =
             crate::error::read_whole_reply(response, retry_after, &cancellation).await?;
 
-        let response_json: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|error| MekaError::Provider(format!("invalid JSON response: {error}")))?;
+        let response_json: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|error| {
+                not_a_completion(&format!("invalid JSON response ({error})"), &response_text)
+            })?;
 
         let (message, stop, usage) = self.parse_non_streaming_response(&response_json)?;
         Ok(crate::provider::Completion {
@@ -970,9 +994,10 @@ async fn handle_stream_chunk(
     //
     // `"error": null` is a field some servers emit on every chunk, and is no error.
     if let Some(error) = data.get("error").filter(|error| !error.is_null()) {
+        tracing::debug!("Chat Completions error frame: {data}");
         return ChunkOutcome::Fail(crate::error::provider_stream_error_object(
             error,
-            "the endpoint reported an error mid-stream",
+            "the endpoint reported an error in the stream",
         ));
     }
 
@@ -2072,6 +2097,183 @@ mod tests {
         };
         assert_eq!(parts, std::slice::from_ref(&unnamed));
         assert_eq!(id, "call_2");
+    }
+
+    /// A provider on a local endpoint that records the body of each request it accepts and answers
+    /// it with the raw HTTP response `answer` makes of that body.
+    async fn provider_on_endpoint(
+        answer: impl Fn(&serde_json::Value) -> String + Send + 'static,
+    ) -> (
+        OpenAiChatCompletionsProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tokio::spawn({
+            let bodies = std::sync::Arc::clone(&bodies);
+            async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let body_start = loop {
+                        let read = match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => read,
+                        };
+                        request.extend_from_slice(&chunk[..read]);
+                        let Some(head_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let length: usize = String::from_utf8_lossy(&request[..head_end])
+                            .split("\r\n")
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, value)| value.trim().parse().ok())
+                            .unwrap_or(0);
+                        if request.len() >= head_end + 4 + length {
+                            break head_end + 4;
+                        }
+                    };
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&request[body_start..]).expect("a JSON body");
+                    let response = answer(&body);
+                    crate::sync::lock(&bodies).push(body);
+                    if socket.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if socket.shutdown().await.is_err() {
+                        tracing::debug!("mock endpoint failed to shut its socket down cleanly");
+                    }
+                }
+            }
+        });
+        let provider = OpenAiChatCompletionsProvider::from_settings(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::OpenAiChatCompletions,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "gpt-4o".to_string(),
+            )
+            .base_url(Some(format!("http://127.0.0.1:{port}")))
+            .effort(None)
+            .max_output_tokens(None),
+        )
+        .expect("build test provider");
+        (provider, bodies)
+    }
+
+    /// A raw HTTP response of `status` with `body` as `content_type`, closing the connection.
+    fn http_response(status: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// `complete` asks for a stream and folds it when the request says the session streams, and
+    /// for a whole reply otherwise, so an endpoint that answers only a stream serves the one and
+    /// refuses the other.
+    #[tokio::test]
+    async fn complete_asks_for_a_stream_when_the_request_says_so() {
+        let (provider, bodies) = provider_on_endpoint(|body| {
+            if body["stream"] == true {
+                http_response(
+                    "200 OK",
+                    "text/event-stream",
+                    concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Streamed.\"}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    ),
+                )
+            } else {
+                http_response(
+                    "400 Bad Request",
+                    "application/json",
+                    r#"{"error":{"message":"only stream mode","type":"invalid_request_error"}}"#,
+                )
+            }
+        })
+        .await;
+        let messages = [Message::user("hello")];
+        let completion = provider
+            .complete(
+                crate::provider::CompletionRequest::new("", &messages, &[]).streaming(true),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("the stream is folded");
+        assert_eq!(completion.message.text_content(), "Streamed.");
+        assert_eq!(completion.stop.reason, StopReason::EndTurn);
+        let error = provider
+            .complete(
+                crate::provider::CompletionRequest::new("", &messages, &[]),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect_err("the endpoint refuses a whole reply");
+        assert!(matches!(error, MekaError::InvalidRequest(_)), "{error}");
+        let asked: Vec<serde_json::Value> = crate::sync::lock(&bodies)
+            .iter()
+            .map(|body| body["stream"].clone())
+            .collect();
+        assert_eq!(asked, [serde_json::json!(true), serde_json::json!(false)]);
+    }
+
+    /// A whole reply that is not a completion, an error object under a 200 or a page that is not
+    /// JSON, fails with what the endpoint sent, and not as a failure a retry would answer.
+    #[tokio::test]
+    async fn a_whole_reply_that_is_not_a_completion_fails_with_what_the_endpoint_sent() {
+        for (body, sent) in [
+            (
+                r#"{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"upstream busy"}}}"#,
+                r#""raw":"upstream busy""#,
+            ),
+            ("<html>Bad gateway</html>\n", "<html>Bad gateway</html>"),
+        ] {
+            let (provider, _) =
+                provider_on_endpoint(move |_| http_response("200 OK", "application/json", body))
+                    .await;
+            let error = provider
+                .complete(
+                    crate::provider::CompletionRequest::new("", &[Message::user("hello")], &[]),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .expect_err("not a completion");
+            assert!(
+                matches!(&error, MekaError::Provider(message) if message.contains(sent)),
+                "{error}"
+            );
+        }
+    }
+
+    /// A whole reply that is not a completion and runs past the bound is cut in the message, and
+    /// goes to the log whole, as the cut says.
+    #[test]
+    fn a_reply_that_is_not_a_completion_goes_to_the_log_whole() {
+        let logs = crate::streams::capture::capture_logs(tracing::Level::DEBUG);
+        let cause = "c".repeat(crate::error::RELAYED_BODY_BYTES);
+        let error = provider_for_test()
+            .parse_non_streaming_response(&serde_json::json!({"error": {"message": cause}}))
+            .expect_err("not a completion");
+        assert!(
+            matches!(&error, MekaError::Provider(message)
+                if message.ends_with(crate::error::TRUNCATION_MARKER)),
+            "{error:?}"
+        );
+        assert!(
+            logs.logged().contains(&cause),
+            "the log holds what the message cut"
+        );
     }
 
     /// A stream that breaks off still delivers what arrived before the break, its calls among it,
@@ -3178,6 +3380,31 @@ mod tests {
                 ChunkOutcome::Fail(MekaError::RetryableProvider { .. })
             ),
             "a server_error is the transient kind: {outcome:?}"
+        );
+    }
+
+    /// An error frame past the bound is cut in the message, and goes to the log whole, as the cut
+    /// says.
+    #[tokio::test]
+    async fn an_error_frame_goes_to_the_log_whole() {
+        let logs = crate::streams::capture::capture_logs(tracing::Level::DEBUG);
+        let cause = "c".repeat(crate::error::RELAYED_BODY_BYTES);
+        let (sender, _receiver) = mpsc::channel::<StreamEvent>(8);
+        let outcome = handle_stream_chunk(
+            &serde_json::json!({"error": {"message": "Provider returned error", "code": 400,
+                "metadata": {"raw": cause}}}),
+            &mut ChatCompletionsStream::default(),
+            &sender,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, ChunkOutcome::Fail(MekaError::Provider(message))
+                if message.ends_with(crate::error::TRUNCATION_MARKER)),
+            "{outcome:?}"
+        );
+        assert!(
+            logs.logged().contains(&cause),
+            "the log holds what the message cut"
         );
     }
 

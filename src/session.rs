@@ -544,7 +544,8 @@ pub(crate) struct AgentOptions {
     /// turns.
     pub(crate) one_shot: bool,
     /// When true, assistant responses stream token-by-token via `Provider::stream`; otherwise the
-    /// agent uses the blocking `Provider::complete`.
+    /// agent uses the blocking `Provider::complete`. A request outside a turn, a compaction's, is
+    /// asked the same way.
     pub(crate) streaming: bool,
     /// Whether `shell_execute` calls at `read` run inside the platform sandbox. Forced off when
     /// no sandbox backend is available.

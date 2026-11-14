@@ -162,8 +162,8 @@ const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// stream that carries nothing is bounded by [`STREAM_IDLE_TIMEOUT`] at the SSE layer, the one
 /// place silence means something; and a stop drops a pending request in
 /// `crate::oauth::send_with_one_refresh` and its body in `crate::error::read_whole_reply`, where
-/// every request a turn or an account call makes is sent and its whole reply read. A token
-/// exchange, a revocation and an MCP auth probe run their own bounded requests outside a turn.
+/// every request a turn or an account call makes is sent and its whole reply read. An account
+/// read, a token exchange, a revocation and an MCP auth probe bound their own requests.
 ///
 /// And no redirects: a 3xx comes back as the status it is, for [`succeeded`] to refuse with the
 /// location it named. reqwest strips `Authorization` on a hop to another host and leaves
@@ -353,6 +353,11 @@ pub(crate) struct Attribution {
     /// without it the endpoint spreads one conversation's requests across machines, and the prompt
     /// cache answers a fraction of them.
     pub(crate) session_id: Option<Uuid>,
+    /// The session of the conversation the request belongs to: the one above, or for a worker's
+    /// request the session at the root of its family. A Claude subscription request names it as
+    /// its session (`X-Claude-Code-Session-Id`, `metadata.user_id.session_id`), which Claude Code
+    /// keeps one of for a conversation and its sub-agents alike.
+    pub(crate) root_session_id: Option<Uuid>,
     /// Where the prompt this request answers came from (`cc_turn_origin`). A compaction has none.
     pub(crate) turn_origin: Option<TurnOrigin>,
     /// Where the turn stands in its conversation (`cc_prompt_index` and `cc_turn_index`). A
@@ -953,10 +958,9 @@ pub(crate) struct PartialReply {
 
 /// How a stream of [`StreamEvent`]s becomes the message it described.
 ///
-/// The one fold, for the agent (which also shows each event as it arrives) and for a `complete` on
-/// the Responses and Claude wires (the stream aggregated with nobody watching). Two copies can
-/// disagree on when a thinking block is kept, and a resumed transcript then differs from the live
-/// turn.
+/// The one fold, for the agent (which also shows each event as it arrives) and for a `complete`
+/// that asks for a stream (the stream aggregated with nobody watching). Two copies can disagree on
+/// when a thinking block is kept, and a resumed transcript then differs from the live turn.
 #[derive(Default)]
 pub(crate) struct MessageAccumulator {
     /// What arrived at each place, laid out by place; see [`StreamEvent::Place`].
@@ -1440,7 +1444,8 @@ impl PartsAt {
 }
 
 /// Fold a [`StreamEvent`] stream into the [`Completion`] a [`Provider::complete`] returns, with
-/// nobody watching: how a wire with one request shape answers a non-streaming call. A
+/// nobody watching: how a wire with one request shape answers a non-streaming call, and how
+/// `openai-chat-completions` answers one for a session that streams. A
 /// `StreamEvent::Error` is logged at debug, not returned: every producer sends it ahead of its own
 /// typed `Err`, which surfaces from the concurrently awaited `stream` and is said once there, as a
 /// warning by the retry or by the host.

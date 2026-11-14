@@ -9,8 +9,8 @@
 //! What they do not share is storage. Memories are rows, so [`crate::fs::lock_store`],
 //! [`crate::fs::reject_symlinked_path`] and [`check_case_collision`] are the skill store's alone:
 //! a `UNIQUE COLLATE NOCASE` column and a transaction do all three jobs on the database side.
-//! [`split_frontmatter`] and [`yaml_scalar`] serve skills, and `meka memory export`, which is the
-//! only place memory touches YAML at all.
+//! [`split_frontmatter`] serves skills and `meka memory import`, which reads the frontmatter an
+//! export wrote.
 
 /// Split a file into (frontmatter, body) if it starts with a `---` fence. Returns None when no
 /// valid frontmatter block is present.
@@ -60,54 +60,6 @@ pub(crate) fn split_frontmatter<'a>(content: &'a str) -> Option<(&'a str, &'a st
     None
 }
 
-/// YAML-quote a scalar when it contains characters that would otherwise require structural
-/// interpretation. Plain ASCII text without leading punctuation, colons, or hash marks passes
-/// through unquoted.
-///
-/// **Safe only for a value that has already been normalized to one line.** It escapes `\` and `"`
-/// and quotes on a fixed character list, which is not the same thing as knowing when YAML needs
-/// quoting; skills use a real serializer, because hand-rolled quoting loses content on a newline
-/// in a `license` and on a metadata *key* containing one.
-///
-/// Its remaining caller is `crate::memory::render_memory`, the export renderer, which passes four
-/// kinds of value and is safe for four separate reasons: a `description` or a `source` that has
-/// been through [`normalize_description`], a `created`, `verified` or `expires` that is RFC 3339
-/// rendered from a `SystemTime`, `tags` whose elements have all passed
-/// `crate::memory::validate_tag`, and `references` whose elements have all passed
-/// `crate::memory::validate_reference`, which refuses a control character and so a newline.
-/// (`priority` is a `u8`, `load` a fixed name, and neither reaches here.)
-///
-/// That list is the safety argument, so a *fifth* kind of value invalidates it. Anything free-form
-/// (anything that could arrive holding a newline) needs the serializer, not this.
-pub(crate) fn yaml_scalar(text: &str) -> String {
-    // The leading set is every YAML indicator character, `[`, `{`, `]`, `}` and `,` included:
-    // unquoted, a description beginning `[` produces a file with an unterminated flow sequence,
-    // which `meka memory export` reports as success and a read back then refuses, so a backup
-    // silently loses a memory. `null`, `true`, `~` and anything numeric are quoted for the
-    // adjacent reason: unquoted they come back as a type rather than a string, so Meka and every
-    // real YAML tool disagree about the same file.
-    let looks_typed = matches!(
-        text.to_ascii_lowercase().as_str(),
-        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
-    ) || text.parse::<f64>().is_ok();
-    let needs_quotes = text.is_empty()
-        || text.trim() != text
-        || looks_typed
-        || text.starts_with([
-            '-', '?', ':', '!', '&', '*', '#', '|', '>', '%', '@', '`', '"', '\'', '[', ']', '{',
-            '}', ',',
-        ])
-        || text.contains(':')
-        || text.contains('#')
-        || text.contains('\n');
-    if needs_quotes {
-        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{escaped}\"")
-    } else {
-        text.to_string()
-    }
-}
-
 /// Serializes tests that set `$EDITOR` / `$VISUAL`, which are process-global.
 ///
 /// The same shape as [`crate::config::CONFIG_DIR_ENV_LOCK`], and separate from it because the two
@@ -155,11 +107,9 @@ pub(crate) fn editor_command(path: &std::path::Path) -> Option<std::process::Com
 /// Collapse a description to the single line it is contractually meant to be.
 ///
 /// Load-bearing rather than cosmetic, and the reason it lives here rather than in either store: a
-/// description is written into a YAML scalar, and an embedded newline breaks the frontmatter it
-/// sits in. A description of `"step 1\n---\nstep 2"` renders a `---` line inside the header, which
-/// [`split_frontmatter`] then takes for the closing fence, leaving an unterminated quoted scalar
-/// that no parser will accept. A bare `\r` does the same without even tripping [`yaml_scalar`]'s
-/// quoting check. `split_whitespace` handles every such character in one pass.
+/// description is one line of the per-turn index the model reads, so an embedded newline, or a
+/// bare `\r`, would let it open what looks like a new section there. `split_whitespace` handles
+/// every such character in one pass.
 pub(crate) fn normalize_description(description: &str) -> String {
     description.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -464,27 +414,6 @@ mod tests {
     fn split_frontmatter_no_fence() {
         let content = "no frontmatter here\n";
         assert!(split_frontmatter(content).is_none());
-    }
-
-    #[test]
-    fn yaml_scalar_plain_text_is_unquoted() {
-        assert_eq!(yaml_scalar("A plain description"), "A plain description");
-    }
-
-    /// A description containing a colon is the common case that forces quoting: unquoted it would
-    /// parse as a nested mapping and the whole frontmatter block would be rejected.
-    #[test]
-    fn yaml_scalar_quotes_structural_characters() {
-        assert_eq!(yaml_scalar("note: with colon"), "\"note: with colon\"");
-        assert_eq!(yaml_scalar("- leading dash"), "\"- leading dash\"");
-        assert_eq!(yaml_scalar("has # hash"), "\"has # hash\"");
-        assert_eq!(yaml_scalar(""), "\"\"");
-    }
-
-    #[test]
-    fn yaml_scalar_escapes_quotes_and_backslashes() {
-        assert_eq!(yaml_scalar("say \"hi\": now"), "\"say \\\"hi\\\": now\"");
-        assert_eq!(yaml_scalar("back\\slash: x"), "\"back\\\\slash: x\"");
     }
 
     /// The character class is the security boundary for `memory_write`, which runs at read

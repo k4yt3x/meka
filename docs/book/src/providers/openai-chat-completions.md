@@ -94,7 +94,7 @@ model   = "llama3"
 
 **Body fields Meka writes:** `model`, `messages`, `tools`, `stream`, `stream_options` (see Usage below), `reasoning_effort` (when `effort` is set) and `max_completion_tokens` (when `max_output_tokens` is set). Any other field goes in the profile's [`parameters`](../configuration/config-file.md#parameters), as [OpenAI's API reference](https://platform.openai.com/docs/api-reference/chat/create) names it or as the server names its own (`top_k`, `min_p`, `repetition_penalty`, OpenRouter's `provider`), and one of the fields above is refused there. A server that reads `max_tokens` and not `max_completion_tokens` takes it there, with `max_output_tokens` left unset. With `n` above 1, Meka reads the first answer.
 
-**Streaming:** Uses Server-Sent Events (SSE) with `data: {...}` lines. The stream ends with `data: [DONE]`.
+**Streaming:** Uses Server-Sent Events (SSE) with `data: {...}` lines. The stream ends with `data: [DONE]`. A compaction asks the way the session's turns do: streamed, or whole under `--no-stream` or [`display.stream`](../configuration/config-file.md#displaystream) set to `false`.
 
 **Usage:** a streamed request asks for its usage with `stream_options.include_usage`, which OpenAI's own API needs before it reports any; an endpoint that rejects the field takes the account's [`stream_usage`](../configuration/config-file.md#stream_usage) set to `false`. The `cached_tokens` and `cache_write_tokens` an endpoint reports under `prompt_tokens_details` count as cache reads and cache writes in `/status` and the per-turn usage line.
 

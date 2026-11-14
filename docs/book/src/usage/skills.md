@@ -183,7 +183,7 @@ borrowed        -         5         yes       A skill another client installed.
 
 `--paths` adds the on-disk `Path`, which is how you find out *where* an external skill lives. Nothing else goes in this table: `license`, `compatibility`, `allowed-tools`, `version` and arbitrary `metadata` keys are per-skill detail, and `meka skill get <name>` prints all of them.
 
-`--format json` prints `{"skills": [...]}`, each with the fields [`GET /v1/skills`](http-api.md) uses (`name`, `description`, `priority`, `version`, `author`, `compatibility`) plus `external` and `source_dir`, whether or not `--paths` was given. `meka skill get <name> --format json` prints one object with every frontmatter field, `source_dir`, `body_path`, `metadata` and the unmodeled `extra` keys; `show --format json` adds `body`, the text the agent receives.
+`--format json` prints `{"skills": [...]}`, each with the fields [`GET /v1/skills`](http-api.md) uses (`name`, `description`, `priority`, `version`, `author`, `compatibility`) plus `external` and `source_dir`, whether or not `--paths` was given. `meka skill get <name> --format json` prints one object with every frontmatter field, `source_dir`, `body_path`, `metadata` and the unmodeled `extra` keys; `show --format json` adds `body`, the text the agent receives. In JSON, `list` gives each description made safe to draw, as `GET /v1/skills` does, and `get` and `show` give the file's own, as `GET /v1/skills/{name}` does.
 
 ## How the agent uses skills
 

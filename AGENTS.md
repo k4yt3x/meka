@@ -705,9 +705,10 @@ defines a blank, so Meka does, once.
   optional field (`optional_str`), missing for a required one (`require_str`, which refuses by
   name). A value of another type is refused naming the field, never read as absent: for a
   restriction, absent is the dangerous direction. The value comes back as sent; a parser of a word
-  trims it. A field whose blank is itself a value (a replacement that deletes, a body or content
-  to clear, an expiry to lift) opts out by name through the `_allowing_empty` reader, and is listed
-  in the "How a built-in reads its arguments" section of `docs/book/src/tools/overview.md`.
+  trims it. A field whose blank is itself a value (a replacement that deletes, a body, content or
+  source to clear, an expiry to lift) opts out by name through the `_allowing_empty` reader, and
+  is listed in the "How a built-in reads its arguments" section of
+  `docs/book/src/tools/overview.md`.
 - **A list.** `string_or_list`: a list, or one bare string as a one-entry list (a mistake models
   make constantly, and the recovery is free), or nothing. A blank entry is dropped, an entry of
   another type is refused, and `[]` stays `[]`, since an empty list is a value (the documented

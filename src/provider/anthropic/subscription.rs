@@ -67,6 +67,21 @@ impl WireThinkingDisplay {
     }
 }
 
+/// The session id of a request that belongs to no session: an account call, and a completion
+/// nothing attributes. One for the process, as Claude Code mints one for a run.
+static SESSIONLESS_ID: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| Uuid::new_v4().to_string());
+
+/// The session a request names (`X-Claude-Code-Session-Id`, `metadata.user_id.session_id`): the
+/// conversation it belongs to, a worker's request naming its root's as a sub-agent of Claude
+/// Code's names its parent's, else [`SESSIONLESS_ID`]. The provider instance has none of its own,
+/// since one serves every session on its profile and is rebuilt whenever the token is refreshed.
+fn session_id_of(attribution: &crate::provider::Attribution) -> String {
+    attribution
+        .root_session_id
+        .map_or_else(|| SESSIONLESS_ID.clone(), |id| id.to_string())
+}
+
 /// The `claude-subscription` backend: one profile's model and the OAuth credential it bills.
 pub(crate) struct ClaudeSubscriptionProvider {
     client: reqwest::Client,
@@ -77,7 +92,6 @@ pub(crate) struct ClaudeSubscriptionProvider {
     model: String,
     client_id: String,
     oauth_token_url: String,
-    session_id: String,
     device_id: String,
     /// The subscriber's account UUID, sent as `metadata.user_id.account_uuid` (matching Claude
     /// Code). Captured from the credential at construction; empty for pre-existing logins until a
@@ -164,7 +178,6 @@ impl ClaudeSubscriptionProvider {
             oauth_token_url: oauth_token_url.unwrap_or_else(|| {
                 crate::provider::DEFAULT_CLAUDE_SUBSCRIPTION_TOKEN_URL.to_string()
             }),
-            session_id: Uuid::new_v4().to_string(),
             device_id,
             account_uuid,
             thinking,
@@ -368,9 +381,9 @@ impl ClaudeSubscriptionProvider {
     /// transport error and in a refused status, which is how a user tells a usage probe from a
     /// profile read.
     async fn fetch_oauth_endpoint(&self, path: &str, what: &str) -> Result<String> {
-        // A token with no signal source: these calls answer a command, not a turn, and the
-        // process that asked ends with the command. Held for the whole reply so the body is read
-        // through the same door as every other.
+        // A token nothing fires: these calls answer a command, not a turn, so no stop reaches
+        // them and the request's own timeout is their bound. Held for the whole reply so the body
+        // is read through the same door as every other.
         let cancellation = tokio_util::sync::CancellationToken::new();
         let response = crate::oauth::send_with_one_refresh(
             self,
@@ -385,10 +398,12 @@ impl ClaudeSubscriptionProvider {
             || async {
                 let (auth_name, auth_value) = self.ensure_valid_credential().await?;
                 Ok(attestation::apply_headers(
-                    self.client.get(format!("{}{}", self.base_url, path)),
+                    self.client
+                        .get(format!("{}{}", self.base_url, path))
+                        .timeout(crate::oauth::ACCOUNT_READ_TIMEOUT),
                     auth_name,
                     &auth_value,
-                    &self.session_id,
+                    &SESSIONLESS_ID,
                     Some("oauth-2025-04-20"),
                     None,
                 ))
@@ -503,7 +518,7 @@ impl ClaudeSubscriptionProvider {
         let metadata_user_id = serde_json::json!({
             "device_id": self.device_id,
             "account_uuid": self.account_uuid,
-            "session_id": self.session_id,
+            "session_id": session_id_of(attribution),
         })
         .to_string();
 
@@ -684,7 +699,7 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
             request,
             auth_header_name,
             &auth_header_value,
-            &self.session_id,
+            &session_id_of(attribution),
             self.compute_betas(
                 has_tools || declares_deferred,
                 self.thinking.is_on(),
@@ -779,10 +794,11 @@ impl Provider for ClaudeSubscriptionProvider {
         let role = {
             let request = attestation::apply_headers(
                 self.client
-                    .get(format!("{}/api/oauth/claude_cli/roles", self.base_url)),
+                    .get(format!("{}/api/oauth/claude_cli/roles", self.base_url))
+                    .timeout(crate::oauth::ACCOUNT_READ_TIMEOUT),
                 auth_name,
                 &auth_value,
-                &self.session_id,
+                &SESSIONLESS_ID,
                 Some("oauth-2025-04-20"),
                 None,
             );
@@ -1104,17 +1120,128 @@ mod tests {
         );
     }
 
-    /// A provider pointed at a port nothing is listening on, with a credential that needs no
-    /// refresh round trip of its own first.
-    ///
-    /// An OAuth token rather than the API key the other tests use, because this backend refuses an
-    /// API key outright and would never reach a send. The port is bound and dropped, so connecting
-    /// is refused rather than answered or left hanging.
+    /// An account read that an endpoint accepts and never answers ends on its own timeout. No
+    /// stop reaches one, and the screen's `/usage` and an editor's await it, so without a bound
+    /// the command would wait for as long as the process lives.
+    #[tokio::test]
+    async fn an_account_read_nobody_answers_ends_on_its_own_timeout() {
+        let endpoint = crate::oauth::testing::SilentEndpoint::after(&[]).await;
+        let provider = provider_with_a_live_token(endpoint.base_url.clone());
+
+        let error = endpoint
+            .outcome_of(provider.fetch_usage())
+            .await
+            .expect_err("an unanswered read is a failure");
+        assert!(
+            matches!(error, MekaError::RetryableProvider { .. }),
+            "{error}"
+        );
+    }
+
+    /// The role read is bounded the same way, and being best-effort, its silence costs the
+    /// identity only the role.
+    #[tokio::test]
+    async fn a_role_read_nobody_answers_costs_the_identity_only_its_role() {
+        let endpoint = crate::oauth::testing::SilentEndpoint::after(&[
+            r#"{"account":{"email":"user@example.com"}}"#,
+        ])
+        .await;
+        let provider = provider_with_a_live_token(endpoint.base_url.clone());
+
+        let identity = endpoint
+            .outcome_of(provider.fetch_identity())
+            .await
+            .expect("the profile was read")
+            .expect("this backend has an identity");
+        assert_eq!(identity.email.as_deref(), Some("user@example.com"));
+        assert_eq!(identity.role, None);
+    }
+
+    /// The session a request names, in its header and in `metadata.user_id`.
+    async fn session_named(
+        provider: &ClaudeSubscriptionProvider,
+        attribution: &crate::provider::Attribution,
+    ) -> String {
+        let request = shared::ClaudeBackend::authenticated_request(
+            provider,
+            provider.client.post("http://127.0.0.1:9/v1/messages"),
+            false,
+            false,
+            true,
+            attribution,
+        )
+        .await
+        .expect("builds")
+        .build()
+        .expect("a request");
+        let header = request
+            .headers()
+            .get("X-Claude-Code-Session-Id")
+            .and_then(|value| value.to_str().ok())
+            .expect("the session header")
+            .to_string();
+        let body = provider.build_request_body(
+            "system",
+            &[Message::user("hello")],
+            &[],
+            true,
+            attribution,
+        );
+        let user_id: serde_json::Value =
+            serde_json::from_str(body["metadata"]["user_id"].as_str().expect("a user id"))
+                .expect("JSON");
+        assert_eq!(
+            user_id["session_id"], header,
+            "the body and the header name one session"
+        );
+        header
+    }
+
+    /// A request names the session of the conversation it belongs to. One provider serves every
+    /// session on its profile and is rebuilt at each token refresh, so an id of the provider's own
+    /// would present unrelated conversations as one session and one conversation as several.
+    #[tokio::test]
+    async fn a_request_names_the_session_of_its_conversation() {
+        let provider = provider_with_a_live_token("http://127.0.0.1:9".to_string());
+        let rebuilt = provider_with_a_live_token("http://127.0.0.1:9".to_string());
+        let conversation = Uuid::new_v4();
+        let of = |session| crate::provider::Attribution {
+            root_session_id: Some(session),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            session_named(&provider, &of(conversation)).await,
+            conversation.to_string()
+        );
+        assert_eq!(
+            session_named(&rebuilt, &of(conversation)).await,
+            conversation.to_string(),
+            "a refresh rebuilds the provider and must not move the conversation's session"
+        );
+        let other = Uuid::new_v4();
+        assert_eq!(
+            session_named(&provider, &of(other)).await,
+            other.to_string(),
+            "a second conversation on the profile is a session of its own"
+        );
+    }
+
+    /// A provider pointed at a port nothing is listening on. The port is bound and dropped, so
+    /// connecting is refused rather than answered or left hanging.
     fn provider_on_a_dead_port() -> ClaudeSubscriptionProvider {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
         let port = listener.local_addr().expect("the bound address").port();
         drop(listener);
+        provider_with_a_live_token(format!("http://127.0.0.1:{port}"))
+    }
 
+    /// A provider pointed at `base_url`, with a credential that needs no refresh round trip of
+    /// its own first.
+    ///
+    /// An OAuth token rather than the API key the other tests use, because this backend refuses an
+    /// API key outright and would never reach a send.
+    fn provider_with_a_live_token(base_url: String) -> ClaudeSubscriptionProvider {
         ClaudeSubscriptionProvider::from_settings(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ClaudeSubscription,
@@ -1126,7 +1253,7 @@ mod tests {
                 },
                 "claude-sonnet-4-20250514".to_string(),
             )
-            .base_url(Some(format!("http://127.0.0.1:{port}")))
+            .base_url(Some(base_url))
             .client_id(None)
             .oauth_token_url(None)
             .token_store(None)

@@ -203,13 +203,15 @@ pub(crate) struct ResidentRewind {
 }
 
 /// What a worker descends from: the prompt its spawning call answered, so its requests bill to
-/// it, and its spawner's agent id when the spawner is itself a worker. The prompt id alone of the
-/// spawning turn's attribution: Claude Code stamps neither an origin nor a position on a
+/// it, its spawner's agent id when the spawner is itself a worker, and the session at the root of
+/// its family, which its requests name as the conversation they belong to. The prompt id alone of
+/// the spawning turn's attribution: Claude Code stamps neither an origin nor a position on a
 /// sub-agent's messages, so a sub-agent's requests report neither.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct WorkerLineage {
     pub(crate) prompt_id: Option<uuid::Uuid>,
     pub(crate) parent_agent_id: Option<String>,
+    pub(crate) root_session_id: Option<uuid::Uuid>,
 }
 
 /// Whether an agent is the session's own or a worker spawned from it, and everything that follows
@@ -588,6 +590,15 @@ impl Agent {
             options,
             AgentRole::Worker(lineage),
         )
+    }
+
+    /// The session of the conversation this agent's requests belong to: its own for the root
+    /// agent, and for a worker the one at the root of its family.
+    pub(crate) fn root_session_id(&self) -> Option<uuid::Uuid> {
+        match &self.role {
+            AgentRole::Root => self.cells.session_id.get(),
+            AgentRole::Worker(lineage) => lineage.root_session_id,
+        }
     }
 
     /// How this agent's requests name it when it is a worker: its id from its own session, its
